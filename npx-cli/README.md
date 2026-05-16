@@ -24,5 +24,5 @@ package version. For testing a different release:
 
 ```bash
 npx @forgeailab/forge --release latest
-FORGE_NPX_TAG=v0.1.0 npx @forgeailab/forge
+FORGE_NPX_TAG=v0.1.1 npx @forgeailab/forge
 ```

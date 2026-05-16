@@ -6,8 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+No unreleased changes yet.
+
+## [0.1.1] - 2026-05-16
+
 ### Added
 
+- `forge-ctl login`, `logout`, and `whoami` commands for API-token based CLI auth.
+- MCP install flows can create/login with API tokens before writing client config.
 - npm bootstrapper package so users can start Forge with `npx @forgeailab/forge`.
 
 ## [0.1.0] - 2026-05-15

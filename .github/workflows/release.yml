@@ -193,8 +193,6 @@ jobs:
 
       - name: Publish package
         working-directory: npx-cli
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           package_name=$(node -p "require('./package.json').name")
           version="${GITHUB_REF_NAME#v}"
