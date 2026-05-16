@@ -4,7 +4,7 @@ use forge_client::{
 };
 
 #[derive(Parser)]
-#[command(name = "forge-ctl", about = "Forge CLI client")]
+#[command(name = "forge-ctl", version, about = "Forge CLI client")]
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     server: String,

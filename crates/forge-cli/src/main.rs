@@ -14,6 +14,7 @@ const DEFAULT_LOG_FILTER: &str = "forge=info,forge_cli=info,api=info,services=in
 const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
+#[command(name = "forge", version, about = "Forge — local-first workflow engine for coding agents")]
 struct Cli {
     #[arg(long)]
     demo: bool,
