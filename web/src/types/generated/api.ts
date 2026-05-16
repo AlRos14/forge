@@ -1158,6 +1158,7 @@ export interface McpConfigActionRequest {
   agent: string
   scope?: string
   project_id?: string
+  public_base_url?: string | null
   action: 'install' | 'uninstall'
 }
 

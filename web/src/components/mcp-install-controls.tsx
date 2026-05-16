@@ -209,7 +209,8 @@ export function McpInstallControls({
           const isRowPending = pendingAgent === agent
           const isBulkInstalling = pendingAgent === 'all' && installableAgents.includes(agent)
           const isDisabled = pendingAgent !== null || query.isLoading
-          const rawAgentUrl = query.data?.installed && query.data.url ? query.data.url : installedUrl
+          const rawAgentUrl =
+            query.data?.installed && query.data.url ? query.data.url : (installedUrl ?? expectedUrl)
           const agentUrl = rawAgentUrl ? stripTokenQueryParam(rawAgentUrl) : rawAgentUrl
           const cliCommand = agentUrl ? getCliCommand(agent, agentUrl) : null
           const commandLabel = getCommandLabel(agent)

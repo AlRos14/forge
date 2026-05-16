@@ -30,8 +30,9 @@ pub async fn get_mcp_config(
     let scope = parse_scope(params.scope.as_deref())?;
     let config_path =
         resolve_config_path(&state, &agent, &scope, params.project_id.as_deref()).await?;
-    let expected_url = mcp_url_for_scope(
-        &state.effective_config.server.bind,
+    let expected_url = mcp_url_for_scope_from_request(
+        &state,
+        params.public_base_url.as_deref(),
         &scope,
         params.project_id.as_deref(),
     )?;
@@ -62,8 +63,9 @@ pub async fn update_mcp_config(
     let action = parse_action(&body.action)?;
     let config_path =
         resolve_config_path(&state, &agent, &scope, body.project_id.as_deref()).await?;
-    let expected_url = mcp_url_for_scope(
-        &state.effective_config.server.bind,
+    let expected_url = mcp_url_for_scope_from_request(
+        &state,
+        body.public_base_url.as_deref(),
         &scope,
         body.project_id.as_deref(),
     )?;
@@ -114,8 +116,34 @@ pub async fn update_mcp_config(
     }))
 }
 
-fn mcp_url_for_scope(bind: &str, scope: &McpScope, project_id: Option<&str>) -> ApiResult<String> {
-    let base = format!("http://{bind}/mcp");
+fn mcp_url_for_scope_from_request(
+    state: &AppState,
+    request_public_base_url: Option<&str>,
+    scope: &McpScope,
+    project_id: Option<&str>,
+) -> ApiResult<String> {
+    let public_base_url = state
+        .effective_config
+        .server
+        .public_base_url
+        .as_deref()
+        .or(request_public_base_url);
+    mcp_url_for_scope_with_public_base_url(
+        &state.effective_config.server.bind,
+        public_base_url,
+        scope,
+        project_id,
+    )
+}
+
+fn mcp_url_for_scope_with_public_base_url(
+    bind: &str,
+    public_base_url: Option<&str>,
+    scope: &McpScope,
+    project_id: Option<&str>,
+) -> ApiResult<String> {
+    let base = mcp_base_url(bind, public_base_url)?;
+    let base = format!("{base}/mcp");
     match (
         scope,
         project_id.map(str::trim).filter(|value| !value.is_empty()),
@@ -130,6 +158,29 @@ fn mcp_url_for_scope(bind: &str, scope: &McpScope, project_id: Option<&str>) -> 
         )),
         _ => Ok(base),
     }
+}
+
+fn mcp_base_url(bind: &str, public_base_url: Option<&str>) -> ApiResult<String> {
+    let Some(public_base_url) = public_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(format!("http://{bind}"));
+    };
+
+    let parsed = url::Url::parse(public_base_url).map_err(|_| {
+        ApiError::bad_request_with_code(
+            "invalid_public_base_url",
+            "public_base_url must be an absolute http(s) URL",
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(ApiError::bad_request_with_code(
+            "invalid_public_base_url",
+            "public_base_url must be an absolute http(s) URL",
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn percent_encode_query(value: &str) -> String {
@@ -584,15 +635,58 @@ mod tests {
     fn mcp_url_scopes_project_installs() {
         let bind = "127.0.0.1:8080";
         assert_eq!(
-            mcp_url_for_scope(bind, &McpScope::Project, Some("project 1"))
-                .expect("project URL builds"),
+            mcp_url_for_scope_with_public_base_url(
+                bind,
+                None,
+                &McpScope::Project,
+                Some("project 1"),
+            )
+            .expect("project URL builds"),
             "http://127.0.0.1:8080/mcp?project_id=project%201"
         );
         assert_eq!(
-            mcp_url_for_scope(bind, &McpScope::User, None).expect("user URL builds"),
+            mcp_url_for_scope_with_public_base_url(bind, None, &McpScope::User, None)
+                .expect("user URL builds"),
             "http://127.0.0.1:8080/mcp"
         );
-        assert!(mcp_url_for_scope(bind, &McpScope::Project, None).is_err());
+        assert!(
+            mcp_url_for_scope_with_public_base_url(bind, None, &McpScope::Project, None).is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_url_uses_public_base_url_origin_when_provided() {
+        assert_eq!(
+            mcp_url_for_scope_with_public_base_url(
+                "0.0.0.0:8080",
+                Some("https://forge.example.com/app"),
+                &McpScope::Project,
+                Some("project 1"),
+            )
+            .expect("project URL builds"),
+            "https://forge.example.com/mcp?project_id=project%201"
+        );
+        assert_eq!(
+            mcp_url_for_scope_with_public_base_url(
+                "0.0.0.0:8080",
+                Some("http://192.168.1.20:8080"),
+                &McpScope::User,
+                None,
+            )
+            .expect("user URL builds"),
+            "http://192.168.1.20:8080/mcp"
+        );
+    }
+
+    #[test]
+    fn mcp_url_rejects_invalid_public_base_url() {
+        assert!(mcp_url_for_scope_with_public_base_url(
+            "0.0.0.0:8080",
+            Some("ftp://forge.example.com"),
+            &McpScope::User,
+            None,
+        )
+        .is_err());
     }
 
     #[test]
@@ -692,9 +786,13 @@ command = "other"
 
         let response = install_config(&state, "claude", Some("user"), None).await;
         let url = response.url.expect("install returns url");
-        let expected_url =
-            mcp_url_for_scope(&state.effective_config.server.bind, &McpScope::User, None)
-                .expect("expected URL builds");
+        let expected_url = mcp_url_for_scope_with_public_base_url(
+            &state.effective_config.server.bind,
+            None,
+            &McpScope::User,
+            None,
+        )
+        .expect("expected URL builds");
 
         assert_eq!(url, expected_url);
         assert!(url.contains("/mcp"));
@@ -703,12 +801,36 @@ command = "other"
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn install_user_scope_uses_request_public_base_url() {
+        let _guard = TEST_ENV_LOCK.lock().expect("test env lock");
+        let home_dir = unique_temp_dir("forge-mcp-user-public-base");
+        std::fs::create_dir_all(&home_dir).expect("home dir creates");
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str());
+        let state = test_state_with_user().await;
+
+        let response = install_config_with_public_base_url(
+            &state,
+            "claude",
+            Some("user"),
+            None,
+            Some("http://192.168.1.20:8080/app"),
+        )
+        .await;
+        let url = response.url.expect("install returns url");
+
+        assert_eq!(url, "http://192.168.1.20:8080/mcp");
+        let _ = std::fs::remove_dir_all(home_dir);
+    }
+
+    #[tokio::test]
     async fn get_mcp_config_reports_installed_for_bare_url() {
         let repo_dir = unique_temp_dir("forge-mcp-bare");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
-        let expected_url = mcp_url_for_scope(
+        let expected_url = mcp_url_for_scope_with_public_base_url(
             &state.effective_config.server.bind,
+            None,
             &McpScope::Project,
             Some(&project_id),
         )
@@ -729,8 +851,9 @@ command = "other"
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
         let raw_token = "fg_0102030405060708091011121314151617181920";
         create_test_pat(&state, raw_token, "Legacy MCP token").await;
-        let expected_url = mcp_url_for_scope(
+        let expected_url = mcp_url_for_scope_with_public_base_url(
             &state.effective_config.server.bind,
+            None,
             &McpScope::Project,
             Some(&project_id),
         )
@@ -844,6 +967,16 @@ command = "other"
         scope: Option<&str>,
         project_id: Option<&str>,
     ) -> McpConfigResponse {
+        install_config_with_public_base_url(state, agent, scope, project_id, None).await
+    }
+
+    async fn install_config_with_public_base_url(
+        state: &AppState,
+        agent: &str,
+        scope: Option<&str>,
+        project_id: Option<&str>,
+        public_base_url: Option<&str>,
+    ) -> McpConfigResponse {
         update_mcp_config(
             State(state.clone()),
             test_authenticated_user(),
@@ -851,6 +984,7 @@ command = "other"
                 agent: agent.to_owned(),
                 scope: scope.map(str::to_owned),
                 project_id: project_id.map(str::to_owned),
+                public_base_url: public_base_url.map(str::to_owned),
                 action: "install".to_owned(),
             }),
         )
@@ -870,6 +1004,7 @@ command = "other"
                 agent: agent.to_owned(),
                 scope: scope.map(str::to_owned),
                 project_id: project_id.map(str::to_owned),
+                public_base_url: None,
             }),
             State(state.clone()),
             test_authenticated_user(),

@@ -1133,12 +1133,22 @@ export function useCliProjectionQuery() {
   })
 }
 
+function browserPublicBaseUrl(): string | undefined {
+  if (typeof window === 'undefined') return undefined
+  return window.location.origin
+}
+
 export function useMcpConfigQuery(agent: string, scope: string, projectId?: string) {
   return useQuery({
     queryKey: qk.mcpConfig(agent, scope, projectId),
     queryFn: () =>
       apiFetch<McpConfigResponse>('/config/mcp', {
-        search: { agent, scope, ...(projectId ? { project_id: projectId } : {}) },
+        search: {
+          agent,
+          scope,
+          public_base_url: browserPublicBaseUrl(),
+          ...(projectId ? { project_id: projectId } : {}),
+        },
       }),
   })
 }
@@ -1149,7 +1159,10 @@ export function useUpdateMcpConfig() {
     mutationFn: (body: McpConfigActionRequest) =>
       apiFetch<McpConfigResponse>('/config/mcp', {
         method: 'POST',
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          ...body,
+          public_base_url: body.public_base_url ?? browserPublicBaseUrl(),
+        }),
       }),
     onSuccess: (_data, variables) => {
       void queryClient.invalidateQueries({

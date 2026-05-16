@@ -29,6 +29,7 @@ pub struct McpConfigQuery {
     pub agent: String,
     pub scope: Option<String>,
     pub project_id: Option<String>,
+    pub public_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +38,7 @@ pub struct McpConfigActionRequest {
     pub agent: String,
     pub scope: Option<String>,
     pub project_id: Option<String>,
+    pub public_base_url: Option<String>,
     pub action: String,
 }
 
