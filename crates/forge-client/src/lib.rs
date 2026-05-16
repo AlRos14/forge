@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod auth;
 pub mod client;
 pub mod daemon;
 pub mod daemon_link;

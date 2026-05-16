@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use forge_client::{
-    agent, client::ForgeClient, daemon, mcp, project, repo, run, task, OutputFormat,
+    agent, auth, client::ForgeClient, daemon, mcp, project, repo, run, task, OutputFormat,
 };
 
 #[derive(Parser)]
@@ -16,6 +16,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Login(auth::LoginArgs),
+    Logout(auth::LogoutArgs),
+    Whoami(auth::WhoamiArgs),
     Task(task::TaskArgs),
     Agent(agent::AgentArgs),
     Daemon(daemon::DaemonArgs),
@@ -31,6 +34,9 @@ async fn main() -> anyhow::Result<()> {
     let client = ForgeClient::new(&cli.server);
 
     match cli.command {
+        Commands::Login(args) => args.run(&cli.server, &cli.output).await,
+        Commands::Logout(args) => args.run(&cli.output),
+        Commands::Whoami(args) => args.run(&cli.server, &cli.output),
         Commands::Task(args) => args.run(&client, &cli.output).await,
         Commands::Agent(args) => args.run(&client, &cli.output).await,
         Commands::Daemon(args) => args.run(&client, &cli.output).await,

@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::auth::resolve_access_token_for_server;
+
 #[derive(clap::Args)]
 pub struct McpArgs {
     #[command(subcommand)]
@@ -19,6 +21,12 @@ pub enum McpCmd {
         agent: AgentTarget,
         #[arg(long, value_enum, default_value = "project")]
         scope: ConfigScope,
+        /// User access token to embed in the MCP URL. Overrides FORGE_TOKEN and stored login.
+        #[arg(long)]
+        token: Option<String>,
+        /// Scope this MCP endpoint to a single Forge project.
+        #[arg(long)]
+        project_id: Option<String>,
     },
     Uninstall {
         #[arg(long, value_enum, default_value = "claude")]
@@ -51,7 +59,18 @@ pub enum ConfigScope {
 impl McpArgs {
     pub async fn run(&self, server: &str) -> Result<()> {
         match &self.cmd {
-            McpCmd::Install { agent, scope } => install(server, *agent, *scope),
+            McpCmd::Install {
+                agent,
+                scope,
+                token,
+                project_id,
+            } => install(
+                server,
+                *agent,
+                *scope,
+                token.as_deref(),
+                project_id.as_deref(),
+            ),
             McpCmd::Uninstall { agent, scope } => uninstall(*agent, *scope),
             McpCmd::Status { agent, scope } => status(*agent, *scope),
         }
@@ -121,9 +140,15 @@ pub fn write_config(path: &Path, config: &Value) -> Result<()> {
     Ok(())
 }
 
-pub fn install(server: &str, agent: AgentTarget, scope: ConfigScope) -> Result<()> {
+pub fn install(
+    server: &str,
+    agent: AgentTarget,
+    scope: ConfigScope,
+    token: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<()> {
     let path = config_path(agent, scope)?;
-    let install_url = install_url(server, scope);
+    let install_url = install_url(server, token, project_id)?;
     if agent == AgentTarget::Codex {
         let contents = read_codex_config(&path)?;
         write_codex_config_if_changed(
@@ -267,8 +292,21 @@ fn mcp_url(server: &str) -> String {
     format!("{}/mcp", server.trim_end_matches('/'))
 }
 
-fn install_url(server: &str, _scope: ConfigScope) -> String {
-    mcp_url(server)
+fn install_url(server: &str, token: Option<&str>, project_id: Option<&str>) -> Result<String> {
+    let token = resolve_access_token_for_server(server, token)?.ok_or_else(|| {
+        anyhow!(
+            "MCP install requires an access token; run `forge-ctl login`, pass --token, or set FORGE_TOKEN"
+        )
+    })?;
+    let mut url = url::Url::parse(&mcp_url(server)).context("parse Forge MCP URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            query.append_pair("project_id", project_id);
+        }
+        query.append_pair("token", &token);
+    }
+    Ok(url.to_string())
 }
 
 fn read_codex_config(path: &Path) -> Result<String> {
@@ -380,12 +418,7 @@ fn unquote_toml_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn config_relative_path_uses_shared_project_file_for_claude() {
@@ -466,16 +499,84 @@ command = "other"
     }
 
     #[test]
-    fn install_url_is_bare() {
-        let url = install_url("http://127.0.0.1:8080/", ConfigScope::Project);
+    fn install_url_requires_token() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let temp = unique_temp_dir("forge-client-mcp-no-token");
+        let _token = EnvVarGuard::unset("FORGE_TOKEN");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
 
-        assert_eq!(url, "http://127.0.0.1:8080/mcp");
-        assert!(!url.contains("token="));
+        let error = install_url("http://127.0.0.1:8080/", None, None).expect_err("token required");
+
+        assert!(error.to_string().contains("requires an access token"));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn install_writes_bare_url_on_temp_dir() {
-        let _guard = TEST_ENV_LOCK.lock().expect("test env lock");
+    fn install_url_includes_explicit_token_and_project() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let temp = unique_temp_dir("forge-client-mcp-explicit-token");
+        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_from_env");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
+
+        let url = install_url(
+            "http://127.0.0.1:8080/",
+            Some("fg_explicit"),
+            Some("project 1"),
+        )
+        .expect("url builds");
+
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8080/mcp?project_id=project+1&token=fg_explicit"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn install_url_falls_back_to_forge_token_env() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let temp = unique_temp_dir("forge-client-mcp-env-token");
+        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_from_env");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
+
+        let url = install_url("http://127.0.0.1:8080/", None, None).expect("url builds");
+
+        assert_eq!(url, "http://127.0.0.1:8080/mcp?token=fg_from_env");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn install_url_falls_back_to_stored_login_token() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let temp = unique_temp_dir("forge-client-mcp-stored-token");
+        fs::create_dir_all(&temp).expect("forge data dir creates");
+        let _token = EnvVarGuard::unset("FORGE_TOKEN");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
+        fs::write(
+            temp.join("forge_ctl_credentials.json"),
+            serde_json::json!({
+                "server_url": "http://127.0.0.1:8080",
+                "token": "fg_stored",
+                "token_id": "token-1",
+                "token_prefix": "fg_st",
+                "email": "user@example.com"
+            })
+            .to_string(),
+        )
+        .expect("credentials write");
+
+        let url = install_url("http://127.0.0.1:8080/", None, None).expect("url builds");
+
+        assert_eq!(url, "http://127.0.0.1:8080/mcp?token=fg_stored");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn install_writes_token_url_on_temp_dir() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let data_dir = unique_temp_dir("forge-client-mcp-install-data");
+        let _token = EnvVarGuard::unset("FORGE_TOKEN");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
         let repo_dir = unique_temp_dir("forge-client-mcp-install");
         fs::create_dir_all(&repo_dir).expect("repo dir creates");
         let cwd_guard = CurrentDirGuard::set(&repo_dir);
@@ -484,6 +585,8 @@ command = "other"
             "http://127.0.0.1:8080",
             AgentTarget::Claude,
             ConfigScope::Project,
+            Some("fg_test"),
+            Some("project-1"),
         )
         .expect("install succeeds");
         drop(cwd_guard);
@@ -494,9 +597,12 @@ command = "other"
             .expect("forge url reads")
             .expect("forge url installed");
 
-        assert_eq!(url, "http://127.0.0.1:8080/mcp");
-        assert!(!url.contains("token="));
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8080/mcp?project_id=project-1&token=fg_test"
+        );
         let _ = fs::remove_dir_all(repo_dir);
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -520,6 +626,35 @@ command = "other"
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
         }
     }
 }

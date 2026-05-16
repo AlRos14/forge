@@ -51,10 +51,11 @@ impl RunArgs {
 }
 
 async fn wait_for_terminal_state(client: &ForgeClient, task_id: &str) -> Result<i32> {
-    let response = reqwest::Client::new()
-        .get(client.url("/api/v1/events"))
-        .send()
-        .await?;
+    let mut request = reqwest::Client::new().get(client.url("/api/v1/events"));
+    if let Some(token) = client.bearer_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
     if !response.status().is_success() {
         bail!("event stream failed with status {}", response.status());
     }

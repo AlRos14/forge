@@ -96,6 +96,11 @@ polling.
 Forge exposes 7 tools at `POST /mcp` (JSON-RPC 2.0). The MCP server has its own
 `McpState` and does not depend on the `api` crate.
 
+MCP requests require authentication. Clients can send `Authorization: Bearer
+<token>` or include `token=<token>` in the MCP URL query string; `forge-ctl mcp
+install` writes the query-string form because the supported client config files
+store only the server URL.
+
 | Tool | Purpose |
 |------|---------|
 | `forge_create_task` | Create a new task |

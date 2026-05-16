@@ -14,6 +14,9 @@ running first (default `http://127.0.0.1:8080`).
 
 | Command | What it does |
 |---------|--------------|
+| `login`   | Authenticate the CLI and store a reusable token |
+| `logout`  | Remove stored CLI credentials |
+| `whoami`  | Show stored CLI login state |
 | `project` | Create / list / show projects |
 | `repo`    | Add / list repos under a project |
 | `task`    | Create, list, show, transition, cancel, archive tasks |
@@ -25,6 +28,23 @@ running first (default `http://127.0.0.1:8080`).
 Use `forge-ctl <command> --help` for the full set of flags on each subcommand.
 
 ## Common flows
+
+### Authenticate the CLI
+
+`forge-ctl login` exchanges your account credentials for a CLI personal access
+token and stores it under the Forge data directory. Later commands, including
+`forge-ctl mcp install`, reuse that stored token automatically for the same
+`--server` URL.
+
+```bash
+printf '%s\n' "$FORGE_PASSWORD" | forge-ctl login \
+  --email you@example.com \
+  --password-stdin
+
+forge-ctl whoami
+```
+
+Use `forge-ctl logout` to remove the local credentials file.
 
 ### Quick scripted run
 
@@ -69,6 +89,23 @@ forge-ctl --server http://127.0.0.1:8080 daemon link \
 The token is used only for initial ownership; the daemon receives and stores
 its own registration token afterward. Add `--once` for a one-shot
 registration/report.
+
+### Installing MCP client config
+
+`forge-ctl mcp install` writes the Forge MCP URL into a supported MCP client
+config file. MCP requests require authentication; after `forge-ctl login`, the
+stored CLI token is used automatically. You can still pass `--token` or set
+`FORGE_TOKEN` to override the stored token:
+
+```bash
+forge-ctl mcp install --agent claude
+forge-ctl mcp install --agent codex --project-id <PROJECT_ID>
+forge-ctl mcp install --agent cursor --scope user --token fg_...
+```
+
+Supported agents are `claude`, `codex`, and `cursor`. Supported config scopes
+are `project`, `local`, and `user`; the optional `--project-id` scopes MCP tool
+calls to one Forge project.
 
 ### JSON output for scripting
 

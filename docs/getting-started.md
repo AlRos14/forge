@@ -5,6 +5,17 @@ against your own git repo.
 
 ## Install
 
+### npm bootstrapper (macOS / Linux)
+
+```bash
+npx @forgeailab/forge --demo
+```
+
+The npm package is a small bootstrapper. It downloads the matching Forge GitHub
+release archive, caches it under `~/.forge/npx`, and starts the local server
+with the bundled web UI assets. The browser opens automatically unless you pass
+`--no-open`.
+
 ### Homebrew (macOS / Linux, recommended)
 
 ```bash
@@ -158,6 +169,10 @@ The same flow is exercised end-to-end by `cargo test -p api --test happy_path`.
 For interactive work, the CLI is friendlier than raw curl:
 
 ```bash
+printf '%s\n' "$FORGE_PASSWORD" | forge-ctl login \
+  --email you@example.com \
+  --password-stdin
+
 forge-ctl project create --name "My Project"
 forge-ctl task list --project-id <ID>
 forge-ctl agent register --name "Claude" --executor-type shell
