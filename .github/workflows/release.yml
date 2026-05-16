@@ -118,7 +118,12 @@ jobs:
 
       - name: Generate checksums
         run: |
-          find artifacts -name '*.tar.gz' -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          # download-artifact nests files as artifacts/<name>/<name>.tar.gz; flatten
+          # so SHA256SUMS lists clean filenames that match what users download from
+          # the release page (`sha256sum -c SHA256SUMS` works against downloaded files).
+          mkdir -p release-files
+          find artifacts -name '*.tar.gz' -type f -exec cp {} release-files/ \;
+          cd release-files && sha256sum *.tar.gz > ../SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
