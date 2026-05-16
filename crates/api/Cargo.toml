@@ -45,7 +45,7 @@ db = { path = "../db" }
 events = { path = "../events" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.28"
 tower = "0.5"
 
 [lints]
