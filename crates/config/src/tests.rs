@@ -1,6 +1,7 @@
 use crate::{
-    default_data_dir, default_workspace_root, ConfigOverrides, ForgeConfig, DEFAULT_SERVER_BIND,
-    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    data_dir_from_env, default_data_dir, default_workspace_root, read_server_state,
+    server_state_path, write_server_state, ConfigOverrides, ForgeConfig, ServerState,
+    DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use std::{
     env, fs,
@@ -230,6 +231,42 @@ workspace:
     assert_eq!(config.forge.data_dir, PathBuf::from("/file/data"));
     assert_eq!(config.db_path(), PathBuf::from("/file/data/forge.db"));
     assert_eq!(config.workspace.root, PathBuf::from("/file/worktrees"));
+}
+
+#[test]
+fn data_dir_from_env_expands_forge_data_dir() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let home = tempdir().expect("home tempdir");
+    let previous_home = env::var_os("HOME");
+
+    env::set_var("HOME", home.path());
+    env::set_var("FORGE_DATA_DIR", "~/forge-data-from-env");
+
+    assert_eq!(data_dir_from_env(), home.path().join("forge-data-from-env"));
+
+    if let Some(previous_home) = previous_home {
+        env::set_var("HOME", previous_home);
+    } else {
+        env::remove_var("HOME");
+    }
+    clear_forge_env();
+}
+
+#[test]
+fn server_state_round_trips_in_data_dir() {
+    let dir = tempdir().expect("tempdir");
+    let state = ServerState::new("127.0.0.1:49152", "http://127.0.0.1:49152");
+
+    assert_eq!(read_server_state(dir.path()).expect("state reads"), None);
+
+    write_server_state(dir.path(), &state).expect("state writes");
+
+    assert_eq!(
+        read_server_state(dir.path()).expect("state reads"),
+        Some(state)
+    );
+    assert!(server_state_path(dir.path()).ends_with("server.json"));
 }
 
 fn clear_forge_env() {

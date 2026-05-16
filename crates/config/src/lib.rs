@@ -5,6 +5,7 @@ mod error;
 mod file;
 mod loader;
 mod path;
+mod runtime;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -15,7 +16,10 @@ pub use defaults::{
     DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 pub use error::ConfigError;
-pub use path::{default_config_path, default_data_dir, default_workspace_root};
+pub use path::{data_dir_from_env, default_config_path, default_data_dir, default_workspace_root};
+pub use runtime::{
+    read_server_state, server_state_path, write_server_state, ServerState, SERVER_STATE_FILE,
+};
 pub use types::{
     AgentDefaults, ConfigOverrides, ForgeConfig, ForgePaths, ProjectSettings, ServerConfig,
     WorkspaceConfig,

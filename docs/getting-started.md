@@ -62,13 +62,19 @@ Data persists in the `forge-data` Docker volume. Set `RUST_LOG=debug` in
 
 By default the server:
 
-- Binds `127.0.0.1:8080`.
+- Binds loopback on an OS-selected port the first time, then reuses that port
+  from `~/.forge/server.json` on later starts.
 - Creates `~/.forge/forge.db` (SQLite, WAL mode).
 - Boots an embedded daemon that auto-registers and reports installed CLIs
   (`shell` always, plus `codex` / `claude_code` / `opencode` when on `PATH`).
 - Upserts default executor profiles from the adapter registry.
 
-Open [http://localhost:8080](http://localhost:8080) for the web UI.
+Open the `management_url` printed in the server logs for the web UI. For raw
+API calls, set:
+
+```bash
+FORGE_URL=$(jq -r .server_url ~/.forge/server.json)
+```
 
 ## Configuration
 
@@ -95,13 +101,13 @@ pollutes `~/.forge`. See the project [Makefile](../Makefile).
 The embedded daemon auto-detects installed CLIs. Verify what's available:
 
 ```bash
-curl -sS :8080/api/v1/daemons | jq '.items[].cli_inventory'
+curl -sS "$FORGE_URL/api/v1/daemons" | jq '.items[].cli_inventory'
 ```
 
 Register an agent against one of the reported CLIs:
 
 ```bash
-curl -sS -X POST :8080/api/v1/agents \
+curl -sS -X POST "$FORGE_URL/api/v1/agents" \
   -H 'content-type: application/json' \
   -d '{
     "name": "claude-coder",
@@ -120,23 +126,23 @@ This drives a task from `todo → done` against a real local repo, using the
 
 ```bash
 # 1. Create a project + repo pointing at a real git checkout.
-PROJECT_ID=$(curl -sS -X POST :8080/api/v1/projects \
+PROJECT_ID=$(curl -sS -X POST "$FORGE_URL/api/v1/projects" \
   -H 'content-type: application/json' \
   -d '{"name":"demo"}' | jq -r .id)
 
-curl -sS -X POST :8080/api/v1/projects/$PROJECT_ID/repos \
+curl -sS -X POST "$FORGE_URL/api/v1/projects/$PROJECT_ID/repos" \
   -H 'content-type: application/json' \
   -d '{"name":"my-repo","url":"/abs/path/to/repo","default_branch":"main"}'
 
 # 2. Use the auto-reported daemon and register a shell agent.
-DAEMON_ID=$(curl -sS :8080/api/v1/daemons | jq -r '.items[0].id')
-AGENT_ID=$(curl -sS -X POST :8080/api/v1/agents \
+DAEMON_ID=$(curl -sS "$FORGE_URL/api/v1/daemons" | jq -r '.items[0].id')
+AGENT_ID=$(curl -sS -X POST "$FORGE_URL/api/v1/agents" \
   -H 'content-type: application/json' \
   -d "{\"name\":\"demo-agent\",\"executor_type\":\"shell\",\"daemon_id\":\"$DAEMON_ID\"}" \
   | jq -r .id)
 
 # 3. Create a task with inline CI steps.
-TASK_ID=$(curl -sS -X POST :8080/api/v1/projects/$PROJECT_ID/tasks \
+TASK_ID=$(curl -sS -X POST "$FORGE_URL/api/v1/projects/$PROJECT_ID/tasks" \
   -H 'content-type: application/json' \
   -d '{
     "title":"greet",
@@ -145,19 +151,19 @@ TASK_ID=$(curl -sS -X POST :8080/api/v1/projects/$PROJECT_ID/tasks \
   }' | jq -r .id)
 
 # 4. Claim the task — the executor auto-dispatches.
-curl -sS -X POST :8080/api/v1/tasks/$TASK_ID/claim \
+curl -sS -X POST "$FORGE_URL/api/v1/tasks/$TASK_ID/claim" \
   -H 'content-type: application/json' \
   -d "{\"agent_id\":\"$AGENT_ID\",\"overrides\":null}"
 
 # 5. Transition to review. The review runner fires the CI steps inline and
 #    returns {task, review} in one response.
-curl -sS -X POST :8080/api/v1/tasks/$TASK_ID/transition \
+curl -sS -X POST "$FORGE_URL/api/v1/tasks/$TASK_ID/transition" \
   -H 'content-type: application/json' \
   -d '{"status":"review","version":2}'
 
 # 6. Transition to merging. The merge runs, the task auto-advances to done,
 #    and the worktree is cleaned up synchronously.
-curl -sS -X POST :8080/api/v1/tasks/$TASK_ID/transition \
+curl -sS -X POST "$FORGE_URL/api/v1/tasks/$TASK_ID/transition" \
   -H 'content-type: application/json' \
   -d '{"status":"merging","version":3}'
 ```
@@ -194,7 +200,7 @@ sending heartbeats. In the web UI: **Daemons → Link daemon** generates a token
 and prints the full command:
 
 ```bash
-forge-ctl --server http://127.0.0.1:8080 daemon link \
+forge-ctl daemon link \
   --token fg_... \
   --workspace-root "$HOME/.forge/workspaces"
 ```

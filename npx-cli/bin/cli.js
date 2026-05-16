@@ -14,7 +14,7 @@ const PACKAGE = require("../package.json");
 const REPO = "ForgeAILab/forge";
 const CACHE_ROOT = path.join(os.homedir(), ".forge", "npx");
 const USER_AGENT = `${PACKAGE.name}/${PACKAGE.version}`;
-const DEFAULT_URL = "http://127.0.0.1:8080";
+const SERVER_STATE_FILE = "server.json";
 
 function usage() {
   const version = PACKAGE.version;
@@ -27,11 +27,12 @@ Usage:
 
 Examples:
   npx ${PACKAGE.name} --demo
-  npx ${PACKAGE.name} --no-open
+  npx ${PACKAGE.name} --open
   npx ${PACKAGE.name} ctl project list
 
 Options handled by the bootstrapper:
-  --no-open                 Do not open the web UI after starting forge
+  --open                    Open the web UI after starting forge
+  --no-open                 Accepted for compatibility; opening is off by default
   --release <tag|latest>    Download a specific GitHub release tag
   --version                 Show the npm bootstrapper version
   --help                    Show this help
@@ -58,7 +59,7 @@ function isCtlInvocation(args) {
 function parseArgs(argv) {
   const args = [...argv];
   let command = path.basename(process.argv[1] || "") === "forge-ctl" ? "forge-ctl" : "forge";
-  let openBrowser = command === "forge";
+  let openBrowser = false;
   let release =
     process.env.FORGE_NPX_TAG ||
     (PACKAGE.version === "0.0.0" ? "latest" : `v${PACKAGE.version}`);
@@ -325,7 +326,7 @@ async function ensureRelease(release) {
   return { binaryPath, ctlPath, installDir, tag };
 }
 
-function openBrowserWhenReady(child, url) {
+function openBrowserWhenReady(child, dataDir) {
   const started = Date.now();
   const deadlineMs = 30000;
   let stopped = false;
@@ -336,6 +337,13 @@ function openBrowserWhenReady(child, url) {
 
   const tick = () => {
     if (stopped) return;
+    const url = readServerUrl(dataDir);
+    if (!url) {
+      if (Date.now() - started < deadlineMs) {
+        setTimeout(tick, 500);
+      }
+      return;
+    }
     httpGet(`${url}/healthz`)
       .then(() => {
         openUrl(url);
@@ -348,6 +356,18 @@ function openBrowserWhenReady(child, url) {
   };
 
   setTimeout(tick, 500);
+}
+
+function readServerUrl(dataDir) {
+  try {
+    const state = JSON.parse(
+      fs.readFileSync(path.join(dataDir, SERVER_STATE_FILE), "utf8")
+    );
+    if (typeof state.server_url === "string" && state.server_url.trim()) {
+      return state.server_url.trim().replace(/\/+$/, "");
+    }
+  } catch {}
+  return null;
 }
 
 function httpGet(url) {
@@ -381,6 +401,21 @@ function openUrl(url) {
   } catch {}
 }
 
+function forgeDataDir(env, args) {
+  if (env.FORGE_DATA_DIR) {
+    return path.resolve(env.FORGE_DATA_DIR);
+  }
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--data-dir" && args[i + 1]) {
+      return path.resolve(args[i + 1]);
+    }
+    if (args[i].startsWith("--data-dir=")) {
+      return path.resolve(args[i].slice("--data-dir=".length));
+    }
+  }
+  return path.join(os.homedir(), ".forge");
+}
+
 function runBinary(binary, args, env, openBrowser) {
   const child = childProcess.spawn(binary, args, {
     env,
@@ -388,7 +423,7 @@ function runBinary(binary, args, env, openBrowser) {
   });
 
   if (openBrowser) {
-    openBrowserWhenReady(child, DEFAULT_URL);
+    openBrowserWhenReady(child, forgeDataDir(env, args));
   }
 
   child.on("exit", (code, signal) => {

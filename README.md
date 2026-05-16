@@ -30,7 +30,7 @@ Most coding agents can edit files. Forge helps you **operate them safely**.
 - **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with audit log and cancellation paths.
 - **One isolated git worktree per task** — agents can't step on each other, and you can throw work away without polluting your repo.
 - **Review gates with CI** — define `ci_steps` per task; the review runner blocks merge until they pass.
-- **Local-first by default** — single binary, SQLite, binds to `127.0.0.1:8080`. No accounts, no telemetry, no SaaS.
+- **Local-first by default** — single binary, SQLite, loopback-only server with a persisted local port. No accounts, no telemetry, no SaaS.
 - **BYO agent** — first-class adapters for Claude Code, Codex, Gemini, opencode, and a generic shell executor. Add your own.
 - **Multiple surfaces** — REST API, MCP JSON-RPC, `forge-ctl` CLI, and a React web UI ship in the same binary.
 
@@ -56,12 +56,10 @@ curl -fsSL https://raw.githubusercontent.com/ForgeAILab/forge/main/install.sh | 
 
 # Start the server with seeded demo data if you installed it locally
 forge --demo
-
-# Open the web UI
-open http://localhost:8080
 ```
 
-That's it — you should see a demo project with a labelled task and a fake daemon report. From here:
+Open the `management_url` printed in the server logs. That's it — you should
+see a demo project with a labelled task and a fake daemon report. From here:
 
 - Drive a real task end-to-end → [docs/getting-started.md](docs/getting-started.md)
 - Wire up Claude Code / Codex / Gemini → [docs/getting-started.md#agents](docs/getting-started.md#configuring-agents)

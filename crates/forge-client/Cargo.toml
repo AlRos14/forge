@@ -1,6 +1,6 @@
 [package]
 name = "forge-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [[bin]]
@@ -11,6 +11,7 @@ path = "src/main.rs"
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
 clap = { version = "4", features = ["derive"] }
+config = { path = "../config" }
 executors = { path = "../executors" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["full"] }

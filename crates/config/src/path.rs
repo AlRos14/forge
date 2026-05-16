@@ -11,6 +11,15 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 #[must_use]
+pub fn data_dir_from_env() -> PathBuf {
+    env::var("FORGE_DATA_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_path(&value))
+        .unwrap_or_else(default_data_dir)
+}
+
+#[must_use]
 pub fn default_workspace_root() -> PathBuf {
     env::temp_dir().join("forge").join("worktrees")
 }

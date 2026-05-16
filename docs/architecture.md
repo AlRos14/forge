@@ -235,4 +235,5 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
 - **workspace** — File-based locking via `.forge.lock`. Path validation
   prevents traversal escapes.
 - **config** — `ForgeConfig` with precedence: CLI flags > env vars > config
-  file > defaults. Default bind `127.0.0.1:8080`.
+  file > defaults. Default bind uses loopback with an OS-selected port, then
+  persists the selected port under the Forge data directory.

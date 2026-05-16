@@ -1,12 +1,13 @@
 # forge-ctl
 
 `forge-ctl` is the CLI client for the Forge REST API. The server must be
-running first (default `http://127.0.0.1:8080`).
+running first. By default, `forge-ctl` reads the server URL persisted by the
+last `forge` launch under the Forge data directory.
 
 ## Global flags
 
 ```text
---server <URL>            Forge server URL  (default: http://127.0.0.1:8080)
+--server <URL>            Forge server URL  (default: persisted local server)
 --output <FORMAT>         table | json      (default: table)
 ```
 
@@ -34,7 +35,7 @@ Use `forge-ctl <command> --help` for the full set of flags on each subcommand.
 `forge-ctl login` exchanges your account credentials for a CLI personal access
 token and stores it under the Forge data directory. Later commands, including
 `forge-ctl mcp install`, reuse that stored token automatically for the same
-`--server` URL.
+server URL.
 
 ```bash
 printf '%s\n' "$FORGE_PASSWORD" | forge-ctl login \
@@ -81,7 +82,7 @@ sending heartbeats. In the web UI: **Daemons → Link daemon** generates the
 token and prints the full command:
 
 ```bash
-forge-ctl --server http://127.0.0.1:8080 daemon link \
+forge-ctl daemon link \
   --token fg_... \
   --workspace-root "$HOME/.forge/workspaces"
 ```

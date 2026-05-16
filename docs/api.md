@@ -1,7 +1,8 @@
 # API Reference
 
-All endpoints are under `/api/v1/`. The MCP endpoint is `POST /mcp`. The default
-bind is `127.0.0.1:8080`. **No authentication is required (localhost-only MVP).**
+All endpoints are under `/api/v1/`. The MCP endpoint is `POST /mcp`. By default,
+Forge binds loopback on an OS-selected port, persists it in `~/.forge/server.json`,
+and reuses it on later starts. **No authentication is required (localhost-only MVP).**
 Do not expose Forge to the public internet without an authenticating reverse
 proxy.
 

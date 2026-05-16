@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 No unreleased changes yet.
 
+## [0.1.2] - 2026-05-16
+
+### Changed
+
+- npm bootstrapper no longer opens a browser by default; pass `--open` to opt in.
+- Forge persists the selected local server port so `forge-ctl` can discover the server without a manual `--server` URL.
+
 ## [0.1.1] - 2026-05-16
 
 ### Added

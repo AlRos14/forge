@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
-use config::{ConfigOverrides, ForgeConfig};
-use std::net::{SocketAddr, TcpListener};
+use config::{read_server_state, write_server_state, ConfigOverrides, ForgeConfig, ServerState};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,7 +52,7 @@ async fn main() {
         .bind
         .parse()
         .expect("Failed to parse server bind address");
-    let listener = TcpListener::bind(configured_addr).expect("Failed to bind server listener");
+    let listener = bind_server_listener(&config, configured_addr);
     listener
         .set_nonblocking(true)
         .expect("Failed to make server listener nonblocking");
@@ -63,6 +63,17 @@ async fn main() {
         .expect("Failed to read bound server address");
     let mut effective_config = config.clone();
     effective_config.server.bind = addr.to_string();
+    let server_url = server_url_for_addr(addr);
+    if let Err(error) = write_server_state(
+        &effective_config.forge.data_dir,
+        &ServerState::new(&effective_config.server.bind, &server_url),
+    ) {
+        warn!(
+            %error,
+            data_dir = %effective_config.forge.data_dir.display(),
+            "failed to persist Forge server port"
+        );
+    }
     let web_dist = web_dist_dir();
     if !web_dist.join("index.html").is_file() {
         warn!(
@@ -377,6 +388,56 @@ fn absolute_path(path: PathBuf) -> std::io::Result<PathBuf> {
     }
 }
 
+fn bind_server_listener(config: &ForgeConfig, configured_addr: SocketAddr) -> TcpListener {
+    if configured_addr.port() == 0 {
+        match read_server_state(&config.forge.data_dir) {
+            Ok(Some(state)) => match state.bind.parse::<SocketAddr>() {
+                Ok(addr) if addr.port() != 0 => match TcpListener::bind(addr) {
+                    Ok(listener) => {
+                        info!(bind_addr = %addr, "reusing persisted Forge server port");
+                        return listener;
+                    }
+                    Err(error) => {
+                        warn!(
+                            bind_addr = %addr,
+                            %error,
+                            "persisted Forge server port unavailable; selecting a new port"
+                        );
+                    }
+                },
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        bind_addr = %state.bind,
+                        %error,
+                        "ignoring invalid persisted Forge server bind"
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    data_dir = %config.forge.data_dir.display(),
+                    %error,
+                    "failed to read persisted Forge server port"
+                );
+            }
+        }
+    }
+
+    TcpListener::bind(configured_addr).expect("Failed to bind server listener")
+}
+
+fn server_url_for_addr(addr: SocketAddr) -> String {
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_owned(),
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_owned(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    format!("http://{host}:{}", addr.port())
+}
+
 fn web_dist_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("FORGE_WEB_DIST_DIR") {
         return PathBuf::from(path);
@@ -421,8 +482,8 @@ fn local_url(port: u16, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute_path, web_dist_dir};
-    use std::path::PathBuf;
+    use super::{absolute_path, server_url_for_addr, web_dist_dir};
+    use std::{net::SocketAddr, path::PathBuf};
 
     #[test]
     fn absolute_path_preserves_absolute_paths() {
@@ -455,5 +516,12 @@ mod tests {
         } else {
             std::env::remove_var("FORGE_WEB_DIST_DIR");
         }
+    }
+
+    #[test]
+    fn server_url_uses_loopback_for_unspecified_bind() {
+        let addr: SocketAddr = "0.0.0.0:49152".parse().expect("addr parses");
+
+        assert_eq!(server_url_for_addr(addr), "http://127.0.0.1:49152");
     }
 }
