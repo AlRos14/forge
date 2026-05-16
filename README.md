@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="assets/forge-wordmark.png" alt="Forge" width="420">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/forge-wordmark-transparent.png">
+  <img src="assets/forge-wordmark.png" alt="Forge" width="420">
+</picture>
 
 **The local-first workflow engine for coding agents.**
 
@@ -74,6 +77,10 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 
 ## Core concepts
 
+<picture>
+  <img src="assets/screenshots/board.png" alt="Forge kanban board showing tasks across backlog, todo, in_progress, review, and done columns">
+</picture>
+
 | Concept | What it is |
 |---|---|
 | **Project** | A workspace grouping repos, tasks, agents, and a workflow definition. |
@@ -83,6 +90,17 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 | **Daemon** | The local process that reports installed CLIs and runs executions. |
 | **Worktree** | An isolated git checkout created per task, cleaned up on `done`/`cancelled`. |
 | **Review gate** | The CI steps + optional human approval that block `review → merging`. |
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/screenshots/task-detail.png" alt="Task detail page with status, assignees by role, observability metrics, and lifecycle actions"></td>
+    <td width="50%"><img src="assets/screenshots/daemons.png" alt="Daemon detail showing auto-detected CLIs: codex, claude_code, gemini, opencode, shell"></td>
+  </tr>
+  <tr>
+    <td><sub><em>Task detail — lifecycle, role assignments, CI/review gate, audit log</em></sub></td>
+    <td><sub><em>Daemon — auto-detects installed CLIs on the host (Claude Code, Codex, Gemini, opencode, shell)</em></sub></td>
+  </tr>
+</table>
 
 Deeper dive → [docs/architecture.md](docs/architecture.md).
 
