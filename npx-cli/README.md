@@ -6,9 +6,10 @@ Run Forge from npm without installing a platform binary first:
 npx @forgeailab/forge --demo
 ```
 
-The package downloads the matching Forge GitHub release archive for macOS or
-Linux, verifies it against `SHA256SUMS` when available, caches it under
-`~/.forge/npx`, and starts the `forge` binary with the bundled web UI assets.
+The package downloads the matching Forge GitHub release archive for macOS,
+glibc Linux, or musl Linux, verifies it against `SHA256SUMS` when available,
+caches it under `~/.forge/npx`, and starts the `forge` binary with the bundled
+web UI assets.
 
 Useful commands:
 
@@ -28,5 +29,5 @@ package version. For testing a different release:
 
 ```bash
 npx @forgeailab/forge --release latest
-FORGE_NPX_TAG=v0.1.2 npx @forgeailab/forge
+FORGE_NPX_TAG=v0.1.3 npx @forgeailab/forge
 ```

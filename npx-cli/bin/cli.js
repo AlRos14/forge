@@ -100,24 +100,52 @@ function parseArgs(argv) {
   return { command, openBrowser, passthrough, release };
 }
 
-function platformInfo() {
-  if (process.platform !== "darwin" && process.platform !== "linux") {
+function platformInfo(platform = process.platform, archInput = process.arch) {
+  if (platform !== "darwin" && platform !== "linux") {
     throw new Error(
-      `Unsupported platform ${process.platform}. Forge release archives currently support macOS and Linux.`
+      `Unsupported platform ${platform}. Forge release archives currently support macOS and Linux.`
     );
   }
 
-  let osName = process.platform === "darwin" ? "macos" : "linux";
-  let arch = process.arch;
+  let osName = platform === "darwin" ? "macos" : "linux";
+  let arch = archInput;
   if (arch === "x64") arch = "x86_64";
   if (arch === "arm64") arch = "aarch64";
 
   if (arch !== "x86_64" && arch !== "aarch64") {
-    throw new Error(`Unsupported architecture ${process.arch}`);
+    throw new Error(`Unsupported architecture ${archInput}`);
+  }
+
+  if (platform === "linux" && linuxLibc() === "musl") {
+    osName = "linux-musl";
   }
 
   const artifact = `forge-${arch}-${osName}`;
   return { artifact, archiveName: `${artifact}.tar.gz` };
+}
+
+function linuxLibc() {
+  const override = process.env.FORGE_NPX_LIBC;
+  if (override === "gnu" || override === "musl") {
+    return override;
+  }
+
+  const report = process.report?.getReport?.();
+  if (report?.header?.glibcVersionRuntime) {
+    return "gnu";
+  }
+
+  let output = "";
+  try {
+    output = childProcess.execFileSync("ldd", ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    output = `${error.stdout || ""}\n${error.stderr || ""}`;
+  }
+
+  return /musl/i.test(output) ? "musl" : "gnu";
 }
 
 function request(url, redirects = 0) {
@@ -464,10 +492,14 @@ async function main() {
   runBinary(binary, options.passthrough, env, options.openBrowser);
 }
 
-main().catch((error) => {
-  console.error(`forge npm bootstrap failed: ${error.message}`);
-  if (process.env.FORGE_NPX_DEBUG && error.stack) {
-    console.error(error.stack);
-  }
-  process.exit(1);
-});
+module.exports = { linuxLibc, platformInfo };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`forge npm bootstrap failed: ${error.message}`);
+    if (process.env.FORGE_NPX_DEBUG && error.stack) {
+      console.error(error.stack);
+    }
+    process.exit(1);
+  });
+}

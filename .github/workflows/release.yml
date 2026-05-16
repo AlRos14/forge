@@ -24,15 +24,27 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: forge-x86_64-linux
+            builder: cargo
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: forge-aarch64-linux
+            builder: cargo
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: forge-x86_64-linux-musl
+            builder: cross
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: forge-aarch64-linux-musl
+            builder: cross
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: forge-x86_64-macos
+            builder: cargo
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: forge-aarch64-macos
+            builder: cargo
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -71,6 +83,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -81,14 +99,14 @@ jobs:
           FORGE_SKIP_WEB_BUILD: "1"
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build -p forge-cli --release --target ${{ matrix.target }}
+        run: ${{ matrix.builder }} build -p forge-cli --release --target ${{ matrix.target }}
 
       - name: Build forge-ctl binary
         env:
           FORGE_SKIP_WEB_BUILD: "1"
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build -p forge-client --release --target ${{ matrix.target }}
+        run: ${{ matrix.builder }} build -p forge-client --release --target ${{ matrix.target }}
 
       - name: Package binaries
         run: |

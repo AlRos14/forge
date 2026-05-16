@@ -34,11 +34,31 @@ case "$ARCH" in
     *)             echo "Error: unsupported architecture '$ARCH'" >&2; exit 1 ;;
 esac
 
-ARTIFACT="forge-${ARCH}-${OS}"
+LIBC_SUFFIX=""
+if [ "$OS" = "linux" ]; then
+    LIBC="${FORGE_LIBC:-}"
+    if [ -z "$LIBC" ] && command -v ldd >/dev/null 2>&1; then
+        LDD_OUTPUT="$(ldd --version 2>&1 || true)"
+        if printf '%s' "$LDD_OUTPUT" | grep -qi musl; then
+            LIBC="musl"
+        fi
+    fi
+
+    case "$LIBC" in
+        musl) LIBC_SUFFIX="-musl" ;;
+        gnu|"") ;;
+        *) echo "Error: unsupported FORGE_LIBC '$LIBC' (expected 'gnu' or 'musl')" >&2; exit 1 ;;
+    esac
+fi
+
+ARTIFACT="forge-${ARCH}-${OS}${LIBC_SUFFIX}"
 URL="https://github.com/${REPO}/releases/latest/download/${ARTIFACT}.tar.gz"
 
 echo "    OS:   ${OS}"
 echo "    Arch: ${ARCH}"
+if [ "$OS" = "linux" ]; then
+    echo "    Libc: ${LIBC:-gnu}"
+fi
 echo "    Fetching: ${URL}"
 
 if ! curl -fsSL "$URL" -o "${TMP_DIR}/${ARTIFACT}.tar.gz"; then

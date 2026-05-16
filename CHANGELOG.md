@@ -8,6 +8,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 No unreleased changes yet.
 
+## [0.1.3] - 2026-05-16
+
+### Added
+
+- Linux release artifacts now include musl builds for Alpine and other musl-based environments.
+
 ## [0.1.2] - 2026-05-16
 
 ### Changed

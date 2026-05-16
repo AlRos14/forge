@@ -12,9 +12,9 @@ npx @forgeailab/forge --demo
 ```
 
 The npm package is a small bootstrapper. It downloads the matching Forge GitHub
-release archive, caches it under `~/.forge/npx`, and starts the local server
-with the bundled web UI assets. The browser opens automatically unless you pass
-`--no-open`.
+release archive for macOS, glibc Linux, or musl Linux, caches it under
+`~/.forge/npx`, and starts the local server with the bundled web UI assets. The
+browser does not open automatically; pass `--open` to opt in.
 
 ### Homebrew (macOS / Linux, recommended)
 
@@ -34,9 +34,10 @@ curl -fsSL https://raw.githubusercontent.com/ForgeAILab/forge/main/install.sh | 
 
 Or grab a tarball directly from [Releases](https://github.com/ForgeAILab/forge/releases).
 Archives ship `forge`, `forge-ctl`, and the built web UI assets. The installer puts
-the UI under `/usr/local/share/forge/web/dist`. For a manual install, run `forge`
-from the extracted archive root or set `FORGE_WEB_DIST_DIR` to the extracted
-`web/dist` directory.
+the UI under `/usr/local/share/forge/web/dist` and selects the musl Linux archive
+on musl-based systems such as Alpine. For a manual install, run `forge` from the
+extracted archive root or set `FORGE_WEB_DIST_DIR` to the extracted `web/dist`
+directory.
 
 ### Build from source
 
