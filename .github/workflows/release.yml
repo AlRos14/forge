@@ -78,11 +78,15 @@ jobs:
       - name: Build forge binary
         env:
           FORGE_SKIP_WEB_BUILD: "1"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build -p forge-cli --release --target ${{ matrix.target }}
 
       - name: Build forge-ctl binary
         env:
           FORGE_SKIP_WEB_BUILD: "1"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build -p forge-client --release --target ${{ matrix.target }}
 
       - name: Package binaries
