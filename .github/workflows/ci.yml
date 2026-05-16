@@ -84,3 +84,22 @@ jobs:
 
       - name: Playwright smoke
         run: pnpm run e2e
+
+  npm-bootstrapper:
+    name: npm Bootstrapper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Syntax check
+        run: node --check npx-cli/bin/cli.js
+
+      - name: Pack dry run
+        working-directory: npx-cli
+        run: npm pack --dry-run

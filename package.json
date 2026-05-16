@@ -1,4 +1,8 @@
 {
+	"scripts": {
+		"check:npx-cli": "node --check npx-cli/bin/cli.js",
+		"pack:npx-cli": "cd npx-cli && npm pack --dry-run"
+	},
 	"devDependencies": {
 		"@playwright/test": "^1.59.1"
 	}

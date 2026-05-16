@@ -9,6 +9,7 @@
 
 [![CI](https://github.com/ForgeAILab/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/ForgeAILab/forge/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ForgeAILab/forge?include_prereleases&sort=semver)](https://github.com/ForgeAILab/forge/releases)
+[![npm](https://img.shields.io/npm/v/@forgeailab/forge)](https://www.npmjs.com/package/@forgeailab/forge)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status: public beta](https://img.shields.io/badge/status-public%20beta-orange.svg)](#status)
 
@@ -44,13 +45,16 @@ If you want a chat UI bolted onto your editor, Forge is not for you. Try Cursor,
 ## 5-minute quickstart
 
 ```bash
+# Run instantly through npm (macOS / Linux)
+npx @forgeailab/forge --demo
+
 # Install via Homebrew (macOS / Linux)
 brew install forgeailab/tap/forge
 
 # Or grab the latest release directly
 curl -fsSL https://raw.githubusercontent.com/ForgeAILab/forge/main/install.sh | bash
 
-# Start the server with seeded demo data
+# Start the server with seeded demo data if you installed it locally
 forge --demo
 
 # Open the web UI

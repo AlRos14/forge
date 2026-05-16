@@ -6,7 +6,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Added
+
+- npm bootstrapper package so users can start Forge with `npx @forgeailab/forge`.
 
 ## [0.1.0] - 2026-05-15
 

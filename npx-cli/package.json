@@ -1,0 +1,36 @@
+{
+  "name": "@forgeailab/forge",
+  "version": "0.0.0",
+  "description": "NPX bootstrapper for the Forge local-first coding agent workflow engine",
+  "license": "MIT",
+  "homepage": "https://github.com/ForgeAILab/forge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ForgeAILab/forge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ForgeAILab/forge/issues"
+  },
+  "bin": {
+    "forge": "bin/cli.js",
+    "forge-ctl": "bin/cli.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "agents",
+    "ai",
+    "automation",
+    "coding-agents",
+    "forge",
+    "workflow"
+  ]
+}
