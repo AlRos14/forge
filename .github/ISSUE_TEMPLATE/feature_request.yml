@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest a feature for Forge
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please describe the feature you'd like to see.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What problem does this feature solve? What are you trying to do that you can't do today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe your ideal solution. Include any API ideas, CLI changes, or workflow improvements.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches have you considered?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Forge does this relate to?
+      options:
+        - Server (REST API)
+        - CLI (forge-ctl)
+        - Frontend (web UI)
+        - MCP endpoint
+        - Executor / agent
+        - Database / migrations
+        - Configuration
+        - Other

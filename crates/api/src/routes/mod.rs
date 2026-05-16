@@ -1,0 +1,962 @@
+use std::{collections::HashMap, str::FromStr};
+
+use api_types::{
+    AgentResponse, ConversationMessageResponse, ConversationResponse, DaemonResponse,
+    ExecutionResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
+    ReviewResponse, RuntimeResponse, StateKind, StepResultEntry, StepResultResponse,
+    Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
+    TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
+};
+use db::{
+    Agent, Conversation, ConversationMessage, ConversationMessageRole, ConversationMessageStatus,
+    ConversationStatus, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review,
+    Runtime, SortBy, SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo,
+    TransitionLogRepo, Workspace, WorkspaceRepo,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use services::workflow::engine::WorkflowEngine;
+use services::{
+    plan_artifact::{read_plan_for_workspace, PlanArtifactError},
+    task_diagnostics::{derive_workflow_exception, derive_workflow_health},
+    task_service::action_resolver::resolve_execution_actions,
+};
+use sqlx::Row;
+
+use crate::errors::{ApiError, ApiResult};
+
+pub mod admin;
+pub mod agents;
+pub mod auth;
+pub mod clis;
+pub mod conversations;
+pub mod daemons;
+pub mod events;
+pub mod executions;
+pub mod executor_types;
+pub mod external_links;
+pub mod fs;
+pub mod integrations;
+pub mod mcp_config;
+pub mod members;
+pub mod notifications;
+pub mod oauth;
+pub mod operations;
+pub mod project_agents;
+pub mod projects;
+pub mod repos;
+pub mod reviews;
+pub mod runtimes;
+pub mod settings;
+pub mod tasks;
+pub mod workflow;
+pub mod workflow_templates;
+pub mod workspaces;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListParams {
+    pub cursor: Option<String>,
+    pub limit: Option<i64>,
+    pub include_total: Option<bool>,
+    pub q: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
+    pub status: Option<String>,
+    pub agent_id: Option<String>,
+    pub assignee_type: Option<String>,
+    pub assignee_id: Option<String>,
+    pub include_archived: Option<bool>,
+    pub include_cancelled: Option<bool>,
+    pub task_type: Option<String>,
+    pub priority: Option<i64>,
+    pub capabilities: Option<String>,
+    pub executor_type: Option<String>,
+    pub daemon_id: Option<String>,
+}
+
+pub fn page_request(params: &ListParams) -> ApiResult<PageRequest> {
+    Ok(PageRequest {
+        cursor: params.cursor.clone(),
+        limit: params.limit.unwrap_or(20).clamp(1, 100),
+        include_total: params.include_total.unwrap_or(false),
+        sort_by: parse_sort_by(params.sort_by.as_deref())?,
+        sort_order: parse_sort_order(params.sort_order.as_deref())?,
+    })
+}
+
+pub fn task_page_request(params: &ListParams) -> ApiResult<PageRequest> {
+    if params.sort_by.is_none() {
+        return Ok(PageRequest {
+            cursor: params.cursor.clone(),
+            limit: params.limit.unwrap_or(20).clamp(1, 100),
+            include_total: params.include_total.unwrap_or(false),
+            sort_by: SortBy::BoardPosition,
+            sort_order: SortOrder::Asc,
+        });
+    }
+
+    Ok(PageRequest {
+        cursor: params.cursor.clone(),
+        limit: params.limit.unwrap_or(20).clamp(1, 100),
+        include_total: params.include_total.unwrap_or(false),
+        sort_by: parse_task_sort_by(params.sort_by.as_deref())?,
+        sort_order: parse_sort_order(params.sort_order.as_deref())?,
+    })
+}
+
+pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse<U> {
+    let has_more = page.next_cursor.is_some();
+    PaginatedResponse {
+        items: page.items.into_iter().map(map).collect(),
+        next_cursor: page.next_cursor,
+        has_more,
+        total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
+    }
+}
+
+pub fn project_response(project: Project) -> ProjectResponse {
+    let settings = parse_json_value(project.settings);
+    let default_review_config = settings
+        .get("default_review_config")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    ProjectResponse {
+        id: project.id,
+        name: project.name,
+        settings,
+        default_review_config,
+        primary_repo_id: project.primary_repo_id,
+        owner_id: project.owner_id,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+        workflow_template_name: project.workflow_template_name,
+        paused_at: project.paused_at.clone(),
+        paused: project.paused_at.is_some(),
+    }
+}
+
+pub fn repo_response(repo: Repo) -> RepoResponse {
+    RepoResponse {
+        id: repo.id,
+        project_id: repo.project_id,
+        name: repo.name,
+        local_path: repo.local_path,
+        remote_url: repo.remote_url,
+        default_branch: repo.default_branch,
+        work_mode: repo_work_mode_response(repo.work_mode),
+        pr_provider: None,
+        pr_provider_status: None,
+        created_at: repo.created_at,
+        updated_at: repo.updated_at,
+    }
+}
+
+fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
+    match work_mode {
+        db::WorkMode::DirectMerge => api_types::WorkMode::DirectMerge,
+        db::WorkMode::PullRequest => api_types::WorkMode::PullRequest,
+    }
+}
+
+pub async fn task_response(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
+    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
+    task_response_inner(db, task, true, false, latest_review, latest_execution).await
+}
+
+pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
+    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
+    task_response_inner(db, task, false, false, latest_review, latest_execution).await
+}
+
+pub async fn task_response_with_awaiting_human(
+    db: &db::SqliteDb,
+    task: Task,
+    awaiting_human: bool,
+) -> ApiResult<TaskResponse> {
+    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
+    task_response_inner(
+        db,
+        task,
+        true,
+        awaiting_human,
+        latest_review,
+        latest_execution,
+    )
+    .await
+}
+
+pub(crate) async fn task_response_light_with_latest(
+    db: &db::SqliteDb,
+    task: Task,
+    latest_review: Option<Review>,
+    latest_execution: Option<Execution>,
+) -> ApiResult<TaskResponse> {
+    task_response_inner(db, task, false, false, latest_review, latest_execution).await
+}
+
+async fn latest_diagnostic_rows(
+    db: &db::SqliteDb,
+    task_id: &str,
+) -> std::result::Result<(Option<Review>, Option<Execution>), db::DbError> {
+    let task_ids = [task_id];
+    let mut reviews = db::ReviewRepo::list_latest_reviews_for_tasks(db, &task_ids).await?;
+    let mut executions = db::ExecutionRepo::list_latest_executions_for_tasks(db, &task_ids).await?;
+    Ok((reviews.pop(), executions.pop()))
+}
+
+async fn task_response_inner(
+    db: &db::SqliteDb,
+    task: Task,
+    include_actions: bool,
+    awaiting_human: bool,
+    latest_review: Option<Review>,
+    latest_execution: Option<Execution>,
+) -> ApiResult<TaskResponse> {
+    let task_role_assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
+    let role_assignments = task_role_assignments
+        .iter()
+        .cloned()
+        .map(task_role_assignment_response)
+        .collect();
+
+    let project = ProjectRepo::get_by_id(db, &task.project_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
+    let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+    let mut remaining_retries = HashMap::new();
+    for state in &workflow.states {
+        if state.kind != StateKind::Gate {
+            continue;
+        }
+        let Some(max_rejections) = state
+            .gate_config
+            .as_ref()
+            .and_then(|config| config.max_rejections)
+        else {
+            continue;
+        };
+        let count = TransitionLogRepo::count_gate_rejections(db, &task.id, &state.name).await?;
+        remaining_retries.insert(
+            state.name.clone(),
+            (i64::from(max_rejections) - count).max(0),
+        );
+    }
+    let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
+    let (plan_progress, plan_artifact) = if include_actions {
+        match workspace_model.as_ref() {
+            Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    let workspace = workspace_model.map(workspace_response);
+    let error_annotation = task.error_annotation.as_deref().map(|s| {
+        serde_json::from_str::<TaskAnnotation>(s)
+            .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
+    });
+    let execution_actions = if include_actions {
+        let executions = db::ExecutionRepo::list_by_task(
+            db,
+            &task.id,
+            PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?
+        .items;
+        let blocked_metadata_annotation = blocked_metadata_annotation(&task);
+        let error_blocking_annotation = match error_annotation.as_ref() {
+            Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
+            _ => None,
+        };
+        let blocking_annotation = blocked_metadata_annotation
+            .as_ref()
+            .or(error_blocking_annotation);
+        resolve_execution_actions(&task, &workflow, &executions, blocking_annotation)
+    } else {
+        Vec::new()
+    };
+    let workflow_exception = derive_workflow_exception(
+        &task,
+        &workflow,
+        latest_review.as_ref(),
+        latest_execution.as_ref(),
+        &remaining_retries,
+    );
+    let workflow_health = Some(derive_workflow_health(
+        &task,
+        &workflow,
+        &task_role_assignments,
+        latest_review.as_ref(),
+        latest_execution.as_ref(),
+        awaiting_human,
+        workflow_exception.as_ref(),
+    ));
+    let execution_observability = task_execution_observability(db, &task.id).await?;
+    let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
+
+    Ok(TaskResponse {
+        id: task.id,
+        project_id: task.project_id,
+        repo_id: task.repo_id,
+        parent_task_id: task.parent_task_id.clone(),
+        assignee_type: task.assignee_type,
+        assignee_id: task.assignee_id,
+        title: task.title,
+        description: task.description,
+        task_type: parse_task_type(&task.task_type),
+        status: task.status,
+        awaiting_human,
+        priority: task.priority,
+        board_position: task.board_position,
+        subtask_order: task.subtask_order,
+        role_assignments,
+        remaining_retries,
+        execution_actions,
+        error_annotation,
+        blocked: task
+            .blocked_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        failed: task
+            .failed_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        workflow_health,
+        workflow_exception,
+        execution_observability,
+        task_state_config: task.task_state_config.map(parse_json_value),
+        review_passed_at: task.review_passed_at,
+        archived_at: task.archived_at,
+        workspace,
+        plan_progress,
+        plan_artifact,
+        external_issue_number: external_link.as_ref().map(|link| link.remote_issue_number),
+        external_issue_url: external_link.as_ref().map(|link| link.remote_url.clone()),
+        version: task.version,
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+    })
+}
+
+fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
+    let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
+    let kind = metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("blocked")
+        .to_owned();
+    let reason = metadata
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("Task is blocked")
+        .to_owned();
+    let execution_id = metadata
+        .get("execution_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let recovery_actions = metadata
+        .get("recovery_actions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+
+    Some(TaskBlockingAnnotation {
+        annotation_type: kind,
+        blocking_reason: reason.clone(),
+        blocked_by: Some(
+            metadata
+                .get("blocked_by")
+                .and_then(Value::as_str)
+                .unwrap_or("system")
+                .to_owned(),
+        ),
+        blocked_at: metadata
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        blocked_execution_id: execution_id.clone(),
+        artifact: execution_id.map(|id| api_types::BlockingArtifact {
+            kind: "execution".to_owned(),
+            id: Some(id),
+            log_path: None,
+        }),
+        message: Some(reason),
+        hook: metadata.get("hook").cloned(),
+        recovery_actions,
+    })
+}
+
+async fn task_execution_observability(
+    db: &db::SqliteDb,
+    task_id: &str,
+) -> std::result::Result<api_types::TaskExecutionObservability, db::DbError> {
+    let row = sqlx::query(
+        "WITH task_executions AS (
+             SELECT * FROM execution WHERE task_id = ?
+         ),
+         usage_totals AS (
+             SELECT
+                 COALESCE(SUM(eu.input_tokens), 0) AS total_input_tokens,
+                 COALESCE(SUM(eu.output_tokens), 0) AS total_output_tokens,
+                 COALESCE(SUM(eu.cache_read_tokens), 0) AS total_cache_read_tokens,
+                 COALESCE(SUM(eu.cache_write_tokens), 0) AS total_cache_write_tokens,
+                 SUM(eu.cost_usd) AS total_cost_usd
+             FROM execution_usage eu
+             JOIN task_executions e ON e.id = eu.execution_id
+         )
+         SELECT
+             (SELECT COUNT(*) FROM task_executions) AS execution_count,
+             (SELECT COALESCE(SUM(max(COALESCE(
+                 (CASE
+                     WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
+                     ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
+                  END) - CAST(strftime('%s', created_at) AS INTEGER),
+                 0), 0)), 0)
+              FROM task_executions) AS total_runtime_seconds,
+             (SELECT id FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_execution_id,
+             (SELECT role FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_role,
+             (SELECT created_at FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_started_at,
+             (SELECT max(COALESCE(
+                 CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER),
+                 0), 0)
+              FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_elapsed_seconds,
+             (SELECT id FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_id,
+             (SELECT status FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_status,
+             (SELECT role FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_role,
+             (SELECT created_at FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_started_at,
+             (SELECT stopped_at FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_stopped_at,
+             (SELECT max(COALESCE(
+                 (CASE
+                     WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
+                     ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
+                  END) - CAST(strftime('%s', created_at) AS INTEGER),
+                 0), 0)
+              FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds,
+             usage_totals.total_input_tokens,
+             usage_totals.total_output_tokens,
+             usage_totals.total_cache_read_tokens,
+             usage_totals.total_cache_write_tokens,
+             usage_totals.total_cost_usd
+         FROM usage_totals",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await?;
+
+    let total_input_tokens = row.try_get::<i64, _>("total_input_tokens")?;
+    let total_output_tokens = row.try_get::<i64, _>("total_output_tokens")?;
+    let total_cache_read_tokens = row.try_get::<i64, _>("total_cache_read_tokens")?;
+    let total_cache_write_tokens = row.try_get::<i64, _>("total_cache_write_tokens")?;
+    Ok(api_types::TaskExecutionObservability {
+        execution_count: row.try_get("execution_count")?,
+        active_execution_id: row.try_get("active_execution_id")?,
+        active_role: row.try_get("active_role")?,
+        active_started_at: row.try_get("active_started_at")?,
+        active_elapsed_seconds: row
+            .try_get::<Option<i64>, _>("active_elapsed_seconds")?
+            .map(|value| value as f64),
+        latest_execution_id: row.try_get("latest_execution_id")?,
+        latest_execution_status: row.try_get("latest_execution_status")?,
+        latest_role: row.try_get("latest_role")?,
+        latest_started_at: row.try_get("latest_started_at")?,
+        latest_stopped_at: row.try_get("latest_stopped_at")?,
+        latest_runtime_seconds: row
+            .try_get::<Option<i64>, _>("latest_runtime_seconds")?
+            .map(|value| value as f64),
+        total_runtime_seconds: row.try_get::<i64, _>("total_runtime_seconds")? as f64,
+        total_input_tokens,
+        total_output_tokens,
+        total_cache_read_tokens,
+        total_cache_write_tokens,
+        total_tokens: total_input_tokens
+            + total_output_tokens
+            + total_cache_read_tokens
+            + total_cache_write_tokens,
+        total_cost_usd: row.try_get("total_cost_usd")?,
+    })
+}
+
+fn parse_task_type(task_type: &str) -> TaskType {
+    match task_type {
+        "planning_task" => TaskType::PlanningTask,
+        "sub_task" => TaskType::SubTask,
+        _ => TaskType::Task,
+    }
+}
+
+pub fn task_wire(task: Task, agent_name: Option<String>) -> ApiTask {
+    let task_type = parse_task_type(&task.task_type);
+    let agent_id = if task.assignee_type.as_deref() == Some("agent") {
+        task.assignee_id
+    } else {
+        None
+    };
+    ApiTask {
+        id: task.id,
+        project_id: task.project_id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+        task_type,
+        priority: task.priority.try_into().unwrap_or_else(|_| {
+            if task.priority.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        }),
+        board_position: task.board_position,
+        blocked: task
+            .blocked_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        failed: task
+            .failed_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        agent_id,
+        agent_name,
+        external_issue_number: None,
+        external_issue_url: None,
+        version: task.version,
+        updated_at: task.updated_at,
+    }
+}
+
+pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRoleAssignmentResponse {
+    TaskRoleAssignmentResponse {
+        id: assignment.id,
+        task_id: assignment.task_id,
+        role_name: assignment.role_name,
+        assignee_type: assignment.assignee_type.map(|kind| kind.to_string()),
+        assignee_id: assignment.assignee_id,
+        created_at: assignment.created_at,
+        updated_at: assignment.updated_at,
+    }
+}
+
+pub fn conversation_response(conversation: Conversation) -> ConversationResponse {
+    ConversationResponse {
+        id: conversation.id,
+        project_id: conversation.project_id,
+        agent_id: conversation.agent_id,
+        title: conversation.title,
+        status: match conversation.status {
+            ConversationStatus::Active => api_types::ConversationStatus::Active,
+            ConversationStatus::Archived => api_types::ConversationStatus::Archived,
+        },
+        system_prompt: conversation.system_prompt,
+        message_count: conversation.message_count,
+        last_message_at: conversation.last_message_at,
+        agent_session_id: conversation.agent_session_id,
+        version: conversation.version,
+        created_at: conversation.created_at,
+        updated_at: conversation.updated_at,
+    }
+}
+
+pub fn conversation_message_response(message: ConversationMessage) -> ConversationMessageResponse {
+    ConversationMessageResponse {
+        id: message.id,
+        conversation_id: message.conversation_id,
+        role: match message.role {
+            ConversationMessageRole::User => api_types::ConversationMessageRole::User,
+            ConversationMessageRole::Assistant => api_types::ConversationMessageRole::Assistant,
+            ConversationMessageRole::System => api_types::ConversationMessageRole::System,
+        },
+        content: message.content,
+        status: match message.status {
+            ConversationMessageStatus::Complete => api_types::ConversationMessageStatus::Complete,
+            ConversationMessageStatus::Streaming => api_types::ConversationMessageStatus::Streaming,
+            ConversationMessageStatus::Failed => api_types::ConversationMessageStatus::Failed,
+            ConversationMessageStatus::Cancelled => api_types::ConversationMessageStatus::Cancelled,
+        },
+        model: message.model,
+        token_usage_json: message
+            .token_usage_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok()),
+        duration_ms: message.duration_ms,
+        error: message.error,
+        sequence: message.sequence,
+        created_at: message.created_at,
+        updated_at: message.updated_at,
+    }
+}
+
+pub fn agent_response(
+    agent: Agent,
+    active_task_count: Option<i64>,
+    effective_status: Option<String>,
+    stats: db::AgentExecutionStats,
+) -> AgentResponse {
+    AgentResponse {
+        id: agent.id,
+        name: agent.name,
+        description: agent.description,
+        executor_type: agent.executor_type,
+        model: agent.model,
+        reasoning_effort: agent.reasoning_effort,
+        permission_policy: agent.permission_policy,
+        prompt_template: agent.prompt_template,
+        capabilities: serde_json::from_str(&agent.capabilities_json).unwrap_or_default(),
+        config_json: parse_json_value_or_empty_object(agent.config_json),
+        daemon_id: agent.daemon_id,
+        max_concurrent_tasks: agent.max_concurrent_tasks,
+        status: agent_status_response(agent.status),
+        active_task_count,
+        effective_status,
+        total_runs: stats.total_runs,
+        avg_duration_ms: stats.avg_duration_ms,
+        success_rate: stats.success_rate,
+        is_default: agent.is_default,
+        paused: agent.paused,
+        owner_id: agent.owner_id,
+        visibility: agent.visibility,
+        version: agent.version,
+        created_at: agent.created_at,
+        updated_at: agent.updated_at,
+    }
+}
+
+pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
+    DaemonResponse {
+        id: daemon.id,
+        machine_id: daemon.machine_id,
+        hostname: daemon.hostname,
+        os: daemon.os,
+        arch: daemon.arch,
+        agent_version: daemon.agent_version,
+        status: daemon.status.to_string(),
+        last_report_at: daemon.last_report_at,
+        detected_clis: serde_json::from_str(&daemon.detected_clis_json).unwrap_or(Value::Null),
+        labels: serde_json::from_str(&daemon.labels_json).unwrap_or(Value::Null),
+        owner_id: daemon.owner_id,
+        visibility: daemon.visibility,
+        version: daemon.version,
+        created_at: daemon.created_at,
+        updated_at: daemon.updated_at,
+    }
+}
+
+pub fn runtime_response(runtime: Runtime) -> RuntimeResponse {
+    RuntimeResponse {
+        id: runtime.id,
+        daemon_id: runtime.daemon_id,
+        kind: runtime.kind,
+        workspace_root: runtime.workspace_root,
+        status: runtime.status.to_string(),
+        created_at: runtime.created_at,
+        updated_at: runtime.updated_at,
+    }
+}
+
+pub fn workspace_response(workspace: Workspace) -> WorkspaceResponse {
+    WorkspaceResponse {
+        id: workspace.id,
+        task_id: workspace.task_id,
+        repo_id: workspace.repo_id,
+        worktree_path: workspace.worktree_path,
+        branch: workspace.branch,
+        status: workspace.status.to_string(),
+        before_sha: workspace.before_sha,
+        error: workspace.error,
+        created_at: workspace.created_at,
+        updated_at: workspace.updated_at,
+    }
+}
+
+pub fn execution_response(execution: Execution) -> ExecutionResponse {
+    ExecutionResponse {
+        id: execution.id,
+        task_id: execution.task_id,
+        agent_id: execution.agent_id,
+        role: execution.role,
+        status: execution_status_response(execution.status),
+        parent_execution_id: execution.parent_execution_id,
+        agent_session_id: execution.agent_session_id,
+        prompt: execution.prompt,
+        summary: execution.summary,
+        logs_path: execution.logs_path,
+        before_sha: execution.before_sha,
+        after_sha: execution.after_sha,
+        error: execution.error,
+        stop_reason: execution.stop_reason.map(stop_reason_response),
+        stopped_by: execution.stopped_by,
+        resume_policy: execution.resume_policy.map(resume_policy_response),
+        stopped_at: execution.stopped_at,
+        executor_config_snapshot: execution
+            .executor_config_snapshot_json
+            .map(parse_json_value),
+        workspace_id: execution.workspace_id,
+        plan_progress: None,
+        plan_artifact: None,
+        usage: None,
+        created_at: execution.created_at,
+        updated_at: execution.updated_at,
+    }
+}
+
+pub async fn execution_response_with_plan(
+    db: &db::SqliteDb,
+    execution: Execution,
+) -> ApiResult<ExecutionResponse> {
+    let workspace_id = execution.workspace_id.clone();
+    let mut response = execution_response(execution);
+    if let Some(workspace_id) = workspace_id {
+        let (plan_progress, plan_artifact) = plan_artifact_response(db, &workspace_id).await?;
+        response.plan_progress = plan_progress;
+        response.plan_artifact = plan_artifact;
+    }
+    Ok(response)
+}
+
+async fn plan_artifact_response(
+    db: &db::SqliteDb,
+    workspace_id: &str,
+) -> ApiResult<(
+    Option<api_types::PlanProgressSummary>,
+    Option<api_types::PlanArtifactDetail>,
+)> {
+    match read_plan_for_workspace(db, workspace_id).await {
+        Ok(Some((progress, artifact))) => Ok((Some(progress), Some(artifact))),
+        Ok(None) | Err(PlanArtifactError::WorkspaceNotFound { .. }) => Ok((None, None)),
+        Err(PlanArtifactError::DbError(error)) => Err(ApiError::from(error)),
+        Err(error) => Ok((
+            Some(api_types::PlanProgressSummary {
+                total: 0,
+                completed: 0,
+                remaining: 0,
+                available: false,
+                warnings: vec![error.to_string()],
+            }),
+            None,
+        )),
+    }
+}
+
+pub fn execution_usage_response(usage: db::ExecutionUsage) -> api_types::ExecutionUsageResponse {
+    api_types::ExecutionUsageResponse {
+        id: usage.id,
+        execution_id: usage.execution_id,
+        provider: usage.provider,
+        model: usage.model,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        cost_usd: usage.cost_usd,
+        created_at: usage.created_at,
+    }
+}
+
+pub fn task_usage_summary_response(
+    summary: db::TaskUsageSummary,
+) -> api_types::TaskUsageSummaryResponse {
+    api_types::TaskUsageSummaryResponse {
+        total_input_tokens: summary.total_input_tokens,
+        total_output_tokens: summary.total_output_tokens,
+        total_cache_read_tokens: summary.total_cache_read_tokens,
+        total_cache_write_tokens: summary.total_cache_write_tokens,
+        total_cost_usd: summary.total_cost_usd,
+        execution_count: summary.execution_count,
+    }
+}
+
+pub fn review_response(review: db::Review) -> ReviewResponse {
+    let details = parse_review_details(&review.step_results_json).unwrap_or_default();
+    review_response_with_details(review, details)
+}
+
+pub fn review_response_strict(review: db::Review) -> ApiResult<ReviewResponse> {
+    let details = parse_review_details(&review.step_results_json).map_err(|error| {
+        ApiError::bad_request(format!("invalid review step_results_json: {error}"))
+    })?;
+    Ok(review_response_with_details(review, details))
+}
+
+fn review_response_with_details(review: db::Review, details: ReviewDetails) -> ReviewResponse {
+    let step_results = details.ci_steps.iter().map(step_result_response).collect();
+
+    ReviewResponse {
+        id: review.id,
+        task_id: review.task_id,
+        execution_id: review.execution_id,
+        attempt_number: review.attempt_number,
+        status: review_status_response(review.status),
+        step_results,
+        details,
+        started_at: review.started_at,
+        finished_at: review.finished_at,
+        created_at: review.created_at,
+        updated_at: review.updated_at,
+    }
+}
+
+fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
+    let value = serde_json::from_str::<Value>(value)?;
+    if value.is_array() {
+        return Ok(ReviewDetails {
+            ci_steps: serde_json::from_value(value)?,
+            auditor: None,
+        });
+    }
+    serde_json::from_value(value)
+}
+
+fn step_result_response(step: &StepResultEntry) -> StepResultResponse {
+    StepResultResponse {
+        index: step.index,
+        command: step.command.clone(),
+        exit_code: step.exit_code,
+        stderr_tail: step.stderr_tail.clone(),
+        output_tail: step.output_tail.clone(),
+        started_at: step.started_at.clone(),
+        finished_at: step.finished_at.clone(),
+    }
+}
+
+pub fn serialize_json<T>(value: Option<T>) -> ApiResult<Option<String>>
+where
+    T: Serialize,
+{
+    value
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| ApiError::bad_request(format!("invalid JSON value: {error}")))
+}
+
+pub fn parse_csv<T>(value: Option<&String>, field: &str) -> ApiResult<Vec<T>>
+where
+    T: FromStr,
+    <T as FromStr>::Err: std::fmt::Display,
+{
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .filter(|item| !item.trim().is_empty())
+        .map(|item| {
+            item.trim()
+                .parse()
+                .map_err(|_| ApiError::bad_request(format!("invalid {field}: {item}")))
+        })
+        .collect()
+}
+
+pub fn parse_optional<T>(value: Option<&String>, field: &str) -> ApiResult<Option<T>>
+where
+    T: FromStr,
+    <T as FromStr>::Err: std::fmt::Display,
+{
+    value
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| ApiError::bad_request(format!("invalid {field}: {value}")))
+        })
+        .transpose()
+}
+
+fn parse_json_value(value: impl Into<String>) -> Value {
+    let value = value.into();
+    serde_json::from_str(&value).unwrap_or(Value::String(value))
+}
+
+fn parse_json_value_or_empty_object(value: String) -> Value {
+    serde_json::from_str(&value).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn parse_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
+    match value.unwrap_or("created_at") {
+        "created_at" => Ok(SortBy::CreatedAt),
+        "updated_at" => Ok(SortBy::UpdatedAt),
+        "priority" => Ok(SortBy::Priority),
+        "board_position" => Ok(SortBy::BoardPosition),
+        "id" => Ok(SortBy::Id),
+        value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
+    }
+}
+
+fn parse_task_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
+    match value.unwrap_or("board_position") {
+        "created_at" => Ok(SortBy::CreatedAt),
+        "updated_at" => Ok(SortBy::UpdatedAt),
+        "priority" => Ok(SortBy::Priority),
+        "board_position" => Ok(SortBy::BoardPosition),
+        "title" => Ok(SortBy::Title),
+        "status" => Ok(SortBy::Status),
+        "agent" => Ok(SortBy::Agent),
+        "task_type" => Ok(SortBy::TaskType),
+        "id" => Ok(SortBy::Id),
+        value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
+    }
+}
+
+fn parse_sort_order(value: Option<&str>) -> ApiResult<SortOrder> {
+    match value.unwrap_or("desc") {
+        "asc" => Ok(SortOrder::Asc),
+        "desc" => Ok(SortOrder::Desc),
+        value => Err(ApiError::bad_request(format!(
+            "invalid sort_order: {value}"
+        ))),
+    }
+}
+
+fn review_status_response(value: db::ReviewStatus) -> api_types::ReviewStatus {
+    match value {
+        db::ReviewStatus::Running => api_types::ReviewStatus::Running,
+        db::ReviewStatus::AwaitingHuman => api_types::ReviewStatus::AwaitingHuman,
+        db::ReviewStatus::Passed => api_types::ReviewStatus::Passed,
+        db::ReviewStatus::Failed => api_types::ReviewStatus::Failed,
+        db::ReviewStatus::Cancelled => api_types::ReviewStatus::Cancelled,
+    }
+}
+
+fn stop_reason_response(value: db::StopReason) -> api_types::StopReason {
+    match value {
+        db::StopReason::UserCancelled => api_types::StopReason::UserCancelled,
+        db::StopReason::TaskCancelled => api_types::StopReason::TaskCancelled,
+        db::StopReason::RoleReassigned => api_types::StopReason::RoleReassigned,
+        db::StopReason::GracefulShutdown => api_types::StopReason::GracefulShutdown,
+        db::StopReason::CrashRecovery => api_types::StopReason::CrashRecovery,
+        db::StopReason::AgentTimeout => api_types::StopReason::AgentTimeout,
+        db::StopReason::ExecutionStalled => api_types::StopReason::ExecutionStalled,
+        db::StopReason::ExecutorCancelled => api_types::StopReason::ExecutorCancelled,
+        db::StopReason::ExecutorFailed => api_types::StopReason::ExecutorFailed,
+        db::StopReason::LegacyUnknown => api_types::StopReason::LegacyUnknown,
+    }
+}
+
+fn resume_policy_response(value: db::ResumePolicy) -> api_types::ResumePolicy {
+    match value {
+        db::ResumePolicy::Auto => api_types::ResumePolicy::Auto,
+        db::ResumePolicy::Manual => api_types::ResumePolicy::Manual,
+        db::ResumePolicy::None => api_types::ResumePolicy::None,
+    }
+}
+
+fn agent_status_response(value: db::AgentStatus) -> api_types::AgentStatus {
+    match value {
+        db::AgentStatus::Idle => api_types::AgentStatus::Idle,
+        db::AgentStatus::Busy => api_types::AgentStatus::Busy,
+        db::AgentStatus::Error => api_types::AgentStatus::Error,
+        db::AgentStatus::Offline => api_types::AgentStatus::Offline,
+    }
+}
+
+fn execution_status_response(value: db::ExecutionStatus) -> api_types::ExecutionStatus {
+    match value {
+        db::ExecutionStatus::Running => api_types::ExecutionStatus::Running,
+        db::ExecutionStatus::Completed => api_types::ExecutionStatus::Completed,
+        db::ExecutionStatus::Failed => api_types::ExecutionStatus::Failed,
+        db::ExecutionStatus::Cancelled => api_types::ExecutionStatus::Cancelled,
+    }
+}

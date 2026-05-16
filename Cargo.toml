@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/forge-cli",
+    "crates/forge-client",
+    "crates/forge-daemon",
+    "crates/api",
+    "crates/api-types",
+    "crates/db",
+    "crates/services",
+    "crates/executors",
+    "crates/cli-adapters",
+    "crates/workspace",
+    "crates/git",
+    "crates/review",
+    "crates/events",
+    "crates/mcp-server",
+    "crates/config",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+description = "AI coding agent workflow engine — orchestrate agents through structured task lifecycles"
+homepage = "https://github.com/ForgeAILab/forge"
+repository = "https://github.com/ForgeAILab/forge"
+
+[workspace.dependencies]
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

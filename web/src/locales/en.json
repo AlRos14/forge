@@ -1,0 +1,256 @@
+{
+  "appName": "Forge",
+  "board": "Board",
+  "tasks": "Tasks",
+  "agents": "Agents",
+  "settings": "Settings",
+  "theme": "Theme",
+  "search": "Search",
+  "createTask": "Create Task",
+  "unassigned": "Unassigned",
+  "reconnected": "Reconnected - refreshing data",
+  "common": {
+    "cancel": "Cancel",
+    "create": "Create",
+    "delete": "Delete",
+    "edit": "Edit",
+    "loading": "Loading...",
+    "loadMore": "Load More",
+    "notFound": "Not found",
+    "retry": "Retry",
+    "save": "Save",
+    "selectAgent": "Select agent",
+    "unassigned": "Unassigned"
+  },
+  "projectSwitcher": {
+    "createProject": "Create project",
+    "createFailed": "Failed to create project",
+    "nameRequired": "Project name is required",
+    "projectName": "Project name",
+    "projectNamePlaceholder": "My project",
+    "selectProject": "Select project",
+    "switchProject": "Switch project"
+  },
+  "appShell": {
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
+    "toggleTheme": "Toggle theme",
+    "navigation": {
+      "agents": "Agents",
+      "board": "Board",
+      "chat": "Chat",
+      "daemons": "Daemons",
+      "mcp": "MCP",
+      "operations": "Operations",
+      "profiles": "Profiles",
+      "settings": "Settings",
+      "system": "Settings",
+      "tasks": "Tasks",
+      "project": "Project",
+      "workspace": "Workspace"
+    }
+  },
+  "commandPalette": {
+    "button": "Search",
+    "dialogLabel": "Command palette",
+    "placeholder": "Type a command or search task...",
+    "noResults": "No results",
+    "groups": {
+      "actions": "Actions",
+      "recentTasks": "Recent tasks",
+      "tasks": "Tasks"
+    },
+    "actions": {
+      "createTask": "Create task",
+      "goToAgents": "Go to agents",
+      "goToBoard": "Go to board",
+      "goToSettings": "Go to settings",
+      "goToTasks": "Go to tasks",
+      "toggleTheme": "Toggle theme"
+    }
+  },
+  "board": {
+    "searchPlaceholder": "Search title",
+    "allAgents": "All agents",
+    "minPriority": "Min priority",
+    "maxPriority": "Max priority",
+    "quickCreateTask": "Quick create task",
+    "taskTitle": "Task title",
+    "noTasks": "No tasks yet - create your first task",
+    "createTask": "Create task",
+    "tasksFailed": "Tasks failed to load",
+    "confirmBlockedToProgress": "This will reset review/fix attempt counters. Continue?",
+    "versionConflict": "Version conflict - task was updated",
+    "transitionFailed": "Transition failed",
+    "taskCreationFailed": "Task creation failed",
+    "columns": {
+      "todo": "Todo",
+      "inProgress": "In Progress",
+      "review": "Review",
+      "merging": "Merging",
+      "mergeFailed": "Merge Failed",
+      "blocked": "Blocked",
+      "done": "Done",
+      "cancelled": "Cancelled"
+    },
+    "taskMenu": {
+      "assignAgent": "Assign Agent",
+      "cancel": "Cancel",
+      "viewDetail": "View Detail"
+    },
+    "taskTypes": {
+      "task": "task",
+      "planningTask": "planning_task",
+      "subTask": "sub_task"
+    }
+  },
+  "taskCreateDialog": {
+    "title": "Create Task",
+    "fields": {
+      "description": "Description",
+      "priority": "Priority",
+      "title": "Title",
+      "type": "Type"
+    },
+    "actions": {
+      "cancel": "Cancel",
+      "create": "Create"
+    },
+    "errors": {
+      "creationFailed": "Task creation failed"
+    }
+  },
+  "taskList": {
+    "title": "Tasks",
+    "description": "Review and update project tasks.",
+    "empty": "No tasks yet - create your first task",
+    "tasksFailed": "Tasks failed to load",
+    "selected": "{{count}} selected",
+    "cancelSelected": "Cancel selected",
+    "assignAgent": "Assign agent",
+    "selectAllVisible": "Select all visible tasks",
+    "selectTask": "Select {{title}}",
+    "agentAssignmentFailed": "Agent assignment failed",
+    "taskCancellationFailed": "Task cancellation failed",
+    "columns": {
+      "agent": "Agent",
+      "priority": "Priority",
+      "status": "Status",
+      "title": "Title",
+      "type": "Type",
+      "updatedAt": "Updated At"
+    },
+    "sort": {
+      "ascending": "up",
+      "descending": "down"
+    }
+  },
+  "router": {
+    "loading": "Loading...",
+    "notFound": "Not found",
+    "taskNotFound": "Task not found",
+    "taskFailed": "Task failed to load",
+    "statusTransition": "Status transition",
+    "moveStatus": "Move status",
+    "agent": "Agent",
+    "priority": "Priority",
+    "created": "Created",
+    "updated": "Updated",
+    "subTasks": "Sub-tasks",
+    "done": "done",
+    "noSubTasks": "No sub-tasks",
+    "executions": "Executions",
+    "diff": "Diff",
+    "review": "Review",
+    "noExecutions": "No executions",
+    "noDiffAvailable": "No diff available",
+    "followUp": "Follow-up",
+    "followUpNotWired": "Follow-up creation is not wired yet.",
+    "attempt": "Attempt {{count}}",
+    "approve": "Approve",
+    "reject": "Reject",
+    "feedbackRequired": "Feedback is required",
+    "submitReview": "Submit review",
+    "executionLog": "Execution log",
+    "loadEarlierLogs": "Load earlier logs",
+    "resumeScroll": "Resume scroll",
+    "hideInfo": "Hide info",
+    "showInfo": "Show info",
+    "metadata": "Metadata",
+    "pressI": "Press I",
+    "id": "ID",
+    "status": "Status",
+    "role": "Role",
+    "sessionId": "Session ID",
+    "beforeSha": "Before SHA",
+    "afterSha": "After SHA",
+    "started": "Started",
+    "duration": "Duration",
+    "parentExecution": "Parent execution",
+    "executionNotFound": "Execution not found"
+  },
+  "agentsPage": {
+    "title": "Agents",
+    "description": "Register executors and manage capacity.",
+    "registerAgent": "Register Agent",
+    "register": "Register",
+    "editAgent": "Edit Agent",
+    "deleteAgent": "Delete agent",
+    "save": "Save",
+    "empty": "No agents registered - register your first agent",
+    "emptyDescription": "Add an executor before assigning work.",
+    "activeTasks": "Active tasks",
+    "lastHeartbeat": "Last heartbeat",
+    "loadingDetails": "Loading agent details...",
+    "deleteDescription": "Execution history will be preserved and its agent reference will be set to null.",
+    "cannotDeleteActive": "Cannot delete an agent with active tasks",
+    "reloadAndRetry": "Reload and retry",
+    "agentsFailed": "Agents failed to load",
+    "errors": {
+      "registrationFailed": "Agent registration failed",
+      "updateFailed": "Agent update failed",
+      "deletionFailed": "Agent deletion failed"
+    },
+    "fields": {
+      "capabilities": "Capabilities",
+      "capabilitiesPlaceholder": "repo, shell, review",
+      "executorType": "Executor type",
+      "maxConcurrentTasks": "Max concurrent tasks",
+      "name": "Name",
+      "promptTemplate": "Prompt template"
+    }
+  },
+  "projectSettings": {
+    "title": "Project Settings",
+    "project": "Project",
+    "projectName": "Project name",
+    "reviewConfig": "Review config",
+    "mergeConfig": "Merge config",
+    "repos": "Repos",
+    "addRepo": "Add Repo",
+    "editRepo": "Edit Repo",
+    "deleteRepo": "Delete repo",
+    "noRepositories": "No repositories configured",
+    "defaultBranch": "Default branch",
+    "repoDeleteDescription": "Tasks may reference this repository. Confirm the backend accepts this deletion before continuing.",
+    "projectSaved": "Project settings saved",
+    "projectFailed": "Project failed to load",
+    "repositoriesFailed": "Repositories failed to load",
+    "errors": {
+      "jsonObject": "{{label}} must be a JSON object",
+      "invalidJson": "{{label}} is not valid JSON",
+      "projectNameRequired": "Project name is required",
+      "projectUpdateFailed": "Project update failed",
+      "repoNameUrlRequired": "Repository name and URL are required",
+      "repoUpdateFailed": "Repository update failed",
+      "repoCreationFailed": "Repository creation failed",
+      "repoDeletionFailed": "Repository deletion failed",
+      "reloadAndRetry": "Reload and retry"
+    },
+    "fields": {
+      "defaultBranch": "Default branch",
+      "name": "Name",
+      "source": "Source"
+    }
+  }
+}

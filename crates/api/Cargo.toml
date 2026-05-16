@@ -1,0 +1,52 @@
+[package]
+name = "api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = { version = "0.8", features = ["ws"] }
+config = { path = "../config" }
+db = { path = "../db" }
+events = { path = "../events" }
+executors = { path = "../executors" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
+git = { path = "../git" }
+mcp-server = { path = "../mcp-server" }
+rand = "0.8"
+review = { path = "../review" }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+services = { path = "../services" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = { workspace = true }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+workspace = { path = "../workspace" }
+
+[dev-dependencies]
+async-trait = "0.1"
+api-types = { path = "../api-types" }
+cli-adapters = { path = "../cli-adapters" }
+db = { path = "../db" }
+events = { path = "../events" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-tungstenite = "0.24"
+tower = "0.5"
+
+[lints]
+workspace = true

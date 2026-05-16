@@ -1,0 +1,182 @@
+use super::*;
+
+impl TaskService {
+    pub(super) async fn wait_for_agent_active_before_dispatch(
+        &self,
+        execution: &Execution,
+    ) -> Result<Option<db::Execution>> {
+        let Some(agent_id) = execution.agent_id.as_deref() else {
+            return Ok(None);
+        };
+        let deadline = tokio::time::Instant::now() + DISPATCH_STATUS_WAIT_CEILING;
+
+        loop {
+            let current_execution = ExecutionRepo::get_by_id(&*self.db, &execution.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("execution", execution.id.clone()))?;
+            if current_execution.status != ExecutionStatus::Running {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    status = %current_execution.status,
+                    "execution dispatch stopped while waiting for agent"
+                );
+                return Ok(Some(current_execution));
+            }
+
+            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+            let status = compute_effective_status(&self.db, &agent).await?;
+            if status == EffectiveStatus::Active
+                || self
+                    .busy_only_because_current_execution(&status, &agent, execution)
+                    .await?
+            {
+                return Ok(None);
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let message = format!(
+                    "agent {agent_id} did not become active within 600s before dispatch; last effective_status={status}"
+                );
+                return self
+                    .fail_execution_before_dispatch(&execution.id, message)
+                    .await
+                    .map(Some);
+            }
+
+            tracing::debug!(
+                execution_id = %execution.id,
+                %agent_id,
+                effective_status = %status,
+                "waiting to dispatch execution"
+            );
+            // V1 keeps the wait inside the existing execution task instead of adding
+            // a scheduler queue; queued work remains Running and resumes on recovery.
+            tokio::time::sleep(DISPATCH_STATUS_POLL_INTERVAL).await;
+        }
+    }
+
+    pub(super) async fn busy_only_because_current_execution(
+        &self,
+        status: &EffectiveStatus,
+        agent: &Agent,
+        execution: &Execution,
+    ) -> Result<bool> {
+        if *status != EffectiveStatus::Busy {
+            return Ok(false);
+        }
+        let running_count = count_running_executions(&self.db, &agent.id).await?;
+        if running_count <= agent.max_concurrent_tasks {
+            return Ok(true);
+        }
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let role_assignment = match execution.role.as_str() {
+            "executor" | crate::workflow::default_roles::CODER => {
+                self.coder_assignment(&task.id).await?
+            }
+            role => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?,
+        };
+        if !matches!(
+            role_assignment.as_ref(),
+            Some(assignment)
+                if assignment.assignee_type == Some(AssigneeKind::Agent)
+                    && assignment.assignee_id.as_deref() == Some(&agent.id)
+        ) {
+            return Ok(false);
+        }
+        Ok(running_count <= agent.max_concurrent_tasks)
+    }
+
+    pub(super) async fn ensure_no_running_interactive_execution(
+        &self,
+        task_id: &str,
+    ) -> Result<()> {
+        let page = ExecutionRepo::list_by_task(
+            &*self.db,
+            task_id,
+            PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?;
+        if let Some(running) = page.items.into_iter().find(|execution| {
+            execution.role == "interactive" && execution.status == ExecutionStatus::Running
+        }) {
+            return Err(ServiceError::invalid_operation(format!(
+                "interactive execution already running: {}",
+                running.id
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn check_dependency_gate(&self, task: &Task, agent_id: &str) -> Result<()> {
+        let unsatisfied_dependencies =
+            TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &task.id).await?;
+        if unsatisfied_dependencies.is_empty() {
+            return Ok(());
+        }
+
+        for depends_on_id in &unsatisfied_dependencies {
+            let page = ExecutionRepo::list_by_task(
+                &*self.db,
+                depends_on_id,
+                PageRequest {
+                    cursor: None,
+                    limit: 20,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc,
+                },
+            )
+            .await?;
+            let context_holder_match = page.items.into_iter().any(|execution| {
+                execution.role == "executor" && execution.agent_id.as_deref() == Some(agent_id)
+            });
+            if context_holder_match {
+                return Ok(());
+            }
+        }
+
+        Err(ServiceError::DependencyGate)
+    }
+
+    pub async fn fail_execution_before_dispatch(
+        &self,
+        execution_id: &str,
+        error: String,
+    ) -> Result<db::Execution> {
+        let execution = ExecutionRepo::update(
+            &*self.db,
+            db::UpdateExecution {
+                id: execution_id.to_owned(),
+                status: Some(ExecutionStatus::Failed),
+                stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
+                stopped_by: Some(Some("system:dispatch".to_owned())),
+                resume_policy: Some(Some(db::ResumePolicy::Manual)),
+                stopped_at: Some(Some(now_rfc3339())),
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: Some(Some(error)),
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .map_err(ServiceError::from)?;
+        super::publish_terminal_execution_event(self, &execution);
+        Ok(execution)
+    }
+}

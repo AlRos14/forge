@@ -1,0 +1,20 @@
+[package]
+name = "workspace"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+git = { path = "../git" }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "process", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+
+[lints]
+workspace = true

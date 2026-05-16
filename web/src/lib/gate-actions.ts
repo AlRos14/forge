@@ -1,0 +1,140 @@
+import type {
+  StateDefinition,
+  Task,
+  WorkflowDefinition,
+} from '@/types/generated'
+import { getBlockingAnnotation, outgoingWorkflowEdges, type WorkflowEdge } from '@/lib/workflow-utils'
+
+type TaskWithHumanGate = Task & { awaiting_human?: boolean }
+
+export type HumanGateActions = {
+  stateName: string
+  approveLabel: string
+  rejectLabel?: string
+}
+
+export function getHumanGateActions(
+  task: TaskWithHumanGate | undefined,
+  workflow: WorkflowDefinition | undefined,
+): HumanGateActions | null {
+  if (!task || !workflow) return null
+  const blockingAnnotation = getBlockingAnnotation(task)
+  if (
+    task.status === 'blocked' &&
+    blockingAnnotation?.recovery_actions?.includes('retry_hook')
+  ) {
+    return {
+      stateName: task.status,
+      approveLabel:
+        blockingAnnotation.blocking_reason === 'target_repo_dirty'
+          ? 'Resume Merge'
+          : 'Resume Task',
+    }
+  }
+  if (task.blocked || task.failed) return null
+
+  const state = workflow.states.find((candidate) => candidate.name === task.status)
+  if (!state || state.kind !== 'gate') return null
+  if (!isHumanHeldGate(task, state)) return null
+
+  const approveTransition = gateApproveTransition(workflow, state.name)
+  if (!approveTransition) return null
+
+  const rejectTransition = gateRejectTransition(workflow, state.name, approveTransition)
+  const stateLabel = state.display_name || formatStateName(state.name)
+  return {
+    stateName: state.name,
+    approveLabel: actionLabel(state.gate_config?.approve_label, `Approve ${stateLabel}`),
+    rejectLabel: rejectTransition
+      ? actionLabel(state.gate_config?.reject_label, `Reject ${stateLabel}`)
+      : undefined,
+  }
+}
+
+function isHumanHeldGate(task: TaskWithHumanGate, state: StateDefinition): boolean {
+  if (task.awaiting_human) return true
+  if (!state.role) return false
+  return task.role_assignments.some(
+    (assignment) => assignment.role_name === state.role && assignment.assignee_type === 'user',
+  )
+}
+
+function gateApproveTransition(
+  workflow: WorkflowDefinition,
+  stateName: string,
+): WorkflowEdge | undefined {
+  const outgoing = outgoingTransitions(workflow, stateName)
+  return (
+    outgoing.find((transition) => transition.trigger === 'accept') ??
+    outgoing.find(
+      (transition) =>
+        stateKind(workflow, transition.to) === 'active' &&
+        !isRejectionTarget(workflow, transition.to),
+    ) ??
+    outgoing.find((transition) => !isRejectionTarget(workflow, transition.to))
+  )
+}
+
+function gateRejectTransition(
+  workflow: WorkflowDefinition,
+  stateName: string,
+  approveTransition: WorkflowEdge,
+): WorkflowEdge | undefined {
+  const outgoing = outgoingTransitions(workflow, stateName)
+  const rejectTransition = outgoing.find((transition) => transition.trigger === 'reject')
+  if (rejectTransition) return rejectTransition
+
+  const configuredRejectTarget = workflow.states.find(
+    (candidate) => candidate.name === stateName,
+  )?.gate_config?.reject_target
+  if (configuredRejectTarget) {
+    const configuredTransition = outgoing.find(
+      (transition) => transition.to === configuredRejectTarget,
+    )
+    if (configuredTransition) return configuredTransition
+  }
+
+  const activeBounce = outgoing.find(
+    (transition) =>
+      transition.to !== approveTransition.to &&
+      stateKind(workflow, transition.to) === 'active',
+  )
+  if (activeBounce) return activeBounce
+
+  return outgoing.find(
+    (transition) =>
+      transition.to !== approveTransition.to &&
+      isRejectionTarget(workflow, transition.to),
+  )
+}
+
+function outgoingTransitions(workflow: WorkflowDefinition, stateName: string): WorkflowEdge[] {
+  return outgoingWorkflowEdges(workflow, stateName)
+}
+
+function stateKind(workflow: WorkflowDefinition, stateName: string): string | undefined {
+  return workflow.states.find((state) => state.name === stateName)?.kind
+}
+
+function isRejectionTarget(workflow: WorkflowDefinition, stateName: string): boolean {
+  const normalized = stateName.toLowerCase()
+  if (
+    normalized === 'blocked' ||
+    normalized === 'failed' ||
+    normalized.endsWith('_failed') ||
+    normalized.endsWith('-failed')
+  ) {
+    return true
+  }
+  const state = workflow.states.find((candidate) => candidate.name === stateName)
+  return state?.kind === 'custom' && normalized.includes('fail')
+}
+
+function actionLabel(configured: string | null | undefined, fallback: string): string {
+  const trimmed = configured?.trim()
+  return trimmed || fallback
+}
+
+function formatStateName(stateName: string): string {
+  return stateName.replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}

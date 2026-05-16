@@ -1,0 +1,45 @@
+[package]
+name = "services"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+cli-adapters = { path = "../cli-adapters" }
+db = { path = "../db" }
+events = { path = "../events" }
+executors = { path = "../executors" }
+git = { path = "../git" }
+review = { path = "../review" }
+workspace = { path = "../workspace" }
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+bcrypt = "0.17"
+config = { path = "../config" }
+hex = "0.4"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "signal", "sync", "time", "process"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+tracing = { workspace = true }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+which = "*"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+#![forbid(unsafe_code)]
+
+pub mod claude;
+pub mod codex;
+pub mod command;
+pub mod commit;
+pub mod gemini;
+pub mod null;
+pub mod opencode;
+pub mod shell;
+
+pub use claude::ClaudeCodeAdapter;
+pub use codex::CodexAdapter;
+pub use gemini::GeminiAdapter;
+pub use null::NullAdapter;
+pub use opencode::OpencodeAdapter;
+pub use shell::ShellAdapter;
+
+use executors::AdapterRegistry;
+
+/// Build a registry with all built-in adapters.
+pub fn default_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Box::new(ShellAdapter::new()));
+    registry.register(Box::new(CodexAdapter::new()));
+    registry.register(Box::new(ClaudeCodeAdapter::new()));
+    registry.register(Box::new(OpencodeAdapter::new()));
+    registry.register(Box::new(GeminiAdapter::new()));
+    registry
+}

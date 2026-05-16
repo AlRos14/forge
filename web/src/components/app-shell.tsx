@@ -1,0 +1,555 @@
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react'
+import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
+import type { IconWeight } from '@phosphor-icons/react'
+import {
+  List,
+  ChatCircleDots,
+  Robot,
+  Kanban,
+  Gear,
+  Key,
+  Sliders,
+  Sun,
+  Moon,
+  CaretUpDown,
+  Plus,
+  Pause,
+  Pulse,
+  Check,
+  Desktop,
+  SidebarSimple,
+  MagnifyingGlass,
+  SignOut,
+  UserCircle,
+} from '@phosphor-icons/react'
+import { useTranslation } from 'react-i18next'
+import { useCreateProject, useProjectsInfiniteQuery } from '@/api/hooks'
+import { logoutApi } from '@/api/auth'
+import { Avatar } from '@/components/ui/avatar'
+import { CommandPalette } from '@/components/command-palette'
+import { NotificationCenter } from '@/components/notification-center'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { cn } from '@/lib/cn'
+import { useLayoutStore } from '@/stores/layout'
+import { useAuthStore } from '@/stores/auth'
+
+type NavItem = {
+  to: string
+  key: 'board' | 'tasks' | 'chat' | 'agents' | 'daemons' | 'operations' | 'settings' | 'system'
+  icon: ComponentType<{ size?: string | number; weight?: IconWeight }>
+  section: 'project' | 'global'
+}
+
+const navItems: NavItem[] = [
+  { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'project' },
+  { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
+  { to: '/projects/$projectId/chat', key: 'chat', icon: ChatCircleDots, section: 'project' },
+  { to: '/projects/$projectId/settings', key: 'settings', icon: Gear, section: 'project' },
+  { to: '/agents', key: 'agents', icon: Robot, section: 'global' },
+  { to: '/daemons', key: 'daemons', icon: Desktop, section: 'global' },
+  { to: '/operations', key: 'operations', icon: Pulse, section: 'global' },
+  { to: '/settings', key: 'system', icon: Sliders, section: 'global' },
+]
+
+const PROJECTS_PAGE_SIZE = 20
+
+function ProjectSwitcher({
+  projectId,
+  collapsed,
+}: {
+  projectId: string | undefined
+  collapsed: boolean
+}) {
+  const { t } = useTranslation()
+  const navigate = useNavigate()
+  const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
+  const createProject = useCreateProject()
+  const [createOpen, setCreateOpen] = useState(false)
+  const [newName, setNewName] = useState('')
+  const [error, setError] = useState('')
+
+  const projects = projectsQuery.data?.pages.flatMap((page) => page.items) ?? []
+  const currentProject = projects.find((p) => p.id === projectId)
+
+  const fetchNextProjectsPage = () => {
+    if (projectsQuery.hasNextPage && !projectsQuery.isFetchingNextPage) {
+      void projectsQuery.fetchNextPage()
+    }
+  }
+
+  const handleProjectsScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    const target = event.currentTarget
+    if (target.scrollHeight - target.scrollTop - target.clientHeight < 48) {
+      fetchNextProjectsPage()
+    }
+  }
+
+  const renderProjectMenuItems = () => (
+    <div className="max-h-[70vh] overflow-y-auto pr-1" onScroll={handleProjectsScroll}>
+      {projects.map((p) => (
+        <DropdownMenuItem
+          key={p.id}
+          onClick={() => void navigate({ to: '/projects/$projectId/board', params: { projectId: p.id } })}
+        >
+          <Avatar name={p.name} seed={p.id} size="xs" className="mr-2 rounded" />
+          <span className="min-w-0 flex-1 truncate text-left" title={p.name}>
+            {p.name}
+          </span>
+          {p.paused ? (
+            <Pause size={12} className="ml-1 shrink-0 text-muted-foreground" weight="fill" />
+          ) : null}
+          {p.id === projectId && <Check size={14} className="ml-1 shrink-0 text-success" />}
+        </DropdownMenuItem>
+      ))}
+      {projectsQuery.hasNextPage || projectsQuery.isFetchingNextPage ? (
+        <DropdownMenuItem
+          keepOpen
+          disabled={projectsQuery.isFetchingNextPage}
+          className="justify-center text-xs text-muted-foreground"
+          onClick={fetchNextProjectsPage}
+        >
+          {projectsQuery.isFetchingNextPage ? 'Loading...' : 'Load more'}
+        </DropdownMenuItem>
+      ) : null}
+    </div>
+  )
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault()
+    const name = newName.trim()
+    if (!name) {
+      setError(t('projectSwitcher.nameRequired'))
+      return
+    }
+    try {
+      const created = await createProject.mutateAsync({ name })
+      setCreateOpen(false)
+      setNewName('')
+      setError('')
+      void navigate({ to: '/projects/$projectId/board', params: { projectId: created.id } })
+    } catch {
+      setError(t('projectSwitcher.createFailed'))
+    }
+  }
+
+  if (collapsed) {
+    return (
+      <div className="mb-1 flex min-w-0 justify-center px-1">
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            className="flex items-center justify-center rounded-lg transition-opacity hover:opacity-80"
+            aria-label={t('projectSwitcher.switchProject')}
+            title={currentProject?.name ?? t('projectSwitcher.selectProject')}
+          >
+            <Avatar name={currentProject?.name ?? 'P'} seed={projectId ?? 'default'} size="md" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" side="bottom" className="w-52">
+            {renderProjectMenuItems()}
+            {projects.length > 0 && <DropdownMenuSeparator />}
+            <DropdownMenuItem onClick={() => setCreateOpen(true)}>
+              <Plus size={14} className="mr-2" />
+              <span className="flex-1 text-left">{t('projectSwitcher.createProject')}</span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <CreateProjectDialog
+          open={createOpen}
+          onOpenChange={(v) => {
+            setCreateOpen(v)
+            if (!v) {
+              setNewName('')
+              setError('')
+            }
+          }}
+          name={newName}
+          onNameChange={setNewName}
+          error={error}
+          loading={createProject.isPending}
+          onSubmit={handleCreate}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="mb-1 min-w-0 px-2">
+      <DropdownMenu className="block w-full">
+        <DropdownMenuTrigger className="flex w-full min-w-0 items-center gap-2.5 overflow-hidden rounded-lg px-2.5 py-2 text-ui transition-colors hover:bg-sidebar-hover">
+          <Avatar
+            name={currentProject?.name ?? 'P'}
+            seed={projectId ?? 'default'}
+            size="sm"
+            className="shrink-0 rounded-md"
+          />
+          <span
+            className="min-w-0 flex-1 truncate text-left font-medium text-foreground"
+            title={currentProject?.name ?? t('projectSwitcher.selectProject')}
+          >
+            {currentProject?.name ?? t('projectSwitcher.selectProject')}
+          </span>
+          {currentProject?.paused ? (
+            <Pause size={12} className="shrink-0 text-muted-foreground" weight="fill" />
+          ) : null}
+          <CaretUpDown size={14} className="shrink-0 text-muted-foreground" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" side="bottom" className="w-60">
+          {renderProjectMenuItems()}
+          {projects.length > 0 && <DropdownMenuSeparator />}
+          <DropdownMenuItem onClick={() => setCreateOpen(true)}>
+            <Plus size={14} className="mr-2" />
+            <span className="flex-1 text-left">{t('projectSwitcher.createProject')}</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <CreateProjectDialog
+        open={createOpen}
+        onOpenChange={(v) => {
+          setCreateOpen(v)
+          if (!v) {
+            setNewName('')
+            setError('')
+          }
+        }}
+        name={newName}
+        onNameChange={setNewName}
+        error={error}
+        loading={createProject.isPending}
+        onSubmit={handleCreate}
+      />
+    </div>
+  )
+}
+
+function CreateProjectDialog({
+  open,
+  onOpenChange,
+  name,
+  onNameChange,
+  error,
+  loading,
+  onSubmit,
+}: {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  name: string
+  onNameChange: (v: string) => void
+  error: string
+  loading: boolean
+  onSubmit: (e: React.FormEvent) => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <form onSubmit={onSubmit}>
+          <DialogHeader>
+            <DialogTitle>{t('projectSwitcher.createProject')}</DialogTitle>
+          </DialogHeader>
+          <div className="my-4 space-y-2">
+            <Label htmlFor="project-name">{t('projectSwitcher.projectName')}</Label>
+            <Input
+              id="project-name"
+              value={name}
+              onChange={(e) => onNameChange(e.target.value)}
+              placeholder={t('projectSwitcher.projectNamePlaceholder')}
+              autoFocus
+            />
+            {error && <p className="text-sm text-destructive">{error}</p>}
+          </div>
+          <DialogFooter>
+            <button
+              type="button"
+              className="cursor-pointer rounded-md border px-3 py-1.5 text-sm transition-colors hover:bg-accent"
+              onClick={() => onOpenChange(false)}
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="submit"
+              disabled={loading}
+              className="cursor-pointer rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+            >
+              {loading ? t('common.loading') : t('common.create')}
+            </button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function NavSection({
+  label,
+  collapsed,
+  children,
+}: {
+  label: string
+  collapsed: boolean
+  children: ReactNode
+}) {
+  if (collapsed) {
+    return <div className="space-y-0.5 px-1">{children}</div>
+  }
+  return (
+    <div>
+      <p className="mb-1 px-4 font-mono text-micro font-semibold uppercase tracking-[1.2px] text-muted-foreground">
+        {label}
+      </p>
+      <div className="space-y-0.5 px-2">{children}</div>
+    </div>
+  )
+}
+
+function UserMenu() {
+  const navigate = useNavigate()
+  const user = useAuthStore((s) => s.user)
+  const { refreshToken, clearAuth } = useAuthStore()
+
+  async function handleLogout() {
+    if (refreshToken) {
+      try {
+        await logoutApi({ refresh_token: refreshToken })
+      } catch {
+        // Server-side revocation failure is non-fatal; still clear local state
+      }
+    }
+    clearAuth()
+    void navigate({ to: '/login', search: { redirect: undefined } })
+  }
+
+  const label = user?.display_name ?? user?.email ?? 'Account'
+  const initial = label[0]?.toUpperCase() ?? 'U'
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label="User menu"
+        title={label}
+      >
+        {user ? initial : <UserCircle size={18} />}
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-52">
+        {user && (
+          <>
+            <div className="px-3 py-2">
+              {user.display_name && (
+                <p className="truncate text-sm font-medium text-foreground">{user.display_name}</p>
+              )}
+              <p className="truncate text-xs text-muted-foreground">{user.email}</p>
+            </div>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        <DropdownMenuItem onClick={() => void navigate({ to: '/account' })}>
+          <Key size={14} className="mr-2" />
+          Account settings
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={() => void handleLogout()}
+          className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+        >
+          <SignOut size={14} className="mr-2" />
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+export function AppShell({ children }: { children: ReactNode }) {
+  const { t } = useTranslation()
+  const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
+  const sidebarCollapsed = useLayoutStore((s) => s.sidebarCollapsed)
+  const setSidebarCollapsed = useLayoutStore((s) => s.setSidebarCollapsed)
+  const theme = useLayoutStore((s) => s.theme)
+  const setTheme = useLayoutStore((s) => s.setTheme)
+  const params = useRouterState({
+    select: (state) => state.matches.at(-1)?.params as { projectId?: string } | undefined,
+  })
+  const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
+  const storedProjectId = useLayoutStore((s) => s.selectedProjectId)
+  const setSelectedProjectId = useLayoutStore((s) => s.setSelectedProjectId)
+  const routeProjectId = params?.projectId
+  const firstProjectId = projectsQuery.data?.pages[0]?.items[0]?.id
+  const projectId = routeProjectId ?? storedProjectId ?? firstProjectId
+
+  useEffect(() => {
+    if (routeProjectId && routeProjectId !== storedProjectId) {
+      setSelectedProjectId(routeProjectId)
+    }
+  }, [routeProjectId, storedProjectId, setSelectedProjectId])
+
+  const projectNavItems = navItems.filter((item) => item.section === 'project')
+  const globalNavItems = navItems.filter((item) => {
+    if (item.section !== 'global') return false
+    if (item.key === 'daemons' || item.key === 'operations' || item.key === 'system') {
+      return isAdmin
+    }
+    return true
+  })
+
+  const renderNavLink = (item: NavItem) => {
+    const Icon = item.icon
+    const isProjectRoute = item.section === 'project'
+
+    if (isProjectRoute && !projectId) {
+      return (
+        <button
+          key={item.key}
+          className={cn(
+            'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] leading-none text-muted-foreground/50',
+            sidebarCollapsed && 'justify-center px-0',
+          )}
+          disabled
+          type="button"
+        >
+          <Icon size={16} />
+          {!sidebarCollapsed && <span>{t(`appShell.navigation.${item.key}`)}</span>}
+        </button>
+      )
+    }
+
+    const linkProps = isProjectRoute
+      ? { to: item.to, params: { projectId: projectId! } }
+      : { to: item.to }
+
+    return (
+      <Link
+        key={item.key}
+        {...linkProps}
+        className={cn(
+          'group relative flex items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-[13px] leading-none font-medium transition-colors hover:bg-sidebar-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
+          sidebarCollapsed && 'justify-center px-0',
+        )}
+        inactiveProps={{
+          className: 'text-sidebar-foreground',
+        }}
+        activeProps={{
+          className:
+            'bg-[var(--ember-surface)] text-sidebar-active-foreground before:absolute before:left-0 before:top-1/2 before:-translate-y-1/2 before:h-4 before:w-[3px] before:rounded-r-full before:bg-primary',
+        }}
+      >
+        <Icon size={16} />
+        {!sidebarCollapsed && <span>{t(`appShell.navigation.${item.key}`)}</span>}
+      </Link>
+    )
+  }
+
+  return (
+    <div className="flex h-screen bg-background">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:ring-2 focus:ring-ring"
+      >
+        Skip to main content
+      </a>
+
+      {/* Sidebar */}
+      <aside
+        className={cn(
+          'flex flex-col border-r border-sidebar-border bg-sidebar motion-safe:transition-all motion-safe:duration-200',
+          sidebarCollapsed ? 'w-14' : 'w-60',
+        )}
+      >
+        {/* Sidebar header */}
+        <div
+          className={cn(
+            'flex h-14 shrink-0 items-center border-b border-sidebar-border',
+            sidebarCollapsed ? 'justify-center px-1' : 'justify-between px-3',
+          )}
+        >
+          {!sidebarCollapsed && (
+            <div className="flex items-center gap-2">
+              <img src="/logo.png" alt="Forge" className="h-7 w-7 rounded-lg" />
+              <span className="text-sm font-semibold tracking-tight text-foreground">Forge</span>
+            </div>
+          )}
+          <button
+            type="button"
+            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            <SidebarSimple size={16} weight={sidebarCollapsed ? 'regular' : 'fill'} />
+          </button>
+        </div>
+
+        {/* Navigation */}
+        <nav className="flex flex-1 flex-col gap-4 overflow-y-auto py-3">
+          {/* Project switcher */}
+          <ProjectSwitcher projectId={projectId} collapsed={sidebarCollapsed} />
+
+          {/* Project nav */}
+          <NavSection
+            label={t('appShell.navigation.project', 'Project')}
+            collapsed={sidebarCollapsed}
+          >
+            {projectNavItems.map(renderNavLink)}
+          </NavSection>
+
+          {/* Global nav */}
+          <NavSection
+            label={t('appShell.navigation.workspace', 'Workspace')}
+            collapsed={sidebarCollapsed}
+          >
+            {globalNavItems.map(renderNavLink)}
+          </NavSection>
+        </nav>
+      </aside>
+
+      {/* Main content */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Header */}
+        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-sidebar-border bg-background px-5">
+          {projectId ? (
+            <CommandPalette projectId={projectId} />
+          ) : (
+            <button
+              className="flex min-w-[280px] items-center gap-2 rounded-lg border border-input bg-card px-3 py-1.5 text-ui text-muted-foreground opacity-50"
+              disabled
+              type="button"
+            >
+              <MagnifyingGlass size={14} />
+              <span>{t('commandPalette.button')}</span>
+              <kbd className="ml-auto rounded bg-muted px-1.5 py-0.5 font-mono text-micro text-muted-foreground">
+                ⌘K
+              </kbd>
+            </button>
+          )}
+          <div className="flex items-center gap-2">
+            <NotificationCenter projectId={projectId} />
+            <button
+              type="button"
+              className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-input bg-card text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+              aria-label={t('appShell.toggleTheme')}
+            >
+              {theme === 'light' ? <Moon size={15} /> : <Sun size={15} />}
+            </button>
+            <UserMenu />
+          </div>
+        </header>
+        <main id="main-content" className="min-h-0 flex-1 overflow-auto bg-card p-5">{children}</main>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,251 @@
+use crate::{
+    default_data_dir, default_workspace_root, ConfigOverrides, ForgeConfig, DEFAULT_SERVER_BIND,
+    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+};
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
+use tempfile::tempdir;
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[test]
+fn defaults_are_usable_without_a_config_file() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let missing_path = tempdir()
+        .expect("tempdir")
+        .path()
+        .join("missing-forge.yaml");
+    let config = ForgeConfig::load(Some(&missing_path), ConfigOverrides::default())
+        .expect("default config loads");
+
+    assert_eq!(config.server.bind, DEFAULT_SERVER_BIND);
+    assert!(config.server.mcp_enabled);
+    assert_eq!(config.forge.data_dir, default_data_dir());
+    assert_eq!(config.db_path(), default_data_dir().join("forge.db"));
+    assert_eq!(config.workspace.root, default_workspace_root());
+    assert_eq!(
+        config.workspace.cleanup_delay_seconds,
+        DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS
+    );
+}
+
+#[test]
+fn precedence_is_cli_over_env_over_file_over_defaults() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+forge:
+  data_dir: /file/data
+server:
+  bind: 127.0.0.1:9000
+  public_base_url: https://file.example.com/app
+workspace:
+  root: /file/worktrees
+  cleanup_delay_seconds: 10
+agent:
+  max_concurrent_tasks: 2
+  heartbeat_interval_seconds: 15
+  max_missed_heartbeats: 4
+project:
+  default_priority: normal
+"#,
+    )
+    .expect("write config");
+
+    env::set_var("FORGE_SERVER_BIND", "127.0.0.1:9100");
+    env::set_var("FORGE_PUBLIC_BASE_URL", "https://env.example.com/app");
+    env::set_var("FORGE_DATA_DIR", "/env/data");
+    env::set_var("FORGE_WORKSPACE_ROOT", "/env/worktrees");
+    env::set_var("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS", "20");
+    env::set_var("FORGE_AGENT_MAX_CONCURRENT_TASKS", "3");
+    env::set_var("FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS", "25");
+    env::set_var("FORGE_AGENT_MAX_MISSED_HEARTBEATS", "5");
+
+    let config = ForgeConfig::load(
+        Some(&config_path),
+        ConfigOverrides {
+            server_bind: Some("127.0.0.1:9200".to_owned()),
+            server_public_base_url: Some("https://cli.example.com/app".to_owned()),
+            mcp_enabled: None,
+            data_dir: Some(PathBuf::from("/cli/data")),
+            workspace_root: Some(PathBuf::from("/cli/worktrees")),
+            workspace_cleanup_delay_seconds: Some(30),
+            agent_max_concurrent_tasks: Some(4),
+            agent_heartbeat_interval_seconds: Some(35),
+            agent_max_missed_heartbeats: Some(6),
+            ..Default::default()
+        },
+    )
+    .expect("config loads");
+
+    assert_eq!(config.server.bind, "127.0.0.1:9200");
+    assert_eq!(
+        config.server.public_base_url.as_deref(),
+        Some("https://cli.example.com/app")
+    );
+    assert_eq!(config.forge.data_dir, PathBuf::from("/cli/data"));
+    assert_eq!(config.db_path(), PathBuf::from("/cli/data/forge.db"));
+    assert_eq!(config.workspace.root, PathBuf::from("/cli/worktrees"));
+    assert_eq!(config.workspace.cleanup_delay_seconds, 30);
+    assert_eq!(config.agent.max_concurrent_tasks, 4);
+    assert_eq!(config.agent.heartbeat_interval_seconds, 35);
+    assert_eq!(config.agent.max_missed_heartbeats, 6);
+    assert_eq!(
+        config.project.values.get("default_priority"),
+        Some(&"normal".to_owned())
+    );
+
+    clear_forge_env();
+}
+
+#[test]
+fn trusted_origin_uses_bind_when_public_base_url_is_absent() {
+    let mut config = ForgeConfig::default();
+    config.server.bind = "127.0.0.1:8080".to_owned();
+    config.server.public_base_url = None;
+
+    assert_eq!(config.trusted_origin(), "http://127.0.0.1:8080");
+}
+
+#[test]
+fn trusted_origin_strips_public_base_url_path() {
+    let mut config = ForgeConfig::default();
+    config.server.bind = "127.0.0.1:8080".to_owned();
+    config.server.public_base_url = Some("https://forge.example.com/something".to_owned());
+
+    assert_eq!(config.trusted_origin(), "https://forge.example.com");
+}
+
+#[test]
+fn mcp_resource_url_appends_mcp_to_trusted_origin() {
+    let mut config = ForgeConfig::default();
+    config.server.public_base_url = Some("https://forge.example.com/something".to_owned());
+
+    assert_eq!(config.mcp_resource_url(), "https://forge.example.com/mcp");
+}
+
+#[test]
+fn mcp_enabled_defaults_to_true_and_can_be_overridden() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let missing_path = tempdir()
+        .expect("tempdir")
+        .path()
+        .join("missing-forge.yaml");
+    let default_config = ForgeConfig::load(Some(&missing_path), ConfigOverrides::default())
+        .expect("default config loads");
+    assert!(default_config.server.mcp_enabled);
+
+    let overridden = ForgeConfig::load(
+        Some(&missing_path),
+        ConfigOverrides {
+            mcp_enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .expect("config loads with override");
+    assert!(!overridden.server.mcp_enabled);
+}
+
+#[test]
+fn env_overrides_file_when_cli_override_is_absent() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+forge:
+  data_dir: /file/data
+server:
+  public_base_url: https://file.example.com/app
+workspace:
+  root: /file/worktrees
+"#,
+    )
+    .expect("write config");
+
+    env::set_var("FORGE_DATA_DIR", "/env/data");
+    env::set_var("FORGE_PUBLIC_BASE_URL", "https://env.example.com/app");
+    env::set_var("FORGE_WORKSPACE_ROOT", "/env/worktrees");
+
+    let config =
+        ForgeConfig::load(Some(&config_path), ConfigOverrides::default()).expect("config loads");
+
+    assert_eq!(config.forge.data_dir, PathBuf::from("/env/data"));
+    assert_eq!(
+        config.server.public_base_url.as_deref(),
+        Some("https://env.example.com/app")
+    );
+    assert_eq!(config.workspace.root, PathBuf::from("/env/worktrees"));
+
+    clear_forge_env();
+}
+
+#[test]
+fn file_overrides_defaults_when_no_env_or_cli_override_exists() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+forge:
+  data_dir: /file/data
+server:
+  bind: 127.0.0.1:9000
+  public_base_url: https://file.example.com/app
+workspace:
+  root: /file/worktrees
+"#,
+    )
+    .expect("write config");
+
+    let config =
+        ForgeConfig::load(Some(&config_path), ConfigOverrides::default()).expect("config loads");
+
+    assert_eq!(config.server.bind, "127.0.0.1:9000");
+    assert_eq!(
+        config.server.public_base_url.as_deref(),
+        Some("https://file.example.com/app")
+    );
+    assert_eq!(config.forge.data_dir, PathBuf::from("/file/data"));
+    assert_eq!(config.db_path(), PathBuf::from("/file/data/forge.db"));
+    assert_eq!(config.workspace.root, PathBuf::from("/file/worktrees"));
+}
+
+fn clear_forge_env() {
+    for key in [
+        "FORGE_SERVER_BIND",
+        "FORGE_PUBLIC_BASE_URL",
+        "FORGE_DATA_DIR",
+        "FORGE_WORKSPACE_ROOT",
+        "FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS",
+        "FORGE_AGENT_MAX_CONCURRENT_TASKS",
+        "FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
+        "FORGE_AGENT_MAX_MISSED_HEARTBEATS",
+        "FORGE_JWT_SECRET",
+        "FORGE_BCRYPT_COST",
+        "FORGE_CORS_ORIGINS",
+    ] {
+        env::remove_var(key);
+    }
+}

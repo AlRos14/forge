@@ -1,0 +1,169 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Foundry light palette — warm stone base, ember accent */
+  --background: 60 9% 98%;
+  --foreground: 24 10% 10%;
+  --card: 0 0% 100%;
+  --card-foreground: 24 10% 15%;
+  --muted: 30 12% 95%;
+  --muted-foreground: 25 6% 45%;
+  --border: 30 10% 88%;
+  --input: 30 10% 88%;
+  --ring: 25 95% 53%;
+  --primary: 25 95% 53%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 30 12% 95%;
+  --secondary-foreground: 24 10% 15%;
+  --accent: 30 12% 93%;
+  --accent-foreground: 24 10% 15%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 100%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 24 10% 10%;
+
+  /* Extended tokens */
+  --success: 160 84% 39%;
+  --success-foreground: 0 0% 100%;
+  --warning: 38 92% 50%;
+  --warning-foreground: 0 0% 100%;
+
+  /* Sidebar */
+  --sidebar: 0 0% 100%;
+  --sidebar-foreground: 25 6% 45%;
+  --sidebar-border: 30 10% 91%;
+  --sidebar-active: 25 95% 53%;
+  --sidebar-active-foreground: 25 95% 40%;
+  --sidebar-hover: 30 12% 95%;
+
+  /* Subtle border — softer than --border, used for cards/panels */
+  --border-subtle: 30 10% 92%;
+  --surface-hover: 30 8% 93%;
+
+  /* Ember accents */
+  --ember-surface: rgba(234, 88, 12, 0.08);
+  --ember-border: rgba(234, 88, 12, 0.22);
+  --ember-glow: rgba(234, 88, 12, 0.15);
+  --ember-glow-strong: rgba(234, 88, 12, 0.25);
+  --ember-text: 25 95% 40%;
+
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.03);
+  --shadow-soft: 0 1px 3px 0 rgb(0 0 0 / 0.04), 0 1px 2px -1px rgb(0 0 0 / 0.03);
+  --shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.06), 0 1px 2px -1px rgb(0 0 0 / 0.04);
+  --shadow-card-hover: 0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.04);
+  --shadow-float: 0 8px 24px -4px rgb(0 0 0 / 0.12), 0 2px 8px -2px rgb(0 0 0 / 0.06);
+  --shadow-ember: -2px 0 8px rgba(234, 88, 12, 0.25);
+}
+
+.dark {
+  /* Foundry dark palette — charcoal base, ember accent */
+  --background: 20 13% 5%;
+  --foreground: 60 9% 98%;
+  --card: 24 10% 10%;
+  --card-foreground: 60 9% 98%;
+  --muted: 20 9% 15%;
+  --muted-foreground: 24 5% 45%;
+  --border: 18 6% 21%;
+  --input: 18 6% 21%;
+  --ring: 25 95% 53%;
+  --primary: 25 95% 53%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 20 9% 15%;
+  --secondary-foreground: 22 6% 83%;
+  --accent: 20 9% 15%;
+  --accent-foreground: 60 9% 98%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --popover: 24 10% 10%;
+  --popover-foreground: 60 9% 98%;
+
+  --success: 160 84% 39%;
+  --success-foreground: 0 0% 100%;
+  --warning: 38 92% 50%;
+  --warning-foreground: 0 0% 100%;
+
+  /* Sidebar — darkest layer, ember active */
+  --sidebar: 20 13% 4%;
+  --sidebar-foreground: 24 5% 45%;
+  --sidebar-border: 18 6% 16%;
+  --sidebar-active: 25 95% 53%;
+  --sidebar-active-foreground: 31 97% 72%;
+  --sidebar-hover: 20 9% 15%;
+
+  /* Subtle border — softer than --border, used for cards/panels */
+  --border-subtle: 10 7% 15%;
+  --surface-hover: 12 15% 15%;
+
+  /* Ember accents */
+  --ember-surface: rgba(249, 115, 22, 0.08);
+  --ember-border: rgba(249, 115, 22, 0.22);
+  --ember-glow: rgba(249, 115, 22, 0.15);
+  --ember-glow-strong: rgba(249, 115, 22, 0.25);
+  --ember-text: 31 97% 72%;
+
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.22);
+  --shadow-soft: 0 1px 3px 0 rgb(0 0 0 / 0.3), 0 1px 2px -1px rgb(0 0 0 / 0.2);
+  --shadow-card: 0 2px 8px -2px rgb(0 0 0 / 0.4), 0 1px 3px -1px rgb(0 0 0 / 0.3);
+  --shadow-card-hover: 0 4px 16px -4px rgb(0 0 0 / 0.5), 0 2px 6px -2px rgb(0 0 0 / 0.3);
+  --shadow-float: 0 12px 32px -8px rgb(0 0 0 / 0.6), 0 4px 12px -4px rgb(0 0 0 / 0.4);
+  --shadow-ember: -2px 0 8px rgba(249, 115, 22, 0.25);
+}
+
+* {
+  @apply border-border;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  font-family:
+    'Inter',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code,
+pre,
+.font-mono {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.65);
+}
+
+@keyframes pulse-ember {
+  0%,
+  100% {
+    box-shadow: var(--shadow-soft), inset 6px 0 8px -6px rgba(249, 115, 22, 0.3);
+  }
+  50% {
+    box-shadow: var(--shadow-soft), inset 7px 0 10px -6px rgba(249, 115, 22, 0.6);
+  }
+}

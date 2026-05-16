@@ -1,0 +1,369 @@
+use super::*;
+use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
+use api_types::{StateKind, WorkflowDefinition};
+
+impl TaskService {
+    pub async fn claim_task(
+        &self,
+        task_id: impl Into<String>,
+        assignee: Assignee,
+        overrides: Option<ExecutionOverrides>,
+    ) -> Result<ClaimedTask> {
+        let task_id = task_id.into();
+        validate_required("task_id", &task_id)?;
+
+        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        if task.parent_task_id.is_some() {
+            return Err(ServiceError::subtask_managed_by_root(
+                task_id.clone(),
+                task.parent_task_id.clone().unwrap_or_default(),
+            ));
+        }
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if matches!(&assignee, Assignee::Agent(_)) && project.paused_at.is_some() {
+            return Err(ServiceError::ProjectPaused {
+                project_id: project.id,
+            });
+        }
+        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        WorkflowEngine::validate_claimable(&workflow, &task.status)?;
+        let target_status = resolve_claim_target(&workflow, &task.status)?;
+        let target_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == target_status)
+            .and_then(crate::workflow::effective_role)
+            .map(str::to_owned);
+        let capacity_statuses = workflow_capacity_statuses(&workflow);
+        let (assignee_type, agent, assignee_id, max_concurrent_tasks, event_assignee_id) =
+            match assignee {
+                Assignee::Agent(agent_id) => {
+                    validate_required("agent_id", &agent_id)?;
+                    let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+                    if agent.paused {
+                        return Err(ServiceError::AgentPaused {
+                            agent_id: agent.id.clone(),
+                        });
+                    }
+                    let max_concurrent_tasks = agent.max_concurrent_tasks;
+                    (
+                        "agent".to_owned(),
+                        Some(agent),
+                        Some(agent_id.clone()),
+                        max_concurrent_tasks,
+                        agent_id,
+                    )
+                }
+                Assignee::User(user_handle) => {
+                    validate_required("user_handle", &user_handle)?;
+                    (
+                        "user".to_owned(),
+                        None,
+                        Some(user_handle.clone()),
+                        i64::MAX,
+                        user_handle,
+                    )
+                }
+            };
+        if let Some(claiming_agent_id) = agent.as_ref().map(|agent| agent.id.as_str()) {
+            if let Some(role_name) = target_role.as_deref() {
+                self.ensure_claim_role_available(&task.id, role_name, claiming_agent_id)
+                    .await?;
+            }
+        }
+        let previous_status = task.status.clone();
+        let workspace = prepare_workspace(
+            &self.db,
+            &self.workspace_root,
+            &task,
+            &task_id,
+            self.repo_cache_locks.clone(),
+        )
+        .await?;
+        let now = now_rfc3339();
+        let execution_id = new_uuid_v4();
+        let executor_config_snapshot_json = match agent.as_ref() {
+            Some(agent) => {
+                match build_executor_config_snapshot(&self.db, &task, agent, overrides).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        create_failed_execution_record(
+                            &self.db,
+                            &task_id,
+                            agent,
+                            &workspace,
+                            &execution_id,
+                            error.to_string(),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
+        let agent_id = agent.as_ref().map(|agent| agent.id.clone());
+
+        let mut transaction = self.db.pool().begin().await.map_err(DbError::from)?;
+        let claimed = TaskRepo::claim(
+            &*self.db,
+            &mut transaction,
+            ClaimTask {
+                task_id: task_id.clone(),
+                assignee_type,
+                assignee_id,
+                expected_version: task.version,
+                source_status: task.status.clone(),
+                target_status: target_status.clone(),
+                capacity_statuses,
+                execution: CreateExecution {
+                    id: execution_id.clone(),
+                    task_id: task_id.clone(),
+                    agent_id: agent_id.clone(),
+                    role: target_role.clone().unwrap_or_else(|| "executor".to_owned()),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                max_concurrent_tasks,
+                claimed_at: now,
+            },
+        )
+        .await?;
+        transaction.commit().await.map_err(DbError::from)?;
+
+        if let Some(claiming_agent_id) = agent_id.as_deref() {
+            self.assign_claim_state_role(&claimed.task, claiming_agent_id)
+                .await?;
+        }
+
+        self.publish(ForgeEvent {
+            event_type: "task.assigned".to_owned(),
+            entity_id: claimed.task.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskAssigned {
+                project_id: claimed.task.project_id.clone(),
+                agent_id: event_assignee_id,
+                execution_id: execution_id.clone(),
+            },
+        });
+        // Claims move work into a workflow-resolved active state, so subscribers need the same status event as manual transitions.
+        self.publish(ForgeEvent {
+            event_type: "task.status_changed".to_owned(),
+            entity_id: claimed.task.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskStatusChanged {
+                project_id: claimed.task.project_id.clone(),
+                old_status: task.status.to_string(),
+                new_status: claimed.task.status.to_string(),
+            },
+        });
+
+        if agent_id.is_some() {
+            if claimed.task.parent_task_id.is_none() {
+                if let Err(error) = super::execution::subtasks::begin_next_turn(
+                    &self.db,
+                    &self.event_bus,
+                    &self.workspace_root,
+                    &claimed.task.id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        task_id = %claimed.task.id,
+                        %error,
+                        "failed to begin subtask sequence, dispatching normally"
+                    );
+                }
+            }
+            self.dispatch_claim_state_role_agent(
+                &claimed.task,
+                &previous_status,
+                &execution_id,
+                claimed.execution.workspace_id.clone(),
+            )
+            .await;
+        }
+
+        Ok(claimed)
+    }
+
+    async fn dispatch_claim_state_role_agent(
+        &self,
+        task: &Task,
+        previous_status: &str,
+        execution_id: &str,
+        workspace_id: Option<String>,
+    ) {
+        let Ok(Some(project)) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await else {
+            return;
+        };
+        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let Some(state) = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+        else {
+            return;
+        };
+        if !state
+            .hooks
+            .on_enter
+            .iter()
+            .any(|hook| hook.action == "dispatch_role_agent")
+        {
+            return;
+        }
+        let gate_config = state.gate_config.clone();
+        let state_config = state.config.clone();
+
+        let ctx = HookContext {
+            task_id: task.id.clone(),
+            project_id: task.project_id.clone(),
+            from_state: previous_status.to_owned(),
+            to_state: task.status.clone(),
+            db: Arc::clone(&self.db),
+            event_bus: Arc::clone(&self.event_bus),
+            gate_config,
+            workflow: Arc::new(workflow),
+            triggered_by: "agent:claim".to_owned(),
+            review_runner: self.review_runner.clone(),
+            merge_service: self.merge_service.clone(),
+            cleanup_scheduler: self.cleanup_scheduler.clone(),
+            task_executor: self.task_executor.clone(),
+            daemon_connections: self.daemon_connections.clone(),
+            workspace_root: self.workspace_root.clone(),
+            repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_id,
+            agent_id: task.assignee_id.clone(),
+            execution_id: Some(execution_id.to_owned()),
+            state_config,
+        };
+        let _ = DispatchRoleAgent.execute(&ctx).await;
+    }
+
+    async fn assign_claim_state_role(&self, task: &Task, claiming_agent_id: &str) -> Result<()> {
+        let Some(role_name) = self.role_for_state(task, &task.status).await? else {
+            return Ok(());
+        };
+        self.ensure_claim_role_available(&task.id, &role_name, claiming_agent_id)
+            .await?;
+
+        let existing =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &role_name).await?;
+        if existing.is_some() {
+            return Ok(());
+        }
+
+        let now = now_rfc3339();
+        TaskRoleAssignmentRepo::assign(
+            &*self.db,
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name,
+                assignee_type: Some(AssigneeKind::Agent),
+                assignee_id: Some(claiming_agent_id.to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(super) async fn role_for_state(
+        &self,
+        task: &Task,
+        state_name: &str,
+    ) -> Result<Option<String>> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        Ok(workflow
+            .states
+            .iter()
+            .find(|state| state.name == state_name)
+            .and_then(crate::workflow::effective_role)
+            .map(str::to_owned))
+    }
+
+    async fn ensure_claim_role_available(
+        &self,
+        task_id: &str,
+        role_name: &str,
+        claiming_agent_id: &str,
+    ) -> Result<()> {
+        let existing =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
+        if existing.as_ref().is_some_and(|assignment| {
+            assignment.assignee_type != Some(AssigneeKind::Agent)
+                || assignment.assignee_id.as_deref() != Some(claiming_agent_id)
+        }) {
+            return Err(ServiceError::conflict(format!(
+                "role '{role_name}' is assigned to a different agent"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn resolve_claim_target(workflow: &WorkflowDefinition, current_status: &str) -> Result<String> {
+    let source_kind = workflow.state_kind(current_status);
+    let targets = workflow
+        .outgoing_trigger_targets(current_status)
+        .filter(|(trigger, _)| {
+            !trigger.system_only()
+                || matches!(source_kind, Some(StateKind::Initial | StateKind::Custom))
+        })
+        .filter_map(|(_, target_name)| {
+            workflow
+                .states
+                .iter()
+                .find(|target| target.name == target_name)
+                .map(|target| (target.name.clone(), target.kind))
+        })
+        .collect::<Vec<_>>();
+    let target = targets
+        .iter()
+        .find(|(_, kind)| *kind == StateKind::Active)
+        .or_else(|| targets.iter().find(|(_, kind)| *kind == StateKind::Gate))
+        .map(|(name, _)| name.clone());
+
+    target.ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "task in state '{current_status}' has no claimable active transition"
+        ))
+    })
+}
+
+fn workflow_capacity_statuses(workflow: &WorkflowDefinition) -> Vec<String> {
+    workflow
+        .states
+        .iter()
+        .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
+        .map(|state| state.name.clone())
+        .collect()
+}

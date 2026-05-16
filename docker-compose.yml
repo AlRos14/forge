@@ -1,0 +1,13 @@
+services:
+  forge:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - forge-data:/data
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+
+volumes:
+  forge-data:

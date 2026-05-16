@@ -1,0 +1,454 @@
+#![forbid(unsafe_code)]
+
+use clap::Parser;
+use config::{ConfigOverrides, ForgeConfig};
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{error, info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::EnvFilter;
+
+const DEFAULT_LOG_FILTER: &str = "forge=info,forge_cli=info,api=info,services=info,review=info,cli_adapters=info,executors=info,db=warn,tower_http=info,sqlx=warn";
+const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Parser)]
+struct Cli {
+    #[arg(long)]
+    demo: bool,
+    #[arg(long = "no-mcp")]
+    no_mcp: bool,
+    #[arg(long = "no-embedded-daemon")]
+    no_embedded_daemon: bool,
+    /// Override the data directory (database, credentials, workflows).
+    /// Defaults to ~/.forge. Use --data-dir ./test for local testing.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let config = ForgeConfig::load(
+        None,
+        ConfigOverrides {
+            mcp_enabled: if cli.no_mcp { Some(false) } else { None },
+            data_dir: cli.data_dir,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to load config");
+
+    init_tracing(&config.forge.data_dir.join("logs"));
+
+    let configured_addr: SocketAddr = config
+        .server
+        .bind
+        .parse()
+        .expect("Failed to parse server bind address");
+    let listener = TcpListener::bind(configured_addr).expect("Failed to bind server listener");
+    listener
+        .set_nonblocking(true)
+        .expect("Failed to make server listener nonblocking");
+    let listener =
+        tokio::net::TcpListener::from_std(listener).expect("Failed to adopt server listener");
+    let addr = listener
+        .local_addr()
+        .expect("Failed to read bound server address");
+    let mut effective_config = config.clone();
+    effective_config.server.bind = addr.to_string();
+    let web_dist = web_dist_dir();
+    if !web_dist.join("index.html").is_file() {
+        warn!(
+            web_dist = %web_dist.display(),
+            "web UI assets not found; API routes will still run, but browser navigation may return 404"
+        );
+    }
+    let db_path = config.db_path();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).expect("Failed to create data directory");
+    }
+    let database_url = format!("sqlite:{}", db_path.display());
+    let forge_home = db_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let workspace_root = absolute_path(config.workspace.root.clone())
+        .expect("Failed to resolve workspace root path");
+
+    info!(
+        bind_addr = %effective_config.server.bind,
+        management_url = %local_url(addr.port(), "/"),
+        api_base_url = %local_url(addr.port(), "/api/v1"),
+        healthz_url = %local_url(addr.port(), "/healthz"),
+        mcp_enabled = effective_config.server.mcp_enabled,
+        embedded_daemon_enabled = !cli.no_embedded_daemon,
+        demo_mode = cli.demo,
+        data_dir = %effective_config.forge.data_dir.display(),
+        db_path = %db_path.display(),
+        workspace_root = %workspace_root.display(),
+        "initializing forge"
+    );
+
+    // 1. Create database pool and run migrations
+    let pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("Failed to create database pool");
+    db::run_migrations(&pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let event_bus = Arc::new(events::EventBus::with_default_capacity());
+    let mut registry = cli_adapters::default_registry();
+    if cli.demo {
+        registry.register(Box::new(cli_adapters::NullAdapter::new()));
+    }
+    let adapter_registry = Arc::new(registry);
+    let merge_service = Arc::new(services::MergeService::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.clone(),
+    ));
+    let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.clone(),
+    ));
+    let review_runner = Arc::new(review::ReviewRunner::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        Arc::clone(&adapter_registry),
+    ));
+
+    match services::ensure_default_agents(&db, &adapter_registry).await {
+        Ok(agents) => info!(agent_count = agents.len(), "default agents ready"),
+        Err(error) => warn!(%error, "default agent upsert failed"),
+    }
+
+    if cli.demo {
+        if let Err(error) = services::install_demo_data(&db).await {
+            error!(%error, "demo install failed");
+            std::process::exit(1);
+        }
+    }
+
+    let embedded_daemon = if cli.no_embedded_daemon {
+        None
+    } else {
+        Some(Arc::new(
+            services::EmbeddedDaemon::new(
+                Arc::clone(&db),
+                Arc::clone(&event_bus),
+                Arc::clone(&adapter_registry),
+                forge_home,
+                workspace_root.clone(),
+            )
+            .await
+            .expect("embedded daemon init"),
+        ))
+    };
+    let _embedded_handle = embedded_daemon.as_ref().map(|d| Arc::clone(d).start());
+
+    // 2. Run crash recovery
+    let recovery = services::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus));
+    match recovery.run().await {
+        Ok(count) if count > 0 => info!(recovered_count = count, "recovered orphaned tasks"),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "crash recovery failed"),
+    }
+
+    // 4. Start daemon monitor
+    let daemon_monitor = Arc::new(services::DaemonMonitor::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+    ));
+    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
+
+    // Start lifecycle event emitter
+    let mut plugin_registry = services::lifecycle::PluginRegistry::new();
+    plugin_registry.register(Arc::new(
+        services::lifecycle::knowledge_inject::KnowledgeInjectPlugin,
+    ));
+    plugin_registry.register(Arc::new(
+        services::lifecycle::knowledge_capture::KnowledgeCapturePlugin,
+    ));
+    let plugin_registry = Arc::new(plugin_registry);
+    let lifecycle_emitter = services::lifecycle::LifecycleEventEmitter::new(
+        Arc::clone(&db),
+        Arc::clone(&plugin_registry),
+    );
+    let lifecycle_rx = event_bus.subscribe();
+    tokio::spawn(async move { lifecycle_emitter.run(lifecycle_rx).await });
+
+    // 5. Build app state and start server
+    if !effective_config.server.mcp_enabled {
+        info!("mcp endpoint disabled");
+    }
+    let state = api::AppState::with_adapter_registry_services_and_shutdown(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        effective_config.server.mcp_enabled,
+        adapter_registry,
+        merge_service,
+        Arc::clone(&cleanup_scheduler),
+        review_runner,
+        api::state::ShutdownSignal::new(),
+        config.workflows_dir(),
+    )
+    .with_effective_config(effective_config.clone());
+    let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    let task_dispatcher = Arc::new(services::TaskDispatcher::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
+    ));
+    let monitor = Arc::new(
+        services::HeartbeatMonitor::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
+            .with_task_service(Arc::clone(&state.task_service))
+            .with_task_executor(Arc::clone(&state.task_executor)),
+    );
+    let monitor_handle = Arc::clone(&monitor).start();
+    let task_dispatcher_handle = Arc::clone(&task_dispatcher).start();
+    let external_sync = Arc::new(services::ExternalSyncService::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
+    ));
+    let _external_sync_handle = Arc::clone(&external_sync).start();
+    let state = state.with_task_dispatcher(Arc::clone(&task_dispatcher));
+
+    if let Err(error) = state.workflow_template_service.initialize().await {
+        warn!(%error, "workflow template initialization failed");
+    }
+
+    // 6. Install graceful shutdown
+    let shutdown = Arc::new(
+        services::GracefulShutdown::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
+            .with_task_executor(Arc::clone(&state.task_executor)),
+    );
+    let server_shutdown_signal = state.shutdown_signal.clone();
+    let shutdown_clone = Arc::clone(&shutdown);
+    let handler_shutdown_signal = server_shutdown_signal.clone();
+    let shutdown_handle = tokio::spawn(async move {
+        termination_signal().await;
+        info!("shutting down gracefully");
+        handler_shutdown_signal.request();
+        monitor.stop();
+        daemon_monitor.stop();
+        task_dispatcher.stop();
+        external_sync.stop();
+        if let Some(embedded_daemon) = &embedded_daemon {
+            embedded_daemon.stop();
+        }
+        match tokio::time::timeout(Duration::from_secs(10), shutdown_clone.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "graceful shutdown failed"),
+            Err(_) => warn!("graceful shutdown timed out"),
+        }
+    });
+
+    if effective_config.server.mcp_enabled {
+        info!(
+            bind_addr = %effective_config.server.bind,
+            management_url = %local_url(addr.port(), "/"),
+            api_base_url = %local_url(addr.port(), "/api/v1"),
+            healthz_url = %local_url(addr.port(), "/healthz"),
+            mcp_url = %local_url(addr.port(), "/mcp"),
+            workspace_root = %workspace_root.display(),
+            port = addr.port(),
+            "forge server listening"
+        );
+    } else {
+        info!(
+            bind_addr = %effective_config.server.bind,
+            management_url = %local_url(addr.port(), "/"),
+            api_base_url = %local_url(addr.port(), "/api/v1"),
+            healthz_url = %local_url(addr.port(), "/healthz"),
+            workspace_root = %workspace_root.display(),
+            port = addr.port(),
+            "forge server listening"
+        );
+    }
+
+    let api_shutdown_signal = server_shutdown_signal.clone();
+    let mut api_handle = tokio::spawn(api::serve_with_listener(
+        listener,
+        state,
+        web_dist,
+        async move {
+            api_shutdown_signal.wait().await;
+        },
+    ));
+
+    tokio::select! {
+        result = &mut api_handle => {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!(%error, "forge api failed");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    error!(%error, "forge api task failed");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ = server_shutdown_signal.wait() => {
+            match tokio::time::timeout(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT, &mut api_handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    error!(%error, "forge api failed during shutdown");
+                    std::process::exit(1);
+                }
+                Ok(Err(error)) => {
+                    error!(%error, "forge api task failed during shutdown");
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    warn!("forge api graceful shutdown timed out; aborting server task");
+                    api_handle.abort();
+                    match api_handle.await {
+                        Err(error) if error.is_cancelled() => {}
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!(%error, "forge api failed after shutdown abort"),
+                        Err(error) => warn!(%error, "forge api task failed after shutdown abort"),
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = shutdown_handle.await;
+    let _ = cleanup_handle.await;
+    match tokio::time::timeout(Duration::from_secs(5), monitor_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "heartbeat monitor task failed during shutdown"),
+        Err(_) => warn!("heartbeat monitor did not stop before shutdown timeout"),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), task_dispatcher_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "task dispatcher task failed during shutdown"),
+        Err(_) => warn!("task dispatcher did not stop before shutdown timeout"),
+    }
+}
+
+fn init_tracing(log_dir: &std::path::Path) {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+
+    std::fs::create_dir_all(log_dir).expect("Failed to create log directory");
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_suffix("log")
+        .build(log_dir)
+        .expect("Failed to create log file appender");
+    let writer = std::io::stderr.and(file_appender);
+
+    if matches!(
+        std::env::var("FORGE_LOG_FORMAT").as_deref(),
+        Ok("json" | "JSON")
+    ) {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(writer)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(writer)
+            .compact()
+            .init();
+    }
+}
+
+fn absolute_path(path: PathBuf) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn web_dist_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("FORGE_WEB_DIST_DIR") {
+        return PathBuf::from(path);
+    }
+
+    let cwd_dist = PathBuf::from("web/dist");
+    if cwd_dist.join("index.html").is_file() {
+        return cwd_dist;
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(prefix) = exe_path.parent().and_then(Path::parent) {
+            let installed_dist = prefix.join("share/forge/web/dist");
+            if installed_dist.join("index.html").is_file() {
+                return installed_dist;
+            }
+        }
+    }
+
+    cwd_dist
+}
+
+#[cfg(unix)]
+async fn termination_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn termination_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+fn local_url(port: u16, path: &str) -> String {
+    format!("http://127.0.0.1:{port}{path}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absolute_path, web_dist_dir};
+    use std::path::PathBuf;
+
+    #[test]
+    fn absolute_path_preserves_absolute_paths() {
+        let path = if cfg!(windows) {
+            PathBuf::from(r"C:\forge\workspaces")
+        } else {
+            PathBuf::from("/tmp/forge/workspaces")
+        };
+
+        assert_eq!(absolute_path(path.clone()).expect("path resolves"), path);
+    }
+
+    #[test]
+    fn absolute_path_resolves_relative_paths_from_current_dir() {
+        let path = absolute_path(PathBuf::from("test/workspaces")).expect("path resolves");
+
+        assert!(path.is_absolute());
+        assert!(path.ends_with("test/workspaces"));
+    }
+
+    #[test]
+    fn web_dist_dir_honors_env_override() {
+        let previous = std::env::var_os("FORGE_WEB_DIST_DIR");
+        std::env::set_var("FORGE_WEB_DIST_DIR", "/tmp/forge-web-dist");
+
+        assert_eq!(web_dist_dir(), PathBuf::from("/tmp/forge-web-dist"));
+
+        if let Some(previous) = previous {
+            std::env::set_var("FORGE_WEB_DIST_DIR", previous);
+        } else {
+            std::env::remove_var("FORGE_WEB_DIST_DIR");
+        }
+    }
+}

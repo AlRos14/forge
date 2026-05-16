@@ -1,0 +1,546 @@
+#![allow(dead_code, clippy::assertions_on_constants)]
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use api::{build_router, AppState};
+use api_types::{
+    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, ExecutionStatus,
+    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse, TaskStatus,
+};
+use axum::{
+    body::{to_bytes, Body},
+    http::{header, Method, Request, StatusCode},
+    Router,
+};
+use db::ReviewRepo;
+use events::{EventBus, EventContext, ForgeEvent};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn forge_happy_path_end_to_end() {
+    let repo_dir = TestDir::new("forge-happy-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
+
+    let workspaces_root = TestDir::new("forge-happy-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let mut events_rx = harness.event_bus.subscribe();
+
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "Happy Path" }),
+        StatusCode::OK,
+    )
+    .await;
+    let project_id = project.id;
+
+    let repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/repos"),
+        json!({
+            "name": "repo",
+            "local_path": repo_path.to_string_lossy(),
+            "remote_url": repo_path.to_string_lossy(),
+            "default_branch": default_branch
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let _repo_id = repo.id;
+    assert!(repo.local_path.is_some());
+    let expected_local_path = repo_path.canonicalize().expect("canonical repo path");
+    let returned_local_path = repo
+        .local_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .and_then(|path| path.canonicalize().ok());
+    assert_eq!(
+        returned_local_path.as_deref(),
+        Some(expected_local_path.as_path())
+    );
+    assert_eq!(repo.remote_url, repo_path.to_string_lossy().as_ref());
+
+    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let agent: AgentResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({
+            "name": "shell-agent",
+            "executor_type": "shell",
+            "daemon_id": daemon_id,
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(agent.effective_status.as_deref(), Some("active"));
+    let agent_id = agent.id;
+
+    let created_task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Happy path task",
+            "description": "echo hello > greeting.txt && git add . && git commit -m 'hi'",
+            "review_config": { "ci_steps": ["test -f greeting.txt"] }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task_id = created_task.id;
+    assert_eq!(created_task.status, "todo".to_owned());
+    assert_eq!(created_task.version, 1);
+
+    let claimed: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/claim"),
+        json!({ "agent_id": agent_id, "overrides": null }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(claimed.status, "in_progress".to_owned());
+    assert_eq!(claimed.version, 2);
+
+    let execution = single_execution_for_task(&harness.app, &task_id).await;
+    let execution_id = execution.id.clone();
+
+    let worktree_path = workspaces_root.path().join(&task_id).join("repo");
+    let greeting_path = worktree_path.join("greeting.txt");
+    poll_until_workspace_written(&harness.app, &task_id, &greeting_path).await;
+    poll_until_execution_completed(&harness.state.db, &execution_id).await;
+
+    let completed = poll_until_task_status(&harness.app, &task_id, "done".to_owned()).await;
+    assert_eq!(
+        completed.status,
+        "done".to_owned(),
+        "review-pass auto-cascades through merging to done"
+    );
+
+    let latest_subject = run_git(&repo_path, &["log", "-1", "--format=%s"]);
+    assert!(
+        latest_subject.contains("hi") || latest_subject.contains(&task_id),
+        "latest git subject references the task change: {latest_subject}"
+    );
+    assert!(
+        !workspaces_root.path().join(&task_id).exists(),
+        "workspace task directory is cleaned"
+    );
+
+    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+        .await
+        .expect("reviews load");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, db::ReviewStatus::Passed);
+    assert_eq!(reviews[0].attempt_number, 1);
+    let step_results: serde_json::Value =
+        serde_json::from_str(&reviews[0].step_results_json).expect("step results parse");
+    let ci_steps = step_results
+        .get("ci_steps")
+        .cloned()
+        .unwrap_or(step_results.clone());
+    assert_eq!(ci_steps.as_array().expect("step results array").len(), 1);
+    assert_eq!(ci_steps[0]["exit_code"], 0);
+
+    let events = drain_events(&mut events_rx).await;
+    assert_event_type(&events, "task.created");
+    assert_event_type(&events, "task.assigned");
+    assert_status_event(&events, &task_id, "in_progress");
+    assert_event_type(&events, "task.auto_transitioned");
+    assert_event_type(&events, "review.passed");
+    assert_status_event(&events, &task_id, "review");
+    assert_status_event(&events, &task_id, "merging");
+    assert_status_event(&events, &task_id, "done");
+    assert_event_type(&events, "workspace.cleaned");
+}
+
+struct TestHarness {
+    app: Router,
+    state: Arc<AppState>,
+    event_bus: Arc<EventBus>,
+    _web_dist_dir: TestDir,
+}
+
+async fn test_app(workspace_root: &Path) -> TestHarness {
+    let pool = db::create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    db::run_migrations(&pool).await.expect("migrations run");
+
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+        .await
+        .expect("default agents upsert");
+    let event_bus = Arc::new(EventBus::new(256));
+    let merge_service = Arc::new(services::MergeService::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.to_path_buf(),
+    ));
+    let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.to_path_buf(),
+    ));
+    let review_runner = Arc::new(review::ReviewRunner::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        Arc::clone(&adapter_registry),
+    ));
+    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
+        db,
+        Arc::clone(&event_bus),
+        true,
+        adapter_registry,
+        merge_service,
+        cleanup_scheduler,
+        review_runner,
+        api::state::ShutdownSignal::new(),
+        std::env::temp_dir().join("forge-test-workflows"),
+    ));
+
+    let web_dist_dir = TestDir::new("forge-happy-web");
+    std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
+    let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
+
+    TestHarness {
+        app,
+        state,
+        event_bus,
+        _web_dist_dir: web_dist_dir,
+    }
+}
+
+async fn setup_git_repo(path: &Path) -> std::path::PathBuf {
+    let repo_path = path.join("repo");
+    std::fs::create_dir_all(&repo_path).expect("repo dir creates");
+    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
+    run_git(&repo_path, &["config", "user.name", "Forge Test"]);
+    std::fs::write(repo_path.join("README.md"), "# Happy Path\n").expect("README writes");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-m", "initial commit"]);
+    repo_path
+}
+
+async fn register_daemon_and_report_shell(app: &Router, workspace_root: &Path) -> String {
+    let registration: DaemonRegisterResponse = json_request(
+        app,
+        Method::POST,
+        "/api/v1/daemons/register",
+        json!({
+            "machine_id": services::embedded_daemon::embedded_machine_id(),
+            "hostname": "happy-path-host",
+            "os": "linux",
+            "arch": "x86_64",
+            "agent_version": "happy-path-test",
+            "labels": { "suite": "happy_path" }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let daemon_id = registration.daemon_id;
+
+    let _: DaemonResponse = json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!("/api/v1/daemons/{daemon_id}/report"),
+        &registration.registration_token,
+        json!({
+            "detected_clis": [{
+                "kind": "shell",
+                "availability": "authenticated",
+                "path": "/bin/sh"
+            }],
+            "runtimes": [{
+                "kind": "local",
+                "workspace_root": workspace_root.to_string_lossy(),
+                "status": "ready"
+            }]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    daemon_id
+}
+
+async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &str) {
+    for _ in 0..100 {
+        if let Some(execution) = db::ExecutionRepo::get_by_id(&**db, execution_id)
+            .await
+            .expect("execution lookup")
+        {
+            if execution.status == db::ExecutionStatus::Completed {
+                return;
+            }
+            if execution.status != db::ExecutionStatus::Running {
+                panic!(
+                    "execution ended in unexpected status: {:?}",
+                    execution.status
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("execution did not complete within timeout");
+}
+
+async fn poll_until_workspace_written(app: &Router, task_id: &str, greeting_path: &Path) {
+    for _ in 0..100 {
+        if greeting_path.exists() {
+            return;
+        }
+        let execution = single_execution_for_task(app, task_id).await;
+        if execution.status != ExecutionStatus::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        greeting_path.exists(),
+        "greeting.txt was not written before execution stopped"
+    );
+}
+
+async fn poll_until_task_status(
+    app: &Router,
+    task_id: &str,
+    expected_status: TaskStatus,
+) -> TaskResponse {
+    for _ in 0..100 {
+        let task: TaskResponse = empty_request(
+            app,
+            Method::GET,
+            &format!("/api/v1/tasks/{task_id}"),
+            StatusCode::OK,
+        )
+        .await;
+        if task.status == expected_status {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("task did not reach {expected_status:?} within timeout");
+}
+
+async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionResponse {
+    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/executions"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(executions.items.len(), 1);
+    executions.items.into_iter().next().unwrap()
+}
+
+async fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<ForgeEvent>) -> Vec<ForgeEvent> {
+    let mut events = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Ok(event)) => events.push(event),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
+        }
+    }
+    events
+}
+
+fn assert_event_type(events: &[ForgeEvent], event_type: &str) {
+    assert!(
+        events.iter().any(|event| event.event_type == event_type),
+        "missing event {event_type}; got {:?}",
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn assert_status_event(events: &[ForgeEvent], task_id: &str, expected_status: &str) {
+    assert!(
+        events.iter().any(|event| {
+            event.event_type == "task.status_changed"
+                && event.entity_id == task_id
+                && matches!(
+                    &event.context,
+                    EventContext::TaskStatusChanged { new_status, .. }
+                        if new_status == expected_status
+                )
+        }),
+        "missing task.status_changed to {expected_status}"
+    );
+}
+
+async fn json_request<T>(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    expected_status: StatusCode,
+) -> T
+where
+    T: DeserializeOwned,
+{
+    let response = raw_json_request(app, method, uri, body).await;
+    parse_response(response, expected_status).await
+}
+
+async fn json_request_with_bearer<T>(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: Value,
+    expected_status: StatusCode,
+) -> T
+where
+    T: DeserializeOwned,
+{
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .expect("build authorized JSON request"),
+        )
+        .await
+        .expect("router response");
+    parse_response(response, expected_status).await
+}
+
+async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T
+where
+    T: DeserializeOwned,
+{
+    let response = raw_empty_request(app, method, uri).await;
+    parse_response(response, expected_status).await
+}
+
+fn test_jwt() -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = serde_json::json!({
+        "sub": "test-user-id",
+        "email": "test@example.com",
+        "is_admin": true,
+        "iat": now,
+        "exp": now + 900,
+    });
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
+    )
+    .expect("encode test jwt")
+}
+
+async fn raw_json_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .expect("build JSON request"),
+        )
+        .await
+        .expect("router response")
+}
+
+async fn raw_empty_request(app: &Router, method: Method, uri: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
+                .body(Body::empty())
+                .expect("build empty request"),
+        )
+        .await
+        .expect("router response")
+}
+
+async fn parse_response<T>(response: axum::response::Response, expected_status: StatusCode) -> T
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response body");
+    assert_eq!(
+        status,
+        expected_status,
+        "unexpected response status with body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    serde_json::from_slice(&bytes).expect("parse JSON response")
+}
+
+fn run_git(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git command runs");
+    assert!(
+        output.status.success(),
+        "git {} failed\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("temp dir creates");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}

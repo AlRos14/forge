@@ -1,0 +1,26 @@
+[package]
+name = "forge-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+cli-adapters = { path = "../cli-adapters" }
+clap = { version = "4", features = ["derive"] }
+config = { path = "../config" }
+db = { path = "../db" }
+events = { path = "../events" }
+review = { path = "../review" }
+services = { path = "../services" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

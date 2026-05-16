@@ -1,0 +1,23 @@
+[package]
+name = "mcp-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+executors = { path = "../executors" }
+db = { path = "../db" }
+services = { path = "../services" }
+events = { path = "../events" }
+axum = "0.8"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[lints]
+workspace = true

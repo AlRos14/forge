@@ -1,0 +1,31 @@
+[package]
+name = "forge-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "forge-ctl"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+cli-adapters = { path = "../cli-adapters" }
+clap = { version = "4", features = ["derive"] }
+executors = { path = "../executors" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+serde_json = "1"
+anyhow = "1"
+tabled = { path = "tabled", version = "0.17" }
+serde = { version = "1", features = ["derive"] }
+futures-util = "0.3"
+url = "2"
+tracing = { workspace = true }
+which = "7"
+
+[dev-dependencies]
+api = { path = "../api" }
+db = { path = "../db" }
+events = { path = "../events" }
+axum = "0.8"

@@ -1,0 +1,29 @@
+[package]
+name = "forge-daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge-daemon"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+cli-adapters = { path = "../cli-adapters" }
+executors = { path = "../executors" }
+forge-client = { path = "../forge-client" }
+git = { path = "../git" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = "2"
+which = "7"
+
+[lints]
+workspace = true

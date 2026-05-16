@@ -1,0 +1,12 @@
+* @mai1015
+
+/.github/ @mai1015
+/crates/ @mai1015
+/docs/ @mai1015
+/scripts/ @mai1015
+/web/ @mai1015
+
+/Cargo.toml @mai1015
+/Cargo.lock @mai1015
+/Dockerfile @mai1015
+/install.sh @mai1015
