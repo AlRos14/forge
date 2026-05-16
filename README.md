@@ -65,16 +65,6 @@ That's it — you should see a demo project with a labelled task and a fake daem
 
 Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 
-## Demo
-
-<div align="center">
-
-<video src="assets/demo.mp4" controls width="100%" muted autoplay loop playsinline></video>
-
-<sub><em>30s walkthrough — task lifecycle, isolated worktrees, review gate, merge.</em></sub>
-
-</div>
-
 ## Core concepts
 
 <picture>
