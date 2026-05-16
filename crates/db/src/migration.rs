@@ -1,9 +1,14 @@
 use crate::{now_rfc3339, DbError, Result};
+use include_dir::{include_dir, Dir};
 use sqlx::SqlitePool;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
+
+// Embed every migration .sql file into the binary at compile time so a released
+// binary has no filesystem dependency on the source tree.
+static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Migration {
@@ -13,7 +18,33 @@ struct Migration {
 }
 
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
-    run_migrations_from(pool, default_migration_dir()).await
+    ensure_migration_table(pool).await?;
+
+    let mut migrations: Vec<(Migration, String)> = MIGRATIONS_DIR
+        .files()
+        .filter(|file| file.path().extension().and_then(|ext| ext.to_str()) == Some("sql"))
+        .map(|file| {
+            let migration = parse_migration_path(file.path().to_path_buf())?;
+            let sql = file
+                .contents_utf8()
+                .ok_or_else(|| DbError::InvalidMigrationFilename {
+                    path: file.path().to_path_buf(),
+                })?
+                .to_string();
+            Ok::<_, DbError>((migration, sql))
+        })
+        .collect::<Result<_>>()?;
+
+    migrations.sort_by_key(|(migration, _)| migration.version);
+
+    for (migration, sql) in migrations {
+        if is_applied(pool, migration.version).await? {
+            continue;
+        }
+        apply_migration_sql(pool, &migration, &sql).await?;
+    }
+
+    Ok(())
 }
 
 pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Path>) -> Result<()> {
@@ -111,10 +142,13 @@ async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> Result<()>
         path: migration.path.clone(),
         source,
     })?;
+    apply_migration_sql(pool, migration, &sql).await
+}
 
-    if migration_requires_direct_connection(&sql) {
+async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str) -> Result<()> {
+    if migration_requires_direct_connection(sql) {
         let mut connection = pool.acquire().await?;
-        sqlx::raw_sql(&sql).execute(&mut *connection).await?;
+        sqlx::raw_sql(sql).execute(&mut *connection).await?;
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(migration.version)
             .bind(&migration.name)
@@ -124,7 +158,7 @@ async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> Result<()>
     } else {
         let mut transaction = pool.begin().await?;
 
-        sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+        sqlx::raw_sql(sql).execute(&mut *transaction).await?;
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(migration.version)
             .bind(&migration.name)
@@ -143,8 +177,4 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
     // migrations that rebuild referenced tables must run directly on a single
     // connection instead of inside the default transaction wrapper.
     sql.to_ascii_lowercase().contains("pragma foreign_keys")
-}
-
-fn default_migration_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations")
 }
