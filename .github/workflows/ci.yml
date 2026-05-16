@@ -83,4 +83,4 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Playwright smoke
-        run: pnpm run e2e:smoke
+        run: pnpm run e2e

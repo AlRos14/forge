@@ -42,7 +42,7 @@ pnpm lint
 pnpm typecheck
 pnpm test
 pnpm exec playwright install --with-deps chromium
-pnpm run e2e:smoke
+pnpm run e2e
 ```
 
 ## Code Standards

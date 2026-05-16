@@ -44,7 +44,7 @@ pnpm lint           # ESLint, zero warnings allowed
 pnpm typecheck      # tsc --noEmit
 pnpm test           # Vitest unit tests
 pnpm exec playwright install --with-deps chromium
-pnpm run e2e:smoke  # Playwright smoke against a running stack
+pnpm run e2e        # Playwright smoke against a running stack
 ```
 
 ## Layout
