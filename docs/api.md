@@ -2,9 +2,16 @@
 
 All endpoints are under `/api/v1/`. The MCP endpoint is `POST /mcp`. By default,
 Forge binds loopback on an OS-selected port, persists it in `~/.forge/server.json`,
-and reuses it on later starts. **No authentication is required (localhost-only MVP).**
+and reuses it on later starts.
+
+Authentication is required on all non-exempt routes. Requests must carry a
+`Bearer` token — either a session JWT obtained via `POST /api/v1/auth/login`
+or a personal access token (PAT) prefixed `fg_` issued at
+`POST /api/v1/auth/tokens`. MCP clients can additionally use an OAuth 2.1
+access token (see `/.well-known/oauth-authorization-server`). The
+`register`, `login`, `refresh`, and `logout` routes are the only exempt ones.
 Do not expose Forge to the public internet without an authenticating reverse
-proxy.
+proxy in front of it.
 
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).

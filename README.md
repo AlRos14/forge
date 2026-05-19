@@ -5,7 +5,7 @@
   <img src="assets/forge-wordmark.png" alt="Forge" width="420">
 </picture>
 
-**The local-first workflow engine for coding agents.**
+**Make multiple coding agents collaborate on one repo — without stepping on each other.**
 
 [![CI](https://github.com/ForgeAILab/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/ForgeAILab/forge/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ForgeAILab/forge?include_prereleases&sort=semver)](https://github.com/ForgeAILab/forge/releases)
@@ -13,9 +13,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status: public beta](https://img.shields.io/badge/status-public%20beta-orange.svg)](#status)
 
-Run Claude Code, Codex, Gemini, and other agents through a real task lifecycle —
-isolated git worktrees, CI gates, review, merge — driven by a REST API, an
-MCP endpoint, and a built-in web UI. No cloud, no lock-in, MIT licensed.
+Forge gives every task its own isolated git worktree, then runs your CI gate and
+review step before changes touch `main`. Drive Claude Code, Codex, Gemini, opencode,
+and your own shell agents through one local-first task lifecycle — REST API, MCP
+endpoint, CLI, and web UI in a single binary. Self-hosted, MIT, no cloud.
 
 [Quickstart](#5-minute-quickstart) · [Why Forge](#why-forge) · [Docs](docs/) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
@@ -25,22 +26,24 @@ MCP endpoint, and a built-in web UI. No cloud, no lock-in, MIT licensed.
 
 ## Why Forge
 
-Most coding agents can edit files. Forge helps you **operate them safely**.
+Running two coding agents against the same repo is how you lose diffs. Forge fixes
+that: every task runs in its own git worktree, hits your CI gate, and waits for
+review before it merges. **Agents collaborate; they don't collide.**
 
-- **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with audit log and cancellation paths.
-- **One isolated git worktree per task** — agents can't step on each other, and you can throw work away without polluting your repo.
-- **Review gates with CI** — define `ci_steps` per task; the review runner blocks merge until they pass.
-- **Local-first by default** — single binary, SQLite, loopback-only server with a persisted local port. No accounts, no telemetry, no SaaS.
-- **BYO agent** — first-class adapters for Claude Code, Codex, Gemini, opencode, and a generic shell executor. Add your own.
-- **Multiple surfaces** — REST API, MCP JSON-RPC, `forge-ctl` CLI, and a React web UI ship in the same binary.
+- **One isolated git worktree per task** — Claude Code, Codex, and Gemini can each work in parallel without overwriting each other or polluting your main checkout.
+- **Review gate with your CI** — define `ci_steps` per task; the review runner blocks merge until they pass. Human approval is an explicit transition, not an afterthought.
+- **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with an audit log and explicit cancellation paths so handoffs between agents (and humans) are legible.
+- **BYO agent** — first-class adapters for Claude Code, Codex, Gemini, opencode, and a generic shell executor. Add your own with a small adapter.
+- **One binary, every surface** — REST API, MCP JSON-RPC, `forge-ctl` CLI, and a React web UI ship together. Drive Forge from a script, an editor, or a browser.
+- **Local-first by default** — single binary, SQLite, loopback-only server with a persisted local port. No telemetry, no SaaS, your data stays on disk.
 
 ## Who it's for
 
-- **Solo developers** running multiple coding agents in parallel and tired of manually juggling branches and reviews.
+- **Developers already running more than one coding agent** (Claude Code + Codex, Codex + Gemini, …) who keep losing diffs to branch collisions or shared-tree edits.
 - **Small engineering teams** piloting agent workflows who need worktree isolation, audit trails, and a review gate before code lands on `main`.
 - **Builders** who want a local, hackable control plane for AI coding work — not another hosted dashboard.
 
-If you want a chat UI bolted onto your editor, Forge is not for you. Try Cursor, Continue, or Cline instead.
+If you only want a chat UI bolted onto your editor, Forge is not for you. Try Continue or Cline instead.
 
 ## 5-minute quickstart
 
