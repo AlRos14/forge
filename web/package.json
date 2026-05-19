@@ -17,7 +17,7 @@
     "generate:types": "cargo test -p api-types -- --ignored export_typescript"
   },
   "dependencies": {
-    "@codemirror/autocomplete": "^6.20.1",
+    "@codemirror/autocomplete": "^6.20.2",
     "@codemirror/lang-json": "^6.0.2",
     "@codemirror/lang-markdown": "^6.5.0",
     "@codemirror/language": "^6.12.3",
