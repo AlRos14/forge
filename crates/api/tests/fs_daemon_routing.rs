@@ -520,7 +520,9 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
     };
     other_socket
         .send(WsMessage::Text(
-            serde_json::to_string(&terminal).expect("daemon frame serializes"),
+            serde_json::to_string(&terminal)
+                .expect("daemon frame serializes")
+                .into(),
         ))
         .await
         .expect("send forged terminal notification");
@@ -666,7 +668,9 @@ async fn assert_heartbeat_echo(socket: &mut ClientSocket, seq: u64) {
     let heartbeat = DaemonFrame::Heartbeat { seq };
     socket
         .send(WsMessage::Text(
-            serde_json::to_string(&heartbeat).expect("heartbeat serializes"),
+            serde_json::to_string(&heartbeat)
+                .expect("heartbeat serializes")
+                .into(),
         ))
         .await
         .expect("send heartbeat");
