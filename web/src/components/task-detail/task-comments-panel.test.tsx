@@ -4,7 +4,7 @@ import {
   type QueryClient as QueryClientType,
 } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { qk } from '@/api/query-keys'
 import { routeSsePayload } from '@/api/sse'
@@ -13,6 +13,9 @@ import type { Comment, Task, TaskMediaResponse } from '@/types/generated'
 import { TaskCommentsPanel } from './task-comments-panel'
 
 const now = '2026-05-19T12:00:00Z'
+const originalCreateObjectURL = URL.createObjectURL
+const originalRevokeObjectURL = URL.revokeObjectURL
+let objectUrlCounter = 0
 
 const task = {
   id: 'task-1',
@@ -60,12 +63,24 @@ function media(overrides: Partial<TaskMediaResponse>): TaskMediaResponse {
 }
 
 function mockMediaFetch(items: TaskMediaResponse[]) {
-  return vi.spyOn(window, 'fetch').mockResolvedValue(
-    new Response(JSON.stringify({ items, has_more: false }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    }),
-  )
+  return vi.spyOn(window, 'fetch').mockImplementation((input) => {
+    const url =
+      typeof input === 'string' ? input : input instanceof Request ? input.url : input.toString()
+    if (url.includes(`/api/v1/tasks/${task.id}/media`)) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ items, has_more: false }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      )
+    }
+    return Promise.resolve(
+      new Response('media bytes', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      }),
+    )
+  })
 }
 
 function renderPanel(content: string, mediaItems: TaskMediaResponse[] = []) {
@@ -104,8 +119,22 @@ function renderPanel(content: string, mediaItems: TaskMediaResponse[] = []) {
 }
 
 describe('TaskCommentsPanel', () => {
+  beforeEach(() => {
+    objectUrlCounter = 0
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => `blob:forge-media-${++objectUrlCounter}`),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    })
+  })
+
   afterEach(() => {
     vi.restoreAllMocks()
+    restoreUrlObjectMethod('createObjectURL', originalCreateObjectURL)
+    restoreUrlObjectMethod('revokeObjectURL', originalRevokeObjectURL)
   })
 
   it('preserves Markdown rendering for text comments', () => {
@@ -116,7 +145,7 @@ describe('TaskCommentsPanel', () => {
     expect(link.href).toBe('https://example.com/docs')
   })
 
-  it('renders task-owned image previews inline', () => {
+  it('renders task-owned image previews inline', async () => {
     renderPanel('![screenshot.png](/api/v1/media/image-1)', [
       media({
         id: 'image-1',
@@ -126,8 +155,11 @@ describe('TaskCommentsPanel', () => {
       }),
     ])
 
-    const image = screen.getByRole('img', { name: 'screenshot.png' }) as HTMLImageElement
-    expect(image.getAttribute('src')).toBe('/api/v1/media/image-1')
+    const image = (await screen.findByRole('img', {
+      name: 'screenshot.png',
+    })) as HTMLImageElement
+    expect(image.getAttribute('src')).toMatch(/^blob:forge-media-/)
+    expect(image.dataset.mediaUrl).toBe('/api/v1/media/image-1')
     expect(image.className).toContain('max-h-96')
   })
 
@@ -145,7 +177,8 @@ describe('TaskCommentsPanel', () => {
       expect(container.querySelector('video')).not.toBeNull()
     })
     const video = container.querySelector('video') as HTMLVideoElement
-    expect(video.getAttribute('src')).toBe('/api/v1/media/video-1')
+    expect(video.getAttribute('src')).toMatch(/^blob:forge-media-/)
+    expect(video.dataset.mediaUrl).toBe('/api/v1/media/video-1')
     expect(video.controls).toBe(true)
     expect(video.className).toContain('max-h-96')
   })
@@ -203,3 +236,14 @@ describe('TaskCommentsPanel', () => {
     expect(dispatch).not.toHaveBeenCalled()
   })
 })
+
+function restoreUrlObjectMethod(
+  key: 'createObjectURL' | 'revokeObjectURL',
+  original: typeof URL.createObjectURL | typeof URL.revokeObjectURL,
+) {
+  if (original) {
+    Object.defineProperty(URL, key, { configurable: true, value: original })
+  } else {
+    Reflect.deleteProperty(URL, key)
+  }
+}

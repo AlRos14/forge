@@ -12,14 +12,17 @@ import {
   useTaskMediaQuery,
   useUploadTaskMedia,
 } from '@/api/hooks'
+import { apiFetchBlob } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Avatar } from '@/components/ui/avatar'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import {
+  useEffect,
   useMemo,
   useRef,
+  useState,
   type ChangeEvent,
   type Dispatch,
   type ReactNode,
@@ -29,6 +32,7 @@ import type { Comment, Task, TaskMediaResponse } from '@/types/generated'
 
 const TASK_MEDIA_URL_PREFIX = '/api/v1/media/'
 const TASK_MEDIA_URL_PATTERN = /^\/api\/v1\/media\/[^\s]*$/
+const API_V1_PREFIX = '/api/v1'
 
 const taskCommentSanitizeSchema: RehypeSanitizeSchema = {
   ...defaultSchema,
@@ -63,6 +67,58 @@ function isImageMedia(media: Pick<TaskMediaResponse, 'content_type'>): boolean {
 
 function isVideoMedia(media: Pick<TaskMediaResponse, 'content_type'>): boolean {
   return media.content_type.startsWith('video/')
+}
+
+function mediaApiPath(url: string): string {
+  return url.startsWith(API_V1_PREFIX) ? url.slice(API_V1_PREFIX.length) : url
+}
+
+function useTaskMediaObjectUrls(mediaItems: TaskMediaResponse[] | undefined) {
+  const [objectUrls, setObjectUrls] = useState<Map<string, string>>(() => new Map())
+
+  useEffect(() => {
+    const previewMedia = (mediaItems ?? []).filter(
+      (media) => isImageMedia(media) || isVideoMedia(media),
+    )
+    if (previewMedia.length === 0) {
+      setObjectUrls(new Map())
+      return
+    }
+
+    let cancelled = false
+    const createdObjectUrls: string[] = []
+
+    void Promise.all(
+      previewMedia.map(async (media) => {
+        try {
+          const blob = await apiFetchBlob(mediaApiPath(media.url))
+          const objectUrl = URL.createObjectURL(blob)
+          if (cancelled) {
+            URL.revokeObjectURL(objectUrl)
+            return null
+          }
+          createdObjectUrls.push(objectUrl)
+          return [media.url, objectUrl] as const
+        } catch {
+          return null
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) return
+      setObjectUrls(
+        new Map(entries.filter((entry): entry is readonly [string, string] => Boolean(entry))),
+      )
+    })
+
+    return () => {
+      cancelled = true
+      for (const objectUrl of createdObjectUrls) {
+        URL.revokeObjectURL(objectUrl)
+      }
+    }
+  }, [mediaItems])
+
+  return objectUrls
 }
 
 function taskCommentUrlTransform(url: string, key: string, node: { tagName?: string }) {
@@ -103,17 +159,20 @@ function formatByteSize(bytes: number): string {
 function TaskMediaDownloadLink({
   href,
   media,
+  objectUrl,
   label,
   className,
 }: {
   href: string
   media?: TaskMediaResponse
+  objectUrl?: string
   label: ReactNode
   className?: string
 }) {
   return (
     <a
-      href={href}
+      href={objectUrl ?? href}
+      data-media-url={href}
       download={media?.filename ?? true}
       className={cn(
         'not-prose my-2 inline-flex max-w-full items-center gap-2 rounded-md border bg-card px-3 py-2 text-sm text-foreground hover:bg-muted',
@@ -136,35 +195,47 @@ function TaskMediaDownloadLink({
   )
 }
 
-function createMarkdownComponents(mediaByUrl: Map<string, TaskMediaResponse>): Components {
+function createMarkdownComponents(
+  mediaByUrl: Map<string, TaskMediaResponse>,
+  mediaObjectUrls: Map<string, string>,
+): Components {
   return {
     a({ href, children, className, ...props }) {
       delete (props as { node?: unknown }).node
       if (isTaskMediaUrl(href)) {
         const media = mediaByUrl.get(href)
-        if (media && isImageMedia(media)) {
+        const objectUrl = mediaObjectUrls.get(href)
+        if (media && isImageMedia(media) && objectUrl) {
           return (
             <img
-              src={href}
+              src={objectUrl}
               alt={media.filename}
+              data-media-url={href}
               loading="lazy"
               className="my-2 max-h-96 max-w-full rounded-md border object-contain"
             />
           )
         }
-        if (media && isVideoMedia(media)) {
+        if (media && isVideoMedia(media) && objectUrl) {
           return (
             <video
-              src={href}
+              src={objectUrl}
               controls
               preload="metadata"
               aria-label={media.filename}
+              data-media-url={href}
               className="my-2 max-h-96 w-full max-w-full rounded-md border bg-black object-contain"
             />
           )
         }
         return (
-          <TaskMediaDownloadLink href={href} media={media} label={children} className={className} />
+          <TaskMediaDownloadLink
+            href={href}
+            media={media}
+            objectUrl={objectUrl}
+            label={children}
+            className={className}
+          />
         )
       }
       return (
@@ -177,14 +248,29 @@ function createMarkdownComponents(mediaByUrl: Map<string, TaskMediaResponse>): C
       delete (props as { node?: unknown }).node
       if (!isTaskMediaUrl(src)) return null
       const media = mediaByUrl.get(src)
+      const objectUrl = mediaObjectUrls.get(src)
+      if (!media) {
+        return <TaskMediaDownloadLink href={src} label={alt ?? src} />
+      }
       if (media && !isImageMedia(media)) {
+        return (
+          <TaskMediaDownloadLink
+            href={src}
+            media={media}
+            objectUrl={objectUrl}
+            label={alt ?? media.filename}
+          />
+        )
+      }
+      if (media && !objectUrl) {
         return <TaskMediaDownloadLink href={src} media={media} label={alt ?? media.filename} />
       }
       return (
         <img
-          src={src}
+          src={objectUrl ?? src}
           alt={alt ?? ''}
           title={title}
+          data-media-url={src}
           loading="lazy"
           className={cn('my-2 max-h-96 max-w-full rounded-md border object-contain', className)}
           {...props}
@@ -194,13 +280,19 @@ function createMarkdownComponents(mediaByUrl: Map<string, TaskMediaResponse>): C
     video({ src, poster, preload, className, ...props }) {
       delete (props as { node?: unknown }).node
       if (!isTaskMediaUrl(src)) return null
+      const objectUrl = mediaObjectUrls.get(src)
+      if (!objectUrl) {
+        const media = mediaByUrl.get(src)
+        return <TaskMediaDownloadLink href={src} media={media} label={media?.filename ?? src} />
+      }
       const safePoster = isTaskMediaUrl(poster) ? poster : undefined
       return (
         <video
-          src={src}
+          src={objectUrl}
           poster={safePoster}
           controls
           preload={preload ?? 'metadata'}
+          data-media-url={src}
           className={cn(
             'my-2 max-h-96 w-full max-w-full rounded-md border bg-black object-contain',
             className,
@@ -240,7 +332,11 @@ export function TaskCommentsPanel({
     () => new Map((taskMedia.data ?? []).map((media) => [media.url, media])),
     [taskMedia.data],
   )
-  const markdownComponents = useMemo(() => createMarkdownComponents(mediaByUrl), [mediaByUrl])
+  const mediaObjectUrls = useTaskMediaObjectUrls(taskMedia.data)
+  const markdownComponents = useMemo(
+    () => createMarkdownComponents(mediaByUrl, mediaObjectUrls),
+    [mediaByUrl, mediaObjectUrls],
+  )
 
   const onFileSelected = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]

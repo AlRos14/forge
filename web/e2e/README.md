@@ -28,6 +28,7 @@ Most specs use `./fixtures`, which logs in a deterministic default user before n
 - smoke.spec.ts: page loads, navigation visible
 - kanban-board.spec.ts: board columns render correctly
 - task-transition-timeline.spec.ts: task detail transition timeline renders
+- task-media.spec.ts: task comments upload and preview real image/video media fixtures
 
 ## Adding tests
 

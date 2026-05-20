@@ -28,6 +28,10 @@ import { refreshAccess, useAuthStore } from '@/stores/auth'
 
 const API_BASE = '/api/v1'
 
+type ApiFetchInit = RequestInit & {
+  search?: Record<string, string | number | boolean | undefined>
+}
+
 export class ApiError extends Error {
   status: number
   requestId?: string
@@ -40,10 +44,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiFetch<T>(
-  path: string,
-  init?: RequestInit & { search?: Record<string, string | number | boolean | undefined> },
-): Promise<T> {
+async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response> {
   const url = new URL(`${API_BASE}${path}`, window.location.origin)
   const { search, headers, ...fetchInit } = init ?? {}
   if (search) {
@@ -96,12 +97,22 @@ export async function apiFetch<T>(
     )
   }
 
+  return response
+}
+
+export async function apiFetch<T>(path: string, init?: ApiFetchInit): Promise<T> {
+  const response = await apiResponse(path, init)
   const text = await response.text()
   if (response.status === 204 || text.length === 0) {
     return undefined as T
   }
 
   return JSON.parse(text) as T
+}
+
+export async function apiFetchBlob(path: string, init?: ApiFetchInit): Promise<Blob> {
+  const response = await apiResponse(path, init)
+  return response.blob()
 }
 
 export function listFsEntries(path: string, daemonId: string): Promise<FsListResponse> {

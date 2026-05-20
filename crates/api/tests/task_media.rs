@@ -25,6 +25,7 @@ use tokio::sync::broadcast;
 use tower::ServiceExt;
 
 const DEFAULT_MEDIA_LIMIT: u64 = 1024 * 1024;
+const SAMPLE_MEDIA_LIMIT: u64 = 100 * 1024 * 1024;
 
 #[tokio::test]
 async fn upload_image_evidence() {
@@ -81,6 +82,80 @@ async fn upload_video_evidence() {
         &media_row(&harness, &media.id, false).await
     )
     .exists());
+}
+
+#[tokio::test]
+async fn e2e_uploads_sample_video_and_image_assets() {
+    let fixture = MediaFixture::new("forge-media-sample-assets");
+    let harness = test_app(
+        fixture.workspace_root(),
+        fixture.data_dir(),
+        SAMPLE_MEDIA_LIMIT,
+        None,
+    )
+    .await;
+    let task = create_task(&harness.app, "Sample asset evidence").await;
+    let image_bytes = read_asset("logo.png");
+    let video_bytes = read_asset("demo.mp4");
+
+    let image = upload_media_ok(
+        &harness.app,
+        &task.id,
+        "logo.png",
+        "image/png",
+        &image_bytes,
+    )
+    .await;
+    let video = upload_media_ok(
+        &harness.app,
+        &task.id,
+        "demo.mp4",
+        "video/mp4",
+        &video_bytes,
+    )
+    .await;
+
+    assert_eq!(image.byte_size, image_bytes.len() as i64);
+    assert_eq!(video.byte_size, video_bytes.len() as i64);
+    assert!(stored_path(
+        fixture.data_dir(),
+        &media_row(&harness, &image.id, false).await
+    )
+    .exists());
+    assert!(stored_path(
+        fixture.data_dir(),
+        &media_row(&harness, &video.id, false).await
+    )
+    .exists());
+
+    let listed = list_task_media(&harness.app, &task.id).await;
+    assert_eq!(listed.items.len(), 2);
+    assert!(listed.items.iter().any(|item| item.id == image.id
+        && item.filename == "logo.png"
+        && item.content_type == "image/png"));
+    assert!(listed.items.iter().any(|item| item.id == video.id
+        && item.filename == "demo.mp4"
+        && item.content_type == "video/mp4"));
+
+    let (status, headers, body) = get_media_body(&harness.app, &image.url).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_header_eq(&headers, header::CONTENT_TYPE, "image/png");
+    assert!(headers.get(header::CONTENT_DISPOSITION).is_none());
+    assert_eq!(body.len(), image_bytes.len());
+    assert!(
+        body == image_bytes,
+        "downloaded image bytes differ from fixture"
+    );
+
+    let (status, headers, body) = get_media_body(&harness.app, &video.url).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_header_eq(&headers, header::CONTENT_TYPE, "video/mp4");
+    assert!(headers.get(header::CONTENT_DISPOSITION).is_none());
+    assert_eq!(body.len(), video_bytes.len());
+    assert!(
+        body == video_bytes,
+        "downloaded video bytes differ from fixture"
+    );
 }
 
 #[tokio::test]
@@ -874,6 +949,13 @@ async fn media_row(harness: &TestHarness, media_id: &str, include_deleted: bool)
 
 fn stored_path(data_dir: &Path, media: &db::TaskMedia) -> PathBuf {
     data_dir.join("media").join(&media.storage_key)
+}
+
+fn read_asset(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|error| panic!("read asset {}: {error}", path.display()))
 }
 
 fn storage_key_is_safe(storage_key: &str) -> bool {
