@@ -9,6 +9,12 @@ pub const METHOD_EXECUTION_START: &str = "execution.start";
 pub const METHOD_EXECUTION_CANCEL: &str = "execution.cancel";
 pub const METHOD_EXECUTION_LOG: &str = "execution.log";
 pub const METHOD_EXECUTION_TERMINAL: &str = "execution.terminal";
+pub const METHOD_TERMINAL_START: &str = "terminal.start";
+pub const METHOD_TERMINAL_INPUT: &str = "terminal.input";
+pub const METHOD_TERMINAL_RESIZE: &str = "terminal.resize";
+pub const METHOD_TERMINAL_TERMINATE: &str = "terminal.terminate";
+pub const METHOD_TERMINAL_OUTPUT: &str = "terminal.output";
+pub const METHOD_TERMINAL_EXITED: &str = "terminal.exited";
 
 pub const DAEMON_UNAVAILABLE: &str = "daemon_unavailable";
 pub const DAEMON_TIMEOUT: &str = "daemon_timeout";
@@ -131,6 +137,88 @@ pub struct ExecutionTerminalNotification {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct TerminalStartParams {
+    pub session_id: String,
+    pub workspace_path: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub shell: Option<String>,
+    pub env: Option<Vec<(String, String)>>,
+    pub idle_timeout_secs: u64,
+    pub max_lifetime_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalStartResult {
+    pub session_id: String,
+    pub pid: Option<u32>,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalInputParams {
+    pub session_id: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalInputResult {
+    pub session_id: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalResizeParams {
+    pub session_id: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalResizeResult {
+    pub session_id: String,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalTerminateParams {
+    pub session_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalTerminateResult {
+    pub session_id: String,
+    pub terminated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalOutputNotification {
+    pub session_id: String,
+    pub data: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalExitedNotification {
+    pub session_id: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub reason: Option<String>,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DaemonErrorPayload {
     pub code: String,
     pub message: String,
@@ -140,7 +228,7 @@ pub struct DaemonErrorPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonErrorPayload, DaemonFrame};
+    use super::{DaemonErrorPayload, DaemonFrame, TerminalOutputNotification};
 
     #[test]
     fn request_frame_round_trips() {
@@ -212,5 +300,24 @@ mod tests {
         let decoded: DaemonFrame =
             serde_json::from_value(json).expect("deserialize notification frame");
         assert!(matches!(decoded, DaemonFrame::Notification { .. }));
+    }
+
+    #[test]
+    fn terminal_output_notification_round_trips() {
+        let notification = TerminalOutputNotification {
+            session_id: "term-1".to_owned(),
+            data: "hello\r\n".to_owned(),
+            ts: "2026-05-20T00:00:00Z".to_owned(),
+        };
+
+        let json = serde_json::to_value(&notification).expect("serialize terminal output");
+        assert_eq!(json["session_id"], "term-1");
+        assert_eq!(json["data"], "hello\r\n");
+
+        let decoded: TerminalOutputNotification =
+            serde_json::from_value(json).expect("deserialize terminal output");
+        assert_eq!(decoded.session_id, "term-1");
+        assert_eq!(decoded.data, "hello\r\n");
+        assert_eq!(decoded.ts, "2026-05-20T00:00:00Z");
     }
 }

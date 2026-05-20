@@ -108,10 +108,40 @@ impl TaskService {
         .await
         .map_err(ServiceError::from)?;
 
+        if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+            if terminal_activity
+                .workspace_has_active_terminal(workspace_id)
+                .await
+            {
+                return Err(ServiceError::TerminalActiveExecution {
+                    workspace_id: workspace_id.to_owned(),
+                });
+            }
+        }
         let _exec_lock_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
             if let Some(guard) = locks.try_acquire(workspace_id) {
+                if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+                    if terminal_activity
+                        .workspace_has_active_terminal(workspace_id)
+                        .await
+                    {
+                        return Err(ServiceError::TerminalActiveExecution {
+                            workspace_id: workspace_id.to_owned(),
+                        });
+                    }
+                }
                 Some(guard)
             } else {
+                if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+                    if terminal_activity
+                        .workspace_has_active_terminal(workspace_id)
+                        .await
+                    {
+                        return Err(ServiceError::TerminalActiveExecution {
+                            workspace_id: workspace_id.to_owned(),
+                        });
+                    }
+                }
                 self.event_bus.publish(events::ForgeEvent {
                     event_type: "workspace.execution_waiting".to_owned(),
                     entity_id: workspace_id.to_owned(),

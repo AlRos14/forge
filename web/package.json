@@ -10,6 +10,7 @@
     "test": "vitest run --exclude 'e2e/**'",
     "e2e": "playwright test e2e/smoke.spec.ts",
     "e2e:media": "playwright test e2e/task-media.spec.ts",
+    "e2e:terminal": "playwright test e2e/task-terminal.spec.ts",
     "e2e:ui": "playwright test --ui",
     "e2e:debug": "playwright test --debug",
     "preview": "vite preview",

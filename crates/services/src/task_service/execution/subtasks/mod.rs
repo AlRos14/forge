@@ -313,6 +313,8 @@ fn subtask_engine(
         cleanup_scheduler: None,
         task_executor: None,
         daemon_connections: None,
+        workspace_exec_locks: None,
+        terminal_activity: None,
         workspace_root: workspace_root.to_path_buf(),
         repo_cache_locks: None,
     }

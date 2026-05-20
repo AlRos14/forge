@@ -360,6 +360,35 @@ pub fn api_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route(
+            "/api/v1/tasks/{id}/terminals",
+            post(routes::terminals::create_terminal_session)
+                .get(routes::terminals::list_terminal_sessions),
+        )
+        .route(
+            "/api/v1/tasks/{id}/terminals/availability",
+            get(routes::terminals::terminal_availability),
+        )
+        .route(
+            "/api/v1/terminals/{id}",
+            get(routes::terminals::get_terminal_session),
+        )
+        .route(
+            "/api/v1/terminals/{id}/attach-token",
+            post(routes::terminals::issue_terminal_attach_token),
+        )
+        .route(
+            "/api/v1/terminals/{id}/resize",
+            post(routes::terminals::resize_terminal_session),
+        )
+        .route(
+            "/api/v1/terminals/{id}/terminate",
+            post(routes::terminals::terminate_terminal_session),
+        )
+        .route(
+            "/api/v1/terminals/{id}/ws",
+            get(routes::terminals::terminal_ws),
+        )
+        .route(
             "/api/v1/comments/{id}",
             delete(routes::tasks::delete_comment),
         )

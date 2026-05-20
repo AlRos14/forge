@@ -175,6 +175,14 @@ pub enum EventContext {
         task_id: String,
         status: String,
     },
+    TaskTerminalSessionChanged {
+        task_id: String,
+        session_id: String,
+        workspace_id: String,
+        kind: String,
+        status: String,
+        reason: Option<String>,
+    },
     TaskSubtaskSequenceStarted {
         task_id: String,
     },

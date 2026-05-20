@@ -18,6 +18,7 @@ mod repo_review;
 mod requests;
 mod runtime;
 mod settings;
+mod terminal;
 mod workflow;
 
 pub use analytics::*;
@@ -36,6 +37,7 @@ pub use repo_review::*;
 pub use requests::*;
 pub use runtime::*;
 pub use settings::*;
+pub use terminal::*;
 pub use workflow::*;
 
 #[test]
@@ -81,6 +83,14 @@ fn export_typescript() {
     TaskResponse::export().expect("export TaskResponse");
     ExecutionUsageResponse::export().expect("export ExecutionUsageResponse");
     TaskUsageSummaryResponse::export().expect("export TaskUsageSummaryResponse");
+    TerminalSessionStatus::export().expect("export TerminalSessionStatus");
+    TerminalSessionResponse::export().expect("export TerminalSessionResponse");
+    CreateTerminalSessionRequest::export().expect("export CreateTerminalSessionRequest");
+    ResizeTerminalSessionRequest::export().expect("export ResizeTerminalSessionRequest");
+    TerminalAttachTokenResponse::export().expect("export TerminalAttachTokenResponse");
+    TerminalAvailability::export().expect("export TerminalAvailability");
+    TerminalClientFrame::export().expect("export TerminalClientFrame");
+    TerminalServerFrame::export().expect("export TerminalServerFrame");
     TasksResponse::export().expect("export TasksResponse");
     PositionRequest::export().expect("export PositionRequest");
     PositionResponse::export().expect("export PositionResponse");

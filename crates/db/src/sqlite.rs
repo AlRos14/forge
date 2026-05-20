@@ -6,19 +6,20 @@ use crate::{
     CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAgentLink,
     CreateProjectHookRun, CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime,
     CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia,
-    CreateWorkspace, Daemon, DaemonRepo, DbError, Execution, ExecutionRepo, ExecutionStatus,
-    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown,
-    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, PrMetadata,
-    PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink,
+    CreateTerminalSession, CreateWorkspace, Daemon, DaemonRepo, DbError, Execution, ExecutionRepo,
+    ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo,
+    ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page, PageRequest,
+    PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink,
     ProjectAgentLinkRepo, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
     ProjectHookRunStatus, ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
     Repo, RepoRepo, Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery,
     RuntimeRepo, Skill, SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo,
     TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo,
-    TaskUsageSummary, UpdateAgent, UpdateConversation, UpdateConversationMessage,
-    UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
-    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
-    UpdateTaskStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
+    TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    UpdateConversation, UpdateConversationMessage, UpdateDaemonReport, UpdateExecution,
+    UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
+    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
     WorkspaceStatus,
 };
 use async_trait::async_trait;
@@ -55,6 +56,7 @@ mod task;
 mod task_comment;
 mod task_dependency;
 mod task_media;
+mod task_terminal_session;
 mod user_auth;
 mod workflow;
 mod workspace;
@@ -491,6 +493,28 @@ fn map_task_media(row: SqliteRow) -> Result<TaskMedia> {
         author_name: row.try_get("author_name")?,
         created_at: row.try_get("created_at")?,
         deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn map_terminal_session(row: SqliteRow) -> Result<TerminalSession> {
+    Ok(TerminalSession {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        daemon_id: row.try_get("daemon_id")?,
+        status: parse_enum(row.try_get::<String, _>("status")?)?,
+        rows: row.try_get("rows")?,
+        cols: row.try_get("cols")?,
+        pid: row.try_get("pid")?,
+        exit_code: row.try_get("exit_code")?,
+        exit_signal: row.try_get("exit_signal")?,
+        exit_reason: row.try_get("exit_reason")?,
+        created_by_user_id: row.try_get("created_by_user_id")?,
+        created_at: row.try_get("created_at")?,
+        started_at: row.try_get("started_at")?,
+        last_activity_at: row.try_get("last_activity_at")?,
+        ended_at: row.try_get("ended_at")?,
+        version: row.try_get("version")?,
     })
 }
 

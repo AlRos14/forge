@@ -45,6 +45,14 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/tasks/{id}/media` | List task media attachments (paginated) |
 | GET    | `/api/v1/media/{media_id}` | Stream task media bytes |
 | DELETE | `/api/v1/media/{media_id}` | Delete task media attachment |
+| POST   | `/api/v1/tasks/{id}/terminals` | Create task terminal session |
+| GET    | `/api/v1/tasks/{id}/terminals` | List task terminal sessions |
+| GET    | `/api/v1/tasks/{id}/terminals/availability` | Check whether a task terminal can be created |
+| GET    | `/api/v1/terminals/{id}` | Get task terminal session |
+| POST   | `/api/v1/terminals/{id}/attach-token` | Issue a one-shot terminal WebSocket attach token |
+| POST   | `/api/v1/terminals/{id}/resize` | Resize task terminal session |
+| POST   | `/api/v1/terminals/{id}/terminate` | Terminate task terminal session |
+| GET    | `/api/v1/terminals/{id}/ws?attach_token=TOKEN` | Terminal WebSocket upgrade |
 | POST   | `/api/v1/agents` | Register agent |
 | GET    | `/api/v1/agents` | List agents |
 | GET    | `/api/v1/agents/{id}` | Get agent |
@@ -105,6 +113,191 @@ rows to determine `has_more`. The response field is `items` (not `data`).
 | `include_cancelled` | Include cancelled tasks (default false unless `status` includes `cancelled`) |
 | `include_archived` | Include archived tasks (default false) |
 | `include_total` | Include total count in response |
+
+## Terminal sessions
+
+Task terminal sessions expose an interactive shell in an existing task
+worktree. Terminal access is disabled by default and is scoped to authenticated
+project members with access to the owning task.
+
+### Endpoints
+
+| Method | Path | Request | Success |
+|--------|------|---------|---------|
+| POST | `/api/v1/tasks/{id}/terminals` | JSON body `{ "rows": 24, "cols": 80 }`; both fields are optional `u16` values | `201` with `{ "session": TerminalSessionResponse, "attach": TerminalAttachTokenResponse }` |
+| GET | `/api/v1/tasks/{id}/terminals?include_ended=bool` | Optional `include_ended` query param; default `false` | `200` with `TerminalSessionResponse[]` |
+| GET | `/api/v1/tasks/{id}/terminals/availability` | None | `200` with `TerminalAvailability` |
+| GET | `/api/v1/terminals/{id}` | None | `200` with `TerminalSessionResponse` |
+| POST | `/api/v1/terminals/{id}/attach-token` | None | `200` with `TerminalAttachTokenResponse` |
+| POST | `/api/v1/terminals/{id}/resize` | JSON body `{ "rows": 24, "cols": 80 }`; both fields are required `u16` values | `200` with `TerminalSessionResponse` |
+| POST | `/api/v1/terminals/{id}/terminate` | JSON body `{ "reason": "user requested" }`; body and `reason` are optional | `200` with `TerminalSessionResponse` |
+| GET | `/api/v1/terminals/{id}/ws?attach_token=TOKEN` | WebSocket upgrade; `attach_token` query param is required | WebSocket stream of `TerminalServerFrame` text JSON frames |
+
+The WebSocket endpoint only accepts the short-lived `attach_token` issued by
+the REST create or attach-token endpoints. Browser-native WebSocket clients
+cannot set an `Authorization` header, so Forge rejects session JWTs or PATs in
+the WebSocket query string and also rejects `Authorization` without an
+`attach_token`.
+
+### REST types
+
+`TerminalSessionResponse`:
+
+```json
+{
+  "id": "term_...",
+  "task_id": "task_...",
+  "workspace_id": "workspace_...",
+  "daemon_id": null,
+  "status": "running",
+  "rows": 24,
+  "cols": 80,
+  "exit_code": null,
+  "exit_signal": null,
+  "exit_reason": null,
+  "created_at": "2026-05-20T12:00:00Z",
+  "started_at": "2026-05-20T12:00:01Z",
+  "last_activity_at": "2026-05-20T12:00:04Z",
+  "ended_at": null,
+  "created_by_user_id": "user_..."
+}
+```
+
+`status` is one of `starting`, `running`, `exited`, `terminated`,
+`timed_out`, `orphaned`, or `cleanup_terminated`.
+
+`TerminalAttachTokenResponse`:
+
+```json
+{
+  "attach_token": "one-shot-token",
+  "expires_at": "2026-05-20T12:01:00Z",
+  "ws_url": "/api/v1/terminals/term_.../ws?attach_token=one-shot-token",
+  "session_id": "term_..."
+}
+```
+
+`TerminalAvailability`:
+
+```json
+{
+  "enabled": true,
+  "workspace_ready": true,
+  "daemon_reachable": true,
+  "active_execution": false,
+  "session_count_for_task": 0,
+  "session_count_for_user": 1,
+  "max_sessions_per_task": 2,
+  "max_sessions_per_user": 4,
+  "can_create": true,
+  "reason": null
+}
+```
+
+### WebSocket frames
+
+WebSocket messages are text JSON frames tagged by a `type` discriminator.
+Binary WebSocket frames are rejected; terminal byte streams are base64-encoded
+inside JSON frames. On reconnect, the server replays up
+to `terminal.reconnect_scrollback_bytes` bytes of in-memory scrollback
+(64 KiB by default).
+
+Client -> server (`TerminalClientFrame`):
+
+```json
+{ "type": "input", "data": "bHMK" }
+```
+
+```json
+{ "type": "resize", "rows": 40, "cols": 120 }
+```
+
+```json
+{ "type": "ping" }
+```
+
+Server -> client (`TerminalServerFrame`):
+
+```json
+{ "type": "output", "data": "aGVsbG8NCg==" }
+```
+
+```json
+{ "type": "exit", "exit_code": 0, "signal": null, "reason": null }
+```
+
+```json
+{ "type": "error", "code": "invalid_frame", "message": "terminal websocket frames must be text JSON" }
+```
+
+```json
+{ "type": "pong" }
+```
+
+### SSE events
+
+`GET /api/v1/events` subscribers receive terminal lifecycle changes as
+`task.terminal.session_changed` events. The context payload is:
+
+```json
+{
+  "task_id": "task_...",
+  "session_id": "term_...",
+  "workspace_id": "workspace_...",
+  "kind": "created",
+  "status": "running",
+  "reason": null
+}
+```
+
+`kind` is one of `created`, `attached`, `resized`, `terminated`, `exited`,
+`timed_out`, `orphaned`, or `cleanup_terminated`. `reason` is optional and is
+included when the backend has a user-supplied or cleanup reason.
+
+### Daemon transport
+
+Terminal daemon transport is internal to Forge. The browser connects to the
+API server; the API server proxies process operations to the daemon over the
+existing daemon transport when the task is directly assigned to an agent with
+`daemon_id`, or when the current workflow state's effective role assignment
+points to an agent with `daemon_id`. Tasks without an agent daemon use the
+embedded server PTY path. See the
+[task terminal architecture](architecture.md#task-terminal-sessions) for the
+full design rationale.
+
+| Method | Direction | Params | Result |
+|--------|-----------|--------|--------|
+| `terminal.start` | Request | `{ "session_id": "...", "workspace_path": "...", "rows": 24, "cols": 80, "shell": null, "env": null, "idle_timeout_secs": 1800, "max_lifetime_secs": 28800 }` | `{ "session_id": "...", "pid": 1234, "started_at": "2026-05-20T12:00:01Z" }` |
+| `terminal.input` | Request | `{ "session_id": "...", "data": "<base64>" }` | `{ "session_id": "...", "accepted": true }` |
+| `terminal.resize` | Request | `{ "session_id": "...", "rows": 40, "cols": 120 }` | `{ "session_id": "...", "applied": true }` |
+| `terminal.terminate` | Request | `{ "session_id": "...", "reason": "user requested" }` | `{ "session_id": "...", "terminated": true }` |
+| `terminal.output` | Notification | `{ "session_id": "...", "data": "<base64>", "ts": "2026-05-20T12:00:04Z" }` | None |
+| `terminal.exited` | Notification | `{ "session_id": "...", "exit_code": 0, "signal": null, "reason": null, "ts": "2026-05-20T12:00:05Z" }` | None |
+
+### Configuration
+
+Terminal configuration lives under the `terminal` config section:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `terminal.enabled` | `false` | Enables task terminal creation when true |
+| `terminal.max_sessions_per_task` | `2` | Maximum running terminal sessions for one task |
+| `terminal.max_sessions_per_user` | `4` | Maximum running terminal sessions created by one user |
+| `terminal.idle_timeout_secs` | `1800` | Idle timeout before cleanup terminates a session |
+| `terminal.max_lifetime_secs` | `28800` | Absolute session lifetime limit |
+| `terminal.attach_token_ttl_secs` | `60` | Attach-token lifetime in seconds |
+| `terminal.reconnect_scrollback_bytes` | `65536` | Maximum in-memory scrollback replayed on reconnect |
+
+### Access model
+
+Only authenticated project members with access to the owning task can create,
+list, attach to, resize, or terminate that task's terminal sessions. Terminal
+sessions and managed Forge executions mutually block each other in the same
+workspace to prevent concurrent mutation of the same worktree. Version 1 keeps
+only bounded reconnect scrollback in memory and does not persist full terminal
+transcripts. The security boundary is Forge's single-user, local-first model:
+terminal commands run with the privileges of the local Forge daemon or server
+process and are not intended for public internet exposure.
 
 ## Task media (rich comment attachments)
 

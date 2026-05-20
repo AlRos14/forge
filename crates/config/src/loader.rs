@@ -82,6 +82,30 @@ impl ForgeConfig {
             }
         }
 
+        if let Some(terminal) = file.terminal {
+            if let Some(enabled) = terminal.enabled {
+                self.terminal.enabled = enabled;
+            }
+            if let Some(max_sessions_per_task) = terminal.max_sessions_per_task {
+                self.terminal.max_sessions_per_task = max_sessions_per_task;
+            }
+            if let Some(max_sessions_per_user) = terminal.max_sessions_per_user {
+                self.terminal.max_sessions_per_user = max_sessions_per_user;
+            }
+            if let Some(idle_timeout_secs) = terminal.idle_timeout_secs {
+                self.terminal.idle_timeout_secs = idle_timeout_secs;
+            }
+            if let Some(max_lifetime_secs) = terminal.max_lifetime_secs {
+                self.terminal.max_lifetime_secs = max_lifetime_secs;
+            }
+            if let Some(attach_token_ttl_secs) = terminal.attach_token_ttl_secs {
+                self.terminal.attach_token_ttl_secs = attach_token_ttl_secs;
+            }
+            if let Some(reconnect_scrollback_bytes) = terminal.reconnect_scrollback_bytes {
+                self.terminal.reconnect_scrollback_bytes = reconnect_scrollback_bytes;
+            }
+        }
+
         if let Some(project) = file.project {
             self.project.values.extend(project);
         }

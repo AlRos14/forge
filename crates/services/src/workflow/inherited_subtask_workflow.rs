@@ -273,6 +273,8 @@ mod tests {
             cleanup_scheduler: None,
             task_executor: None,
             daemon_connections: None,
+            workspace_exec_locks: None,
+            terminal_activity: None,
             workspace_root: PathBuf::new(),
             repo_cache_locks: None,
         };

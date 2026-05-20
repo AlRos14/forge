@@ -22,5 +22,5 @@ pub use runtime::{
 };
 pub use types::{
     AgentDefaults, ConfigOverrides, ForgeConfig, ForgePaths, ProjectSettings, ServerConfig,
-    WorkspaceConfig,
+    TerminalConfig, WorkspaceConfig,
 };

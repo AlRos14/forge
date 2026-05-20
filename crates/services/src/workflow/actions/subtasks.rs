@@ -292,6 +292,8 @@ mod subtask_hook_test_support {
                 cleanup_scheduler: None,
                 task_executor: None,
                 daemon_connections: None,
+                workspace_exec_locks: None,
+                terminal_activity: None,
                 workspace_root: std::path::PathBuf::new(),
                 repo_cache_locks: None,
                 workspace_id: None,
