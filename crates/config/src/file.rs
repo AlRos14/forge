@@ -23,6 +23,7 @@ pub(crate) struct FileServerConfig {
     pub jwt_secret: Option<String>,
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
+    pub media_upload_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,9 +4,9 @@ use api_types::{
     LaunchExecutionRequest, LaunchExecutionResponse, PaginatedResponse, PositionRequest,
     PositionResponse, RecoverTaskRequest, RejectGateRequest, RejectReviewRequest,
     ReorderSubtasksRequest, ReviewConfig, ReviewDecisionResponse, StateKind, TaskDependency,
-    TaskResponse, TaskRoleAssignmentResponse, TransitionLogEntry, TransitionSource,
-    TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest, WorkflowDefinition,
-    WorkflowTrigger, WorkspaceResponse,
+    TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TransitionLogEntry,
+    TransitionSource, TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest,
+    WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -16,8 +16,8 @@ use axum::{
 use db::{
     now_rfc3339, CommentAuthorType, CreateTaskComment, CreateTaskRoleAssignment, ExecutionRepo,
     ExecutionStatus, PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder,
-    TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo,
-    TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
+    TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,7 @@ mod crud;
 mod dependencies;
 mod execution;
 mod gates;
+mod media;
 mod reviews;
 mod roles;
 mod transitions;
@@ -58,6 +59,7 @@ pub use crud::{
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
 pub use gates::{approve_gate, gate_approve, gate_reject, reject_gate, GateRejectRequest};
+pub use media::{delete_media, get_media, list_media, upload_media};
 pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
 pub use roles::{
     assign_task_role, list_task_roles, remove_task_role, RoleResetRequest,
@@ -132,6 +134,25 @@ fn comment_response(comment: db::TaskComment) -> CommentResponse {
         content: comment.content,
         created_at: comment.created_at,
         updated_at: comment.updated_at,
+    }
+}
+
+fn media_response(media: db::TaskMedia) -> TaskMediaResponse {
+    TaskMediaResponse {
+        url: format!("/api/v1/media/{}", media.id),
+        id: media.id,
+        task_id: media.task_id,
+        filename: media.display_filename,
+        content_type: media.content_type,
+        byte_size: media.byte_size,
+        author_type: match media.author_type {
+            CommentAuthorType::User => AuthorType::User,
+            CommentAuthorType::Agent => AuthorType::Agent,
+            CommentAuthorType::System => AuthorType::System,
+        },
+        author_id: media.author_id,
+        author_name: media.author_name,
+        created_at: media.created_at,
     }
 }
 

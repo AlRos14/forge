@@ -236,6 +236,17 @@ pub enum EventContext {
         author_type: String,
         author_name: String,
     },
+    TaskMediaUploaded {
+        task_id: String,
+        media_id: String,
+        content_type: String,
+        byte_size: i64,
+        filename: String,
+    },
+    TaskMediaDeleted {
+        task_id: String,
+        media_id: String,
+    },
     FollowUpDispatched {
         task_id: String,
         parent_execution_id: String,

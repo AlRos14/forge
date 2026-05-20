@@ -187,6 +187,15 @@ pub trait TaskCommentRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait TaskMediaRepo: Send + Sync {
+    async fn create_media(&self, input: CreateTaskMedia) -> Result<TaskMedia>;
+    async fn list_media(&self, task_id: &str, page: PageRequest) -> Result<Page<TaskMedia>>;
+    async fn list_active_media_for_task(&self, task_id: &str) -> Result<Vec<TaskMedia>>;
+    async fn get_media_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<TaskMedia>>;
+    async fn soft_delete_media(&self, id: &str, deleted_at: &str) -> Result<TaskMedia>;
+}
+
+#[async_trait]
 pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;

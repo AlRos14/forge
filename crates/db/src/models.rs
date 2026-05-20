@@ -484,6 +484,35 @@ pub struct TaskComment {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskMedia {
+    pub id: String,
+    pub task_id: String,
+    pub display_filename: String,
+    pub content_type: String,
+    pub byte_size: i64,
+    pub storage_key: String,
+    pub author_type: CommentAuthorType,
+    pub author_id: Option<String>,
+    pub author_name: String,
+    pub created_at: String,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskMedia {
+    pub id: String,
+    pub task_id: String,
+    pub display_filename: String,
+    pub content_type: String,
+    pub byte_size: i64,
+    pub storage_key: String,
+    pub author_type: CommentAuthorType,
+    pub author_id: Option<String>,
+    pub author_name: String,
+    pub created_at: String,
+}
+
 macro_rules! enum_strings {
     ($enum:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         impl fmt::Display for $enum {

@@ -56,7 +56,8 @@ export async function apiFetch<T>(
 
   const makeHeaders = (overrideToken?: string) => {
     const h = new Headers(headers)
-    if (!h.has('content-type')) {
+    const isFormDataBody = typeof FormData !== 'undefined' && fetchInit.body instanceof FormData
+    if (!h.has('content-type') && !isFormDataBody) {
       h.set('content-type', 'application/json')
     }
     const token = overrideToken ?? useAuthStore.getState().accessToken
@@ -277,7 +278,10 @@ export function listPats(): Promise<TokenResponse[]> {
   return apiFetch<TokenResponse[]>('/auth/tokens')
 }
 
-export function createPat(body: { name: string; expires_at?: string | null }): Promise<TokenResponse> {
+export function createPat(body: {
+  name: string
+  expires_at?: string | null
+}): Promise<TokenResponse> {
   return apiFetch<TokenResponse>('/auth/tokens', {
     method: 'POST',
     body: JSON.stringify(body),

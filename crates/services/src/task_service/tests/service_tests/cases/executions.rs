@@ -322,10 +322,26 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
     })
     .await
     .expect("planner execution completes");
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
+    let task = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("task loads")
+                .expect("task exists");
+            let metadata = task.metadata().expect("metadata parses");
+            if metadata
+                .extra
+                .get("awaiting_human_reason")
+                .and_then(Value::as_str)
+                == Some("plan_review")
+            {
+                break task;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner completion marks task awaiting plan review");
     let metadata = task.metadata().expect("metadata parses");
     assert_eq!(
         metadata

@@ -1,7 +1,8 @@
 use crate::{
     default_data_dir, default_workspace_root, DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS,
     DEFAULT_AGENT_MAX_CONCURRENT_TASKS, DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST,
-    DEFAULT_CORS_ORIGIN, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_CORS_ORIGIN, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND,
+    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub bcrypt_cost: u32,
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
+    #[serde(default = "default_media_upload_limit_bytes")]
+    pub media_upload_limit_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +70,7 @@ pub struct ConfigOverrides {
     pub jwt_secret: Option<String>,
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
+    pub media_upload_limit_bytes: Option<u64>,
 }
 
 impl ForgeConfig {
@@ -129,6 +133,7 @@ impl Default for ForgeConfig {
                 jwt_secret: None,
                 bcrypt_cost: DEFAULT_BCRYPT_COST,
                 cors_origins: vec![DEFAULT_CORS_ORIGIN.to_owned()],
+                media_upload_limit_bytes: DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
             },
             workspace: WorkspaceConfig {
                 root: default_workspace_root(),
@@ -154,6 +159,10 @@ fn default_bcrypt_cost() -> u32 {
 
 fn default_cors_origins() -> Vec<String> {
     vec![DEFAULT_CORS_ORIGIN.to_owned()]
+}
+
+fn default_media_upload_limit_bytes() -> u64 {
+    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES
 }
 
 fn parse_trusted_origin(value: &str) -> Option<String> {

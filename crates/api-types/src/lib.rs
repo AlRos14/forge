@@ -91,6 +91,7 @@ fn export_typescript() {
     TransitionSource::export().expect("export TransitionSource");
     TransitionTaskRequest::export().expect("export TransitionTaskRequest");
     AuthorType::export().expect("export AuthorType");
+    TaskMediaResponse::export().expect("export TaskMediaResponse");
     RecoverTaskRequest::export().expect("export RecoverTaskRequest");
     TestLifecycleHookRequest::export().expect("export TestLifecycleHookRequest");
     CreateCommentRequest::export().expect("export CreateCommentRequest");

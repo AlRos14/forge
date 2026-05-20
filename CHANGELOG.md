@@ -6,7 +6,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Breaking
+
+- Task media now requires access to the owning project, restricts media deletion to project owners/admins, and rejects SVG uploads instead of serving them as inline media.
 
 ## [0.1.3] - 2026-05-16
 

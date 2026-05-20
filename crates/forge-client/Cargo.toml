@@ -13,7 +13,7 @@ cli-adapters = { path = "../cli-adapters" }
 clap = { version = "4", features = ["derive"] }
 config = { path = "../config" }
 executors = { path = "../executors" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 serde_json = "1"

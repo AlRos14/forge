@@ -245,6 +245,22 @@ pub struct CommentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct TaskMediaResponse {
+    pub id: String,
+    pub task_id: String,
+    pub filename: String,
+    pub content_type: String,
+    #[ts(type = "number")]
+    pub byte_size: i64,
+    pub url: String,
+    pub author_type: AuthorType,
+    pub author_id: Option<String>,
+    pub author_name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct NotificationResponse {
     pub id: String,
     pub project_id: String,

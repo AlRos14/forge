@@ -9,7 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 api-types = { path = "../api-types" }
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 config = { path = "../config" }
 db = { path = "../db" }
 events = { path = "../events" }

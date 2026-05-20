@@ -5,19 +5,19 @@ use crate::{
     CreateConversation, CreateConversationMessage, CreateExecution, CreateNotification,
     CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAgentLink,
     CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
-    CreateTaskComment, CreateTaskExternalLink, CreateWorkspace, Daemon, DaemonRepo, DbError,
-    Execution, ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo,
-    ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown, Notification, NotificationListQuery,
-    NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
-    PrProviderConfigRepo, Project, ProjectAgentLink, ProjectAgentLinkRepo, ProjectAnalyticsRepo,
-    ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, Repo, RepoRepo,
-    Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, Skill,
-    SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo,
-    TaskExternalLink, TaskListQuery, TaskRepo, TaskUsageSummary, UpdateAgent, UpdateConversation,
-    UpdateConversationMessage, UpdateDaemonReport, UpdateExecution, UpdatePrMetadata,
-    UpdatePrProviderConfig, UpdateProject, UpdateProjectIntegration, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
-    WorkspaceStatus,
+    CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateWorkspace, Daemon,
+    DaemonRepo, DbError, Execution, ExecutionRepo, ExecutionStatus, ExecutionUsage,
+    ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown, Notification,
+    NotificationListQuery, NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo,
+    PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink, ProjectAgentLinkRepo,
+    ProjectAnalyticsRepo, ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
+    Repo, RepoRepo, Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery,
+    RuntimeRepo, Skill, SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo,
+    TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo,
+    TaskUsageSummary, UpdateAgent, UpdateConversation, UpdateConversationMessage,
+    UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
+    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus, UpsertDaemon,
+    UpsertExecutionUsage, Workspace, WorkspaceRepo, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -51,6 +51,7 @@ mod system_setting;
 mod task;
 mod task_comment;
 mod task_dependency;
+mod task_media;
 mod user_auth;
 mod workflow;
 mod workspace;
@@ -468,6 +469,22 @@ fn map_task_comment(row: SqliteRow) -> Result<TaskComment> {
         content: row.try_get("content")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_task_media(row: SqliteRow) -> Result<TaskMedia> {
+    Ok(TaskMedia {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        display_filename: row.try_get("display_filename")?,
+        content_type: row.try_get("content_type")?,
+        byte_size: row.try_get("byte_size")?,
+        storage_key: row.try_get("storage_key")?,
+        author_type: parse_enum(row.try_get::<String, _>("author_type")?)?,
+        author_id: row.try_get("author_id")?,
+        author_name: row.try_get("author_name")?,
+        created_at: row.try_get("created_at")?,
+        deleted_at: row.try_get("deleted_at")?,
     })
 }
 

@@ -56,6 +56,9 @@ impl ForgeConfig {
             if let Some(cors_origins) = server.cors_origins {
                 self.server.cors_origins = cors_origins;
             }
+            if let Some(media_upload_limit_bytes) = server.media_upload_limit_bytes {
+                self.server.media_upload_limit_bytes = media_upload_limit_bytes;
+            }
         }
 
         if let Some(workspace) = file.workspace {
@@ -126,6 +129,10 @@ impl ForgeConfig {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Some(value) = env_value("FORGE_MEDIA_UPLOAD_LIMIT_BYTES") {
+            self.server.media_upload_limit_bytes =
+                parse_env_u64("FORGE_MEDIA_UPLOAD_LIMIT_BYTES", &value)?;
+        }
         Ok(())
     }
 
@@ -165,6 +172,9 @@ impl ForgeConfig {
         }
         if let Some(cors_origins) = overrides.cors_origins {
             self.server.cors_origins = cors_origins;
+        }
+        if let Some(media_upload_limit_bytes) = overrides.media_upload_limit_bytes {
+            self.server.media_upload_limit_bytes = media_upload_limit_bytes;
         }
     }
 }

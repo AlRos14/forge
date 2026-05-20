@@ -81,6 +81,7 @@ import type {
   Review,
   ReviewDecisionResponse,
   Task,
+  TaskMediaResponse,
   TaskRoleAssignmentResponse,
   TransitionLogEntry,
   TransitionTaskResponse,
@@ -350,7 +351,13 @@ export function useCreateConversation(projectId: string) {
 export function useUpdateConversation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ conversationId, body }: { conversationId: string; body: UpdateConversationRequest }) =>
+    mutationFn: ({
+      conversationId,
+      body,
+    }: {
+      conversationId: string
+      body: UpdateConversationRequest
+    }) =>
       apiFetch<Conversation>(`/conversations/${conversationId}`, {
         method: 'PATCH',
         body: JSON.stringify(body),
@@ -370,7 +377,9 @@ export function useArchiveConversation() {
     mutationFn: (conversationId: string) =>
       apiFetch<void>(`/conversations/${conversationId}`, { method: 'DELETE' }),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ predicate: (query) => query.queryKey[2] === 'conversations' })
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[2] === 'conversations',
+      })
     },
   })
 }
@@ -379,9 +388,12 @@ export function useConversationMessagesQuery(conversationId: string) {
   return useInfiniteQuery({
     queryKey: qk.conversationMessages(conversationId),
     queryFn: ({ pageParam }) =>
-      apiFetch<PaginatedResponse<ConversationMessage>>(`/conversations/${conversationId}/messages`, {
-        search: { cursor: pageParam as string | undefined, limit: 50 },
-      }),
+      apiFetch<PaginatedResponse<ConversationMessage>>(
+        `/conversations/${conversationId}/messages`,
+        {
+          search: { cursor: pageParam as string | undefined, limit: 50 },
+        },
+      ),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: Boolean(conversationId),
@@ -404,21 +416,19 @@ export function useConversationLogsQuery(conversationId: string, isRunning?: boo
 export function useSendConversationMessage() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({
-      conversationId,
-      body,
-    }: {
-      conversationId: string
-      body: SendMessageRequest
-    }) =>
+    mutationFn: ({ conversationId, body }: { conversationId: string; body: SendMessageRequest }) =>
       apiFetch<SendMessageResponse>(`/conversations/${conversationId}/messages`, {
         method: 'POST',
         body: JSON.stringify(body),
       }),
     onSuccess: (_response, variables) => {
-      void queryClient.invalidateQueries({ queryKey: qk.conversationMessages(variables.conversationId) })
+      void queryClient.invalidateQueries({
+        queryKey: qk.conversationMessages(variables.conversationId),
+      })
       void queryClient.invalidateQueries({ queryKey: qk.conversation(variables.conversationId) })
-      void queryClient.invalidateQueries({ predicate: (query) => query.queryKey[2] === 'conversations' })
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[2] === 'conversations',
+      })
     },
   })
 }
@@ -603,8 +613,7 @@ export function useRecoverTask() {
       action: RecoveryAction
       reason?: string
       context?: string
-    }) =>
-      recoverTask(taskId, action, reason, context),
+    }) => recoverTask(taskId, action, reason, context),
     onSuccess: (task) => {
       void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(task.id) })
@@ -676,6 +685,22 @@ export function useCommentsQuery(taskId: string) {
       const response = await apiFetch<PaginatedResponse<Comment>>(`/tasks/${taskId}/comments`, {
         search: { limit: 200, sort_by: 'created_at', sort_order: 'asc' },
       })
+      return response.items
+    },
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskMediaQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskMedia(taskId),
+    queryFn: async () => {
+      const response = await apiFetch<PaginatedResponse<TaskMediaResponse>>(
+        `/tasks/${taskId}/media`,
+        {
+          search: { limit: 200, sort_by: 'created_at', sort_order: 'asc' },
+        },
+      )
       return response.items
     },
     enabled: Boolean(taskId),
@@ -755,6 +780,32 @@ export function useCreateComment() {
       }),
     onSuccess: (comment) => {
       void queryClient.invalidateQueries({ queryKey: qk.comments(comment.task_id) })
+    },
+  })
+}
+
+export function useUploadTaskMedia() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      file,
+      authorName,
+    }: {
+      taskId: string
+      file: File
+      authorName?: string
+    }) => {
+      const formData = new FormData()
+      formData.append('file', file)
+      if (authorName) formData.append('author_name', authorName)
+      return apiFetch<TaskMediaResponse>(`/tasks/${taskId}/media`, {
+        method: 'POST',
+        body: formData,
+      })
+    },
+    onSuccess: (media) => {
+      void queryClient.invalidateQueries({ queryKey: qk.taskMedia(media.task_id) })
     },
   })
 }
@@ -928,11 +979,15 @@ const AGENTS_CACHE_GC_TIME = 60 * 60 * 1000
 type AgentPagesData = InfiniteData<PaginatedResponse<Agent>, string | undefined>
 
 function isPaginatedAgents(data: unknown): data is PaginatedResponse<Agent> {
-  return typeof data === 'object' && data !== null && Array.isArray((data as { items?: unknown }).items)
+  return (
+    typeof data === 'object' && data !== null && Array.isArray((data as { items?: unknown }).items)
+  )
 }
 
 function isAgentPagesData(data: unknown): data is AgentPagesData {
-  return typeof data === 'object' && data !== null && Array.isArray((data as { pages?: unknown }).pages)
+  return (
+    typeof data === 'object' && data !== null && Array.isArray((data as { pages?: unknown }).pages)
+  )
 }
 
 function findCachedAgent(
@@ -1166,11 +1221,7 @@ export function useUpdateMcpConfig() {
       }),
     onSuccess: (_data, variables) => {
       void queryClient.invalidateQueries({
-        queryKey: qk.mcpConfig(
-          variables.agent,
-          variables.scope ?? 'project',
-          variables.project_id,
-        ),
+        queryKey: qk.mcpConfig(variables.agent, variables.scope ?? 'project', variables.project_id),
       })
     },
   })
@@ -1276,13 +1327,7 @@ export function useWorkflowQuery(projectId: string) {
 export function useUpdateWorkflow() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({
-      projectId,
-      body,
-    }: {
-      projectId: string
-      body: UpdateProjectWorkflowRequest
-    }) =>
+    mutationFn: ({ projectId, body }: { projectId: string; body: UpdateProjectWorkflowRequest }) =>
       apiFetch<WorkflowDefinition>(`/projects/${projectId}/workflow`, {
         method: 'PUT',
         body: JSON.stringify(body),
@@ -1639,13 +1684,7 @@ export function useExternalLinksQuery(taskId: string) {
 export function useCreateExternalLink() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({
-      taskId,
-      remoteIssueNumber,
-    }: {
-      taskId: string
-      remoteIssueNumber: number
-    }) =>
+    mutationFn: ({ taskId, remoteIssueNumber }: { taskId: string; remoteIssueNumber: number }) =>
       apiFetch<ExternalLinkResponse>(`/tasks/${taskId}/external-links`, {
         method: 'POST',
         body: JSON.stringify({ remote_issue_number: remoteIssueNumber }),

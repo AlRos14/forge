@@ -8,6 +8,7 @@ export const qk = {
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
   reviews: (taskId: string) => ['tasks', taskId, 'reviews'] as const,
   comments: (taskId: string) => ['tasks', taskId, 'comments'] as const,
+  taskMedia: (taskId: string) => ['tasks', taskId, 'media'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,
   agent: (id: string) => ['agents', id] as const,

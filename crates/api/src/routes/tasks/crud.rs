@@ -146,7 +146,8 @@ pub async fn delete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    state.task_service.soft_delete(id).await?;
+    let task = state.task_service.soft_delete(id).await?;
+    super::media::delete_task_media_for_task(&state, &task.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

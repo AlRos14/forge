@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use reqwest::StatusCode;
+use reqwest::{multipart::Form, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::auth::{normalize_server_url, stored_token_for_server};
@@ -42,6 +42,15 @@ impl ForgeClient {
         let response = self
             .apply_auth(self.http.post(self.url(path)))
             .json(body)
+            .send()
+            .await?;
+        decode_json(response).await
+    }
+
+    pub async fn post_multipart<T: DeserializeOwned>(&self, path: &str, form: Form) -> Result<T> {
+        let response = self
+            .apply_auth(self.http.post(self.url(path)))
+            .multipart(form)
             .send()
             .await?;
         decode_json(response).await

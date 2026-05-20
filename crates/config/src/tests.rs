@@ -1,7 +1,7 @@
 use crate::{
     data_dir_from_env, default_data_dir, default_workspace_root, read_server_state,
     server_state_path, write_server_state, ConfigOverrides, ForgeConfig, ServerState,
-    DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use std::{
     env, fs,
@@ -29,6 +29,10 @@ fn defaults_are_usable_without_a_config_file() {
 
     assert_eq!(config.server.bind, DEFAULT_SERVER_BIND);
     assert!(config.server.mcp_enabled);
+    assert_eq!(
+        config.server.media_upload_limit_bytes,
+        DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES
+    );
     assert_eq!(config.forge.data_dir, default_data_dir());
     assert_eq!(config.db_path(), default_data_dir().join("forge.db"));
     assert_eq!(config.workspace.root, default_workspace_root());
@@ -282,6 +286,7 @@ fn clear_forge_env() {
         "FORGE_JWT_SECRET",
         "FORGE_BCRYPT_COST",
         "FORGE_CORS_ORIGINS",
+        "FORGE_MEDIA_UPLOAD_LIMIT_BYTES",
     ] {
         env::remove_var(key);
     }

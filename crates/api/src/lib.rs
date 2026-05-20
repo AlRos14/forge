@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
@@ -350,8 +350,18 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::create_comment).get(routes::tasks::list_comments),
         )
         .route(
+            "/api/v1/tasks/{id}/media",
+            post(routes::tasks::upload_media)
+                .get(routes::tasks::list_media)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
             "/api/v1/comments/{id}",
             delete(routes::tasks::delete_comment),
+        )
+        .route(
+            "/api/v1/media/{media_id}",
+            get(routes::tasks::get_media).delete(routes::tasks::delete_media),
         )
         .route(
             "/api/v1/tasks/{id}/external-links",
