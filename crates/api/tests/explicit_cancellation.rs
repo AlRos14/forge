@@ -154,6 +154,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             description: None,
             task_type: "task".to_owned(),
             status: status.to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,

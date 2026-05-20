@@ -1,0 +1,1 @@
+ALTER TABLE project ADD COLUMN project_work_epoch INTEGER NOT NULL DEFAULT 0;

@@ -6,8 +6,8 @@ use events::EventBus;
 use executors::{AdapterExecutor, AdapterRegistry, TaskExecutor};
 use services::{
     AgentService, AuthService, ConversationService, DaemonService, MergeService,
-    NotificationService, OperatorStatusEmitter, OperatorStatusService, TaskService,
-    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
+    NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
+    TaskService, WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
 use tokio::sync::watch;
 use workspace::RepoCacheLockManager;
@@ -65,6 +65,7 @@ pub struct AppState {
         Arc<services::workflow::template_service::WorkflowTemplateService>,
     pub merge_service: Arc<MergeService>,
     pub notification_service: Arc<NotificationService>,
+    pub project_hook_service: Arc<ProjectHookService>,
     pub operator_status_service: Arc<OperatorStatusService>,
     pub operator_status_emitter: Arc<OperatorStatusEmitter>,
     pub cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
@@ -198,6 +199,12 @@ impl AppState {
             Arc::clone(&event_bus),
         ));
         let _notification_service_handle = Arc::clone(&notification_service).start();
+        let project_hook_service = Arc::new(ProjectHookService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            Arc::clone(&task_service),
+            Arc::clone(&notification_service),
+        ));
         let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
@@ -226,6 +233,7 @@ impl AppState {
             workflow_template_service,
             merge_service,
             notification_service,
+            project_hook_service,
             operator_status_service,
             operator_status_emitter,
             cleanup_scheduler,

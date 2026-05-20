@@ -5,8 +5,17 @@ use std::collections::HashSet;
 impl TaskRepo for SqliteDb {
     async fn create(&self, input: CreateTask) -> Result<Task> {
         let mut transaction = self.pool.begin().await?;
+        let task = TaskRepo::create_in_tx(self, &mut transaction, input).await?;
+        transaction.commit().await?;
+        Ok(task)
+    }
 
-        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
+    async fn create_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTask,
+    ) -> Result<Task> {
+        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(input.repo_id.as_deref())
@@ -17,6 +26,7 @@ impl TaskRepo for SqliteDb {
             .bind(input.description.as_deref())
             .bind(&input.task_type)
             .bind(&input.status)
+            .bind(if input.is_automation { 1 } else { 0 })
             .bind(input.priority)
             .bind(input.subtask_order)
             .bind(input.task_state_config.as_deref())
@@ -26,12 +36,13 @@ impl TaskRepo for SqliteDb {
             .bind(&input.created_at)
             .bind(&input.updated_at)
             .bind(&input.project_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
-        transaction.commit().await?;
-        TaskRepo::get_by_id(self, &input.id, true)
-            .await?
-            .ok_or(DbError::NotFound)
+        let row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.id)
+            .fetch_one(&mut **transaction)
+            .await?;
+        map_task(row)
     }
 
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>> {

@@ -1,6 +1,8 @@
 // Types aligned with the backend api-types crate responses.
 // PaginatedResponse<T> = { data: T[], next_cursor?, has_more, total_count? }
 
+import type { ProjectHookRule } from './bindings/ProjectHookRule'
+
 export type TaskStatus = string
 
 export type TaskType = 'task' | 'planning_task' | 'sub_task'
@@ -431,6 +433,7 @@ export interface Project {
   name: string
   primary_repo_id: string | null
   settings: Record<string, unknown>
+  project_hooks: ProjectHookRule[]
   default_review_config?: ReviewConfig | null
   workflow_template_name?: string | null
   paused_at: string | null
@@ -728,6 +731,7 @@ export interface UpdateProjectRequest {
   primary_repo_id?: string | null
   settings?: Record<string, unknown> | null
   default_review_config?: ReviewConfig | null
+  project_hooks?: ProjectHookRule[] | null
 }
 
 export interface CreateRepoRequest {

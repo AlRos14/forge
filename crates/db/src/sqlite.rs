@@ -4,20 +4,22 @@ use crate::{
     ConversationMessageListQuery, ConversationMessageRepo, ConversationRepo, CreateAgent,
     CreateConversation, CreateConversationMessage, CreateExecution, CreateNotification,
     CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAgentLink,
-    CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
-    CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateWorkspace, Daemon,
-    DaemonRepo, DbError, Execution, ExecutionRepo, ExecutionStatus, ExecutionUsage,
-    ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown, Notification,
-    NotificationListQuery, NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo,
-    PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink, ProjectAgentLinkRepo,
-    ProjectAnalyticsRepo, ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
+    CreateProjectHookRun, CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime,
+    CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia,
+    CreateWorkspace, Daemon, DaemonRepo, DbError, Execution, ExecutionRepo, ExecutionStatus,
+    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown,
+    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, PrMetadata,
+    PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink,
+    ProjectAgentLinkRepo, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
+    ProjectHookRunStatus, ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
     Repo, RepoRepo, Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery,
     RuntimeRepo, Skill, SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo,
     TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo,
     TaskUsageSummary, UpdateAgent, UpdateConversation, UpdateConversationMessage,
     UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
-    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus, UpsertDaemon,
-    UpsertExecutionUsage, Workspace, WorkspaceRepo, WorkspaceStatus,
+    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
+    UpdateTaskStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -42,6 +44,7 @@ mod pr_metadata;
 mod pr_provider_config;
 mod project;
 mod project_agent_link;
+mod project_hook_run;
 mod project_member;
 mod repo;
 mod review;
@@ -134,8 +137,8 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
     }
 }
 
-const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
-const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
     page.limit.clamp(1, 500)
@@ -191,6 +194,8 @@ fn map_project(row: SqliteRow) -> Result<Project> {
         primary_repo_id: row.try_get("primary_repo_id")?,
         paused_at: row.try_get("paused_at")?,
         owner_id: row.try_get("owner_id")?,
+        project_hooks_json: row.try_get("project_hooks_json")?,
+        project_work_epoch: row.try_get("project_work_epoch")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -375,6 +380,7 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         description: row.try_get("description")?,
         task_type: row.try_get("task_type")?,
         status: row.try_get("status")?,
+        is_automation: row.try_get::<i64, _>("is_automation")? != 0,
         priority: row.try_get("priority")?,
         board_position: row.try_get("board_position")?,
         subtask_order: row.try_get("subtask_order")?,

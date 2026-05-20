@@ -96,6 +96,10 @@ export function routeSsePayload(
     void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
   }
 
+  if (eventType === 'project_hook.run_changed' && payload.project_id) {
+    void queryClient.invalidateQueries({ queryKey: qk.projectHookRuns(payload.project_id) })
+  }
+
   if (eventType.startsWith('task.')) {
     const taskId = payload.task_id ?? payload.entity_id
     void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
@@ -308,6 +312,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'project.deleted',
         'project.paused',
         'project.resumed',
+        'project_hook.run_changed',
         'profile.created',
         'profile.updated',
         'profile.deleted',

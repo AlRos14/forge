@@ -109,29 +109,38 @@ impl TaskService {
         } else {
             None
         };
-        let mut task = TaskRepo::create(
-            &*self.db,
-            CreateTask {
-                id: new_uuid_v4(),
-                project_id,
-                repo_id,
-                parent_task_id,
-                subtask_order,
-                assignee_type: None,
-                assignee_id: None,
-                title,
-                description,
-                task_type: effective_task_type,
-                status: initial_status,
-                priority: priority.unwrap_or(0),
-                task_state_config,
-                merge_config: serialize_config(merge_config)?,
-                plan: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await?;
+        let create_task = CreateTask {
+            id: new_uuid_v4(),
+            project_id,
+            repo_id,
+            parent_task_id,
+            subtask_order,
+            assignee_type: None,
+            assignee_id: None,
+            title,
+            description,
+            task_type: effective_task_type,
+            status: initial_status,
+            is_automation: false,
+            priority: priority.unwrap_or(0),
+            task_state_config,
+            merge_config: serialize_config(merge_config)?,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let mut transaction = self.db.pool().begin().await?;
+        let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        if !task.is_automation {
+            ProjectRepo::increment_project_work_epoch(
+                &*self.db,
+                &mut transaction,
+                &task.project_id,
+                1,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         if is_subtask {
             TaskRepo::set_metadata_json(&*self.db, &task.id, metadata_json.clone(), &now).await?;
             task.metadata_json = metadata_json;
@@ -158,6 +167,80 @@ impl TaskService {
         if is_root {
             self.assign_project_default_roles(&task).await?;
         }
+
+        self.publish(ForgeEvent {
+            event_type: "task.created".to_owned(),
+            entity_id: task.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskCreated {
+                project_id: task.project_id.clone(),
+                title: task.title.clone(),
+            },
+        });
+
+        Ok(task)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_automation_task(
+        &self,
+        project_id: impl Into<String>,
+        title: impl Into<String>,
+        description: Option<String>,
+        task_type: Option<String>,
+        task_state_config: Option<String>,
+        merge_config: Option<Value>,
+    ) -> Result<Task> {
+        let project_id = project_id.into();
+        let title = title.into();
+        validate_required("project_id", &project_id)?;
+        validate_required("title", &title)?;
+
+        let project = ProjectRepo::get_by_id(&*self.db, &project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
+        let repo_id = project.primary_repo_id.clone();
+        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+        let initial_status = if repo_id.is_none() {
+            workflow
+                .states
+                .iter()
+                .find(|state| state.kind == api_types::StateKind::Backlog)
+                .map(|state| state.name.clone())
+                .ok_or_else(|| ServiceError::invalid_operation("workflow has no backlog state"))?
+        } else {
+            workflow
+                .states
+                .iter()
+                .find(|state| state.kind == api_types::StateKind::Initial)
+                .map(|state| state.name.clone())
+                .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
+        };
+
+        let now = now_rfc3339();
+        let create_task = CreateTask {
+            id: new_uuid_v4(),
+            project_id,
+            repo_id,
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title,
+            description,
+            task_type: task_type.unwrap_or_else(|| "task".to_owned()),
+            status: initial_status,
+            is_automation: true,
+            priority: 0,
+            task_state_config,
+            merge_config: serialize_config(merge_config)?,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let mut transaction = self.db.pool().begin().await?;
+        let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        transaction.commit().await?;
 
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),

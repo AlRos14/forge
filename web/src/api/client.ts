@@ -24,6 +24,7 @@ import type {
   WorkflowTemplateResponse,
   WorkflowTemplateSummary,
 } from '@/types/generated'
+import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
 import { refreshAccess, useAuthStore } from '@/stores/auth'
 
 const API_BASE = '/api/v1'
@@ -242,6 +243,16 @@ export async function getProjectAnalytics(
   return apiFetch<ProjectAnalyticsResponse>(
     `/projects/${projectId}/analytics${query ? `?${query}` : ''}`,
   )
+}
+
+export function listProjectHookRuns(
+  projectId: string,
+  cursor?: string,
+  limit = 20,
+): Promise<ProjectHookRunsResponse> {
+  return apiFetch<ProjectHookRunsResponse>(`/projects/${projectId}/project_hook_runs`, {
+    search: { cursor, limit },
+  })
 }
 
 export function markNotificationRead(notificationId: string): Promise<NotificationResponse> {

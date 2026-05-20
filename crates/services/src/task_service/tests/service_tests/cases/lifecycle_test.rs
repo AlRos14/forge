@@ -21,6 +21,7 @@ async fn hook_test_does_not_transition_or_create_execution() {
             description: None,
             task_type: "task".to_owned(),
             status: "todo".to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,

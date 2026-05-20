@@ -325,6 +325,7 @@ async fn seed_awaiting_human_review_with_passed_flag(
             description: Some("exercise reviewer rejection".to_owned()),
             task_type: "task".to_owned(),
             status: "review".to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: Some(
                 json!({

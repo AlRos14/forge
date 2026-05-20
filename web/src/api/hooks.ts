@@ -27,6 +27,7 @@ import {
   listMembers,
   listNotifications,
   listPats,
+  listProjectHookRuns,
   listProjectAgentLinks,
   listProjectAgents,
   listWorkflowTemplates,
@@ -230,6 +231,15 @@ export function useProjectAnalytics(projectId: string, from?: string, to?: strin
   return useQuery({
     queryKey: qk.projectAnalytics(projectId, from, to),
     queryFn: () => getProjectAnalytics(projectId, from, to),
+  })
+}
+
+export function useProjectHookRunsQuery(projectId: string, limit = 20) {
+  return useInfiniteQuery({
+    queryKey: qk.projectHookRunPages(projectId, limit),
+    queryFn: ({ pageParam }) => listProjectHookRuns(projectId, pageParam, limit),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
   })
 }
 

@@ -24,6 +24,7 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
+| GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
 | POST   | `/api/v1/projects/{id}/tasks` | Create task |
@@ -52,6 +53,36 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
+
+## Projects
+
+`ProjectResponse` includes `project_hooks`, an array of project-wide hook
+rules stored separately from workflow settings. Projects with no configured
+rules return an empty array.
+
+`PATCH /api/v1/projects/{id}` accepts the existing `name`, `settings`,
+`default_review_config`, `primary_repo_id`, and `paused` fields, plus an
+optional `project_hooks` array. When provided, the server validates and stores
+the rules in `project.project_hooks_json`; saving rules does not run hook
+actions. Omitting `project_hooks` leaves existing rules unchanged; sending an
+empty array clears all rules.
+
+Project hook validation rejects unsupported trigger and action types, the
+`task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
+required action strings such as `dispatch_agent.agent_id`.
+
+### Project Hooks
+
+Project hooks are project-wide automation rules stored on
+`ProjectResponse.project_hooks` and updated by `PATCH /api/v1/projects/{id}`.
+The v1 evaluator supports `project.all_work_completed`, which fires when the
+project has visible non-automation tasks and all of them are in terminal
+workflow states. `dispatch_agent` launches a
+configured agent, `create_task` creates a task, `add_comment` adds a task
+comment, and `notify` creates a notification. `task.stuck` is
+deferred to a future stuck-signal change. Run history is available at
+`GET /api/v1/projects/{id}/project_hook_runs` with `items` and `next_cursor`
+pagination.
 
 ## Pagination
 

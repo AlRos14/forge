@@ -5,6 +5,11 @@ use sqlx::{Sqlite, Transaction};
 #[async_trait]
 pub trait TaskRepo: Send + Sync {
     async fn create(&self, input: CreateTask) -> Result<Task>;
+    async fn create_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTask,
+    ) -> Result<Task>;
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>>;
@@ -201,8 +206,43 @@ pub trait ProjectRepo: Send + Sync {
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
     async fn update(&self, input: UpdateProject) -> Result<Project>;
+    async fn set_project_hooks_json(
+        &self,
+        id: &str,
+        project_hooks_json: &str,
+        updated_at: &str,
+    ) -> Result<()>;
+    async fn increment_project_work_epoch(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        by: i64,
+    ) -> Result<i64>;
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
     async fn delete(&self, id: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait ProjectHookRunRepo: Send + Sync {
+    async fn try_claim(&self, input: CreateProjectHookRun) -> Result<Option<ProjectHookRun>>;
+    async fn try_claim_or_skip_at_limit(
+        &self,
+        input: CreateProjectHookRun,
+        max_active_runs: i64,
+        skip_reason: &str,
+    ) -> Result<Option<ProjectHookRun>>;
+    async fn update_status(&self, input: UpdateProjectHookRun) -> Result<ProjectHookRun>;
+    async fn list_recent_for_project(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ProjectHookRun>>;
+    async fn list_for_project(
+        &self,
+        project_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<ProjectHookRun>>;
+    async fn count_active_for_rule(&self, project_id: &str, rule_id: &str) -> Result<i64>;
 }
 
 #[async_trait]
@@ -565,6 +605,7 @@ pub struct CreateTask {
     pub description: Option<String>,
     pub task_type: String,
     pub status: String,
+    pub is_automation: bool,
     pub priority: i64,
     pub subtask_order: Option<i64>,
     pub task_state_config: Option<String>,

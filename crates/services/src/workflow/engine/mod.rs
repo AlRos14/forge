@@ -813,6 +813,10 @@ impl WorkflowEngine {
                     })
                     .to_string()
                 });
+            let reopens_visible_work = from_state.kind == StateKind::Terminal
+                && to_state.kind != StateKind::Terminal
+                && !task.is_automation;
+            let mut transaction = self.db.pool().begin().await?;
             let update = query(
                 "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
             )
@@ -821,12 +825,22 @@ impl WorkflowEngine {
             .bind(entry_barrier_json.as_deref())
             .bind(&task_id)
             .bind(version)
-            .execute(self.db.pool())
+            .execute(&mut *transaction)
             .await?;
 
             if update.rows_affected() != 1 {
                 return Err(db::DbError::VersionConflict.into());
             }
+            if reopens_visible_work {
+                ProjectRepo::increment_project_work_epoch(
+                    &*self.db,
+                    &mut transaction,
+                    &task.project_id,
+                    1,
+                )
+                .await?;
+            }
+            transaction.commit().await?;
 
             let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
                 .await?

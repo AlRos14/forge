@@ -520,6 +520,7 @@ async fn seed_review_task_with_executor(
             description: Some("resolve a conflicting change".to_owned()),
             task_type: "task".to_owned(),
             status: "review".to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,

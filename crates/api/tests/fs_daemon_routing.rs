@@ -716,6 +716,7 @@ async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str) ->
             description: None,
             task_type: "task".to_owned(),
             status: "in_progress".to_owned(),
+            is_automation: false,
             priority: 0,
             subtask_order: None,
             task_state_config: None,

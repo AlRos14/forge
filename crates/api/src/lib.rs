@@ -129,6 +129,10 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/projects/{id}/analytics",
             get(routes::projects::get_project_analytics),
         )
+        .route(
+            "/api/v1/projects/{id}/project_hook_runs",
+            get(routes::projects::list_project_hook_runs),
+        )
         .route("/api/v1/users/search", get(routes::members::search_users))
         .route(
             "/api/v1/projects/{id}/members",

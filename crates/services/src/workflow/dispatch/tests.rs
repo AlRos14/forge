@@ -26,6 +26,7 @@ fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
         description: description.map(str::to_string),
         task_type: "task".to_string(),
         status: default_states::IN_PROGRESS.to_string(),
+        is_automation: false,
         priority: 0,
         board_position: 1.0,
         task_state_config: None,

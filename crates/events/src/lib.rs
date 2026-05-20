@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+pub const PROJECT_HOOK_RUN_CHANGED_EVENT: &str = "project_hook.run_changed";
 pub const OPERATIONS_STATUS_CHANGED_EVENT: &str = "operations.status_changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +319,19 @@ pub enum EventContext {
     },
     OperationsStatusChanged {
         trigger: String,
+    },
+    ProjectHookRunChanged {
+        project_id: String,
+        run_id: String,
+        rule_id: String,
+        trigger_type: String,
+        dedupe_key: String,
+        status: String,
+        source_task_id: Option<String>,
+        automation_task_id: Option<String>,
+        execution_id: Option<String>,
+        agent_id: Option<String>,
+        reason: Option<String>,
     },
     ConversationMessageCreated {
         project_id: String,

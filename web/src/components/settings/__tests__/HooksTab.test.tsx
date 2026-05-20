@@ -7,6 +7,9 @@ const hooks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/api/hooks', () => hooks)
+vi.mock('@/components/settings/ProjectHooksSection', () => ({
+  ProjectHooksSection: () => null,
+}))
 
 describe('HooksTab hook testing', () => {
   it('runs a hook test and renders debug output fields', async () => {

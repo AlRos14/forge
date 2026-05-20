@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CreateNotification, NotificationRepo, ReviewRepo, SqliteDb, TaskRepo,
+    new_uuid_v4, now_rfc3339, CreateNotification, Notification, NotificationRepo, ReviewRepo,
+    SqliteDb, TaskRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 
@@ -27,6 +28,23 @@ impl NotificationService {
                 }
             }
         })
+    }
+
+    pub async fn create_project_hook_notification(
+        &self,
+        project_id: String,
+        task_id: Option<String>,
+        title: String,
+        body: Option<String>,
+    ) -> crate::Result<Notification> {
+        self.create_and_publish(
+            project_id,
+            task_id,
+            "project_hook.notify".to_owned(),
+            title,
+            body,
+        )
+        .await
     }
 
     async fn handle_event(&self, event: ForgeEvent) -> crate::Result<()> {
@@ -121,7 +139,7 @@ impl NotificationService {
         event_type: String,
         title: String,
         body: Option<String>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Notification> {
         let notification = NotificationRepo::create(
             &*self.db,
             CreateNotification {
@@ -142,14 +160,14 @@ impl NotificationService {
             entity_id: notification.id.clone(),
             timestamp: event_timestamp(),
             context: EventContext::NotificationCreated {
-                notification_id: notification.id,
-                project_id: notification.project_id,
-                task_id: notification.task_id,
+                notification_id: notification.id.clone(),
+                project_id: notification.project_id.clone(),
+                task_id: notification.task_id.clone(),
                 event_type,
                 title,
             },
         });
-        Ok(())
+        Ok(notification)
     }
 }
 

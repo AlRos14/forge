@@ -396,6 +396,7 @@ mod tests {
                 description: None,
                 task_type: "task".to_owned(),
                 status: "todo".to_owned(),
+                is_automation: false,
                 priority: 0,
                 subtask_order: None,
                 task_state_config: None,

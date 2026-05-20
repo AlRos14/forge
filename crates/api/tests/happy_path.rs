@@ -15,8 +15,8 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use db::ReviewRepo;
-use events::{EventBus, EventContext, ForgeEvent};
+use db::{ProjectHookRunRepo, ReviewRepo, TaskRepo};
+use events::{EventBus, EventContext, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -150,6 +150,35 @@ async fn forge_happy_path_end_to_end() {
     assert_eq!(ci_steps.as_array().expect("step results array").len(), 1);
     assert_eq!(ci_steps[0]["exit_code"], 0);
 
+    let listed_tasks: PaginatedResponse<TaskResponse> = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        listed_tasks.items.iter().any(|task| task.id == task_id),
+        "normal non-automation task remains visible in project task list"
+    );
+    let persisted_task = TaskRepo::get_by_id(&*harness.state.db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(
+        !persisted_task.is_automation,
+        "happy-path user-created task defaults to non-automation"
+    );
+
+    let hook_runs =
+        ProjectHookRunRepo::list_recent_for_project(&*harness.state.db, &project_id, 10)
+            .await
+            .expect("project hook runs load");
+    assert!(
+        hook_runs.is_empty(),
+        "projects without configured hooks must not create project hook runs"
+    );
+
     let events = drain_events(&mut events_rx).await;
     assert_event_type(&events, "task.created");
     assert_event_type(&events, "task.assigned");
@@ -160,6 +189,12 @@ async fn forge_happy_path_end_to_end() {
     assert_status_event(&events, &task_id, "merging");
     assert_status_event(&events, &task_id, "done");
     assert_event_type(&events, "workspace.cleaned");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != PROJECT_HOOK_RUN_CHANGED_EVENT),
+        "no project_hook.run_changed events are emitted when no hooks are configured"
+    );
 }
 
 struct TestHarness {

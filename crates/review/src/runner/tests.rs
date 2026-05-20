@@ -154,6 +154,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             description: None,
             task_type: "task".to_owned(),
             status: "in_progress".to_string(),
+            is_automation: false,
             priority: 0,
             task_state_config: Some(task_state_config),
             merge_config: None,

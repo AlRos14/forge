@@ -12,8 +12,71 @@ pub struct Project {
     pub primary_repo_id: Option<String>,
     pub paused_at: Option<String>,
     pub owner_id: Option<String>,
+    pub project_hooks_json: String,
+    pub project_work_epoch: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectHookRunStatus {
+    Queued,
+    Running,
+    Dispatched,
+    Skipped,
+    Failed,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectHookRun {
+    pub id: String,
+    pub project_id: String,
+    pub rule_id: String,
+    pub trigger_type: String,
+    pub dedupe_key: String,
+    pub status: ProjectHookRunStatus,
+    pub source_task_id: Option<String>,
+    pub source_execution_id: Option<String>,
+    pub automation_task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectHookRun {
+    pub id: String,
+    pub project_id: String,
+    pub rule_id: String,
+    pub trigger_type: String,
+    pub dedupe_key: String,
+    pub status: ProjectHookRunStatus,
+    pub source_task_id: Option<String>,
+    pub source_execution_id: Option<String>,
+    pub automation_task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateProjectHookRun {
+    pub id: String,
+    pub status: ProjectHookRunStatus,
+    // Outer Some means "update this column"; inner None writes SQL NULL.
+    pub automation_task_id: Option<Option<String>>,
+    pub execution_id: Option<Option<String>>,
+    pub agent_id: Option<Option<String>>,
+    pub reason: Option<Option<String>>,
+    pub updated_at: String,
+    pub completed_at: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +373,7 @@ pub struct Task {
     pub description: Option<String>,
     pub task_type: String,
     pub status: TaskStatus,
+    pub is_automation: bool,
     pub priority: i64,
     pub board_position: f64,
     pub subtask_order: Option<i64>,
@@ -623,6 +687,15 @@ enum_strings!(ReviewStatus {
     Passed => "passed",
     Failed => "failed",
     Cancelled => "cancelled",
+});
+
+enum_strings!(ProjectHookRunStatus {
+    Queued => "queued",
+    Running => "running",
+    Dispatched => "dispatched",
+    Skipped => "skipped",
+    Failed => "failed",
+    Completed => "completed",
 });
 
 enum_strings!(CommentAuthorType {

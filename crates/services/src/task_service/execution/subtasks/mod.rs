@@ -619,6 +619,7 @@ mod tests {
             description: description.map(str::to_owned),
             task_type: "task".to_string(),
             status: status.to_owned(),
+            is_automation: false,
             priority: 0,
             board_position: 1.0,
             subtask_order: None,

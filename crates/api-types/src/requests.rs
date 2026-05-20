@@ -2,7 +2,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::LifecycleEvent;
+use crate::{
+    project_hooks::{parse_project_hooks_json, ProjectHookRule},
+    LifecycleEvent,
+};
 use crate::{
     ConversationStatus, InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskStatus, TaskType,
     WorkMode,
@@ -163,6 +166,8 @@ pub struct UpdateProjectRequest {
     pub default_review_config: Option<ReviewConfig>,
     pub primary_repo_id: Option<String>,
     pub paused: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_project_hooks")]
+    pub project_hooks: Option<Vec<ProjectHookRule>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -210,6 +215,21 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_project_hooks<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ProjectHookRule>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let json = serde_json::to_string(&value).map_err(serde::de::Error::custom)?;
+    parse_project_hooks_json(&json)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

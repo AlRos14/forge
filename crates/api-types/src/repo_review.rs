@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::{AuthorType, ReviewConfig, ReviewStatus, TaskResponse, WorkMode, WorkflowDefinition};
+use crate::{
+    project_hooks::ProjectHookRule, AuthorType, ReviewConfig, ReviewStatus, TaskResponse, WorkMode,
+    WorkflowDefinition,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +52,7 @@ pub struct ProjectResponse {
     pub id: String,
     pub name: String,
     pub settings: Value,
+    pub project_hooks: Vec<ProjectHookRule>,
     pub default_review_config: Option<ReviewConfig>,
     pub primary_repo_id: Option<String>,
     pub owner_id: Option<String>,

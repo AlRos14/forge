@@ -229,6 +229,7 @@ async fn seed_task(
             description: Some("echo test".to_owned()),
             task_type: "task".to_owned(),
             status: status.to_owned(),
+            is_automation: false,
             priority,
             task_state_config: None,
             merge_config: None,
