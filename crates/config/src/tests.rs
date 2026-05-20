@@ -1,7 +1,8 @@
 use crate::{
     data_dir_from_env, default_data_dir, default_workspace_root, read_server_state,
     server_state_path, write_server_state, ConfigOverrides, ForgeConfig, ServerState,
-    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    TerminalConfig, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND,
+    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use std::{
     env, fs,
@@ -40,6 +41,49 @@ fn defaults_are_usable_without_a_config_file() {
         config.workspace.cleanup_delay_seconds,
         DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS
     );
+}
+
+#[test]
+fn terminal_config_default_values_match_spec() {
+    let terminal = TerminalConfig::default();
+
+    assert!(!terminal.enabled);
+    assert_eq!(terminal.max_sessions_per_task, 2);
+    assert_eq!(terminal.max_sessions_per_user, 4);
+    assert_eq!(terminal.idle_timeout_secs, 1800);
+    assert_eq!(terminal.max_lifetime_secs, 28800);
+    assert_eq!(terminal.attach_token_ttl_secs, 60);
+    assert_eq!(terminal.reconnect_scrollback_bytes, 65536);
+}
+
+#[test]
+fn partial_terminal_file_config_merges_with_defaults() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+terminal:
+  enabled: true
+  max_sessions_per_task: 3
+  attach_token_ttl_secs: 45
+"#,
+    )
+    .expect("write config");
+
+    let config =
+        ForgeConfig::load(Some(&config_path), ConfigOverrides::default()).expect("config loads");
+
+    assert!(config.terminal.enabled);
+    assert_eq!(config.terminal.max_sessions_per_task, 3);
+    assert_eq!(config.terminal.max_sessions_per_user, 4);
+    assert_eq!(config.terminal.idle_timeout_secs, 1800);
+    assert_eq!(config.terminal.max_lifetime_secs, 28800);
+    assert_eq!(config.terminal.attach_token_ttl_secs, 45);
+    assert_eq!(config.terminal.reconnect_scrollback_bytes, 65536);
 }
 
 #[test]

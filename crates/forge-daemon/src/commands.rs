@@ -1,15 +1,20 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use api_types::{
     DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
     ExecutionStartParams, ExecutionStartResult, FsBranchesParams, FsBranchesResult, FsEntry,
-    FsListParams, FsListResult, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START,
-    METHOD_FS_BRANCHES, METHOD_FS_LIST, PATH_GUARDRAIL, UNSUPPORTED_METHOD,
+    FsListParams, FsListResult, TerminalInputParams, TerminalResizeParams, TerminalStartParams,
+    TerminalTerminateParams, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START,
+    METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
+    METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, PATH_GUARDRAIL, UNSUPPORTED_METHOD,
 };
 use serde::{de::DeserializeOwned, Serialize};
+
+const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 
 const SKIP_NAMES: &[&str] = &[
     ".Trashes",
@@ -34,7 +39,16 @@ const SKIP_NAMES: &[&str] = &[
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
+#[allow(dead_code)]
 pub async fn handle_request(frame: DaemonFrame, workspace_root: &Path) -> DaemonFrame {
+    handle_request_with_terminal(frame, workspace_root, None).await
+}
+
+pub async fn handle_request_with_terminal(
+    frame: DaemonFrame,
+    workspace_root: &Path,
+    terminal: Option<&Arc<crate::terminal::TerminalRuntime>>,
+) -> DaemonFrame {
     let DaemonFrame::Request { id, method, params } = frame else {
         return error_frame(
             None,
@@ -45,6 +59,58 @@ pub async fn handle_request(frame: DaemonFrame, workspace_root: &Path) -> Daemon
     };
 
     match method.as_str() {
+        METHOD_TERMINAL_START => match terminal {
+            Some(terminal) => match decode_params::<TerminalStartParams>(&id, params) {
+                Ok(params) => match terminal.start(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            None => terminal_unavailable_frame(id),
+        },
+        METHOD_TERMINAL_INPUT => match terminal {
+            Some(terminal) => match decode_params::<TerminalInputParams>(&id, params) {
+                Ok(params) => match terminal.input(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            None => terminal_unavailable_frame(id),
+        },
+        METHOD_TERMINAL_RESIZE => match terminal {
+            Some(terminal) => match decode_params::<TerminalResizeParams>(&id, params) {
+                Ok(params) => match terminal.resize(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            None => terminal_unavailable_frame(id),
+        },
+        METHOD_TERMINAL_TERMINATE => match terminal {
+            Some(terminal) => match decode_params::<TerminalTerminateParams>(&id, params) {
+                Ok(params) => match terminal.terminate(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            None => terminal_unavailable_frame(id),
+        },
         METHOD_FS_LIST => match decode_params::<FsListParams>(&id, params) {
             Ok(params) => match list_entries(params, workspace_root).await {
                 Ok(result) => response_frame(id, result),
@@ -108,6 +174,15 @@ pub async fn handle_request(frame: DaemonFrame, workspace_root: &Path) -> Daemon
             None,
         ),
     }
+}
+
+fn terminal_unavailable_frame(id: String) -> DaemonFrame {
+    error_frame(
+        Some(id),
+        TERMINAL_UNAVAILABLE,
+        "terminal support is not available in this daemon command context",
+        None,
+    )
 }
 
 async fn list_entries(params: FsListParams, workspace_root: &Path) -> CommandResult<FsListResult> {

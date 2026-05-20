@@ -1,4 +1,5 @@
 use super::*;
+use crate::terminal_service::TerminalActivityTracker;
 use crate::workflow::default_roles;
 use crate::workspace_execution_lock::WorkspaceExecutionLockManager;
 use ::workspace::RepoCacheLockManager;

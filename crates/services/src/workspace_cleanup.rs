@@ -1,9 +1,10 @@
-use crate::Result;
+use crate::{Result, ServiceError};
+use async_trait::async_trait;
 use db::{now_rfc3339, SqliteDb, WorkspaceRepo};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::{
@@ -17,11 +18,16 @@ use workspace::{WorkspaceError, WorkspaceManager};
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Debug)]
 pub struct WorkspaceCleanupScheduler {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
+    terminal_cleanup: RwLock<Option<Arc<dyn WorkspaceCleanupObserver>>>,
+}
+
+#[async_trait]
+pub trait WorkspaceCleanupObserver: Send + Sync {
+    async fn cleanup_workspace_terminals(&self, workspace_id: &str) -> Result<()>;
 }
 
 impl WorkspaceCleanupScheduler {
@@ -30,11 +36,23 @@ impl WorkspaceCleanupScheduler {
             db,
             event_bus,
             workspace_root,
+            terminal_cleanup: RwLock::new(None),
         }
     }
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub fn set_terminal_cleanup_handler(&self, handler: Arc<dyn WorkspaceCleanupObserver>) {
+        match self.terminal_cleanup.write() {
+            Ok(mut terminal_cleanup) => {
+                *terminal_cleanup = Some(handler);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "workspace cleanup terminal handler lock poisoned");
+            }
+        }
     }
 
     pub fn spawn(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
@@ -118,6 +136,20 @@ impl WorkspaceCleanupScheduler {
             workspace_root = %self.workspace_root.display(),
             "cleaning up workspace"
         );
+        let terminal_cleanup = self
+            .terminal_cleanup
+            .read()
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "workspace cleanup terminal handler lock poisoned: {error}"
+                ))
+            })?
+            .clone();
+        if let Some(terminal_cleanup) = terminal_cleanup {
+            terminal_cleanup
+                .cleanup_workspace_terminals(workspace_id)
+                .await?;
+        }
         let manager = WorkspaceManager::new(self.workspace_root.clone());
         match manager.cleanup_worktree(&workspace.task_id).await {
             Ok(()) => {}

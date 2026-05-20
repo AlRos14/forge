@@ -49,6 +49,7 @@ pub mod reviews;
 pub mod runtimes;
 pub mod settings;
 pub mod tasks;
+pub mod terminals;
 pub mod workflow;
 pub mod workflow_templates;
 pub mod workspaces;

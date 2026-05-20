@@ -7,7 +7,8 @@ use executors::{AdapterExecutor, AdapterRegistry, TaskExecutor};
 use services::{
     AgentService, AuthService, ConversationService, DaemonService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, TaskService,
-    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
+    TerminalActivityTracker, TerminalService, WorkspaceCleanupScheduler,
+    WorkspaceExecutionLockManager,
 };
 use tokio::sync::watch;
 use workspace::RepoCacheLockManager;
@@ -65,6 +66,7 @@ pub struct AppState {
         Arc<services::workflow::template_service::WorkflowTemplateService>,
     pub merge_service: Arc<MergeService>,
     pub notification_service: Arc<NotificationService>,
+    pub terminal_service: Arc<TerminalService>,
     pub operator_status_service: Arc<OperatorStatusService>,
     pub operator_status_emitter: Arc<OperatorStatusEmitter>,
     pub cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
@@ -158,6 +160,7 @@ impl AppState {
             Arc::new(AdapterExecutor::new(Arc::clone(&adapter_registry)));
         let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+        let terminal_activity = Arc::new(TerminalActivityTracker::default());
         let workflow_template_service = Arc::new(
             services::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
         );
@@ -174,6 +177,15 @@ impl AppState {
                 Arc::clone(&event_bus),
                 execution_event_handler,
             ));
+        let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            Arc::clone(&daemon_connections),
+            Arc::clone(&workspace_exec_locks),
+            effective_config.terminal.clone(),
+            workspace_root.clone(),
+            Arc::clone(&terminal_activity),
+        ));
         // Use the same root for workspace creation and cleanup so done tasks remove what claim made.
         let task_service = Arc::new(
             TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
@@ -183,6 +195,7 @@ impl AppState {
                 .with_task_executor(Arc::clone(&task_executor))
                 .with_daemon_connections(Arc::clone(&daemon_connections))
                 .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
+                .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
                 .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
                 .with_workspace_root(workspace_root.clone()),
         );
@@ -193,6 +206,14 @@ impl AppState {
         );
         let agent_service = Arc::new(AgentService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let daemon_service = Arc::new(DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+        let terminal_cleanup_handler: Arc<
+            dyn services::workspace_cleanup::WorkspaceCleanupObserver,
+        > = terminal_service.clone();
+        cleanup_scheduler.set_terminal_cleanup_handler(terminal_cleanup_handler);
+        let terminal_event_handler: Arc<
+            dyn services::daemon_transport::DaemonTerminalEventHandler,
+        > = terminal_service.clone();
+        daemon_connections.set_terminal_event_handler(terminal_event_handler);
         let notification_service = Arc::new(NotificationService::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -226,6 +247,7 @@ impl AppState {
             workflow_template_service,
             merge_service,
             notification_service,
+            terminal_service,
             operator_status_service,
             operator_status_emitter,
             cleanup_scheduler,
@@ -256,6 +278,27 @@ impl AppState {
             Arc::clone(&self.auth_service),
             config.mcp_resource_url(),
         ));
+        let terminal_activity = self.terminal_service.activity_tracker();
+        let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+            Arc::clone(&self.daemon_connections),
+            Arc::clone(&self.workspace_exec_locks),
+            config.terminal.clone(),
+            self.cleanup_scheduler.workspace_root().to_path_buf(),
+            terminal_activity,
+        ));
+        let terminal_cleanup_handler: Arc<
+            dyn services::workspace_cleanup::WorkspaceCleanupObserver,
+        > = terminal_service.clone();
+        self.cleanup_scheduler
+            .set_terminal_cleanup_handler(terminal_cleanup_handler);
+        let terminal_event_handler: Arc<
+            dyn services::daemon_transport::DaemonTerminalEventHandler,
+        > = terminal_service.clone();
+        self.daemon_connections
+            .set_terminal_event_handler(terminal_event_handler);
+        self.terminal_service = terminal_service;
         self.effective_config = Arc::new(config);
         self
     }

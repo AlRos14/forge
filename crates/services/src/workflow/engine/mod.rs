@@ -21,8 +21,10 @@ use self::{
 use crate::{
     deferred_dispatch,
     merge_service::MergeService,
+    terminal_service::TerminalActivityTracker,
     workflow::{default_workflow, inherited_subtask_workflow, registry, HookContext, HookResult},
     workspace_cleanup::WorkspaceCleanupScheduler,
+    workspace_execution_lock::WorkspaceExecutionLockManager,
     ServiceError,
 };
 
@@ -39,6 +41,8 @@ pub struct WorkflowEngine {
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
     pub task_executor: Option<Arc<dyn TaskExecutor>>,
     pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
+    pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
     pub workspace_root: PathBuf,
     pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 }
@@ -242,6 +246,8 @@ impl WorkflowEngine {
             cleanup_scheduler: self.cleanup_scheduler.clone(),
             task_executor: self.task_executor.clone(),
             daemon_connections: self.daemon_connections.clone(),
+            workspace_exec_locks: self.workspace_exec_locks.clone(),
+            terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
             workspace_id,
@@ -683,6 +689,8 @@ impl WorkflowEngine {
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
                 task_executor: self.task_executor.clone(),
                 daemon_connections: self.daemon_connections.clone(),
+                workspace_exec_locks: self.workspace_exec_locks.clone(),
+                terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
                 workspace_id: workspace_id.clone(),
@@ -707,6 +715,8 @@ impl WorkflowEngine {
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
                 task_executor: self.task_executor.clone(),
                 daemon_connections: self.daemon_connections.clone(),
+                workspace_exec_locks: self.workspace_exec_locks.clone(),
+                terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
                 workspace_id,

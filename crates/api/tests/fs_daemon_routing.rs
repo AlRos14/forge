@@ -10,9 +10,14 @@ use std::{
 
 use api::{build_router, serve_with_listener, AppState};
 use api_types::{
-    BranchListResponse, DaemonFrame, DaemonRegisterResponse, ErrorResponse,
-    ExecutionTerminalNotification, FsEntry, FsListResponse, FsListResult,
-    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
+    BranchListResponse, CreateTerminalSessionResponse, DaemonFrame, DaemonRegisterResponse,
+    ErrorResponse, ExecutionTerminalNotification, FsEntry, FsListResponse, FsListResult,
+    TerminalAvailability, TerminalClientFrame, TerminalInputParams, TerminalInputResult,
+    TerminalOutputNotification, TerminalResizeParams, TerminalResizeResult, TerminalServerFrame,
+    TerminalSessionResponse, TerminalSessionStatus as ApiTerminalSessionStatus,
+    TerminalStartParams, TerminalStartResult, TerminalTerminateParams, TerminalTerminateResult,
+    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_OUTPUT,
+    METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -20,12 +25,14 @@ use axum::{
     Router,
 };
 use db::{
-    AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject, CreateTask, DaemonRepo,
-    DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, TaskRepo, UpsertDaemon,
-    UserRepo,
+    AgentRepo, AgentStatus, AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo,
+    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, Execution,
+    ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
+    UpsertDaemon, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
@@ -529,6 +536,204 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
     assert_execution_status_remains(&state, &execution.id, ExecutionStatus::Running).await;
 }
 
+#[tokio::test]
+async fn task_terminal_routes_through_connected_external_daemon_api() {
+    let base_state = test_state().await;
+    let mut config = (*base_state.effective_config).clone();
+    config.terminal.enabled = true;
+    let state = Arc::new((*base_state).clone().with_effective_config(config));
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "terminal-owner-daemon").await;
+    let server = TestServer::start(Arc::clone(&state)).await;
+    let mut daemon_socket = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        &registration.registration_token,
+    )
+    .await
+    .expect("daemon websocket upgrade succeeds");
+    wait_until_connected(&state, &registration.daemon_id).await;
+
+    let fixture = seed_terminal_task_for_daemon(&state, &registration.daemon_id).await;
+    let availability: TerminalAvailability = empty_request(
+        &app,
+        &format!("/api/v1/tasks/{}/terminals/availability", fixture.task_id),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(availability.can_create);
+    assert!(availability.daemon_reachable);
+
+    let create_app = app.clone();
+    let create_uri = format!("/api/v1/tasks/{}/terminals", fixture.task_id);
+    let create_token = test_jwt();
+    let create_task = tokio::spawn(async move {
+        json_request_with_bearer::<CreateTerminalSessionResponse>(
+            &create_app,
+            Method::POST,
+            &create_uri,
+            &create_token,
+            json!({ "rows": 31, "cols": 101 }),
+            StatusCode::CREATED,
+        )
+        .await
+    });
+
+    let (start_id, start_params) =
+        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_START).await;
+    let start_params: TerminalStartParams =
+        serde_json::from_value(start_params).expect("terminal.start params parse");
+    assert_eq!(start_params.workspace_path, fixture.workspace_path);
+    assert_eq!(start_params.rows, 31);
+    assert_eq!(start_params.cols, 101);
+    send_daemon_response(
+        &mut daemon_socket,
+        start_id,
+        TerminalStartResult {
+            session_id: start_params.session_id.clone(),
+            pid: Some(4242),
+            started_at: db::now_rfc3339(),
+        },
+    )
+    .await;
+
+    let created = create_task.await.expect("create task joins");
+    assert!(matches!(
+        created.session.status,
+        ApiTerminalSessionStatus::Running
+    ));
+    assert_eq!(
+        created.session.daemon_id.as_deref(),
+        Some(registration.daemon_id.as_str())
+    );
+    assert_eq!(created.session.id, start_params.session_id);
+
+    let persisted = db::TerminalSessionRepo::get_terminal_session(&*state.db, &created.session.id)
+        .await
+        .expect("terminal session loads")
+        .expect("terminal session exists");
+    assert_eq!(
+        persisted.daemon_id.as_deref(),
+        Some(registration.daemon_id.as_str())
+    );
+
+    let mut terminal_socket =
+        connect_terminal(&server, &created.session.id, &created.attach.attach_token)
+            .await
+            .expect("terminal websocket upgrade succeeds");
+    send_terminal_client_frame(&mut terminal_socket, TerminalClientFrame::Ping {}).await;
+    assert!(matches!(
+        next_terminal_server_frame(&mut terminal_socket).await,
+        TerminalServerFrame::Pong {}
+    ));
+
+    send_daemon_notification(
+        &mut daemon_socket,
+        METHOD_TERMINAL_OUTPUT,
+        TerminalOutputNotification {
+            session_id: created.session.id.clone(),
+            data: "ZGFlbW9uLW91dHB1dC1vawo=".to_owned(),
+            ts: db::now_rfc3339(),
+        },
+    )
+    .await;
+    let output = next_terminal_server_frame(&mut terminal_socket).await;
+    assert!(matches!(
+        output,
+        TerminalServerFrame::Output { data } if data == "ZGFlbW9uLW91dHB1dC1vawo="
+    ));
+
+    send_terminal_client_frame(
+        &mut terminal_socket,
+        TerminalClientFrame::Input {
+            data: "ZWNobyB2aWEtZGFlbW9uCg==".to_owned(),
+        },
+    )
+    .await;
+    let (input_id, input_params) =
+        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_INPUT).await;
+    let input_params: TerminalInputParams =
+        serde_json::from_value(input_params).expect("terminal.input params parse");
+    assert_eq!(input_params.session_id, created.session.id);
+    assert_eq!(input_params.data, "ZWNobyB2aWEtZGFlbW9uCg==");
+    send_daemon_response(
+        &mut daemon_socket,
+        input_id,
+        TerminalInputResult {
+            session_id: input_params.session_id,
+            accepted: true,
+        },
+    )
+    .await;
+
+    send_terminal_client_frame(
+        &mut terminal_socket,
+        TerminalClientFrame::Resize {
+            rows: 42,
+            cols: 120,
+        },
+    )
+    .await;
+    let (resize_id, resize_params) =
+        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_RESIZE).await;
+    let resize_params: TerminalResizeParams =
+        serde_json::from_value(resize_params).expect("terminal.resize params parse");
+    assert_eq!(resize_params.session_id, created.session.id);
+    assert_eq!(resize_params.rows, 42);
+    assert_eq!(resize_params.cols, 120);
+    send_daemon_response(
+        &mut daemon_socket,
+        resize_id,
+        TerminalResizeResult {
+            session_id: resize_params.session_id,
+            applied: true,
+        },
+    )
+    .await;
+
+    let terminate_app = app.clone();
+    let terminate_uri = format!("/api/v1/terminals/{}/terminate", created.session.id);
+    let terminate_token = test_jwt();
+    let terminate_task = tokio::spawn(async move {
+        json_request_with_bearer::<TerminalSessionResponse>(
+            &terminate_app,
+            Method::POST,
+            &terminate_uri,
+            &terminate_token,
+            json!({ "reason": "api-test" }),
+            StatusCode::OK,
+        )
+        .await
+    });
+
+    let (terminate_id, terminate_params) =
+        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_TERMINATE).await;
+    let terminate_params: TerminalTerminateParams =
+        serde_json::from_value(terminate_params).expect("terminal.terminate params parse");
+    assert_eq!(terminate_params.session_id, created.session.id);
+    assert_eq!(terminate_params.reason.as_deref(), Some("api-test"));
+    send_daemon_response(
+        &mut daemon_socket,
+        terminate_id,
+        TerminalTerminateResult {
+            session_id: terminate_params.session_id,
+            terminated: true,
+        },
+    )
+    .await;
+
+    let terminated = terminate_task.await.expect("terminate task joins");
+    assert!(matches!(
+        terminated.status,
+        ApiTerminalSessionStatus::Terminated
+    ));
+    let exit = next_terminal_server_frame(&mut terminal_socket).await;
+    assert!(matches!(
+        exit,
+        TerminalServerFrame::Exit { reason, .. } if reason.as_deref() == Some("api-test")
+    ));
+}
+
 async fn respond_to_fs_list(
     registry: Arc<services::daemon_transport::DaemonConnectionRegistry>,
     daemon_id: String,
@@ -646,6 +851,93 @@ async fn connect_daemon(
     );
 
     connect_async(request).await.map(|(socket, _)| socket)
+}
+
+async fn connect_terminal(
+    server: &TestServer,
+    session_id: &str,
+    attach_token: &str,
+) -> Result<ClientSocket, WsError> {
+    let url = format!(
+        "ws://{}/api/v1/terminals/{session_id}/ws?attach_token={attach_token}",
+        server.addr
+    );
+    connect_async(url).await.map(|(socket, _)| socket)
+}
+
+async fn next_daemon_request(socket: &mut ClientSocket, expected_method: &str) -> (String, Value) {
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("daemon request arrives")
+            .expect("daemon websocket remains open")
+            .expect("daemon request is valid");
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        let frame: DaemonFrame = serde_json::from_str(text.as_ref()).expect("daemon frame parses");
+        match frame {
+            DaemonFrame::Request { id, method, params } => {
+                assert_eq!(method, expected_method);
+                return (id, params);
+            }
+            DaemonFrame::Heartbeat { .. } => {}
+            other => panic!("expected daemon request frame, got {other:?}"),
+        }
+    }
+}
+
+async fn send_daemon_response<T: Serialize>(socket: &mut ClientSocket, id: String, result: T) {
+    let frame = DaemonFrame::Response {
+        id,
+        result: serde_json::to_value(result).expect("daemon result serializes"),
+    };
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&frame).expect("daemon response serializes"),
+        ))
+        .await
+        .expect("send daemon response");
+}
+
+async fn send_daemon_notification<T: Serialize>(
+    socket: &mut ClientSocket,
+    method: &str,
+    params: T,
+) {
+    let frame = DaemonFrame::Notification {
+        method: method.to_owned(),
+        params: serde_json::to_value(params).expect("daemon notification serializes"),
+    };
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&frame).expect("daemon notification frame serializes"),
+        ))
+        .await
+        .expect("send daemon notification");
+}
+
+async fn send_terminal_client_frame(socket: &mut ClientSocket, frame: TerminalClientFrame) {
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&frame).expect("terminal client frame serializes"),
+        ))
+        .await
+        .expect("send terminal client frame");
+}
+
+async fn next_terminal_server_frame(socket: &mut ClientSocket) -> TerminalServerFrame {
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("terminal server frame arrives")
+            .expect("terminal websocket remains open")
+            .expect("terminal frame is valid");
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        return serde_json::from_str(text.as_ref()).expect("terminal server frame parses");
+    }
 }
 
 async fn wait_until_connected(state: &AppState, daemon_id: &str) {
@@ -787,6 +1079,148 @@ async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str) ->
     .expect("execution creates")
 }
 
+struct TerminalTaskFixture {
+    task_id: String,
+    workspace_path: String,
+}
+
+async fn seed_terminal_task_for_daemon(state: &AppState, daemon_id: &str) -> TerminalTaskFixture {
+    let now = db::now_rfc3339();
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let repo_id = uuid::Uuid::new_v4().to_string();
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let workspace_id = uuid::Uuid::new_v4().to_string();
+
+    ProjectRepo::create(
+        &*state.db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Terminal Ownership".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+    RepoRepo::create(
+        &*state.db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "terminal-repo".to_owned(),
+            remote_url: "file:///tmp/terminal-repo".to_owned(),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("repo creates");
+    TaskRepo::create(
+        &*state.db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Daemon terminal".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("task creates");
+    AgentRepo::create(
+        &*state.db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: "Terminal Owner Agent".to_owned(),
+            description: None,
+            executor_type: "codex".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            daemon_id: Some(daemon_id.to_owned()),
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("agent creates");
+    TaskRoleAssignmentRepo::assign(
+        &*state.db,
+        CreateTaskRoleAssignment {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            role_name: services::workflow::default_roles::CODER.to_owned(),
+            assignee_type: Some(AssigneeKind::Agent),
+            assignee_id: Some(agent_id),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("role assignment creates");
+
+    let workspace_root = state.cleanup_scheduler.workspace_root().to_path_buf();
+    fs::create_dir_all(&workspace_root).expect("workspace root exists");
+    let worktree_path = workspace_root
+        .join("terminal-daemon-routing")
+        .join(&task_id)
+        .join("repo");
+    fs::create_dir_all(&worktree_path).expect("worktree path exists");
+    WorkspaceRepo::create(
+        &*state.db,
+        CreateWorkspace {
+            id: workspace_id,
+            task_id: task_id.clone(),
+            repo_id,
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch: workspace::task_branch_name(&task_id),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("workspace creates");
+
+    TerminalTaskFixture {
+        task_id,
+        workspace_path: worktree_path.to_string_lossy().into_owned(),
+    }
+}
+
 async fn assert_execution_status_remains(
     state: &AppState,
     execution_id: &str,
@@ -844,6 +1278,21 @@ where
     T: DeserializeOwned,
 {
     let response = raw_json_request(app, method, uri, None, body).await;
+    parse_response(response, expected_status).await
+}
+
+async fn json_request_with_bearer<T>(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: Value,
+    expected_status: StatusCode,
+) -> T
+where
+    T: DeserializeOwned,
+{
+    let response = raw_json_request(app, method, uri, Some(token), body).await;
     parse_response(response, expected_status).await
 }
 

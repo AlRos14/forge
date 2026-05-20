@@ -29,6 +29,7 @@ pub mod shutdown;
 pub mod task_diagnostics;
 pub mod task_dispatcher;
 pub mod task_service;
+pub mod terminal_service;
 pub mod types;
 pub mod workflow;
 pub mod workspace_cleanup;
@@ -62,6 +63,7 @@ pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{NewSubtaskInput, TaskService};
+pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
 pub use workflow::template_service::WorkflowTemplateService;
 pub use workspace_cleanup::WorkspaceCleanupScheduler;
@@ -151,6 +153,30 @@ pub enum ServiceError {
 
     #[error("task sequence already started for task {task_id}")]
     TaskSequenceAlreadyStarted { task_id: String },
+
+    #[error("terminal access is disabled")]
+    TerminalDisabled,
+
+    #[error("terminal workspace is not ready")]
+    TerminalWorkspaceNotReady,
+
+    #[error("terminal session limit reached for {scope}")]
+    TerminalSessionLimit { scope: String },
+
+    #[error("terminal daemon unavailable: {daemon_id}")]
+    TerminalDaemonUnavailable { daemon_id: String },
+
+    #[error("terminal blocked by active execution in workspace {workspace_id}")]
+    TerminalActiveExecution { workspace_id: String },
+
+    #[error("terminal attach token is invalid")]
+    TerminalAttachTokenInvalid,
+
+    #[error("terminal path guardrail rejected the workspace path")]
+    TerminalPathGuardrail,
+
+    #[error("terminal session not found")]
+    TerminalNotFound,
 }
 
 impl From<db::DbError> for ServiceError {

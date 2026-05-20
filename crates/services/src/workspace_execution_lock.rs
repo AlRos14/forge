@@ -27,6 +27,19 @@ impl WorkspaceExecutionLockManager {
         Arc::clone(&entry).lock_owned().await
     }
 
+    pub async fn try_acquire_async(&self, workspace_id: &str) -> Option<OwnedMutexGuard<()>> {
+        let entry = {
+            let mut locks = self.locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(workspace_id.to_owned())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+
+        entry.try_lock_owned().ok()
+    }
+
     pub fn try_acquire(&self, workspace_id: &str) -> Option<OwnedMutexGuard<()>> {
         let entry = {
             let mut locks = self.locks.try_lock().ok()?;

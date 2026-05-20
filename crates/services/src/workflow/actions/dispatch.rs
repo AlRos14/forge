@@ -190,6 +190,12 @@ impl HookAction for DispatchRoleAgent {
                     if let Some(daemon_connections) = ctx.daemon_connections.as_ref().cloned() {
                         service = service.with_daemon_connections(daemon_connections);
                     }
+                    if let Some(workspace_exec_locks) = ctx.workspace_exec_locks.as_ref().cloned() {
+                        service = service.with_workspace_exec_locks(workspace_exec_locks);
+                    }
+                    if let Some(terminal_activity) = ctx.terminal_activity.as_ref().cloned() {
+                        service = service.with_terminal_activity_tracker(terminal_activity);
+                    }
                     let trigger = follow_up_trigger(ctx);
                     return match service
                         .dispatch_role_follow_up(
@@ -288,6 +294,12 @@ impl HookAction for DispatchRoleAgent {
                 }
                 if let Some(daemon_connections) = ctx.daemon_connections.as_ref().cloned() {
                     service = service.with_daemon_connections(daemon_connections);
+                }
+                if let Some(workspace_exec_locks) = ctx.workspace_exec_locks.as_ref().cloned() {
+                    service = service.with_workspace_exec_locks(workspace_exec_locks);
+                }
+                if let Some(terminal_activity) = ctx.terminal_activity.as_ref().cloned() {
+                    service = service.with_terminal_activity_tracker(terminal_activity);
                 }
 
                 match service

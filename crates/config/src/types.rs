@@ -14,6 +14,8 @@ pub struct ForgeConfig {
     pub server: ServerConfig,
     pub workspace: WorkspaceConfig,
     pub agent: AgentDefaults,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
     pub project: ProjectSettings,
 }
 
@@ -49,6 +51,18 @@ pub struct AgentDefaults {
     pub max_concurrent_tasks: u32,
     pub heartbeat_interval_seconds: u64,
     pub max_missed_heartbeats: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    pub enabled: bool,
+    pub max_sessions_per_task: u32,
+    pub max_sessions_per_user: u32,
+    pub idle_timeout_secs: u64,
+    pub max_lifetime_secs: u64,
+    pub attach_token_ttl_secs: u64,
+    pub reconnect_scrollback_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -144,7 +158,22 @@ impl Default for ForgeConfig {
                 heartbeat_interval_seconds: DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS,
                 max_missed_heartbeats: DEFAULT_AGENT_MAX_MISSED_HEARTBEATS,
             },
+            terminal: TerminalConfig::default(),
             project: ProjectSettings::default(),
+        }
+    }
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_sessions_per_task: 2,
+            max_sessions_per_user: 4,
+            idle_timeout_secs: 1800,
+            max_lifetime_secs: 28800,
+            attach_token_ttl_secs: 60,
+            reconnect_scrollback_bytes: 65536,
         }
     }
 }

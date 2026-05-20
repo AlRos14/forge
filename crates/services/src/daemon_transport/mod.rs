@@ -52,6 +52,28 @@ pub trait DaemonExecutionEventHandler: Send + Sync {
     ) -> Result<(), ServiceError>;
 }
 
+#[async_trait]
+pub trait DaemonTerminalEventHandler: Send + Sync {
+    async fn handle_terminal_output(
+        &self,
+        _daemon_id: &str,
+        _notification: api_types::TerminalOutputNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_exited(
+        &self,
+        _daemon_id: &str,
+        _notification: api_types::TerminalExitedNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DaemonTerminalEventHandler for () {}
+
 #[derive(Clone)]
 struct EmbeddedExecutionContext {
     task_service: Weak<TaskService>,
@@ -111,6 +133,7 @@ struct DaemonConnectionRegistryInner {
     connections: Mutex<HashMap<String, DaemonConnection>>,
     event_bus: Option<Arc<EventBus>>,
     execution_events: Mutex<Option<Arc<dyn DaemonExecutionEventHandler>>>,
+    terminal_events: Mutex<Option<Arc<dyn DaemonTerminalEventHandler>>>,
     embedded_execution: Mutex<Option<EmbeddedExecutionContext>>,
 }
 
@@ -124,6 +147,7 @@ impl DaemonConnectionRegistry {
                 connections: Mutex::new(HashMap::new()),
                 event_bus: Some(event_bus),
                 execution_events: Mutex::new(Some(execution_events)),
+                terminal_events: Mutex::new(None),
                 embedded_execution: Mutex::new(None),
             }),
         }
@@ -135,9 +159,14 @@ impl DaemonConnectionRegistry {
                 connections: Mutex::new(HashMap::new()),
                 event_bus: None,
                 execution_events: Mutex::new(None),
+                terminal_events: Mutex::new(None),
                 embedded_execution: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn set_terminal_event_handler(&self, handler: Arc<dyn DaemonTerminalEventHandler>) {
+        *lock(&self.inner.terminal_events) = Some(handler);
     }
 
     pub fn set_embedded_execution_context(
@@ -357,17 +386,16 @@ impl DaemonConnectionRegistry {
     }
 
     fn dispatch_notification(&self, daemon_id: &str, method: String, params: Value) {
-        let Some(handler) = lock(&self.inner.execution_events).clone() else {
-            tracing::info!(
-                daemon_id,
-                method,
-                "dropping daemon notification; no execution event handler is configured"
-            );
-            return;
-        };
-
         match method.as_str() {
             api_types::METHOD_EXECUTION_LOG => {
+                let Some(handler) = lock(&self.inner.execution_events).clone() else {
+                    tracing::info!(
+                        daemon_id,
+                        method,
+                        "dropping daemon notification; no execution event handler is configured"
+                    );
+                    return;
+                };
                 match serde_json::from_value::<api_types::ExecutionLogNotification>(params) {
                     Ok(notification) => {
                         let daemon_id = daemon_id.to_owned();
@@ -387,6 +415,14 @@ impl DaemonConnectionRegistry {
                 }
             }
             api_types::METHOD_EXECUTION_TERMINAL => {
+                let Some(handler) = lock(&self.inner.execution_events).clone() else {
+                    tracing::info!(
+                        daemon_id,
+                        method,
+                        "dropping daemon notification; no execution event handler is configured"
+                    );
+                    return;
+                };
                 match serde_json::from_value::<api_types::ExecutionTerminalNotification>(params) {
                     Ok(notification) => {
                         let daemon_id = daemon_id.to_owned();
@@ -406,6 +442,72 @@ impl DaemonConnectionRegistry {
                             daemon_id,
                             %error,
                             "dropping malformed execution.terminal notification"
+                        );
+                    }
+                }
+            }
+            api_types::METHOD_TERMINAL_OUTPUT => {
+                let Some(handler) = lock(&self.inner.terminal_events).clone() else {
+                    tracing::info!(
+                        daemon_id,
+                        method,
+                        "dropping daemon notification; no terminal event handler is configured"
+                    );
+                    return;
+                };
+                match serde_json::from_value::<api_types::TerminalOutputNotification>(params) {
+                    Ok(notification) => {
+                        let daemon_id = daemon_id.to_owned();
+                        tokio::spawn(async move {
+                            if let Err(error) = handler
+                                .handle_terminal_output(&daemon_id, notification)
+                                .await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to handle daemon terminal output notification"
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            daemon_id,
+                            %error,
+                            "dropping malformed terminal.output notification"
+                        );
+                    }
+                }
+            }
+            api_types::METHOD_TERMINAL_EXITED => {
+                let Some(handler) = lock(&self.inner.terminal_events).clone() else {
+                    tracing::info!(
+                        daemon_id,
+                        method,
+                        "dropping daemon notification; no terminal event handler is configured"
+                    );
+                    return;
+                };
+                match serde_json::from_value::<api_types::TerminalExitedNotification>(params) {
+                    Ok(notification) => {
+                        let daemon_id = daemon_id.to_owned();
+                        tokio::spawn(async move {
+                            if let Err(error) = handler
+                                .handle_terminal_exited(&daemon_id, notification)
+                                .await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to handle daemon terminal exited notification"
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            daemon_id,
+                            %error,
+                            "dropping malformed terminal.exited notification"
                         );
                     }
                 }

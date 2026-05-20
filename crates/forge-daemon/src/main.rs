@@ -3,6 +3,7 @@ mod connect;
 mod credentials;
 mod detect;
 mod reporter;
+mod terminal;
 
 use std::{
     collections::BTreeMap,

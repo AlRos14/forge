@@ -4,7 +4,11 @@ use api_types::{GateConfig, StateDefinition, StateKind, WorkflowDefinition};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::{merge_service::MergeService, workspace_cleanup::WorkspaceCleanupScheduler};
+use crate::{
+    merge_service::MergeService, terminal_service::TerminalActivityTracker,
+    workspace_cleanup::WorkspaceCleanupScheduler,
+    workspace_execution_lock::WorkspaceExecutionLockManager,
+};
 use executors::TaskExecutor;
 use workspace::RepoCacheLockManager;
 
@@ -29,6 +33,8 @@ pub struct HookContext {
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
     pub task_executor: Option<Arc<dyn TaskExecutor>>,
     pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
+    pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
     pub workspace_root: PathBuf,
     pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     pub workspace_id: Option<String>,

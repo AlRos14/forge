@@ -196,6 +196,49 @@ pub trait TaskMediaRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait TerminalSessionRepo: Send + Sync {
+    async fn create_terminal_session(
+        &self,
+        input: CreateTerminalSession,
+    ) -> Result<TerminalSession>;
+    async fn get_terminal_session(&self, id: &str) -> Result<Option<TerminalSession>>;
+    async fn list_terminal_sessions_for_task(
+        &self,
+        task_id: &str,
+        include_ended: bool,
+    ) -> Result<Vec<TerminalSession>>;
+    async fn list_running_terminal_sessions_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TerminalSession>>;
+    async fn list_running_terminal_sessions_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TerminalSession>>;
+    async fn list_running_terminal_sessions_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<TerminalSession>>;
+    async fn list_all_running_terminal_sessions(&self) -> Result<Vec<TerminalSession>>;
+    async fn update_terminal_session_status(
+        &self,
+        id: &str,
+        expected_version: i64,
+        update: UpdateTerminalSessionStatus,
+    ) -> Result<TerminalSession>;
+    async fn update_terminal_session_size(
+        &self,
+        id: &str,
+        rows: i64,
+        cols: i64,
+        last_activity_at: &str,
+    ) -> Result<TerminalSession>;
+    async fn touch_terminal_session_activity(&self, id: &str, last_activity_at: &str)
+        -> Result<()>;
+    async fn delete_terminal_sessions_for_workspace(&self, workspace_id: &str) -> Result<u64>;
+}
+
+#[async_trait]
 pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;

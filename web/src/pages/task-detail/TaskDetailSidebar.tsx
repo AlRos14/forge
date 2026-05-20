@@ -5,6 +5,7 @@ import {
   GitBranchIcon as GitBranch,
   HouseIcon as House,
   PlayIcon as Play,
+  TerminalWindowIcon as TerminalWindow,
 } from '@phosphor-icons/react'
 import { Link } from '@tanstack/react-router'
 import { Badge } from '@/components/ui/badge'
@@ -28,7 +29,7 @@ function statusBadge(status: TaskStatus) {
   return <Badge className={cn('border-transparent', statusClassNames[status])}>{status}</Badge>
 }
 
-type ActiveTab = 'overview' | 'executions' | 'review' | 'diff' | 'comments' | 'history'
+type ActiveTab = 'overview' | 'executions' | 'review' | 'diff' | 'terminal' | 'comments' | 'history'
 
 interface TaskDetailSidebarProps {
   task: Task | undefined
@@ -52,12 +53,47 @@ export function TaskDetailSidebar({
   showReviewTab,
 }: TaskDetailSidebarProps) {
   const navItems = [
-    { id: 'overview' as const, label: 'Overview', Icon: House, badge: undefined as string | undefined },
-    { id: 'executions' as const, label: 'Executions', Icon: Play, badge: executionCount > 0 ? String(executionCount) : undefined },
-    ...(showReviewTab ? [{ id: 'review' as const, label: 'Review', Icon: CheckSquare, badge: undefined as string | undefined }] : []),
+    {
+      id: 'overview' as const,
+      label: 'Overview',
+      Icon: House,
+      badge: undefined as string | undefined,
+    },
+    {
+      id: 'executions' as const,
+      label: 'Executions',
+      Icon: Play,
+      badge: executionCount > 0 ? String(executionCount) : undefined,
+    },
+    ...(showReviewTab
+      ? [
+          {
+            id: 'review' as const,
+            label: 'Review',
+            Icon: CheckSquare,
+            badge: undefined as string | undefined,
+          },
+        ]
+      : []),
     { id: 'diff' as const, label: 'Diff', Icon: GitBranch, badge: undefined as string | undefined },
-    { id: 'comments' as const, label: 'Comments', Icon: Chat, badge: commentCount > 0 ? String(commentCount) : undefined },
-    { id: 'history' as const, label: 'History', Icon: ClockCounterClockwise, badge: undefined as string | undefined },
+    {
+      id: 'terminal' as const,
+      label: 'Terminal',
+      Icon: TerminalWindow,
+      badge: undefined as string | undefined,
+    },
+    {
+      id: 'comments' as const,
+      label: 'Comments',
+      Icon: Chat,
+      badge: commentCount > 0 ? String(commentCount) : undefined,
+    },
+    {
+      id: 'history' as const,
+      label: 'History',
+      Icon: ClockCounterClockwise,
+      badge: undefined as string | undefined,
+    },
   ]
 
   return (

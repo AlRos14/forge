@@ -513,6 +513,62 @@ pub struct CreateTaskMedia {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSessionStatus {
+    Starting,
+    Running,
+    Exited,
+    Terminated,
+    TimedOut,
+    Orphaned,
+    CleanupTerminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSession {
+    pub id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub daemon_id: Option<String>,
+    pub status: TerminalSessionStatus,
+    pub rows: i64,
+    pub cols: i64,
+    pub pid: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub exit_signal: Option<String>,
+    pub exit_reason: Option<String>,
+    pub created_by_user_id: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTerminalSession {
+    pub id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub daemon_id: Option<String>,
+    pub created_by_user_id: String,
+    pub rows: i64,
+    pub cols: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTerminalSessionStatus {
+    pub status: TerminalSessionStatus,
+    pub started_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub pid: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub exit_signal: Option<String>,
+    pub exit_reason: Option<String>,
+}
+
 macro_rules! enum_strings {
     ($enum:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         impl fmt::Display for $enum {
@@ -629,6 +685,16 @@ enum_strings!(CommentAuthorType {
     User => "user",
     Agent => "agent",
     System => "system",
+});
+
+enum_strings!(TerminalSessionStatus {
+    Starting => "starting",
+    Running => "running",
+    Exited => "exited",
+    Terminated => "terminated",
+    TimedOut => "timed_out",
+    Orphaned => "orphaned",
+    CleanupTerminated => "cleanup_terminated",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
