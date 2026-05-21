@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-21
+
 ### Added
 
 - Added the project-wide hook engine with committed task-event evaluation, all-work-completed trigger support, hook actions for dispatching agents, creating tasks, comments, and notifications, plus hook-run history access.
@@ -16,6 +18,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Fixed
 
 - Terminal resize/start now rejects row or column counts below 2 with `invalid_input`, drops reconnect scrollback after all clients detach, validates terminal session limit config on load, and serializes web reattach attempts.
+- Refreshed the Rust dependency lockfile and compatibility fixes so `cargo audit` and Rust CI pass on the current stable toolchain.
 
 ### Breaking
 
