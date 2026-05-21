@@ -896,7 +896,9 @@ async fn send_daemon_response<T: Serialize>(socket: &mut ClientSocket, id: Strin
     };
     socket
         .send(WsMessage::Text(
-            serde_json::to_string(&frame).expect("daemon response serializes"),
+            serde_json::to_string(&frame)
+                .expect("daemon response serializes")
+                .into(),
         ))
         .await
         .expect("send daemon response");
@@ -913,7 +915,9 @@ async fn send_daemon_notification<T: Serialize>(
     };
     socket
         .send(WsMessage::Text(
-            serde_json::to_string(&frame).expect("daemon notification frame serializes"),
+            serde_json::to_string(&frame)
+                .expect("daemon notification frame serializes")
+                .into(),
         ))
         .await
         .expect("send daemon notification");
@@ -922,7 +926,9 @@ async fn send_daemon_notification<T: Serialize>(
 async fn send_terminal_client_frame(socket: &mut ClientSocket, frame: TerminalClientFrame) {
     socket
         .send(WsMessage::Text(
-            serde_json::to_string(&frame).expect("terminal client frame serializes"),
+            serde_json::to_string(&frame)
+                .expect("terminal client frame serializes")
+                .into(),
         ))
         .await
         .expect("send terminal client frame");
@@ -1141,6 +1147,7 @@ async fn seed_terminal_task_for_daemon(state: &AppState, daemon_id: &str) -> Ter
             description: None,
             task_type: "task".to_owned(),
             status: "in_progress".to_owned(),
+            is_automation: false,
             priority: 0,
             subtask_order: None,
             task_state_config: None,
