@@ -1041,6 +1041,7 @@ fn forge_create_sub_tasks_nested_rejected() {
                 description: None,
                 task_type: "task".to_owned(),
                 status: "todo".to_owned(),
+                is_automation: false,
                 priority: 0,
                 subtask_order: Some(0),
                 task_state_config: None,

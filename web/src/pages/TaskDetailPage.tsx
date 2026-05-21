@@ -52,6 +52,7 @@ import { TaskDetailSidebar } from '@/pages/task-detail/TaskDetailSidebar'
 import { TaskDiffPanel } from '@/pages/task-detail/TaskDiffPanel'
 import { TaskLaunchDialog } from '@/pages/task-detail/TaskLaunchDialog'
 import { TaskOverviewPanel } from '@/pages/task-detail/TaskOverviewPanel'
+import { TaskTerminalPanel } from '@/components/task-detail/task-terminal-panel'
 import type { ExecutionConfigValue } from '@/components/execution-config/ExecutionConfigBar'
 import type {
   Execution,
@@ -61,13 +62,21 @@ import type {
   WorkflowExceptionAction,
 } from '@/types/generated'
 
-export type TaskDetailTab = 'overview' | 'executions' | 'review' | 'diff' | 'comments' | 'history'
+export type TaskDetailTab =
+  | 'overview'
+  | 'executions'
+  | 'review'
+  | 'diff'
+  | 'terminal'
+  | 'comments'
+  | 'history'
 
 export const taskDetailTabs = [
   'overview',
   'executions',
   'review',
   'diff',
+  'terminal',
   'comments',
   'history',
 ] as const
@@ -687,6 +696,8 @@ export function TaskDetailPage({
               }}
             />
           )}
+
+          {initialTab === 'terminal' && <TaskTerminalPanel taskId={taskId} className="h-full" />}
 
           {initialTab === 'comments' && (
             <div className="px-8 py-6">

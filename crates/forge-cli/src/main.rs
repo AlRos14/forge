@@ -213,6 +213,7 @@ async fn main() {
         config.workflows_dir(),
     )
     .with_effective_config(effective_config.clone());
+    let project_hook_service_handle = Arc::clone(&state.project_hook_service).start();
     let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
     let task_dispatcher = Arc::new(services::TaskDispatcher::new(
         Arc::clone(&state.db),
@@ -348,6 +349,7 @@ async fn main() {
         Ok(Err(error)) => warn!(%error, "task dispatcher task failed during shutdown"),
         Err(_) => warn!("task dispatcher did not stop before shutdown timeout"),
     }
+    project_hook_service_handle.abort();
 }
 
 fn init_tracing(log_dir: &std::path::Path) {

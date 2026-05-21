@@ -28,15 +28,16 @@ pub use time::now_rfc3339;
 pub use models::{
     CreateOAuthAuthorizationCode, CreateOAuthClient, CreateOAuthRefreshToken,
     CreatePersonalAccessToken, CreateProjectAgentLink, CreateProjectIntegration,
-    CreateProjectMember, CreateTaskExternalLink, CreateTaskRoleAssignment, CreateTransitionLog,
-    ExecutionUsage, IntegrationPlatform, OAuthAuthorizationCode, OAuthClient, OAuthRefreshToken,
-    PersonalAccessToken, ProjectAgentLink, ProjectIntegration, ProjectMember, RefreshToken,
-    TaskExternalLink, TaskRoleAssignment, TransitionLog, UpdateProjectIntegration, User,
+    CreateProjectMember, CreateTaskExternalLink, CreateTaskRoleAssignment, CreateTerminalSession,
+    CreateTransitionLog, ExecutionUsage, IntegrationPlatform, OAuthAuthorizationCode, OAuthClient,
+    OAuthRefreshToken, PersonalAccessToken, ProjectAgentLink, ProjectIntegration, ProjectMember,
+    RefreshToken, TaskExternalLink, TaskRoleAssignment, TerminalSession, TerminalSessionStatus,
+    TransitionLog, UpdateProjectIntegration, UpdateTerminalSessionStatus, User,
 };
 pub use repository::{
     CiStepStats, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown,
     OAuthAuthorizationCodeRepo, OAuthClientRepo, OAuthRefreshTokenRepo, PersonalAccessTokenRepo,
     ProjectAgentLinkRepo, ProjectAnalyticsRepo, ProjectMemberRepo, ProjectReviewSummary,
     ProjectTokenStats, RefreshTokenRepo, SystemSettingRepo, TaskRoleAssignmentRepo,
-    TaskUsageSummary, TransitionLogRepo, UpsertExecutionUsage, UserRepo,
+    TaskUsageSummary, TerminalSessionRepo, TransitionLogRepo, UpsertExecutionUsage, UserRepo,
 };

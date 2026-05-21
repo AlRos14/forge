@@ -7,16 +7,18 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, ExecutionStatus,
-    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse, TaskStatus,
+    AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
+    ExecutionResponse, ExecutionStatus, PaginatedResponse, ProjectResponse, RepoResponse,
+    TaskResponse, TaskStatus, TerminalAttachTokenResponse, TerminalServerFrame,
+    TerminalSessionResponse, TerminalSessionStatus,
 };
 use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use db::ReviewRepo;
-use events::{EventBus, EventContext, ForgeEvent};
+use db::{ProjectHookRunRepo, ReviewRepo, TaskRepo};
+use events::{EventBus, EventContext, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -54,7 +56,7 @@ async fn forge_happy_path_end_to_end() {
         StatusCode::OK,
     )
     .await;
-    let _repo_id = repo.id;
+    let repo_id = repo.id;
     assert!(repo.local_path.is_some());
     let expected_local_path = repo_path.canonicalize().expect("canonical repo path");
     let returned_local_path = repo
@@ -150,6 +152,37 @@ async fn forge_happy_path_end_to_end() {
     assert_eq!(ci_steps.as_array().expect("step results array").len(), 1);
     assert_eq!(ci_steps[0]["exit_code"], 0);
 
+    let listed_tasks: PaginatedResponse<TaskResponse> = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        listed_tasks.items.iter().any(|task| task.id == task_id),
+        "normal non-automation task remains visible in project task list"
+    );
+    let persisted_task = TaskRepo::get_by_id(&*harness.state.db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(
+        !persisted_task.is_automation,
+        "happy-path user-created task defaults to non-automation"
+    );
+
+    let hook_runs =
+        ProjectHookRunRepo::list_recent_for_project(&*harness.state.db, &project_id, 10)
+            .await
+            .expect("project hook runs load");
+    assert!(
+        hook_runs.is_empty(),
+        "projects without configured hooks must not create project hook runs"
+    );
+
+    exercise_terminal_session(&harness, workspaces_root.path(), &project_id, &repo_id).await;
+
     let events = drain_events(&mut events_rx).await;
     assert_event_type(&events, "task.created");
     assert_event_type(&events, "task.assigned");
@@ -160,6 +193,12 @@ async fn forge_happy_path_end_to_end() {
     assert_status_event(&events, &task_id, "merging");
     assert_status_event(&events, &task_id, "done");
     assert_event_type(&events, "workspace.cleaned");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != PROJECT_HOOK_RUN_CHANGED_EVENT),
+        "no project_hook.run_changed events are emitted when no hooks are configured"
+    );
 }
 
 struct TestHarness {
@@ -176,6 +215,21 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed test user");
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
@@ -196,7 +250,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         Arc::clone(&event_bus),
         Arc::clone(&adapter_registry),
     ));
-    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
+    let mut state = AppState::with_adapter_registry_services_and_shutdown(
         db,
         Arc::clone(&event_bus),
         true,
@@ -206,7 +260,11 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         review_runner,
         api::state::ShutdownSignal::new(),
         std::env::temp_dir().join("forge-test-workflows"),
-    ));
+    );
+    let mut config = (*state.effective_config).clone();
+    config.terminal.enabled = true;
+    state = state.with_effective_config(config);
+    let state = Arc::new(state);
 
     let web_dist_dir = TestDir::new("forge-happy-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
@@ -218,6 +276,144 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         event_bus,
         _web_dist_dir: web_dist_dir,
     }
+}
+
+async fn exercise_terminal_session(
+    harness: &TestHarness,
+    workspace_root: &Path,
+    project_id: &str,
+    repo_id: &str,
+) {
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Terminal happy path", "description": "terminal smoke" }),
+        StatusCode::OK,
+    )
+    .await;
+    seed_ready_workspace(&harness.state.db, workspace_root, &task.id, repo_id).await;
+
+    let created: CreateTerminalSessionResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/terminals", task.id),
+        json!({ "rows": 24, "cols": 80 }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let refreshed: TerminalAttachTokenResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/terminals/{}/attach-token", created.session.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(created.attach.attach_token, refreshed.attach_token);
+
+    let mut live_rx = harness
+        .state
+        .terminal_service
+        .attach_client(&created.session.id)
+        .await;
+    harness
+        .state
+        .terminal_service
+        .handle_terminal_input(&created.session.id, "ZWNobyBmb3JnZS10ZXJtaW5hbC1vawo=")
+        .await
+        .expect("terminal input accepted");
+    wait_for_terminal_output(&mut live_rx, "forge-terminal-ok").await;
+    drop(live_rx);
+
+    let mut replay_rx = harness
+        .state
+        .terminal_service
+        .attach_client(&created.session.id)
+        .await;
+    wait_for_terminal_output(&mut replay_rx, "forge-terminal-ok").await;
+
+    let terminated: TerminalSessionResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/terminals/{}/terminate", created.session.id),
+        json!({ "reason": "happy_path" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(matches!(
+        terminated.status,
+        TerminalSessionStatus::Terminated
+    ));
+}
+
+async fn seed_ready_workspace(
+    db: &Arc<db::SqliteDb>,
+    workspace_root: &Path,
+    task_id: &str,
+    repo_id: &str,
+) {
+    let now = db::now_rfc3339();
+    let worktree_path = workspace_root.join(task_id).join("terminal-repo");
+    std::fs::create_dir_all(&worktree_path).expect("terminal worktree creates");
+    db::WorkspaceRepo::create(
+        &**db,
+        db::CreateWorkspace {
+            id: db::new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            repo_id: repo_id.to_owned(),
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch: workspace::task_branch_name(task_id),
+            status: db::WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("terminal workspace creates");
+}
+
+async fn wait_for_terminal_output(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalServerFrame>,
+    needle: &str,
+) {
+    let mut collected = String::new();
+    for _ in 0..20 {
+        if let Ok(Some(TerminalServerFrame::Output { data })) =
+            tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+        {
+            collected.push_str(&String::from_utf8_lossy(&decode_base64_standard(&data)));
+            if collected.contains(needle) {
+                return;
+            }
+        }
+    }
+    panic!("terminal output did not contain {needle}; collected {collected:?}");
+}
+
+fn decode_base64_standard(input: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => continue,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    out
 }
 
 async fn setup_git_repo(path: &Path) -> std::path::PathBuf {

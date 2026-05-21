@@ -154,6 +154,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             description: None,
             task_type: "task".to_owned(),
             status: status.to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,
@@ -175,6 +176,8 @@ fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
         cleanup_scheduler: None,
         task_executor: None,
         daemon_connections: None,
+        workspace_exec_locks: None,
+        terminal_activity: None,
         workspace_root: std::path::PathBuf::new(),
         repo_cache_locks: None,
     }

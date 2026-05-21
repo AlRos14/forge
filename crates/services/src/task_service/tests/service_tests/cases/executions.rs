@@ -130,6 +130,57 @@ async fn run_execution_emits_terminal_execution_event() {
 }
 
 #[tokio::test]
+async fn run_execution_rejects_when_terminal_active_in_workspace() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let terminal_activity = Arc::new(TerminalActivityTracker::default());
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_terminal_activity_tracker(Arc::clone(&terminal_activity));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Terminal blocks execution",
+            Some("complete".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id, Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    let workspace_id = claimed
+        .execution
+        .workspace_id
+        .as_deref()
+        .expect("execution has workspace");
+    assert!(terminal_activity.try_mark_active(workspace_id).await);
+    let executor = CountingExecutor::default();
+
+    let error = service
+        .run_execution(claimed.execution.id, &executor)
+        .await
+        .expect_err("active terminal rejects execution");
+
+    assert!(matches!(
+        error,
+        ServiceError::TerminalActiveExecution { .. }
+    ));
+    assert_eq!(
+        executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "executor must not launch while a terminal is active"
+    );
+}
+
+#[tokio::test]
 async fn run_execution_batches_execution_log_events() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(128));
@@ -322,10 +373,26 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
     })
     .await
     .expect("planner execution completes");
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
+    let task = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("task loads")
+                .expect("task exists");
+            let metadata = task.metadata().expect("metadata parses");
+            if metadata
+                .extra
+                .get("awaiting_human_reason")
+                .and_then(Value::as_str)
+                == Some("plan_review")
+            {
+                break task;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner completion marks task awaiting plan review");
     let metadata = task.metadata().expect("metadata parses");
     assert_eq!(
         metadata

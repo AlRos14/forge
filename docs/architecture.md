@@ -65,6 +65,53 @@ The `events` crate wraps `tokio::sync::broadcast`. Services publish
 `ForgeEvent` on state changes; the SSE endpoint at `/api/v1/events` subscribes
 and streams them to web clients and other listeners.
 
+### Task terminal sessions
+
+Task terminal sessions are a separate API and daemon path for interactive shell
+access to an existing task worktree. They do not layer onto
+`TaskService.transition()` or the workflow engine. Creating a terminal does not
+claim, transition, reset, or launch the task.
+
+The browser connects only to the API server in v1. REST calls create sessions
+and issue short-lived attach tokens; the browser then upgrades to
+`/api/v1/terminals/{id}/ws?attach_token=...`. There is no direct
+browser-to-daemon connection. For daemon-owned workspaces, the API server
+proxies terminal operations over the existing daemon transport:
+`terminal.start`, `terminal.input`, `terminal.resize`, and
+`terminal.terminate` requests flow to the daemon, while `terminal.output` and
+`terminal.exited` notifications flow back to the server. Embedded server mode
+uses the same service path and also runs a local PTY-backed process; it does
+not use plain stdin/stdout pipes.
+
+Process ownership lives on the daemon side for daemon-owned workspaces and on
+the API server for embedded workspaces. The API treats a task as daemon-owned
+when the task is directly assigned to an agent with `daemon_id`, or when the
+current workflow state's effective role assignment points to an agent with
+`daemon_id`; otherwise it uses embedded server process handling. Both runtimes
+allocate a PTY, start the shell in the server-authorized worktree, forward input
+and output, apply resizes, and terminate the process. Daemon-side starts
+additionally reject workspace paths that escape the daemon workspace root.
+
+The API server persists lifecycle metadata in `task_terminal_session`, including
+task, workspace, daemon, dimensions, status, timestamps, creator, and exit
+metadata. Attach tokens are stored only in memory and are single-use. Reconnect
+scrollback is an in-memory bounded ring buffer per running session, capped by
+`terminal.reconnect_scrollback_bytes`, and is dropped once all browser clients
+detach from that session; full terminal transcripts are not persisted in v1.
+
+Terminal sessions and managed Forge executions cannot run concurrently in the
+same workspace. Terminal creation is blocked while a managed execution is
+active, and managed execution startup must reject or defer while a terminal is
+active for that workspace.
+
+Cleanup is time- and ownership-bound. The default idle timeout is 30 minutes
+(`terminal.idle_timeout_secs = 1800`) and the default absolute lifetime is
+8 hours (`terminal.max_lifetime_secs = 28800`). Workspace cleanup terminates
+running sessions before removing the worktree. If a daemon disconnects beyond
+the heartbeat cleanup threshold, the daemon kills the terminals it owns and the
+server records the sessions as exited, timed out, orphaned, or cleanup
+terminated when it observes the terminal lifecycle event.
+
 ## Task state machine
 
 ```
@@ -199,7 +246,8 @@ Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=5000` per connection.
 
 Tables: `project`, `repo`, `agent`, `skill`, `task`, `execution`, `review`,
-`task_role_assignment`, `transition_log`, `_migration`.
+`task_role_assignment`, `transition_log`, `task_terminal_session`,
+`_migration`.
 
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.
@@ -225,7 +273,7 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
   execution sharing the executor's workspace. Depends only on `db`, `events`,
   `executors` — not on `api` or `services`.
-- **api** — Routes in `routes/{projects,tasks,agents,repos,executions,events,daemons,clis,profiles,runtimes,executor_types}.rs`.
+- **api** — Routes in `routes/{projects,tasks,terminals,agents,repos,executions,events,daemons,clis,profiles,runtimes,executor_types}.rs`.
   Error module is `errors.rs` (plural). Middleware adds request IDs and CORS.
   `claim_task` auto-dispatches the executor.
 - **executors** — `LogWriter` appends JSONL with schema version + sequence

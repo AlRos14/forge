@@ -12,8 +12,71 @@ pub struct Project {
     pub primary_repo_id: Option<String>,
     pub paused_at: Option<String>,
     pub owner_id: Option<String>,
+    pub project_hooks_json: String,
+    pub project_work_epoch: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectHookRunStatus {
+    Queued,
+    Running,
+    Dispatched,
+    Skipped,
+    Failed,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectHookRun {
+    pub id: String,
+    pub project_id: String,
+    pub rule_id: String,
+    pub trigger_type: String,
+    pub dedupe_key: String,
+    pub status: ProjectHookRunStatus,
+    pub source_task_id: Option<String>,
+    pub source_execution_id: Option<String>,
+    pub automation_task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectHookRun {
+    pub id: String,
+    pub project_id: String,
+    pub rule_id: String,
+    pub trigger_type: String,
+    pub dedupe_key: String,
+    pub status: ProjectHookRunStatus,
+    pub source_task_id: Option<String>,
+    pub source_execution_id: Option<String>,
+    pub automation_task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateProjectHookRun {
+    pub id: String,
+    pub status: ProjectHookRunStatus,
+    // Outer Some means "update this column"; inner None writes SQL NULL.
+    pub automation_task_id: Option<Option<String>>,
+    pub execution_id: Option<Option<String>>,
+    pub agent_id: Option<Option<String>>,
+    pub reason: Option<Option<String>>,
+    pub updated_at: String,
+    pub completed_at: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +373,7 @@ pub struct Task {
     pub description: Option<String>,
     pub task_type: String,
     pub status: TaskStatus,
+    pub is_automation: bool,
     pub priority: i64,
     pub board_position: f64,
     pub subtask_order: Option<i64>,
@@ -484,6 +548,91 @@ pub struct TaskComment {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskMedia {
+    pub id: String,
+    pub task_id: String,
+    pub display_filename: String,
+    pub content_type: String,
+    pub byte_size: i64,
+    pub storage_key: String,
+    pub author_type: CommentAuthorType,
+    pub author_id: Option<String>,
+    pub author_name: String,
+    pub created_at: String,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskMedia {
+    pub id: String,
+    pub task_id: String,
+    pub display_filename: String,
+    pub content_type: String,
+    pub byte_size: i64,
+    pub storage_key: String,
+    pub author_type: CommentAuthorType,
+    pub author_id: Option<String>,
+    pub author_name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSessionStatus {
+    Starting,
+    Running,
+    Exited,
+    Terminated,
+    TimedOut,
+    Orphaned,
+    CleanupTerminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSession {
+    pub id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub daemon_id: Option<String>,
+    pub status: TerminalSessionStatus,
+    pub rows: i64,
+    pub cols: i64,
+    pub pid: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub exit_signal: Option<String>,
+    pub exit_reason: Option<String>,
+    pub created_by_user_id: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTerminalSession {
+    pub id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub daemon_id: Option<String>,
+    pub created_by_user_id: String,
+    pub rows: i64,
+    pub cols: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTerminalSessionStatus {
+    pub status: TerminalSessionStatus,
+    pub started_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub pid: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub exit_signal: Option<String>,
+    pub exit_reason: Option<String>,
+}
+
 macro_rules! enum_strings {
     ($enum:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         impl fmt::Display for $enum {
@@ -596,10 +745,29 @@ enum_strings!(ReviewStatus {
     Cancelled => "cancelled",
 });
 
+enum_strings!(ProjectHookRunStatus {
+    Queued => "queued",
+    Running => "running",
+    Dispatched => "dispatched",
+    Skipped => "skipped",
+    Failed => "failed",
+    Completed => "completed",
+});
+
 enum_strings!(CommentAuthorType {
     User => "user",
     Agent => "agent",
     System => "system",
+});
+
+enum_strings!(TerminalSessionStatus {
+    Starting => "starting",
+    Running => "running",
+    Exited => "exited",
+    Terminated => "terminated",
+    TimedOut => "timed_out",
+    Orphaned => "orphaned",
+    CleanupTerminated => "cleanup_terminated",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

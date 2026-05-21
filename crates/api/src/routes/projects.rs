@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 
 use api_types::{
-    CiStepAnalytics, CreateProjectRequest, ModelTokenBreakdown as ApiModelTokenBreakdown,
-    PaginatedResponse, ProjectAnalyticsResponse, ProjectResponse, ProjectSettings, ReviewConfig,
-    ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest, TokenUsageAnalytics,
-    UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
+    parse_project_hooks_json, CiStepAnalytics, CreateProjectRequest,
+    ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse, ProjectAnalyticsResponse,
+    ProjectHookRunResponse, ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
+    ProjectSettings, ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
+    TokenUsageAnalytics, UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -12,8 +13,9 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CiStepStats, CreateProject, ModelTokenBreakdown,
-    ProjectAnalyticsRepo, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, UpdateProject,
+    new_uuid_v4, now_rfc3339, CiStepStats, CreateProject, ModelTokenBreakdown, PageRequest,
+    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary,
+    ProjectTokenStats, SortBy, SortOrder, UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -86,7 +88,7 @@ pub async fn create_project(
         },
     });
 
-    Ok(Json(project_response(project)))
+    Ok(Json(project_response(project)?))
 }
 
 pub async fn list_projects(
@@ -114,7 +116,10 @@ pub async fn list_projects(
         }
     }
     let response = PaginatedResponse {
-        items: visible_items.into_iter().map(project_response).collect(),
+        items: visible_items
+            .into_iter()
+            .map(project_response)
+            .collect::<ApiResult<Vec<_>>>()?,
         next_cursor,
         has_more,
         total_count,
@@ -139,7 +144,36 @@ pub async fn get_project(
             return Err(ApiError::not_found("project", id));
         }
     }
-    Ok(Json(project_response(project)))
+    Ok(Json(project_response(project)?))
+}
+
+pub async fn list_project_hook_runs(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Query(params): Query<ListParams>,
+) -> ApiResult<Json<ProjectHookRunsResponse>> {
+    require_project_visible(&state, &id, &user.user_id).await?;
+    let page = ProjectHookRunRepo::list_for_project(
+        &*state.db,
+        &id,
+        PageRequest {
+            cursor: params.cursor,
+            limit: params.limit.unwrap_or(20).clamp(1, 100),
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await?;
+    Ok(Json(ProjectHookRunsResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(project_hook_run_response)
+            .collect(),
+        next_cursor: page.next_cursor,
+    }))
 }
 
 pub async fn get_project_analytics(
@@ -325,7 +359,7 @@ pub async fn pause_project(
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
     if project.paused_at.is_some() {
-        return Ok(Json(project_response(project)));
+        return Ok(Json(project_response(project)?));
     }
 
     let paused_at = now_rfc3339();
@@ -341,7 +375,7 @@ pub async fn pause_project(
         context: EventContext::ProjectPaused { paused_at },
     });
 
-    Ok(Json(project_response(project)))
+    Ok(Json(project_response(project)?))
 }
 
 pub async fn resume_project(
@@ -352,7 +386,7 @@ pub async fn resume_project(
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
     if project.paused_at.is_none() {
-        return Ok(Json(project_response(project)));
+        return Ok(Json(project_response(project)?));
     }
 
     ProjectRepo::set_paused_at(&*state.db, &id, None).await?;
@@ -367,7 +401,7 @@ pub async fn resume_project(
         context: EventContext::ProjectResumed {},
     });
 
-    Ok(Json(project_response(project)))
+    Ok(Json(project_response(project)?))
 }
 
 pub async fn update_project(
@@ -376,22 +410,45 @@ pub async fn update_project(
     Path(id): Path<String>,
     Json(request): Json<UpdateProjectRequest>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    let UpdateProjectRequest {
+        name,
+        settings,
+        default_review_config,
+        primary_repo_id,
+        paused,
+        project_hooks,
+    } = request;
+    let project_hooks_json = match project_hooks {
+        Some(rules) => {
+            let serialized = serde_json::to_string(&rules).map_err(|error| {
+                ApiError::bad_request(format!("invalid project hooks: {error}"))
+            })?;
+            parse_project_hooks_json(&serialized).map_err(ApiError::bad_request)?;
+            Some(serialized)
+        }
+        None => None,
+    };
     let settings = update_settings(
         &state.db,
         &id,
         &user.user_id,
-        request.settings,
-        request.default_review_config.as_ref(),
+        settings,
+        default_review_config.as_ref(),
     )
     .await?;
+    if let Some(project_hooks_json) = project_hooks_json.as_deref() {
+        let updated_at = now_rfc3339();
+        ProjectRepo::set_project_hooks_json(&*state.db, &id, project_hooks_json, &updated_at)
+            .await?;
+    }
     let project = ProjectRepo::update(
         &*state.db,
         UpdateProject {
             id,
-            name: request.name,
+            name,
             settings,
-            primary_repo_id: request.primary_repo_id.map(Some),
-            paused_at: request.paused.map(|paused: bool| paused.then(now_rfc3339)),
+            primary_repo_id: primary_repo_id.map(Some),
+            paused_at: paused.map(|paused: bool| paused.then(now_rfc3339)),
             updated_at: now_rfc3339(),
         },
     )
@@ -403,7 +460,52 @@ pub async fn update_project(
         context: EventContext::ProjectUpdated {},
     });
 
-    Ok(Json(project_response(project)))
+    Ok(Json(project_response(project)?))
+}
+
+async fn require_project_visible(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> ApiResult<db::Project> {
+    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
+    if project.owner_id.is_some()
+        && db::ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
+            .await?
+            .is_none()
+    {
+        return Err(ApiError::not_found("project", project_id.to_owned()));
+    }
+    Ok(project)
+}
+
+fn project_hook_run_response(run: ProjectHookRun) -> ProjectHookRunResponse {
+    ProjectHookRunResponse {
+        id: run.id,
+        project_id: run.project_id,
+        rule_id: run.rule_id,
+        trigger_type: run.trigger_type,
+        dedupe_key: run.dedupe_key,
+        status: match run.status {
+            db::ProjectHookRunStatus::Queued => ProjectHookRunStatus::Queued,
+            db::ProjectHookRunStatus::Running => ProjectHookRunStatus::Running,
+            db::ProjectHookRunStatus::Dispatched => ProjectHookRunStatus::Dispatched,
+            db::ProjectHookRunStatus::Skipped => ProjectHookRunStatus::Skipped,
+            db::ProjectHookRunStatus::Failed => ProjectHookRunStatus::Failed,
+            db::ProjectHookRunStatus::Completed => ProjectHookRunStatus::Completed,
+        },
+        source_task_id: run.source_task_id,
+        source_execution_id: run.source_execution_id,
+        automation_task_id: run.automation_task_id,
+        execution_id: run.execution_id,
+        agent_id: run.agent_id,
+        reason: run.reason,
+        created_at: run.created_at,
+        updated_at: run.updated_at,
+        completed_at: run.completed_at,
+    }
 }
 
 pub async fn test_project_lifecycle_hook(

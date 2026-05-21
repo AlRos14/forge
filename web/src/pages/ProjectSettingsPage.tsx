@@ -348,6 +348,7 @@ export function ProjectSettingsPage({
 
           {initialTab === 'hooks' && (
             <HooksTab
+              project={project}
               projectId={projectId}
               projectIsLoading={projectQuery.isLoading}
               canSave={Boolean(project)}

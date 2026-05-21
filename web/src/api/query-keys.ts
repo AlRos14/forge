@@ -8,12 +8,16 @@ export const qk = {
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
   reviews: (taskId: string) => ['tasks', taskId, 'reviews'] as const,
   comments: (taskId: string) => ['tasks', taskId, 'comments'] as const,
+  taskMedia: (taskId: string) => ['tasks', taskId, 'media'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,
   agent: (id: string) => ['agents', id] as const,
   agentTasks: (id: string, filterKey: string) => ['agents', id, 'tasks', filterKey] as const,
   project: (id: string) => ['projects', id] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
+  projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
+  projectHookRunPages: (projectId: string, limit: number) =>
+    ['projects', projectId, 'project-hook-runs', limit] as const,
   projectConversations: (projectId: string, status: string = 'active') =>
     ['projects', projectId, 'conversations', status] as const,
   conversation: (id: string) => ['conversations', id] as const,

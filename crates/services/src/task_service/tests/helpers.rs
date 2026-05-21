@@ -168,6 +168,7 @@ pub(super) async fn seed_task_with_status_at(
             description: Some("seeded task".to_owned()),
             task_type: "task".to_owned(),
             status: status.to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,

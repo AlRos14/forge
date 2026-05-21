@@ -292,6 +292,8 @@ mod tests {
             primary_repo_id: None,
             paused_at: None,
             owner_id: None,
+            project_hooks_json: "[]".to_owned(),
+            project_work_epoch: 0,
             created_at: "now".to_owned(),
             updated_at: "now".to_owned(),
         }

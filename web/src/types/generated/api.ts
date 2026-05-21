@@ -1,6 +1,8 @@
 // Types aligned with the backend api-types crate responses.
 // PaginatedResponse<T> = { data: T[], next_cursor?, has_more, total_count? }
 
+import type { ProjectHookRule } from './bindings/ProjectHookRule'
+
 export type TaskStatus = string
 
 export type TaskType = 'task' | 'planning_task' | 'sub_task'
@@ -67,6 +69,78 @@ export type WorkMode = 'direct_merge' | 'pull_request'
 export type ConversationStatus = 'active' | 'archived'
 export type ConversationMessageRole = 'user' | 'assistant' | 'system'
 export type ConversationMessageStatus = 'complete' | 'streaming' | 'failed' | 'cancelled'
+export type TerminalSessionStatus =
+  | 'starting'
+  | 'running'
+  | 'exited'
+  | 'terminated'
+  | 'timed_out'
+  | 'orphaned'
+  | 'cleanup_terminated'
+
+export interface TerminalSessionResponse {
+  id: string
+  task_id: string
+  workspace_id: string
+  daemon_id?: string | null
+  status: TerminalSessionStatus
+  rows: number
+  cols: number
+  exit_code?: number | null
+  exit_signal?: string | null
+  exit_reason?: string | null
+  created_at: string
+  started_at?: string | null
+  last_activity_at?: string | null
+  ended_at?: string | null
+  created_by_user_id: string
+}
+
+export interface CreateTerminalSessionRequest {
+  rows?: number | null
+  cols?: number | null
+}
+
+export interface ResizeTerminalSessionRequest {
+  rows: number
+  cols: number
+}
+
+export interface TerminalAttachTokenResponse {
+  attach_token: string
+  expires_at: string
+  ws_url: string
+  session_id: string
+}
+
+export interface TerminalAvailability {
+  enabled: boolean
+  workspace_ready: boolean
+  daemon_reachable: boolean
+  active_execution: boolean
+  session_count_for_task: number
+  session_count_for_user: number
+  max_sessions_per_task: number
+  max_sessions_per_user: number
+  can_create: boolean
+  reason?: string | null
+}
+
+export type TerminalClientFrame =
+  | { type: 'input'; data: string }
+  | { type: 'resize'; rows: number; cols: number }
+  | { type: 'ping' }
+
+export type TerminalServerFrame =
+  | { type: 'output'; data: string }
+  | {
+      type: 'exit'
+      exit_code?: number | null
+      signal?: string | null
+      reason?: string | null
+    }
+  | { type: 'error'; code: string; message: string }
+  | { type: 'pong' }
 
 export interface BlockingArtifact {
   kind: string
@@ -431,6 +505,7 @@ export interface Project {
   name: string
   primary_repo_id: string | null
   settings: Record<string, unknown>
+  project_hooks: ProjectHookRule[]
   default_review_config?: ReviewConfig | null
   workflow_template_name?: string | null
   paused_at: string | null
@@ -728,6 +803,7 @@ export interface UpdateProjectRequest {
   primary_repo_id?: string | null
   settings?: Record<string, unknown> | null
   default_review_config?: ReviewConfig | null
+  project_hooks?: ProjectHookRule[] | null
 }
 
 export interface CreateRepoRequest {

@@ -2,6 +2,7 @@ use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     lifecycle::{LifecycleHookContext, LifecycleHookRun, LifecycleHookRunner},
     merge_service::MergeService,
+    terminal_service::TerminalActivityTracker,
     workflow::{default_states, engine::WorkflowEngine},
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
@@ -102,6 +103,7 @@ pub struct TaskService {
     task_executor: Option<Arc<dyn TaskExecutor>>,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
+    terminal_activity: Option<Arc<TerminalActivityTracker>>,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     workspace_root: PathBuf,
 }
@@ -173,6 +175,7 @@ impl TaskService {
             task_executor: None,
             daemon_connections: None,
             workspace_exec_locks: None,
+            terminal_activity: None,
             repo_cache_locks: None,
             workspace_root: default_workspace_root(),
         }
@@ -203,6 +206,14 @@ impl TaskService {
 
     pub fn with_workspace_exec_locks(mut self, locks: Arc<WorkspaceExecutionLockManager>) -> Self {
         self.workspace_exec_locks = Some(locks);
+        self
+    }
+
+    pub fn with_terminal_activity_tracker(
+        mut self,
+        terminal_activity: Arc<TerminalActivityTracker>,
+    ) -> Self {
+        self.terminal_activity = Some(terminal_activity);
         self
     }
 

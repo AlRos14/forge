@@ -4,19 +4,22 @@ use crate::{
     ConversationMessageListQuery, ConversationMessageRepo, ConversationRepo, CreateAgent,
     CreateConversation, CreateConversationMessage, CreateExecution, CreateNotification,
     CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAgentLink,
-    CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
-    CreateTaskComment, CreateTaskExternalLink, CreateWorkspace, Daemon, DaemonRepo, DbError,
-    Execution, ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo,
-    ExternalLinkRepo, IntegrationRepo, ModelTokenBreakdown, Notification, NotificationListQuery,
-    NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
-    PrProviderConfigRepo, Project, ProjectAgentLink, ProjectAgentLinkRepo, ProjectAnalyticsRepo,
-    ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, Repo, RepoRepo,
-    Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, Skill,
-    SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo,
-    TaskExternalLink, TaskListQuery, TaskRepo, TaskUsageSummary, UpdateAgent, UpdateConversation,
-    UpdateConversationMessage, UpdateDaemonReport, UpdateExecution, UpdatePrMetadata,
-    UpdatePrProviderConfig, UpdateProject, UpdateProjectIntegration, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
+    CreateProjectHookRun, CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime,
+    CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia,
+    CreateTerminalSession, CreateWorkspace, Daemon, DaemonRepo, DbError, Execution, ExecutionRepo,
+    ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo,
+    ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page, PageRequest,
+    PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink,
+    ProjectAgentLinkRepo, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
+    ProjectHookRunStatus, ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
+    Repo, RepoRepo, Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery,
+    RuntimeRepo, Skill, SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo,
+    TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo,
+    TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    UpdateConversation, UpdateConversationMessage, UpdateDaemonReport, UpdateExecution,
+    UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
+    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
     WorkspaceStatus,
 };
 use async_trait::async_trait;
@@ -42,6 +45,7 @@ mod pr_metadata;
 mod pr_provider_config;
 mod project;
 mod project_agent_link;
+mod project_hook_run;
 mod project_member;
 mod repo;
 mod review;
@@ -51,6 +55,8 @@ mod system_setting;
 mod task;
 mod task_comment;
 mod task_dependency;
+mod task_media;
+mod task_terminal_session;
 mod user_auth;
 mod workflow;
 mod workspace;
@@ -133,8 +139,8 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
     }
 }
 
-const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
-const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
     page.limit.clamp(1, 500)
@@ -190,6 +196,8 @@ fn map_project(row: SqliteRow) -> Result<Project> {
         primary_repo_id: row.try_get("primary_repo_id")?,
         paused_at: row.try_get("paused_at")?,
         owner_id: row.try_get("owner_id")?,
+        project_hooks_json: row.try_get("project_hooks_json")?,
+        project_work_epoch: row.try_get("project_work_epoch")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -374,6 +382,7 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         description: row.try_get("description")?,
         task_type: row.try_get("task_type")?,
         status: row.try_get("status")?,
+        is_automation: row.try_get::<i64, _>("is_automation")? != 0,
         priority: row.try_get("priority")?,
         board_position: row.try_get("board_position")?,
         subtask_order: row.try_get("subtask_order")?,
@@ -468,6 +477,44 @@ fn map_task_comment(row: SqliteRow) -> Result<TaskComment> {
         content: row.try_get("content")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_task_media(row: SqliteRow) -> Result<TaskMedia> {
+    Ok(TaskMedia {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        display_filename: row.try_get("display_filename")?,
+        content_type: row.try_get("content_type")?,
+        byte_size: row.try_get("byte_size")?,
+        storage_key: row.try_get("storage_key")?,
+        author_type: parse_enum(row.try_get::<String, _>("author_type")?)?,
+        author_id: row.try_get("author_id")?,
+        author_name: row.try_get("author_name")?,
+        created_at: row.try_get("created_at")?,
+        deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn map_terminal_session(row: SqliteRow) -> Result<TerminalSession> {
+    Ok(TerminalSession {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        daemon_id: row.try_get("daemon_id")?,
+        status: parse_enum(row.try_get::<String, _>("status")?)?,
+        rows: row.try_get("rows")?,
+        cols: row.try_get("cols")?,
+        pid: row.try_get("pid")?,
+        exit_code: row.try_get("exit_code")?,
+        exit_signal: row.try_get("exit_signal")?,
+        exit_reason: row.try_get("exit_reason")?,
+        created_by_user_id: row.try_get("created_by_user_id")?,
+        created_at: row.try_get("created_at")?,
+        started_at: row.try_get("started_at")?,
+        last_activity_at: row.try_get("last_activity_at")?,
+        ended_at: row.try_get("ended_at")?,
+        version: row.try_get("version")?,
     })
 }
 

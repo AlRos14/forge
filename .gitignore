@@ -42,7 +42,13 @@ credentials*
 
 .claude/worktrees/
 .playwright-mcp
+.codex/
 .pnpm-store/
 test-results/
 
 node_modules/
+
+docs/spec/
+
+# Canonical generated TypeScript bindings live under web/src/types/generated.
+crates/api-types/bindings/ProjectHook*.ts

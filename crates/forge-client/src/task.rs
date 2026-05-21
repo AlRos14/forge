@@ -1,9 +1,12 @@
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use api_types::{
-    ClaimTaskRequest, CreateTaskRequest, PaginatedResponse, TaskResponse, TransitionTaskRequest,
-    TransitionTaskResponse,
+    ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, PaginatedResponse,
+    TaskMediaResponse, TaskResponse, TransitionTaskRequest, TransitionTaskResponse,
 };
 use clap::Subcommand;
+use reqwest::multipart::Form;
 use serde_json::json;
 
 use crate::{
@@ -15,11 +18,11 @@ use crate::{
 #[derive(clap::Args)]
 pub struct TaskArgs {
     #[command(subcommand)]
-    cmd: TaskCmd,
+    pub cmd: TaskCmd,
 }
 
 #[derive(Subcommand)]
-enum TaskCmd {
+pub enum TaskCmd {
     Create {
         #[arg(long)]
         project_id: String,
@@ -53,6 +56,35 @@ enum TaskCmd {
     },
     Cancel {
         id: String,
+    },
+    Media(MediaArgs),
+}
+
+#[derive(clap::Args)]
+pub struct MediaArgs {
+    #[command(subcommand)]
+    pub cmd: MediaCmd,
+}
+
+#[derive(Subcommand)]
+pub enum MediaCmd {
+    Upload {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        author_name: Option<String>,
+    },
+    Comment {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        author_name: Option<String>,
+        #[arg(long)]
+        media_url: Vec<String>,
     },
 }
 
@@ -132,8 +164,75 @@ impl TaskArgs {
                     .await?;
                 print_task(output, &task)
             }
+            TaskCmd::Media(args) => args.run(client, output).await,
         }
     }
+}
+
+impl MediaArgs {
+    async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
+        match &self.cmd {
+            MediaCmd::Upload {
+                task_id,
+                file,
+                author_name,
+            } => {
+                let media = upload_media(client, task_id, file, author_name.as_deref()).await?;
+                print_media(output, &media)
+            }
+            MediaCmd::Comment {
+                task_id,
+                content,
+                author_name,
+                media_url,
+            } => {
+                let comment = create_media_comment(
+                    client,
+                    task_id,
+                    content,
+                    author_name.as_deref(),
+                    media_url,
+                )
+                .await?;
+                print_json(&comment)
+            }
+        }
+    }
+}
+
+async fn upload_media(
+    client: &ForgeClient,
+    task_id: &str,
+    file: &Path,
+    author_name: Option<&str>,
+) -> Result<TaskMediaResponse> {
+    let mut form = Form::new()
+        .file("file", file)
+        .await
+        .with_context(|| format!("read media file {}", file.display()))?;
+    if let Some(author_name) = non_empty_author(author_name) {
+        form = form.text("author_name", author_name.to_owned());
+    }
+
+    client
+        .post_multipart(&format!("/api/v1/tasks/{task_id}/media"), form)
+        .await
+}
+
+async fn create_media_comment(
+    client: &ForgeClient,
+    task_id: &str,
+    content: &str,
+    author_name: Option<&str>,
+    media_urls: &[String],
+) -> Result<CommentResponse> {
+    let request = CreateCommentRequest {
+        content: comment_content_with_media(content, media_urls),
+        author_name: non_empty_author(author_name).unwrap_or("Agent").to_owned(),
+    };
+    client
+        .post(&format!("/api/v1/tasks/{task_id}/comments"), &request)
+        .await
 }
 
 fn task_list_path(project_id: &str, status: Option<&str>, limit: Option<i64>) -> String {
@@ -160,4 +259,84 @@ fn print_task(output: &OutputFormat, task: &TaskResponse) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn print_media(output: &OutputFormat, media: &TaskMediaResponse) -> Result<()> {
+    match output {
+        OutputFormat::Json => print_json(media),
+        OutputFormat::Table => {
+            println!(
+                "{}  {}  {}  {}",
+                media.id, media.content_type, media.byte_size, media.url
+            );
+            Ok(())
+        }
+    }
+}
+
+fn non_empty_author(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn comment_content_with_media(content: &str, media_urls: &[String]) -> String {
+    if media_urls.is_empty() {
+        return content.to_owned();
+    }
+
+    let mut rendered = content.to_owned();
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered.push('\n');
+    for media_url in media_urls {
+        rendered.push_str(&media_markdown(media_url));
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn media_markdown(media_url: &str) -> String {
+    match media_extension(media_url).as_deref() {
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "svg") => {
+            format!("![media]({media_url})")
+        }
+        Some("mp4" | "webm" | "mov") => {
+            format!(
+                "<video src=\"{}\" controls></video>",
+                html_attr_escape(media_url)
+            )
+        }
+        _ => format!("[media]({media_url})"),
+    }
+}
+
+fn media_extension(media_url: &str) -> Option<String> {
+    let path = url::Url::parse(media_url)
+        .ok()
+        .map(|url| url.path().to_owned())
+        .unwrap_or_else(|| {
+            media_url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(media_url)
+                .to_owned()
+        });
+    Path::new(&path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+fn html_attr_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }

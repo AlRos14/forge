@@ -2,6 +2,12 @@ use db::DbError;
 use serde_json::{json, Value};
 use services::ServiceError;
 
+use api_types::{
+    TERMINAL_ACTIVE_EXECUTION, TERMINAL_ATTACH_TOKEN_INVALID, TERMINAL_DAEMON_UNAVAILABLE,
+    TERMINAL_DISABLED, TERMINAL_INVALID_INPUT, TERMINAL_NOT_FOUND, TERMINAL_PATH_GUARDRAIL,
+    TERMINAL_SESSION_LIMIT, TERMINAL_USER_LIMIT, TERMINAL_WORKSPACE_NOT_READY,
+};
+
 use crate::protocol::{error_response, McpResponse};
 
 #[derive(Debug)]
@@ -119,6 +125,69 @@ impl From<ServiceError> for McpToolError {
                 "code": "TASK_SEQUENCE_ALREADY_STARTED",
                 "task_id": task_id
             })),
+            ServiceError::TerminalDisabled => Self::new(-32029, "terminal access is disabled")
+                .with_data(json!({
+                    "code": TERMINAL_DISABLED
+                })),
+            ServiceError::TerminalWorkspaceNotReady => {
+                Self::new(-32029, "task workspace is not ready for terminal access").with_data(
+                    json!({
+                        "code": TERMINAL_WORKSPACE_NOT_READY
+                    }),
+                )
+            }
+            ServiceError::TerminalSessionLimit { scope } => {
+                let code = if scope == "user" {
+                    TERMINAL_USER_LIMIT
+                } else {
+                    TERMINAL_SESSION_LIMIT
+                };
+                Self::new(
+                    -32029,
+                    format!("terminal session limit reached for {scope}"),
+                )
+                .with_data(json!({
+                    "code": code,
+                    "scope": scope
+                }))
+            }
+            ServiceError::TerminalDaemonUnavailable { daemon_id } => {
+                Self::new(-32029, format!("terminal daemon {daemon_id} unavailable")).with_data(
+                    json!({
+                        "code": TERMINAL_DAEMON_UNAVAILABLE,
+                        "daemon_id": daemon_id
+                    }),
+                )
+            }
+            ServiceError::TerminalActiveExecution { workspace_id } => Self::new(
+                -32029,
+                format!("workspace {workspace_id} has active terminal or execution work"),
+            )
+            .with_data(json!({
+                "code": TERMINAL_ACTIVE_EXECUTION,
+                "workspace_id": workspace_id
+            })),
+            ServiceError::TerminalAttachTokenInvalid => {
+                Self::new(-32602, "terminal attach token is invalid").with_data(json!({
+                    "code": TERMINAL_ATTACH_TOKEN_INVALID
+                }))
+            }
+            ServiceError::TerminalPathGuardrail => Self::new(
+                -32602,
+                "terminal workspace path failed guardrail validation",
+            )
+            .with_data(json!({
+                "code": TERMINAL_PATH_GUARDRAIL
+            })),
+            ServiceError::TerminalNotFound => Self::new(-32004, "terminal session not found")
+                .with_data(json!({
+                    "code": TERMINAL_NOT_FOUND
+                })),
+            ServiceError::TerminalInvalidInput { message } => {
+                Self::new(-32602, message).with_data(json!({
+                    "code": TERMINAL_INVALID_INPUT
+                }))
+            }
             ServiceError::DaemonUnavailable { daemon_id } => {
                 Self::new(-32029, format!("daemon {daemon_id} unavailable"))
                     .with_data(json!({"code": "daemon_unavailable", "daemon_id": daemon_id}))

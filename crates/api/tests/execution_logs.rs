@@ -198,6 +198,7 @@ async fn seed_execution(db: &db::SqliteDb, logs_path: Option<PathBuf>) -> String
             description: None,
             task_type: "task".to_owned(),
             status: "in_progress".to_owned(),
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,

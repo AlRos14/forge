@@ -187,6 +187,7 @@ fn is_auth_exempt(path: &str) -> bool {
             | "/api/v1/health"
             | "/healthz"
     ) || path.starts_with("/api/v1/daemons/register")
+        || path.starts_with("/api/v1/terminals/") && path.ends_with("/ws")
         || path.starts_with("/api/v1/daemons/") && path.ends_with("/report")
         || path.starts_with("/api/v1/daemons/") && path.ends_with("/connect")
         || path.starts_with("/.well-known")

@@ -8,6 +8,7 @@ import {
 } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { useTestProjectLifecycleHook } from '@/api/hooks'
+import { ProjectHooksSection } from '@/components/settings/ProjectHooksSection'
 import {
   BUILTIN_PLUGINS,
   LIFECYCLE_EVENTS,
@@ -29,9 +30,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
-import type { LifecycleEvent, LifecycleHookDef, LifecycleHooks } from '@/types/generated'
+import type { LifecycleEvent, LifecycleHookDef, LifecycleHooks, Project } from '@/types/generated'
 
 interface HooksTabProps {
+  project?: Project
   projectId: string
   projectIsLoading: boolean
   canSave: boolean
@@ -42,6 +44,7 @@ interface HooksTabProps {
 }
 
 export function HooksTab({
+  project,
   projectId,
   projectIsLoading,
   canSave,
@@ -167,6 +170,12 @@ export function HooksTab({
 
   return (
     <>
+      <ProjectHooksSection
+        project={project}
+        projectId={projectId}
+        projectIsLoading={projectIsLoading}
+      />
+
       <div className="mb-8">
         <h2 className="text-page font-semibold tracking-tight">Lifecycle Hooks</h2>
         <p className="mt-1 text-sm text-muted-foreground">

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
@@ -128,6 +128,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/analytics",
             get(routes::projects::get_project_analytics),
+        )
+        .route(
+            "/api/v1/projects/{id}/project_hook_runs",
+            get(routes::projects::list_project_hook_runs),
         )
         .route("/api/v1/users/search", get(routes::members::search_users))
         .route(
@@ -350,8 +354,47 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::create_comment).get(routes::tasks::list_comments),
         )
         .route(
+            "/api/v1/tasks/{id}/media",
+            post(routes::tasks::upload_media)
+                .get(routes::tasks::list_media)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/v1/tasks/{id}/terminals",
+            post(routes::terminals::create_terminal_session)
+                .get(routes::terminals::list_terminal_sessions),
+        )
+        .route(
+            "/api/v1/tasks/{id}/terminals/availability",
+            get(routes::terminals::terminal_availability),
+        )
+        .route(
+            "/api/v1/terminals/{id}",
+            get(routes::terminals::get_terminal_session),
+        )
+        .route(
+            "/api/v1/terminals/{id}/attach-token",
+            post(routes::terminals::issue_terminal_attach_token),
+        )
+        .route(
+            "/api/v1/terminals/{id}/resize",
+            post(routes::terminals::resize_terminal_session),
+        )
+        .route(
+            "/api/v1/terminals/{id}/terminate",
+            post(routes::terminals::terminate_terminal_session),
+        )
+        .route(
+            "/api/v1/terminals/{id}/ws",
+            get(routes::terminals::terminal_ws),
+        )
+        .route(
             "/api/v1/comments/{id}",
             delete(routes::tasks::delete_comment),
+        )
+        .route(
+            "/api/v1/media/{media_id}",
+            get(routes::tasks::get_media).delete(routes::tasks::delete_media),
         )
         .route(
             "/api/v1/tasks/{id}/external-links",

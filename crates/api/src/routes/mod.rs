@@ -1,9 +1,9 @@
 use std::{collections::HashMap, str::FromStr};
 
 use api_types::{
-    AgentResponse, ConversationMessageResponse, ConversationResponse, DaemonResponse,
-    ExecutionResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
-    ReviewResponse, RuntimeResponse, StateKind, StepResultEntry, StepResultResponse,
+    parse_project_hooks_json, AgentResponse, ConversationMessageResponse, ConversationResponse,
+    DaemonResponse, ExecutionResponse, PaginatedResponse, ProjectResponse, RepoResponse,
+    ReviewDetails, ReviewResponse, RuntimeResponse, StateKind, StepResultEntry, StepResultResponse,
     Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
     TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
 };
@@ -49,6 +49,7 @@ pub mod reviews;
 pub mod runtimes;
 pub mod settings;
 pub mod tasks;
+pub mod terminals;
 pub mod workflow;
 pub mod workflow_templates;
 pub mod workspaces;
@@ -114,16 +115,23 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
     }
 }
 
-pub fn project_response(project: Project) -> ProjectResponse {
+pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
     let settings = parse_json_value(project.settings);
     let default_review_config = settings
         .get("default_review_config")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok());
-    ProjectResponse {
+    let project_hooks = parse_project_hooks_json(&project.project_hooks_json).map_err(|error| {
+        ApiError::internal(format!(
+            "invalid persisted project hooks for project {}: {error}",
+            project.id
+        ))
+    })?;
+    Ok(ProjectResponse {
         id: project.id,
         name: project.name,
         settings,
+        project_hooks,
         default_review_config,
         primary_repo_id: project.primary_repo_id,
         owner_id: project.owner_id,
@@ -132,7 +140,7 @@ pub fn project_response(project: Project) -> ProjectResponse {
         workflow_template_name: project.workflow_template_name,
         paused_at: project.paused_at.clone(),
         paused: project.paused_at.is_some(),
-    }
+    })
 }
 
 pub fn repo_response(repo: Repo) -> RepoResponse {

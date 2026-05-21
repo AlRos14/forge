@@ -108,6 +108,7 @@ pub(crate) fn daemon_error_to_service_error(
             daemon_id: daemon_id.to_owned(),
             method: method.to_owned(),
         },
+        api_types::INVALID_INPUT => ServiceError::terminal_invalid_input(error.message),
         _ => ServiceError::Domain(error.message),
     }
 }

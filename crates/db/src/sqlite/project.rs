@@ -4,7 +4,7 @@ use crate::now_rfc3339;
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
-        sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, '[]', 0, ?, ?)")
             .bind(&input.id)
             .bind(&input.name)
             .bind(&input.settings)
@@ -72,17 +72,54 @@ impl ProjectRepo for SqliteDb {
         }
         project.updated_at = input.updated_at;
         sqlx::query(
-            "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, project_hooks_json = ?, project_work_epoch = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&project.name)
         .bind(&project.settings)
         .bind(project.primary_repo_id.as_deref())
         .bind(project.paused_at.as_deref())
+        .bind(&project.project_hooks_json)
+        .bind(project.project_work_epoch)
         .bind(&project.updated_at)
         .bind(&project.id)
         .execute(&self.pool)
         .await?;
         Ok(project)
+    }
+
+    async fn set_project_hooks_json(
+        &self,
+        id: &str,
+        project_hooks_json: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE project SET project_hooks_json = ?, updated_at = ? WHERE id = ?")
+                .bind(project_hooks_json)
+                .bind(updated_at)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn increment_project_work_epoch(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        by: i64,
+    ) -> Result<i64> {
+        let epoch = sqlx::query_scalar::<_, i64>(
+            "UPDATE project SET project_work_epoch = project_work_epoch + ? WHERE id = ? RETURNING project_work_epoch",
+        )
+        .bind(by)
+        .bind(project_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        epoch.ok_or(DbError::NotFound)
     }
 
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()> {

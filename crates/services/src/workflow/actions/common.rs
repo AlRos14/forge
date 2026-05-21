@@ -112,6 +112,8 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
         cleanup_scheduler: ctx.cleanup_scheduler.clone(),
         task_executor: ctx.task_executor.clone(),
         daemon_connections: ctx.daemon_connections.clone(),
+        workspace_exec_locks: ctx.workspace_exec_locks.clone(),
+        terminal_activity: ctx.terminal_activity.clone(),
         workspace_root: ctx.workspace_root.clone(),
         repo_cache_locks: ctx.repo_cache_locks.clone(),
     };

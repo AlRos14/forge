@@ -24,9 +24,14 @@ import type {
   WorkflowTemplateResponse,
   WorkflowTemplateSummary,
 } from '@/types/generated'
+import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
 import { refreshAccess, useAuthStore } from '@/stores/auth'
 
 const API_BASE = '/api/v1'
+
+type ApiFetchInit = RequestInit & {
+  search?: Record<string, string | number | boolean | undefined>
+}
 
 export class ApiError extends Error {
   status: number
@@ -40,10 +45,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiFetch<T>(
-  path: string,
-  init?: RequestInit & { search?: Record<string, string | number | boolean | undefined> },
-): Promise<T> {
+async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response> {
   const url = new URL(`${API_BASE}${path}`, window.location.origin)
   const { search, headers, ...fetchInit } = init ?? {}
   if (search) {
@@ -56,7 +58,8 @@ export async function apiFetch<T>(
 
   const makeHeaders = (overrideToken?: string) => {
     const h = new Headers(headers)
-    if (!h.has('content-type')) {
+    const isFormDataBody = typeof FormData !== 'undefined' && fetchInit.body instanceof FormData
+    if (!h.has('content-type') && !isFormDataBody) {
       h.set('content-type', 'application/json')
     }
     const token = overrideToken ?? useAuthStore.getState().accessToken
@@ -95,12 +98,22 @@ export async function apiFetch<T>(
     )
   }
 
+  return response
+}
+
+export async function apiFetch<T>(path: string, init?: ApiFetchInit): Promise<T> {
+  const response = await apiResponse(path, init)
   const text = await response.text()
   if (response.status === 204 || text.length === 0) {
     return undefined as T
   }
 
   return JSON.parse(text) as T
+}
+
+export async function apiFetchBlob(path: string, init?: ApiFetchInit): Promise<Blob> {
+  const response = await apiResponse(path, init)
+  return response.blob()
 }
 
 export function listFsEntries(path: string, daemonId: string): Promise<FsListResponse> {
@@ -232,6 +245,16 @@ export async function getProjectAnalytics(
   )
 }
 
+export function listProjectHookRuns(
+  projectId: string,
+  cursor?: string,
+  limit = 20,
+): Promise<ProjectHookRunsResponse> {
+  return apiFetch<ProjectHookRunsResponse>(`/projects/${projectId}/project_hook_runs`, {
+    search: { cursor, limit },
+  })
+}
+
 export function markNotificationRead(notificationId: string): Promise<NotificationResponse> {
   return apiFetch<NotificationResponse>(`/notifications/${notificationId}/read`, {
     method: 'PATCH',
@@ -277,7 +300,10 @@ export function listPats(): Promise<TokenResponse[]> {
   return apiFetch<TokenResponse[]>('/auth/tokens')
 }
 
-export function createPat(body: { name: string; expires_at?: string | null }): Promise<TokenResponse> {
+export function createPat(body: {
+  name: string
+  expires_at?: string | null
+}): Promise<TokenResponse> {
   return apiFetch<TokenResponse>('/auth/tokens', {
     method: 'POST',
     body: JSON.stringify(body),

@@ -249,6 +249,7 @@ async fn create_project_route(
         workflow_template_name: None,
         paused_at: None,
         paused: request.paused.unwrap_or(false),
+        project_hooks: vec![],
     };
     data.projects.insert(project.id.clone(), project.clone());
     Json(project)

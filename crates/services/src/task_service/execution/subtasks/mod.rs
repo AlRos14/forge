@@ -313,6 +313,8 @@ fn subtask_engine(
         cleanup_scheduler: None,
         task_executor: None,
         daemon_connections: None,
+        workspace_exec_locks: None,
+        terminal_activity: None,
         workspace_root: workspace_root.to_path_buf(),
         repo_cache_locks: None,
     }
@@ -619,6 +621,7 @@ mod tests {
             description: description.map(str::to_owned),
             task_type: "task".to_string(),
             status: status.to_owned(),
+            is_automation: false,
             priority: 0,
             board_position: 1.0,
             subtask_order: None,

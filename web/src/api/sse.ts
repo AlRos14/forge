@@ -32,6 +32,7 @@ type SsePayload = {
   source?: string | null
   conversation_id?: string
   message_id?: string
+  media_id?: string
   role?: string
   status?: string
   delta?: string
@@ -95,6 +96,10 @@ export function routeSsePayload(
     void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
   }
 
+  if (eventType === 'project_hook.run_changed' && payload.project_id) {
+    void queryClient.invalidateQueries({ queryKey: qk.projectHookRuns(payload.project_id) })
+  }
+
   if (eventType.startsWith('task.')) {
     const taskId = payload.task_id ?? payload.entity_id
     void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
@@ -112,6 +117,9 @@ export function routeSsePayload(
     }
     if (eventType === 'task.role_reassigned') {
       void queryClient.invalidateQueries({ queryKey: qk.taskRoles(taskId) })
+    }
+    if (eventType === 'task.media.uploaded' || eventType === 'task.media.deleted') {
+      void queryClient.invalidateQueries({ queryKey: qk.taskMedia(taskId) })
     }
     if (payload.execution_id) {
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
@@ -279,6 +287,8 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'task.subtask_sequence_paused',
         'task.subtask_sequence_resumed',
         'task.subtask_commit_recorded',
+        'task.media.uploaded',
+        'task.media.deleted',
         'execution.started',
         'execution.log',
         'execution.completed',
@@ -302,6 +312,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'project.deleted',
         'project.paused',
         'project.resumed',
+        'project_hook.run_changed',
         'profile.created',
         'profile.updated',
         'profile.deleted',

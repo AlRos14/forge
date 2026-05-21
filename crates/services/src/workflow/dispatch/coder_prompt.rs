@@ -61,6 +61,7 @@ fn coder_system(ctx: &AgentDispatchContext) -> String {
         .as_deref()
         .is_some_and(|plan| !plan.trim().is_empty());
     let mut system = "You are the coder agent for this Forge workflow task. Your job is to implement code changes in the worktree. Once you finish, the task moves to the reviewer agent for verification. Keep the scope tight, verify the result compiles and passes locally, and commit your changes.".to_string();
+    system.push_str("\n\nProof of work for app-touching changes: If your task modifies user-facing UI or runtime behavior, capture a screenshot (or short walkthrough video) demonstrating the change. Upload it with forge-ctl task media upload --task-id <id> --file <path> and post a comment with forge-ctl task media comment --task-id <id> --content validation-notes --media-url <url> before transitioning to review.");
     if has_plan {
         system.push_str(" A planner agent already investigated and produced a plan — do not redo that work. Treat the provided plan as instructions to execute now.");
     }

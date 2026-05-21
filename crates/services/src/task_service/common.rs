@@ -47,7 +47,7 @@ impl TaskService {
             })
     }
 
-    pub(super) async fn create_system_comment(&self, task_id: &str, content: String) -> Result<()> {
+    pub(crate) async fn create_system_comment(&self, task_id: &str, content: String) -> Result<()> {
         let now = now_rfc3339();
         let comment = TaskCommentRepo::create_comment(
             &*self.db,

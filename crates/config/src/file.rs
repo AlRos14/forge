@@ -7,6 +7,7 @@ pub(crate) struct FileConfig {
     pub server: Option<FileServerConfig>,
     pub workspace: Option<FileWorkspaceConfig>,
     pub agent: Option<FileAgentDefaults>,
+    pub terminal: Option<FileTerminalConfig>,
     pub project: Option<BTreeMap<String, String>>,
 }
 
@@ -23,6 +24,7 @@ pub(crate) struct FileServerConfig {
     pub jwt_secret: Option<String>,
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
+    pub media_upload_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,4 +38,15 @@ pub(crate) struct FileAgentDefaults {
     pub max_concurrent_tasks: Option<u32>,
     pub heartbeat_interval_seconds: Option<u64>,
     pub max_missed_heartbeats: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileTerminalConfig {
+    pub enabled: Option<bool>,
+    pub max_sessions_per_task: Option<u32>,
+    pub max_sessions_per_user: Option<u32>,
+    pub idle_timeout_secs: Option<u64>,
+    pub max_lifetime_secs: Option<u64>,
+    pub attach_token_ttl_secs: Option<u64>,
+    pub reconnect_scrollback_bytes: Option<usize>,
 }

@@ -1,4 +1,9 @@
-use api_types::ErrorResponse;
+use api_types::{
+    ErrorResponse, TERMINAL_ACTIVE_EXECUTION, TERMINAL_ATTACH_TOKEN_INVALID,
+    TERMINAL_DAEMON_UNAVAILABLE, TERMINAL_DISABLED, TERMINAL_INVALID_INPUT, TERMINAL_NOT_FOUND,
+    TERMINAL_PATH_GUARDRAIL, TERMINAL_SESSION_LIMIT, TERMINAL_USER_LIMIT,
+    TERMINAL_WORKSPACE_NOT_READY,
+};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -328,6 +333,64 @@ impl From<ServiceError> for ApiError {
                 message: format!("task sequence already started for task {task_id}"),
                 details: Some(json!({ "task_id": task_id })),
             },
+            ServiceError::TerminalDisabled => Self {
+                status: StatusCode::FORBIDDEN,
+                code: TERMINAL_DISABLED,
+                message: "terminal access is disabled".to_owned(),
+                details: None,
+            },
+            ServiceError::TerminalWorkspaceNotReady => Self {
+                status: StatusCode::CONFLICT,
+                code: TERMINAL_WORKSPACE_NOT_READY,
+                message: "task workspace is not ready for terminal access".to_owned(),
+                details: None,
+            },
+            ServiceError::TerminalSessionLimit { scope } => {
+                let code = if scope == "user" {
+                    TERMINAL_USER_LIMIT
+                } else {
+                    TERMINAL_SESSION_LIMIT
+                };
+                Self {
+                    status: StatusCode::CONFLICT,
+                    code,
+                    message: format!("terminal session limit reached for {scope}"),
+                    details: Some(json!({ "scope": scope })),
+                }
+            }
+            ServiceError::TerminalDaemonUnavailable { daemon_id } => Self {
+                status: StatusCode::CONFLICT,
+                code: TERMINAL_DAEMON_UNAVAILABLE,
+                message: format!("terminal daemon {daemon_id} is unavailable"),
+                details: Some(json!({ "daemon_id": daemon_id })),
+            },
+            ServiceError::TerminalActiveExecution { workspace_id } => Self {
+                status: StatusCode::CONFLICT,
+                code: TERMINAL_ACTIVE_EXECUTION,
+                message: format!("workspace {workspace_id} has active terminal or execution work"),
+                details: Some(json!({ "workspace_id": workspace_id })),
+            },
+            ServiceError::TerminalAttachTokenInvalid => Self {
+                status: StatusCode::FORBIDDEN,
+                code: TERMINAL_ATTACH_TOKEN_INVALID,
+                message: "terminal attach token is invalid".to_owned(),
+                details: None,
+            },
+            ServiceError::TerminalPathGuardrail => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: TERMINAL_PATH_GUARDRAIL,
+                message: "terminal workspace path failed guardrail validation".to_owned(),
+                details: None,
+            },
+            ServiceError::TerminalNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: TERMINAL_NOT_FOUND,
+                message: "terminal session not found".to_owned(),
+                details: None,
+            },
+            ServiceError::TerminalInvalidInput { message } => {
+                Self::bad_request_with_code(TERMINAL_INVALID_INPUT, message)
+            }
         }
     }
 }

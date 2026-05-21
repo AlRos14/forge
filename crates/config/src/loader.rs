@@ -27,6 +27,7 @@ impl ForgeConfig {
 
         config.apply_env()?;
         config.apply_overrides(overrides);
+        config.validate()?;
         Ok(config)
     }
 
@@ -56,6 +57,9 @@ impl ForgeConfig {
             if let Some(cors_origins) = server.cors_origins {
                 self.server.cors_origins = cors_origins;
             }
+            if let Some(media_upload_limit_bytes) = server.media_upload_limit_bytes {
+                self.server.media_upload_limit_bytes = media_upload_limit_bytes;
+            }
         }
 
         if let Some(workspace) = file.workspace {
@@ -76,6 +80,30 @@ impl ForgeConfig {
             }
             if let Some(max_missed_heartbeats) = agent.max_missed_heartbeats {
                 self.agent.max_missed_heartbeats = max_missed_heartbeats;
+            }
+        }
+
+        if let Some(terminal) = file.terminal {
+            if let Some(enabled) = terminal.enabled {
+                self.terminal.enabled = enabled;
+            }
+            if let Some(max_sessions_per_task) = terminal.max_sessions_per_task {
+                self.terminal.max_sessions_per_task = max_sessions_per_task;
+            }
+            if let Some(max_sessions_per_user) = terminal.max_sessions_per_user {
+                self.terminal.max_sessions_per_user = max_sessions_per_user;
+            }
+            if let Some(idle_timeout_secs) = terminal.idle_timeout_secs {
+                self.terminal.idle_timeout_secs = idle_timeout_secs;
+            }
+            if let Some(max_lifetime_secs) = terminal.max_lifetime_secs {
+                self.terminal.max_lifetime_secs = max_lifetime_secs;
+            }
+            if let Some(attach_token_ttl_secs) = terminal.attach_token_ttl_secs {
+                self.terminal.attach_token_ttl_secs = attach_token_ttl_secs;
+            }
+            if let Some(reconnect_scrollback_bytes) = terminal.reconnect_scrollback_bytes {
+                self.terminal.reconnect_scrollback_bytes = reconnect_scrollback_bytes;
             }
         }
 
@@ -126,6 +154,10 @@ impl ForgeConfig {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Some(value) = env_value("FORGE_MEDIA_UPLOAD_LIMIT_BYTES") {
+            self.server.media_upload_limit_bytes =
+                parse_env_u64("FORGE_MEDIA_UPLOAD_LIMIT_BYTES", &value)?;
+        }
         Ok(())
     }
 
@@ -165,6 +197,9 @@ impl ForgeConfig {
         }
         if let Some(cors_origins) = overrides.cors_origins {
             self.server.cors_origins = cors_origins;
+        }
+        if let Some(media_upload_limit_bytes) = overrides.media_upload_limit_bytes {
+            self.server.media_upload_limit_bytes = media_upload_limit_bytes;
         }
     }
 }

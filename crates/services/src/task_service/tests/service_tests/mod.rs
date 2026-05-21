@@ -1,4 +1,5 @@
 use super::*;
+use crate::terminal_service::TerminalActivityTracker;
 use crate::workflow::default_roles;
 use crate::workspace_execution_lock::WorkspaceExecutionLockManager;
 use ::workspace::RepoCacheLockManager;
@@ -327,6 +328,7 @@ async fn seed_task_with_status(
             description: Some("seeded task".to_owned()),
             task_type: "task".to_owned(),
             status,
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,
@@ -361,6 +363,7 @@ async fn seed_subtask_with_status(
             description: Some("seeded subtask".to_owned()),
             task_type: "task".to_owned(),
             status,
+            is_automation: false,
             priority: 0,
             task_state_config: None,
             merge_config: None,

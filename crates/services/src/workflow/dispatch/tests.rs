@@ -26,6 +26,7 @@ fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
         description: description.map(str::to_string),
         task_type: "task".to_string(),
         status: default_states::IN_PROGRESS.to_string(),
+        is_automation: false,
         priority: 0,
         board_position: 1.0,
         task_state_config: None,
@@ -215,6 +216,12 @@ fn coder_prompt_first_time_does_not_contain_rereview_directive() {
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V1).build(&ctx);
 
     assert!(prompt.system.contains("implement code changes"));
+    assert!(prompt
+        .system
+        .contains("Proof of work for app-touching changes"));
+    assert!(prompt
+        .system
+        .contains("forge-ctl task media upload --task-id <id> --file <path>"));
     assert!(prompt.system.contains("planner agent already investigated"));
     assert!(prompt.system.contains("Treat the provided plan"));
     assert!(prompt.user.contains("Implementation objective:"));

@@ -55,6 +55,8 @@ impl TaskService {
             cleanup_scheduler: self.cleanup_scheduler.clone(),
             task_executor: self.task_executor.clone(),
             daemon_connections: self.daemon_connections.clone(),
+            workspace_exec_locks: self.workspace_exec_locks.clone(),
+            terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
         };
@@ -434,6 +436,8 @@ impl TaskService {
             cleanup_scheduler: self.cleanup_scheduler.clone(),
             task_executor: self.task_executor.clone(),
             daemon_connections: self.daemon_connections.clone(),
+            workspace_exec_locks: self.workspace_exec_locks.clone(),
+            terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
         };
