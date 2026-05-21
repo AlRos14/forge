@@ -179,6 +179,9 @@ pub enum ServiceError {
 
     #[error("terminal session not found")]
     TerminalNotFound,
+
+    #[error("invalid terminal input: {message}")]
+    TerminalInvalidInput { message: String },
 }
 
 impl From<db::DbError> for ServiceError {
@@ -226,6 +229,12 @@ impl ServiceError {
 
     pub(crate) fn invalid_operation(message: impl Into<String>) -> Self {
         Self::InvalidOperation {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn terminal_invalid_input(message: impl Into<String>) -> Self {
+        Self::TerminalInvalidInput {
             message: message.into(),
         }
     }

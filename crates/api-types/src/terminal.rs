@@ -10,6 +10,7 @@ pub const TERMINAL_ACTIVE_EXECUTION: &str = "terminal_active_execution";
 pub const TERMINAL_ATTACH_TOKEN_INVALID: &str = "terminal_attach_token_invalid";
 pub const TERMINAL_PATH_GUARDRAIL: &str = "terminal_path_guardrail";
 pub const TERMINAL_NOT_FOUND: &str = "terminal_not_found";
+pub const TERMINAL_INVALID_INPUT: &str = "invalid_input";
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]

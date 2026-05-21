@@ -7,8 +7,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    TERMINAL_ACTIVE_EXECUTION, TERMINAL_DISABLED, TERMINAL_NOT_FOUND, TERMINAL_SESSION_LIMIT,
-    TERMINAL_USER_LIMIT, TERMINAL_WORKSPACE_NOT_READY,
+    TERMINAL_ACTIVE_EXECUTION, TERMINAL_DISABLED, TERMINAL_INVALID_INPUT, TERMINAL_NOT_FOUND,
+    TERMINAL_SESSION_LIMIT, TERMINAL_USER_LIMIT, TERMINAL_WORKSPACE_NOT_READY,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -434,6 +434,43 @@ async fn create_session_succeeds_with_attach_token() {
         .terminate_session(session_id, TEST_USER_ID, Some("test cleanup".to_owned()))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn create_session_rejects_too_small_terminal_size() {
+    let harness = setup(enabled_terminal()).await;
+    let task = seed_task(&harness).await;
+    seed_ready_workspace(&harness, &task).await;
+
+    let (status, body) = request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/terminals", task.task_id),
+        Some(json!({ "rows": 1, "cols": 80 })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_error_code(&body, TERMINAL_INVALID_INPUT);
+}
+
+#[tokio::test]
+async fn resize_session_rejects_too_small_terminal_size() {
+    let harness = setup(enabled_terminal()).await;
+    let task = seed_task(&harness).await;
+    let workspace_id = seed_ready_workspace(&harness, &task).await;
+    let session_id = seed_running_session(&harness, &task, &workspace_id).await;
+
+    let (status, body) = request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/terminals/{session_id}/resize"),
+        Some(json!({ "rows": 24, "cols": 1 })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_error_code(&body, TERMINAL_INVALID_INPUT);
 }
 
 #[tokio::test]

@@ -85,6 +85,7 @@ export function TaskTerminalPanel({ taskId, className }: TaskTerminalPanelProps)
   const resizeTimerRef = useRef<number | null>(null)
   const currentSessionIdRef = useRef<string | null>(null)
   const inputDisabledRef = useRef(false)
+  const reattachPromiseRef = useRef<Promise<void> | null>(null)
 
   const [availability, setAvailability] = useState<TerminalAvailability | null>(null)
   const [sessions, setSessions] = useState<TerminalSessionResponse[]>([])
@@ -346,17 +347,22 @@ export function TaskTerminalPanel({ taskId, className }: TaskTerminalPanelProps)
     }
   }
 
-  const handleReattach = async () => {
-    if (!runningSession) return
+  const handleReattach = async (session: TerminalSessionResponse | null = runningSession) => {
+    if (!session || reattachPromiseRef.current) return
     setIsReattaching(true)
     setErrorMessage(null)
+    const reattachPromise = connectToSession(session)
+    reattachPromiseRef.current = reattachPromise
     try {
-      await connectToSession(runningSession)
+      await reattachPromise
     } catch (error) {
       const message = getApiErrorMessage(error, 'Terminal session failed to reattach.')
       setErrorMessage(message)
       toast.error(message)
     } finally {
+      if (reattachPromiseRef.current === reattachPromise) {
+        reattachPromiseRef.current = null
+      }
       setIsReattaching(false)
     }
   }
@@ -432,7 +438,9 @@ export function TaskTerminalPanel({ taskId, className }: TaskTerminalPanelProps)
               disabled={isReattaching || isStarting}
               size="sm"
               variant="outline"
-              onClick={handleReattach}
+              onClick={() => {
+                void handleReattach()
+              }}
             >
               Reattach to running session
             </Button>
@@ -506,7 +514,7 @@ export function TaskTerminalPanel({ taskId, className }: TaskTerminalPanelProps)
                       size="sm"
                       variant="outline"
                       onClick={() => {
-                        void connectToSession(session)
+                        void handleReattach(session)
                       }}
                     >
                       Reattach

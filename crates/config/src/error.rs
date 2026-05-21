@@ -15,6 +15,9 @@ pub enum ConfigError {
         value: String,
         message: String,
     },
+    InvalidConfig {
+        message: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -33,6 +36,7 @@ impl fmt::Display for ConfigError {
             } => {
                 write!(f, "invalid environment variable {key}={value:?}: {message}")
             }
+            Self::InvalidConfig { message } => write!(f, "invalid config: {message}"),
         }
     }
 }
@@ -42,7 +46,7 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::InvalidEnv { .. } => None,
+            Self::InvalidEnv { .. } | Self::InvalidConfig { .. } => None,
         }
     }
 }

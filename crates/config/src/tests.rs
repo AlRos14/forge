@@ -1,6 +1,6 @@
 use crate::{
     data_dir_from_env, default_data_dir, default_workspace_root, read_server_state,
-    server_state_path, write_server_state, ConfigOverrides, ForgeConfig, ServerState,
+    server_state_path, write_server_state, ConfigError, ConfigOverrides, ForgeConfig, ServerState,
     TerminalConfig, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND,
     DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
@@ -84,6 +84,50 @@ terminal:
     assert_eq!(config.terminal.max_lifetime_secs, 28800);
     assert_eq!(config.terminal.attach_token_ttl_secs, 45);
     assert_eq!(config.terminal.reconnect_scrollback_bytes, 65536);
+}
+
+#[test]
+fn terminal_config_rejects_task_limit_above_user_limit() {
+    let mut terminal = TerminalConfig::default();
+    terminal.max_sessions_per_task = 5;
+    terminal.max_sessions_per_user = 4;
+
+    let error = terminal
+        .validate()
+        .expect_err("terminal config rejects invalid limits");
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidConfig { message }
+            if message.contains("terminal.max_sessions_per_task")
+    ));
+}
+
+#[test]
+fn config_load_validates_terminal_limits() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+terminal:
+  max_sessions_per_task: 5
+  max_sessions_per_user: 4
+"#,
+    )
+    .expect("write config");
+
+    let error = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+        .expect_err("invalid config rejects on load");
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidConfig { message }
+            if message.contains("terminal.max_sessions_per_task")
+    ));
 }
 
 #[test]

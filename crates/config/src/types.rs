@@ -1,8 +1,8 @@
 use crate::{
-    default_data_dir, default_workspace_root, DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS,
-    DEFAULT_AGENT_MAX_CONCURRENT_TASKS, DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST,
-    DEFAULT_CORS_ORIGIN, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND,
-    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    default_data_dir, default_workspace_root, error::ConfigError,
+    DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
+    DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
+    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -128,6 +128,10 @@ impl ForgeConfig {
         Ok(dir)
     }
 
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.terminal.validate()
+    }
+
     #[must_use]
     pub fn jwt_secret_path(&self) -> PathBuf {
         self.forge.data_dir.join("jwt_secret.bin")
@@ -175,6 +179,20 @@ impl Default for TerminalConfig {
             attach_token_ttl_secs: 60,
             reconnect_scrollback_bytes: 65536,
         }
+    }
+}
+
+impl TerminalConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_sessions_per_task > self.max_sessions_per_user {
+            return Err(ConfigError::InvalidConfig {
+                message: format!(
+                    "terminal.max_sessions_per_task ({}) must be less than or equal to terminal.max_sessions_per_user ({})",
+                    self.max_sessions_per_task, self.max_sessions_per_user
+                ),
+            });
+        }
+        Ok(())
     }
 }
 

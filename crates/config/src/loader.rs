@@ -27,6 +27,7 @@ impl ForgeConfig {
 
         config.apply_env()?;
         config.apply_overrides(overrides);
+        config.validate()?;
         Ok(config)
     }
 

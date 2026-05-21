@@ -45,6 +45,7 @@ use crate::{
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
+const MIN_TERMINAL_DIMENSION: u16 = 2;
 const TERMINAL_SESSION_CHANGED_EVENT: &str = "task.terminal.session_changed";
 const EMBEDDED_WATCHDOG_MAX_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const EMBEDDED_EXIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
@@ -270,9 +271,11 @@ impl TerminalService {
             return Err(ServiceError::TerminalDisabled);
         }
 
+        let rows = rows.unwrap_or(DEFAULT_ROWS);
+        let cols = cols.unwrap_or(DEFAULT_COLS);
+        validate_terminal_size(rows, cols)?;
+
         let (task, workspace) = self.require_terminal_workspace(task_id).await?;
-        let rows = rows.unwrap_or(DEFAULT_ROWS).max(1);
-        let cols = cols.unwrap_or(DEFAULT_COLS).max(1);
 
         let task_sessions =
             TerminalSessionRepo::list_running_terminal_sessions_for_task(&*self.db, task_id)
@@ -485,6 +488,8 @@ impl TerminalService {
         rows: u16,
         cols: u16,
     ) -> Result<TerminalSessionResponse, ServiceError> {
+        validate_terminal_size(rows, cols)?;
+
         let session = self.load_session(session_id).await?;
         if !terminal_session_is_active(&session.status) {
             return Err(ServiceError::TerminalNotFound);
@@ -518,8 +523,8 @@ impl TerminalService {
         let resized = TerminalSessionRepo::update_terminal_session_size(
             &*self.db,
             session_id,
-            i64::from(rows.max(1)),
-            i64::from(cols.max(1)),
+            i64::from(rows),
+            i64::from(cols),
             &now,
         )
         .await?;
@@ -694,8 +699,16 @@ impl TerminalService {
 
     pub async fn detach_closed_clients(&self, session_id: &str) {
         let mut state = self.state.lock().await;
-        if let Some(clients) = state.attached_clients.get_mut(session_id) {
-            clients.retain(|sender| !sender.is_closed());
+        let remove_scrollback = match state.attached_clients.get_mut(session_id) {
+            Some(clients) => {
+                clients.retain(|sender| !sender.is_closed());
+                clients.is_empty()
+            }
+            None => true,
+        };
+        if remove_scrollback {
+            state.attached_clients.remove(session_id);
+            state.scrollback.remove(session_id);
         }
     }
 
@@ -1234,13 +1247,21 @@ async fn record_terminal_output(
     match STANDARD.decode(&data_b64) {
         Ok(decoded) => {
             let mut state_guard = state.lock().await;
-            let scrollback = state_guard
-                .scrollback
-                .entry(session_id.clone())
-                .or_default();
-            scrollback.extend(decoded);
-            while scrollback.len() > reconnect_scrollback_bytes {
-                scrollback.pop_front();
+            let has_attached_client = state_guard
+                .attached_clients
+                .get(&session_id)
+                .is_some_and(|clients| clients.iter().any(|sender| !sender.is_closed()));
+            if has_attached_client {
+                let scrollback = state_guard
+                    .scrollback
+                    .entry(session_id.clone())
+                    .or_default();
+                scrollback.extend(decoded);
+                while scrollback.len() > reconnect_scrollback_bytes {
+                    scrollback.pop_front();
+                }
+            } else {
+                state_guard.scrollback.remove(&session_id);
             }
         }
         Err(error) => {
@@ -1501,6 +1522,15 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
         pixel_width: 0,
         pixel_height: 0,
     }
+}
+
+fn validate_terminal_size(rows: u16, cols: u16) -> Result<(), ServiceError> {
+    if rows < MIN_TERMINAL_DIMENSION || cols < MIN_TERMINAL_DIMENSION {
+        return Err(ServiceError::terminal_invalid_input(format!(
+            "terminal rows and cols must each be at least {MIN_TERMINAL_DIMENSION}"
+        )));
+    }
+    Ok(())
 }
 
 fn watchdog_interval(idle_timeout_secs: u64, max_lifetime_secs: u64) -> StdDuration {
@@ -1802,6 +1832,46 @@ mod tests {
 
         let state = service.state.lock().await;
         assert_eq!(state.attach_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn detach_closed_clients_drops_scrollback_when_no_clients_remain() {
+        let (service, _db, _root) = test_service(enabled_terminal()).await;
+        let rx = service.attach_client("session-1").await;
+        service
+            .handle_daemon_output(TerminalOutputNotification {
+                session_id: "session-1".to_owned(),
+                data: STANDARD.encode("scrollback"),
+                ts: now_rfc3339(),
+            })
+            .await;
+        drop(rx);
+
+        service.detach_closed_clients("session-1").await;
+        service
+            .handle_daemon_output(TerminalOutputNotification {
+                session_id: "session-1".to_owned(),
+                data: STANDARD.encode("after-detach"),
+                ts: now_rfc3339(),
+            })
+            .await;
+
+        let state = service.state.lock().await;
+        assert!(!state.attached_clients.contains_key("session-1"));
+        assert!(!state.scrollback.contains_key("session-1"));
+    }
+
+    #[tokio::test]
+    async fn resize_rejects_too_small_terminal_size() {
+        let (service, db, root) = test_service(enabled_terminal()).await;
+        let seeded = seed_running_terminal(&db, root.path()).await;
+
+        let error = service
+            .resize_session(&seeded.session_id, TEST_USER_ID, 1, 80)
+            .await
+            .expect_err("too-small resize rejects");
+
+        assert!(matches!(error, ServiceError::TerminalInvalidInput { .. }));
     }
 
     #[tokio::test]

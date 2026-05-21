@@ -1,7 +1,8 @@
 use api_types::{
     ErrorResponse, TERMINAL_ACTIVE_EXECUTION, TERMINAL_ATTACH_TOKEN_INVALID,
-    TERMINAL_DAEMON_UNAVAILABLE, TERMINAL_DISABLED, TERMINAL_NOT_FOUND, TERMINAL_PATH_GUARDRAIL,
-    TERMINAL_SESSION_LIMIT, TERMINAL_USER_LIMIT, TERMINAL_WORKSPACE_NOT_READY,
+    TERMINAL_DAEMON_UNAVAILABLE, TERMINAL_DISABLED, TERMINAL_INVALID_INPUT, TERMINAL_NOT_FOUND,
+    TERMINAL_PATH_GUARDRAIL, TERMINAL_SESSION_LIMIT, TERMINAL_USER_LIMIT,
+    TERMINAL_WORKSPACE_NOT_READY,
 };
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -387,6 +388,9 @@ impl From<ServiceError> for ApiError {
                 message: "terminal session not found".to_owned(),
                 details: None,
             },
+            ServiceError::TerminalInvalidInput { message } => {
+                Self::bad_request_with_code(TERMINAL_INVALID_INPUT, message)
+            }
         }
     }
 }

@@ -96,8 +96,8 @@ The API server persists lifecycle metadata in `task_terminal_session`, including
 task, workspace, daemon, dimensions, status, timestamps, creator, and exit
 metadata. Attach tokens are stored only in memory and are single-use. Reconnect
 scrollback is an in-memory bounded ring buffer per running session, capped by
-`terminal.reconnect_scrollback_bytes`; full terminal transcripts are not
-persisted in v1.
+`terminal.reconnect_scrollback_bytes`, and is dropped once all browser clients
+detach from that session; full terminal transcripts are not persisted in v1.
 
 Terminal sessions and managed Forge executions cannot run concurrently in the
 same workspace. Terminal creation is blocked while a managed execution is

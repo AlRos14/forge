@@ -124,12 +124,12 @@ project members with access to the owning task.
 
 | Method | Path | Request | Success |
 |--------|------|---------|---------|
-| POST | `/api/v1/tasks/{id}/terminals` | JSON body `{ "rows": 24, "cols": 80 }`; both fields are optional `u16` values | `201` with `{ "session": TerminalSessionResponse, "attach": TerminalAttachTokenResponse }` |
+| POST | `/api/v1/tasks/{id}/terminals` | JSON body `{ "rows": 24, "cols": 80 }`; both fields are optional `u16` values, and supplied values must be at least `2` | `201` with `{ "session": TerminalSessionResponse, "attach": TerminalAttachTokenResponse }` |
 | GET | `/api/v1/tasks/{id}/terminals?include_ended=bool` | Optional `include_ended` query param; default `false` | `200` with `TerminalSessionResponse[]` |
 | GET | `/api/v1/tasks/{id}/terminals/availability` | None | `200` with `TerminalAvailability` |
 | GET | `/api/v1/terminals/{id}` | None | `200` with `TerminalSessionResponse` |
 | POST | `/api/v1/terminals/{id}/attach-token` | None | `200` with `TerminalAttachTokenResponse` |
-| POST | `/api/v1/terminals/{id}/resize` | JSON body `{ "rows": 24, "cols": 80 }`; both fields are required `u16` values | `200` with `TerminalSessionResponse` |
+| POST | `/api/v1/terminals/{id}/resize` | JSON body `{ "rows": 24, "cols": 80 }`; both fields are required `u16` values of at least `2` | `200` with `TerminalSessionResponse` |
 | POST | `/api/v1/terminals/{id}/terminate` | JSON body `{ "reason": "user requested" }`; body and `reason` are optional | `200` with `TerminalSessionResponse` |
 | GET | `/api/v1/terminals/{id}/ws?attach_token=TOKEN` | WebSocket upgrade; `attach_token` query param is required | WebSocket stream of `TerminalServerFrame` text JSON frames |
 
@@ -164,7 +164,10 @@ the WebSocket query string and also rejects `Authorization` without an
 ```
 
 `status` is one of `starting`, `running`, `exited`, `terminated`,
-`timed_out`, `orphaned`, or `cleanup_terminated`.
+`timed_out`, `orphaned`, or `cleanup_terminated`. `cleanup_terminated` is an
+internal cleanup status used when Forge terminates a session for workspace
+cleanup; users normally see it through session history rather than as an
+interactive state.
 
 `TerminalAttachTokenResponse`:
 
@@ -212,6 +215,9 @@ Client -> server (`TerminalClientFrame`):
 { "type": "resize", "rows": 40, "cols": 120 }
 ```
 
+Resize frames use the same terminal size validation as the REST resize endpoint:
+`rows` and `cols` must both be at least `2`.
+
 ```json
 { "type": "ping" }
 ```
@@ -253,6 +259,7 @@ Server -> client (`TerminalServerFrame`):
 `kind` is one of `created`, `attached`, `resized`, `terminated`, `exited`,
 `timed_out`, `orphaned`, or `cleanup_terminated`. `reason` is optional and is
 included when the backend has a user-supplied or cleanup reason.
+`cleanup_terminated` is emitted only for internal workspace cleanup.
 
 ### Daemon transport
 
@@ -274,6 +281,9 @@ full design rationale.
 | `terminal.output` | Notification | `{ "session_id": "...", "data": "<base64>", "ts": "2026-05-20T12:00:04Z" }` | None |
 | `terminal.exited` | Notification | `{ "session_id": "...", "exit_code": 0, "signal": null, "reason": null, "ts": "2026-05-20T12:00:05Z" }` | None |
 
+`terminal.start` and `terminal.resize` reject `rows` or `cols` below `2` with
+an `invalid_input` daemon error.
+
 ### Configuration
 
 Terminal configuration lives under the `terminal` config section:
@@ -287,6 +297,10 @@ Terminal configuration lives under the `terminal` config section:
 | `terminal.max_lifetime_secs` | `28800` | Absolute session lifetime limit |
 | `terminal.attach_token_ttl_secs` | `60` | Attach-token lifetime in seconds |
 | `terminal.reconnect_scrollback_bytes` | `65536` | Maximum in-memory scrollback replayed on reconnect |
+
+`terminal.max_sessions_per_task` must be less than or equal to
+`terminal.max_sessions_per_user`; invalid terminal configuration is rejected
+when Forge loads config.
 
 ### Access model
 

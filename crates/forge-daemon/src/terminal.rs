@@ -13,7 +13,7 @@ use api_types::{
     DaemonErrorPayload, DaemonFrame, TerminalExitedNotification, TerminalInputParams,
     TerminalInputResult, TerminalOutputNotification, TerminalResizeParams, TerminalResizeResult,
     TerminalStartParams, TerminalStartResult, TerminalTerminateParams, TerminalTerminateResult,
-    INVALID_FRAME, METHOD_TERMINAL_EXITED, METHOD_TERMINAL_OUTPUT,
+    INVALID_FRAME, INVALID_INPUT, METHOD_TERMINAL_EXITED, METHOD_TERMINAL_OUTPUT,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -25,6 +25,7 @@ const PATH_GUARDRAIL: &str = "path_guardrail";
 const TERMINAL_NOT_FOUND: &str = "terminal_not_found";
 const TERMINAL_ERROR: &str = "terminal_error";
 const TERMINAL_EXISTS: &str = "terminal_exists";
+const MIN_TERMINAL_DIMENSION: u16 = 2;
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -67,7 +68,7 @@ impl TerminalRuntime {
             canonicalize_under_root(&self.workspace_root, Path::new(&params.workspace_path))?;
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(pty_size(params.rows, params.cols))
+            .openpty(pty_size(params.rows, params.cols)?)
             .map_err(|error| terminal_error(format!("failed to open PTY: {error}")))?;
         let reader = pair
             .master
@@ -182,7 +183,7 @@ impl TerminalRuntime {
             .ok_or_else(|| terminal_not_found_error(&params.session_id))?;
         handle
             .master
-            .resize(pty_size(params.rows, params.cols))
+            .resize(pty_size(params.rows, params.cols)?)
             .map_err(|error| terminal_error(format!("failed to resize terminal: {error}")))?;
         handle
             .last_activity
@@ -436,13 +437,18 @@ fn command_builder_for_command_line(command_line: String) -> CommandBuilder {
     command
 }
 
-fn pty_size(rows: u16, cols: u16) -> PtySize {
-    PtySize {
+fn pty_size(rows: u16, cols: u16) -> Result<PtySize, DaemonErrorPayload> {
+    if rows < MIN_TERMINAL_DIMENSION || cols < MIN_TERMINAL_DIMENSION {
+        return Err(invalid_input_error(format!(
+            "terminal rows and cols must each be at least {MIN_TERMINAL_DIMENSION}"
+        )));
+    }
+    Ok(PtySize {
         rows,
         cols,
         pixel_width: 0,
         pixel_height: 0,
-    }
+    })
 }
 
 fn rfc3339_now() -> String {
@@ -511,6 +517,14 @@ fn terminal_error(message: impl Into<String>) -> DaemonErrorPayload {
     }
 }
 
+fn invalid_input_error(message: impl Into<String>) -> DaemonErrorPayload {
+    DaemonErrorPayload {
+        code: INVALID_INPUT.to_owned(),
+        message: message.into(),
+        details: None,
+    }
+}
+
 fn path_guardrail_error(message: impl Into<String>) -> DaemonErrorPayload {
     DaemonErrorPayload {
         code: PATH_GUARDRAIL.to_owned(),
@@ -525,8 +539,8 @@ mod tests {
 
     use api_types::{
         DaemonFrame, TerminalExitedNotification, TerminalInputParams, TerminalOutputNotification,
-        TerminalResizeParams, TerminalStartParams, TerminalTerminateParams, METHOD_TERMINAL_EXITED,
-        METHOD_TERMINAL_OUTPUT,
+        TerminalResizeParams, TerminalStartParams, TerminalTerminateParams, INVALID_INPUT,
+        METHOD_TERMINAL_EXITED, METHOD_TERMINAL_OUTPUT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use tempfile::TempDir;
@@ -565,6 +579,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_rejects_too_small_terminal_size() {
+        let (runtime, _rx, _root, workspace) = runtime_with_workspace();
+        let mut params = start_params("small-start", &workspace, None);
+        params.rows = 1;
+
+        let error = runtime
+            .start(params)
+            .await
+            .expect_err("too-small terminal size rejected");
+
+        assert_eq!(error.code, INVALID_INPUT);
+    }
+
+    #[tokio::test]
     async fn test_resize_ok() {
         let (runtime, _rx, _root, workspace) = runtime_with_workspace();
         runtime
@@ -585,6 +613,33 @@ mod tests {
         runtime
             .terminate(TerminalTerminateParams {
                 session_id: "resize".to_owned(),
+                reason: None,
+            })
+            .await
+            .expect("terminate");
+    }
+
+    #[tokio::test]
+    async fn test_resize_rejects_too_small_terminal_size() {
+        let (runtime, _rx, _root, workspace) = runtime_with_workspace();
+        runtime
+            .start(start_params("resize-small", &workspace, None))
+            .await
+            .expect("terminal starts");
+
+        let error = runtime
+            .resize(TerminalResizeParams {
+                session_id: "resize-small".to_owned(),
+                rows: 40,
+                cols: 1,
+            })
+            .await
+            .expect_err("too-small resize rejected");
+
+        assert_eq!(error.code, INVALID_INPUT);
+        runtime
+            .terminate(TerminalTerminateParams {
+                session_id: "resize-small".to_owned(),
                 reason: None,
             })
             .await

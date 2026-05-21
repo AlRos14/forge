@@ -4,8 +4,8 @@ use services::ServiceError;
 
 use api_types::{
     TERMINAL_ACTIVE_EXECUTION, TERMINAL_ATTACH_TOKEN_INVALID, TERMINAL_DAEMON_UNAVAILABLE,
-    TERMINAL_DISABLED, TERMINAL_NOT_FOUND, TERMINAL_PATH_GUARDRAIL, TERMINAL_SESSION_LIMIT,
-    TERMINAL_USER_LIMIT, TERMINAL_WORKSPACE_NOT_READY,
+    TERMINAL_DISABLED, TERMINAL_INVALID_INPUT, TERMINAL_NOT_FOUND, TERMINAL_PATH_GUARDRAIL,
+    TERMINAL_SESSION_LIMIT, TERMINAL_USER_LIMIT, TERMINAL_WORKSPACE_NOT_READY,
 };
 
 use crate::protocol::{error_response, McpResponse};
@@ -183,6 +183,11 @@ impl From<ServiceError> for McpToolError {
                 .with_data(json!({
                     "code": TERMINAL_NOT_FOUND
                 })),
+            ServiceError::TerminalInvalidInput { message } => {
+                Self::new(-32602, message).with_data(json!({
+                    "code": TERMINAL_INVALID_INPUT
+                }))
+            }
             ServiceError::DaemonUnavailable { daemon_id } => {
                 Self::new(-32029, format!("daemon {daemon_id} unavailable"))
                     .with_data(json!({"code": "daemon_unavailable", "daemon_id": daemon_id}))

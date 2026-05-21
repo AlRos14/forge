@@ -20,6 +20,7 @@ pub const DAEMON_UNAVAILABLE: &str = "daemon_unavailable";
 pub const DAEMON_TIMEOUT: &str = "daemon_timeout";
 pub const UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const INVALID_FRAME: &str = "invalid_frame";
+pub const INVALID_INPUT: &str = "invalid_input";
 pub const PATH_GUARDRAIL: &str = "path_guardrail";
 pub const EXECUTION_NOT_FOUND: &str = "execution_not_found";
 
