@@ -112,6 +112,54 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
     project_id
 }
 
+async fn seed_project_without_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) -> String {
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+
+    ProjectRepo::create(
+        db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Forge".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: task_id.to_owned(),
+            project_id: project_id.clone(),
+            repo_id: None,
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "test task".to_owned(),
+            description: Some("echo test".to_owned()),
+            task_type: "task".to_owned(),
+            status: status.to_owned(),
+            priority: 0,
+            is_automation: false,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("task creates");
+    project_id
+}
+
 fn setup_git_repo(path: &std::path::Path) -> String {
     run_git(path, &["init"]);
     run_git(path, &["config", "user.email", "test@forge.dev"]);
@@ -359,6 +407,58 @@ async fn build_role_dispatch_harness(
             project_id,
             from_state: from_state.to_owned(),
             to_state: to_state.to_owned(),
+            db,
+            event_bus: Arc::new(EventBus::new(16)),
+            gate_config,
+            workflow,
+            triggered_by: "system:test".to_owned(),
+            review_runner: None,
+            merge_service: None,
+            cleanup_scheduler: None,
+            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            daemon_connections: None,
+            workspace_exec_locks: None,
+            terminal_activity: None,
+            workspace_root: workspace_root.path().to_path_buf(),
+            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            workspace_id: None,
+            agent_id: None,
+            execution_id: None,
+            state_config: json!({}),
+        },
+        rx,
+        _repo_dir: repo_dir,
+        _workspace_root: workspace_root,
+    }
+}
+
+async fn build_no_repo_dispatch_harness(
+    task_id: &str,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+) -> DispatchHarness {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_root = TempDir::new().expect("workspace dir creates");
+    let project_id =
+        seed_project_without_repo_and_task(&db, task_id, default_states::IN_PROGRESS).await;
+    seed_agent_with_max(&db, agent_id, max_concurrent_tasks).await;
+    assign_agent_role(&db, task_id, default_roles::CODER, agent_id).await;
+
+    let workflow = Arc::new(default_workflow::default_workflow());
+    let gate_config = workflow
+        .states
+        .iter()
+        .find(|state| state.name == default_states::IN_PROGRESS)
+        .and_then(|state| state.gate_config.clone());
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    DispatchHarness {
+        ctx: HookContext {
+            task_id: task_id.to_owned(),
+            project_id,
+            from_state: default_states::TODO.to_owned(),
+            to_state: default_states::IN_PROGRESS.to_owned(),
             db,
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
@@ -1348,6 +1448,36 @@ async fn dispatch_role_agent_initial_dispatch_creates_execution_with_capacity() 
     assert_eq!(executions.items.len(), 1);
     assert_eq!(executions.items[0].status, ExecutionStatus::Running);
     assert_eq!(executions.items[0].agent_id.as_deref(), Some(agent_id));
+}
+
+#[tokio::test]
+async fn dispatch_role_agent_skips_initial_dispatch_without_repo() {
+    let agent_id = "agent-coder-no-repo";
+    let mut harness = build_no_repo_dispatch_harness("task-dispatch-no-repo", agent_id, 1).await;
+    let ctx = harness.ctx.clone();
+    let mut event_rx = ctx.event_bus.subscribe();
+
+    let result = DispatchRoleAgent.execute(&ctx).await;
+
+    match result {
+        HookResult::Skipped { reason } => assert_eq!(reason, "task has no associated repo"),
+        other => panic!("expected skipped result, got {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
+            .await
+            .is_err()
+    );
+    assert!(
+        event_rx.try_recv().is_err(),
+        "dispatch event should not emit for repo-less task"
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::CODER)
+            .await
+            .expect("execution count loads"),
+        0
+    );
 }
 
 #[tokio::test]

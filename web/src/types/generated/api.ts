@@ -505,7 +505,7 @@ export interface Project {
   name: string
   primary_repo_id: string | null
   settings: Record<string, unknown>
-  project_hooks: ProjectHookRule[]
+  project_hooks?: ProjectHookRule[]
   default_review_config?: ReviewConfig | null
   workflow_template_name?: string | null
   paused_at: string | null

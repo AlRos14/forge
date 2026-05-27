@@ -246,6 +246,17 @@ pub fn stored_token_for_server(server: &str) -> Result<Option<String>> {
     Ok(Some(credentials.token).filter(|token| !token.trim().is_empty()))
 }
 
+pub fn stored_server_url() -> Result<Option<String>> {
+    let Some(credentials) = read_credentials(&credentials_path())? else {
+        return Ok(None);
+    };
+    if credentials.token.trim().is_empty() {
+        return Ok(None);
+    }
+    let server = normalize_server_url(&credentials.server_url);
+    Ok((!server.is_empty()).then_some(server))
+}
+
 pub fn normalize_server_url(server: &str) -> String {
     server.trim().trim_end_matches('/').to_owned()
 }

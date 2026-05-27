@@ -7,8 +7,8 @@ use api_types::{
 };
 // use chrono::{DateTime, Utc};
 use db::{
-    AssigneeKind, Execution, ExecutionStatus, Review, ReviewStatus, Task, TaskMetadata,
-    TaskRoleAssignment,
+    AssigneeKind, Execution, ExecutionStatus, ResumePolicy, Review, ReviewStatus, Task,
+    TaskMetadata, TaskRoleAssignment,
 };
 use serde_json::Value;
 
@@ -31,6 +31,9 @@ pub fn derive_workflow_health(
         .iter()
         .find(|state| state.name == task.status);
     let role = current_state.and_then(effective_role).map(str::to_owned);
+    let awaiting_human = awaiting_human
+        || task_metadata_awaiting_human(task)
+        || latest_review.is_some_and(|review| review.status == ReviewStatus::AwaitingHuman);
 
     if task.failed_json.is_some() {
         return health(
@@ -137,6 +140,13 @@ pub fn derive_workflow_health(
                 task.updated_at.clone(),
                 None,
             );
+        }
+
+        if let Some(execution) = latest_execution.filter(|execution| {
+            execution_matches_role(execution, role_name)
+                && stopped_execution_blocks_progress(execution)
+        }) {
+            return stopped_execution_health(task, role_name, execution, latest_review);
         }
 
         // Disabled: dispatch_missing_after_grace produced false "Stuck" labels
@@ -454,6 +464,97 @@ fn health(
         review_id,
         since: Some(since),
         stale_reason,
+    }
+}
+
+fn task_metadata_awaiting_human(task: &Task) -> bool {
+    TaskMetadata::parse(task.metadata_json.as_deref())
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .extra
+                .get("awaiting_human")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn stopped_execution_blocks_progress(execution: &Execution) -> bool {
+    execution.status != ExecutionStatus::Running
+        && matches!(execution.resume_policy, None | Some(ResumePolicy::Manual))
+}
+
+fn stopped_execution_health(
+    task: &Task,
+    role_name: &str,
+    execution: &Execution,
+    latest_review: Option<&Review>,
+) -> WorkflowHealthSummary {
+    let since = execution
+        .stopped_at
+        .clone()
+        .unwrap_or_else(|| execution.updated_at.clone());
+
+    match execution.status {
+        ExecutionStatus::Failed => health(
+            WorkflowHealthKind::Failed,
+            HealthSeverity::Error,
+            "Execution Failed",
+            Some(execution.error.clone().unwrap_or_else(|| {
+                format!(
+                    "Latest {role_name} execution failed while task is still {}",
+                    task.status
+                )
+            })),
+            task,
+            Some(role_name.to_owned()),
+            Some(execution.id.clone()),
+            latest_review.map(|review| review.id.clone()),
+            since,
+            Some("execution_failed_without_task_block".to_owned()),
+        ),
+        ExecutionStatus::Completed => health(
+            WorkflowHealthKind::Stuck,
+            HealthSeverity::Warning,
+            "Stuck",
+            Some(format!(
+                "{role_name} execution completed but task is still {}",
+                task.status
+            )),
+            task,
+            Some(role_name.to_owned()),
+            Some(execution.id.clone()),
+            latest_review.map(|review| review.id.clone()),
+            since,
+            Some("execution_completed_without_transition".to_owned()),
+        ),
+        ExecutionStatus::Cancelled => health(
+            WorkflowHealthKind::Stuck,
+            HealthSeverity::Warning,
+            "Execution Stopped",
+            Some(format!(
+                "{role_name} execution stopped but task is still {}",
+                task.status
+            )),
+            task,
+            Some(role_name.to_owned()),
+            Some(execution.id.clone()),
+            latest_review.map(|review| review.id.clone()),
+            since,
+            Some("execution_stopped_without_transition".to_owned()),
+        ),
+        ExecutionStatus::Running => health(
+            WorkflowHealthKind::Running,
+            HealthSeverity::Info,
+            "Running",
+            Some(format!("{role_name} execution is running")),
+            task,
+            Some(role_name.to_owned()),
+            Some(execution.id.clone()),
+            latest_review.map(|review| review.id.clone()),
+            execution.created_at.clone(),
+            None,
+        ),
     }
 }
 

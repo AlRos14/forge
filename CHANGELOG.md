@@ -6,6 +6,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- `forge-ctl` now defaults to the stored login server before falling back to the last local server state.
+- Project list responses from older servers without `project_hooks` fields deserialize correctly.
+- Repo-less tasks no longer auto-dispatch agent work, and stopped executions now surface in workflow health.
+
 ## [0.1.4] - 2026-05-21
 
 ### Added

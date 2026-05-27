@@ -11,7 +11,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Forge server URL (default: persisted local server)"
+        help = "Forge server URL (default: stored login server, then persisted local server)"
     )]
     server: Option<String>,
     #[arg(long, default_value = "table", value_enum)]
@@ -89,6 +89,10 @@ fn resolve_server_url(explicit: Option<&str>) -> Result<String> {
         return Ok(auth::normalize_server_url(server));
     }
 
+    if let Some(server) = auth::stored_server_url()? {
+        return Ok(server);
+    }
+
     let data_dir = data_dir_from_env();
     let state_path = server_state_path(&data_dir);
     let state = read_server_state(&data_dir)
@@ -147,6 +151,38 @@ mod tests {
         assert_eq!(
             resolve_server_url(None).expect("server resolves"),
             "http://127.0.0.1:49153"
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn server_url_prefers_stored_login_over_persisted_server_state() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let data_dir = unique_temp_dir("forge-ctl-login-state");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.clone());
+        fs::create_dir_all(&data_dir).expect("data dir creates");
+        write_server_state(
+            &data_dir,
+            &ServerState::new("127.0.0.1:49153", "http://127.0.0.1:49153/"),
+        )
+        .expect("state writes");
+        fs::write(
+            data_dir.join("forge_ctl_credentials.json"),
+            serde_json::json!({
+                "server_url": "https://forge.example.com/",
+                "token": "fg_stored",
+                "token_id": "token-1",
+                "token_prefix": "fg_st",
+                "email": "user@example.com"
+            })
+            .to_string(),
+        )
+        .expect("credentials write");
+
+        assert_eq!(
+            resolve_server_url(None).expect("server resolves"),
+            "https://forge.example.com"
         );
 
         let _ = fs::remove_dir_all(data_dir);

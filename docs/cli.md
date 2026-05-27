@@ -1,13 +1,14 @@
 # forge-ctl
 
 `forge-ctl` is the CLI client for the Forge REST API. The server must be
-running first. By default, `forge-ctl` reads the server URL persisted by the
-last `forge` launch under the Forge data directory.
+running first. By default, `forge-ctl` uses the server from the stored CLI
+login, then falls back to the server URL persisted by the last `forge` launch
+under the Forge data directory.
 
 ## Global flags
 
 ```text
---server <URL>            Forge server URL  (default: persisted local server)
+--server <URL>            Forge server URL  (default: stored login, then local server)
 --output <FORMAT>         table | json      (default: table)
 ```
 
