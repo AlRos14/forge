@@ -1,10 +1,12 @@
 import type { Agent, AgentStatus, Daemon } from '@/types/generated'
 
-export const executorTypes = ['claude_code', 'codex', 'opencode', 'shell', 'null'] as const
+export const executorTypes = ['claude_code', 'codex', 'cursor', 'gemini', 'opencode', 'shell', 'null'] as const
 
 export const executorDisplayNames: Record<string, string> = {
   claude_code: 'Claude Code',
   codex: 'Codex',
+  cursor: 'Cursor',
+  gemini: 'Gemini',
   opencode: 'OpenCode',
   shell: 'Shell',
   null: 'Null (no-op)',

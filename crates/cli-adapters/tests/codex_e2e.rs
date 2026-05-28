@@ -27,7 +27,7 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
         return Ok(());
     }
 
-    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.116.0", "--version"]) {
+    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.133.0", "--version"]) {
         println!("skipping Codex E2E: @openai/codex npx package not available offline");
         return Ok(());
     }
@@ -43,11 +43,8 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
         description: "Create a file called HELLO.md in the repo root with the single word banana."
             .to_owned(),
         agent_config: json!({
-            "executor_type": "codex",
-            "config": {
-                "model": "gpt-5-codex",
-                "sandbox": "workspace-write"
-            }
+            "sandbox": "workspace-write",
+            "permission_policy": "supervised"
         }),
         logs_path: logs_path.to_string_lossy().into_owned(),
         heartbeat_interval_seconds: 30,
@@ -58,7 +55,11 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
     let adapter = CodexAdapter::new();
     let result = tokio::time::timeout(Duration::from_secs(120), adapter.execute(ctx)).await??;
 
-    assert_eq!(result.status, ExecutionOutcome::Completed);
+    assert_eq!(
+        result.status,
+        ExecutionOutcome::Completed,
+        "unexpected Codex result: {result:?}"
+    );
     assert!(
         result.agent_session_id.is_some(),
         "expected Codex thread id to be captured"

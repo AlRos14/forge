@@ -35,6 +35,7 @@ Adapters differ in where user-visible chat messages come from.
 | ----------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Codex       | Codex app-server protocol events normalized into Forge JSONL. | The UI renders `execution.prompt` first. Native Codex `userMessage` events are still parsed for later user turns, but a native event matching `execution.prompt` is skipped to avoid duplicates. |
 | Claude Code | Claude Code stream JSON normalized into Forge JSONL.          | The UI renders `execution.prompt` first. Forge may also preserve a `kind: "user"` prompt log for compatibility, but the matching log is skipped in chat to avoid duplicates.                     |
+| Cursor      | Cursor Agent stream JSON normalized into Forge JSONL.         | Cursor emits a native `user` event in print mode; the UI renders `execution.prompt` first and skips matching native prompt events to avoid duplicates.                                           |
 | Shell       | Process stdout/stderr written into Forge JSONL.               | Shell has no structured agent conversation; stdout/stderr render as shell output.                                                                                                                |
 
 ## Resume Identifiers
@@ -46,6 +47,7 @@ follow-ups.
 | ----------- | ------------------- | -------------------------------------------------------------------------- |
 | Codex       | `resume_thread_id`  | Existing Codex thread id. Follow-ups fork the thread and start a new turn. |
 | Claude Code | `resume_session_id` | Existing Claude session id passed to Claude Code resume mode.              |
+| Cursor      | `resume_session_id` | Existing Cursor Agent session id passed to `cursor-agent --resume`.        |
 
 ## Follow-Up Turns
 
@@ -71,6 +73,7 @@ Adapter behavior:
 | ----------- | ----------------------------------------------------------------------------------------------------------- |
 | Codex       | Uses `resume_thread_id`, forks the existing thread, then starts a new turn with the follow-up prompt.        |
 | Claude Code | Uses `resume_session_id`, starts Claude Code in resume mode, then sends the follow-up prompt over stdin JSON. |
+| Cursor      | Uses `resume_session_id`, starts `cursor-agent --resume`, then sends the follow-up prompt in print mode.     |
 
 The important distinction is that native agent history is used for agent
 context, while Forge execution metadata is used for stable product chat display.
@@ -87,6 +90,8 @@ Use this checklist when revisiting prompt/resume behavior:
   native `userMessage` event.
 - Claude Code follow-up resumes from the parent session and does not require the
   Claude stream to echo the prompt.
+- Cursor follow-up resumes from the parent session and deduplicates the native
+  Cursor `user` event when it matches `execution.prompt`.
 - Raw logs remain unchanged; prompt synthesis affects only chat rendering.
 
 ## Important Invariants

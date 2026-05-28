@@ -104,6 +104,18 @@ pub struct ClaudeCodeConfig {
     pub command_overrides: CommandOverrides,
 }
 
+/// Cursor Agent CLI executor config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CursorConfig {
+    pub model: Option<String>,
+    pub force: Option<bool>,
+    pub resume_session_id: Option<String>,
+    pub permission_policy: Option<PermissionPolicy>,
+    pub prompt_template: Option<String>,
+    #[serde(flatten)]
+    pub command_overrides: CommandOverrides,
+}
+
 /// OpenCode executor config. Field names compatible with Vibe Kanban.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct OpencodeConfig {
@@ -160,6 +172,7 @@ pub fn deserialize_config(
         ExecutorKind::Shell => deserialize_typed::<ShellConfig>(kind, json),
         ExecutorKind::Codex => deserialize_typed::<CodexConfig>(kind, json),
         ExecutorKind::ClaudeCode => deserialize_typed::<ClaudeCodeConfig>(kind, json),
+        ExecutorKind::Cursor => deserialize_typed::<CursorConfig>(kind, json),
         ExecutorKind::Opencode => deserialize_typed::<OpencodeConfig>(kind, json),
         ExecutorKind::Gemini => deserialize_typed::<GeminiConfig>(kind, json),
         ExecutorKind::Null => deserialize_typed::<NullConfig>(kind, json),
@@ -210,6 +223,7 @@ pub fn resolve_config_value(
         ExecutorKind::Shell => normalize_typed::<ShellConfig>(kind, &merged),
         ExecutorKind::Codex => normalize_typed::<CodexConfig>(kind, &merged),
         ExecutorKind::ClaudeCode => normalize_typed::<ClaudeCodeConfig>(kind, &merged),
+        ExecutorKind::Cursor => normalize_typed::<CursorConfig>(kind, &merged),
         ExecutorKind::Opencode => normalize_typed::<OpencodeConfig>(kind, &merged),
         ExecutorKind::Gemini => normalize_typed::<GeminiConfig>(kind, &merged),
         ExecutorKind::Null => normalize_typed::<NullConfig>(kind, &merged),

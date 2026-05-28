@@ -5,8 +5,8 @@ use axum::{
 };
 use db::DaemonRepo;
 use executors::{
-    ClaudeCodeConfig, CodexConfig, DiscoverContext, ExecutorKind, GeminiConfig, OpencodeConfig,
-    ShellConfig,
+    ClaudeCodeConfig, CodexConfig, CursorConfig, DiscoverContext, ExecutorKind, GeminiConfig,
+    OpencodeConfig, ShellConfig,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
@@ -27,6 +27,11 @@ pub async fn list_executor_types() -> Json<Vec<ExecutorTypeDescriptor>> {
             "claude_code",
             "Claude Code",
             schema_to_value(schema_for!(ClaudeCodeConfig)),
+        ),
+        descriptor::<CursorConfig>(
+            "cursor",
+            "Cursor",
+            schema_to_value(schema_for!(CursorConfig)),
         ),
         descriptor::<OpencodeConfig>(
             "opencode",

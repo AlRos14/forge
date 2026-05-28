@@ -67,7 +67,8 @@ By default the server:
   from `~/.forge/server.json` on later starts.
 - Creates `~/.forge/forge.db` (SQLite, WAL mode).
 - Boots an embedded daemon that auto-registers and reports installed CLIs
-  (`shell` always, plus `codex` / `claude_code` / `opencode` when on `PATH`).
+  (`shell` always, plus `codex` / `claude_code` / `cursor` / `gemini` /
+  `opencode` when on `PATH`).
 - Upserts default executor profiles from the adapter registry.
 
 Open the `management_url` printed in the server logs for the web UI. For raw
@@ -116,6 +117,10 @@ curl -sS -X POST "$FORGE_URL/api/v1/agents" \
     "daemon_id": "<daemon-id-from-above>"
   }'
 ```
+
+For Cursor, use `"executor_type": "cursor"`. Forge runs `cursor-agent` in
+headless print mode with stream JSON output; set `CURSOR_API_KEY` or run
+`cursor-agent login` first so the daemon reports it as authenticated.
 
 The `shell` executor is always available and useful for scripted tests — see the
 walkthrough below.

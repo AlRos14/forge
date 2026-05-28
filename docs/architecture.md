@@ -17,7 +17,7 @@ crates/
 ├── db/            # SQLite schema, migrations, repository implementations
 ├── services/      # Business logic (task state machine, workflow engine)
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
-├── cli-adapters/  # Codex, Claude, Gemini, opencode, shell, null adapters
+├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
 ├── workspace/     # Git worktree lifecycle, locking, path guardrails
 ├── git/           # Low-level git operations
 ├── review/        # CI runner, auditor orchestration

@@ -683,6 +683,17 @@ fn isolation_posture(executor_kind: &str, permission_policy: &str, config: &Valu
                     .to_owned()
             }
         }
+        "cursor" => {
+            if config
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(permission_policy != "plan")
+            {
+                "force".to_owned()
+            } else {
+                "propose_only".to_owned()
+            }
+        }
         _ => "not_applicable".to_owned(),
     }
 }

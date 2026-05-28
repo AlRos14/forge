@@ -1021,7 +1021,7 @@ fn build_executor_config(
             } else {
                 map.remove("resume_fallback_prompt");
             }
-        } else if executor_type == "claude_code" {
+        } else if executor_type == "claude_code" || executor_type == "cursor" {
             map.insert(
                 "resume_session_id".to_owned(),
                 Value::String(session_id.to_owned()),

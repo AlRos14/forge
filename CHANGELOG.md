@@ -6,6 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Added a first-class Cursor executor backed by `cursor-agent` headless stream JSON mode, including daemon detection, agent registration, web UI configuration, session resume, and execution log normalization.
+
+### Changed
+
+- Updated the Forge-managed Codex, Claude Code, and Claude Code Router package pins to their current npm `latest` versions.
+
 ### Fixed
 
 - `forge-ctl` now defaults to the stored login server before falling back to the last local server state.

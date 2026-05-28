@@ -17,7 +17,9 @@ pub fn resolve_effective_policy(
         matches!(executor_kind, ExecutorKind::Codex) && isolation_posture == "danger-full-access";
     let claude_code_high_risk = matches!(executor_kind, ExecutorKind::ClaudeCode)
         && config_bool(config, config_snapshot, "dangerously_skip_permissions") == Some(true);
-    let is_high_risk = codex_high_risk || claude_code_high_risk;
+    let cursor_high_risk =
+        matches!(executor_kind, ExecutorKind::Cursor) && isolation_posture == "force";
+    let is_high_risk = codex_high_risk || claude_code_high_risk || cursor_high_risk;
 
     EffectiveExecutionPolicy {
         executor_kind: executor_kind.to_string(),
@@ -91,6 +93,16 @@ fn resolve_isolation_posture(
                 "dangerously_skip_permissions".to_owned()
             } else {
                 "standard".to_owned()
+            }
+        }
+        ExecutorKind::Cursor => {
+            if config_bool(config, config_snapshot, "force").unwrap_or_else(|| {
+                config_string(config, config_snapshot, "permission_policy").as_deref()
+                    != Some("plan")
+            }) {
+                "force".to_owned()
+            } else {
+                "propose_only".to_owned()
             }
         }
         ExecutorKind::Shell

@@ -402,6 +402,7 @@ fn executor_display_name(executor_type: &str) -> &str {
     match executor_type {
         "claude_code" => "Claude Code",
         "codex" => "Codex",
+        "cursor" => "Cursor",
         "gemini" => "Gemini",
         "opencode" => "OpenCode",
         "shell" => "Shell",
