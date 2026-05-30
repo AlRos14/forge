@@ -109,6 +109,9 @@ pub(crate) fn daemon_error_to_service_error(
             method: method.to_owned(),
         },
         api_types::INVALID_INPUT => ServiceError::terminal_invalid_input(error.message),
+        api_types::PATH_GUARDRAIL | api_types::INVALID_FRAME | api_types::UNSUPPORTED_METHOD => {
+            ServiceError::invalid_operation(error.message)
+        }
         _ => ServiceError::Domain(error.message),
     }
 }

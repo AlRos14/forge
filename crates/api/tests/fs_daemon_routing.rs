@@ -16,8 +16,9 @@ use api_types::{
     TerminalOutputNotification, TerminalResizeParams, TerminalResizeResult, TerminalServerFrame,
     TerminalSessionResponse, TerminalSessionStatus as ApiTerminalSessionStatus,
     TerminalStartParams, TerminalStartResult, TerminalTerminateParams, TerminalTerminateResult,
-    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_OUTPUT,
-    METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE,
+    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_TERMINAL_INPUT,
+    METHOD_TERMINAL_OUTPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
+    METHOD_TERMINAL_TERMINATE, PATH_GUARDRAIL,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -28,7 +29,7 @@ use db::{
     AgentRepo, AgentStatus, AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo,
     CreateTask, CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, Execution,
     ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
-    UpsertDaemon, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    UpdateExecution, UpsertDaemon, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
@@ -488,6 +489,128 @@ async fn disconnected_filesystem_request_is_not_queued_for_report_polling() {
 }
 
 #[tokio::test]
+async fn connected_remote_daemon_receives_execution_start_request() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "execution-start-connected-remote").await;
+    let (connection, mut outbound) =
+        services::daemon_transport::DaemonConnection::new(registration.daemon_id.clone());
+    state
+        .daemon_connections
+        .register(registration.daemon_id.clone(), connection);
+
+    let fixture =
+        seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
+    let service = state.task_service.clone();
+    let execution_id = fixture.execution.id.clone();
+    let starter = tokio::spawn(async move { service.start_execution(execution_id).await });
+
+    let frame = outbound.recv().await.expect("server sends execution start");
+    let DaemonFrame::Request { id, method, params } = frame else {
+        panic!("expected daemon request frame");
+    };
+    assert_eq!(method, METHOD_EXECUTION_START);
+    assert_eq!(params["execution_id"], fixture.execution.id);
+    assert_eq!(params["task_id"], fixture.task_id);
+    assert_eq!(params["workspace_path"], fixture.workspace_path);
+    assert_eq!(params["executor_type"], "shell");
+    assert_eq!(params["prompt"]["description"], "echo remote");
+
+    state.daemon_connections.dispatch_incoming(
+        &registration.daemon_id,
+        DaemonFrame::Response {
+            id,
+            result: serde_json::to_value(api_types::ExecutionStartResult {
+                execution_id: fixture.execution.id.clone(),
+                accepted: true,
+            })
+            .expect("execution start result serializes"),
+        },
+    );
+
+    let result = starter
+        .await
+        .expect("starter task joins")
+        .expect("start execution succeeds");
+    assert_eq!(result.execution_id, fixture.execution.id);
+    assert!(result.accepted);
+}
+
+#[tokio::test]
+async fn remote_execution_start_error_marks_execution_failed() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "execution-start-error-remote").await;
+    let (connection, mut outbound) =
+        services::daemon_transport::DaemonConnection::new(registration.daemon_id.clone());
+    state
+        .daemon_connections
+        .register(registration.daemon_id.clone(), connection);
+
+    let fixture =
+        seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
+    let service = state.task_service.clone();
+    let execution_id = fixture.execution.id.clone();
+    let starter = tokio::spawn(async move { service.start_execution(execution_id).await });
+
+    let frame = outbound.recv().await.expect("server sends execution start");
+    let DaemonFrame::Request { id, method, .. } = frame else {
+        panic!("expected daemon request frame");
+    };
+    assert_eq!(method, METHOD_EXECUTION_START);
+
+    state.daemon_connections.dispatch_incoming(
+        &registration.daemon_id,
+        DaemonFrame::Error {
+            id: Some(id),
+            error: api_types::DaemonErrorPayload {
+                code: PATH_GUARDRAIL.to_owned(),
+                message: "failed to resolve path '/server-only/worktree'".to_owned(),
+                details: None,
+            },
+        },
+    );
+
+    let error = starter
+        .await
+        .expect("starter task joins")
+        .expect_err("start execution fails");
+    assert!(
+        error.to_string().contains("failed to resolve path"),
+        "unexpected error: {error}"
+    );
+
+    let execution = ExecutionRepo::get_by_id(&*state.db, &fixture.execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(execution.stop_reason, Some(db::StopReason::ExecutorFailed));
+    assert_eq!(execution.stopped_by.as_deref(), Some("system:dispatch"));
+    assert!(
+        execution
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("failed to resolve path")),
+        "unexpected execution error: {:?}",
+        execution.error
+    );
+
+    let task = TaskRepo::get_by_id(&*state.db, &fixture.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(
+        task.blocked_json.is_some(),
+        "dispatch failure should block the task for recovery"
+    );
+    assert!(
+        task.error_annotation.is_some(),
+        "dispatch failure should expose an executor-failure annotation"
+    );
+}
+
+#[tokio::test]
 async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
     let state = test_state().await;
     let app = test_app(&state);
@@ -522,6 +645,11 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
             signal: None,
             error: None,
             ts: db::now_rfc3339(),
+            status: None,
+            agent_session_id: None,
+            summary: None,
+            after_sha: None,
+            usage: None,
         })
         .expect("terminal notification serializes"),
     };
@@ -536,6 +664,77 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
     assert_heartbeat_echo(&mut other_socket, 42).await;
 
     assert_execution_status_remains(&state, &execution.id, ExecutionStatus::Running).await;
+}
+
+#[tokio::test]
+async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "execution-terminal-preserve-metadata").await;
+    let server = TestServer::start(Arc::clone(&state)).await;
+    let mut daemon_socket = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        &registration.registration_token,
+    )
+    .await
+    .expect("daemon websocket upgrade succeeds");
+    wait_until_connected(&state, &registration.daemon_id).await;
+
+    let execution = seed_running_execution_for_daemon(&state, &registration.daemon_id).await;
+    ExecutionRepo::update(
+        &*state.db,
+        UpdateExecution {
+            id: execution.id.clone(),
+            status: None,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: Some(Some("remote-session-1".to_owned())),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(Some("partial remote summary".to_owned())),
+            logs_path: None,
+            before_sha: None,
+            after_sha: Some(Some("partial-after-sha".to_owned())),
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("execution metadata updates");
+
+    send_daemon_notification(
+        &mut daemon_socket,
+        METHOD_EXECUTION_TERMINAL,
+        ExecutionTerminalNotification {
+            execution_id: execution.id.clone(),
+            exit_code: Some(1),
+            signal: None,
+            error: Some("remote process failed".to_owned()),
+            ts: db::now_rfc3339(),
+            status: Some("failed".to_owned()),
+            agent_session_id: None,
+            summary: None,
+            after_sha: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let updated = wait_for_execution_status(&state, &execution.id, ExecutionStatus::Failed).await;
+    assert_eq!(
+        updated.agent_session_id.as_deref(),
+        Some("remote-session-1")
+    );
+    assert_eq!(updated.summary.as_deref(), Some("partial remote summary"));
+    assert_eq!(updated.after_sha.as_deref(), Some("partial-after-sha"));
+    assert_eq!(
+        updated.error.as_deref(),
+        Some("remote process failed; exit code 1")
+    );
 }
 
 #[tokio::test]
@@ -1090,6 +1289,170 @@ async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str) ->
     .expect("execution creates")
 }
 
+struct StartableExecutionFixture {
+    task_id: String,
+    workspace_path: String,
+    execution: Execution,
+}
+
+async fn seed_startable_execution_for_daemon(
+    state: &AppState,
+    daemon_id: &str,
+    prompt: &str,
+) -> StartableExecutionFixture {
+    let now = db::now_rfc3339();
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let repo_id = uuid::Uuid::new_v4().to_string();
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let workspace_id = uuid::Uuid::new_v4().to_string();
+    let workspace_path = state
+        .cleanup_scheduler
+        .workspace_root()
+        .join("execution-start")
+        .join(&task_id);
+    fs::create_dir_all(&workspace_path).expect("workspace path creates");
+
+    ProjectRepo::create(
+        &*state.db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Execution Start".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(TEST_USER_ID.to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+    RepoRepo::create(
+        &*state.db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "execution-repo".to_owned(),
+            remote_url: "file:///tmp/execution-repo".to_owned(),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("repo creates");
+    TaskRepo::create(
+        &*state.db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            assignee_type: Some("agent".to_owned()),
+            assignee_id: Some(agent_id.clone()),
+            title: "Start remote execution".to_owned(),
+            description: Some(prompt.to_owned()),
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("task creates");
+    AgentRepo::create(
+        &*state.db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: "Remote Shell".to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            daemon_id: Some(daemon_id.to_owned()),
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Busy,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: Some(TEST_USER_ID.to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("agent creates");
+    WorkspaceRepo::create(
+        &*state.db,
+        CreateWorkspace {
+            id: workspace_id.clone(),
+            task_id: task_id.clone(),
+            repo_id,
+            worktree_path: workspace_path.to_string_lossy().into_owned(),
+            branch: "forge/task/start".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("workspace creates");
+    let execution = ExecutionRepo::create(
+        &*state.db,
+        CreateExecution {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some(now.clone()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                serde_json::json!({ "executor_type": "shell", "config": {} }).to_string(),
+            ),
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("execution creates");
+
+    StartableExecutionFixture {
+        task_id,
+        workspace_path: workspace_path.to_string_lossy().into_owned(),
+        execution,
+    }
+}
+
 struct TerminalTaskFixture {
     task_id: String,
     workspace_path: String,
@@ -1251,6 +1614,29 @@ async fn assert_execution_status_remains(
         if tokio::time::Instant::now() >= deadline {
             return;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_execution_status(
+    state: &AppState,
+    execution_id: &str,
+    expected_status: ExecutionStatus,
+) -> Execution {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        if execution.status == expected_status {
+            return execution;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "execution did not reach {expected_status}, current status was {}",
+            execution.status
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

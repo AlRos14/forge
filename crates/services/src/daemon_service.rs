@@ -1,9 +1,9 @@
 use crate::{Result, ServiceError};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use db::{
-    new_uuid_v4, now_rfc3339, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, CreateRuntime,
-    Daemon, DaemonRepo, DaemonStatus, Page, PageRequest, RuntimeRepo, RuntimeStatus, SortBy,
-    SortOrder, SqliteDb, UpdateDaemonReport, UpsertDaemon,
+    new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateRuntime, Daemon,
+    DaemonRepo, DaemonStatus, Page, PageRequest, RuntimeRepo, RuntimeStatus, SqliteDb,
+    UpdateDaemonReport, UpsertDaemon,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::ExecutorKind;
@@ -249,27 +249,23 @@ impl DaemonService {
         executor_type: &str,
         owner_id: &str,
     ) -> Result<bool> {
-        let page = AgentRepo::list(
-            &*self.db,
-            AgentListQuery {
-                status: None,
-                executor_type: Some(executor_type.to_owned()),
-                capabilities: Vec::new(),
-                page: PageRequest {
-                    cursor: None,
-                    limit: 500,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Asc,
-                },
-            },
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM agent
+                WHERE daemon_id = ?
+                  AND executor_type = ?
+                  AND owner_id = ?
+                LIMIT 1
+            )",
         )
+        .bind(daemon_id)
+        .bind(executor_type)
+        .bind(owner_id)
+        .fetch_one(self.db.pool())
         .await?;
 
-        Ok(page.items.into_iter().any(|agent| {
-            agent.daemon_id.as_deref() == Some(daemon_id)
-                && agent.owner_id.as_deref() == Some(owner_id)
-        }))
+        Ok(exists != 0)
     }
 
     #[tracing::instrument(skip(self, page), fields(limit = page.limit))]
@@ -414,7 +410,7 @@ fn executor_display_name(executor_type: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{create_sqlite_pool, run_migrations};
+    use db::{create_sqlite_pool, run_migrations, User, UserRepo};
 
     async fn service() -> DaemonService {
         let pool = create_sqlite_pool("sqlite::memory:")
@@ -479,5 +475,62 @@ mod tests {
             .authenticate(&second.daemon_id, &second.plaintext_token)
             .await
             .expect("new token authenticates");
+    }
+
+    #[tokio::test]
+    async fn report_full_cli_set_is_idempotent_for_daemon_agents() {
+        let service = service().await;
+        let now = now_rfc3339();
+        let user_id = "user-1".to_owned();
+        UserRepo::create_user(
+            &*service.db,
+            &User {
+                id: user_id.clone(),
+                email: "daemon-owner@example.com".to_owned(),
+                password_hash: "hash".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("user creates");
+
+        let mut input = register_input("machine-1");
+        input.owner_id = Some(user_id);
+        input.visibility = Some("account".to_owned());
+        let registration = service.register(input).await.expect("register succeeds");
+
+        let report = || DaemonReportInput {
+            detected_clis: [
+                "claude_code",
+                "codex",
+                "cursor",
+                "gemini",
+                "opencode",
+                "shell",
+            ]
+            .into_iter()
+            .map(|kind| DetectedCliInput {
+                kind: kind.to_owned(),
+                availability: "authenticated".to_owned(),
+                config_path: None,
+                version: None,
+                path: None,
+            })
+            .collect(),
+            runtimes: Vec::new(),
+            labels: None,
+        };
+
+        service
+            .ingest_report(&registration.daemon_id, report())
+            .await
+            .expect("first report creates daemon agents");
+        service
+            .ingest_report(&registration.daemon_id, report())
+            .await
+            .expect("second report sees existing daemon agents");
     }
 }

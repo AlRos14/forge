@@ -4,7 +4,10 @@ pub mod agent;
 pub mod auth;
 pub mod client;
 pub mod daemon;
+#[doc(hidden)]
+pub mod daemon_fs;
 pub mod daemon_link;
+pub mod daemon_runtime;
 pub mod mcp;
 pub mod output;
 pub mod project;

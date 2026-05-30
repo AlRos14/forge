@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-30
+
 ### Added
 
 - Added a first-class Cursor executor backed by `cursor-agent` headless stream JSON mode, including daemon detection, agent registration, web UI configuration, session resume, and execution log normalization.
@@ -16,6 +18,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Linked `forge-ctl daemon link` sessions now keep the daemon command stream open so filesystem browsing and remote agent dispatch work from server-managed local daemons.
+- Daemon reports with a full authenticated CLI set no longer fail while checking existing daemon-scoped agents.
+- Remote daemon `execution.start` failures now fail and block the execution for recovery instead of leaving it stuck in `running`.
 - `forge-ctl` now defaults to the stored login server before falling back to the last local server state.
 - Project list responses from older servers without `project_hooks` fields deserialize correctly.
 - Repo-less tasks no longer auto-dispatch agent work, and stopped executions now surface in workflow health.

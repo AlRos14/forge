@@ -184,34 +184,51 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
         };
 
         let writer = self.writer_for(&notification, &execution).await?;
-        let kind = match notification.stream.as_str() {
-            "stderr" => LogKind::Stderr,
-            _ => LogKind::Stdout,
+        let kind = notification
+            .kind
+            .as_deref()
+            .and_then(|value| value.parse::<LogKind>().ok())
+            .unwrap_or(match notification.stream.as_str() {
+                "stderr" => LogKind::Stderr,
+                _ => LogKind::Stdout,
+            });
+        let stream = match notification.log_stream.as_deref() {
+            Some("heartbeat") => LogStream::Heartbeat,
+            _ => LogStream::Main,
         };
-        let log = json!({
-            "line": notification.line,
-            "daemon_seq": notification.seq,
-            "daemon_ts": notification.ts,
-            "stream": notification.stream,
+        let payload = notification.payload.clone().unwrap_or_else(|| {
+            json!({
+                "line": notification.line,
+                "daemon_seq": notification.seq,
+                "daemon_ts": notification.ts,
+                "stream": notification.stream,
+            })
         });
         writer
             .lock()
             .await
-            .write(kind, LogStream::Main, log.clone())
+            .write(kind.clone(), stream.clone(), payload.clone())
             .await
             .map_err(|error| {
                 ServiceError::invalid_operation(format!("failed to write execution log: {error}"))
             })?;
 
-        ExecutionRepo::update_last_activity_at(
-            &*self.db,
-            &notification.execution_id,
-            &event_timestamp(),
-        )
-        .await?;
+        let execution_id = notification.execution_id.clone();
+        ExecutionRepo::update_last_activity_at(&*self.db, &execution_id, &event_timestamp())
+            .await?;
+        let log = json!({
+            "schema_version": 1,
+            "sequence": notification.seq,
+            "timestamp": notification.ts,
+            "execution_id": execution_id.clone(),
+            "kind": kind,
+            "stream": stream,
+            "payload": payload,
+            "truncated": notification.truncated.unwrap_or(false),
+        });
         self.event_bus.publish(ForgeEvent {
             event_type: "execution.log".to_owned(),
-            entity_id: notification.execution_id,
+            entity_id: execution_id,
             timestamp: event_timestamp(),
             context: EventContext::ExecutionLog {
                 task_id: execution.task_id,

@@ -454,6 +454,23 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<()> {
+        self.annotate_executor_failure_block_with_retry(execution, true)
+            .await
+    }
+
+    pub(crate) async fn annotate_dispatch_failure_block(
+        &self,
+        execution: &Execution,
+    ) -> Result<()> {
+        self.annotate_executor_failure_block_with_retry(execution, false)
+            .await
+    }
+
+    async fn annotate_executor_failure_block_with_retry(
+        &self,
+        execution: &Execution,
+        allow_retry: bool,
+    ) -> Result<()> {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
@@ -468,14 +485,15 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == task.status);
-        if self
-            .maybe_schedule_execution_retry(
-                execution,
-                &task,
-                current_state.map(|state| &state.config),
-                current_state.and_then(|state| state.gate_config.as_ref()),
-            )
-            .await?
+        if allow_retry
+            && self
+                .maybe_schedule_execution_retry(
+                    execution,
+                    &task,
+                    current_state.map(|state| &state.config),
+                    current_state.and_then(|state| state.gate_config.as_ref()),
+                )
+                .await?
         {
             return Ok(());
         }

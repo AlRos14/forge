@@ -202,8 +202,10 @@ Full CLI reference → [docs/cli.md](cli.md).
 
 `forge-ctl daemon link` registers the current machine with a running Forge
 server, saves daemon credentials, reports local CLI availability, and keeps
-sending heartbeats. In the web UI: **Daemons → Link daemon** generates a token
-and prints the full command:
+sending heartbeats. While it is running, it also keeps the daemon command
+stream open so Forge can browse local paths and dispatch agents on that
+machine. In the web UI: **Daemons → Link daemon** generates a token and prints
+the full command:
 
 ```bash
 forge-ctl daemon link \
@@ -213,9 +215,14 @@ forge-ctl daemon link \
 
 The token is used only for initial ownership; the daemon receives and stores its
 own registration token afterward. Use `--once` for a one-shot
-registration/report. Full remote execution depends on the remote-daemon
-transport work; today this makes the machine visible for daemon/CLI inventory
-and agent pinning.
+registration/report only; `--once` does not keep the command stream open for
+filesystem browsing or execution dispatch.
+
+Execution dispatch expects the server-created task worktree to exist at the same
+absolute path on the daemon host. For containers, mount the server workspace
+root into the container at that same path. A daemon on an unrelated filesystem
+can still serve filesystem browsing under its own `--workspace-root`, but it
+cannot run server-created task worktrees yet.
 
 ## Where to next
 

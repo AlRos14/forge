@@ -78,8 +78,9 @@ forge-ctl task cancel <TASK_ID>
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge
-server, saves daemon credentials, reports installed CLI inventory, and keeps
-sending heartbeats. In the web UI: **Daemons → Link daemon** generates the
+server, saves daemon credentials, reports installed CLI inventory, keeps
+sending heartbeats, and serves filesystem and execution commands over the
+daemon command stream. In the web UI: **Daemons → Link daemon** generates the
 token and prints the full command:
 
 ```bash
@@ -90,7 +91,13 @@ forge-ctl daemon link \
 
 The token is used only for initial ownership; the daemon receives and stores
 its own registration token afterward. Add `--once` for a one-shot
-registration/report.
+registration/report that does not keep the command stream open.
+
+Execution dispatch requires the task worktree path created by the server to
+exist at the same absolute path on the daemon host. Use a local daemon or mount
+the server workspace root into the daemon host/container at the same path. A
+daemon on an unrelated filesystem can browse its own `--workspace-root`, but it
+cannot run server-created task worktrees yet.
 
 ### Installing MCP client config
 

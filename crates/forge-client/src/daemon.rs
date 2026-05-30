@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,10 +14,12 @@ use api_types::{
 use clap::Subcommand;
 use executors::{AvailabilityStatus, ExecutorKind};
 use serde::{Deserialize, Serialize};
-use tokio::{process::Command as TokioCommand, time::timeout};
+use tokio::{process::Command as TokioCommand, sync::watch, time::timeout};
 
 use crate::{
     client::ForgeClient,
+    daemon_link::DaemonClient,
+    daemon_runtime,
     output::{print_json, print_table_daemons},
     OutputFormat,
 };
@@ -123,13 +126,32 @@ impl DaemonArgs {
                 }
 
                 println!(
-                    "daemon linked as {}; reporting every {}s",
+                    "daemon linked as {}; reporting every {}s with command stream enabled",
                     linked.credentials.daemon_id, interval_seconds
                 );
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let mut daemon_client = DaemonClient::new(client.url("/"))?;
+                daemon_client.set_credentials(
+                    linked.credentials.daemon_id.clone(),
+                    linked.credentials.token.clone(),
+                );
+                let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
+                    Arc::new(daemon_client),
+                    workspace_root.clone(),
+                    shutdown_rx,
+                ));
                 loop {
                     tokio::select! {
                         result = tokio::signal::ctrl_c() => {
                             result.context("listen for Ctrl-C")?;
+                            let _ = shutdown_tx.send(true);
+                            connect_handle.abort();
+                            match connect_handle.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => eprintln!("daemon command stream stopped: {error}"),
+                                Err(error) if error.is_cancelled() => {}
+                                Err(error) => eprintln!("daemon command stream task failed: {error}"),
+                            }
                             println!("daemon link stopped");
                             return Ok(());
                         }

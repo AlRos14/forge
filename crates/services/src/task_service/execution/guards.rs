@@ -177,6 +177,16 @@ impl TaskService {
         .await
         .map_err(ServiceError::from)?;
         super::publish_terminal_execution_event(self, &execution);
+        if should_block_task_for_failed_execution(&execution) {
+            if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    task_id = %execution.task_id,
+                    %error,
+                    "failed to block task after dispatch failure"
+                );
+            }
+        }
         Ok(execution)
     }
 }

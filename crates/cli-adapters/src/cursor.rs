@@ -426,7 +426,7 @@ fn classify_cursor_event(event: &Value) -> LogKind {
 }
 
 fn should_force(config: &CursorConfig) -> bool {
-    config.force.unwrap_or_else(|| {
+    config.force.unwrap_or({
         !matches!(
             config.permission_policy.as_ref(),
             Some(PermissionPolicy::Plan)

@@ -73,6 +73,34 @@ pub(super) async fn clear_execution_retry_metadata(db: &SqliteDb, task: &Task) -
     Ok(())
 }
 
+pub(super) fn usage_provider_from_agent_config(agent_config: &Value) -> String {
+    usage_provider_for_executor_type(agent_config.get("executor_type").and_then(Value::as_str))
+}
+
+pub(super) fn usage_provider_from_snapshot(snapshot_json: Option<&str>) -> String {
+    let executor_type = snapshot_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("executor_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    usage_provider_for_executor_type(executor_type.as_deref())
+}
+
+fn usage_provider_for_executor_type(executor_type: Option<&str>) -> String {
+    match executor_type.unwrap_or_default() {
+        "codex" => "openai",
+        "claude_code" => "anthropic",
+        "cursor" => "cursor",
+        "opencode" => "opencode",
+        other if !other.is_empty() => other,
+        _ => "unknown",
+    }
+    .to_owned()
+}
+
 pub(super) async fn set_planning_awaiting_review_metadata(
     db: &SqliteDb,
     task: &Task,

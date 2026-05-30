@@ -287,7 +287,7 @@ function DaemonLinkDialog({
           <DialogTitle>Link daemon</DialogTitle>
           <DialogDescription>
             Create a personal link token, then run the command on the machine that should report
-            local CLIs to Forge.
+            local CLIs, browse paths, and run agent work for Forge.
           </DialogDescription>
         </DialogHeader>
 

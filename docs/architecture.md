@@ -65,6 +65,23 @@ The `events` crate wraps `tokio::sync::broadcast`. Services publish
 `ForgeEvent` on state changes; the SSE endpoint at `/api/v1/events` subscribes
 and streams them to web clients and other listeners.
 
+### Daemon command transport
+
+Linked daemons keep a WebSocket command stream open at
+`/api/v1/daemons/{id}/connect`. The API server routes filesystem requests
+(`fs.list`, `fs.branches`) and daemon-owned managed executions
+(`execution.start`, `execution.cancel`) over that stream. The daemon validates
+paths against its advertised workspace root, runs the local CLI adapter, streams
+execution logs back as `execution.log` notifications, and reports final status
+through `execution.terminal`.
+
+Managed execution dispatch currently assumes the server-created task worktree
+exists at the same absolute path on the daemon host. That covers local daemons
+and containers or hosts with a shared workspace mount. A daemon on a separate
+filesystem can still browse paths under its own `--workspace-root`, but
+`execution.start` rejects server-only worktree paths until Forge has a remote
+workspace sync or git handoff path.
+
 ### Task terminal sessions
 
 Task terminal sessions are a separate API and daemon path for interactive shell
