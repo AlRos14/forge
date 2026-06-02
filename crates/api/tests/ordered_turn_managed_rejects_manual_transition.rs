@@ -1,12 +1,12 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
 mod common;
 
-use api_types::TaskResponse;
+use api_types::{TaskResponse, TransitionTaskResponse};
 use axum::http::{Method, StatusCode};
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[tokio::test]
-async fn subtask_managed_rejects_manual_transition() {
+async fn subtask_managed_allows_manual_status_transition() {
     let repo_dir = common::TestDir::new("forge-subtask-managed-repo");
     let repo_path = common::setup_git_repo(repo_dir.path());
     let workspace_root = common::TestDir::new("forge-subtask-managed-workspaces");
@@ -50,19 +50,22 @@ async fn subtask_managed_rejects_manual_transition() {
     assert_eq!(claimed_root.status, "in_progress");
 
     let managed_child = common::poll_task_status(&harness.app, &child.id, "in_progress").await;
-    let response = common::raw_json_request(
+    let moved_child: TransitionTaskResponse = common::json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/transition", managed_child.id),
         json!({
-            "status": "in_progress",
+            "status": "done",
             "version": managed_child.version,
             "reason": "manual move"
         }),
+        StatusCode::OK,
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let body: Value = common::parse_response(response, StatusCode::CONFLICT).await;
-    assert_eq!(body["code"], "SUBTASK_MANAGED_BY_ROOT");
+    assert_eq!(moved_child.task.status, "done");
+    assert_eq!(
+        moved_child.task.parent_task_id.as_deref(),
+        Some(root.id.as_str())
+    );
 }
