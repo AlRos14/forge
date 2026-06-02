@@ -487,7 +487,10 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use api_types::{FsListResult, METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST};
+    use api_types::{
+        ExecutionLogNotification, FsListResult, METHOD_EXECUTION_LOG, METHOD_EXECUTION_TERMINAL,
+        METHOD_FS_LIST,
+    };
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -567,12 +570,12 @@ mod tests {
                     "executor_type": "shell",
                     "config": {}
                 }),
-                prompt: serde_json::json!({ "description": "sleep 30" }),
+                prompt: serde_json::json!({ "description": "printf 'started\\n'; sleep 30" }),
                 max_turns: None,
             })
             .await
             .expect("execution starts");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        next_execution_log_line(&mut rx, &execution_id, "started").await;
         runtime
             .cancel(ExecutionCancelParams {
                 execution_id: execution_id.clone(),
@@ -583,6 +586,31 @@ mod tests {
 
         let notification = next_terminal_notification(&mut rx, &execution_id).await;
         assert_eq!(notification.status.as_deref(), Some("cancelled"));
+    }
+
+    async fn next_execution_log_line(
+        rx: &mut mpsc::UnboundedReceiver<DaemonFrame>,
+        execution_id: &str,
+        expected_line: &str,
+    ) -> ExecutionLogNotification {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("execution log arrives")
+                .expect("runtime keeps sender open");
+            let DaemonFrame::Notification { method, params } = frame else {
+                continue;
+            };
+            if method != METHOD_EXECUTION_LOG {
+                continue;
+            }
+            let notification: ExecutionLogNotification =
+                serde_json::from_value(params).expect("execution log parses");
+            if notification.execution_id == execution_id && notification.line == expected_line {
+                return notification;
+            }
+        }
     }
 
     async fn next_terminal_notification(
