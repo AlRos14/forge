@@ -188,6 +188,14 @@ runs. `AgentOnly` runs when `triggered_by` starts with `"agent:"` or equals
 `"system"`; `UserOnly` runs only when it starts with `"user:"`. Non-matching
 hooks are skipped without a hook-result entry.
 
+Human-triggered transitions are treated as project-management actions. The
+dependency gate does not block `user:*` card moves, including board drag
+transitions, so users can reorder and reclassify work like they would in Jira.
+Subtasks follow the same rule for status moves while still using the inherited
+subtask workflow, so invalid child states remain rejected by the graph. AI
+execution remains gated separately: initial role dispatch and interactive launch
+both run dependency checks before creating an execution.
+
 Cancellation is implicit from any non-terminal state to
 `workflow.cancellation_state` (or terminal `"cancelled"` if unset), even
 without an explicit edge. Project `before_exit` guards are bypassed for this

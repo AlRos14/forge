@@ -204,7 +204,11 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   const onStatusChange = (status: string, reason?: string) => {
     if (!task || status === task.status) return
     transitionTask.mutate(
-      { taskId: task.id, body: { status, version: task.version, reason } },
+      {
+        taskId: task.id,
+        body: { status, version: task.version, reason },
+        currentStatus: task.status,
+      },
       {
         onSuccess: (result) => {
           if (status !== 'review' || !result.review) return

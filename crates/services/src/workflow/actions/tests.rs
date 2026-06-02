@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
 use super::{
-    AutoCascadeOnReviewPass, CheckRetryBudget, DispatchRoleAgent, NotifyRoleHolder,
+    AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
     RequireUpstreamRolesCompleted, RunCiSteps,
 };
 use crate::workflow::{
@@ -563,6 +563,25 @@ async fn build_test_ctx(
         execution_id: None,
         state_config: json!({}),
     }
+}
+
+#[tokio::test]
+async fn dependency_gate_skips_user_managed_transitions() {
+    let mut ctx = build_test_ctx(
+        "task-dependency-user-skip",
+        default_states::TODO,
+        default_states::PLANNING,
+        None,
+    )
+    .await;
+    ctx.triggered_by = "user:api".to_owned();
+
+    let result = DependencyGate.execute(&ctx).await;
+
+    assert!(matches!(
+        result,
+        HookResult::Skipped { reason } if reason.contains("user-managed transition")
+    ));
 }
 
 async fn seed_transition_log(

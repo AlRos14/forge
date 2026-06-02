@@ -26,6 +26,15 @@ fn blocking_hook(action: &str) -> HookSpec {
     }
 }
 
+fn agent_blocking_hook(action: &str) -> HookSpec {
+    HookSpec {
+        action: action.to_string(),
+        params: json!({}),
+        applies_to: HookAudience::AgentOnly,
+        on_failure: FailurePolicy::Block,
+    }
+}
+
 fn state(
     name: &str,
     kind: StateKind,
@@ -66,7 +75,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Todo",
             None,
             StateHooks {
-                before_exit: vec![blocking_hook("dependency_gate")],
+                before_exit: vec![agent_blocking_hook("dependency_gate")],
                 ..StateHooks::default()
             },
         ),

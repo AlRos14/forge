@@ -27,6 +27,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        self.check_dependency_gate(&task, agent_id).await?;
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;

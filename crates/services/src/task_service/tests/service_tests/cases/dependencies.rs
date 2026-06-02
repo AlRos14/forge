@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::task_service::tests::helpers::seed_role_assignment;
 
 #[tokio::test]
 async fn test_done_transition_emits_dependency_satisfied_event() {
@@ -84,11 +85,12 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
 }
 
 #[tokio::test]
-async fn test_unsatisfied_dependency_blocks_work_start_but_not_backlog_or_cancel() {
+async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_moves() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
 
     let prerequisite = service
         .create_task(
@@ -121,6 +123,13 @@ async fn test_unsatisfied_dependency_blocks_work_start_but_not_backlog_or_cancel
     TaskDependencyRepo::add_dependency(&*db, &dependent.id, &prerequisite.id, &now_rfc3339())
         .await
         .expect("dependency creates");
+    seed_role_assignment(
+        &db,
+        &dependent.id,
+        crate::workflow::default_roles::PLANNER,
+        Some(&agent_id),
+    )
+    .await;
 
     let blocked = service
         .transition(
@@ -139,11 +148,52 @@ async fn test_unsatisfied_dependency_blocks_work_start_but_not_backlog_or_cancel
         .expect("dependent exists");
     assert_eq!(still_todo.status, crate::workflow::default_states::TODO);
 
-    let moved_back = service
+    let user_moved = service
         .transition(
             still_todo.id.clone(),
+            crate::workflow::default_states::PLANNING.to_owned(),
+            (still_todo.version, None),
+        )
+        .await
+        .expect("user-managed move bypasses dependency gate");
+    assert_eq!(
+        user_moved.task.status,
+        crate::workflow::default_states::PLANNING
+    );
+
+    let dispatch = service
+        .dispatch_initial_role_execution(
+            &user_moved.task.id,
+            &agent_id,
+            crate::workflow::default_roles::PLANNER,
+            "plan the task".to_owned(),
+        )
+        .await;
+    assert!(matches!(dispatch, Err(ServiceError::DependencyGate)));
+
+    let parked = service
+        .create_task(
+            project_id.clone(),
+            "Parkable dependent",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("parkable task creates");
+    TaskDependencyRepo::add_dependency(&*db, &parked.id, &prerequisite.id, &now_rfc3339())
+        .await
+        .expect("dependency creates");
+
+    let moved_back = service
+        .transition(
+            parked.id.clone(),
             crate::workflow::default_states::BACKLOG.to_owned(),
-            still_todo.version,
+            parked.version,
         )
         .await
         .expect("dependent can move back to backlog");

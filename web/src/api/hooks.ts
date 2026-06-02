@@ -43,6 +43,7 @@ import {
   updateSettings,
 } from '@/api/client'
 import { qk } from '@/api/query-keys'
+import { getApiErrorCode } from '@/lib/api-error'
 import type {
   Agent,
   AgentAvailability,
@@ -525,12 +526,41 @@ export function useUpdateTask() {
 
 export function useTransitionTask() {
   const queryClient = useQueryClient()
+  type TransitionTaskMutation = {
+    taskId: string
+    body: TransitionTaskRequest
+    currentStatus?: string
+  }
+  const transition = (taskId: string, body: TransitionTaskRequest) =>
+    apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/transition`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+
   return useMutation({
-    mutationFn: ({ taskId, body }: { taskId: string; body: TransitionTaskRequest }) =>
-      apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/transition`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
+    mutationFn: async ({ taskId, body, currentStatus }: TransitionTaskMutation) => {
+      try {
+        return await transition(taskId, body)
+      } catch (error) {
+        if (
+          !(error instanceof ApiError) ||
+          error.status !== 409 ||
+          getApiErrorCode(error) !== 'version_conflict' ||
+          !currentStatus
+        ) {
+          throw error
+        }
+
+        const latest = await apiFetch<Task>(`/tasks/${taskId}`)
+        if (latest.status === body.status) {
+          return { task: latest, review: null }
+        }
+        if (latest.status !== currentStatus) {
+          throw error
+        }
+        return transition(taskId, { ...body, version: latest.version })
+      }
+    },
     onMutate: ({ taskId }) => {
       recordUserInitiatedTransition(taskId)
     },

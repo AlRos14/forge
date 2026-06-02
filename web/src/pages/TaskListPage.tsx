@@ -27,7 +27,7 @@ import { Funnel, Plus, UserCircle, X } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
 import { toastApiError } from '@/lib/api-error'
 import { getBlockingAnnotation } from '@/lib/workflow-utils'
-import type { TaskStatus } from '@/types/generated'
+import type { Task, TaskStatus } from '@/types/generated'
 
 export type TaskListSortBy = 'title' | 'status' | 'agent' | 'priority' | 'task_type' | 'updated_at'
 export type TaskListSortOrder = 'asc' | 'desc'
@@ -229,9 +229,9 @@ export function TaskListPage({
     )
   }
 
-  const moveTask = (taskId: string, status: TaskStatus, version: number) => {
+  const moveTask = (task: Task, status: TaskStatus) => {
     transitionTask.mutate(
-      { taskId, body: { status, version } },
+      { taskId: task.id, body: { status, version: task.version }, currentStatus: task.status },
       {
         onError: (error) => toastApiError(error, 'Status transition failed'),
       },
@@ -544,7 +544,7 @@ export function TaskListPage({
                           <TaskStatusDropdown
                             disabled={transitionTask.isPending}
                             status={task.status}
-                            onChange={(status) => moveTask(task.id, status, task.version)}
+                            onChange={(status) => moveTask(task, status)}
                           />
                           {(() => {
                             const blockingAnnotation = getBlockingAnnotation(task)

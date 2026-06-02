@@ -311,6 +311,7 @@ fn initialize_returns_correct_protocol_version() {
             .await
             .expect("initialize succeeds");
         assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
     });
 }
 

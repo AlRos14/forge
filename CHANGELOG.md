@@ -6,6 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-06-02
+
+### Fixed
+
+- User-managed task and subtask status moves are no longer blocked by dependency or root-managed subtask guards; AI dispatch and execution launch still enforce dependency gates before starting work.
+- Board status transitions now retry genuine task version conflicts once and show the real API error for other HTTP 409 responses.
+- MCP initialize responses now report the crate package version instead of a hard-coded server version.
+
 ## [0.1.5] - 2026-05-30
 
 ### Added

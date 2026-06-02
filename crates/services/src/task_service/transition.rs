@@ -14,14 +14,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if let Some(parent_id) = task.parent_task_id.as_deref() {
-            if options.triggered_by.starts_with("user:") {
-                return Err(ServiceError::subtask_managed_by_root(
-                    task_id.clone(),
-                    parent_id.to_owned(),
-                ));
-            }
-        }
         let previous_status = task.status.clone();
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?

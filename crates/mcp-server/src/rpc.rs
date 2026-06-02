@@ -188,7 +188,7 @@ fn handle_initialize() -> Result<Value, McpToolError> {
         "protocolVersion": "2025-03-26",
         "serverInfo": {
             "name": "forge-mcp",
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
         },
         "capabilities": {
             "tools": {},

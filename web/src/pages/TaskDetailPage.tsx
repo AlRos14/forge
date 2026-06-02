@@ -357,6 +357,7 @@ export function TaskDetailPage({
       {
         taskId: task.id,
         body: { status, version: task.version, reason },
+        currentStatus: task.status,
       },
       {
         onSuccess: (result) => {
