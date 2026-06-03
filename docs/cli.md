@@ -23,7 +23,7 @@ under the Forge data directory.
 | `repo`    | Add / list repos under a project |
 | `task`    | Create, list, show, transition, cancel, archive tasks |
 | `agent`   | Register / list / show agents |
-| `daemon`  | List daemons, **link** an external daemon to a server |
+| `daemon`  | Link, start, and report an external daemon |
 | `run`     | Create + claim a task and follow the SSE stream until terminal state |
 | `mcp`     | Helpers for the MCP JSON-RPC endpoint |
 
@@ -92,6 +92,19 @@ forge-ctl daemon link \
 The token is used only for initial ownership; the daemon receives and stores
 its own registration token afterward. Add `--once` for a one-shot
 registration/report that does not keep the command stream open.
+
+After a daemon has been linked once, use `forge-ctl daemon start` to run it
+again from the saved daemon credentials without registering or claiming it
+again:
+
+```bash
+forge-ctl daemon start \
+  --workspace-root "$HOME/.forge/workspaces"
+```
+
+`daemon start` keeps the same heartbeat and command stream open as `daemon
+link`. Use `daemon report` only for a one-shot status update; it does not keep
+the command stream open.
 
 Execution dispatch requires the task worktree path created by the server to
 exist at the same absolute path on the daemon host. Use a local daemon or mount

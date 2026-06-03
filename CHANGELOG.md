@@ -6,6 +6,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Added `forge-ctl daemon start` to restart a previously linked daemon from saved credentials without repeating initial registration.
+
 ## [0.1.6] - 2026-06-02
 
 ### Fixed

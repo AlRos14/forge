@@ -218,6 +218,16 @@ own registration token afterward. Use `--once` for a one-shot
 registration/report only; `--once` does not keep the command stream open for
 filesystem browsing or execution dispatch.
 
+After the first link, restart the daemon from its saved credentials with:
+
+```bash
+forge-ctl daemon start \
+  --workspace-root "$HOME/.forge/workspaces"
+```
+
+`daemon start` does not register or claim the daemon again; it just reports
+local CLI availability and keeps the command stream open.
+
 Execution dispatch expects the server-created task worktree to exist at the same
 absolute path on the daemon host. For containers, mount the server workspace
 root into the container at that same path. A daemon on an unrelated filesystem
