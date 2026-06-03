@@ -146,13 +146,15 @@ impl DaemonArgs {
                 );
                 run_daemon_loop(
                     client,
-                    &credentials_path,
-                    &linked.credentials,
-                    &workspace_root,
-                    &labels,
-                    *interval_seconds,
                     output,
-                    "daemon link stopped",
+                    DaemonLoopConfig {
+                        credentials_path: &credentials_path,
+                        initial_credentials: &linked.credentials,
+                        workspace_root: &workspace_root,
+                        labels: &labels,
+                        interval_seconds: *interval_seconds,
+                        stopped_message: "daemon link stopped",
+                    },
                 )
                 .await
             }
@@ -179,13 +181,15 @@ impl DaemonArgs {
                 );
                 run_daemon_loop(
                     client,
-                    &credentials_path,
-                    &credentials,
-                    &workspace_root,
-                    &labels,
-                    *interval_seconds,
                     output,
-                    "daemon start stopped",
+                    DaemonLoopConfig {
+                        credentials_path: &credentials_path,
+                        initial_credentials: &credentials,
+                        workspace_root: &workspace_root,
+                        labels: &labels,
+                        interval_seconds: *interval_seconds,
+                        stopped_message: "daemon start stopped",
+                    },
                 )
                 .await
             }
@@ -215,25 +219,29 @@ struct LinkResult {
     daemon: DaemonResponse,
 }
 
+struct DaemonLoopConfig<'a> {
+    credentials_path: &'a Path,
+    initial_credentials: &'a DaemonCredentials,
+    workspace_root: &'a Path,
+    labels: &'a BTreeMap<String, String>,
+    interval_seconds: u64,
+    stopped_message: &'a str,
+}
+
 async fn run_daemon_loop(
     client: &ForgeClient,
-    credentials_path: &Path,
-    initial_credentials: &DaemonCredentials,
-    workspace_root: &Path,
-    labels: &BTreeMap<String, String>,
-    interval_seconds: u64,
     output: &OutputFormat,
-    stopped_message: &str,
+    config: DaemonLoopConfig<'_>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut daemon_client = DaemonClient::new(client.url("/"))?;
     daemon_client.set_credentials(
-        initial_credentials.daemon_id.clone(),
-        initial_credentials.token.clone(),
+        config.initial_credentials.daemon_id.clone(),
+        config.initial_credentials.token.clone(),
     );
     let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
-        workspace_root.to_path_buf(),
+        config.workspace_root.to_path_buf(),
         shutdown_rx,
     ));
     loop {
@@ -248,13 +256,13 @@ async fn run_daemon_loop(
                     Err(error) if error.is_cancelled() => {}
                     Err(error) => eprintln!("daemon command stream task failed: {error}"),
                 }
-                println!("{stopped_message}");
+                println!("{}", config.stopped_message);
                 return Ok(());
             }
-            () = tokio::time::sleep(Duration::from_secs(interval_seconds.max(1))) => {
-                let credentials = read_credentials(credentials_path)?
-                    .ok_or_else(|| anyhow!("missing daemon credentials at {}", credentials_path.display()))?;
-                let daemon = report_once(client, &credentials, workspace_root, labels).await?;
+            () = tokio::time::sleep(Duration::from_secs(config.interval_seconds.max(1))) => {
+                let credentials = read_credentials(config.credentials_path)?
+                    .ok_or_else(|| anyhow!("missing daemon credentials at {}", config.credentials_path.display()))?;
+                let daemon = report_once(client, &credentials, config.workspace_root, config.labels).await?;
                 if matches!(output, OutputFormat::Json) {
                     print_json(&daemon)?;
                 } else {
