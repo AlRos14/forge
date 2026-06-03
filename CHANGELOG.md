@@ -6,6 +6,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-06-03
+
+### Fixed
+
+- Fixed existing databases that already recorded migration version 53 before the Cursor executor migration so daemon reports can create `cursor` agents.
+
 ## [0.1.7] - 2026-06-03
 
 ### Added
