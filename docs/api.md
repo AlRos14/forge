@@ -475,7 +475,9 @@ Common HTTP mappings:
 `GET /api/v1/events` streams `ForgeEvent` payloads from the in-memory event
 bus. Useful for the web UI and for long-running scripts that want to react to
 state changes (`task.status_changed`, `execution.completed`, …) without
-polling.
+polling. Daemon command-stream lifecycle changes emit `daemon.connected` and
+`daemon.offline` so clients can refresh daemon availability without waiting for
+polling or stale-heartbeat cleanup.
 
 ## MCP tools
 

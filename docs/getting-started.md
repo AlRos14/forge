@@ -204,8 +204,10 @@ Full CLI reference → [docs/cli.md](cli.md).
 server, saves daemon credentials, reports local CLI availability, and keeps
 sending heartbeats. While it is running, it also keeps the daemon command
 stream open so Forge can browse local paths and dispatch agents on that
-machine. In the web UI: **Daemons → Link daemon** generates a token and prints
-the full command:
+machine. Forge marks the daemon offline when that command stream disconnects,
+and after a server restart until the daemon reconnects.
+In the web UI: **Daemons → Link daemon** generates a token and prints the full
+command:
 
 ```bash
 forge-ctl daemon link \

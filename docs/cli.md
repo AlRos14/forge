@@ -107,6 +107,10 @@ forge-ctl daemon start \
 `daemon start` keeps the same heartbeat and command stream open as `daemon
 link`. Use `daemon report` only for a one-shot status update; it does not keep
 the command stream open.
+Forge marks the daemon offline when that command stream disconnects, and uses
+stream heartbeats to keep the daemon's last-seen timestamp fresh while it is
+connected. When the Forge server starts, external daemons are considered
+offline until their command stream reconnects.
 
 Execution dispatch requires the task worktree path created by the server to
 exist at the same absolute path on the daemon host. Use a local daemon or mount

@@ -302,6 +302,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'agent.resumed',
         'agent.timeout',
         'daemon.registered',
+        'daemon.connected',
         'daemon.report_received',
         'daemon.offline',
         'workspace.created',

@@ -180,6 +180,109 @@ impl DaemonService {
         Ok(daemon)
     }
 
+    #[tracing::instrument(skip(self), fields(daemon_id = %daemon_id))]
+    pub async fn mark_connected(&self, daemon_id: &str) -> Result<Daemon> {
+        let daemon = self.touch_connection(daemon_id).await?;
+        self.publish(ForgeEvent {
+            event_type: "daemon.connected".to_owned(),
+            entity_id: daemon.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::DaemonConnected {},
+        });
+        Ok(daemon)
+    }
+
+    #[tracing::instrument(skip(self), fields(daemon_id = %daemon_id))]
+    pub async fn touch_connection(&self, daemon_id: &str) -> Result<Daemon> {
+        validate_required("daemon_id", daemon_id)?;
+        let now = now_rfc3339();
+        DaemonRepo::mark_online(&*self.db, daemon_id, &now)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[tracing::instrument(skip(self), fields(daemon_id = %daemon_id))]
+    pub async fn mark_disconnected(&self, daemon_id: &str) -> Result<Daemon> {
+        validate_required("daemon_id", daemon_id)?;
+        let now = now_rfc3339();
+        let daemon = DaemonRepo::mark_offline(&*self.db, daemon_id, &now).await?;
+        self.publish(ForgeEvent {
+            event_type: "daemon.offline".to_owned(),
+            entity_id: daemon.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::DaemonOffline {},
+        });
+        self.publish(ForgeEvent {
+            event_type: "reconciliation.event".to_owned(),
+            entity_id: daemon.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::ReconciliationEvent {
+                task_id: None,
+                execution_id: None,
+                reason: "daemon disconnected".to_owned(),
+            },
+        });
+        Ok(daemon)
+    }
+
+    #[tracing::instrument(skip(self), fields(retained_machine_id = %retained_machine_id))]
+    pub async fn mark_external_daemons_disconnected(
+        &self,
+        retained_machine_id: &str,
+        reason: &str,
+    ) -> Result<u64> {
+        validate_required("retained_machine_id", retained_machine_id)?;
+        validate_required("reason", reason)?;
+
+        let daemon_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id
+             FROM daemon
+             WHERE status = 'online'
+               AND machine_id != ?",
+        )
+        .bind(retained_machine_id)
+        .fetch_all(self.db.pool())
+        .await?;
+        if daemon_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE daemon
+             SET status = 'offline',
+                 updated_at = ?,
+                 version = version + 1
+             WHERE status = 'online'
+               AND machine_id != ?",
+        )
+        .bind(&now)
+        .bind(retained_machine_id)
+        .execute(self.db.pool())
+        .await?;
+
+        for daemon_id in daemon_ids {
+            self.publish(ForgeEvent {
+                event_type: "daemon.offline".to_owned(),
+                entity_id: daemon_id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::DaemonOffline {},
+            });
+            self.publish(ForgeEvent {
+                event_type: "reconciliation.event".to_owned(),
+                entity_id: daemon_id,
+                timestamp: event_timestamp(),
+                context: EventContext::ReconciliationEvent {
+                    task_id: None,
+                    execution_id: None,
+                    reason: reason.to_owned(),
+                },
+            });
+        }
+
+        Ok(result.rows_affected())
+    }
+
     async fn ensure_agents_for_daemon(
         &self,
         daemon: &Daemon,
@@ -410,7 +513,7 @@ fn executor_display_name(executor_type: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{create_sqlite_pool, run_migrations, User, UserRepo};
+    use db::{create_sqlite_pool, run_migrations, DaemonStatus, User, UserRepo};
 
     async fn service() -> DaemonService {
         let pool = create_sqlite_pool("sqlite::memory:")
@@ -532,5 +635,36 @@ mod tests {
             .ingest_report(&registration.daemon_id, report())
             .await
             .expect("second report sees existing daemon agents");
+    }
+
+    #[tokio::test]
+    async fn startup_disconnect_marks_only_external_daemons_offline() {
+        let service = service().await;
+        let external = service
+            .register(register_input("external-machine"))
+            .await
+            .expect("external daemon registers");
+        let embedded_machine_id = crate::embedded_daemon::embedded_machine_id();
+        let embedded = service
+            .register(register_input(&embedded_machine_id))
+            .await
+            .expect("embedded daemon registers");
+
+        let count = service
+            .mark_external_daemons_disconnected(&embedded_machine_id, "server startup")
+            .await
+            .expect("startup disconnect succeeds");
+
+        assert_eq!(count, 1);
+        let external = DaemonRepo::get_by_id(&*service.db, &external.daemon_id)
+            .await
+            .expect("external daemon loads")
+            .expect("external daemon exists");
+        let embedded = DaemonRepo::get_by_id(&*service.db, &embedded.daemon_id)
+            .await
+            .expect("embedded daemon loads")
+            .expect("embedded daemon exists");
+        assert_eq!(external.status, DaemonStatus::Offline);
+        assert_eq!(embedded.status, DaemonStatus::Online);
     }
 }

@@ -5,13 +5,13 @@ use std::{
 };
 
 use api::{build_router, serve_with_listener, AppState};
-use api_types::DaemonRegisterResponse;
+use api_types::{DaemonFrame, DaemonRegisterResponse};
 use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -119,6 +119,86 @@ async fn daemon_connect_replaces_stale_connection() {
     }
 }
 
+#[tokio::test]
+async fn daemon_connect_updates_status_for_socket_lifecycle() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "connect-status-lifecycle").await;
+    db::DaemonRepo::mark_offline(&*state.db, &registration.daemon_id, &db::now_rfc3339())
+        .await
+        .expect("daemon starts offline");
+    let server = TestServer::start(Arc::clone(&state)).await;
+
+    let mut socket = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        Some(&registration.registration_token),
+    )
+    .await
+    .expect("websocket upgrade succeeds");
+
+    wait_until_status(&state, &registration.daemon_id, db::DaemonStatus::Online).await;
+    assert!(state
+        .daemon_connections
+        .is_connected(&registration.daemon_id));
+
+    socket
+        .send(WsMessage::Close(None))
+        .await
+        .expect("close frame sends");
+
+    wait_until_status(&state, &registration.daemon_id, db::DaemonStatus::Offline).await;
+    assert!(!state
+        .daemon_connections
+        .is_connected(&registration.daemon_id));
+}
+
+#[tokio::test]
+async fn daemon_heartbeat_refreshes_last_report_at() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "connect-heartbeat-touch").await;
+    let server = TestServer::start(Arc::clone(&state)).await;
+
+    let mut socket = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        Some(&registration.registration_token),
+    )
+    .await
+    .expect("websocket upgrade succeeds");
+
+    let connected =
+        wait_until_status(&state, &registration.daemon_id, db::DaemonStatus::Online).await;
+    let prior_last_report_at = connected.last_report_at;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let heartbeat =
+        serde_json::to_string(&DaemonFrame::Heartbeat { seq: 7 }).expect("heartbeat serializes");
+    socket
+        .send(WsMessage::Text(heartbeat.into()))
+        .await
+        .expect("heartbeat sends");
+
+    let echoed = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("heartbeat echo arrives")
+        .expect("socket remains open")
+        .expect("heartbeat echo succeeds");
+    match echoed {
+        WsMessage::Text(text) => {
+            let frame: DaemonFrame =
+                serde_json::from_str(text.as_ref()).expect("heartbeat echo parses");
+            assert!(matches!(frame, DaemonFrame::Heartbeat { seq: 7 }));
+        }
+        other => panic!("expected heartbeat echo text frame, got {other:?}"),
+    }
+
+    let touched =
+        wait_until_last_report_change(&state, &registration.daemon_id, prior_last_report_at).await;
+    assert_eq!(touched.status, db::DaemonStatus::Online);
+}
+
 async fn test_state() -> Arc<AppState> {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
@@ -181,6 +261,50 @@ async fn wait_until_connected(state: &AppState, daemon_id: &str) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "daemon connection was not registered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_until_status(
+    state: &AppState,
+    daemon_id: &str,
+    expected: db::DaemonStatus,
+) -> db::Daemon {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let daemon = db::DaemonRepo::get_by_id(&*state.db, daemon_id)
+            .await
+            .expect("daemon loads")
+            .expect("daemon exists");
+        if daemon.status == expected {
+            return daemon;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon status did not become {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_until_last_report_change(
+    state: &AppState,
+    daemon_id: &str,
+    prior: Option<String>,
+) -> db::Daemon {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let daemon = db::DaemonRepo::get_by_id(&*state.db, daemon_id)
+            .await
+            .expect("daemon loads")
+            .expect("daemon exists");
+        if daemon.last_report_at.is_some() && daemon.last_report_at != prior {
+            return daemon;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon last_report_at did not change"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
