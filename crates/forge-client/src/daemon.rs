@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::Arc,
@@ -111,7 +112,7 @@ impl DaemonArgs {
                 interval_seconds,
                 once,
             } => {
-                let workspace_root = resolve_workspace_root(workspace_root.as_deref());
+                let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
                 let hostname = hostname
                     .clone()
@@ -164,7 +165,7 @@ impl DaemonArgs {
                 labels,
                 interval_seconds,
             } => {
-                let workspace_root = resolve_workspace_root(workspace_root.as_deref());
+                let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(
@@ -198,7 +199,7 @@ impl DaemonArgs {
                 credentials,
                 labels,
             } => {
-                let workspace_root = resolve_workspace_root(workspace_root.as_deref());
+                let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(
@@ -488,6 +489,23 @@ fn resolve_workspace_root(explicit: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| default_forge_home().join("workspaces"))
 }
 
+fn prepare_workspace_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    let workspace_root = resolve_workspace_root(explicit);
+    let workspace_root = absolute_path(&workspace_root)
+        .with_context(|| format!("resolve daemon workspace root {}", workspace_root.display()))?;
+    fs::create_dir_all(&workspace_root)
+        .with_context(|| format!("create daemon workspace root {}", workspace_root.display()))?;
+    Ok(workspace_root)
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 fn default_forge_home() -> PathBuf {
     if let Some(path) = std::env::var_os("FORGE_DAEMON_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
@@ -588,5 +606,22 @@ fn print_daemon(output: &OutputFormat, daemon: &DaemonResponse) -> Result<()> {
             print_table_daemons(std::slice::from_ref(daemon));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_workspace_root;
+
+    #[test]
+    fn prepare_workspace_root_creates_missing_directory() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let root = temp.path().join("missing").join("workspaces");
+
+        let prepared = prepare_workspace_root(Some(&root)).expect("workspace root is prepared");
+
+        assert_eq!(prepared, root);
+        assert!(prepared.is_absolute());
+        assert!(prepared.is_dir());
     }
 }

@@ -92,6 +92,8 @@ forge-ctl daemon link \
 The token is used only for initial ownership; the daemon receives and stores
 its own registration token afterward. Add `--once` for a one-shot
 registration/report that does not keep the command stream open.
+The configured workspace root is created automatically before the daemon
+registers or reports.
 
 After a daemon has been linked once, use `forge-ctl daemon start` to run it
 again from the saved daemon credentials without registering or claiming it

@@ -6,6 +6,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-06-03
+
+### Fixed
+
+- Daemon link/start/report now create the configured workspace root before reporting it, so Add Local Repository can browse the launch directory instead of failing on `path=.` when the directory is missing.
+
 ## [0.1.8] - 2026-06-03
 
 ### Fixed

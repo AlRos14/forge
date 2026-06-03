@@ -226,7 +226,9 @@ forge-ctl daemon start \
 ```
 
 `daemon start` does not register or claim the daemon again; it just reports
-local CLI availability and keeps the command stream open.
+local CLI availability and keeps the command stream open. `daemon link` and
+`daemon start` create the configured workspace root if it does not already
+exist, so filesystem browsing can open the launch directory immediately.
 
 Execution dispatch expects the server-created task worktree to exist at the same
 absolute path on the daemon host. For containers, mount the server workspace
