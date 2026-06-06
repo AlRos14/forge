@@ -36,24 +36,48 @@ impl DiffService {
             .await?
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
 
-        let base_ref = repo.default_branch;
+        let default_branch = repo.default_branch;
+        let before_sha = workspace
+            .before_sha
+            .as_deref()
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty());
+        let (base_sha, base_is_commit) = match try_run_git(
+            &workspace.worktree_path,
+            ["merge-base", &default_branch, "HEAD"],
+        )
+        .await?
+        {
+            Some(merge_base) if !merge_base.is_empty() => (merge_base, true),
+            _ => {
+                let base_spec = before_sha.unwrap_or(default_branch.as_str());
+                (
+                    run_git(&workspace.worktree_path, ["rev-parse", base_spec]).await?,
+                    before_sha.is_some(),
+                )
+            }
+        };
+        let base_ref = if base_is_commit {
+            format!("{default_branch}@{}", short_sha(&base_sha))
+        } else {
+            default_branch
+        };
         let head_ref = workspace.branch.clone();
-        let base_sha = run_git(&workspace.worktree_path, ["rev-parse", &base_ref]).await?;
         let head_sha = run_git(&workspace.worktree_path, ["rev-parse", "HEAD"]).await?;
         let diff = run_git(
             &workspace.worktree_path,
-            ["diff", "--find-renames", &base_ref],
+            ["diff", "--find-renames", &base_sha],
         )
         .await?;
 
         let statuses = run_git(
             &workspace.worktree_path,
-            ["diff", "--name-status", "--find-renames", &base_ref],
+            ["diff", "--name-status", "--find-renames", &base_sha],
         )
         .await?;
         let numstat = run_git(
             &workspace.worktree_path,
-            ["diff", "--numstat", "--find-renames", &base_ref],
+            ["diff", "--numstat", "--find-renames", &base_sha],
         )
         .await?;
         let files = merge_diff_summaries(&statuses, &numstat);
@@ -74,6 +98,10 @@ impl DiffService {
             diff,
         })
     }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 fn ensure_workspace_diffable(workspace: &Workspace) -> Result<()> {
@@ -115,6 +143,30 @@ async fn run_git<const N: usize>(worktree_path: &str, args: [&str; N]) -> Result
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+async fn try_run_git<const N: usize>(
+    worktree_path: &str,
+    args: [&str; N],
+) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(Path::new(worktree_path))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| ServiceError::invalid_operation(format!("failed to run git: {error}")))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
 }
 
 fn merge_diff_summaries(statuses: &str, numstat: &str) -> Vec<FileDiffSummary> {

@@ -37,6 +37,7 @@ For the conceptual model behind these endpoints see
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
 | POST   | `/api/v1/tasks/{id}/review` | Re-run the CI steps without changing state |
+| GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
 | POST   | `/api/v1/tasks/{id}/comments` | Create task comment |
 | GET    | `/api/v1/tasks/{id}/comments` | List task comments (paginated) |
@@ -59,6 +60,7 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
+| GET    | `/api/v1/workspaces/{id}/diff` | Get workspace diff |
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
 
@@ -78,6 +80,21 @@ empty array clears all rules.
 Project hook validation rejects unsupported trigger and action types, the
 `task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
 required action strings such as `dispatch_agent.agent_id`.
+
+## Task Diffs
+
+`GET /api/v1/tasks/{id}/diff` and `GET /api/v1/workspaces/{id}/diff` return a
+`DiffEnvelope` with file summaries, aggregate stats, raw unified diff text, and
+the compared refs. Forge compares the workspace against
+`merge-base(<default_branch>, HEAD)`, not the current default branch tip, so
+later default-branch changes from other work do not pollute the task diff. If
+Git cannot compute a merge base, Forge falls back to the commit recorded when
+the workspace was created (`workspace.before_sha`), then to the repo default
+branch for older rows without `before_sha`.
+
+`base_sha` is the exact baseline commit. `base_ref` is display-oriented: for
+normal Forge-created workspaces it is formatted as
+`<default_branch>@<short_sha>`; fallback rows use the default branch name.
 
 ### Project Hooks
 

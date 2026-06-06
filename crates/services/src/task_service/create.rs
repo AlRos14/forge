@@ -265,7 +265,7 @@ impl TaskService {
                 source.title,
                 source.description,
                 None,
-                Some(source.priority as i64),
+                Some(source.priority),
                 Some(source.task_type),
                 source.task_state_config,
                 source

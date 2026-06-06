@@ -61,7 +61,13 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
         StatusCode::OK,
     )
     .await;
-    assert_eq!(diff.data.base_ref, default_branch);
+    let base_sha = launched
+        .workspace
+        .before_sha
+        .clone()
+        .expect("workspace records base sha");
+    assert_eq!(diff.data.base_sha, base_sha);
+    assert_eq!(diff.data.base_ref, base_ref(&default_branch, &base_sha));
     assert!(
         diff.data.files.iter().any(|file| file.path == "README.md"),
         "diff response should include the modified file",
@@ -78,6 +84,69 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
     assert_eq!(workspace_diff.data.files.len(), diff.data.files.len());
 
     let _ = repo_dir;
+}
+
+#[tokio::test]
+async fn task_diff_uses_merge_base_when_default_branch_advances() {
+    let app = test_app().await;
+    let (project_id, _repo_id, repo_dir, default_branch) = create_project_and_repo(&app).await;
+    let agent_id = create_agent(&app).await;
+
+    let task: TaskResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Task with stable diff base" }),
+        StatusCode::OK,
+    )
+    .await;
+    let launched = app
+        .state
+        .task_service
+        .launch_execution(task.id.clone(), agent_id, None, None)
+        .await
+        .expect("launch succeeds");
+    let base_sha = launched
+        .workspace
+        .before_sha
+        .clone()
+        .expect("workspace records base sha");
+
+    std::fs::write(repo_dir.join("main-only.txt"), "landed on default branch\n")
+        .expect("default branch file writes");
+    run_git(&repo_dir, &["add", "-A"]);
+    run_git(&repo_dir, &["commit", "-m", "advance default branch"]);
+
+    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    std::fs::write(
+        workspace_path.join("README.md"),
+        "# Task diff\nworkspace update\n",
+    )
+    .expect("workspace file writes");
+
+    let diff: DiffEnvelope = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/diff", task.id),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(diff.data.base_sha, base_sha);
+    assert_eq!(diff.data.base_ref, base_ref(&default_branch, &base_sha));
+    assert!(
+        diff.data.files.iter().any(|file| file.path == "README.md"),
+        "diff response should include the task work",
+    );
+    assert!(
+        !diff
+            .data
+            .files
+            .iter()
+            .any(|file| file.path == "main-only.txt"),
+        "diff response should not include default-branch-only changes",
+    );
+    assert!(!diff.data.diff.contains("main-only.txt"));
 }
 
 struct Harness {
@@ -256,6 +325,13 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         .expect("utf8")
         .trim()
         .to_owned()
+}
+
+fn base_ref(default_branch: &str, base_sha: &str) -> String {
+    format!(
+        "{default_branch}@{}",
+        base_sha.get(..12).unwrap_or(base_sha)
+    )
 }
 
 async fn json_request<T: DeserializeOwned>(
