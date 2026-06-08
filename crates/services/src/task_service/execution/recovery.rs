@@ -1348,6 +1348,13 @@ impl TaskService {
             &finished_at,
         )
         .await?;
+        if let Err(error) = self
+            .memory_service
+            .record_review_result_if_final(&task.project_id, &review)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
         let task = TaskRepo::set_review_passed_at(
             &*self.db,
             &task.id,

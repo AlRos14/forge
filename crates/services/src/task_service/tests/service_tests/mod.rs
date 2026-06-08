@@ -636,4 +636,36 @@ async fn next_role_reassigned_event(
     }
 }
 
+#[tokio::test]
+async fn add_user_comment_indexes_comment_memory_item() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+
+    let comment = service
+        .add_user_comment(
+            &task.id,
+            "Mai".to_owned(),
+            "remember this user-provided context".to_owned(),
+        )
+        .await
+        .expect("user comment creates");
+
+    assert_eq!(comment.author_type, db::CommentAuthorType::User);
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM memory_item \
+         WHERE project_id = ? AND task_id = ? AND source_type = 'comment' \
+           AND kind = 'comment' AND metadata_json = ?",
+    )
+    .bind(&project_id)
+    .bind(&task.id)
+    .bind(json!({ "source_ref": comment.id }).to_string())
+    .fetch_one(db.pool())
+    .await
+    .expect("comment memory item count loads");
+    assert_eq!(count, 1);
+}
+
 mod cases;

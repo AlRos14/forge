@@ -907,6 +907,14 @@ impl WorkflowEngine {
                 "workflow transition applied"
             );
 
+            let memory_service = crate::MemoryService::new(Arc::clone(&self.db));
+            if let Err(error) = memory_service
+                .record_transition_if_failure(&task.project_id, &transition_log, None)
+                .await
+            {
+                tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+            }
+
             self.event_bus.publish(ForgeEvent {
                 event_type: "task.status_changed".to_string(),
                 entity_id: task.id.clone(),
@@ -1370,6 +1378,18 @@ impl WorkflowEngine {
                         %error,
                         "workflow failed to persist hook results"
                     );
+                } else {
+                    let memory_service = crate::MemoryService::new(Arc::clone(&self.db));
+                    if let Err(error) = memory_service
+                        .record_transition_if_failure(
+                            &task.project_id,
+                            &transition_log,
+                            Some(&payload),
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+                    }
                 }
             }
 

@@ -32,9 +32,9 @@ mod tests {
 
         assert!(entries
             .iter()
-            .any(|entry| entry.id == "reviewer.default.v1"));
+            .any(|entry| entry.id == "reviewer.default.v2"));
         assert!(entries
             .iter()
-            .any(|entry| entry.id == "coder.review_fix.v1"));
+            .any(|entry| entry.id == "coder.review_fix.v2"));
     }
 }

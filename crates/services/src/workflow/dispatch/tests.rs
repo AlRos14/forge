@@ -6,10 +6,10 @@ use crate::workflow::{
         apply_prompt_overrides, build_effective_prompt, effective_prompt_selection,
         generic_prompt::GenericPromptBuilder, planner_prompt::PlannerPromptBuilder,
         resolve_prompt_builder, reviewer_prompt::ReviewerPromptBuilder, AgentDispatchContext,
-        DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V1,
-        BUILDER_ID_CODER_MERGE_FIX_V1, BUILDER_ID_CODER_REVIEW_FIX_V1,
-        BUILDER_ID_GENERIC_DEFAULT_V1, BUILDER_ID_PLANNER_DEFAULT_V1,
-        BUILDER_ID_REVIEWER_DEFAULT_V1,
+        DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
+        BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2,
+        BUILDER_ID_REVIEWER_DEFAULT_V2,
     },
 };
 
@@ -86,6 +86,147 @@ fn fake_context(role: &str) -> AgentDispatchContext {
     }
 }
 
+const FAILURE_TAXONOMY_LINE: &str = "Failure taxonomy: classify any blocker using exactly this taxonomy: transient | input_missing | environment | code_bug | design_gap | review_failed | systemic.";
+const HANDOFF_SECTIONS_LINE: &str =
+    "Summary | Deliverables | Verification | Deviations | Next Step";
+
+#[test]
+fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
+    let cases = vec![
+        (
+            BUILDER_ID_CODER_IMPLEMENTATION_V2,
+            default_roles::CODER,
+            vec![
+                "Coder boundary:",
+                "Must implement only the requested task in the task worktree.",
+                "Must not change unrelated behavior",
+            ],
+        ),
+        (
+            BUILDER_ID_CODER_REVIEW_FIX_V2,
+            default_roles::CODER,
+            vec![
+                "Review-fix boundary:",
+                "Must address prior review or CI feedback precisely",
+                "Must not reopen solved work or add unrelated changes.",
+            ],
+        ),
+        (
+            BUILDER_ID_CODER_MERGE_FIX_V2,
+            default_roles::CODER,
+            vec![
+                "Merge-fix boundary:",
+                "Must resolve merge conflicts minimally while preserving implementation intent",
+                "Must not rewrite the feature or add unrelated cleanup.",
+            ],
+        ),
+        (
+            BUILDER_ID_REVIEWER_DEFAULT_V2,
+            default_roles::REVIEWER,
+            vec![
+                "Reviewer boundary:",
+                "Must remain read-only",
+                "Must not edit files, stage changes, commit changes",
+            ],
+        ),
+        (
+            BUILDER_ID_PLANNER_DEFAULT_V2,
+            default_roles::PLANNER,
+            vec![
+                "Planner boundary:",
+                "Must investigate enough to produce an executable plan",
+                "Must not modify code or mark implementation items done",
+            ],
+        ),
+        (
+            BUILDER_ID_GENERIC_DEFAULT_V2,
+            "security_engineer",
+            vec![
+                "Generic boundary:",
+                "Must follow the assigned role from the dispatch context",
+                "Must not modify code unless the assigned role explicitly requires implementation work.",
+            ],
+        ),
+    ];
+
+    for (builder_id, role, role_lines) in cases {
+        let prompt = resolve_prompt_builder(builder_id).build(&fake_context(role));
+
+        assert!(
+            prompt.system.contains(FAILURE_TAXONOMY_LINE),
+            "{builder_id} missing failure taxonomy"
+        );
+        assert!(
+            prompt.system.contains(
+                "Before acting, restate objective, constraints, and acceptance criteria."
+            ),
+            "{builder_id} missing restatement rule"
+        );
+        assert!(
+            prompt
+                .system
+                .contains("Never hide failed verification; report failures explicitly."),
+            "{builder_id} missing failed verification rule"
+        );
+        for line in role_lines {
+            assert!(
+                prompt.system.contains(line),
+                "{builder_id} missing role line: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coder_family_prompts_require_structured_completion_handoff() {
+    for builder_id in [
+        BUILDER_ID_CODER_IMPLEMENTATION_V2,
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_CODER_MERGE_FIX_V2,
+    ] {
+        let prompt = resolve_prompt_builder(builder_id).build(&fake_context(default_roles::CODER));
+
+        assert!(
+            prompt.system.contains(HANDOFF_SECTIONS_LINE),
+            "{builder_id} missing handoff sections"
+        );
+        assert!(
+            prompt
+                .system
+                .contains("List any verification not run with the reason."),
+            "{builder_id} missing skipped verification rule"
+        );
+        assert!(
+            prompt
+                .system
+                .contains("For UI/runtime behavior changes, include proof media"),
+            "{builder_id} missing proof media rule"
+        );
+    }
+}
+
+#[test]
+fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
+    let prompt = resolve_prompt_builder(BUILDER_ID_REVIEWER_DEFAULT_V2)
+        .build(&fake_context(default_roles::REVIEWER));
+
+    assert!(prompt
+        .system
+        .contains("Reviewer findings: Put structured findings before the verdict."));
+    assert!(prompt
+        .system
+        .contains("Each BLOCKING finding must include evidence"));
+    assert!(prompt.system.contains("expected vs actual behavior"));
+    assert!(prompt
+        .system
+        .contains("Separate NON-BLOCKING findings from BLOCKING findings."));
+    assert!(prompt
+        .system
+        .contains("End your response with EXACTLY ONE verdict marker in the existing format:"));
+    assert!(prompt.system.contains("===REVIEW: PASS==="));
+    assert!(prompt.system.contains("===REVIEW: FAIL: <short reason>==="));
+}
+
 #[test]
 fn coder_prompt_includes_manual_bounce_reason_and_failed_attempt() {
     let mut ctx = fake_context(default_roles::CODER);
@@ -95,7 +236,7 @@ fn coder_prompt_includes_manual_bounce_reason_and_failed_attempt() {
         fake_review(2, db::ReviewStatus::Passed),
     ];
 
-    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V1).build(&ctx);
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2).build(&ctx);
 
     assert!(prompt
         .system
@@ -110,7 +251,7 @@ fn coder_prompt_includes_manual_bounce_reason_and_failed_attempt() {
 fn coder_prompt_omits_manual_bounce_reason_when_absent() {
     let ctx = fake_context(default_roles::CODER);
 
-    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V1).build(&ctx);
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2).build(&ctx);
 
     assert!(!prompt
         .system
@@ -125,7 +266,7 @@ fn coder_prompt_merge_failed_follow_up_contains_rereview_directive() {
     ctx.continuation_of_execution_id = Some("parent-exec".to_string());
     ctx.task.review_passed_at = Some("2026-04-17T10:00:00Z".to_string());
 
-    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V1).build(&ctx);
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
 
     assert!(prompt.user.contains("merge failed due to conflicts"));
     assert!(
@@ -155,7 +296,7 @@ fn coder_prompt_review_follow_up_is_self_contained() {
     ctx.latest_review_execution_id = Some("review-exec-2".to_string());
     ctx.latest_review_logs_path = Some("/tmp/forge/logs/review-exec-2.jsonl".to_string());
 
-    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V1).build(&ctx);
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2).build(&ctx);
 
     assert!(prompt.user.contains("Task: Add dispatch context"));
     assert!(prompt.user.contains("Description:"));
@@ -196,7 +337,7 @@ fn coder_prompt_ci_follow_up_is_focused_on_failing_check() {
         ..fake_review(2, db::ReviewStatus::Failed)
     }];
 
-    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V1).build(&ctx);
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2).build(&ctx);
 
     assert!(prompt.user.contains("CI failed during review"));
     assert!(prompt.user.contains("./scripts/ci-forge-review.sh"));
@@ -213,7 +354,7 @@ fn coder_prompt_ci_follow_up_is_focused_on_failing_check() {
 fn coder_prompt_first_time_does_not_contain_rereview_directive() {
     let ctx = fake_context(default_roles::CODER);
 
-    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V1).build(&ctx);
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2).build(&ctx);
 
     assert!(prompt.system.contains("implement code changes"));
     assert!(prompt
@@ -289,7 +430,7 @@ fn generic_prompt_dumps_core_context_for_unknown_role() {
 #[test]
 fn prompt_overrides_replace_and_append_from_state_config() {
     let prompt = apply_prompt_overrides(
-        resolve_prompt_builder(BUILDER_ID_PLANNER_DEFAULT_V1)
+        resolve_prompt_builder(BUILDER_ID_PLANNER_DEFAULT_V2)
             .build(&fake_context(default_roles::PLANNER)),
         &json!({
             "system": "Use the project planning rubric.",
@@ -313,32 +454,32 @@ fn prompt_overrides_replace_and_append_from_state_config() {
 #[test]
 fn builder_precedence_prefers_trigger_then_state_then_role_default() {
     let trigger = DispatchIntent {
-        builder_id: Some(BUILDER_ID_CODER_REVIEW_FIX_V1.to_string()),
+        builder_id: Some(BUILDER_ID_CODER_REVIEW_FIX_V2.to_string()),
         execution_policy: None,
         prompt_config: json!({}),
     };
     let state = DispatchIntent {
-        builder_id: Some(BUILDER_ID_REVIEWER_DEFAULT_V1.to_string()),
+        builder_id: Some(BUILDER_ID_REVIEWER_DEFAULT_V2.to_string()),
         execution_policy: None,
         prompt_config: json!({}),
     };
     let selected = effective_prompt_selection(default_roles::CODER, Some(&trigger), Some(&state));
-    assert_eq!(selected.builder_id, BUILDER_ID_CODER_REVIEW_FIX_V1);
+    assert_eq!(selected.builder_id, BUILDER_ID_CODER_REVIEW_FIX_V2);
 
     let selected_state = effective_prompt_selection(default_roles::CODER, None, Some(&state));
-    assert_eq!(selected_state.builder_id, BUILDER_ID_REVIEWER_DEFAULT_V1);
+    assert_eq!(selected_state.builder_id, BUILDER_ID_REVIEWER_DEFAULT_V2);
 
     let selected_role_default = effective_prompt_selection(default_roles::CODER, None, None);
     assert_eq!(
         selected_role_default.builder_id,
-        BUILDER_ID_CODER_IMPLEMENTATION_V1
+        BUILDER_ID_CODER_IMPLEMENTATION_V2
     );
 }
 
 #[test]
 fn builder_precedence_falls_back_to_generic_for_unknown_role() {
     let selected = effective_prompt_selection("custom_role", None, None);
-    assert_eq!(selected.builder_id, BUILDER_ID_GENERIC_DEFAULT_V1);
+    assert_eq!(selected.builder_id, BUILDER_ID_GENERIC_DEFAULT_V2);
 }
 
 #[test]
@@ -346,14 +487,14 @@ fn custom_reviewer_role_can_use_explicit_reviewer_builder() {
     let mut ctx = fake_context("reviewer1");
     ctx.state_name = "security_review".to_string();
     let state_dispatch = DispatchIntent {
-        builder_id: Some(BUILDER_ID_REVIEWER_DEFAULT_V1.to_string()),
+        builder_id: Some(BUILDER_ID_REVIEWER_DEFAULT_V2.to_string()),
         execution_policy: None,
         prompt_config: json!({}),
     };
 
     let (prompt, selection) = build_effective_prompt(&ctx, None, Some(&state_dispatch));
 
-    assert_eq!(selection.builder_id, BUILDER_ID_REVIEWER_DEFAULT_V1);
+    assert_eq!(selection.builder_id, BUILDER_ID_REVIEWER_DEFAULT_V2);
     assert!(prompt.system.contains("reviewer"));
     assert!(prompt.user.contains("Review task: Add dispatch context"));
 }

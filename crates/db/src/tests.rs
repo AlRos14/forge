@@ -6,7 +6,8 @@ use crate::{
     CreateConversation, CreateConversationMessage, CreateExecution, CreateProject,
     CreateProjectAgentLink, CreateProjectMember, CreateRepo, CreateReview, CreateSkill, CreateTask,
     CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace, DaemonRepo, DaemonStatus,
-    DbError, ExecutionRepo, ExecutionStatus, NotificationListQuery, NotificationRepo, PageRequest,
+    DbError, ExecutionRepo, ExecutionStatus, MemoryConfidence, MemoryItem, MemoryKind,
+    MemoryRepository, MemorySourceType, NotificationListQuery, NotificationRepo, PageRequest,
     ProjectAgentLinkRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus,
     SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo, TaskListQuery, TaskRepo,
     TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
@@ -162,6 +163,160 @@ async fn seed_project(db: &SqliteDb, name: &str, owner_id: Option<String>) -> St
     .await
     .expect("project creates");
     project_id
+}
+
+fn memory_item(project_id: &str, title: &str, body: &str) -> MemoryItem {
+    MemoryItem {
+        row_id: 0,
+        id: new_uuid_v4(),
+        project_id: project_id.to_owned(),
+        task_id: None,
+        execution_id: None,
+        conversation_id: None,
+        source_type: MemorySourceType::Comment.to_string(),
+        kind: MemoryKind::Observation.to_string(),
+        title: title.to_owned(),
+        summary: None,
+        body: body.to_owned(),
+        metadata_json: "{}".to_owned(),
+        confidence: Some(MemoryConfidence::Confirmed.to_string()),
+        quality_score: None,
+        created_by_type: None,
+        created_by_id: None,
+        created_at: now_rfc3339(),
+    }
+}
+
+#[tokio::test]
+async fn test_memory_insert_and_fts_search() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Memory search", None).await;
+    let item = memory_item(
+        &project_id,
+        "Lantern handoff",
+        "The execution found a durable lantern clue.",
+    );
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("memory item inserts");
+
+    let (items, has_more) =
+        MemoryRepository::search_memory_items(&db, &project_id, "lantern", 10, None)
+            .await
+            .expect("memory search succeeds");
+
+    assert!(!has_more);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, item.id);
+    assert!(items[0].row_id > 0);
+}
+
+#[tokio::test]
+async fn test_memory_project_isolation() {
+    let db = sqlite_db().await;
+    let project_a = seed_project(&db, "Memory A", None).await;
+    let project_b = seed_project(&db, "Memory B", None).await;
+    let item_a = memory_item(&project_a, "Shared needle A", "sharedneedle belongs to A");
+    let item_b = memory_item(&project_b, "Shared needle B", "sharedneedle belongs to B");
+    MemoryRepository::insert_memory_item(&db, &item_a)
+        .await
+        .expect("project A memory inserts");
+    MemoryRepository::insert_memory_item(&db, &item_b)
+        .await
+        .expect("project B memory inserts");
+
+    let (items, has_more) =
+        MemoryRepository::search_memory_items(&db, &project_a, "sharedneedle", 10, None)
+            .await
+            .expect("project-scoped memory search succeeds");
+
+    assert!(!has_more);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].project_id, project_a);
+    assert_eq!(items[0].id, item_a.id);
+}
+
+#[tokio::test]
+async fn test_memory_cascade_delete() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Memory cascade", None).await;
+    let item = memory_item(
+        &project_id,
+        "Cascade marker",
+        "cascadeneedle should disappear from memory FTS",
+    );
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("memory item inserts");
+
+    ProjectRepo::delete(&db, &project_id)
+        .await
+        .expect("project deletes");
+
+    let loaded = MemoryRepository::get_memory_item(&db, &item.id)
+        .await
+        .expect("memory item lookup succeeds");
+    assert!(loaded.is_none());
+    let fts_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM memory_item_fts WHERE memory_item_fts MATCH ?",
+    )
+    .bind("cascadeneedle")
+    .fetch_one(db.pool())
+    .await
+    .expect("memory fts count succeeds");
+    assert_eq!(fts_count, 0);
+}
+
+#[test]
+fn test_memory_no_update_path() {
+    fn assert_append_only_repository<T: MemoryRepository + ?Sized>() {}
+
+    assert_append_only_repository::<SqliteDb>();
+    // MemoryRepository intentionally exposes insert/get/search/list only; there is no update method.
+}
+
+#[test]
+fn test_memory_enum_round_trips() {
+    let kinds = [
+        MemoryKind::Observation,
+        MemoryKind::Decision,
+        MemoryKind::Handoff,
+        MemoryKind::Failure,
+        MemoryKind::ReviewResult,
+        MemoryKind::ExecutionSummary,
+        MemoryKind::Comment,
+        MemoryKind::Transition,
+        MemoryKind::ConversationMessage,
+        MemoryKind::Artifact,
+        MemoryKind::Lesson,
+        MemoryKind::ContextPack,
+    ];
+    for kind in kinds {
+        let value = kind.to_string();
+        assert_eq!(value.parse::<MemoryKind>().unwrap(), kind);
+    }
+
+    let source_types = [
+        MemorySourceType::Execution,
+        MemorySourceType::Review,
+        MemorySourceType::Comment,
+        MemorySourceType::Transition,
+        MemorySourceType::Conversation,
+    ];
+    for source_type in source_types {
+        let value = source_type.to_string();
+        assert_eq!(value.parse::<MemorySourceType>().unwrap(), source_type);
+    }
+
+    let confidences = [
+        MemoryConfidence::Confirmed,
+        MemoryConfidence::Partial,
+        MemoryConfidence::Unconfirmed,
+    ];
+    for confidence in confidences {
+        let value = confidence.to_string();
+        assert_eq!(value.parse::<MemoryConfidence>().unwrap(), confidence);
+    }
 }
 
 async fn seed_agent(

@@ -6,6 +6,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-06-08
+
+### Added
+
+- Memory layer: a new append-only `memory_item` store (FTS5-indexed) that automatically captures execution summaries, reviews, task comments, failure/hook-error transitions, and conversation messages as searchable, project-scoped, attributed memories.
+- New REST endpoint: GET /api/v1/projects/{id}/memory/search — project-scoped layered memory search with pagination
+- New REST endpoint: GET /api/v1/memory/{id} — memory item retrieval by id
+- New MCP tool: forge_memory_search — project-scoped memory search with injection-guard wrapper
+- New MCP tool: forge_memory_get — memory item retrieval by id
+- New REST endpoint: POST /api/v1/memory/backfill (admin) — backfill memory index from existing data
+- New CLI command: forge-ctl memory backfill
+- Effective prompt preview: GET /api/v1/tasks/{id}/prompt-preview (read-only, no dispatch), MCP tool forge_preview_prompt, and CLI forge-ctl task prompt-preview
+
+### Changed
+
+- Prompt contracts v2: all default prompt builders updated with managed-execution contract, explicit role boundaries, structured handoffs (coder family), and structured reviewer findings. Builder ids bumped: coder_implementation_v1→v2, coder_review_fix_v1→v2, coder_merge_fix_v1→v2, reviewer_default_v1→v2, planner_default_v1→v2, generic_default_v1→v2.
+
+### Fixed
+
+- Task comments created through the REST API were not indexed into the memory layer because the handler bypassed the indexing service path; user comments now route through `TaskService::add_user_comment` and are indexed.
+- Codex executor model list now advertises currently supported models (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark); removed stale entries (gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5.4-fast) that the current Codex CLI rejects.
+
 ## [0.1.10] - 2026-06-06
 
 ### Fixed

@@ -21,7 +21,7 @@ under the Forge data directory.
 | `whoami`  | Show stored CLI login state |
 | `project` | Create / list / show projects |
 | `repo`    | Add / list repos under a project |
-| `task`    | Create, list, show, transition, cancel, archive tasks |
+| `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
 | `agent`   | Register / list / show agents |
 | `daemon`  | Link, start, and report an external daemon |
 | `run`     | Create + claim a task and follow the SSE stream until terminal state |
@@ -72,8 +72,13 @@ forge-ctl agent register --name "Claude" --executor-type shell
 
 forge-ctl task list --project-id <ID>
 forge-ctl task show <TASK_ID>
+forge-ctl task prompt-preview <TASK_ID> --role coder
 forge-ctl task cancel <TASK_ID>
 ```
+
+`task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
+to preview the prompt for a transition target instead of the task's current
+state.
 
 ### Linking an external daemon
 

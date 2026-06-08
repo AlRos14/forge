@@ -1,4 +1,4 @@
-use crate::{models::*, pagination::*, Result};
+use crate::{models::*, pagination::*, DbError, Result};
 use async_trait::async_trait;
 use sqlx::{Sqlite, Transaction};
 
@@ -165,6 +165,25 @@ pub trait ConversationMessageRepo: Send + Sync {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationMessage>>;
+}
+
+#[async_trait]
+pub trait MemoryRepository: Send + Sync {
+    async fn insert_memory_item(&self, item: &MemoryItem) -> std::result::Result<(), DbError>;
+    async fn get_memory_item(&self, id: &str) -> std::result::Result<Option<MemoryItem>, DbError>;
+    async fn search_memory_items(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> std::result::Result<(Vec<MemoryItem>, bool), DbError>;
+    async fn list_memory_items_by_source(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_id: &str,
+    ) -> std::result::Result<Vec<MemoryItem>, DbError>;
 }
 
 #[async_trait]

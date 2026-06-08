@@ -65,6 +65,22 @@ The `events` crate wraps `tokio::sync::broadcast`. Services publish
 `ForgeEvent` on state changes; the SSE endpoint at `/api/v1/events` subscribes
 and streams them to web clients and other listeners.
 
+### Memory Layer
+
+The memory layer is a read-only retrieval index over execution summaries,
+reviews, comments, failure-bearing transition logs, and conversations. It
+stores attributed memory items separately from the source records, with every
+result carrying the memory id, source type, source id, project id, optional task
+id, creation time, and creator attribution.
+
+Retrieval is layered: callers request a `layer` value in the `0-255` contract
+space, and the first tranche implements layers `1`, `2`, and `3` with
+`token_budget` mapping for cheap-first disclosure. REST and MCP both call
+`MemoryService` for search/get behavior. MCP responses add an explicit
+injection guardrail that frames retrieved bodies as background context, not
+agent instructions or directives. Raw execution JSONL log payloads are not
+indexed or returned by the memory layer.
+
 ### Daemon command transport
 
 Linked daemons keep a WebSocket command stream open at

@@ -346,12 +346,12 @@ fn validate_dispatch(
 fn is_known_prompt_builder_id(builder_id: &str) -> bool {
     matches!(
         builder_id,
-        "generic.default.v1"
-            | "planner.default.v1"
-            | "coder.implementation.v1"
-            | "coder.review_fix.v1"
-            | "coder.merge_fix.v1"
-            | "reviewer.default.v1"
+        "generic.default.v2"
+            | "planner.default.v2"
+            | "coder.implementation.v2"
+            | "coder.review_fix.v2"
+            | "coder.merge_fix.v2"
+            | "reviewer.default.v2"
     )
 }
 

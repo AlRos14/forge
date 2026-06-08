@@ -432,6 +432,14 @@ impl TaskService {
 
         super::publish_terminal_execution_event(self, &updated);
 
+        if let Err(error) = self
+            .memory_service
+            .record_execution_summary_if_present(&task.project_id, &updated)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
+
         if updated.status == ExecutionStatus::Completed {
             if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
                 tracing::warn!(

@@ -31,6 +31,20 @@ pub struct SettingListResponse {
     pub items: Vec<SettingResponse>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MemoryBackfillResponse {
+    pub items: Vec<MemoryBackfillTypeResponse>,
+    pub indexed: u64,
+    pub skipped: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryBackfillTypeResponse {
+    pub source_type: String,
+    pub indexed: u64,
+    pub skipped: u64,
+}
+
 pub async fn list_users(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -151,6 +165,26 @@ pub async fn delete_setting(
     SystemSettingRepo::delete_setting(&*state.db, &key).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn backfill_memory(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+) -> ApiResult<Json<MemoryBackfillResponse>> {
+    let summary = state.memory_service.backfill_sources().await?;
+    Ok(Json(MemoryBackfillResponse {
+        indexed: summary.indexed,
+        skipped: summary.skipped,
+        items: summary
+            .items
+            .into_iter()
+            .map(|result| MemoryBackfillTypeResponse {
+                source_type: result.source_type.to_string(),
+                indexed: result.indexed,
+                skipped: result.skipped,
+            })
+            .collect(),
+    }))
 }
 
 fn admin_user_response(user: User) -> AdminUserResponse {

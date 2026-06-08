@@ -1,4 +1,4 @@
-use db::{ExecutionRepo, ProjectMemberRepo, ProjectRepo, TaskRepo};
+use db::{ExecutionRepo, MemoryRepository, ProjectMemberRepo, ProjectRepo, TaskRepo};
 use serde_json::{json, Value};
 
 use crate::{
@@ -91,6 +91,11 @@ async fn apply_project_scope(
         assert_execution_in_scope(state, project_id, execution_id).await?;
     }
 
+    if tool_name == "forge_memory_get" {
+        let memory_id = required_string_arg(object, "id")?;
+        assert_memory_in_scope(state, project_id, memory_id).await?;
+    }
+
     Ok(arguments)
 }
 
@@ -102,12 +107,14 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
             | "forge_get_project"
             | "forge_update_project"
             | "forge_update_project_lifecycle_hooks"
+            | "forge_memory_search"
     )
 }
 
 fn task_scope_field(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "forge_get_task"
+        | "forge_preview_prompt"
         | "forge_assign_agent"
         | "forge_cancel_task"
         | "forge_get_task_diff"
@@ -160,6 +167,26 @@ async fn assert_execution_in_scope(
         .await?
         .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
     assert_task_in_scope(state, project_id, &execution.task_id).await
+}
+
+async fn assert_memory_in_scope(
+    state: &AppState,
+    project_id: &str,
+    memory_id: &str,
+) -> Result<(), McpToolError> {
+    let item = MemoryRepository::get_memory_item(&*state.db, memory_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("memory_item", memory_id.to_owned()))?;
+    if item.project_id != project_id {
+        return Err(
+            McpToolError::new(-32602, "memory item does not belong to scoped MCP project")
+                .with_data(json!({
+                    "project_id": project_id,
+                    "id": memory_id,
+                })),
+        );
+    }
+    Ok(())
 }
 
 async fn assert_project_membership(

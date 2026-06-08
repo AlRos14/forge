@@ -267,6 +267,13 @@ pub(super) async fn create_system_comment(ctx: &HookContext, content: String) ->
         },
     )
     .await?;
+    let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
+    if let Err(error) = memory_service
+        .record_task_comment(&ctx.project_id, &comment)
+        .await
+    {
+        tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+    }
     ctx.event_bus.publish(ForgeEvent {
         event_type: "comment.created".to_string(),
         entity_id: comment.id.clone(),
@@ -495,7 +502,7 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
         }
     };
     let now = now_rfc3339();
-    ReviewRepo::update_status(
+    let review = ReviewRepo::update_status(
         &*ctx.db,
         &review.id,
         ReviewStatus::AwaitingHuman,
@@ -505,6 +512,13 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
     )
     .await
     .map_err(|error| error.to_string())?;
+    let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
+    if let Err(error) = memory_service
+        .record_review_result_if_final(&ctx.project_id, &review)
+        .await
+    {
+        tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+    }
     Ok(())
 }
 

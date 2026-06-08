@@ -1,6 +1,7 @@
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     lifecycle::{LifecycleHookContext, LifecycleHookRun, LifecycleHookRunner},
+    memory::MemoryService,
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
     workflow::{default_states, engine::WorkflowEngine},
@@ -17,8 +18,8 @@ use db::{
     CommentAuthorType, CreateExecution, CreateTask, CreateTaskComment, CreateTaskRoleAssignment,
     CreateWorkspace, DbError, Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo,
     PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy,
-    SortOrder, SqliteDb, Task, TaskCommentRepo, TaskDependencyRepo, TaskMetadata, TaskRepo,
-    TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
+    SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata,
+    TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
     UpsertExecutionUsage, Workspace, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
@@ -106,6 +107,7 @@ pub struct TaskService {
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     workspace_root: PathBuf,
+    memory_service: Arc<MemoryService>,
 }
 
 #[derive(Debug)]
@@ -166,6 +168,7 @@ pub struct LaunchExecutionResult {
 
 impl TaskService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         Self {
             db,
             event_bus,
@@ -178,6 +181,7 @@ impl TaskService {
             terminal_activity: None,
             repo_cache_locks: None,
             workspace_root: default_workspace_root(),
+            memory_service,
         }
     }
 
@@ -232,6 +236,11 @@ impl TaskService {
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = workspace_root;
+        self
+    }
+
+    pub fn with_memory_service(mut self, memory_service: Arc<MemoryService>) -> Self {
+        self.memory_service = memory_service;
         self
     }
 
@@ -357,6 +366,14 @@ impl TaskService {
         }
 
         execution::publish_terminal_execution_event(self, &updated);
+
+        if let Err(error) = self
+            .memory_service
+            .record_execution_summary_if_present(&task.project_id, &updated)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
 
         if updated.status == ExecutionStatus::Completed {
             if let Err(error) = execution::clear_execution_retry_metadata(&self.db, &task).await {

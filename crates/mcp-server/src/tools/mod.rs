@@ -28,6 +28,9 @@ pub(crate) async fn dispatch_tool(
         }
         "forge_list_tasks" => handlers::forge_list_tasks(state, arguments).await,
         "forge_get_task" => handlers::forge_get_task(state, arguments).await,
+        "forge_preview_prompt" => handlers::forge_preview_prompt(state, arguments).await,
+        "forge_memory_search" => handlers::forge_memory_search(state, arguments).await,
+        "forge_memory_get" => handlers::forge_memory_get(state, arguments).await,
         "forge_assign_agent" => handlers::forge_assign_agent(state, arguments).await,
         "forge_cancel_task" => handlers::forge_cancel_task(state, arguments).await,
         "forge_get_task_diff" => handlers::forge_get_task_diff(state, arguments).await,

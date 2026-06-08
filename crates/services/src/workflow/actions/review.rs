@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use db::{
     now_rfc3339, ReviewRepo, ReviewStatus, TaskRepo, TransitionLog, TransitionLogRepo,
@@ -106,6 +108,13 @@ impl HookAction for RunCiSteps {
                     };
                 }
             };
+            let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
+            if let Err(error) = memory_service
+                .record_review_result_if_final(&ctx.project_id, &review)
+                .await
+            {
+                tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+            }
             publish_review_failed(ctx, &review, failed_step_index);
             if had_review_passed {
                 if let Err(error) =
@@ -168,6 +177,13 @@ impl HookAction for RunCiSteps {
                 };
             }
         };
+        let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
+        if let Err(error) = memory_service
+            .record_review_result_if_final(&ctx.project_id, &review)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
 
         if status == ReviewStatus::Passed {
             if !had_review_passed {

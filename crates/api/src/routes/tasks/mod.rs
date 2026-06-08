@@ -2,11 +2,11 @@ use api_types::{
     AddDependencyRequest, ApproveGateRequest, AssignRoleRequest, AuthorType, ClaimTaskRequest,
     CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope, HookResultEntry,
     LaunchExecutionRequest, LaunchExecutionResponse, PaginatedResponse, PositionRequest,
-    PositionResponse, RecoverTaskRequest, RejectGateRequest, RejectReviewRequest,
-    ReorderSubtasksRequest, ReviewConfig, ReviewDecisionResponse, StateKind, TaskDependency,
-    TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TransitionLogEntry,
-    TransitionSource, TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest,
-    WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
+    PositionResponse, PromptPreviewResponse, RecoverTaskRequest, RejectGateRequest,
+    RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig, ReviewDecisionResponse, StateKind,
+    TaskDependency, TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse,
+    TransitionLogEntry, TransitionSource, TransitionTaskRequest, TransitionTaskResponse,
+    UpdateTaskRequest, WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -14,7 +14,7 @@ use axum::{
     Json,
 };
 use db::{
-    now_rfc3339, CommentAuthorType, CreateTaskComment, CreateTaskRoleAssignment, ExecutionRepo,
+    now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo,
     ExecutionStatus, PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder,
     TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
     TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
@@ -46,6 +46,7 @@ mod dependencies;
 mod execution;
 mod gates;
 mod media;
+mod prompt_preview;
 mod reviews;
 mod roles;
 mod transitions;
@@ -60,6 +61,7 @@ pub use dependencies::{add_dependency, list_dependencies, list_dependents, remov
 pub use execution::{claim_task, launch_task};
 pub use gates::{approve_gate, gate_approve, gate_reject, reject_gate, GateRejectRequest};
 pub use media::{delete_media, get_media, list_media, upload_media};
+pub use prompt_preview::prompt_preview;
 pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
 pub use roles::{
     assign_task_role, list_task_roles, remove_task_role, RoleResetRequest,

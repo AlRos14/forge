@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use api_types::LifecycleHooks;
+use api_types::{LifecycleHooks, WorkflowTrigger};
 use db::{AgentStatus, PageRequest, SortBy, SortOrder, TaskStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,6 +40,29 @@ pub(crate) struct ListTasksParams {
 #[derive(Debug, Deserialize)]
 pub(crate) struct GetTaskParams {
     pub(crate) task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PreviewPromptParams {
+    pub(crate) task_id: String,
+    pub(crate) role: String,
+    pub(crate) trigger: Option<WorkflowTrigger>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemorySearchParams {
+    pub(crate) project_id: String,
+    pub(crate) query: String,
+    pub(crate) layer: Option<u8>,
+    pub(crate) token_budget: Option<u32>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemoryGetParams {
+    pub(crate) id: String,
+    pub(crate) layer: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]

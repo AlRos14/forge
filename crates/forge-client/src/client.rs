@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use api_types::PromptPreviewResponse;
 use reqwest::{multipart::Form, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -36,6 +37,24 @@ impl ForgeClient {
             .send()
             .await?;
         decode_json(response).await
+    }
+
+    pub async fn prompt_preview(
+        &self,
+        task_id: &str,
+        role: &str,
+        trigger: Option<&str>,
+    ) -> Result<PromptPreviewResponse> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("role", role);
+        if let Some(trigger) = trigger {
+            query.append_pair("trigger", trigger);
+        }
+        self.get(&format!(
+            "/api/v1/tasks/{task_id}/prompt-preview?{}",
+            query.finish()
+        ))
+        .await
     }
 
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
