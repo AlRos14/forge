@@ -30,6 +30,18 @@ fn map_memory_rows(rows: Vec<SqliteRow>) -> Result<Vec<MemoryItem>> {
         .collect()
 }
 
+fn literal_fts_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
 #[async_trait]
 impl MemoryRepository for SqliteDb {
     async fn insert_memory_item(&self, item: &MemoryItem) -> Result<()> {
@@ -64,6 +76,42 @@ impl MemoryRepository for SqliteDb {
             .transpose()
     }
 
+    async fn memory_source_exists(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_ref: &str,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM memory_item WHERE project_id = ? AND source_type = ? AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.source_ref') END = ? LIMIT 1)",
+        )
+        .bind(project_id)
+        .bind(source_type)
+        .bind(source_ref)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    async fn memory_source_exists_with_confidence(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_ref: &str,
+        confidence: &str,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM memory_item WHERE project_id = ? AND source_type = ? AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.source_ref') END = ? AND confidence = ? LIMIT 1)",
+        )
+        .bind(project_id)
+        .bind(source_type)
+        .bind(source_ref)
+        .bind(confidence)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
     async fn search_memory_items(
         &self,
         project_id: &str,
@@ -72,13 +120,16 @@ impl MemoryRepository for SqliteDb {
         cursor: Option<String>,
     ) -> Result<(Vec<MemoryItem>, bool)> {
         let limit = limit.clamp(1, 500);
+        let Some(fts_query) = literal_fts_query(query) else {
+            return Ok((Vec::new(), false));
+        };
         let cursor = decode_memory_cursor(cursor)?;
         let rows = if let Some(cursor) = cursor {
             sqlx::query(
-                "SELECT memory_item.* FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.project_id = ? AND memory_item_fts MATCH ? AND (memory_item.created_at < ? OR (memory_item.created_at = ? AND memory_item.id < ?)) ORDER BY rank, memory_item.created_at DESC, memory_item.id DESC LIMIT ?",
+                "SELECT memory_item.* FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.project_id = ? AND memory_item_fts MATCH ? AND (memory_item.created_at < ? OR (memory_item.created_at = ? AND memory_item.id < ?)) ORDER BY memory_item.created_at DESC, memory_item.id DESC LIMIT ?",
             )
             .bind(project_id)
-            .bind(query)
+            .bind(&fts_query)
             .bind(&cursor.created_at)
             .bind(&cursor.created_at)
             .bind(&cursor.id)
@@ -87,10 +138,10 @@ impl MemoryRepository for SqliteDb {
             .await?
         } else {
             sqlx::query(
-                "SELECT memory_item.* FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.project_id = ? AND memory_item_fts MATCH ? ORDER BY rank, memory_item.created_at DESC, memory_item.id DESC LIMIT ?",
+                "SELECT memory_item.* FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.project_id = ? AND memory_item_fts MATCH ? ORDER BY memory_item.created_at DESC, memory_item.id DESC LIMIT ?",
             )
             .bind(project_id)
-            .bind(query)
+            .bind(&fts_query)
             .bind(limit as i64 + 1)
             .fetch_all(&self.pool)
             .await?

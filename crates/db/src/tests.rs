@@ -15,6 +15,7 @@ use crate::{
     UpdateTerminalSessionStatus, UpsertDaemon, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
 fn page(limit: i64) -> PageRequest {
     PageRequest {
@@ -187,6 +188,16 @@ fn memory_item(project_id: &str, title: &str, body: &str) -> MemoryItem {
     }
 }
 
+fn memory_cursor(item: &MemoryItem) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "created_at": &item.created_at,
+            "id": &item.id,
+        }))
+        .expect("memory cursor serializes"),
+    )
+}
+
 #[tokio::test]
 async fn test_memory_insert_and_fts_search() {
     let db = sqlite_db().await;
@@ -209,6 +220,154 @@ async fn test_memory_insert_and_fts_search() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, item.id);
     assert!(items[0].row_id > 0);
+}
+
+#[tokio::test]
+async fn test_memory_search_escapes_fts_query_syntax() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Memory punctuation search", None).await;
+    let item = memory_item(
+        &project_id,
+        "Punctuation handoff",
+        "A user's note says can't reproduce foo or AND yet.",
+    );
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("memory item inserts");
+
+    let (apostrophe_items, apostrophe_has_more) =
+        MemoryRepository::search_memory_items(&db, &project_id, "can't", 10, None)
+            .await
+            .expect("apostrophe search succeeds");
+    let (operator_items, operator_has_more) =
+        MemoryRepository::search_memory_items(&db, &project_id, "foo or AND", 10, None)
+            .await
+            .expect("operator-looking search succeeds");
+
+    assert!(!apostrophe_has_more);
+    assert_eq!(apostrophe_items.len(), 1);
+    assert_eq!(apostrophe_items[0].id, item.id);
+    assert!(!operator_has_more);
+    assert_eq!(operator_items.len(), 1);
+    assert_eq!(operator_items[0].id, item.id);
+}
+
+#[tokio::test]
+async fn test_memory_search_cursor_uses_same_order_as_results() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Memory pagination", None).await;
+    let mut oldest = memory_item(
+        &project_id,
+        "Pager oldest",
+        "pagerneedle pagerneedle pagerneedle pagerneedle",
+    );
+    oldest.created_at = "2026-06-08T00:00:00Z".to_owned();
+    oldest.id = "00000000-0000-4000-8000-000000000001".to_owned();
+    let mut middle = memory_item(&project_id, "Pager middle", "pagerneedle");
+    middle.created_at = "2026-06-08T00:00:01Z".to_owned();
+    middle.id = "00000000-0000-4000-8000-000000000002".to_owned();
+    let mut newest = memory_item(&project_id, "Pager newest", "pagerneedle");
+    newest.created_at = "2026-06-08T00:00:02Z".to_owned();
+    newest.id = "00000000-0000-4000-8000-000000000003".to_owned();
+
+    for item in [&oldest, &middle, &newest] {
+        MemoryRepository::insert_memory_item(&db, item)
+            .await
+            .expect("memory item inserts");
+    }
+
+    let (page_one, page_one_has_more) =
+        MemoryRepository::search_memory_items(&db, &project_id, "pagerneedle", 1, None)
+            .await
+            .expect("first page succeeds");
+    assert!(page_one_has_more);
+    assert_eq!(page_one[0].id, newest.id);
+
+    let (page_two, page_two_has_more) = MemoryRepository::search_memory_items(
+        &db,
+        &project_id,
+        "pagerneedle",
+        1,
+        Some(memory_cursor(&page_one[0])),
+    )
+    .await
+    .expect("second page succeeds");
+    assert!(page_two_has_more);
+    assert_eq!(page_two[0].id, middle.id);
+    assert_ne!(page_two[0].id, page_one[0].id);
+
+    let (page_three, page_three_has_more) = MemoryRepository::search_memory_items(
+        &db,
+        &project_id,
+        "pagerneedle",
+        1,
+        Some(memory_cursor(&page_two[0])),
+    )
+    .await
+    .expect("third page succeeds");
+    assert!(!page_three_has_more);
+    assert_eq!(page_three[0].id, oldest.id);
+}
+
+#[tokio::test]
+async fn test_memory_source_exists_uses_source_ref_field() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Memory source exists", None).await;
+    let mut item = memory_item(&project_id, "Source ref", "source ref body");
+    item.source_type = MemorySourceType::Review.to_string();
+    item.metadata_json = serde_json::json!({
+        "source_ref": "review-1",
+        "extra": true,
+    })
+    .to_string();
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("memory item inserts");
+
+    assert!(MemoryRepository::memory_source_exists(
+        &db,
+        &project_id,
+        &MemorySourceType::Review.to_string(),
+        "review-1"
+    )
+    .await
+    .expect("source exists check succeeds"));
+}
+
+#[tokio::test]
+async fn test_memory_source_exists_with_confidence_filters_source_ref_and_confidence() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Memory source confidence exists", None).await;
+    let mut item = memory_item(&project_id, "Source ref", "source ref body");
+    item.source_type = MemorySourceType::Review.to_string();
+    item.metadata_json = serde_json::json!({
+        "source_ref": "review-1",
+        "extra": true,
+    })
+    .to_string();
+    item.confidence = Some(MemoryConfidence::Partial.to_string());
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("memory item inserts");
+
+    assert!(MemoryRepository::memory_source_exists_with_confidence(
+        &db,
+        &project_id,
+        &MemorySourceType::Review.to_string(),
+        "review-1",
+        &MemoryConfidence::Partial.to_string()
+    )
+    .await
+    .expect("source confidence check succeeds"));
+    assert!(!MemoryRepository::memory_source_exists_with_confidence(
+        &db,
+        &project_id,
+        &MemorySourceType::Review.to_string(),
+        "review-1",
+        &MemoryConfidence::Confirmed.to_string()
+    )
+    .await
+    .expect("source confidence check succeeds"));
 }
 
 #[tokio::test]

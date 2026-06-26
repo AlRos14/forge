@@ -23,7 +23,8 @@ pub async fn search_project_memory(
         return Err(ApiError::bad_request("query must not be empty"));
     }
     let project_uuid = parse_uuid(&project_id, "project_id")?;
-    require_project_visible(&state, &project_id, &user).await?;
+    let normalized_project_id = project_uuid.to_string();
+    require_project_visible(&state, &normalized_project_id, &user).await?;
     let layer = response_layer(params.layer, params.token_budget)?;
     let limit = params.limit.unwrap_or(20);
     let (results, has_more, next_cursor) = state
@@ -41,7 +42,7 @@ pub async fn search_project_memory(
     let mut items = Vec::with_capacity(results.len());
     for (index, result) in results.into_iter().enumerate() {
         let raw = memory_item_for_result(&state, &result).await?;
-        if raw.project_id != project_id {
+        if raw.project_id != normalized_project_id {
             return Err(ApiError::not_found("memory_item", result.id.to_string()));
         }
         items.push(memory_result_dto(

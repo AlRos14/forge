@@ -337,6 +337,7 @@ pub(super) async fn forge_memory_search(
     }
 
     let project_id = parse_uuid_param(&params.project_id, "project_id")?;
+    let normalized_project_id = project_id.to_string();
     let layer = response_layer(params.layer, params.token_budget)?;
     let memory_service = services::MemoryService::new(Arc::clone(&state.db));
     let (results, has_more, next_cursor) = memory_service
@@ -353,7 +354,7 @@ pub(super) async fn forge_memory_search(
     let mut retrieved_context = Vec::with_capacity(results.len());
     for (index, result) in results.into_iter().enumerate() {
         let raw = memory_item_for_result(state, &result).await?;
-        if raw.project_id != params.project_id {
+        if raw.project_id != normalized_project_id {
             return Err(McpToolError::not_found(
                 "memory_item",
                 result.id.to_string(),

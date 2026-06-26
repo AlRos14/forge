@@ -93,13 +93,6 @@ pub struct MemoryBackfillSource {
 #[async_trait]
 pub trait MemoryBackfillRepository: MemoryRepository {
     async fn list_memory_backfill_sources(&self) -> Result<Vec<MemoryBackfillSource>>;
-
-    async fn memory_source_exists(
-        &self,
-        project_id: &str,
-        source_type: &MemorySourceType,
-        source_ref: &str,
-    ) -> Result<bool>;
 }
 
 #[derive(Clone)]
@@ -205,11 +198,7 @@ where
         for source in self.db.list_memory_backfill_sources().await? {
             let result = backfill_result_for_source(&mut results, &source.source_type)
                 .expect("all source types are pre-seeded");
-            if self
-                .db
-                .memory_source_exists(&source.project_id, &source.source_type, &source.source_ref)
-                .await?
-            {
+            if backfill_source_exists(self.db.as_ref(), &source).await? {
                 result.skipped += 1;
                 continue;
             }
@@ -254,7 +243,7 @@ where
             .db
             .memory_source_exists(
                 project_id,
-                &MemorySourceType::Transition,
+                &MemorySourceType::Transition.to_string(),
                 transition.id.as_str(),
             )
             .await?
@@ -304,6 +293,17 @@ where
         let Some(body) = execution_summary_body(execution) else {
             return Ok(None);
         };
+        if self
+            .db
+            .memory_source_exists(
+                project_id,
+                &MemorySourceType::Execution.to_string(),
+                execution.id.as_str(),
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         let title = format!("{} execution {}", execution.status, execution.role);
         let item = self
             .record_from_source(MemoryItemInput {
@@ -337,6 +337,17 @@ where
         if review.status == ReviewStatus::Running {
             return Ok(None);
         }
+        let has_confirmed_outcome = review_has_confirmed_outcome(review);
+        if review_memory_source_exists(
+            self.db.as_ref(),
+            project_id,
+            review.id.as_str(),
+            has_confirmed_outcome,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
         let item = self
             .record_from_source(MemoryItemInput {
                 project_id: parse_uuid(project_id, "project_id")?,
@@ -349,13 +360,11 @@ where
                 title: format!("Review {} attempt {}", review.status, review.attempt_number),
                 summary: review_summary(review),
                 body: review.step_results_json.clone(),
-                confidence: Some(
-                    if matches!(&review.status, ReviewStatus::Passed | ReviewStatus::Failed) {
-                        MemoryConfidence::Confirmed
-                    } else {
-                        MemoryConfidence::Partial
-                    },
-                ),
+                confidence: Some(if has_confirmed_outcome {
+                    MemoryConfidence::Confirmed
+                } else {
+                    MemoryConfidence::Partial
+                }),
                 quality_score: None,
                 creator: None,
             })
@@ -409,6 +418,17 @@ where
         if status == "streaming" {
             return Ok(None);
         }
+        if self
+            .db
+            .memory_source_exists(
+                project_id,
+                &MemorySourceType::Conversation.to_string(),
+                message_id,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         let body = conversation_message_body(role, status, content, error);
         let item = self
             .record_from_source(MemoryItemInput {
@@ -448,23 +468,6 @@ impl MemoryBackfillRepository for SqliteDb {
         sources.extend(list_transition_sources(self).await?);
         sources.extend(list_conversation_sources(self).await?);
         Ok(sources)
-    }
-
-    async fn memory_source_exists(
-        &self,
-        project_id: &str,
-        source_type: &MemorySourceType,
-        source_ref: &str,
-    ) -> Result<bool> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM memory_item WHERE project_id = ? AND source_type = ? AND metadata_json = ?",
-        )
-        .bind(project_id)
-        .bind(source_type.to_string())
-        .bind(source_metadata_json(source_ref))
-        .fetch_one(self.pool())
-        .await?;
-        Ok(count > 0)
     }
 }
 
@@ -799,6 +802,59 @@ fn source_ref_from_metadata(metadata_json: &str) -> Option<String> {
         })
 }
 
+async fn backfill_source_exists<R>(db: &R, source: &MemoryBackfillSource) -> Result<bool>
+where
+    R: MemoryRepository + Send + Sync,
+{
+    if source.source_type == MemorySourceType::Review {
+        return review_memory_source_exists(
+            db,
+            &source.project_id,
+            &source.source_ref,
+            source.confidence == Some(MemoryConfidence::Confirmed),
+        )
+        .await;
+    }
+
+    Ok(db
+        .memory_source_exists(
+            &source.project_id,
+            &source.source_type.to_string(),
+            &source.source_ref,
+        )
+        .await?)
+}
+
+async fn review_memory_source_exists<R>(
+    db: &R,
+    project_id: &str,
+    source_ref: &str,
+    has_confirmed_outcome: bool,
+) -> Result<bool>
+where
+    R: MemoryRepository + Send + Sync,
+{
+    let source_type = MemorySourceType::Review.to_string();
+    if has_confirmed_outcome {
+        return Ok(db
+            .memory_source_exists_with_confidence(
+                project_id,
+                &source_type,
+                source_ref,
+                &MemoryConfidence::Confirmed.to_string(),
+            )
+            .await?);
+    }
+
+    Ok(db
+        .memory_source_exists(project_id, &source_type, source_ref)
+        .await?)
+}
+
+fn review_has_confirmed_outcome(review: &Review) -> bool {
+    matches!(&review.status, ReviewStatus::Passed | ReviewStatus::Failed)
+}
+
 fn snippet(content: &str) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -980,5 +1036,306 @@ fn backfill_summary_from_results(items: Vec<BackfillTypeResult>) -> BackfillSumm
         items,
         indexed,
         skipped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use db::{
+        create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ConversationRepo,
+        ConversationStatus, CreateConversation, CreateExecution, CreateProject, CreateTask,
+        Execution, ExecutionRepo, ExecutionStatus, MemorySourceType, ProjectRepo, Review,
+        ReviewStatus, SqliteDb, TaskRepo,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::MemoryService;
+
+    async fn sqlite_db() -> Arc<SqliteDb> {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        Arc::new(SqliteDb::new(pool))
+    }
+
+    async fn seed_project_task_execution(db: &SqliteDb) -> (Uuid, String, Execution) {
+        let project_id = Uuid::new_v4();
+        let now = now_rfc3339();
+        ProjectRepo::create(
+            db,
+            CreateProject {
+                id: project_id.to_string(),
+                name: "Project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        let task_id = new_uuid_v4();
+        TaskRepo::create(
+            db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.to_string(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Task".to_owned(),
+                description: Some("Task description".to_owned()),
+                task_type: "task".to_owned(),
+                status: "review".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("task creates");
+        let execution = ExecutionRepo::create(
+            db,
+            CreateExecution {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                agent_id: None,
+                role: "coder".to_owned(),
+                status: ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: Some("completed execution summary".to_owned()),
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+        (project_id, task_id, execution)
+    }
+
+    async fn seed_project_conversation(db: &SqliteDb) -> (Uuid, String) {
+        let project_id = Uuid::new_v4();
+        let now = now_rfc3339();
+        ProjectRepo::create(
+            db,
+            CreateProject {
+                id: project_id.to_string(),
+                name: "Project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        let conversation_id = new_uuid_v4();
+        ConversationRepo::create(
+            db,
+            CreateConversation {
+                id: conversation_id.clone(),
+                project_id: project_id.to_string(),
+                agent_id: None,
+                title: "Conversation".to_owned(),
+                status: ConversationStatus::Active,
+                system_prompt: None,
+                message_count: 0,
+                last_message_at: None,
+                agent_session_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("conversation creates");
+        (project_id, conversation_id)
+    }
+
+    async fn memory_count(db: &SqliteDb, project_id: &Uuid, source_type: MemorySourceType) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM memory_item WHERE project_id = ? AND source_type = ?",
+        )
+        .bind(project_id.to_string())
+        .bind(source_type.to_string())
+        .fetch_one(db.pool())
+        .await
+        .expect("memory count loads")
+    }
+
+    #[tokio::test]
+    async fn record_review_result_if_final_is_idempotent() {
+        let db = sqlite_db().await;
+        let (project_id, task_id, execution) = seed_project_task_execution(&db).await;
+        let service = MemoryService::new(Arc::clone(&db));
+        let now = now_rfc3339();
+        let review = Review {
+            id: new_uuid_v4(),
+            task_id,
+            execution_id: execution.id,
+            attempt_number: 1,
+            status: ReviewStatus::Passed,
+            step_results_json: json!({ "auditor": { "verdict": "pass" } }).to_string(),
+            started_at: now.clone(),
+            finished_at: Some(now.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let first = service
+            .record_review_result_if_final(&project_id.to_string(), &review)
+            .await
+            .expect("first review memory records");
+        let second = service
+            .record_review_result_if_final(&project_id.to_string(), &review)
+            .await
+            .expect("second review memory is skipped");
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            memory_count(&db, &project_id, MemorySourceType::Review).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn record_review_result_if_final_records_final_after_awaiting_human() {
+        let db = sqlite_db().await;
+        let (project_id, task_id, execution) = seed_project_task_execution(&db).await;
+        let service = MemoryService::new(Arc::clone(&db));
+        let now = now_rfc3339();
+        let review_id = new_uuid_v4();
+        let awaiting_review = Review {
+            id: review_id.clone(),
+            task_id: task_id.clone(),
+            execution_id: execution.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::AwaitingHuman,
+            step_results_json: json!({ "manual": { "state": "waiting" } }).to_string(),
+            started_at: now.clone(),
+            finished_at: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let passed_review = Review {
+            status: ReviewStatus::Passed,
+            step_results_json: json!({ "manual": { "verdict": "pass" } }).to_string(),
+            finished_at: Some(now.clone()),
+            updated_at: now,
+            ..awaiting_review.clone()
+        };
+
+        let awaiting = service
+            .record_review_result_if_final(&project_id.to_string(), &awaiting_review)
+            .await
+            .expect("awaiting-human review memory records");
+        let passed = service
+            .record_review_result_if_final(&project_id.to_string(), &passed_review)
+            .await
+            .expect("final review memory records");
+        let duplicate_passed = service
+            .record_review_result_if_final(&project_id.to_string(), &passed_review)
+            .await
+            .expect("duplicate final review memory is skipped");
+
+        assert!(awaiting.is_some());
+        assert!(passed.is_some());
+        assert!(duplicate_passed.is_none());
+        assert_eq!(
+            memory_count(&db, &project_id, MemorySourceType::Review).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn record_execution_summary_if_present_is_idempotent() {
+        let db = sqlite_db().await;
+        let (project_id, _task_id, execution) = seed_project_task_execution(&db).await;
+        let service = MemoryService::new(Arc::clone(&db));
+
+        let first = service
+            .record_execution_summary_if_present(&project_id.to_string(), &execution)
+            .await
+            .expect("first execution memory records");
+        let second = service
+            .record_execution_summary_if_present(&project_id.to_string(), &execution)
+            .await
+            .expect("second execution memory is skipped");
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            memory_count(&db, &project_id, MemorySourceType::Execution).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn record_conversation_message_is_idempotent() {
+        let db = sqlite_db().await;
+        let (project_id, conversation_id) = seed_project_conversation(&db).await;
+        let service = MemoryService::new(Arc::clone(&db));
+        let message_id = new_uuid_v4();
+
+        let first = service
+            .record_conversation_message(
+                &project_id.to_string(),
+                None,
+                &message_id,
+                &conversation_id,
+                "user",
+                "complete",
+                "Please remember this.",
+                None,
+            )
+            .await
+            .expect("first conversation memory records");
+        let second = service
+            .record_conversation_message(
+                &project_id.to_string(),
+                None,
+                &message_id,
+                &conversation_id,
+                "user",
+                "complete",
+                "Please remember this.",
+                None,
+            )
+            .await
+            .expect("second conversation memory is skipped");
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            memory_count(&db, &project_id, MemorySourceType::Conversation).await,
+            1
+        );
     }
 }

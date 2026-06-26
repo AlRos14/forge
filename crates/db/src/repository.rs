@@ -171,6 +171,19 @@ pub trait ConversationMessageRepo: Send + Sync {
 pub trait MemoryRepository: Send + Sync {
     async fn insert_memory_item(&self, item: &MemoryItem) -> std::result::Result<(), DbError>;
     async fn get_memory_item(&self, id: &str) -> std::result::Result<Option<MemoryItem>, DbError>;
+    async fn memory_source_exists(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_ref: &str,
+    ) -> std::result::Result<bool, DbError>;
+    async fn memory_source_exists_with_confidence(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_ref: &str,
+        confidence: &str,
+    ) -> std::result::Result<bool, DbError>;
     async fn search_memory_items(
         &self,
         project_id: &str,

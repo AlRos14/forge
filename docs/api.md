@@ -143,7 +143,10 @@ summaries, reviews, comments, failure transitions, and conversations.
 ### `GET /api/v1/projects/{id}/memory/search`
 
 Searches memory within one project. The `{id}` path segment is the project
-scope; callers cannot search across projects.
+scope; callers cannot search across projects. Query text is treated as literal
+terms, not raw SQLite FTS syntax. Results are ordered by `created_at DESC,
+id DESC`; `score` is a response-position helper (`1.0`, `0.5`, `0.333`, ...)
+rather than a cross-query relevance rank.
 
 Query parameters:
 
