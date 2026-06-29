@@ -164,7 +164,7 @@ All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 ### Workflow engine (in progress)
 
 Flexible workflow work is partially implemented. `WorkflowEngine` in
-`crates/services/src/workflow/engine.rs` is the new data-driven path;
+`crates/services/src/workflow/engine/mod.rs` is the new data-driven path;
 `TaskService.transition()` still uses the legacy `TaskStatus`/`transition_allowed`
 path. Treat the engine as a parallel code path until the split is removed.
 
@@ -172,6 +172,19 @@ Workflows are project-defined JSON in `project.workflow_definition`. Empty
 string or `"{}"` resolves at runtime to the built-in `DefaultWorkflow`.
 `WorkflowCache` caches resolved definitions per project and invalidates on
 workflow updates.
+
+`TaskService::transition` resolves the applicable workflow via
+`WorkflowEngine::resolve_workflow_for_transition` before delegating to the
+engine. Root tasks use the project workflow (unchanged). For subtasks: if the
+**current** state is not defined in the inherited subtask workflow (e.g.
+`review`, `merging`), the **project** workflow governs all transitions on that
+task — user, agent, system, and cascades — because the subtask workflow cannot
+define a transition from a state it does not contain. If the current state is
+shared by both workflows (e.g. `in_progress`), **user-initiated** transitions
+use the project workflow and **agent/system-initiated** transitions use the
+inherited subtask workflow (no `review`/`merging`). This aligns validation with
+the frontend, which presents target states from the project workflow for all
+tasks. Automatic subtask lifecycle in subtask-workflow states is unchanged.
 
 `StateKind` classifies states:
 
@@ -186,8 +199,10 @@ workflow updates.
 
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
-1. Load task, check optimistic version, validate the graph edge or implicit
-   cancellation path.
+1. Load task, check optimistic version, validate that `A` and `B` are defined
+   states in the applicable workflow (undefined current or target rejects with
+   an error enumerating defined state names), then validate the graph edge or
+   implicit cancellation path.
 2. Run filtered `A.before_exit` guards unless `B` is the cancellation target;
    `FailurePolicy::Block` failures return `GuardRejection` (HTTP 412).
 3. Update `task.status`, increment `version`, write `transition_log`, publish
@@ -199,6 +214,18 @@ workflow updates.
 6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
 
+**User routing override:** When a user actor's move would be rejected solely
+because (a) no trigger edge connects the states or (b) the matching trigger is
+system-only (`Fail`/`Retry`), and `B` is a defined state in the applicable
+workflow, the engine completes the transition via a user-routing-override path
+(`WorkflowEngine::user_override_transition`): `before_exit`/`before_enter`
+content guards still run and may block; `on_enter`/`after_enter` hooks run
+normally; `task.status_changed` is published unconditionally; agent dispatch fires
+only when a role/agent is assigned. Override transitions are audited as
+`triggered_by = "user:override:<source>"` (e.g. `user:override:api`). This is
+separate from `manual_override_transition`, a system-triggered primitive with
+`skip_before_exit=true` used by `TaskService::advance_to_next_state`.
+
 Hook audience filtering is uniform across phases. `HookAudience::All` always
 runs. `AgentOnly` runs when `triggered_by` starts with `"agent:"` or equals
 `"system"`; `UserOnly` runs only when it starts with `"user:"`. Non-matching
@@ -207,10 +234,11 @@ hooks are skipped without a hook-result entry.
 Human-triggered transitions are treated as project-management actions. The
 dependency gate does not block `user:*` card moves, including board drag
 transitions, so users can reorder and reclassify work like they would in Jira.
-Subtasks follow the same rule for status moves while still using the inherited
-subtask workflow, so invalid child states remain rejected by the graph. AI
-execution remains gated separately: initial role dispatch and interactive launch
-both run dependency checks before creating an execution.
+User moves on subtasks resolve against the project workflow (see resolution
+rule above) so validation matches presented board states; users may also route
+to any defined workflow state via the override path when strict routing would
+reject. AI execution remains gated separately: initial role dispatch and
+interactive launch both run dependency checks before creating an execution.
 
 Cancellation is implicit from any non-terminal state to
 `workflow.cancellation_state` (or terminal `"cancelled"` if unset), even
@@ -245,7 +273,7 @@ exposes it via `GET /api/v1/tasks/{id}/transitions`.
 
 ### Files of interest
 
-- `crates/services/src/workflow/engine.rs` — lifecycle
+- `crates/services/src/workflow/engine/mod.rs` — lifecycle
 - `crates/services/src/workflow/actions/` — curated hook actions
 - `crates/services/src/workflow/default_workflow.rs` — built-in graph
 - `crates/services/src/workflow/validation.rs` — workflow graph validation

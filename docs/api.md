@@ -84,6 +84,17 @@ Project hook validation rejects unsupported trigger and action types, the
 `task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
 required action strings such as `dispatch_agent.agent_id`.
 
+## Task transitions
+
+`POST /api/v1/tasks/{id}/transition` accepts `status`, `version`, optional
+`reason`, optional `source`, and optional `override` (boolean, default `false`).
+When a user move would fail strict routing (missing edge or system-only
+trigger) but the target is a defined workflow state, the server auto-escalates
+to the user-routing-override path regardless of `override`; the flag signals
+explicit client intent only. MCP `forge_transition_task` is unchanged — it still
+emits `triggered_by="system"` and does not support user override (REST-only for
+now).
+
 ## Task Diffs
 
 `GET /api/v1/tasks/{id}/diff` and `GET /api/v1/workspaces/{id}/diff` return a

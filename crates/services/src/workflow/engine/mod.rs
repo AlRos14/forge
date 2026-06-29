@@ -140,6 +140,44 @@ impl WorkflowEngine {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn user_override_transition(
+        &self,
+        task_id: &str,
+        target_state: &str,
+        version: i64,
+        workflow: &WorkflowDefinition,
+        triggered_by: &str,
+        reason: &str,
+        rejection: bool,
+    ) -> crate::Result<TransitionResult> {
+        if !triggered_by.starts_with("user:") {
+            return Err(ServiceError::invalid_operation(
+                "user_override_transition requires a user-scoped triggered_by (got a non-user actor)",
+            ));
+        }
+        let override_triggered_by = if triggered_by.starts_with("user:override:") {
+            triggered_by.to_string()
+        } else if let Some(source) = triggered_by.strip_prefix("user:") {
+            format!("user:override:{source}")
+        } else {
+            unreachable!("triggered_by validated to start with user:")
+        };
+        self.transition_inner(
+            task_id.to_string(),
+            target_state.to_string(),
+            version,
+            workflow,
+            override_triggered_by,
+            reason.to_string(),
+            rejection,
+            false,
+            None,
+            0,
+        )
+        .await
+    }
+
     pub async fn retry_entry_barrier(
         &self,
         task_id: &str,
@@ -519,6 +557,48 @@ impl WorkflowEngine {
         Self::resolve_workflow(workflow_definition_json)
     }
 
+    pub fn resolve_workflow_for_state_classification(
+        task: &db::Task,
+        workflow_definition_json: &str,
+    ) -> WorkflowDefinition {
+        if task.parent_task_id.is_none() {
+            return Self::resolve_workflow(workflow_definition_json);
+        }
+
+        let subtask_wf = inherited_subtask_workflow();
+        let current_in_subtask = subtask_wf
+            .states
+            .iter()
+            .any(|s| s.name.as_str() == task.status.as_str());
+        if current_in_subtask {
+            return subtask_wf;
+        }
+        Self::resolve_workflow(workflow_definition_json)
+    }
+
+    pub fn resolve_workflow_for_transition(
+        task: &db::Task,
+        workflow_definition_json: &str,
+        triggered_by: &str,
+    ) -> WorkflowDefinition {
+        if task.parent_task_id.is_none() {
+            return Self::resolve_workflow(workflow_definition_json);
+        }
+
+        let subtask_wf = inherited_subtask_workflow();
+        let current_in_subtask = subtask_wf
+            .states
+            .iter()
+            .any(|s| s.name.as_str() == task.status.as_str());
+        if !current_in_subtask {
+            return Self::resolve_workflow(workflow_definition_json);
+        }
+        if triggered_by.starts_with("user:") {
+            return Self::resolve_workflow(workflow_definition_json);
+        }
+        subtask_wf
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn transition_inner<'a>(
         &'a self,
@@ -576,60 +656,83 @@ impl WorkflowEngine {
             );
             let from_state = Self::find_state(workflow, &current_status).ok_or_else(|| {
                 ServiceError::InvalidOperation {
-                    message: format!("state '{current_status}' is not defined in workflow"),
+                    message: Self::undefined_state_message(&current_status, workflow),
                 }
             })?;
             let to_state = Self::find_state(workflow, &target_state).ok_or_else(|| {
                 ServiceError::InvalidOperation {
-                    message: format!("state '{target_state}' is not defined in workflow"),
+                    message: Self::undefined_state_message(&target_state, workflow),
                 }
             })?;
             let transition = workflow.trigger_between(&current_status, &target_state);
             let trigger_name = transition.map(|trigger| trigger.as_str().to_owned());
-            let effective_skip_before_exit = match transition {
-                Some(trigger) => {
+            let is_user_actor = triggered_by.starts_with("user:");
+            let none_allowance = transition.is_none()
+                && (((current_status == target_state || to_state.kind == StateKind::Initial)
+                    && skip_before_exit)
+                    || (Self::is_cancellation_target(workflow, &target_state)
+                        && from_state.kind != StateKind::Terminal));
+            let strict_missing_edge = transition.is_none() && !none_allowance;
+            let strict_system_only = matches!(
+                transition,
+                Some(trigger)
                     if !skip_before_exit
-                        && Self::transition_requires_system_actor(
-                            trigger, from_state, to_state,
-                        )
+                        && Self::transition_requires_system_actor(trigger, from_state, to_state)
                         && triggered_by != "system"
+            );
+            let mut triggered_by = triggered_by;
+            let effective_skip_before_exit = if is_user_actor
+                && from_state.kind != StateKind::Terminal
+                && (strict_missing_edge || strict_system_only)
+            {
+                if !triggered_by.starts_with("user:override:") {
+                    let source = triggered_by
+                        .strip_prefix("user:")
+                        .unwrap_or(&triggered_by);
+                    triggered_by = format!("user:override:{source}");
+                }
+                false
+            } else {
+                match transition {
+                    Some(_trigger) => {
+                        if strict_system_only {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                from_state = %current_status,
+                                to_state = %target_state,
+                                workflow_trigger = ?transition,
+                                triggered_by = %triggered_by,
+                                "workflow transition rejected because it is system-only"
+                            );
+                            return Err(ServiceError::InvalidOperation {
+                                message: format!(
+                                    "transition {} -> {} is system-only",
+                                    current_status, target_state
+                                ),
+                            });
+                        }
+                        skip_before_exit
+                    }
+                    None if skip_before_exit && to_state.kind == StateKind::Initial => true,
+                    None if skip_before_exit && current_status == target_state => true,
+                    None if Self::is_cancellation_target(workflow, &target_state)
+                        && from_state.kind != StateKind::Terminal =>
                     {
+                        true
+                    }
+                    None => {
                         tracing::warn!(
                             task_id = %task.id,
                             from_state = %current_status,
                             to_state = %target_state,
-                            workflow_trigger = ?trigger,
+                            from_kind = ?from_state.kind,
+                            to_kind = ?to_state.kind,
                             triggered_by = %triggered_by,
-                            "workflow transition rejected because it is system-only"
+                            reason = %reason,
+                            "workflow transition rejected because no transition is defined"
                         );
-                        return Err(ServiceError::InvalidOperation {
-                            message: format!(
-                                "transition {} -> {} is system-only",
-                                current_status, target_state
-                            ),
-                        });
+                        return Err(ServiceError::Db(db::DbError::InvalidTransition));
                     }
-                    skip_before_exit
-                }
-                None if skip_before_exit && to_state.kind == StateKind::Initial => true,
-                None if skip_before_exit && current_status == target_state => true,
-                None if Self::is_cancellation_target(workflow, &target_state)
-                    && from_state.kind != StateKind::Terminal =>
-                {
-                    true
-                }
-                None => {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        from_state = %current_status,
-                        to_state = %target_state,
-                        from_kind = ?from_state.kind,
-                        to_kind = ?to_state.kind,
-                        triggered_by = %triggered_by,
-                        reason = %reason,
-                        "workflow transition rejected because no transition is defined"
-                    );
-                    return Err(ServiceError::Db(db::DbError::InvalidTransition));
                 }
             };
             tracing::info!(
@@ -1484,6 +1587,18 @@ impl WorkflowEngine {
             })
         }
         .instrument(span))
+    }
+
+    fn undefined_state_message(state_name: &str, workflow: &WorkflowDefinition) -> String {
+        let defined_states = workflow
+            .states
+            .iter()
+            .map(|state| state.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "state '{state_name}' is not defined in workflow; defined states are: {defined_states}"
+        )
     }
 
     fn find_state<'a>(workflow: &'a WorkflowDefinition, name: &str) -> Option<&'a StateDefinition> {
