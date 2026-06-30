@@ -8,8 +8,7 @@ async fn user_subtask_in_progress_to_review_succeeds() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let subtask =
-        seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
+    let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
     let result = service
         .transition(
@@ -71,8 +70,7 @@ async fn system_subtask_transition_still_uses_subtask_workflow() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let subtask =
-        seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
+    let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
     let result = service
         .transition(
@@ -95,9 +93,7 @@ async fn system_subtask_transition_still_uses_subtask_workflow() {
                 "system subtask transition should use subtask workflow without review: {message}"
             );
         }
-        other => panic!(
-            "system subtask in_progress -> review should be rejected, got {other:?}"
-        ),
+        other => panic!("system subtask in_progress -> review should be rejected, got {other:?}"),
     }
 }
 
@@ -258,8 +254,7 @@ async fn subtask_in_project_only_state_cannot_be_deleted() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let subtask =
-        seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
+    let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
     let routed = service
         .transition(

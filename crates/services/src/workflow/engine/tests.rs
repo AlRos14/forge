@@ -1778,7 +1778,10 @@ async fn user_override_does_not_reopen_terminal_state() {
         .await;
 
     assert!(
-        matches!(result, Err(ServiceError::Db(db::DbError::InvalidTransition))),
+        matches!(
+            result,
+            Err(ServiceError::Db(db::DbError::InvalidTransition))
+        ),
         "user override must not reopen a terminal state"
     );
 }
@@ -1871,7 +1874,10 @@ async fn override_not_granted_to_agents_or_system() {
             )
             .await;
         assert!(
-            matches!(result, Err(ServiceError::Db(db::DbError::InvalidTransition))),
+            matches!(
+                result,
+                Err(ServiceError::Db(db::DbError::InvalidTransition))
+            ),
             "{label} actor should be rejected on missing edge without override"
         );
     }
@@ -2078,17 +2084,9 @@ async fn override_is_auditable() {
     let reason = "audit this override";
     let eng = engine(Arc::clone(&db), event_bus);
 
-    eng.transition(
-        &task_id,
-        "done",
-        1,
-        &workflow,
-        "user:test",
-        reason,
-        false,
-    )
-    .await
-    .expect("override transition succeeds");
+    eng.transition(&task_id, "done", 1, &workflow, "user:test", reason, false)
+        .await
+        .expect("override transition succeeds");
 
     let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
         .await
@@ -2272,21 +2270,10 @@ async fn user_override_transition_rejects_non_user_actor() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let system_result = eng
-        .user_override_transition(
-            &task_id,
-            "done",
-            1,
-            &workflow,
-            "system",
-            "override",
-            false,
-        )
+        .user_override_transition(&task_id, "done", 1, &workflow, "system", "override", false)
         .await;
     assert!(
-        matches!(
-            system_result,
-            Err(ServiceError::InvalidOperation { .. })
-        ),
+        matches!(system_result, Err(ServiceError::InvalidOperation { .. })),
         "system actor must be rejected by user_override_transition"
     );
 
