@@ -1,0 +1,639 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use anyhow::Result;
+use api_types::{
+    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
+    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
+    FsListParams, RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
+    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
+    METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
+    METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
+};
+use executors::{
+    AdapterExecutor, ExecutionContext, ExecutionOutcome, ExecutionResult, LogEntry, TaskExecutor,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
+use tokio::{
+    sync::{mpsc, watch},
+    time,
+};
+
+use crate::{
+    daemon_fs,
+    daemon_link::{
+        run_with_reconnect, DaemonClient, DaemonCommandStream, DAEMON_HEARTBEAT_INTERVAL_SECS,
+    },
+};
+
+const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
+const EXECUTION_ERROR: &str = "execution_error";
+
+type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
+
+pub async fn run_command_stream(
+    client: Arc<DaemonClient>,
+    workspace_root: PathBuf,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let workspace_root = Arc::new(workspace_root);
+    run_with_reconnect(client, move |stream| {
+        let workspace_root = Arc::clone(&workspace_root);
+        let shutdown = shutdown.clone();
+        async move { dispatch_loop(stream, workspace_root, shutdown).await }
+    })
+    .await
+}
+
+async fn dispatch_loop(
+    mut stream: DaemonCommandStream,
+    workspace_root: Arc<PathBuf>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let (responses_tx, mut responses_rx) = mpsc::unbounded_channel::<DaemonFrame>();
+    let runtime = DaemonRuntime::new(responses_tx.clone(), workspace_root.as_ref().clone());
+    let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
+    heartbeat.tick().await;
+    let mut heartbeat_seq = 0_u64;
+
+    loop {
+        tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    tracing::info!("daemon command stream shutdown requested");
+                    stream.close().await?;
+                    return Ok(());
+                }
+            }
+            frame = stream.recv() => {
+                match frame {
+                    Ok(frame @ DaemonFrame::Request { .. }) => {
+                        let responses_tx = responses_tx.clone();
+                        let runtime = Arc::clone(&runtime);
+                        tokio::spawn(async move {
+                            let response = runtime.handle_request(frame).await;
+                            if responses_tx.send(response).is_err() {
+                                tracing::warn!("daemon command response dropped because stream loop ended");
+                            }
+                        });
+                    }
+                    Ok(DaemonFrame::Heartbeat { seq }) => {
+                        tracing::trace!(seq, "daemon command heartbeat received");
+                    }
+                    Ok(DaemonFrame::Notification { method, .. }) => {
+                        tracing::warn!(%method, "unexpected daemon command notification received");
+                    }
+                    Ok(DaemonFrame::Response { id, .. }) => {
+                        tracing::warn!(%id, "unexpected daemon command response received");
+                    }
+                    Ok(DaemonFrame::Error { id, error }) => {
+                        tracing::warn!(
+                            id = ?id,
+                            code = %error.code,
+                            message = %error.message,
+                            "unexpected daemon command error received"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "daemon command stream receive failed");
+                        return Err(error);
+                    }
+                }
+            }
+            Some(response) = responses_rx.recv() => {
+                stream.send(&response).await?;
+            }
+            _ = heartbeat.tick() => {
+                heartbeat_seq = heartbeat_seq.saturating_add(1);
+                stream.send_heartbeat(heartbeat_seq).await?;
+            }
+        }
+    }
+}
+
+pub struct DaemonRuntime {
+    workspace_root: PathBuf,
+    outbound: mpsc::UnboundedSender<DaemonFrame>,
+    executor: Arc<AdapterExecutor>,
+}
+
+impl DaemonRuntime {
+    pub fn new(outbound: mpsc::UnboundedSender<DaemonFrame>, workspace_root: PathBuf) -> Arc<Self> {
+        let registry = Arc::new(cli_adapters::default_registry());
+        Arc::new(Self {
+            workspace_root,
+            outbound,
+            executor: Arc::new(AdapterExecutor::new(registry)),
+        })
+    }
+
+    pub async fn handle_request(self: &Arc<Self>, frame: DaemonFrame) -> DaemonFrame {
+        let DaemonFrame::Request { id, method, params } = frame else {
+            return error_frame(
+                None,
+                INVALID_FRAME,
+                "daemon command handler expected a request frame",
+                None,
+            );
+        };
+
+        match method.as_str() {
+            METHOD_FS_LIST => match decode_params::<FsListParams>(&id, params) {
+                Ok(params) => match daemon_fs::list_entries(params, &self.workspace_root).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            METHOD_FS_BRANCHES => match decode_params::<FsBranchesParams>(&id, params) {
+                Ok(params) => match daemon_fs::list_branches(params, &self.workspace_root).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            METHOD_EXECUTION_START => match decode_params::<ExecutionStartParams>(&id, params) {
+                Ok(params) => match self.start(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            METHOD_EXECUTION_CANCEL => match decode_params::<ExecutionCancelParams>(&id, params) {
+                Ok(params) => match self.cancel(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                Err(frame) => frame,
+            },
+            METHOD_TERMINAL_START
+            | METHOD_TERMINAL_INPUT
+            | METHOD_TERMINAL_RESIZE
+            | METHOD_TERMINAL_TERMINATE => terminal_unavailable_frame(id),
+            _ => error_frame(
+                Some(id),
+                UNSUPPORTED_METHOD,
+                format!("unsupported daemon command method: {method}"),
+                None,
+            ),
+        }
+    }
+
+    pub async fn start(
+        self: &Arc<Self>,
+        params: ExecutionStartParams,
+    ) -> CommandResult<ExecutionStartResult> {
+        let worktree_path = daemon_fs::validate_within_root(
+            Path::new(params.workspace_path.trim()),
+            &self.workspace_root,
+        )?;
+        let logs_path = local_execution_log_path(&self.workspace_root, &params.execution_id);
+        let description = prompt_description(&params.prompt);
+        let ctx = ExecutionContext {
+            task_id: params.task_id.clone(),
+            execution_id: params.execution_id.clone(),
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            description,
+            agent_config: params.executor_config,
+            logs_path: logs_path.to_string_lossy().into_owned(),
+            heartbeat_interval_seconds: 30,
+            max_turns: params.max_turns,
+            log_sender: None,
+        };
+
+        let execution_id = params.execution_id.clone();
+        let executor = Arc::clone(&self.executor);
+        let outbound = self.outbound.clone();
+        tokio::spawn(async move {
+            run_execution_task(executor, outbound, ctx).await;
+        });
+
+        Ok(ExecutionStartResult {
+            execution_id,
+            accepted: true,
+        })
+    }
+
+    pub async fn cancel(
+        &self,
+        params: ExecutionCancelParams,
+    ) -> CommandResult<ExecutionCancelResult> {
+        self.executor
+            .cancel(&params.execution_id)
+            .await
+            .map_err(|error| execution_error(format!("failed to cancel execution: {error}")))?;
+        Ok(ExecutionCancelResult {
+            execution_id: params.execution_id,
+            cancelled: true,
+        })
+    }
+}
+
+async fn run_execution_task(
+    executor: Arc<AdapterExecutor>,
+    outbound: mpsc::UnboundedSender<DaemonFrame>,
+    mut ctx: ExecutionContext,
+) {
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
+    ctx.log_sender = Some(log_tx);
+    let log_outbound = outbound.clone();
+    let mut log_forwarder = tokio::spawn(async move {
+        while let Some(entry) = log_rx.recv().await {
+            emit_execution_log(&log_outbound, entry);
+        }
+    });
+
+    emit_execution_log(
+        &outbound,
+        daemon_system_log(&ctx.execution_id, "remote daemon execution started"),
+    );
+
+    let execution_id = ctx.execution_id.clone();
+    let result = executor.execute(ctx).await;
+    // The executor owns the only log sender in ctx, so completion should close the
+    // channel and let the forwarder drain. If an executor holds a sender clone or
+    // emits a very large trailing burst, the timeout favors terminal notification
+    // over complete best-effort log delivery.
+    if tokio::time::timeout(Duration::from_secs(2), &mut log_forwarder)
+        .await
+        .is_err()
+    {
+        log_forwarder.abort();
+        let _ = log_forwarder.await;
+    }
+
+    let notification = match result {
+        Ok(result) => terminal_notification_from_result(execution_id, result),
+        Err(error) => ExecutionTerminalNotification {
+            execution_id,
+            exit_code: Some(1),
+            signal: None,
+            error: Some(error.to_string()),
+            ts: rfc3339_now(),
+            status: Some("failed".to_owned()),
+            agent_session_id: None,
+            summary: None,
+            after_sha: None,
+            usage: None,
+        },
+    };
+    emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification);
+}
+
+fn terminal_notification_from_result(
+    execution_id: String,
+    result: ExecutionResult,
+) -> ExecutionTerminalNotification {
+    let (status, exit_code, signal, error) = match result.status {
+        ExecutionOutcome::Completed => ("completed", Some(0), None, None),
+        ExecutionOutcome::Failed => ("failed", Some(1), None, result.error),
+        ExecutionOutcome::Cancelled => ("cancelled", None, Some("cancelled".to_owned()), None),
+    };
+    ExecutionTerminalNotification {
+        execution_id,
+        exit_code,
+        signal,
+        error,
+        ts: rfc3339_now(),
+        status: Some(status.to_owned()),
+        agent_session_id: result.agent_session_id,
+        summary: result.summary,
+        after_sha: result.after_sha,
+        usage: result.usage.map(|usage| RemoteTokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            cost_usd: usage.cost_usd,
+            model: usage.model,
+        }),
+    }
+}
+
+fn daemon_system_log(execution_id: &str, line: &str) -> LogEntry {
+    LogEntry {
+        schema_version: 1,
+        sequence: 0,
+        timestamp: rfc3339_now(),
+        execution_id: execution_id.to_owned(),
+        kind: executors::LogKind::System,
+        stream: executors::LogStream::Main,
+        payload: serde_json::json!({ "line": line }),
+        truncated: false,
+    }
+}
+
+fn emit_execution_log(outbound: &mpsc::UnboundedSender<DaemonFrame>, entry: LogEntry) {
+    let line = entry
+        .payload
+        .get("line")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| entry.payload.to_string());
+    let stream = match entry.kind {
+        executors::LogKind::Stderr => "stderr",
+        _ => "stdout",
+    };
+    let notification = api_types::ExecutionLogNotification {
+        execution_id: entry.execution_id.clone(),
+        seq: entry.sequence,
+        stream: stream.to_owned(),
+        line,
+        ts: entry.timestamp.clone(),
+        kind: Some(entry.kind.to_string()),
+        log_stream: Some(
+            match entry.stream {
+                executors::LogStream::Heartbeat => "heartbeat",
+                executors::LogStream::Main => "main",
+            }
+            .to_owned(),
+        ),
+        payload: Some(entry.payload),
+        truncated: Some(entry.truncated),
+    };
+    emit_notification(outbound, METHOD_EXECUTION_LOG, notification);
+}
+
+fn emit_notification<T: Serialize>(
+    outbound: &mpsc::UnboundedSender<DaemonFrame>,
+    method: &str,
+    notification: T,
+) {
+    match serde_json::to_value(notification) {
+        Ok(params) => {
+            let _ = outbound.send(DaemonFrame::Notification {
+                method: method.to_owned(),
+                params,
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%error, method, "failed to serialize daemon notification");
+        }
+    }
+}
+
+fn terminal_unavailable_frame(id: String) -> DaemonFrame {
+    error_frame(
+        Some(id),
+        TERMINAL_UNAVAILABLE,
+        "terminal support is not available in this daemon command context",
+        None,
+    )
+}
+
+fn local_execution_log_path(workspace_root: &Path, execution_id: &str) -> PathBuf {
+    workspace_root
+        .join(".forge-daemon")
+        .join("execution-logs")
+        .join(format!("{}.jsonl", safe_path_component(execution_id)))
+}
+
+fn safe_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn prompt_description(prompt: &Value) -> String {
+    prompt
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| prompt.to_string())
+}
+
+fn execution_error(message: impl Into<String>) -> DaemonErrorPayload {
+    DaemonErrorPayload {
+        code: EXECUTION_ERROR.to_owned(),
+        message: message.into(),
+        details: None,
+    }
+}
+
+fn decode_params<T: DeserializeOwned>(
+    id: &str,
+    params: serde_json::Value,
+) -> std::result::Result<T, DaemonFrame> {
+    serde_json::from_value(params).map_err(|error| {
+        error_frame(
+            Some(id.to_owned()),
+            INVALID_FRAME,
+            format!("invalid daemon command params: {error}"),
+            None,
+        )
+    })
+}
+
+fn response_frame<T: Serialize>(id: String, result: T) -> DaemonFrame {
+    match serde_json::to_value(result) {
+        Ok(result) => DaemonFrame::Response { id, result },
+        Err(error) => error_frame(
+            Some(id),
+            INVALID_FRAME,
+            format!("failed to serialize daemon command result: {error}"),
+            None,
+        ),
+    }
+}
+
+fn error_frame(
+    id: Option<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> DaemonFrame {
+    DaemonFrame::Error {
+        id,
+        error: DaemonErrorPayload {
+            code: code.into(),
+            message: message.into(),
+            details,
+        },
+    }
+}
+
+fn rfc3339_now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use api_types::{
+        ExecutionLogNotification, FsListResult, METHOD_EXECUTION_LOG, METHOD_EXECUTION_TERMINAL,
+        METHOD_FS_LIST,
+    };
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn fs_list_returns_entries_under_workspace_root() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        fs::create_dir_all(dir.path().join("src")).expect("src creates");
+        fs::write(dir.path().join("README.md"), "readme").expect("readme writes");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+
+        let frame = DaemonFrame::Request {
+            id: "fs-1".to_owned(),
+            method: METHOD_FS_LIST.to_owned(),
+            params: serde_json::json!({ "path": "." }),
+        };
+        let response = runtime.handle_request(frame).await;
+
+        let DaemonFrame::Response { result, .. } = response else {
+            panic!("expected response");
+        };
+        let result: FsListResult = serde_json::from_value(result).expect("fs result parses");
+        let names = result
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["src", "README.md"]);
+    }
+
+    #[tokio::test]
+    async fn shell_execution_reports_completion_notification() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let execution_id = "exec-shell-ok".to_owned();
+
+        let result = runtime
+            .start(ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: execution_id.clone(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "shell".to_owned(),
+                executor_config: serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {}
+                }),
+                prompt: serde_json::json!({ "description": "printf ok > marker.txt" }),
+                max_turns: None,
+            })
+            .await
+            .expect("execution starts");
+        assert!(result.accepted);
+
+        let notification = next_terminal_notification(&mut rx, &execution_id).await;
+        assert_eq!(notification.status.as_deref(), Some("completed"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("marker.txt")).expect("marker exists"),
+            "ok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_execution_can_be_cancelled() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let execution_id = "exec-shell-cancel".to_owned();
+
+        runtime
+            .start(ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: execution_id.clone(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "shell".to_owned(),
+                executor_config: serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {}
+                }),
+                prompt: serde_json::json!({ "description": "printf 'started\\n'; sleep 30" }),
+                max_turns: None,
+            })
+            .await
+            .expect("execution starts");
+        next_execution_log_line(&mut rx, &execution_id, "started").await;
+        runtime
+            .cancel(ExecutionCancelParams {
+                execution_id: execution_id.clone(),
+                reason: Some("test".to_owned()),
+            })
+            .await
+            .expect("execution cancels");
+
+        let notification = next_terminal_notification(&mut rx, &execution_id).await;
+        assert_eq!(notification.status.as_deref(), Some("cancelled"));
+    }
+
+    async fn next_execution_log_line(
+        rx: &mut mpsc::UnboundedReceiver<DaemonFrame>,
+        execution_id: &str,
+        expected_line: &str,
+    ) -> ExecutionLogNotification {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("execution log arrives")
+                .expect("runtime keeps sender open");
+            let DaemonFrame::Notification { method, params } = frame else {
+                continue;
+            };
+            if method != METHOD_EXECUTION_LOG {
+                continue;
+            }
+            let notification: ExecutionLogNotification =
+                serde_json::from_value(params).expect("execution log parses");
+            if notification.execution_id == execution_id && notification.line == expected_line {
+                return notification;
+            }
+        }
+    }
+
+    async fn next_terminal_notification(
+        rx: &mut mpsc::UnboundedReceiver<DaemonFrame>,
+        execution_id: &str,
+    ) -> ExecutionTerminalNotification {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("terminal notification arrives")
+                .expect("runtime keeps sender open");
+            let DaemonFrame::Notification { method, params } = frame else {
+                continue;
+            };
+            if method != METHOD_EXECUTION_TERMINAL {
+                continue;
+            }
+            let notification: ExecutionTerminalNotification =
+                serde_json::from_value(params).expect("terminal notification parses");
+            if notification.execution_id == execution_id {
+                return notification;
+            }
+        }
+    }
+}

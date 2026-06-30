@@ -1,7 +1,7 @@
 use super::super::*;
 
 #[tokio::test]
-async fn batch_5_4_subtask_management_rejects_manual_child_transition() {
+async fn batch_5_4_subtask_management_allows_manual_child_transition() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -23,16 +23,17 @@ async fn batch_5_4_subtask_management_rejects_manual_child_transition() {
         )
         .await;
 
-    match result {
-        Err(ServiceError::SubtaskManagedByRoot {
-            task_id,
-            root_task_id,
-        }) => {
-            assert_eq!(task_id, child.id);
-            assert_eq!(root_task_id, root.id);
-        }
-        other => panic!("expected SubtaskManagedByRoot, got {other:?}"),
-    }
+    let result = result.expect("user can manage child subtask status");
+
+    assert_eq!(result.task.id, child.id);
+    assert_eq!(
+        result.task.parent_task_id.as_deref(),
+        Some(root.id.as_str())
+    );
+    assert_eq!(
+        result.task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
 }
 
 #[tokio::test]

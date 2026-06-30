@@ -3,15 +3,21 @@ use crate::workflow::{
     default_roles,
     dispatch::{
         default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_PLANNER_DEFAULT_V1,
+        BUILDER_ID_PLANNER_DEFAULT_V2, MANAGED_EXECUTION_CONTRACT,
     },
 };
 
 pub struct PlannerPromptBuilder;
 
+const PLANNER_ROLE_BOUNDARY: &str = "\
+Planner boundary:
+- Must investigate enough to produce an executable plan with risks, tests, and acceptance criteria.
+- Must not modify code or mark implementation items done; leave implementation work unchecked unless already complete.
+- Red flags: code edits, completed implementation checkboxes, plans without verification steps.";
+
 impl PromptBuilder for PlannerPromptBuilder {
     fn id(&self) -> &'static str {
-        BUILDER_ID_PLANNER_DEFAULT_V1
+        BUILDER_ID_PLANNER_DEFAULT_V2
     }
 
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt {
@@ -47,7 +53,9 @@ impl PromptBuilder for PlannerPromptBuilder {
         user.push('\n');
 
         AgentPrompt {
-            system: "You are the planner for this Forge workflow task. Your job is to investigate the codebase, design an approach, and produce a concrete implementation plan with clear verification steps. You do not implement the code — the coder agent will receive your plan and execute it. Leave implementation work unchecked unless it is already complete.".to_string(),
+            system: format!(
+                "You are the planner for this Forge workflow task. Your job is to investigate the codebase, design an approach, and produce a concrete implementation plan with clear verification steps. You do not implement the code; the coder agent will receive your plan and execute it.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{PLANNER_ROLE_BOUNDARY}"
+            ),
             user,
             tools: default_tool_names(default_roles::PLANNER),
         }

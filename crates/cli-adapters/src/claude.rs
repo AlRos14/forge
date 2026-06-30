@@ -18,7 +18,8 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CLAUDE_VERSION: &str = "2.1.112";
+const DEFAULT_CLAUDE_VERSION: &str = "2.1.150";
+const DEFAULT_CLAUDE_ROUTER_VERSION: &str = "2.0.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const PROMPT_SEND_TIMEOUT_SECONDS: u64 = 10;
 const FIRST_OUTPUT_TIMEOUT_SECONDS: u64 = 300;
@@ -122,7 +123,7 @@ impl ClaudeCodeAdapter {
         let mut default_args = vec![
             "-y".to_owned(),
             if config.claude_code_router.unwrap_or(false) {
-                "@musistudio/claude-code-router@1.0.66".to_owned()
+                format!("@musistudio/claude-code-router@{DEFAULT_CLAUDE_ROUTER_VERSION}")
             } else {
                 format!("@anthropic-ai/claude-code@{DEFAULT_CLAUDE_VERSION}")
             },
@@ -915,7 +916,7 @@ mod tests {
             args,
             vec![
                 "-y",
-                "@anthropic-ai/claude-code@2.1.112",
+                "@anthropic-ai/claude-code@2.1.150",
                 "-p",
                 "--verbose",
                 "--output-format=stream-json",
@@ -948,7 +949,7 @@ mod tests {
 
         assert!(args.starts_with(&[
             "-y".to_owned(),
-            "@musistudio/claude-code-router@1.0.66".to_owned(),
+            "@musistudio/claude-code-router@2.0.0".to_owned(),
             "code".to_owned(),
             "-p".to_owned(),
         ]));

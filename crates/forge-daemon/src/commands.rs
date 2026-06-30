@@ -1,53 +1,26 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 use api_types::{
-    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
-    ExecutionStartParams, ExecutionStartResult, FsBranchesParams, FsBranchesResult, FsEntry,
-    FsListParams, FsListResult, TerminalInputParams, TerminalResizeParams, TerminalStartParams,
+    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionStartParams, FsBranchesParams,
+    FsListParams, TerminalInputParams, TerminalResizeParams, TerminalStartParams,
     TerminalTerminateParams, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START,
     METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
-    METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, PATH_GUARDRAIL, UNSUPPORTED_METHOD,
+    METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 
-const SKIP_NAMES: &[&str] = &[
-    ".Trashes",
-    ".Spotlight-V100",
-    ".fseventsd",
-    ".DS_Store",
-    "Library",
-    "$RECYCLE.BIN",
-    "System Volume Information",
-    "AppData",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".cache",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".git",
-];
-
-type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
-
 #[allow(dead_code)]
 pub async fn handle_request(frame: DaemonFrame, workspace_root: &Path) -> DaemonFrame {
-    handle_request_with_terminal(frame, workspace_root, None).await
+    handle_request_with_terminal(frame, workspace_root, None, None).await
 }
 
 pub async fn handle_request_with_terminal(
     frame: DaemonFrame,
     workspace_root: &Path,
     terminal: Option<&Arc<crate::terminal::TerminalRuntime>>,
+    daemon_runtime: Option<&Arc<forge_client::daemon_runtime::DaemonRuntime>>,
 ) -> DaemonFrame {
     let DaemonFrame::Request { id, method, params } = frame else {
         return error_frame(
@@ -112,7 +85,8 @@ pub async fn handle_request_with_terminal(
             None => terminal_unavailable_frame(id),
         },
         METHOD_FS_LIST => match decode_params::<FsListParams>(&id, params) {
-            Ok(params) => match list_entries(params, workspace_root).await {
+            Ok(params) => match forge_client::daemon_fs::list_entries(params, workspace_root).await
+            {
                 Ok(result) => response_frame(id, result),
                 Err(error) => DaemonFrame::Error {
                     id: Some(id),
@@ -122,49 +96,51 @@ pub async fn handle_request_with_terminal(
             Err(frame) => frame,
         },
         METHOD_FS_BRANCHES => match decode_params::<FsBranchesParams>(&id, params) {
-            Ok(params) => match list_branches(params, workspace_root).await {
-                Ok(result) => response_frame(id, result),
-                Err(error) => DaemonFrame::Error {
-                    id: Some(id),
-                    error,
-                },
-            },
+            Ok(params) => {
+                match forge_client::daemon_fs::list_branches(params, workspace_root).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                }
+            }
             Err(frame) => frame,
         },
         METHOD_EXECUTION_START => match decode_params::<ExecutionStartParams>(&id, params) {
-            Ok(params) => {
-                tracing::warn!(
-                    execution_id = %params.execution_id,
-                    "execution.start is not implemented by forge-daemon yet"
-                );
-                let result = ExecutionStartResult {
-                    execution_id: params.execution_id,
-                    accepted: false,
-                };
-                unsupported_with_result(
-                    id,
-                    "execution.start is not supported by this daemon version",
-                    &result,
-                )
-            }
+            Ok(params) => match daemon_runtime {
+                Some(runtime) => match runtime.start(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                None => error_frame(
+                    Some(id),
+                    UNSUPPORTED_METHOD,
+                    "execution.start is not available in this daemon command context",
+                    None,
+                ),
+            },
             Err(frame) => frame,
         },
         METHOD_EXECUTION_CANCEL => match decode_params::<ExecutionCancelParams>(&id, params) {
-            Ok(params) => {
-                tracing::warn!(
-                    execution_id = %params.execution_id,
-                    "execution.cancel is not implemented by forge-daemon yet"
-                );
-                let result = ExecutionCancelResult {
-                    execution_id: params.execution_id,
-                    cancelled: false,
-                };
-                unsupported_with_result(
-                    id,
-                    "execution.cancel is not supported by this daemon version",
-                    &result,
-                )
-            }
+            Ok(params) => match daemon_runtime {
+                Some(runtime) => match runtime.cancel(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                None => error_frame(
+                    Some(id),
+                    UNSUPPORTED_METHOD,
+                    "execution.cancel is not available in this daemon command context",
+                    None,
+                ),
+            },
             Err(frame) => frame,
         },
         _ => error_frame(
@@ -183,156 +159,6 @@ fn terminal_unavailable_frame(id: String) -> DaemonFrame {
         "terminal support is not available in this daemon command context",
         None,
     )
-}
-
-async fn list_entries(params: FsListParams, workspace_root: &Path) -> CommandResult<FsListResult> {
-    let path = validate_within_root(Path::new(params.path.trim()), workspace_root)?;
-    let mut entries = Vec::new();
-
-    for entry in fs::read_dir(&path).map_err(|error| {
-        path_guardrail_error(format!("read directory {}: {error}", path.display()))
-    })? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to read directory entry");
-                continue;
-            }
-        };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if SKIP_NAMES.contains(&name.as_str()) {
-            continue;
-        }
-
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                tracing::warn!(error = %error, path = %entry.path().display(), "failed to read file type");
-                continue;
-            }
-        };
-
-        let entry_path = entry.path();
-        let is_dir = file_type.is_dir();
-        entries.push(FsEntry {
-            name,
-            path: canonical_or_absolute(&entry_path)
-                .to_string_lossy()
-                .into_owned(),
-            is_dir,
-            is_git_repo: is_dir && git::is_git_repo(&entry_path).await,
-        });
-    }
-
-    entries.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-            .then_with(|| left.name.cmp(&right.name))
-    });
-
-    Ok(FsListResult {
-        path: path.to_string_lossy().into_owned(),
-        entries,
-    })
-}
-
-async fn list_branches(
-    params: FsBranchesParams,
-    workspace_root: &Path,
-) -> CommandResult<FsBranchesResult> {
-    let path = validate_within_root(Path::new(params.path.trim()), workspace_root)?;
-    if !git::is_git_repo(&path).await {
-        return Err(path_guardrail_error("path is not a git repository"));
-    }
-
-    let branches = git::list_branches(&path).await.map_err(|error| {
-        path_guardrail_error(format!(
-            "failed to list branches for {}: {error}",
-            path.display()
-        ))
-    })?;
-
-    Ok(FsBranchesResult {
-        branches: branches.branches,
-        default_branch: branches.default_branch,
-        origin_url: branches.origin_url,
-    })
-}
-
-fn validate_within_root(requested: &Path, root: &Path) -> CommandResult<PathBuf> {
-    let resolved = resolve_requested_path(requested, root)?;
-    let canonical = resolved.canonicalize().map_err(|error| {
-        path_guardrail_error(format!(
-            "failed to resolve path '{}': {error}",
-            requested.display()
-        ))
-    })?;
-    let canonical_root = root.canonicalize().map_err(|error| {
-        path_guardrail_error(format!(
-            "failed to resolve daemon workspace root '{}': {error}",
-            root.display()
-        ))
-    })?;
-
-    if !canonical.starts_with(&canonical_root) {
-        return Err(path_escape_error(requested));
-    }
-
-    Ok(canonical)
-}
-
-fn resolve_requested_path(requested: &Path, root: &Path) -> CommandResult<PathBuf> {
-    let requested_text = requested.to_string_lossy();
-    if requested_text == "~" {
-        return home_dir();
-    }
-
-    if let Some(remainder) = requested_text.strip_prefix("~/") {
-        return Ok(home_dir()?.join(remainder));
-    }
-
-    if let Some(remainder) = requested_text.strip_prefix("~\\") {
-        return Ok(home_dir()?.join(remainder));
-    }
-
-    if requested_text.starts_with('~') {
-        return Err(path_guardrail_error("only ~ or ~/... paths are supported"));
-    }
-
-    if requested.is_absolute() {
-        Ok(requested.to_path_buf())
-    } else {
-        Ok(root.join(requested))
-    }
-}
-
-fn home_dir() -> CommandResult<PathBuf> {
-    dirs::home_dir().ok_or_else(|| path_guardrail_error("failed to resolve home directory"))
-}
-
-fn path_escape_error(requested: &Path) -> DaemonErrorPayload {
-    path_guardrail_error(format!(
-        "path '{}' escapes the daemon's workspace root",
-        requested.display()
-    ))
-}
-
-fn path_guardrail_error(message: impl Into<String>) -> DaemonErrorPayload {
-    DaemonErrorPayload {
-        code: PATH_GUARDRAIL.to_owned(),
-        message: message.into(),
-        details: None,
-    }
-}
-
-fn canonical_or_absolute(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn decode_params<T: DeserializeOwned>(
@@ -359,11 +185,6 @@ fn response_frame<T: Serialize>(id: String, result: T) -> DaemonFrame {
             None,
         ),
     }
-}
-
-fn unsupported_with_result<T: Serialize>(id: String, message: &str, result: &T) -> DaemonFrame {
-    let details = serde_json::to_value(result).ok();
-    error_frame(Some(id), UNSUPPORTED_METHOD, message, details)
 }
 
 fn error_frame(

@@ -42,6 +42,7 @@ jobs:
   web:
     name: Web
     runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.59.1-noble
     defaults:
       run:
         working-directory: web
@@ -78,9 +79,6 @@ jobs:
 
       - name: Build
         run: pnpm build
-
-      - name: Install Playwright browsers
-        run: pnpm exec playwright install --with-deps chromium
 
       - name: Playwright smoke
         run: pnpm run e2e

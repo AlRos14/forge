@@ -1,13 +1,14 @@
 # forge-ctl
 
 `forge-ctl` is the CLI client for the Forge REST API. The server must be
-running first. By default, `forge-ctl` reads the server URL persisted by the
-last `forge` launch under the Forge data directory.
+running first. By default, `forge-ctl` uses the server from the stored CLI
+login, then falls back to the server URL persisted by the last `forge` launch
+under the Forge data directory.
 
 ## Global flags
 
 ```text
---server <URL>            Forge server URL  (default: persisted local server)
+--server <URL>            Forge server URL  (default: stored login, then local server)
 --output <FORMAT>         table | json      (default: table)
 ```
 
@@ -20,9 +21,9 @@ last `forge` launch under the Forge data directory.
 | `whoami`  | Show stored CLI login state |
 | `project` | Create / list / show projects |
 | `repo`    | Add / list repos under a project |
-| `task`    | Create, list, show, transition, cancel, archive tasks |
+| `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
 | `agent`   | Register / list / show agents |
-| `daemon`  | List daemons, **link** an external daemon to a server |
+| `daemon`  | Link, start, and report an external daemon |
 | `run`     | Create + claim a task and follow the SSE stream until terminal state |
 | `mcp`     | Helpers for the MCP JSON-RPC endpoint |
 
@@ -71,14 +72,20 @@ forge-ctl agent register --name "Claude" --executor-type shell
 
 forge-ctl task list --project-id <ID>
 forge-ctl task show <TASK_ID>
+forge-ctl task prompt-preview <TASK_ID> --role coder
 forge-ctl task cancel <TASK_ID>
 ```
+
+`task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
+to preview the prompt for a transition target instead of the task's current
+state.
 
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge
-server, saves daemon credentials, reports installed CLI inventory, and keeps
-sending heartbeats. In the web UI: **Daemons → Link daemon** generates the
+server, saves daemon credentials, reports installed CLI inventory, keeps
+sending heartbeats, and serves filesystem and execution commands over the
+daemon command stream. In the web UI: **Daemons → Link daemon** generates the
 token and prints the full command:
 
 ```bash
@@ -89,7 +96,32 @@ forge-ctl daemon link \
 
 The token is used only for initial ownership; the daemon receives and stores
 its own registration token afterward. Add `--once` for a one-shot
-registration/report.
+registration/report that does not keep the command stream open.
+The configured workspace root is created automatically before the daemon
+registers or reports.
+
+After a daemon has been linked once, use `forge-ctl daemon start` to run it
+again from the saved daemon credentials without registering or claiming it
+again:
+
+```bash
+forge-ctl daemon start \
+  --workspace-root "$HOME/.forge/workspaces"
+```
+
+`daemon start` keeps the same heartbeat and command stream open as `daemon
+link`. Use `daemon report` only for a one-shot status update; it does not keep
+the command stream open.
+Forge marks the daemon offline when that command stream disconnects, and uses
+stream heartbeats to keep the daemon's last-seen timestamp fresh while it is
+connected. When the Forge server starts, external daemons are considered
+offline until their command stream reconnects.
+
+Execution dispatch requires the task worktree path created by the server to
+exist at the same absolute path on the daemon host. Use a local daemon or mount
+the server workspace root into the daemon host/container at the same path. A
+daemon on an unrelated filesystem can browse its own `--workspace-root`, but it
+cannot run server-created task worktrees yet.
 
 ### Installing MCP client config
 

@@ -103,6 +103,7 @@ fn default_agent_name(kind: &ExecutorKind) -> String {
         ExecutorKind::Shell => "Shell",
         ExecutorKind::Codex => "Codex",
         ExecutorKind::ClaudeCode => "Claude Code",
+        ExecutorKind::Cursor => "Cursor",
         ExecutorKind::Opencode => "OpenCode",
         ExecutorKind::Gemini => "Gemini",
         ExecutorKind::Null => "Null",

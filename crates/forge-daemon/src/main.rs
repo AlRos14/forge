@@ -7,6 +7,7 @@ mod terminal;
 
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -59,8 +60,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
 
-    let workspace_root = absolute_path(&cli.workspace_root)
-        .with_context(|| format!("resolve workspace root {}", cli.workspace_root.display()))?;
+    let workspace_root = prepare_workspace_root(&cli.workspace_root)?;
     let labels = parse_labels(&cli.label)?;
     let hostname = cli
         .hostname
@@ -287,6 +287,14 @@ fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+fn prepare_workspace_root(path: &Path) -> Result<PathBuf> {
+    let workspace_root = absolute_path(path)
+        .with_context(|| format!("resolve workspace root {}", path.display()))?;
+    fs::create_dir_all(&workspace_root)
+        .with_context(|| format!("create workspace root {}", workspace_root.display()))?;
+    Ok(workspace_root)
 }
 
 fn local_hostname() -> String {

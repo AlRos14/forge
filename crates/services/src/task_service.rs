@@ -1,6 +1,7 @@
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     lifecycle::{LifecycleHookContext, LifecycleHookRun, LifecycleHookRunner},
+    memory::MemoryService,
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
     workflow::{default_states, engine::WorkflowEngine},
@@ -15,11 +16,11 @@ use cli_adapters::codex::protocol::RESUME_THREAD_ID_CONFIG_KEY;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
     CommentAuthorType, CreateExecution, CreateTask, CreateTaskComment, CreateTaskRoleAssignment,
-    CreateWorkspace, DbError, Execution, ExecutionRepo, ExecutionStatus, PageRequest, ProjectRepo,
-    RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task,
-    TaskCommentRepo, TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment,
-    TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo, Workspace, WorkspaceRepo,
-    WorkspaceStatus,
+    CreateWorkspace, DbError, Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo,
+    PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy,
+    SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata,
+    TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
+    UpsertExecutionUsage, Workspace, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -106,6 +107,7 @@ pub struct TaskService {
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     workspace_root: PathBuf,
+    memory_service: Arc<MemoryService>,
 }
 
 #[derive(Debug)]
@@ -166,6 +168,7 @@ pub struct LaunchExecutionResult {
 
 impl TaskService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         Self {
             db,
             event_bus,
@@ -178,6 +181,7 @@ impl TaskService {
             terminal_activity: None,
             repo_cache_locks: None,
             workspace_root: default_workspace_root(),
+            memory_service,
         }
     }
 
@@ -235,6 +239,11 @@ impl TaskService {
         self
     }
 
+    pub fn with_memory_service(mut self, memory_service: Arc<MemoryService>) -> Self {
+        self.memory_service = memory_service;
+        self
+    }
+
     fn publish(&self, event: ForgeEvent) {
         self.event_bus.publish(event);
     }
@@ -267,17 +276,29 @@ impl TaskService {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let succeeded = notification.exit_code == Some(0) && signal.is_none() && error.is_none();
-        let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) = if succeeded {
-            (
+        let outcome = notification.status.as_deref().unwrap_or(if succeeded {
+            "completed"
+        } else {
+            "failed"
+        });
+        let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) = match outcome {
+            "completed" => (
                 ExecutionStatus::Completed,
                 None,
                 None,
                 None,
                 None,
                 Some(None),
-            )
-        } else {
-            (
+            ),
+            "cancelled" => (
+                ExecutionStatus::Cancelled,
+                Some(Some(db::StopReason::ExecutorCancelled)),
+                Some(Some("system:daemon".to_owned())),
+                Some(Some(db::ResumePolicy::Manual)),
+                Some(Some(notification.ts.clone())),
+                Some(None),
+            ),
+            _ => (
                 ExecutionStatus::Failed,
                 Some(Some(db::StopReason::ExecutorFailed)),
                 Some(Some("system:daemon".to_owned())),
@@ -288,25 +309,27 @@ impl TaskService {
                     signal,
                     error,
                 ))),
-            )
+            ),
         };
 
+        let execution_id = notification.execution_id.clone();
+        let terminal_ts = notification.ts.clone();
         let updated = ExecutionRepo::update(
             &*self.db,
             db::UpdateExecution {
-                id: notification.execution_id,
+                id: execution_id,
                 status: Some(status),
                 stop_reason,
                 stopped_by,
                 resume_policy,
                 stopped_at,
-                agent_session_id: None,
+                agent_session_id: notification.agent_session_id.map(Some),
                 agent_message_id: None,
-                last_activity_at: Some(Some(notification.ts)),
-                summary: Some(None),
+                last_activity_at: Some(Some(terminal_ts)),
+                summary: notification.summary.map(Some),
                 logs_path: None,
                 before_sha: None,
-                after_sha: None,
+                after_sha: notification.after_sha.map(Some),
                 error,
                 executor_config_snapshot_json: None,
                 updated_at: now_rfc3339(),
@@ -314,7 +337,43 @@ impl TaskService {
         )
         .await?;
 
+        if let Some(usage) = notification.usage {
+            let provider = execution::usage_provider_from_snapshot(
+                current_execution.executor_config_snapshot_json.as_deref(),
+            );
+            let model = usage.model.unwrap_or_else(|| "default".to_owned());
+            if let Err(error) = ExecutionUsageRepo::upsert(
+                &*self.db,
+                UpsertExecutionUsage {
+                    execution_id: updated.id.clone(),
+                    provider,
+                    model,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    cost_usd: usage.cost_usd,
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    %error,
+                    "failed to record remote execution token usage"
+                );
+            }
+        }
+
         execution::publish_terminal_execution_event(self, &updated);
+
+        if let Err(error) = self
+            .memory_service
+            .record_execution_summary_if_present(&task.project_id, &updated)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
 
         if updated.status == ExecutionStatus::Completed {
             if let Err(error) = execution::clear_execution_retry_metadata(&self.db, &task).await {

@@ -2,18 +2,27 @@ use crate::workflow::{
     default_roles,
     dispatch::{
         default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_REVIEWER_DEFAULT_V1,
+        BUILDER_ID_REVIEWER_DEFAULT_V2, MANAGED_EXECUTION_CONTRACT,
     },
 };
 
 pub struct ReviewerPromptBuilder;
 
 const VERDICT_INSTRUCTION: &str =
-    "End your response with exactly one of:\n===REVIEW: PASS===\n===REVIEW: FAIL: <short reason>===";
+    "End your response with EXACTLY ONE verdict marker in the existing format:\n===REVIEW: PASS===\n===REVIEW: FAIL: <short reason>===";
+
+const REVIEWER_ROLE_BOUNDARY: &str = "\
+Reviewer boundary:
+- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, produce structured findings, and end with one verdict marker.
+- Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
+- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, multiple verdict markers.";
+
+const REVIEWER_FINDINGS_CONTRACT: &str = "\
+Reviewer findings: Put structured findings before the verdict. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings.";
 
 impl PromptBuilder for ReviewerPromptBuilder {
     fn id(&self) -> &'static str {
-        BUILDER_ID_REVIEWER_DEFAULT_V1
+        BUILDER_ID_REVIEWER_DEFAULT_V2
     }
 
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt {
@@ -107,7 +116,9 @@ impl PromptBuilder for ReviewerPromptBuilder {
         user.push('\n');
 
         AgentPrompt {
-            system: "You are the reviewer agent for this Forge workflow task. This is a read-only audit: do not edit files, stage changes, commit changes, or otherwise modify the workspace. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.".to_string(),
+            system: format!(
+                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{VERDICT_INSTRUCTION}"
+            ),
             user,
             tools: default_tool_names(default_roles::REVIEWER),
         }

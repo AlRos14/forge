@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,10 +15,12 @@ use api_types::{
 use clap::Subcommand;
 use executors::{AvailabilityStatus, ExecutorKind};
 use serde::{Deserialize, Serialize};
-use tokio::{process::Command as TokioCommand, time::timeout};
+use tokio::{process::Command as TokioCommand, sync::watch, time::timeout};
 
 use crate::{
     client::ForgeClient,
+    daemon_link::DaemonClient,
+    daemon_runtime,
     output::{print_json, print_table_daemons},
     OutputFormat,
 };
@@ -60,6 +64,21 @@ enum DaemonCmd {
         #[arg(long)]
         once: bool,
     },
+    /// Start a previously linked daemon using saved credentials.
+    Start {
+        /// Directory this daemon should advertise as its workspace root.
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        /// Credentials file created by daemon link.
+        #[arg(long)]
+        credentials: Option<PathBuf>,
+        /// Extra label in key=value form. Can be repeated.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// Report interval while the daemon is running.
+        #[arg(long, default_value_t = DEFAULT_REPORT_INTERVAL_SECONDS)]
+        interval_seconds: u64,
+    },
     /// Send one report using existing credentials.
     Report {
         /// Directory this daemon should advertise as its workspace root.
@@ -93,7 +112,7 @@ impl DaemonArgs {
                 interval_seconds,
                 once,
             } => {
-                let workspace_root = resolve_workspace_root(workspace_root.as_deref());
+                let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
                 let hostname = hostname
                     .clone()
@@ -123,35 +142,64 @@ impl DaemonArgs {
                 }
 
                 println!(
-                    "daemon linked as {}; reporting every {}s",
+                    "daemon linked as {}; reporting every {}s with command stream enabled",
                     linked.credentials.daemon_id, interval_seconds
                 );
-                loop {
-                    tokio::select! {
-                        result = tokio::signal::ctrl_c() => {
-                            result.context("listen for Ctrl-C")?;
-                            println!("daemon link stopped");
-                            return Ok(());
-                        }
-                        () = tokio::time::sleep(Duration::from_secs((*interval_seconds).max(1))) => {
-                            let credentials = read_credentials(&credentials_path)?
-                                .ok_or_else(|| anyhow!("missing daemon credentials at {}", credentials_path.display()))?;
-                            let daemon = report_once(client, &credentials, &workspace_root, &labels).await?;
-                            if matches!(output, OutputFormat::Json) {
-                                print_json(&daemon)?;
-                            } else {
-                                println!("reported daemon {}", daemon.id);
-                            }
-                        }
-                    }
-                }
+                run_daemon_loop(
+                    client,
+                    output,
+                    DaemonLoopConfig {
+                        credentials_path: &credentials_path,
+                        initial_credentials: &linked.credentials,
+                        workspace_root: &workspace_root,
+                        labels: &labels,
+                        interval_seconds: *interval_seconds,
+                        stopped_message: "daemon link stopped",
+                    },
+                )
+                .await
+            }
+            DaemonCmd::Start {
+                workspace_root,
+                credentials,
+                labels,
+                interval_seconds,
+            } => {
+                let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
+                let credentials_path = credentials_path(credentials.as_deref());
+                let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
+                    anyhow!(
+                        "missing daemon credentials at {}; run `forge-ctl daemon link` first",
+                        credentials_path.display()
+                    )
+                })?;
+                let labels = parse_labels(labels)?;
+                let daemon = report_once(client, &credentials, &workspace_root, &labels).await?;
+                print_daemon(output, &daemon)?;
+                println!(
+                    "daemon started as {}; reporting every {}s with command stream enabled",
+                    credentials.daemon_id, interval_seconds
+                );
+                run_daemon_loop(
+                    client,
+                    output,
+                    DaemonLoopConfig {
+                        credentials_path: &credentials_path,
+                        initial_credentials: &credentials,
+                        workspace_root: &workspace_root,
+                        labels: &labels,
+                        interval_seconds: *interval_seconds,
+                        stopped_message: "daemon start stopped",
+                    },
+                )
+                .await
             }
             DaemonCmd::Report {
                 workspace_root,
                 credentials,
                 labels,
             } => {
-                let workspace_root = resolve_workspace_root(workspace_root.as_deref());
+                let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(
@@ -170,6 +218,60 @@ impl DaemonArgs {
 struct LinkResult {
     credentials: DaemonCredentials,
     daemon: DaemonResponse,
+}
+
+struct DaemonLoopConfig<'a> {
+    credentials_path: &'a Path,
+    initial_credentials: &'a DaemonCredentials,
+    workspace_root: &'a Path,
+    labels: &'a BTreeMap<String, String>,
+    interval_seconds: u64,
+    stopped_message: &'a str,
+}
+
+async fn run_daemon_loop(
+    client: &ForgeClient,
+    output: &OutputFormat,
+    config: DaemonLoopConfig<'_>,
+) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut daemon_client = DaemonClient::new(client.url("/"))?;
+    daemon_client.set_credentials(
+        config.initial_credentials.daemon_id.clone(),
+        config.initial_credentials.token.clone(),
+    );
+    let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
+        Arc::new(daemon_client),
+        config.workspace_root.to_path_buf(),
+        shutdown_rx,
+    ));
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("listen for Ctrl-C")?;
+                let _ = shutdown_tx.send(true);
+                connect_handle.abort();
+                match connect_handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("daemon command stream stopped: {error}"),
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => eprintln!("daemon command stream task failed: {error}"),
+                }
+                println!("{}", config.stopped_message);
+                return Ok(());
+            }
+            () = tokio::time::sleep(Duration::from_secs(config.interval_seconds.max(1))) => {
+                let credentials = read_credentials(config.credentials_path)?
+                    .ok_or_else(|| anyhow!("missing daemon credentials at {}", config.credentials_path.display()))?;
+                let daemon = report_once(client, &credentials, config.workspace_root, config.labels).await?;
+                if matches!(output, OutputFormat::Json) {
+                    print_json(&daemon)?;
+                } else {
+                    println!("reported daemon {}", daemon.id);
+                }
+            }
+        }
+    }
 }
 
 async fn link_and_report(
@@ -301,6 +403,7 @@ async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<St
         ExecutorKind::Shell => shell_path_and_version(),
         ExecutorKind::Codex => binary_path_and_version("codex").await,
         ExecutorKind::ClaudeCode => binary_path_and_version("claude").await,
+        ExecutorKind::Cursor => binary_path_and_version("cursor-agent").await,
         ExecutorKind::Opencode => binary_path_and_version("opencode").await,
         ExecutorKind::Gemini => binary_path_and_version("gemini").await,
         ExecutorKind::Null => (None, None),
@@ -384,6 +487,23 @@ fn resolve_workspace_root(explicit: Option<&Path>) -> PathBuf {
     explicit
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_forge_home().join("workspaces"))
+}
+
+fn prepare_workspace_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    let workspace_root = resolve_workspace_root(explicit);
+    let workspace_root = absolute_path(&workspace_root)
+        .with_context(|| format!("resolve daemon workspace root {}", workspace_root.display()))?;
+    fs::create_dir_all(&workspace_root)
+        .with_context(|| format!("create daemon workspace root {}", workspace_root.display()))?;
+    Ok(workspace_root)
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 fn default_forge_home() -> PathBuf {
@@ -486,5 +606,22 @@ fn print_daemon(output: &OutputFormat, daemon: &DaemonResponse) -> Result<()> {
             print_table_daemons(std::slice::from_ref(daemon));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_workspace_root;
+
+    #[test]
+    fn prepare_workspace_root_creates_missing_directory() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let root = temp.path().join("missing").join("workspaces");
+
+        let prepared = prepare_workspace_root(Some(&root)).expect("workspace root is prepared");
+
+        assert_eq!(prepared, root);
+        assert!(prepared.is_absolute());
+        assert!(prepared.is_dir());
     }
 }

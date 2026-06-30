@@ -16,6 +16,7 @@ pub mod external_api;
 pub mod external_sync;
 pub mod integration_service;
 pub mod lifecycle;
+pub mod memory;
 pub mod merge_service;
 pub mod notification_service;
 pub mod oauth_service;
@@ -25,6 +26,7 @@ pub mod plan_artifact;
 pub mod pr_service;
 pub mod project_hooks;
 pub mod project_member_service;
+pub mod prompt_preview;
 pub mod recovery;
 pub mod shutdown;
 pub mod task_diagnostics;
@@ -54,6 +56,10 @@ pub use diff::DiffService;
 pub use embedded_daemon::EmbeddedDaemon;
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
+pub use memory::{
+    BackfillSummary, BackfillTypeResult, MemoryCreator, MemoryItemInput, MemoryReferences,
+    MemorySearchResult, MemoryService,
+};
 pub use merge_service::{MergeOutcome, MergeService};
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
@@ -61,6 +67,7 @@ pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
+pub use prompt_preview::preview_effective_prompt;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;

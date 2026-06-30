@@ -8,6 +8,8 @@ import type { Agent } from '@/types/generated'
 const EXECUTOR_LABELS: Record<string, string> = {
   claude_code: 'Claude Code',
   codex: 'Codex',
+  cursor: 'Cursor',
+  gemini: 'Gemini',
   opencode: 'OpenCode',
   shell: 'Shell',
 }

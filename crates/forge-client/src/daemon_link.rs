@@ -185,7 +185,7 @@ impl DaemonCommandStream {
 
             match message {
                 Message::Text(text) => {
-                    return serde_json::from_str(&text.to_string())
+                    return serde_json::from_str(text.as_ref())
                         .context("deserialize daemon command frame");
                 }
                 Message::Close(_) => return Err(stream_closed_error()),
@@ -350,7 +350,7 @@ async fn send_frame(sender: &SharedCommandSender, frame: &api_types::DaemonFrame
     sender
         .lock()
         .await
-        .send(Message::Text(payload))
+        .send(Message::Text(payload.into()))
         .await
         .context("send daemon command frame")
 }

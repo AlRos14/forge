@@ -259,6 +259,14 @@ pub struct LaunchExecutionResponse {
     pub data: LaunchExecutionData,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct PromptPreviewResponse {
+    pub system: String,
+    pub user: String,
+    pub tools: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ConversationResponse {

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{data_dir_from_env, read_server_state, server_state_path};
 use forge_client::{
-    agent, auth, client::ForgeClient, daemon, mcp, project, repo, run, task, OutputFormat,
+    agent, auth, client::ForgeClient, daemon, mcp, memory, project, repo, run, task, OutputFormat,
 };
 
 #[derive(Parser)]
@@ -11,7 +11,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Forge server URL (default: persisted local server)"
+        help = "Forge server URL (default: stored login server, then persisted local server)"
     )]
     server: Option<String>,
     #[arg(long, default_value = "table", value_enum)]
@@ -29,6 +29,7 @@ enum Commands {
     Agent(agent::AgentArgs),
     Daemon(daemon::DaemonArgs),
     Project(project::ProjectArgs),
+    Memory(memory::MemoryArgs),
     Repo(repo::RepoArgs),
     Run(run::RunArgs),
     Mcp(mcp::McpArgs),
@@ -64,6 +65,10 @@ async fn main() -> Result<()> {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
         }
+        Commands::Memory(args) => {
+            let client = client_for(cli.server.as_deref())?;
+            args.run(&client, &cli.output).await
+        }
         Commands::Repo(args) => {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
@@ -87,6 +92,10 @@ fn client_for(explicit_server: Option<&str>) -> Result<ForgeClient> {
 fn resolve_server_url(explicit: Option<&str>) -> Result<String> {
     if let Some(server) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(auth::normalize_server_url(server));
+    }
+
+    if let Some(server) = auth::stored_server_url()? {
+        return Ok(server);
     }
 
     let data_dir = data_dir_from_env();
@@ -147,6 +156,38 @@ mod tests {
         assert_eq!(
             resolve_server_url(None).expect("server resolves"),
             "http://127.0.0.1:49153"
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn server_url_prefers_stored_login_over_persisted_server_state() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let data_dir = unique_temp_dir("forge-ctl-login-state");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.clone());
+        fs::create_dir_all(&data_dir).expect("data dir creates");
+        write_server_state(
+            &data_dir,
+            &ServerState::new("127.0.0.1:49153", "http://127.0.0.1:49153/"),
+        )
+        .expect("state writes");
+        fs::write(
+            data_dir.join("forge_ctl_credentials.json"),
+            serde_json::json!({
+                "server_url": "https://forge.example.com/",
+                "token": "fg_stored",
+                "token_id": "token-1",
+                "token_prefix": "fg_st",
+                "email": "user@example.com"
+            })
+            .to_string(),
+        )
+        .expect("credentials write");
+
+        assert_eq!(
+            resolve_server_url(None).expect("server resolves"),
+            "https://forge.example.com"
         );
 
         let _ = fs::remove_dir_all(data_dir);

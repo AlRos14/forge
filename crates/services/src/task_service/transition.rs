@@ -14,19 +14,15 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if let Some(parent_id) = task.parent_task_id.as_deref() {
-            if options.triggered_by.starts_with("user:") {
-                return Err(ServiceError::subtask_managed_by_root(
-                    task_id.clone(),
-                    parent_id.to_owned(),
-                ));
-            }
-        }
         let previous_status = task.status.clone();
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_transition(
+            &task,
+            &project.workflow_definition,
+            &options.triggered_by,
+        );
         self.ensure_planning_plan_ready_before_leaving(
             &task,
             &new_status,
@@ -263,7 +259,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_state_classification(
+            &task,
+            &project.workflow_definition,
+        );
         let Some(state) = workflow
             .states
             .iter()
@@ -356,7 +355,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_state_classification(
+            &task,
+            &project.workflow_definition,
+        );
         let state = workflow
             .states
             .iter()
@@ -464,7 +466,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_state_classification(
+            &task,
+            &project.workflow_definition,
+        );
         if matches!(
             workflow.state_kind(&task.status),
             Some(api_types::StateKind::Active | api_types::StateKind::Gate)
@@ -553,7 +558,12 @@ impl TaskService {
         ) {
             return Ok(());
         }
-        if !is_user_reachable_transition(workflow, &task.status, target_status) {
+        let target_defined = workflow
+            .states
+            .iter()
+            .any(|state| state.name.as_str() == target_status);
+        if !(is_user_reachable_transition(workflow, &task.status, target_status) || target_defined)
+        {
             return Ok(());
         }
         let Some(role_name) = crate::workflow::effective_role(source_state) else {

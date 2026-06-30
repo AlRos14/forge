@@ -64,6 +64,11 @@ Hooks carry `applies_to: HookAudience`:
 
 The filter is applied before action resolution/execution. Non-matching hooks are not recorded as skipped hook results.
 
+Human-triggered task movement uses `triggered_by = "user:*"` and has higher
+priority than automation gates. Actions that protect AI work, such as
+`dependency_gate`, must skip those management transitions and enforce the same
+precondition again at execution or dispatch time.
+
 ## Registration
 
 After adding an action type in `actions/`, register it in `registry.rs::resolve_action`:

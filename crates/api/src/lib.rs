@@ -108,6 +108,11 @@ pub fn api_router(state: AppState) -> Router {
             put(routes::admin::upsert_setting).delete(routes::admin::delete_setting),
         )
         .route(
+            "/api/v1/memory/backfill",
+            post(routes::admin::backfill_memory),
+        )
+        .route("/api/v1/memory/{id}", get(routes::memory::get_memory_item))
+        .route(
             "/api/v1/projects",
             post(routes::projects::create_project).get(routes::projects::list_projects),
         )
@@ -128,6 +133,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/analytics",
             get(routes::projects::get_project_analytics),
+        )
+        .route(
+            "/api/v1/projects/{id}/memory/search",
+            get(routes::memory::search_project_memory),
         )
         .route(
             "/api/v1/projects/{id}/project_hook_runs",
@@ -234,6 +243,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::tasks::get_task)
                 .patch(routes::tasks::update_task)
                 .delete(routes::tasks::delete_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/prompt-preview",
+            get(routes::tasks::prompt_preview),
         )
         .route("/api/v1/tasks/{id}/claim", post(routes::tasks::claim_task))
         .route(

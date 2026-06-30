@@ -4,8 +4,8 @@ use crate::workflow::{
     default_roles, default_states,
     dispatch::{
         default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_CODER_IMPLEMENTATION_V1, BUILDER_ID_CODER_MERGE_FIX_V1,
-        BUILDER_ID_CODER_REVIEW_FIX_V1,
+        BUILDER_ID_CODER_IMPLEMENTATION_V2, BUILDER_ID_CODER_MERGE_FIX_V2,
+        BUILDER_ID_CODER_REVIEW_FIX_V2, MANAGED_EXECUTION_CONTRACT,
     },
 };
 
@@ -15,12 +15,12 @@ pub struct CoderMergeFixPromptBuilder;
 
 impl PromptBuilder for CoderImplementationPromptBuilder {
     fn id(&self) -> &'static str {
-        BUILDER_ID_CODER_IMPLEMENTATION_V1
+        BUILDER_ID_CODER_IMPLEMENTATION_V2
     }
 
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt {
         AgentPrompt {
-            system: coder_system(ctx),
+            system: coder_system(ctx, None),
             user: implementation_user(ctx),
             tools: default_tool_names(default_roles::CODER),
         }
@@ -29,12 +29,12 @@ impl PromptBuilder for CoderImplementationPromptBuilder {
 
 impl PromptBuilder for CoderReviewFixPromptBuilder {
     fn id(&self) -> &'static str {
-        BUILDER_ID_CODER_REVIEW_FIX_V1
+        BUILDER_ID_CODER_REVIEW_FIX_V2
     }
 
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt {
         AgentPrompt {
-            system: coder_system(ctx),
+            system: coder_system(ctx, Some(REVIEW_FIX_ROLE_BOUNDARY)),
             user: review_fix_user(ctx),
             tools: default_tool_names(default_roles::CODER),
         }
@@ -43,24 +43,57 @@ impl PromptBuilder for CoderReviewFixPromptBuilder {
 
 impl PromptBuilder for CoderMergeFixPromptBuilder {
     fn id(&self) -> &'static str {
-        BUILDER_ID_CODER_MERGE_FIX_V1
+        BUILDER_ID_CODER_MERGE_FIX_V2
     }
 
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt {
         AgentPrompt {
-            system: coder_system(ctx),
+            system: coder_system(ctx, Some(MERGE_FIX_ROLE_BOUNDARY)),
             user: merge_fix_user(ctx),
             tools: default_tool_names(default_roles::CODER),
         }
     }
 }
 
-fn coder_system(ctx: &AgentDispatchContext) -> String {
+const CODER_ROLE_BOUNDARY: &str = "\
+Coder boundary:
+- Must implement only the requested task in the task worktree.
+- Must inspect supplied plans, comments, and review feedback first, keep scope tight, run relevant verification, and commit completed changes.
+- Must not change unrelated behavior, ignore failed verification, treat review feedback as optional, or claim success without running verification.
+- Red flags: broad refactors, skipped checks, missing proof media for UI/runtime changes.";
+
+const REVIEW_FIX_ROLE_BOUNDARY: &str = "\
+Review-fix boundary:
+- Must address prior review or CI feedback precisely while preserving the implementation direction.
+- Must not reopen solved work or add unrelated changes.
+- Red flags: ignored reviewer evidence, broad rewrites, fixes without verification.";
+
+const MERGE_FIX_ROLE_BOUNDARY: &str = "\
+Merge-fix boundary:
+- Must resolve merge conflicts minimally while preserving implementation intent, then run targeted verification.
+- Must not rewrite the feature or add unrelated cleanup.
+- Red flags: redesigns, formatting churn outside conflicted areas, unrelated fixes.";
+
+const CODER_HANDOFF_CONTRACT: &str = "\
+Completion handoff: End your response with a handoff block containing sections Summary | Deliverables | Verification | Deviations | Next Step.
+List any verification not run with the reason. For UI/runtime behavior changes, include proof media (screenshot or log snippet) or explain why proof could not be captured.";
+
+fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -> String {
     let has_plan = ctx
         .plan
         .as_deref()
         .is_some_and(|plan| !plan.trim().is_empty());
     let mut system = "You are the coder agent for this Forge workflow task. Your job is to implement code changes in the worktree. Once you finish, the task moves to the reviewer agent for verification. Keep the scope tight, verify the result compiles and passes locally, and commit your changes.".to_string();
+    system.push_str("\n\n");
+    system.push_str(MANAGED_EXECUTION_CONTRACT);
+    system.push_str("\n\n");
+    system.push_str(CODER_ROLE_BOUNDARY);
+    if let Some(extra_role_boundary) = extra_role_boundary {
+        system.push_str("\n\n");
+        system.push_str(extra_role_boundary);
+    }
+    system.push_str("\n\n");
+    system.push_str(CODER_HANDOFF_CONTRACT);
     system.push_str("\n\nProof of work for app-touching changes: If your task modifies user-facing UI or runtime behavior, capture a screenshot (or short walkthrough video) demonstrating the change. Upload it with forge-ctl task media upload --task-id <id> --file <path> and post a comment with forge-ctl task media comment --task-id <id> --content validation-notes --media-url <url> before transitioning to review.");
     if has_plan {
         system.push_str(" A planner agent already investigated and produced a plan — do not redo that work. Treat the provided plan as instructions to execute now.");

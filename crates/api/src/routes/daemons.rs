@@ -146,6 +146,22 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
         );
     }
 
+    if let Err(error) = state.daemon_service.mark_connected(&daemon_id).await {
+        tracing::warn!(
+            daemon_id = %daemon_id,
+            connection_id,
+            error = %error,
+            "failed to mark daemon command socket connected"
+        );
+        if state
+            .daemon_connections
+            .is_current(&daemon_id, connection_id)
+        {
+            state.daemon_connections.unregister(&daemon_id);
+        }
+        return;
+    }
+
     tracing::info!(
         daemon_id = %daemon_id,
         connection_id,
@@ -253,12 +269,20 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
         }
     }
 
-    if !connection.is_stale()
+    let should_unregister = !connection.is_stale()
         && state
             .daemon_connections
-            .is_current(&daemon_id, connection_id)
-    {
+            .is_current(&daemon_id, connection_id);
+    if should_unregister {
         state.daemon_connections.unregister(&daemon_id);
+        if let Err(error) = state.daemon_service.mark_disconnected(&daemon_id).await {
+            tracing::warn!(
+                daemon_id = %daemon_id,
+                connection_id,
+                error = %error,
+                "failed to mark daemon command socket disconnected"
+            );
+        }
     }
 
     drop(outbound_tx);
@@ -304,6 +328,13 @@ async fn handle_daemon_text_frame(
             .is_err()
         {
             return false;
+        }
+        if let Err(error) = state.daemon_service.touch_connection(daemon_id).await {
+            tracing::warn!(
+                daemon_id = %daemon_id,
+                error = %error,
+                "failed to touch daemon command socket heartbeat"
+            );
         }
     }
 

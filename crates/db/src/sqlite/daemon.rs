@@ -164,6 +164,23 @@ impl DaemonRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn mark_online(&self, id: &str, last_report_at: &str) -> Result<Daemon> {
+        let result = sqlx::query(
+            "UPDATE daemon SET status = 'online', last_report_at = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+        )
+        .bind(last_report_at)
+        .bind(last_report_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        DaemonRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
     async fn mark_offline(&self, id: &str, updated_at: &str) -> Result<Daemon> {
         let result = sqlx::query(
             "UPDATE daemon SET status = 'offline', updated_at = ?, version = version + 1 WHERE id = ?",

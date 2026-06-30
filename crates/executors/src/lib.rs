@@ -14,7 +14,8 @@ pub use adapter::{
 };
 pub use config::{
     deserialize_config, merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig,
-    CommandOverrides, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy, ShellConfig,
+    CommandOverrides, CursorConfig, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy,
+    ShellConfig,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};

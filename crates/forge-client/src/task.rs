@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use api_types::{
     ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, PaginatedResponse,
-    TaskMediaResponse, TaskResponse, TransitionTaskRequest, TransitionTaskResponse,
+    PromptPreviewResponse, TaskMediaResponse, TaskResponse, TransitionTaskRequest,
+    TransitionTaskResponse,
 };
 use clap::Subcommand;
 use reqwest::multipart::Form;
@@ -56,6 +57,13 @@ pub enum TaskCmd {
     },
     Cancel {
         id: String,
+    },
+    PromptPreview {
+        task_id: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        trigger: Option<String>,
     },
     Media(MediaArgs),
 }
@@ -152,6 +160,7 @@ impl TaskArgs {
                     version: *version,
                     reason: None,
                     source: None,
+                    r#override: None,
                 };
                 let response: TransitionTaskResponse = client
                     .post(&format!("/api/v1/tasks/{id}/transition"), &request)
@@ -163,6 +172,16 @@ impl TaskArgs {
                     .post(&format!("/api/v1/tasks/{id}/cancel"), &json!({}))
                     .await?;
                 print_task(output, &task)
+            }
+            TaskCmd::PromptPreview {
+                task_id,
+                role,
+                trigger,
+            } => {
+                let preview = client
+                    .prompt_preview(task_id, role, trigger.as_deref())
+                    .await?;
+                print_prompt_preview(output, &preview)
             }
             TaskCmd::Media(args) => args.run(client, output).await,
         }
@@ -269,6 +288,24 @@ fn print_media(output: &OutputFormat, media: &TaskMediaResponse) -> Result<()> {
                 "{}  {}  {}  {}",
                 media.id, media.content_type, media.byte_size, media.url
             );
+            Ok(())
+        }
+    }
+}
+
+fn print_prompt_preview(output: &OutputFormat, preview: &PromptPreviewResponse) -> Result<()> {
+    match output {
+        OutputFormat::Json => print_json(preview),
+        OutputFormat::Table => {
+            println!("System:\n{}\n", preview.system);
+            println!("User:\n{}\n", preview.user);
+            let tools = preview
+                .tools
+                .as_ref()
+                .filter(|tools| !tools.is_empty())
+                .map(|tools| tools.join(", "))
+                .unwrap_or_else(|| "none".to_owned());
+            println!("Tools:\n{tools}");
             Ok(())
         }
     }

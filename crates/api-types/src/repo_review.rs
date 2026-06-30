@@ -7,6 +7,10 @@ use crate::{
     WorkflowDefinition,
 };
 
+fn default_json_object() -> Value {
+    Value::Object(Default::default())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffFileStatus {
@@ -51,15 +55,23 @@ pub struct DiffEnvelope {
 pub struct ProjectResponse {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_json_object")]
     pub settings: Value,
+    #[serde(default)]
     pub project_hooks: Vec<ProjectHookRule>,
+    #[serde(default)]
     pub default_review_config: Option<ReviewConfig>,
+    #[serde(default)]
     pub primary_repo_id: Option<String>,
+    #[serde(default)]
     pub owner_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
     pub workflow_template_name: Option<String>,
+    #[serde(default)]
     pub paused_at: Option<String>,
+    #[serde(default)]
     pub paused: bool,
 }
 
@@ -302,4 +314,25 @@ pub struct ErrorResponse {
     pub message: String,
     pub details: Option<Value>,
     pub request_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProjectResponse;
+
+    #[test]
+    fn project_response_accepts_missing_compatibility_fields() {
+        let response: ProjectResponse = serde_json::from_value(serde_json::json!({
+            "id": "project-1",
+            "name": "Forge",
+            "created_at": "2026-05-27T00:00:00Z",
+            "updated_at": "2026-05-27T00:00:00Z"
+        }))
+        .expect("project response should deserialize without compatibility fields");
+
+        assert_eq!(response.id, "project-1");
+        assert_eq!(response.settings, serde_json::json!({}));
+        assert!(response.project_hooks.is_empty());
+        assert!(!response.paused);
+    }
 }

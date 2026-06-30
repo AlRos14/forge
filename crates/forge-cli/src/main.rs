@@ -213,6 +213,21 @@ async fn main() {
         config.workflows_dir(),
     )
     .with_effective_config(effective_config.clone());
+    match state
+        .daemon_service
+        .mark_external_daemons_disconnected(
+            &services::embedded_daemon::embedded_machine_id(),
+            "server startup",
+        )
+        .await
+    {
+        Ok(count) if count > 0 => info!(
+            disconnected_count = count,
+            "marked stale external daemons offline at startup"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to mark stale external daemons offline at startup"),
+    }
     let project_hook_service_handle = Arc::clone(&state.project_hook_service).start();
     let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
     let task_dispatcher = Arc::new(services::TaskDispatcher::new(

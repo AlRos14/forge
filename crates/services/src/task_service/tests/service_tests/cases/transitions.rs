@@ -7,7 +7,7 @@ fn test_dependency_gate_surfaces_as_409_variant() {
 }
 
 #[tokio::test]
-async fn transition_rejects_user_move_for_root_managed_subtask() {
+async fn transition_allows_user_move_for_root_managed_subtask() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -22,20 +22,18 @@ async fn transition_rejects_user_move_for_root_managed_subtask() {
             "in_progress".to_owned(),
             (subtask.version, None),
         )
-        .await;
+        .await
+        .expect("user can manage subtask status");
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::SubtaskManagedByRoot {
-            task_id,
-            root_task_id
-        }) if task_id == subtask.id && root_task_id == root.id
-    ));
+    assert_eq!(
+        result.task.parent_task_id.as_deref(),
+        Some(root.id.as_str())
+    );
     let current = TaskRepo::get_by_id(&*db, &subtask.id, false)
         .await
         .expect("subtask loads")
         .expect("subtask exists");
-    assert_eq!(current.status, "todo");
+    assert_eq!(current.status, "in_progress");
 }
 
 #[tokio::test]

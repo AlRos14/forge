@@ -149,6 +149,22 @@ export function CodexFields({ cfg, onChange }: ExecFieldProps) {
   )
 }
 
+export function CursorFields({ cfg, onChange }: ExecFieldProps) {
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      <ConfigField label="Resume Session" className="col-span-2">
+        <Input value={getStr(cfg, 'resume_session_id')} onChange={(e) => onChange('resume_session_id', e.target.value || undefined)} placeholder="session id" />
+      </ConfigField>
+      <div className="col-span-2 pt-1">
+        <label className="flex cursor-pointer items-center gap-2 text-sm select-none">
+          <Checkbox className="h-3.5 w-3.5" checked={getBool(cfg, 'force')} onChange={(e) => onChange('force', e.target.checked || undefined)} />
+          Force file changes
+        </label>
+      </div>
+    </div>
+  )
+}
+
 export function OpencodeFields({ cfg, onChange }: ExecFieldProps) {
   return (
     <div className="grid grid-cols-2 gap-3">
@@ -247,6 +263,7 @@ export function ExecutorConfigFields({ executorType, cfg, onChange }: { executor
   const props = { cfg, onChange }
   if (executorType === 'claude_code') return <ClaudeCodeFields {...props} />
   if (executorType === 'codex') return <CodexFields {...props} />
+  if (executorType === 'cursor') return <CursorFields {...props} />
   if (executorType === 'opencode') return <OpencodeFields {...props} />
   if (executorType === 'shell') return <ShellFields {...props} />
   return null

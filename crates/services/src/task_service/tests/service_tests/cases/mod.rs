@@ -7,3 +7,4 @@ mod roles;
 mod subtask_modes;
 mod subtasks;
 mod transitions;
+mod user_override;

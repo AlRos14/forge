@@ -14,33 +14,10 @@ pub async fn create_comment(
         return Err(ApiError::bad_request("author_name must not be empty"));
     }
 
-    let now = now_rfc3339();
-    let comment = TaskCommentRepo::create_comment(
-        &*state.db,
-        CreateTaskComment {
-            id: db::new_uuid_v4(),
-            task_id: id,
-            author_type: CommentAuthorType::User,
-            author_id: None,
-            author_name: author_name.to_owned(),
-            content: content.to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await?;
-
-    state.event_bus.publish(events::ForgeEvent {
-        event_type: "comment.created".to_owned(),
-        entity_id: comment.id.clone(),
-        timestamp: events::event_timestamp(),
-        context: events::EventContext::CommentCreated {
-            task_id: comment.task_id.clone(),
-            comment_id: comment.id.clone(),
-            author_type: "user".to_owned(),
-            author_name: comment.author_name.clone(),
-        },
-    });
+    let comment = state
+        .task_service
+        .add_user_comment(&id, author_name.to_owned(), content.to_owned())
+        .await?;
 
     Ok((StatusCode::CREATED, Json(comment_response(comment))))
 }

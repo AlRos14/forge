@@ -26,6 +26,15 @@ fn blocking_hook(action: &str) -> HookSpec {
     }
 }
 
+fn agent_blocking_hook(action: &str) -> HookSpec {
+    HookSpec {
+        action: action.to_string(),
+        params: json!({}),
+        applies_to: HookAudience::AgentOnly,
+        on_failure: FailurePolicy::Block,
+    }
+}
+
 fn state(
     name: &str,
     kind: StateKind,
@@ -66,7 +75,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Todo",
             None,
             StateHooks {
-                before_exit: vec![blocking_hook("dependency_gate")],
+                before_exit: vec![agent_blocking_hook("dependency_gate")],
                 ..StateHooks::default()
             },
         ),
@@ -183,7 +192,7 @@ pub fn default_workflow() -> WorkflowDefinition {
         }
         if state.name == default_states::PLANNING {
             state.dispatch = Some(WorkflowDispatch {
-                builder: Some("planner.default.v1".to_string()),
+                builder: Some("planner.default.v2".to_string()),
                 execution_policy: None,
                 prompt: None,
             });
@@ -224,7 +233,7 @@ pub fn default_workflow() -> WorkflowDefinition {
         }
         if state.name == default_states::REVIEW {
             state.dispatch = Some(WorkflowDispatch {
-                builder: Some("reviewer.default.v1".to_string()),
+                builder: Some("reviewer.default.v2".to_string()),
                 execution_policy: None,
                 prompt: None,
             });
@@ -248,7 +257,7 @@ pub fn default_workflow() -> WorkflowDefinition {
                 WorkflowTriggerDefinition {
                     to: default_states::IN_PROGRESS.to_string(),
                     dispatch: Some(WorkflowDispatch {
-                        builder: Some("coder.review_fix.v1".to_string()),
+                        builder: Some("coder.review_fix.v2".to_string()),
                         execution_policy: Some(
                             WorkflowExecutionPolicy::ResumeLatestTargetRoleThread,
                         ),
@@ -274,7 +283,7 @@ pub fn default_workflow() -> WorkflowDefinition {
                 }
             });
             state.dispatch = Some(WorkflowDispatch {
-                builder: Some("coder.merge_fix.v1".to_string()),
+                builder: Some("coder.merge_fix.v2".to_string()),
                 execution_policy: Some(WorkflowExecutionPolicy::ResumeLatestTargetRoleThread),
                 prompt: None,
             });
@@ -290,7 +299,7 @@ pub fn default_workflow() -> WorkflowDefinition {
                 WorkflowTriggerDefinition {
                     to: default_states::IN_PROGRESS.to_string(),
                     dispatch: Some(WorkflowDispatch {
-                        builder: Some("coder.merge_fix.v1".to_string()),
+                        builder: Some("coder.merge_fix.v2".to_string()),
                         execution_policy: Some(
                             WorkflowExecutionPolicy::ResumeLatestTargetRoleThread,
                         ),
@@ -323,7 +332,7 @@ pub fn default_workflow() -> WorkflowDefinition {
         }
         if state.name == default_states::IN_PROGRESS {
             state.dispatch = Some(WorkflowDispatch {
-                builder: Some("coder.implementation.v1".to_string()),
+                builder: Some("coder.implementation.v2".to_string()),
                 execution_policy: None,
                 prompt: None,
             });

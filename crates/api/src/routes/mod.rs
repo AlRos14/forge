@@ -39,6 +39,7 @@ pub mod fs;
 pub mod integrations;
 pub mod mcp_config;
 pub mod members;
+pub mod memory;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;

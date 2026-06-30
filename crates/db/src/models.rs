@@ -1,6 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqliteRow, Row};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
@@ -478,6 +479,83 @@ pub enum ConversationMessageStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryKind {
+    Observation,
+    Decision,
+    Handoff,
+    Failure,
+    ReviewResult,
+    ExecutionSummary,
+    Comment,
+    Transition,
+    ConversationMessage,
+    Artifact,
+    Lesson,
+    ContextPack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemorySourceType {
+    Execution,
+    Review,
+    Comment,
+    Transition,
+    Conversation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryConfidence {
+    Confirmed,
+    Partial,
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryItem {
+    pub row_id: i64,
+    pub id: String,
+    pub project_id: String,
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub source_type: String,
+    pub kind: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub body: String,
+    pub metadata_json: String,
+    pub confidence: Option<String>,
+    pub quality_score: Option<i64>,
+    pub created_by_type: Option<String>,
+    pub created_by_id: Option<String>,
+    pub created_at: String,
+}
+
+impl MemoryItem {
+    pub fn from_row(row: &SqliteRow) -> std::result::Result<MemoryItem, sqlx::Error> {
+        Ok(MemoryItem {
+            row_id: row.try_get("row_id")?,
+            id: row.try_get("id")?,
+            project_id: row.try_get("project_id")?,
+            task_id: row.try_get("task_id")?,
+            execution_id: row.try_get("execution_id")?,
+            conversation_id: row.try_get("conversation_id")?,
+            source_type: row.try_get("source_type")?,
+            kind: row.try_get("kind")?,
+            title: row.try_get("title")?,
+            summary: row.try_get("summary")?,
+            body: row.try_get("body")?,
+            metadata_json: row.try_get("metadata_json")?,
+            confidence: row.try_get("confidence")?,
+            quality_score: row.try_get("quality_score")?,
+            created_by_type: row.try_get("created_by_type")?,
+            created_by_id: row.try_get("created_by_id")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionStatus {
     Running,
     Completed,
@@ -716,6 +794,35 @@ enum_strings!(ConversationMessageStatus {
     Streaming => "streaming",
     Failed => "failed",
     Cancelled => "cancelled",
+});
+
+enum_strings!(MemoryKind {
+    Observation => "observation",
+    Decision => "decision",
+    Handoff => "handoff",
+    Failure => "failure",
+    ReviewResult => "review_result",
+    ExecutionSummary => "execution_summary",
+    Comment => "comment",
+    Transition => "transition",
+    ConversationMessage => "conversation_message",
+    Artifact => "artifact",
+    Lesson => "lesson",
+    ContextPack => "context_pack",
+});
+
+enum_strings!(MemorySourceType {
+    Execution => "execution",
+    Review => "review",
+    Comment => "comment",
+    Transition => "transition",
+    Conversation => "conversation",
+});
+
+enum_strings!(MemoryConfidence {
+    Confirmed => "confirmed",
+    Partial => "partial",
+    Unconfirmed => "unconfirmed",
 });
 
 enum_strings!(StopReason {

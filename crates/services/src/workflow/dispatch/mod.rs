@@ -16,12 +16,20 @@ pub mod reviewer_prompt;
 #[cfg(test)]
 mod tests;
 
-pub const BUILDER_ID_CODER_IMPLEMENTATION_V1: &str = "coder.implementation.v1";
-pub const BUILDER_ID_CODER_REVIEW_FIX_V1: &str = "coder.review_fix.v1";
-pub const BUILDER_ID_CODER_MERGE_FIX_V1: &str = "coder.merge_fix.v1";
-pub const BUILDER_ID_REVIEWER_DEFAULT_V1: &str = "reviewer.default.v1";
-pub const BUILDER_ID_PLANNER_DEFAULT_V1: &str = "planner.default.v1";
-pub const BUILDER_ID_GENERIC_DEFAULT_V1: &str = "generic.default.v1";
+pub const BUILDER_ID_CODER_IMPLEMENTATION_V2: &str = "coder.implementation.v2";
+pub const BUILDER_ID_CODER_REVIEW_FIX_V2: &str = "coder.review_fix.v2";
+pub const BUILDER_ID_CODER_MERGE_FIX_V2: &str = "coder.merge_fix.v2";
+pub const BUILDER_ID_REVIEWER_DEFAULT_V2: &str = "reviewer.default.v2";
+pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
+pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
+
+pub(crate) const MANAGED_EXECUTION_CONTRACT: &str = "\
+Managed execution:
+- Before acting, restate objective, constraints, and acceptance criteria.
+- Use provided plans, comments, and prior review feedback before fresh exploration.
+- Keep work scoped to the requested task.
+- Failure taxonomy: classify any blocker using exactly this taxonomy: transient | input_missing | environment | code_bug | design_gap | review_failed | systemic.
+- Never hide failed verification; report failures explicitly.";
 
 pub const EXECUTION_POLICY_NEW_EXECUTION: &str = "new_execution";
 pub const EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD: &str =
@@ -111,15 +119,15 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
         let defaults = HashMap::from([
             (
                 default_roles::CODER.to_string(),
-                BUILDER_ID_CODER_IMPLEMENTATION_V1.to_string(),
+                BUILDER_ID_CODER_IMPLEMENTATION_V2.to_string(),
             ),
             (
                 default_roles::REVIEWER.to_string(),
-                BUILDER_ID_REVIEWER_DEFAULT_V1.to_string(),
+                BUILDER_ID_REVIEWER_DEFAULT_V2.to_string(),
             ),
             (
                 default_roles::PLANNER.to_string(),
-                BUILDER_ID_PLANNER_DEFAULT_V1.to_string(),
+                BUILDER_ID_PLANNER_DEFAULT_V2.to_string(),
             ),
         ]);
         Arc::new(RwLock::new(defaults))
@@ -152,7 +160,7 @@ pub fn resolve_prompt_builder(builder_id: &str) -> Arc<dyn PromptBuilder> {
     registry()
         .read()
         .expect("prompt builder registry lock poisoned")
-        .get(BUILDER_ID_GENERIC_DEFAULT_V1)
+        .get(BUILDER_ID_GENERIC_DEFAULT_V2)
         .cloned()
         .unwrap_or_else(|| Arc::new(generic_prompt::GenericPromptBuilder))
 }
@@ -168,37 +176,37 @@ pub fn resolve_default_builder_id_for_role(role: &str) -> Option<String> {
 pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
     vec![
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_CODER_IMPLEMENTATION_V1,
+            id: BUILDER_ID_CODER_IMPLEMENTATION_V2,
             label: "Coder (Implementation)",
             compatible_role_hints: &[default_roles::CODER],
             description: "Implementation-focused prompt for normal coding tasks.",
         },
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_CODER_REVIEW_FIX_V1,
+            id: BUILDER_ID_CODER_REVIEW_FIX_V2,
             label: "Coder (Review Fix)",
             compatible_role_hints: &[default_roles::CODER],
             description: "Focused rework prompt for rejected reviews.",
         },
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_CODER_MERGE_FIX_V1,
+            id: BUILDER_ID_CODER_MERGE_FIX_V2,
             label: "Coder (Merge Fix)",
             compatible_role_hints: &[default_roles::CODER],
             description: "Merge-conflict fix prompt for merge retry loops.",
         },
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_REVIEWER_DEFAULT_V1,
+            id: BUILDER_ID_REVIEWER_DEFAULT_V2,
             label: "Reviewer (Default)",
             compatible_role_hints: &[default_roles::REVIEWER],
             description: "Read-only review prompt with pass/fail verdict instructions.",
         },
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_PLANNER_DEFAULT_V1,
+            id: BUILDER_ID_PLANNER_DEFAULT_V2,
             label: "Planner (Default)",
             compatible_role_hints: &[default_roles::PLANNER],
             description: "Planning prompt for structured implementation plans.",
         },
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_GENERIC_DEFAULT_V1,
+            id: BUILDER_ID_GENERIC_DEFAULT_V2,
             label: "Generic",
             compatible_role_hints: &[],
             description: "Fallback prompt for custom roles without a specialized builder.",
@@ -256,7 +264,7 @@ pub fn effective_prompt_selection(
         .and_then(|intent| intent.builder_id.clone())
         .or_else(|| state_dispatch.and_then(|intent| intent.builder_id.clone()))
         .or_else(|| resolve_default_builder_id_for_role(role))
-        .unwrap_or_else(|| BUILDER_ID_GENERIC_DEFAULT_V1.to_string());
+        .unwrap_or_else(|| BUILDER_ID_GENERIC_DEFAULT_V2.to_string());
     let execution_policy = trigger_dispatch
         .and_then(|intent| intent.execution_policy.clone())
         .or_else(|| state_dispatch.and_then(|intent| intent.execution_policy.clone()))

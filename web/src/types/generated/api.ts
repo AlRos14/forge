@@ -351,6 +351,43 @@ export interface TaskExecutionObservability {
   total_cost_usd?: number | null
 }
 
+export interface PromptPreviewResponse {
+  system: string
+  user: string
+  tools: string[] | null
+}
+
+export interface MemorySearchQuery {
+  query: string
+  layer?: number | null
+  token_budget?: number | null
+  limit?: number | null
+  cursor?: string | null
+}
+
+export interface MemoryGetQuery {
+  layer?: number | null
+}
+
+export interface MemorySearchResultDto {
+  id: string
+  layer: number
+  content: string
+  score: number
+  source_type: string
+  source_id: string
+  project_id: string
+  task_id: string | null
+  created_at: string
+  creator: string | null
+}
+
+export interface MemorySearchResponse {
+  items: MemorySearchResultDto[]
+  has_more: boolean
+  next_cursor: string | null
+}
+
 // --- Paginated wrapper (matches api_types::PaginatedResponse<T>) ---
 
 export interface PaginatedResponse<T> {
@@ -505,7 +542,7 @@ export interface Project {
   name: string
   primary_repo_id: string | null
   settings: Record<string, unknown>
-  project_hooks: ProjectHookRule[]
+  project_hooks?: ProjectHookRule[]
   default_review_config?: ReviewConfig | null
   workflow_template_name?: string | null
   paused_at: string | null
@@ -698,6 +735,7 @@ export interface TransitionTaskRequest {
   version: number
   reason?: string | null
   source?: 'board_drag' | null
+  override?: boolean
 }
 
 export interface ClaimOverrides {

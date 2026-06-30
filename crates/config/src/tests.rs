@@ -88,9 +88,11 @@ terminal:
 
 #[test]
 fn terminal_config_rejects_task_limit_above_user_limit() {
-    let mut terminal = TerminalConfig::default();
-    terminal.max_sessions_per_task = 5;
-    terminal.max_sessions_per_user = 4;
+    let terminal = TerminalConfig {
+        max_sessions_per_task: 5,
+        max_sessions_per_user: 4,
+        ..Default::default()
+    };
 
     let error = terminal
         .validate()

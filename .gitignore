@@ -52,3 +52,4 @@ docs/spec/
 
 # Canonical generated TypeScript bindings live under web/src/types/generated.
 crates/api-types/bindings/ProjectHook*.ts
+.codegraph/

@@ -27,7 +27,7 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
     if !npx_package_available_offline([
         "--offline",
         "-y",
-        "@anthropic-ai/claude-code@2.1.62",
+        "@anthropic-ai/claude-code@2.1.150",
         "code",
         "--version",
     ]) {
@@ -48,11 +48,9 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
         description: "Create a file called HELLO.md in the repo root with the single word banana."
             .to_owned(),
         agent_config: json!({
-            "executor_type": "claude_code",
-            "config": {
-                "model": "claude-sonnet-4-6",
-                "effort": "medium"
-            }
+            "model": "claude-sonnet-4-6",
+            "effort": "medium",
+            "permission_policy": "supervised"
         }),
         logs_path: logs_path.to_string_lossy().into_owned(),
         heartbeat_interval_seconds: 30,
@@ -63,7 +61,11 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
     let adapter = ClaudeCodeAdapter::new();
     let result = tokio::time::timeout(Duration::from_secs(120), adapter.execute(ctx)).await??;
 
-    assert_eq!(result.status, ExecutionOutcome::Completed);
+    assert_eq!(
+        result.status,
+        ExecutionOutcome::Completed,
+        "unexpected Claude result: {result:?}"
+    );
     assert!(
         result.agent_session_id.is_some(),
         "expected Claude session id to be captured"

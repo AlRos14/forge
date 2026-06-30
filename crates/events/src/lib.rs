@@ -287,6 +287,7 @@ pub enum EventContext {
     },
     ProjectResumed {},
     DaemonRegistered {},
+    DaemonConnected {},
     DaemonReportReceived {
         detected_clis_count: usize,
     },

@@ -19,19 +19,40 @@ impl TaskService {
             ));
         }
 
-        let agent = match execution.agent_id.as_deref() {
-            Some(agent_id) => Some(
-                AgentRepo::get_by_id(&*self.db, agent_id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
-            ),
-            None => None,
-        };
-        let provider = self
-            .execution_provider_for_agent(agent.as_ref(), &execution.id)
-            .await?;
-        let params = self.execution_start_params(&execution).await?;
-        provider.start(params).await
+        let result = async {
+            let agent = match execution.agent_id.as_deref() {
+                Some(agent_id) => Some(
+                    AgentRepo::get_by_id(&*self.db, agent_id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
+                ),
+                None => None,
+            };
+            let provider = self
+                .execution_provider_for_agent(agent.as_ref(), &execution.id)
+                .await?;
+            let params = self.execution_start_params(&execution).await?;
+            provider.start(params).await
+        }
+        .await;
+
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let failure_message = error.to_string();
+                if let Err(mark_error) = self
+                    .fail_execution_before_dispatch(&execution.id, failure_message)
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %mark_error,
+                        "failed to mark execution failed after dispatch start error"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn run_execution(
@@ -174,7 +195,7 @@ impl TaskService {
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let assistant_turn_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let usage_provider = usage_provider(&agent_config);
+        let usage_provider = super::usage_provider_from_agent_config(&agent_config);
         let usage_model_fallback = usage_model_fallback(&agent_config);
 
         // Spawn a task that forwards log entries to the event bus
@@ -411,6 +432,14 @@ impl TaskService {
 
         super::publish_terminal_execution_event(self, &updated);
 
+        if let Err(error) = self
+            .memory_service
+            .record_execution_summary_if_present(&task.project_id, &updated)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
+
         if updated.status == ExecutionStatus::Completed {
             if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
                 tracing::warn!(
@@ -559,13 +588,16 @@ impl TaskService {
             })?
             .to_owned();
         let description = execution_description(execution, &task, &executor_config);
+        let max_turns = self.resolve_max_turns(&task).await?;
 
         Ok(api_types::ExecutionStartParams {
+            task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             workspace_path: workspace.worktree_path,
             executor_type,
             executor_config,
             prompt: json!({ "description": description }),
+            max_turns,
         })
     }
 }
@@ -582,21 +614,6 @@ fn execution_description(execution: &Execution, task: &Task, agent_config: &Valu
             .or_else(|| task.description.clone())
             .unwrap_or_else(|| task.title.clone())
     }
-}
-
-fn usage_provider(agent_config: &Value) -> String {
-    match agent_config
-        .get("executor_type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
-        "codex" => "openai",
-        "claude_code" => "anthropic",
-        "opencode" => "opencode",
-        other if !other.is_empty() => other,
-        _ => "unknown",
-    }
-    .to_owned()
 }
 
 fn usage_model_fallback(agent_config: &Value) -> Option<String> {
@@ -782,7 +799,7 @@ mod usage_tests {
             }
         });
 
-        assert_eq!(usage_provider(&snapshot), "openai");
+        assert_eq!(super::usage_provider_from_agent_config(&snapshot), "openai");
         assert_eq!(usage_model_fallback(&snapshot).as_deref(), Some("gpt-5.5"));
     }
 
@@ -794,10 +811,23 @@ mod usage_tests {
             "config": {}
         });
 
-        assert_eq!(usage_provider(&snapshot), "anthropic");
+        assert_eq!(
+            super::usage_provider_from_agent_config(&snapshot),
+            "anthropic"
+        );
         assert_eq!(
             usage_model_fallback(&snapshot).as_deref(),
             Some("claude-haiku-4-5")
         );
+    }
+
+    #[test]
+    fn cursor_usage_provider_maps_to_cursor() {
+        let snapshot = json!({
+            "executor_type": "cursor",
+            "config": {}
+        });
+
+        assert_eq!(super::usage_provider_from_agent_config(&snapshot), "cursor");
     }
 }

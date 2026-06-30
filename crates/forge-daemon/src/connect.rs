@@ -36,6 +36,10 @@ async fn dispatch_loop(
         responses_tx.clone(),
         workspace_root.as_ref().clone(),
     );
+    let daemon_runtime = forge_client::daemon_runtime::DaemonRuntime::new(
+        responses_tx.clone(),
+        workspace_root.as_ref().clone(),
+    );
     let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
     heartbeat.tick().await;
     let mut heartbeat_seq = 0_u64;
@@ -55,11 +59,13 @@ async fn dispatch_loop(
                         let responses_tx = responses_tx.clone();
                         let workspace_root = Arc::clone(&workspace_root);
                         let terminal = Arc::clone(&terminal);
+                        let daemon_runtime = Arc::clone(&daemon_runtime);
                         tokio::spawn(async move {
                             let response = commands::handle_request_with_terminal(
                                 frame,
                                 workspace_root.as_ref(),
                                 Some(&terminal),
+                                Some(&daemon_runtime),
                             )
                             .await;
                             if responses_tx.send(response).is_err() {

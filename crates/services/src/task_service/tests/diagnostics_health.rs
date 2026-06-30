@@ -113,3 +113,109 @@ async fn test_workflow_health_running_reviewer() {
         Some(crate::workflow::default_roles::REVIEWER)
     );
 }
+
+#[tokio::test]
+async fn test_workflow_health_stuck_when_coder_completed_without_transition() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    let coder_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        crate::workflow::default_states::IN_PROGRESS,
+    )
+    .await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&coder_id),
+    )
+    .await;
+    let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("role assignments load");
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&coder_id),
+        crate::workflow::default_roles::CODER,
+        ExecutionStatus::Completed,
+        Some("coder-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+
+    let health = crate::task_diagnostics::derive_workflow_health(
+        &task,
+        &workflow,
+        &role_assignments,
+        None,
+        Some(&execution),
+        false,
+        None,
+    );
+
+    assert_eq!(health.kind, api_types::WorkflowHealthKind::Stuck);
+    assert_eq!(health.severity, api_types::HealthSeverity::Warning);
+    assert_eq!(health.execution_id.as_deref(), Some(execution.id.as_str()));
+    assert_eq!(
+        health.stale_reason.as_deref(),
+        Some("execution_completed_without_transition")
+    );
+}
+
+#[tokio::test]
+async fn test_workflow_health_failed_when_coder_failed_without_block_marker() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    let coder_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        crate::workflow::default_states::IN_PROGRESS,
+    )
+    .await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&coder_id),
+    )
+    .await;
+    let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("role assignments load");
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&coder_id),
+        crate::workflow::default_roles::CODER,
+        ExecutionStatus::Failed,
+        Some("coder-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+
+    let health = crate::task_diagnostics::derive_workflow_health(
+        &task,
+        &workflow,
+        &role_assignments,
+        None,
+        Some(&execution),
+        false,
+        None,
+    );
+
+    assert_eq!(health.kind, api_types::WorkflowHealthKind::Failed);
+    assert_eq!(health.severity, api_types::HealthSeverity::Error);
+    assert_eq!(health.execution_id.as_deref(), Some(execution.id.as_str()));
+    assert_eq!(
+        health.stale_reason.as_deref(),
+        Some("execution_failed_without_task_block")
+    );
+}

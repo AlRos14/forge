@@ -1,7 +1,7 @@
 import { cn } from '@/lib/cn'
 import type { WorkflowHealthSummary } from '@/types/generated'
 
-const prominentKinds = new Set(['blocked', 'failed'])
+const prominentKinds = new Set(['blocked', 'failed', 'stuck'])
 
 export function workflowLabelFromKind(value: string): string {
   return value

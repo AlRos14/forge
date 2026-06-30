@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CODEX_VERSION: &str = "0.125.0";
+const DEFAULT_CODEX_VERSION: &str = "0.133.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
 
@@ -253,11 +253,10 @@ impl CodingExecutorAdapter for CodexAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![
+                "gpt-5.5".into(),
                 "gpt-5.4".into(),
-                "gpt-5.4-fast".into(),
-                "gpt-5.3-codex".into(),
-                "gpt-5.2-codex".into(),
-                "gpt-5.1-codex-max".into(),
+                "gpt-5.4-mini".into(),
+                "gpt-5.3-codex-spark".into(),
             ],
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
             cli_specific: json!({
@@ -828,7 +827,7 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-y", "@openai/codex@0.125.0", "app-server", "--verbose"]
+            vec!["-y", "@openai/codex@0.133.0", "app-server", "--verbose"]
         );
     }
 

@@ -227,7 +227,7 @@ export function RepoForm({
     !pending &&
     !branchQuery.isFetching &&
     (form.source_mode === 'local'
-      ? Boolean(form.local_path.trim()) && (!daemonSelectionRequired || Boolean(daemonId))
+      ? Boolean(form.local_path.trim())
       : Boolean(form.remote_url.trim()))
 
   const navigateTo = (path: string) => {

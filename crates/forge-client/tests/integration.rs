@@ -53,6 +53,28 @@ async fn forge_client_creates_and_gets_project() {
 }
 
 #[tokio::test]
+async fn forge_client_lists_projects_when_project_hooks_is_missing() {
+    let Some(server) = TestServer::spawn().await else {
+        return;
+    };
+    let created = create_project(&server.client, "Legacy List Project").await;
+
+    let projects: PaginatedResponse<ProjectResponse> = server
+        .client
+        .get("/api/v1/projects")
+        .await
+        .expect("list projects");
+
+    let project = projects
+        .items
+        .iter()
+        .find(|project| project.id == created.id)
+        .expect("created project should be listed");
+    assert_eq!(project.name, "Legacy List Project");
+    assert!(project.project_hooks.is_empty());
+}
+
+#[tokio::test]
 async fn forge_client_creates_repo_and_lists_repos() {
     let Some(server) = TestServer::spawn().await else {
         return;
@@ -214,7 +236,10 @@ impl Drop for TestServer {
 
 fn test_router(state: TestState) -> Router {
     Router::new()
-        .route("/api/v1/projects", post(create_project_route))
+        .route(
+            "/api/v1/projects",
+            get(list_projects_route).post(create_project_route),
+        )
         .route("/api/v1/projects/{project_id}", get(get_project_route))
         .route(
             "/api/v1/projects/{project_id}/repos",
@@ -253,6 +278,27 @@ async fn create_project_route(
     };
     data.projects.insert(project.id.clone(), project.clone());
     Json(project)
+}
+
+async fn list_projects_route(State(state): State<TestState>) -> Json<serde_json::Value> {
+    let items: Vec<_> = state
+        .inner
+        .lock()
+        .expect("lock test state")
+        .projects
+        .values()
+        .cloned()
+        .map(|project| {
+            let mut value = serde_json::to_value(project).expect("serialize project");
+            value
+                .as_object_mut()
+                .expect("project serializes to object")
+                .remove("project_hooks");
+            value
+        })
+        .collect();
+
+    Json(serde_json::to_value(paginated(items)).expect("serialize project list"))
 }
 
 async fn get_project_route(

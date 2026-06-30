@@ -66,7 +66,9 @@ async fn forge_mvp_rest_api_flow() {
         &app,
         Method::POST,
         &format!("/api/v1/projects/{project_id}/tasks"),
-        json!({ "title": "E2E test task" }),
+        // The shell executor uses the task description as the command. Keep it
+        // running long enough for the cancellation request to be deterministic.
+        json!({ "title": "E2E test task", "description": "sleep 5" }),
         StatusCode::OK,
     )
     .await;

@@ -60,6 +60,7 @@ impl TaskExecutor for ShellExecutor {
             .env_remove("GIT_INDEX_FILE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_process_group(&mut command);
         if let Some(max_turns) = ctx.max_turns {
             command.env("FORGE_MAX_TURNS", max_turns.to_string());
         }
@@ -123,11 +124,22 @@ impl TaskExecutor for ShellExecutor {
         }
 
         let mut child = process.child.lock().await;
+        if let Some(child_id) = child.id() {
+            let _ = send_sigkill(child_id).await;
+        }
         child.start_kill()?;
 
         Ok(())
     }
 }
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
 
 impl ShellExecutor {
     fn insert_process(
@@ -325,8 +337,28 @@ async fn write_output_event(
 }
 
 async fn send_sigterm(pid: u32) -> std::io::Result<()> {
+    send_signal(pid, "TERM").await
+}
+
+async fn send_sigkill(pid: u32) -> std::io::Result<()> {
+    send_signal(pid, "KILL").await
+}
+
+#[cfg(unix)]
+async fn send_signal(pid: u32, signal: &str) -> std::io::Result<()> {
     Command::new("kill")
-        .arg("-TERM")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .status()
+        .await
+        .map(|_| ())
+}
+
+#[cfg(not(unix))]
+async fn send_signal(pid: u32, signal: &str) -> std::io::Result<()> {
+    Command::new("kill")
+        .arg(format!("-{signal}"))
         .arg(pid.to_string())
         .status()
         .await

@@ -311,6 +311,7 @@ fn initialize_returns_correct_protocol_version() {
             .await
             .expect("initialize succeeds");
         assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
     });
 }
 
@@ -336,6 +337,8 @@ fn tools_list_returns_descriptors() {
             "forge_create_sub_tasks",
             "forge_create_task",
             "forge_follow_up_execution",
+            "forge_memory_get",
+            "forge_memory_search",
             "forge_get_project",
             "forge_get_task",
             "forge_get_task_diff",
@@ -344,6 +347,7 @@ fn tools_list_returns_descriptors() {
             "forge_list_projects",
             "forge_list_task_dependencies",
             "forge_list_tasks",
+            "forge_preview_prompt",
             "forge_register_agent",
             "forge_remove_task_dependency",
             "forge_transition_task",
@@ -389,6 +393,16 @@ fn scoped_tools_list_marks_project_id_optional() {
 
         assert!(required.iter().any(|value| value == "title"));
         assert!(!required.iter().any(|value| value == "project_id"));
+
+        let memory_search = tools
+            .iter()
+            .find(|tool| tool["name"] == "forge_memory_search")
+            .expect("memory search descriptor exists");
+        let memory_required = memory_search["inputSchema"]["required"]
+            .as_array()
+            .expect("required is an array");
+        assert!(memory_required.iter().any(|value| value == "project_id"));
+        assert!(memory_required.iter().any(|value| value == "query"));
     });
 }
 

@@ -21,7 +21,7 @@ import { DropdownMenuItem } from '@/components/ui/dropdown-menu'
 import { TaskDetailModal } from '@/components/task-detail-modal'
 import { Button } from '@/components/ui/button'
 import { taskStatusTransitions } from '@/components/task-controls'
-import { toastApiError } from '@/lib/api-error'
+import { getApiErrorCode, toastApiError } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import {
   type ColumnGroup,
@@ -412,12 +412,17 @@ export function KanbanBoard({ projectId }: { projectId: string }) {
       {
         taskId: task.id,
         body: { status: toStatus, version: task.version, source: options?.source },
+        currentStatus: task.status,
       },
       {
         onError: (error) => {
           setTasks(previousTasks)
           options?.onError?.()
-          if (error instanceof ApiError && error.status === 409) {
+          if (
+            error instanceof ApiError &&
+            error.status === 409 &&
+            getApiErrorCode(error) === 'version_conflict'
+          ) {
             toast.error('Version conflict — task was updated')
             return
           }

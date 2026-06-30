@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::{
-    agent_capacity::count_running_executions_excluding_conversation, Result, ServiceError,
+    agent_capacity::count_running_executions_excluding_conversation, memory::MemoryService, Result,
+    ServiceError,
 };
 
 #[derive(Clone)]
@@ -24,15 +25,23 @@ pub struct ConversationService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     inflight: Arc<Mutex<HashMap<String, String>>>,
+    memory_service: Arc<MemoryService>,
 }
 
 impl ConversationService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         Self {
             db,
             event_bus,
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            memory_service,
         }
+    }
+
+    pub fn with_memory_service(mut self, memory_service: Arc<MemoryService>) -> Self {
+        self.memory_service = memory_service;
+        self
     }
 
     pub async fn create_conversation(
@@ -382,6 +391,12 @@ impl ConversationService {
             },
         )
         .await?;
+        if let Err(error) = self
+            .index_conversation_message_memory(&conversation, &user_message)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
 
         let assistant_message = ConversationMessageRepo::create(
             &*self.db,
@@ -493,6 +508,12 @@ impl ConversationService {
                 &updated,
                 None,
             );
+            if let Err(error) = self
+                .index_conversation_message_memory(&conversation, &updated)
+                .await
+            {
+                tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+            }
         }
         Ok(())
     }
@@ -555,6 +576,14 @@ impl ConversationService {
                         },
                     )
                     .await;
+                }
+            }
+            if let Ok(updated) = &updated {
+                if let Err(index_error) = self
+                    .index_conversation_message_memory(&conversation, updated)
+                    .await
+                {
+                    tracing::warn!(error = %index_error, "memory indexing failed (non-fatal)");
                 }
             }
             self.publish_message_completed(
@@ -712,6 +741,12 @@ impl ConversationService {
             },
         )
         .await?;
+        if let Err(error) = self
+            .index_conversation_message_memory(conversation, &updated)
+            .await
+        {
+            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+        }
         if let Some(session_id) = result.agent_session_id {
             let latest = self.get_conversation(conversation.id.clone()).await?;
             let _ = ConversationRepo::update(
@@ -825,6 +860,26 @@ impl ConversationService {
                 status: message.status.to_string(),
             },
         });
+    }
+
+    async fn index_conversation_message_memory(
+        &self,
+        conversation: &Conversation,
+        message: &ConversationMessage,
+    ) -> Result<()> {
+        self.memory_service
+            .record_conversation_message(
+                &conversation.project_id,
+                conversation.agent_id.as_deref(),
+                &message.id,
+                &conversation.id,
+                &message.role.to_string(),
+                &message.status.to_string(),
+                &message.content,
+                message.error.as_deref(),
+            )
+            .await?;
+        Ok(())
     }
 
     fn publish_message_completed(
@@ -1021,7 +1076,7 @@ fn build_executor_config(
             } else {
                 map.remove("resume_fallback_prompt");
             }
-        } else if executor_type == "claude_code" {
+        } else if executor_type == "claude_code" || executor_type == "cursor" {
             map.insert(
                 "resume_session_id".to_owned(),
                 Value::String(session_id.to_owned()),

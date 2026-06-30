@@ -267,6 +267,12 @@ pub struct DependencyGate;
 #[async_trait]
 impl HookAction for DependencyGate {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        if ctx.triggered_by.starts_with("user:") {
+            return HookResult::Skipped {
+                reason: "user-managed transition bypasses dependency gate".to_string(),
+            };
+        }
+
         let Some(to_state) = ctx
             .workflow
             .states

@@ -1,4 +1,4 @@
-use crate::{models::*, pagination::*, Result};
+use crate::{models::*, pagination::*, DbError, Result};
 use async_trait::async_trait;
 use sqlx::{Sqlite, Transaction};
 
@@ -102,6 +102,7 @@ pub trait DaemonRepo: Send + Sync {
     async fn list_visible(&self, user_id: Option<&str>, page: PageRequest) -> Result<Page<Daemon>>;
     async fn get_visible(&self, id: &str, user_id: Option<&str>) -> Result<Option<Daemon>>;
     async fn update_report(&self, input: UpdateDaemonReport) -> Result<Daemon>;
+    async fn mark_online(&self, id: &str, last_report_at: &str) -> Result<Daemon>;
     async fn mark_offline(&self, id: &str, updated_at: &str) -> Result<Daemon>;
     async fn list_available_for_executor(&self, executor_type: &str) -> Result<Vec<Daemon>>;
 }
@@ -164,6 +165,38 @@ pub trait ConversationMessageRepo: Send + Sync {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationMessage>>;
+}
+
+#[async_trait]
+pub trait MemoryRepository: Send + Sync {
+    async fn insert_memory_item(&self, item: &MemoryItem) -> std::result::Result<(), DbError>;
+    async fn get_memory_item(&self, id: &str) -> std::result::Result<Option<MemoryItem>, DbError>;
+    async fn memory_source_exists(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_ref: &str,
+    ) -> std::result::Result<bool, DbError>;
+    async fn memory_source_exists_with_confidence(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_ref: &str,
+        confidence: &str,
+    ) -> std::result::Result<bool, DbError>;
+    async fn search_memory_items(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> std::result::Result<(Vec<MemoryItem>, bool), DbError>;
+    async fn list_memory_items_by_source(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_id: &str,
+    ) -> std::result::Result<Vec<MemoryItem>, DbError>;
 }
 
 #[async_trait]

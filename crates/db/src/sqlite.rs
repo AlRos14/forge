@@ -36,6 +36,7 @@ mod execution;
 mod execution_usage;
 mod external_link;
 mod integration;
+mod memory;
 mod notification;
 mod oauth_authorization_code;
 mod oauth_client;

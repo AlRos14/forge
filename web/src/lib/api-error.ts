@@ -25,6 +25,16 @@ export function getApiErrorMessage(error: unknown, fallback = 'Request failed'):
   return fallback
 }
 
+export function getApiErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof ApiError)) return undefined
+  try {
+    const parsed = JSON.parse(error.message) as { code?: unknown }
+    return typeof parsed.code === 'string' ? parsed.code : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function toastApiError(error: unknown, fallback?: string): void {
   toast.error(getApiErrorMessage(error, fallback))
 }

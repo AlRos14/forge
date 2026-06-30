@@ -5,7 +5,7 @@ use db::SqliteDb;
 use events::EventBus;
 use executors::{AdapterExecutor, AdapterRegistry, TaskExecutor};
 use services::{
-    AgentService, AuthService, ConversationService, DaemonService, MergeService,
+    AgentService, AuthService, ConversationService, DaemonService, MemoryService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
     TaskService, TerminalActivityTracker, TerminalService, WorkspaceCleanupScheduler,
     WorkspaceExecutionLockManager,
@@ -64,6 +64,7 @@ pub struct AppState {
     pub conversation_service: Arc<ConversationService>,
     pub workflow_template_service:
         Arc<services::workflow::template_service::WorkflowTemplateService>,
+    pub memory_service: Arc<MemoryService>,
     pub merge_service: Arc<MergeService>,
     pub notification_service: Arc<NotificationService>,
     pub project_hook_service: Arc<ProjectHookService>,
@@ -162,6 +163,7 @@ impl AppState {
         let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
+        let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         let workflow_template_service = Arc::new(
             services::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
         );
@@ -198,6 +200,7 @@ impl AppState {
                 .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
                 .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
                 .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
+                .with_memory_service(Arc::clone(&memory_service))
                 .with_workspace_root(workspace_root.clone()),
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
@@ -229,10 +232,10 @@ impl AppState {
         let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
-        let conversation_service = Arc::new(ConversationService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-        ));
+        let conversation_service = Arc::new(
+            ConversationService::new(Arc::clone(&db), Arc::clone(&event_bus))
+                .with_memory_service(Arc::clone(&memory_service)),
+        );
         let auth_service = Arc::new(AuthService::new(
             Arc::clone(&db),
             b"test-jwt-secret-for-development".to_vec(),
@@ -252,6 +255,7 @@ impl AppState {
             daemon_connections,
             conversation_service,
             workflow_template_service,
+            memory_service,
             merge_service,
             notification_service,
             project_hook_service,

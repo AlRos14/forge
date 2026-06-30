@@ -13,7 +13,6 @@ api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
 executors = { path = "../executors" }
 forge-client = { path = "../forge-client" }
-git = { path = "../git" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }

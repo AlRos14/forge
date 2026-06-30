@@ -67,7 +67,8 @@ By default the server:
   from `~/.forge/server.json` on later starts.
 - Creates `~/.forge/forge.db` (SQLite, WAL mode).
 - Boots an embedded daemon that auto-registers and reports installed CLIs
-  (`shell` always, plus `codex` / `claude_code` / `opencode` when on `PATH`).
+  (`shell` always, plus `codex` / `claude_code` / `cursor` / `gemini` /
+  `opencode` when on `PATH`).
 - Upserts default executor profiles from the adapter registry.
 
 Open the `management_url` printed in the server logs for the web UI. For raw
@@ -116,6 +117,10 @@ curl -sS -X POST "$FORGE_URL/api/v1/agents" \
     "daemon_id": "<daemon-id-from-above>"
   }'
 ```
+
+For Cursor, use `"executor_type": "cursor"`. Forge runs `cursor-agent` in
+headless print mode with stream JSON output; set `CURSOR_API_KEY` or run
+`cursor-agent login` first so the daemon reports it as authenticated.
 
 The `shell` executor is always available and useful for scripted tests — see the
 walkthrough below.
@@ -197,8 +202,12 @@ Full CLI reference → [docs/cli.md](cli.md).
 
 `forge-ctl daemon link` registers the current machine with a running Forge
 server, saves daemon credentials, reports local CLI availability, and keeps
-sending heartbeats. In the web UI: **Daemons → Link daemon** generates a token
-and prints the full command:
+sending heartbeats. While it is running, it also keeps the daemon command
+stream open so Forge can browse local paths and dispatch agents on that
+machine. Forge marks the daemon offline when that command stream disconnects,
+and after a server restart until the daemon reconnects.
+In the web UI: **Daemons → Link daemon** generates a token and prints the full
+command:
 
 ```bash
 forge-ctl daemon link \
@@ -208,9 +217,26 @@ forge-ctl daemon link \
 
 The token is used only for initial ownership; the daemon receives and stores its
 own registration token afterward. Use `--once` for a one-shot
-registration/report. Full remote execution depends on the remote-daemon
-transport work; today this makes the machine visible for daemon/CLI inventory
-and agent pinning.
+registration/report only; `--once` does not keep the command stream open for
+filesystem browsing or execution dispatch.
+
+After the first link, restart the daemon from its saved credentials with:
+
+```bash
+forge-ctl daemon start \
+  --workspace-root "$HOME/.forge/workspaces"
+```
+
+`daemon start` does not register or claim the daemon again; it just reports
+local CLI availability and keeps the command stream open. `daemon link` and
+`daemon start` create the configured workspace root if it does not already
+exist, so filesystem browsing can open the launch directory immediately.
+
+Execution dispatch expects the server-created task worktree to exist at the same
+absolute path on the daemon host. For containers, mount the server workspace
+root into the container at that same path. A daemon on an unrelated filesystem
+can still serve filesystem browsing under its own `--workspace-root`, but it
+cannot run server-created task worktrees yet.
 
 ## Where to next
 
