@@ -87,13 +87,11 @@ required action strings such as `dispatch_agent.agent_id`.
 ## Task transitions
 
 `POST /api/v1/tasks/{id}/transition` accepts `status`, `version`, optional
-`reason`, optional `source`, and optional `override` (boolean, default `false`).
-When a user move would fail strict routing (missing edge or system-only
-trigger) but the target is a defined workflow state, the server auto-escalates
-to the user-routing-override path regardless of `override`; the flag signals
-explicit client intent only. MCP `forge_transition_task` is unchanged — it still
-emits `triggered_by="system"` and does not support user override (REST-only for
-now).
+`reason`, and optional `source`. When a user move would fail strict routing
+(missing edge or system-only trigger) but the target is a defined workflow
+state, the server auto-escalates to the user-routing-override path. MCP
+`forge_transition_task` is unchanged — it still emits `triggered_by="system"`
+and does not support user override (REST-only for now).
 
 ## Task Diffs
 

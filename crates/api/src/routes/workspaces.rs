@@ -1,26 +1,14 @@
-use api_types::{DiffEnvelope, WorkspaceResponse};
+use api_types::DiffEnvelope;
 use axum::{
     extract::{Path, State},
     Json,
 };
-use db::WorkspaceRepo;
 use services::{DiffService, ServiceError};
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::workspace_response,
     state::AppState,
 };
-
-pub async fn get_workspace(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<WorkspaceResponse>> {
-    let workspace = WorkspaceRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("workspace", id))?;
-    Ok(Json(workspace_response(workspace)))
-}
 
 pub async fn get_workspace_diff(
     State(state): State<AppState>,

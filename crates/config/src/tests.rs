@@ -363,6 +363,78 @@ fn server_state_round_trips_in_data_dir() {
     assert!(server_state_path(dir.path()).ends_with("server.json"));
 }
 
+#[test]
+fn resolve_jwt_secret_uses_config_value_when_set() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let mut config = ForgeConfig::default();
+    config.forge.data_dir = dir.path().to_path_buf();
+    config.server.jwt_secret = Some("configured-secret-value".to_owned());
+
+    let secret = config.resolve_jwt_secret().expect("secret resolves");
+    assert_eq!(secret, b"configured-secret-value");
+    assert!(!config.jwt_secret_path().exists());
+}
+
+#[test]
+fn resolve_jwt_secret_reads_persisted_file_when_config_is_unset() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let mut config = ForgeConfig::default();
+    config.forge.data_dir = dir.path().to_path_buf();
+    let secret_path = config.jwt_secret_path();
+    let persisted = vec![7_u8; 32];
+    fs::write(&secret_path, &persisted).expect("write secret file");
+
+    let secret = config.resolve_jwt_secret().expect("secret resolves");
+    assert_eq!(secret, persisted);
+}
+
+#[test]
+fn resolve_jwt_secret_generates_persists_and_reuses_secret_file() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let mut config = ForgeConfig::default();
+    config.forge.data_dir = dir.path().to_path_buf();
+    let secret_path = config.jwt_secret_path();
+    assert!(!secret_path.exists());
+
+    let first = config.resolve_jwt_secret().expect("first resolve");
+    assert!(secret_path.is_file());
+    assert_eq!(first.len(), 32);
+    assert_eq!(fs::read(&secret_path).expect("read secret file"), first);
+
+    let second = config.resolve_jwt_secret().expect("second resolve");
+    assert_eq!(second, first);
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_jwt_secret_persists_file_with_restricted_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let mut config = ForgeConfig::default();
+    config.forge.data_dir = dir.path().to_path_buf();
+
+    config.resolve_jwt_secret().expect("secret resolves");
+
+    let mode = fs::metadata(config.jwt_secret_path())
+        .expect("secret file metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
 fn clear_forge_env() {
     for key in [
         "FORGE_SERVER_BIND",

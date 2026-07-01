@@ -11,7 +11,11 @@ use services::{
     WorkspaceExecutionLockManager,
 };
 use tokio::sync::watch;
+use uuid::Uuid;
 use workspace::RepoCacheLockManager;
+
+const TEST_JWT_SECRET: &[u8] = b"test-jwt-secret-for-development";
+const TEST_BCRYPT_COST: u32 = 4;
 
 #[derive(Clone)]
 pub struct ShutdownSignal {
@@ -115,7 +119,7 @@ impl AppState {
         shutdown_signal: ShutdownSignal,
     ) -> Self {
         let workspace_root = default_workspace_root();
-        let workflows_dir = std::env::temp_dir().join("forge-test-workflows");
+        let workflows_dir = test_workflows_dir();
         let merge_service = Arc::new(MergeService::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -141,6 +145,8 @@ impl AppState {
             review_runner,
             shutdown_signal,
             workflows_dir,
+            test_jwt_secret(),
+            test_bcrypt_cost(),
         )
     }
 
@@ -155,6 +161,8 @@ impl AppState {
         review_runner: Arc<review::ReviewRunner>,
         shutdown_signal: ShutdownSignal,
         workflows_dir: PathBuf,
+        jwt_secret: Vec<u8>,
+        bcrypt_cost: u32,
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
@@ -236,11 +244,7 @@ impl AppState {
             ConversationService::new(Arc::clone(&db), Arc::clone(&event_bus))
                 .with_memory_service(Arc::clone(&memory_service)),
         );
-        let auth_service = Arc::new(AuthService::new(
-            Arc::clone(&db),
-            b"test-jwt-secret-for-development".to_vec(),
-            4, // low cost for tests
-        ));
+        let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
         let oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&db),
             Arc::clone(&auth_service),
@@ -325,6 +329,18 @@ fn default_workspace_root() -> PathBuf {
     std::env::var("FORGE_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("forge").join("worktrees"))
+}
+
+pub fn test_workflows_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("forge-test-workflows-{}", Uuid::new_v4()))
+}
+
+pub fn test_jwt_secret() -> Vec<u8> {
+    TEST_JWT_SECRET.to_vec()
+}
+
+pub fn test_bcrypt_cost() -> u32 {
+    TEST_BCRYPT_COST
 }
 
 fn effective_config_for_workspace(workspace_root: PathBuf) -> ForgeConfig {

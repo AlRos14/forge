@@ -468,6 +468,7 @@ dependencies = [
 name = "config"
 version = "0.1.11"
 dependencies = [
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "serde_yaml",

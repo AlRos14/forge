@@ -217,8 +217,8 @@ tasks. Automatic subtask lifecycle in subtask-workflow states is unchanged.
 **User routing override:** When a user actor's move would be rejected solely
 because (a) no trigger edge connects the states or (b) the matching trigger is
 system-only (`Fail`/`Retry`), and `B` is a defined state in the applicable
-workflow, the engine completes the transition via a user-routing-override path
-(`WorkflowEngine::user_override_transition`): `before_exit`/`before_enter`
+workflow, the engine completes the transition via a user-routing-override arm
+inside `transition_inner`: `before_exit`/`before_enter`
 content guards still run and may block; `on_enter`/`after_enter` hooks run
 normally; `task.status_changed` is published unconditionally; agent dispatch fires
 only when a role/agent is assigned. Override transitions are audited as
@@ -342,7 +342,7 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
   execution sharing the executor's workspace. Depends only on `db`, `events`,
   `executors` — not on `api` or `services`.
-- **api** — Routes in `routes/{projects,tasks,terminals,agents,repos,executions,events,daemons,clis,profiles,runtimes,executor_types}.rs`.
+- **api** — Routes in `routes/{projects,tasks,terminals,agents,repos,executions,events,daemons,clis,profiles,executor_types}.rs`.
   Error module is `errors.rs` (plural). Middleware adds request IDs and CORS.
   `claim_task` auto-dispatches the executor.
 - **executors** — `LogWriter` appends JSONL with schema version + sequence

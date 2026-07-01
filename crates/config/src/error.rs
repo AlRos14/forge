@@ -18,6 +18,10 @@ pub enum ConfigError {
     InvalidConfig {
         message: String,
     },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -37,6 +41,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "invalid environment variable {key}={value:?}: {message}")
             }
             Self::InvalidConfig { message } => write!(f, "invalid config: {message}"),
+            Self::Write { path, source } => {
+                write!(f, "failed to write {}: {source}", path.display())
+            }
         }
     }
 }
@@ -47,6 +54,7 @@ impl std::error::Error for ConfigError {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::InvalidEnv { .. } | Self::InvalidConfig { .. } => None,
+            Self::Write { source, .. } => Some(source),
         }
     }
 }

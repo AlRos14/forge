@@ -1,6 +1,6 @@
 use anyhow::Result;
+use api_types::MemoryBackfillResponse;
 use clap::Subcommand;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{client::ForgeClient, output::print_json, OutputFormat};
@@ -14,20 +14,6 @@ pub struct MemoryArgs {
 #[derive(Subcommand)]
 enum MemoryCmd {
     Backfill,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct MemoryBackfillResponse {
-    items: Vec<MemoryBackfillTypeResponse>,
-    indexed: u64,
-    skipped: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct MemoryBackfillTypeResponse {
-    source_type: String,
-    indexed: u64,
-    skipped: u64,
 }
 
 impl MemoryArgs {

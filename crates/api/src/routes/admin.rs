@@ -1,11 +1,14 @@
-use api_types::{AdminUserResponse, SettingResponse, UpdateAdminRequest, UpsertSettingRequest};
+use api_types::{
+    AdminUserListResponse, AdminUserResponse, MemoryBackfillResponse, MemoryBackfillTypeResponse,
+    SettingListResponse, SettingResponse, UpdateAdminRequest, UpsertSettingRequest,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use db::{PageRequest, SortBy, SortOrder, SystemSettingRepo, User, UserRepo};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -17,32 +20,6 @@ use crate::{
 pub struct ListUsersParams {
     pub limit: Option<i64>,
     pub cursor: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminUserListResponse {
-    pub items: Vec<AdminUserResponse>,
-    pub next_cursor: Option<String>,
-    pub has_more: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SettingListResponse {
-    pub items: Vec<SettingResponse>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MemoryBackfillResponse {
-    pub items: Vec<MemoryBackfillTypeResponse>,
-    pub indexed: u64,
-    pub skipped: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MemoryBackfillTypeResponse {
-    pub source_type: String,
-    pub indexed: u64,
-    pub skipped: u64,
 }
 
 pub async fn list_users(

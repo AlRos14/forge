@@ -53,13 +53,19 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", web_dir.join("src").display());
 
-    if env::var_os("FORGE_SKIP_WEB_BUILD").is_some() {
-        println!("cargo:warning=skipping frontend build because FORGE_SKIP_WEB_BUILD is set");
+    if env_is_truthy("FORGE_SKIP_WEB_BUILD") {
+        println!("cargo:warning=skipping web build (FORGE_SKIP_WEB_BUILD set)");
         return;
     }
 
     run(&web_dir, "pnpm", &["install", "--frozen-lockfile"]);
     run(&web_dir, "pnpm", &["run", "build"]);
+}
+
+fn env_is_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 fn run(web_dir: &Path, program: &str, args: &[&str]) {

@@ -271,18 +271,6 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/api/v1/tasks/{id}/diff", get(routes::tasks::get_task_diff))
         .route(
-            "/api/v1/tasks/{id}/rebase",
-            post(routes::tasks::rebase_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/conflicts",
-            get(routes::tasks::get_conflict_state),
-        )
-        .route(
-            "/api/v1/tasks/{id}/conflicts/abort",
-            post(routes::tasks::abort_task_conflict),
-        )
-        .route(
             "/api/v1/tasks/{id}/dependencies",
             post(routes::tasks::add_dependency).get(routes::tasks::list_dependencies),
         )
@@ -349,14 +337,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/review/reject",
             post(routes::tasks::reject_review),
-        )
-        .route(
-            "/api/v1/tasks/{id}/gates/approve",
-            post(routes::tasks::gate_approve),
-        )
-        .route(
-            "/api/v1/tasks/{id}/gates/reject",
-            post(routes::tasks::gate_reject),
         )
         .route(
             "/api/v1/tasks/{id}/reviews",
@@ -508,8 +488,6 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/daemons/{id}/report",
             post(routes::daemons::report_daemon),
         )
-        .route("/api/v1/runtimes", get(routes::runtimes::list_runtimes))
-        .route("/api/v1/runtimes/{id}", get(routes::runtimes::get_runtime))
         .route(
             "/api/v1/tasks/{id}/executions",
             get(routes::executions::list_executions),
@@ -545,10 +523,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/usage",
             get(routes::executions::get_task_usage),
-        )
-        .route(
-            "/api/v1/workspaces/{id}",
-            get(routes::workspaces::get_workspace),
         )
         .route(
             "/api/v1/workspaces/{id}/diff",

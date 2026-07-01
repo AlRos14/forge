@@ -140,44 +140,6 @@ impl WorkflowEngine {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn user_override_transition(
-        &self,
-        task_id: &str,
-        target_state: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        triggered_by: &str,
-        reason: &str,
-        rejection: bool,
-    ) -> crate::Result<TransitionResult> {
-        if !triggered_by.starts_with("user:") {
-            return Err(ServiceError::invalid_operation(
-                "user_override_transition requires a user-scoped triggered_by (got a non-user actor)",
-            ));
-        }
-        let override_triggered_by = if triggered_by.starts_with("user:override:") {
-            triggered_by.to_string()
-        } else if let Some(source) = triggered_by.strip_prefix("user:") {
-            format!("user:override:{source}")
-        } else {
-            unreachable!("triggered_by validated to start with user:")
-        };
-        self.transition_inner(
-            task_id.to_string(),
-            target_state.to_string(),
-            version,
-            workflow,
-            override_triggered_by,
-            reason.to_string(),
-            rejection,
-            false,
-            None,
-            0,
-        )
-        .await
-    }
-
     pub async fn retry_entry_barrier(
         &self,
         task_id: &str,

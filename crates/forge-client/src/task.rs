@@ -160,7 +160,6 @@ impl TaskArgs {
                     version: *version,
                     reason: None,
                     source: None,
-                    r#override: None,
                 };
                 let response: TransitionTaskResponse = client
                     .post(&format!("/api/v1/tasks/{id}/transition"), &request)

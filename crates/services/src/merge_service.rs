@@ -51,12 +51,6 @@ pub enum MergeStrategy {
     Rebase,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConflictState {
-    pub operation: git::ConflictOperation,
-    pub conflict_paths: Vec<String>,
-}
-
 impl MergeService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, workspace_root: PathBuf) -> Self {
         Self {
@@ -245,113 +239,6 @@ impl MergeService {
             branch: source_branch,
             target_branch,
         })
-    }
-
-    /// Rebase the task branch onto the target branch inside the worktree.
-    pub async fn rebase(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
-        let task_id = task_id.into();
-        let (worktree_path, target_branch) = self.resolve_task_worktree(&task_id).await?;
-
-        if !git::is_worktree_clean(&worktree_path).await? {
-            return Ok(MergeOutcome::Dirty {
-                files: git::status_porcelain(&worktree_path).await?,
-            });
-        }
-
-        let before_sha = git::get_current_sha(&worktree_path).await?;
-
-        match git::rebase(&worktree_path, &target_branch).await {
-            Ok(()) => {
-                let after_sha = git::get_current_sha(&worktree_path).await?;
-                Ok(MergeOutcome::Done {
-                    before_sha,
-                    after_sha,
-                    branch: target_branch,
-                })
-            }
-            Err(git::GitError::MergeConflict { stderr, .. }) => {
-                let paths = git::conflict_paths(&worktree_path)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect();
-                if let Err(error) = git::abort_rebase(&worktree_path).await {
-                    tracing::warn!(%task_id, %error, "failed to abort rebase");
-                }
-                Ok(MergeOutcome::Conflict {
-                    details: stderr,
-                    conflict_paths: paths,
-                })
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Query the conflict state of a task's worktree.
-    pub async fn conflict_state(&self, task_id: impl Into<String>) -> Result<ConflictState> {
-        let task_id = task_id.into();
-        let (worktree_path, _) = self.resolve_task_worktree(&task_id).await?;
-
-        let operation = git::detect_conflict_state(&worktree_path).await?;
-        let conflict_paths = if operation != git::ConflictOperation::None {
-            git::conflict_paths(&worktree_path)
-                .await
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        Ok(ConflictState {
-            operation,
-            conflict_paths,
-        })
-    }
-
-    /// Abort any in-progress conflict operation on a task's worktree.
-    pub async fn abort_conflict(&self, task_id: impl Into<String>) -> Result<()> {
-        let task_id = task_id.into();
-        let (worktree_path, _) = self.resolve_task_worktree(&task_id).await?;
-        git::abort_conflict(&worktree_path).await?;
-        Ok(())
-    }
-
-    /// Shared helper: resolve a task to its workspace's worktree path and target branch.
-    async fn resolve_task_worktree(&self, task_id: &str) -> Result<(PathBuf, String)> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::NotFound {
-                entity: "task",
-                id: task_id.to_owned(),
-            })?;
-        let execution = latest_executor_execution(&self.db, task_id).await?;
-        let workspace_id =
-            execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::InvalidOperation {
-                    message: "executor execution missing workspace_id".to_owned(),
-                })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::NotFound {
-                entity: "workspace",
-                id: workspace_id.to_owned(),
-            })?;
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
-            .await?
-            .ok_or_else(|| ServiceError::NotFound {
-                entity: "repo",
-                id: repo_id.to_owned(),
-            })?;
-        let _repo_source = self.resolve_repo_source(&repo).await?;
-        let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
-        let worktree_path = PathBuf::from(&workspace.worktree_path);
-        Ok((worktree_path, target_branch))
     }
 
     async fn resolve_repo_source(&self, repo: &db::Repo) -> Result<String> {

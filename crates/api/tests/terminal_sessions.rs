@@ -69,7 +69,9 @@ async fn setup(terminal: TerminalConfig) -> Harness {
         cleanup_scheduler,
         review_runner,
         api::state::ShutdownSignal::new(),
-        std::env::temp_dir().join("forge-test-workflows"),
+        api::state::test_workflows_dir(),
+        api::state::test_jwt_secret(),
+        api::state::test_bcrypt_cost(),
     );
     let mut config = ForgeConfig::default();
     config.workspace.root = workspace_root.path().to_path_buf();

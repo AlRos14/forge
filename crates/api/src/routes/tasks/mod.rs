@@ -59,7 +59,7 @@ pub use crud::{
 };
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
-pub use gates::{approve_gate, gate_approve, gate_reject, reject_gate, GateRejectRequest};
+pub use gates::{approve_gate, reject_gate};
 pub use media::{delete_media, get_media, list_media, upload_media};
 pub use prompt_preview::prompt_preview;
 pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
@@ -68,10 +68,7 @@ pub use roles::{
     TaskRoleAssignmentListResponse,
 };
 pub use transitions::{list_transitions, transition_task, TransitionLogListResponse};
-pub use workspace::{
-    abort_task_conflict, get_conflict_state, get_task_diff, get_task_workspace, rebase_task,
-    reset_task_workspace,
-};
+pub use workspace::{get_task_diff, get_task_workspace, reset_task_workspace};
 
 async fn project_default_review_config(
     db: &db::SqliteDb,
@@ -179,37 +176,4 @@ fn transition_log_entry(entry: db::TransitionLog) -> ApiResult<TransitionLogEntr
         rejection: entry.rejection,
         created_at: entry.created_at,
     })
-}
-
-fn merge_outcome_response(
-    outcome: services::merge_service::MergeOutcome,
-) -> api_types::MergeOutcomeResponse {
-    match outcome {
-        services::merge_service::MergeOutcome::Done {
-            before_sha,
-            after_sha,
-            branch,
-        } => api_types::MergeOutcomeResponse::Done {
-            before_sha,
-            after_sha,
-            branch,
-        },
-        services::merge_service::MergeOutcome::PullRequest { branch, pr_url, .. } => {
-            api_types::MergeOutcomeResponse::PullRequest { branch, pr_url }
-        }
-        services::merge_service::MergeOutcome::Conflict {
-            details,
-            conflict_paths,
-        } => api_types::MergeOutcomeResponse::Conflict {
-            details,
-            conflict_paths: conflict_paths
-                .into_iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-        },
-        services::merge_service::MergeOutcome::Dirty { files }
-        | services::merge_service::MergeOutcome::TargetDirty { files } => {
-            api_types::MergeOutcomeResponse::Dirty { files }
-        }
-    }
 }

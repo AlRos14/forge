@@ -201,6 +201,9 @@ async fn main() {
     if !effective_config.server.mcp_enabled {
         info!("mcp endpoint disabled");
     }
+    let jwt_secret = config
+        .resolve_jwt_secret()
+        .expect("Failed to resolve JWT secret");
     let state = api::AppState::with_adapter_registry_services_and_shutdown(
         Arc::clone(&db),
         Arc::clone(&event_bus),
@@ -211,6 +214,8 @@ async fn main() {
         review_runner,
         api::state::ShutdownSignal::new(),
         config.workflows_dir(),
+        jwt_secret,
+        effective_config.server.bcrypt_cost,
     )
     .with_effective_config(effective_config.clone());
     match state

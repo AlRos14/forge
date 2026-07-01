@@ -122,9 +122,6 @@ pub struct TransitionTaskRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub source: Option<TransitionSource>,
-    #[serde(default)]
-    #[ts(optional)]
-    pub r#override: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -6,11 +6,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed REST endpoints that had no consumers (web, CLI, or MCP): the legacy non-state-scoped gate decisions `POST /api/v1/tasks/{id}/gates/approve` and `/gates/reject` (use the state-scoped `/gates/{state_name}/approve|reject`), `GET /api/v1/tasks/{id}/conflicts`, `POST /api/v1/tasks/{id}/conflicts/abort`, `POST /api/v1/tasks/{id}/rebase`, `GET /api/v1/runtimes` and `/runtimes/{id}`, and the bare `GET /api/v1/workspaces/{id}` (`/workspaces/{id}/diff` remains).
+- Removed the `override` field from `TransitionTaskRequest`; it was never read — user routing auto-escalation applies unconditionally, so observed behavior is unchanged.
+- `forge-cli`'s build script now skips the frontend build only when `FORGE_SKIP_WEB_BUILD` is `1`/`true`/`yes` (previously any value, including `0`, skipped it).
+
+### Added
+
+- The JWT signing secret is now configurable via `server.jwt_secret` in the config file or `FORGE_JWT_SECRET`; when unset, Forge generates a random 32-byte secret on first start and persists it to `<data_dir>/jwt_secret.bin` (mode `0600`). Bcrypt cost is configurable via `server.bcrypt_cost` / `FORGE_BCRYPT_COST` (default 12).
+
 ### Changed
 
-- User-initiated task transitions on subtasks now resolve against the project workflow, fixing rejections such as `state 'review' is not defined in workflow` when dragging a subtask to a state the board offered. Users may route a task to any defined workflow state, overriding missing-edge and system-only routing restrictions; content guards still apply. Override transitions are audited as `triggered_by = "user:override:<source>"`. REST `TransitionTaskRequest` gained an optional `override` boolean (default false; auto-escalation applies regardless).
+- User-initiated task transitions on subtasks now resolve against the project workflow, fixing rejections such as `state 'review' is not defined in workflow` when dragging a subtask to a state the board offered. Users may route a task to any defined workflow state, overriding missing-edge and system-only routing restrictions; content guards still apply. Override transitions are audited as `triggered_by = "user:override:<source>"`.
 
 ### Fixed
+
+- Production servers previously signed session JWTs with a hardcoded development secret at bcrypt cost 4; they now use the configured or per-install generated secret at cost 12.
 
 - Fixed memory search pagination so cursors follow the result ordering, escaped punctuated memory search input before passing it to SQLite FTS, and made review/execution/conversation memory indexing idempotent by source reference.
 

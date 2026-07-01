@@ -3,15 +3,15 @@ use std::{collections::HashMap, str::FromStr};
 use api_types::{
     parse_project_hooks_json, AgentResponse, ConversationMessageResponse, ConversationResponse,
     DaemonResponse, ExecutionResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    ReviewDetails, ReviewResponse, RuntimeResponse, StateKind, StepResultEntry, StepResultResponse,
-    Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
-    TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
+    ReviewDetails, ReviewResponse, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
+    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType,
+    WorkspaceResponse,
 };
 use db::{
     Agent, Conversation, ConversationMessage, ConversationMessageRole, ConversationMessageStatus,
     ConversationStatus, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review,
-    Runtime, SortBy, SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo,
-    TransitionLogRepo, Workspace, WorkspaceRepo,
+    SortBy, SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo,
+    Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,7 +47,6 @@ pub mod project_agents;
 pub mod projects;
 pub mod repos;
 pub mod reviews;
-pub mod runtimes;
 pub mod settings;
 pub mod tasks;
 pub mod terminals;
@@ -651,18 +650,6 @@ pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
         version: daemon.version,
         created_at: daemon.created_at,
         updated_at: daemon.updated_at,
-    }
-}
-
-pub fn runtime_response(runtime: Runtime) -> RuntimeResponse {
-    RuntimeResponse {
-        id: runtime.id,
-        daemon_id: runtime.daemon_id,
-        kind: runtime.kind,
-        workspace_root: runtime.workspace_root,
-        status: runtime.status.to_string(),
-        created_at: runtime.created_at,
-        updated_at: runtime.updated_at,
     }
 }
 

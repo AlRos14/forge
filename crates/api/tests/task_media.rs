@@ -745,6 +745,8 @@ async fn test_app(
             review_runner,
             api::state::ShutdownSignal::new(),
             data_dir.join("workflows"),
+            api::state::test_jwt_secret(),
+            api::state::test_bcrypt_cost(),
         )
         .with_effective_config(config),
     );

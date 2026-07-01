@@ -2259,37 +2259,3 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
         ),
     }
 }
-
-#[tokio::test]
-async fn user_override_transition_rejects_non_user_actor() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let task_id = new_uuid_v4();
-    let workflow = missing_edge_workflow();
-    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
-    let eng = engine(Arc::clone(&db), event_bus);
-
-    let system_result = eng
-        .user_override_transition(&task_id, "done", 1, &workflow, "system", "override", false)
-        .await;
-    assert!(
-        matches!(system_result, Err(ServiceError::InvalidOperation { .. })),
-        "system actor must be rejected by user_override_transition"
-    );
-
-    let agent_result = eng
-        .user_override_transition(
-            &task_id,
-            "done",
-            1,
-            &workflow,
-            "agent:unit",
-            "override",
-            false,
-        )
-        .await;
-    assert!(
-        matches!(agent_result, Err(ServiceError::InvalidOperation { .. })),
-        "agent actor must be rejected by user_override_transition"
-    );
-}

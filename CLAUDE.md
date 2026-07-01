@@ -38,6 +38,7 @@ cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Rust-only work
 ```
 
 The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment — if you break it, you probably need to revisit the spec, not the test.

@@ -259,7 +259,9 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         cleanup_scheduler,
         review_runner,
         api::state::ShutdownSignal::new(),
-        std::env::temp_dir().join("forge-test-workflows"),
+        api::state::test_workflows_dir(),
+        api::state::test_jwt_secret(),
+        api::state::test_bcrypt_cost(),
     );
     let mut config = (*state.effective_config).clone();
     config.terminal.enabled = true;

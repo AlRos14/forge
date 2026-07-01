@@ -3,6 +3,7 @@
 mod defaults;
 mod error;
 mod file;
+mod jwt_secret;
 mod loader;
 mod path;
 mod runtime;

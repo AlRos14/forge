@@ -3,17 +3,6 @@ use serde_json::Value;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeResponse {
-    pub id: String,
-    pub daemon_id: String,
-    pub kind: String,
-    pub workspace_root: String,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorTypeDescriptor {
     #[serde(rename = "type")]
     pub type_name: String,

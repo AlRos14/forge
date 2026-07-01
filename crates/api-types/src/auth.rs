@@ -112,6 +112,14 @@ pub struct AdminUserResponse {
 
 #[derive(Debug, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct AdminUserListResponse {
+    pub items: Vec<AdminUserResponse>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct UpdateAdminRequest {
     pub is_admin: bool,
 }
@@ -169,6 +177,12 @@ mod tests {
 pub struct SettingResponse {
     pub key: String,
     pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SettingListResponse {
+    pub items: Vec<SettingResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]

@@ -93,6 +93,10 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
 
+JWT signing uses `server.jwt_secret` in the config file or `FORGE_JWT_SECRET`
+when set. Otherwise Forge reads or creates `<data_dir>/jwt_secret.bin` on first
+start (mode `0600` on Unix). Set an explicit secret in production deployments.
+
 ### Local development data dir
 
 `make dev` and friends point data at `./test/` (gitignored) so dev state never

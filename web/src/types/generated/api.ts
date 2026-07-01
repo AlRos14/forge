@@ -735,7 +735,6 @@ export interface TransitionTaskRequest {
   version: number
   reason?: string | null
   source?: 'board_drag' | null
-  override?: boolean
 }
 
 export interface ClaimOverrides {

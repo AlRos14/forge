@@ -441,10 +441,6 @@ impl HeartbeatMonitor {
 pub(crate) struct CancelledExecution {
     pub execution_id: String,
     pub agent_session_id: Option<String>,
-    #[allow(dead_code)]
-    pub executor_config_snapshot_json: Option<String>,
-    #[allow(dead_code)]
-    pub agent_id: Option<String>,
 }
 
 async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
@@ -629,8 +625,6 @@ pub(crate) async fn cancel_running_executions(
         let cancelled_execution = CancelledExecution {
             execution_id: execution.id.clone(),
             agent_session_id: execution.agent_session_id.clone(),
-            executor_config_snapshot_json: execution.executor_config_snapshot_json.clone(),
-            agent_id: execution.agent_id.clone(),
         };
         if ExecutionRepo::update(
             db,
@@ -1407,11 +1401,6 @@ mod tests {
             cancelled[0].agent_session_id.as_deref(),
             Some("session-789")
         );
-        assert_eq!(
-            cancelled[0].executor_config_snapshot_json.as_deref(),
-            Some(r#"{"executor_type":"shell","config":{}}"#)
-        );
-        assert_eq!(cancelled[0].agent_id.as_deref(), Some(agent.id.as_str()));
     }
 
     #[tokio::test]

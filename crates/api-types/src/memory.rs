@@ -39,3 +39,19 @@ pub struct MemorySearchResponse {
     pub has_more: bool,
     pub next_cursor: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct MemoryBackfillTypeResponse {
+    pub source_type: String,
+    pub indexed: u64,
+    pub skipped: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct MemoryBackfillResponse {
+    pub items: Vec<MemoryBackfillTypeResponse>,
+    pub indexed: u64,
+    pub skipped: u64,
+}
