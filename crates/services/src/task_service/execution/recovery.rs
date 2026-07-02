@@ -25,7 +25,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
                 "cannot recover task {} in terminal status {}",
@@ -461,7 +465,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "user:recovery:resume_session",
+        );
         let now = now_rfc3339();
         let execution = ExecutionRepo::create(
             &*self.db,
@@ -567,7 +575,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "user:recovery:reexecute",
+        );
         let state = workflow
             .states
             .iter()
@@ -811,7 +823,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "user:recovery:proceed_once",
+        );
         let target = workflow
             .states
             .iter()
@@ -956,7 +972,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            triggered_by,
+        );
         let uses_system_only_trigger = workflow
             .trigger_between(&task.status, &target_state)
             .is_some_and(|trigger| trigger.system_only());
@@ -1008,15 +1028,19 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            "user:recovery:resume_process",
+        );
         let state = workflow
             .states
             .iter()
             .find(|state| state.name == task.status)
             .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "state {} is not defined in workflow",
-                    task.status
+                ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                    &task.status,
+                    &workflow,
                 ))
             })?;
         if state.kind != api_types::StateKind::Gate {
@@ -1043,15 +1067,19 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            "user:recovery",
+        );
         let state = workflow
             .states
             .iter()
             .find(|state| state.name == task.status)
             .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "state {} is not defined in workflow",
-                    task.status
+                ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                    &task.status,
+                    &workflow,
                 ))
             })?;
         if state.kind != api_types::StateKind::Gate {
@@ -1203,7 +1231,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            "user:recovery",
+        );
         Ok(workflow
             .states
             .iter()
@@ -1242,7 +1274,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "user:recovery:reset_to_initial",
+        );
         let initial_state = workflow_initial_state(&workflow)?;
         let assignee_id = if should_clear_assignments_for_reset(&annotation.blocking_reason) {
             Some(None)
@@ -1324,7 +1360,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "user:recovery:mark_reviewed",
+        );
         let pass_target = workflow
             .auto_transition_target(&task.status)
             .unwrap_or(crate::workflow::default_states::MERGING)
@@ -1425,8 +1465,11 @@ impl TaskService {
             let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-            let workflow =
-                WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+            let workflow = WorkflowEngine::resolve_workflow_for_task(
+                &task,
+                &project.workflow_definition,
+                "user:retry_hook",
+            );
             let engine = WorkflowEngine {
                 db: Arc::clone(&self.db),
                 event_bus: Arc::clone(&self.event_bus),
@@ -1484,7 +1527,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &cleared.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", cleared.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&cleared, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &cleared,
+            &project.workflow_definition,
+            "system",
+        );
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
             event_bus: Arc::clone(&self.event_bus),
@@ -1525,15 +1572,19 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "user:recovery:retry_review",
+        );
         let state = workflow
             .states
             .iter()
             .find(|s| s.name == task.status)
             .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "state {} is not defined in workflow",
-                    task.status
+                ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                    &task.status,
+                    &workflow,
                 ))
             })?;
         if state.kind != api_types::StateKind::Gate {
@@ -1652,8 +1703,11 @@ impl TaskService {
             let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-            let workflow =
-                WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+            let workflow = WorkflowEngine::resolve_workflow_for_task(
+                &task,
+                &project.workflow_definition,
+                "user:skip_hook_once",
+            );
             let barrier_state = task
                 .entry_barrier_json
                 .as_deref()

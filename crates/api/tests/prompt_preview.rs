@@ -137,7 +137,8 @@ async fn direct_prompt_for_accept_to_planning(
         .await
         .expect("project loads")
         .expect("project exists");
-    let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+    let workflow =
+        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, "system");
     let current_state = workflow
         .states
         .iter()

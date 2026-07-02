@@ -4,7 +4,7 @@ import { type APIRequestContext, type APIResponse } from '@playwright/test'
 const DEFAULT_EMAIL = 'e2e-default@test.forge'
 const DEFAULT_PASSWORD = 'Password123!'
 const DEFAULT_DISPLAY_NAME = 'E2E Default User'
-const JWT_SECRET = 'test-jwt-secret-for-development'
+const JWT_SECRET = process.env.FORGE_E2E_JWT_SECRET ?? 'test-jwt-secret-for-development'
 
 type AuthResponse = {
   access_token: string

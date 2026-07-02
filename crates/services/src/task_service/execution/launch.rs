@@ -115,7 +115,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
                 "cannot launch execution for task {} in terminal status {}",
@@ -251,7 +255,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
                 "cannot follow up on a task in terminal status {}",
@@ -457,7 +465,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         // Verify the execution role matches the current state effective role for cascade eligibility
         let current_state = workflow.states.iter().find(|s| s.name == task.status);
         let effective_role = current_state.and_then(|s| {

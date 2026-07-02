@@ -39,7 +39,7 @@ impl CrashRecovery {
         let mut recovered = 0;
 
         for task in tasks {
-            let task = recover_task(
+            let outcome = recover_task(
                 &self.db,
                 task,
                 StopReason::CrashRecovery,
@@ -47,17 +47,21 @@ impl CrashRecovery {
             )
             .await?;
 
-            self.publish(ForgeEvent {
-                event_type: "task.recovered".to_owned(),
-                entity_id: task.id,
-                timestamp: event_timestamp(),
-                context: EventContext::TaskRecovered {
-                    project_id: task.project_id,
-                    reason: "crash_recovery".to_owned(),
-                },
-            });
-            recovered += 1;
+            if outcome.annotated {
+                self.publish(ForgeEvent {
+                    event_type: "task.recovered".to_owned(),
+                    entity_id: outcome.task.id,
+                    timestamp: event_timestamp(),
+                    context: EventContext::TaskRecovered {
+                        project_id: outcome.task.project_id,
+                        reason: "crash_recovery".to_owned(),
+                    },
+                });
+                recovered += 1;
+            }
         }
+
+        recovered += sweep_stale_recovery_annotations(&self.db).await?;
 
         for project in list_projects(&self.db).await? {
             let mut cursor = None;
@@ -280,7 +284,7 @@ impl HeartbeatMonitor {
             });
 
             for task in list_in_progress_tasks(&self.db, Some(&agent.id)).await? {
-                let task = recover_task(
+                let outcome = recover_task(
                     &self.db,
                     task,
                     StopReason::AgentTimeout,
@@ -288,15 +292,17 @@ impl HeartbeatMonitor {
                 )
                 .await?;
 
-                self.publish(ForgeEvent {
-                    event_type: "task.recovered".to_owned(),
-                    entity_id: task.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::TaskRecovered {
-                        project_id: task.project_id,
-                        reason: "agent_timeout".to_owned(),
-                    },
-                });
+                if outcome.annotated {
+                    self.publish(ForgeEvent {
+                        event_type: "task.recovered".to_owned(),
+                        entity_id: outcome.task.id.clone(),
+                        timestamp: event_timestamp(),
+                        context: EventContext::TaskRecovered {
+                            project_id: outcome.task.project_id,
+                            reason: "agent_timeout".to_owned(),
+                        },
+                    });
+                }
             }
 
             timed_out += 1;
@@ -443,6 +449,11 @@ pub(crate) struct CancelledExecution {
     pub agent_session_id: Option<String>,
 }
 
+pub(crate) struct RecoverTaskOutcome {
+    pub task: Task,
+    pub annotated: bool,
+}
+
 async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
     for project in list_projects(db).await? {
@@ -475,7 +486,11 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
                 },
             )
             .await?;
-            tasks.extend(page.items);
+            tasks.extend(
+                page.items
+                    .into_iter()
+                    .filter(|task| task.assignee_type.as_deref() != Some("user")),
+            );
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
@@ -490,11 +505,12 @@ async fn recover_task(
     task: Task,
     stop_reason: StopReason,
     stopped_by: &str,
-) -> Result<Task> {
+) -> Result<RecoverTaskOutcome> {
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+    let workflow =
+        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, stopped_by);
     if workflow
         .states
         .iter()
@@ -513,6 +529,13 @@ async fn recover_task(
         ResumePolicy::Manual,
     )
     .await?;
+
+    if cancelled.is_empty() {
+        return Ok(RecoverTaskOutcome {
+            task,
+            annotated: false,
+        });
+    }
 
     let mut has_resumable_execution = false;
     let should_auto_resume = stop_reason == StopReason::CrashRecovery;
@@ -552,7 +575,10 @@ async fn recover_task(
             execution_count = cancelled.len(),
             "recovered task left in current state because a resumable execution was cancelled"
         );
-        return Ok(task);
+        return Ok(RecoverTaskOutcome {
+            task,
+            annotated: false,
+        });
     }
 
     let (blocking_reason, message) = if stop_reason == StopReason::AgentTimeout {
@@ -581,7 +607,7 @@ async fn recover_task(
         "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
     })
     .to_string();
-    TaskRepo::update_status(
+    let task = TaskRepo::update_status(
         db,
         UpdateTaskStatus {
             id: task.id.clone(),
@@ -594,8 +620,103 @@ async fn recover_task(
             updated_at: now_rfc3339(),
         },
     )
-    .await
-    .map_err(Into::into)
+    .await?;
+
+    Ok(RecoverTaskOutcome {
+        task,
+        annotated: true,
+    })
+}
+
+async fn sweep_stale_recovery_annotations(db: &SqliteDb) -> Result<u64> {
+    let mut cleared = 0_u64;
+
+    for project in list_projects(db).await? {
+        let mut cursor = None;
+        loop {
+            let page = TaskRepo::list(
+                db,
+                TaskListQuery {
+                    project_id: project.id.clone(),
+                    q: None,
+                    statuses: vec![],
+                    agent_ids: Vec::new(),
+                    assignee_types: Vec::new(),
+                    assignee_ids: Vec::new(),
+                    priority: None,
+                    include_archived: false,
+                    include_cancelled: false,
+                    include_deleted: false,
+                    page: page_request(cursor),
+                },
+            )
+            .await?;
+
+            for task in page.items {
+                let Some(annotation_json) = task.error_annotation.as_deref() else {
+                    continue;
+                };
+                let Ok(annotation) = serde_json::from_str::<serde_json::Value>(annotation_json)
+                else {
+                    continue;
+                };
+                if annotation.get("type").and_then(serde_json::Value::as_str)
+                    != Some("recovery_required")
+                {
+                    continue;
+                }
+
+                let blocked_execution_id =
+                    annotation.get("blocked_execution_id").and_then(|value| {
+                        if value.is_null() {
+                            None
+                        } else {
+                            value.as_str()
+                        }
+                    });
+
+                let should_clear = match blocked_execution_id {
+                    None => true,
+                    Some(execution_id) => match ExecutionRepo::get_by_id(db, execution_id).await? {
+                        None => true,
+                        Some(execution) => !execution_awaits_recovery(&execution),
+                    },
+                };
+
+                if !should_clear {
+                    continue;
+                }
+
+                TaskRepo::update_status(
+                    db,
+                    UpdateTaskStatus {
+                        id: task.id.clone(),
+                        expected_version: task.version,
+                        status: task.status.clone(),
+                        assignee_id: None,
+                        error_annotation: Some(None),
+                        blocked_json: None,
+                        failed_json: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+                cleared += 1;
+            }
+
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+
+    Ok(cleared)
+}
+
+fn execution_awaits_recovery(execution: &db::Execution) -> bool {
+    execution.status == ExecutionStatus::Cancelled
+        && matches!(execution.resume_policy, Some(ResumePolicy::Manual))
 }
 
 pub(crate) async fn cancel_running_executions(
@@ -935,6 +1056,17 @@ mod tests {
         status: TaskStatus,
         agent_id: Option<String>,
     ) -> Task {
+        seed_task_with_assignee(db, project_id, repo_id, status, "agent", agent_id).await
+    }
+
+    async fn seed_task_with_assignee(
+        db: &SqliteDb,
+        project_id: String,
+        repo_id: String,
+        status: TaskStatus,
+        assignee_type: &str,
+        assignee_id: Option<String>,
+    ) -> Task {
         let now = now_rfc3339();
         let task = TaskRepo::create(
             db,
@@ -944,8 +1076,8 @@ mod tests {
                 repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: agent_id.as_ref().map(|_| "agent".to_owned()),
-                assignee_id: agent_id.clone(),
+                assignee_type: assignee_id.as_ref().map(|_| assignee_type.to_owned()),
+                assignee_id: assignee_id.clone(),
                 title: "Recover me".to_owned(),
                 description: None,
                 task_type: "task".to_owned(),
@@ -961,21 +1093,23 @@ mod tests {
         )
         .await
         .expect("task creates");
-        if let Some(agent_id) = agent_id {
-            TaskRoleAssignmentRepo::assign(
-                db,
-                CreateTaskRoleAssignment {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    role_name: default_roles::CODER.to_owned(),
-                    assignee_type: Some(db::AssigneeKind::Agent),
-                    assignee_id: Some(agent_id),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-            )
-            .await
-            .expect("role assignment creates");
+        if assignee_type == "agent" {
+            if let Some(agent_id) = assignee_id {
+                TaskRoleAssignmentRepo::assign(
+                    db,
+                    CreateTaskRoleAssignment {
+                        id: new_uuid_v4(),
+                        task_id: task.id.clone(),
+                        role_name: default_roles::CODER.to_owned(),
+                        assignee_type: Some(db::AssigneeKind::Agent),
+                        assignee_id: Some(agent_id),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await
+                .expect("role assignment creates");
+            }
         }
         task
     }
@@ -1021,7 +1155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery_blocks_in_progress_tasks_in_place() {
+    async fn crash_recovery_ignores_idle_in_progress_tasks() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
@@ -1039,7 +1173,7 @@ mod tests {
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
         let recovered = recovery.run_recovery().await.expect("recovery runs");
-        assert_eq!(recovered, 1);
+        assert_eq!(recovered, 0);
 
         let recovered_task = TaskRepo::get_by_id(&*db, &in_progress.id, false)
             .await
@@ -1047,12 +1181,7 @@ mod tests {
             .expect("task exists");
         assert_eq!(recovered_task.status, "in_progress".to_owned());
         assert_eq!(recovered_task.assignee_id, in_progress.assignee_id);
-        let annotation: Value =
-            serde_json::from_str(recovered_task.error_annotation.as_deref().unwrap()).unwrap();
-        assert_eq!(annotation["type"], "recovery_required");
-        assert_eq!(annotation["blocking_reason"], "crash_recovery");
-        assert_eq!(annotation["blocked_by"], "system:crash_recovery");
-        assert_eq!(annotation["message"], "Recovered after server restart");
+        assert_eq!(recovered_task.error_annotation, None);
 
         let unchanged = TaskRepo::get_by_id(&*db, &todo.id, false)
             .await
@@ -1060,9 +1189,37 @@ mod tests {
             .expect("task exists");
         assert_eq!(unchanged.error_annotation, None);
 
-        let event = rx.recv().await.expect("event receives");
-        assert_eq!(event.event_type, "task.recovered");
-        assert_eq!(event.entity_id, in_progress.id);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_skips_user_assigned_in_progress_tasks() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut rx = event_bus.subscribe();
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let user_task = seed_task_with_assignee(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            "user",
+            Some("human-user".to_owned()),
+        )
+        .await;
+
+        let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
+        let recovered = recovery.run_recovery().await.expect("recovery runs");
+        assert_eq!(recovered, 0);
+
+        let unchanged = TaskRepo::get_by_id(&*db, &user_task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(unchanged.status, "in_progress");
+        assert_eq!(unchanged.error_annotation, None);
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1121,6 +1278,7 @@ mod tests {
             Some(agent.id.clone()),
         )
         .await;
+        let _execution = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
 
         let monitor = HeartbeatMonitor::with_check_interval(
             Arc::clone(&db),
@@ -1310,7 +1468,7 @@ mod tests {
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
         let recovered = recovery.run_recovery().await.expect("recovery runs");
-        assert_eq!(recovered, 2);
+        assert_eq!(recovered, 0);
 
         let t1 = TaskRepo::get_by_id(&*db, &task_in_progress.id, false)
             .await
@@ -1342,7 +1500,8 @@ mod tests {
         let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
-        recovery.run_recovery().await.expect("recovery runs");
+        let recovered = recovery.run_recovery().await.expect("recovery runs");
+        assert_eq!(recovered, 1);
 
         let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
@@ -1499,5 +1658,196 @@ mod tests {
         assert_eq!(executions.items.len(), 1);
         assert_eq!(executions.items[0].id, execution.id);
         assert_eq!(executions.items[0].status, ExecutionStatus::Cancelled);
+    }
+
+    async fn stamp_recovery_annotation(
+        db: &SqliteDb,
+        task: &Task,
+        blocked_execution_id: Option<&str>,
+    ) -> Task {
+        let annotation = json!({
+            "type": "recovery_required",
+            "blocking_reason": "crash_recovery",
+            "blocked_by": "system:crash_recovery",
+            "blocked_at": now_rfc3339(),
+            "blocked_execution_id": blocked_execution_id,
+            "artifact": blocked_execution_id.map(|execution_id| json!({
+                "kind": "execution",
+                "id": execution_id,
+                "log_path": null,
+            })),
+            "message": "Recovered after server restart",
+            "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
+        })
+        .to_string();
+        TaskRepo::update_status(
+            db,
+            UpdateTaskStatus {
+                id: task.id.clone(),
+                expected_version: task.version,
+                status: task.status.clone(),
+                assignee_id: None,
+                error_annotation: Some(Some(annotation)),
+                blocked_json: None,
+                failed_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("annotation stamps")
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_clears_stale_recovery_annotations_without_execution() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(&db, project_id, repo_id, "in_progress".to_owned(), None).await;
+        stamp_recovery_annotation(&db, &task, None).await;
+
+        let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
+            .run_recovery()
+            .await
+            .expect("recovery runs");
+        assert_eq!(recovered, 1);
+
+        let updated = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(updated.error_annotation, None);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_preserves_legitimate_pending_recovery_annotations() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
+        ExecutionRepo::update(
+            &*db,
+            UpdateExecution {
+                id: execution.id.clone(),
+                status: Some(ExecutionStatus::Cancelled),
+                stop_reason: Some(Some(StopReason::CrashRecovery)),
+                stopped_by: Some(Some("system:crash_recovery".to_owned())),
+                resume_policy: Some(Some(ResumePolicy::Manual)),
+                stopped_at: Some(Some(now_rfc3339())),
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: Some(Some("Recovered".to_owned())),
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("execution updates");
+        let annotated = stamp_recovery_annotation(&db, &task, Some(&execution.id)).await;
+
+        let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
+            .run_recovery()
+            .await
+            .expect("recovery runs");
+        assert_eq!(recovered, 0);
+
+        let updated = TaskRepo::get_by_id(&*db, &annotated.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(
+            updated.error_annotation.as_deref(),
+            annotated.error_annotation.as_deref()
+        );
+        let annotation: Value =
+            serde_json::from_str(updated.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["blocked_execution_id"], execution.id);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_clears_stale_recovery_annotations_for_missing_execution() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(&db, project_id, repo_id, "in_progress".to_owned(), None).await;
+        stamp_recovery_annotation(&db, &task, Some("missing-execution-id")).await;
+
+        let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
+            .run_recovery()
+            .await
+            .expect("recovery runs");
+        assert_eq!(recovered, 1);
+
+        let updated = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(updated.error_annotation, None);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_clears_stale_recovery_annotations_for_completed_execution() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
+        ExecutionRepo::update(
+            &*db,
+            UpdateExecution {
+                id: execution.id.clone(),
+                status: Some(ExecutionStatus::Completed),
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: Some(Some(now_rfc3339())),
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("execution updates");
+        stamp_recovery_annotation(&db, &task, Some(&execution.id)).await;
+
+        let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
+            .run_recovery()
+            .await
+            .expect("recovery runs");
+        assert_eq!(recovered, 1);
+
+        let updated = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(updated.error_annotation, None);
     }
 }

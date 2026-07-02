@@ -7,7 +7,9 @@ use db::{
 };
 use serde_json::json;
 
-use crate::workflow::{default_states, effective_role, HookAction, HookContext, HookResult};
+use crate::workflow::{
+    default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
+};
 
 use super::common::{
     block_task, create_review_attempt, get_role_assignment, latest_executor_execution,
@@ -318,7 +320,7 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
             .find(|state| state.name == ctx.to_state)
         else {
             return HookResult::Failed {
-                reason: format!("state '{}' is not defined in workflow", ctx.to_state),
+                reason: WorkflowEngine::undefined_state_message(&ctx.to_state, &ctx.workflow),
             };
         };
         let Some(role_name) = effective_role(state) else {

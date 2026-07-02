@@ -29,7 +29,11 @@ impl TaskService {
                 project_id: project.id,
             });
         }
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         WorkflowEngine::validate_claimable(&workflow, &task.status)?;
         let target_status = resolve_claim_target(&workflow, &task.status)?;
         let target_role = workflow
@@ -219,7 +223,8 @@ impl TaskService {
         let Ok(Some(project)) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await else {
             return;
         };
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
         let Some(state) = workflow
             .states
             .iter()
@@ -303,7 +308,8 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
         Ok(workflow
             .states
             .iter()

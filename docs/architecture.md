@@ -173,18 +173,30 @@ string or `"{}"` resolves at runtime to the built-in `DefaultWorkflow`.
 `WorkflowCache` caches resolved definitions per project and invalidates on
 workflow updates.
 
-`TaskService::transition` resolves the applicable workflow via
-`WorkflowEngine::resolve_workflow_for_transition` before delegating to the
-engine. Root tasks use the project workflow (unchanged). For subtasks: if the
-**current** state is not defined in the inherited subtask workflow (e.g.
-`review`, `merging`), the **project** workflow governs all transitions on that
-task — user, agent, system, and cascades — because the subtask workflow cannot
-define a transition from a state it does not contain. If the current state is
-shared by both workflows (e.g. `in_progress`), **user-initiated** transitions
-use the project workflow and **agent/system-initiated** transitions use the
-inherited subtask workflow (no `review`/`merging`). This aligns validation with
-the frontend, which presents target states from the project workflow for all
-tasks. Automatic subtask lifecycle in subtask-workflow states is unchanged.
+The applicable `WorkflowDefinition` is resolved **exactly once** per transition
+entry via `WorkflowEngine::resolve_workflow_for_task`, keyed on whether the task
+is a root or subtask, whether its **current** state belongs to the inherited
+subtask workflow, and the acting party (`triggered_by`). The result is passed
+into wrapper pre-checks, `WorkflowEngine::transition` / `transition_inner`,
+and `HookContext` so hook actions, cascades, and advance steps consume the same
+definition — no downstream layer re-resolves for that transition. Each nested
+transition entry (for example a system cascade step) calls the same function at
+its own entry, which is correct because resolution keys on current-state
+membership, not on who started the original user move.
+
+| Task | Current state | Actor | Applicable workflow |
+| --- | --- | --- | --- |
+| Root | any | any | Project |
+| Subtask | Not in inherited subtask workflow (e.g. `review`, `merging`) | any | Project |
+| Subtask | In shared subtask-workflow state (e.g. `in_progress`) | User (`user:*`) | Project |
+| Subtask | In shared subtask-workflow state | Agent or system | Inherited subtask workflow |
+
+This aligns validation with the frontend, which presents target states from the
+project workflow for all tasks. Automatic subtask lifecycle in subtask-workflow
+states is unchanged. All undefined-state rejections — in the engine, hook
+actions, cascades, recovery helpers, and prompt preview — flow through
+`WorkflowEngine::undefined_state_message`, which enumerates the workflow's
+defined states.
 
 `StateKind` classifies states:
 
@@ -234,11 +246,16 @@ hooks are skipped without a hook-result entry.
 Human-triggered transitions are treated as project-management actions. The
 dependency gate does not block `user:*` card moves, including board drag
 transitions, so users can reorder and reclassify work like they would in Jira.
-User moves on subtasks resolve against the project workflow (see resolution
-rule above) so validation matches presented board states; users may also route
-to any defined workflow state via the override path when strict routing would
-reject. AI execution remains gated separately: initial role dispatch and
-interactive launch both run dependency checks before creating an execution.
+Users may route a task to any defined workflow state via the override path when
+strict routing would reject (see resolution rule above). Any user-initiated
+transition that changes the task's state cancels in-flight executions with
+`StopReason::UserCancelled`; same-state moves leave running executions
+untouched. Parking an agent-assigned task in an Initial- or Backlog-kind state
+retains role assignments but does not launch an executor from the move itself
+— the task re-enters agent flow only through the normal scheduling path when it
+later reaches a dispatchable state. AI execution remains gated separately:
+initial role dispatch and interactive launch both run dependency checks before
+creating an execution.
 
 Cancellation is implicit from any non-terminal state to
 `workflow.cancellation_state` (or terminal `"cancelled"` if unset), even
@@ -267,6 +284,21 @@ Audit-log derived. Gate states may set `gate_config.max_rejections`;
 `rejection = true`, then cascades to `blocked` when exhausted. Generic
 user-triggered gate-to-active bounces are logged with `rejection = false` and
 do not consume budget.
+
+### Crash recovery
+
+`CrashRecovery` runs at server startup; `HeartbeatMonitor` applies the same
+recovery primitive on agent timeout. Both annotate a task with a
+`recovery_required` `error_annotation` only when they actually cancelled at
+least one running execution for that task, and publish `task.recovered` only in
+that case. Tasks whose assignee is a user are excluded from crash-recovery
+selection — agent-oriented recovery is not meaningful for human-driven tasks.
+
+After the orphan pass, startup runs a sweep that clears stale
+`recovery_required` annotations when `blocked_execution_id` is missing, refers
+to a nonexistent execution, or refers to an execution that is not in a stopped
+state awaiting user recovery. The sweep is idempotent and only ever clears
+annotations.
 
 `transition_log` is the audit source of truth for state changes. The API
 exposes it via `GET /api/v1/tasks/{id}/transitions`.
@@ -336,8 +368,9 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
 - **services** — `TaskService.transition()` handles side effects (event
   emission, counter increments, `ReviewRunner` on `→ review`, `MergeService`
   on `review → merging`, `WorkspaceCleanupScheduler` on `→ done` /
-  `→ cancelled`). Background tasks: `CrashRecovery` at startup,
-  `HeartbeatMonitor`, `DaemonMonitor`, `WorkspaceCleanupScheduler`.
+  `→ cancelled`). Background tasks: `CrashRecovery` at startup (orphan
+  execution recovery and stale-annotation sweep), `HeartbeatMonitor`,
+  `DaemonMonitor`, `WorkspaceCleanupScheduler`.
 - **review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc`
   commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
   execution sharing the executor's workspace. Depends only on `db`, `events`,

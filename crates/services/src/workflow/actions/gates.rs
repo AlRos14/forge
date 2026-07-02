@@ -3,7 +3,9 @@ use db::{
     TaskDependencyRepo, TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo, WorkspaceRepo,
 };
 
-use crate::workflow::{default_states, effective_role, HookAction, HookContext, HookResult};
+use crate::workflow::{
+    default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
+};
 
 use super::common::{block_task, get_role_assignment, task, workspace_id};
 
@@ -19,7 +21,7 @@ impl HookAction for AutoCascadeOnUnassignedRole {
             .find(|state| state.name == ctx.to_state)
         else {
             return HookResult::Failed {
-                reason: format!("state '{}' is not defined in workflow", ctx.to_state),
+                reason: WorkflowEngine::undefined_state_message(&ctx.to_state, &ctx.workflow),
             };
         };
         let Some(role_name) = effective_role(state) else {
@@ -280,7 +282,7 @@ impl HookAction for DependencyGate {
             .find(|state| state.name == ctx.to_state)
         else {
             return HookResult::Failed {
-                reason: format!("state '{}' is not defined in workflow", ctx.to_state),
+                reason: WorkflowEngine::undefined_state_message(&ctx.to_state, &ctx.workflow),
             };
         };
         if effective_role(to_state).is_none() {

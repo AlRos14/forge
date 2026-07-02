@@ -18,7 +18,7 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_transition(
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
             &options.triggered_by,
@@ -259,9 +259,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_state_classification(
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
+            "system",
         );
         let Some(state) = workflow
             .states
@@ -355,9 +356,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_state_classification(
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
+            "system",
         );
         let state = workflow
             .states
@@ -384,7 +386,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         let cancel_target = workflow
             .cancellation_state
             .as_deref()
@@ -425,7 +431,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         let target = next_workflow_state(&workflow, &task.status)?;
 
         self.cancel_running_executions_for_manual_advance(&task)
@@ -466,9 +476,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_state_classification(
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
+            "system",
         );
         if matches!(
             workflow.state_kind(&task.status),
@@ -545,30 +556,17 @@ impl TaskService {
             return Ok(());
         }
 
-        let Some(source_state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(());
-        };
-        if !matches!(
-            source_state.kind,
-            api_types::StateKind::Active | api_types::StateKind::Gate
-        ) {
+        if task.status == target_status {
             return Ok(());
         }
-        let target_defined = workflow
+
+        if !workflow
             .states
             .iter()
-            .any(|state| state.name.as_str() == target_status);
-        if !(is_user_reachable_transition(workflow, &task.status, target_status) || target_defined)
+            .any(|state| state.name.as_str() == target_status)
         {
             return Ok(());
         }
-        let Some(role_name) = crate::workflow::effective_role(source_state) else {
-            return Ok(());
-        };
 
         let page = ExecutionRepo::list_by_task(
             &*self.db,
@@ -582,25 +580,15 @@ impl TaskService {
             },
         )
         .await?;
-        let is_cancellation = workflow
-            .cancellation_state
-            .as_deref()
-            .is_some_and(|state| state == target_status);
-        let running_executions = page
+        for execution in page
             .items
             .into_iter()
-            .filter(|execution| {
-                execution.status == ExecutionStatus::Running
-                    && (is_cancellation
-                        || execution.role == role_name
-                        || execution.role == "executor")
-            })
-            .collect::<Vec<_>>();
-        for execution in running_executions {
+            .filter(|execution| execution.status == ExecutionStatus::Running)
+        {
             self.cancel_active_execution(
                 &execution,
                 "cancelled by user transition",
-                db::StopReason::TaskCancelled,
+                db::StopReason::UserCancelled,
                 "user:transition",
                 db::ResumePolicy::None,
             )
@@ -663,8 +651,9 @@ fn next_workflow_state(
         .iter()
         .position(|state| state.name == current_status)
         .ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "state '{current_status}' is not defined in workflow"
+            ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                current_status,
+                workflow,
             ))
         })?;
     let cancellation_state = workflow.cancellation_state.as_deref();
@@ -753,24 +742,6 @@ async fn clear_manual_review_awaiting_metadata(db: &SqliteDb, task: &Task) -> Re
     TaskRepo::get_by_id(db, &task.id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
-}
-
-fn is_user_reachable_transition(
-    workflow: &api_types::WorkflowDefinition,
-    from: &str,
-    to: &str,
-) -> bool {
-    if workflow
-        .outgoing_trigger_targets(from)
-        .any(|(trigger, target)| target == to && !trigger.system_only())
-    {
-        return true;
-    }
-
-    workflow
-        .cancellation_state
-        .as_deref()
-        .is_some_and(|state| state == to)
 }
 
 fn should_clear_transient_error_annotation(task: &Task) -> bool {

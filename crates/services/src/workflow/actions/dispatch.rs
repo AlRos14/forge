@@ -12,7 +12,9 @@ use crate::{
             build_effective_prompt, dispatch_intent_from_workflow_dispatch,
             effective_prompt_selection, loader::load_agent_dispatch_context,
         },
-        effective_role, HookAction, HookContext, HookResult,
+        effective_role,
+        engine::WorkflowEngine,
+        HookAction, HookContext, HookResult,
     },
 };
 
@@ -34,7 +36,7 @@ impl HookAction for DispatchRoleAgent {
             .find(|state| state.name == ctx.to_state)
         else {
             return HookResult::Failed {
-                reason: format!("state '{}' is not defined in workflow", ctx.to_state),
+                reason: WorkflowEngine::undefined_state_message(&ctx.to_state, &ctx.workflow),
             };
         };
 

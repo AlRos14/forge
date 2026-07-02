@@ -180,7 +180,7 @@ impl WorkflowEngine {
         }
         let state = Self::find_state(workflow, &target_state).ok_or_else(|| {
             ServiceError::InvalidOperation {
-                message: format!("state '{target_state}' is not defined in workflow"),
+                message: Self::undefined_state_message(&target_state, workflow),
             }
         })?;
 
@@ -440,7 +440,7 @@ impl WorkflowEngine {
     ) -> crate::Result<db::Task> {
         let to_state = Self::find_state(workflow, target_state).ok_or_else(|| {
             ServiceError::InvalidOperation {
-                message: format!("state '{target_state}' is not defined in workflow"),
+                message: Self::undefined_state_message(target_state, workflow),
             }
         })?;
         if to_state.kind != StateKind::Initial {
@@ -508,43 +508,21 @@ impl WorkflowEngine {
         inherited_subtask_workflow()
     }
 
-    pub fn resolve_workflow_for(
-        task: &db::Task,
-        workflow_definition_json: &str,
-    ) -> WorkflowDefinition {
-        if task.parent_task_id.is_some() {
-            return inherited_subtask_workflow();
-        }
-
-        Self::resolve_workflow(workflow_definition_json)
-    }
-
-    pub fn resolve_workflow_for_state_classification(
-        task: &db::Task,
-        workflow_definition_json: &str,
-    ) -> WorkflowDefinition {
-        if task.parent_task_id.is_none() {
-            return Self::resolve_workflow(workflow_definition_json);
-        }
-
-        let subtask_wf = inherited_subtask_workflow();
-        let current_in_subtask = subtask_wf
-            .states
-            .iter()
-            .any(|s| s.name.as_str() == task.status.as_str());
-        if current_in_subtask {
-            return subtask_wf;
-        }
-        Self::resolve_workflow(workflow_definition_json)
-    }
-
-    pub fn resolve_workflow_for_transition(
+    /// Single source of truth for which workflow governs a task at transition entry.
+    ///
+    /// - Root tasks always use the project workflow.
+    /// - Subtasks in a state absent from the inherited subtask workflow use the project
+    ///   workflow for every actor.
+    /// - Subtasks in a shared subtask-workflow state use the inherited subtask workflow
+    ///   for non-user actors and the project workflow for user actors.
+    pub fn resolve_workflow_for_task(
         task: &db::Task,
         workflow_definition_json: &str,
         triggered_by: &str,
     ) -> WorkflowDefinition {
+        let project_workflow = Self::resolve_workflow(workflow_definition_json);
         if task.parent_task_id.is_none() {
-            return Self::resolve_workflow(workflow_definition_json);
+            return project_workflow;
         }
 
         let subtask_wf = inherited_subtask_workflow();
@@ -553,10 +531,10 @@ impl WorkflowEngine {
             .iter()
             .any(|s| s.name.as_str() == task.status.as_str());
         if !current_in_subtask {
-            return Self::resolve_workflow(workflow_definition_json);
+            return project_workflow;
         }
         if triggered_by.starts_with("user:") {
-            return Self::resolve_workflow(workflow_definition_json);
+            return project_workflow;
         }
         subtask_wf
     }
@@ -1551,7 +1529,9 @@ impl WorkflowEngine {
         .instrument(span))
     }
 
-    fn undefined_state_message(state_name: &str, workflow: &WorkflowDefinition) -> String {
+    /// Canonical undefined-state rejection text. All transition layers must use this helper;
+    /// the legacy non-enumerating `state '…' is not defined in workflow` format must not appear elsewhere.
+    pub fn undefined_state_message(state_name: &str, workflow: &WorkflowDefinition) -> String {
         let defined_states = workflow
             .states
             .iter()
@@ -1579,5 +1559,188 @@ impl WorkflowEngine {
             .as_deref()
             .map(|state| state == target_state)
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod resolve_workflow_tests {
+    use db::{new_uuid_v4, now_rfc3339};
+
+    use super::WorkflowEngine;
+    use crate::workflow::{default_states, default_workflow, inherited_subtask_workflow};
+
+    fn task(parent_task_id: Option<String>, status: &str) -> db::Task {
+        let now = now_rfc3339();
+        db::Task {
+            id: new_uuid_v4(),
+            project_id: new_uuid_v4(),
+            repo_id: None,
+            parent_task_id: parent_task_id.clone(),
+            subtask_order: parent_task_id.map(|_| 0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "task".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: status.to_owned(),
+            is_automation: false,
+            priority: 0,
+            board_position: 0.0,
+            task_state_config: None,
+            merge_config: None,
+            metadata_json: None,
+            plan: None,
+            blocked_json: None,
+            failed_json: None,
+            error_annotation: None,
+            review_passed_at: None,
+            entry_barrier_json: None,
+            version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+            deleted_at: None,
+            archived_at: None,
+        }
+    }
+
+    fn project_workflow_json() -> String {
+        serde_json::to_string(&default_workflow::default_workflow()).expect("workflow serializes")
+    }
+
+    fn uses_project_workflow(resolved: &api_types::WorkflowDefinition) -> bool {
+        resolved
+            .states
+            .iter()
+            .any(|state| state.name == default_states::REVIEW)
+    }
+
+    fn uses_subtask_workflow(resolved: &api_types::WorkflowDefinition) -> bool {
+        !uses_project_workflow(resolved)
+    }
+
+    #[test]
+    fn root_task_always_uses_project_workflow() {
+        let wf_json = project_workflow_json();
+        for (status, actor) in [
+            (default_states::TODO, "user:board"),
+            (default_states::IN_PROGRESS, "system"),
+            (default_states::REVIEW, "agent:abc"),
+        ] {
+            let resolved =
+                WorkflowEngine::resolve_workflow_for_task(&task(None, status), &wf_json, actor);
+            assert!(
+                uses_project_workflow(&resolved),
+                "root task in {status} with actor {actor} must use project workflow"
+            );
+        }
+    }
+
+    #[test]
+    fn subtask_in_shared_state_uses_subtask_workflow_for_non_user_actors() {
+        let wf_json = project_workflow_json();
+        for actor in ["system", "agent:runner", "daemon:embedded"] {
+            let resolved = WorkflowEngine::resolve_workflow_for_task(
+                &task(Some(new_uuid_v4()), default_states::IN_PROGRESS),
+                &wf_json,
+                actor,
+            );
+            assert!(
+                uses_subtask_workflow(&resolved),
+                "subtask in_progress with actor {actor} must use inherited subtask workflow"
+            );
+            assert_eq!(
+                resolved.states.len(),
+                inherited_subtask_workflow().states.len()
+            );
+        }
+    }
+
+    #[test]
+    fn subtask_in_shared_state_uses_project_workflow_for_user_actors() {
+        let wf_json = project_workflow_json();
+        for actor in ["user:board", "user:override:api", "user:test"] {
+            let resolved = WorkflowEngine::resolve_workflow_for_task(
+                &task(Some(new_uuid_v4()), default_states::TODO),
+                &wf_json,
+                actor,
+            );
+            assert!(
+                uses_project_workflow(&resolved),
+                "subtask in shared state with actor {actor} must use project workflow"
+            );
+        }
+    }
+
+    #[test]
+    fn subtask_in_project_only_state_uses_project_workflow_for_all_actors() {
+        let wf_json = project_workflow_json();
+        for actor in ["user:board", "system", "agent:runner"] {
+            let resolved = WorkflowEngine::resolve_workflow_for_task(
+                &task(Some(new_uuid_v4()), default_states::REVIEW),
+                &wf_json,
+                actor,
+            );
+            assert!(
+                uses_project_workflow(&resolved),
+                "subtask in review with actor {actor} must use project workflow"
+            );
+        }
+    }
+
+    #[test]
+    fn undefined_state_message_enumerates_defined_states() {
+        let workflow = default_workflow::default_workflow();
+        let message = WorkflowEngine::undefined_state_message("bogus", &workflow);
+        assert!(message.contains("bogus"));
+        assert!(message.contains("; defined states are:"));
+        for state in &workflow.states {
+            assert!(message.contains(state.name.as_str()));
+        }
+    }
+
+    #[test]
+    fn legacy_undefined_state_message_format_absent_from_services_src() {
+        let services_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        scan_rs_sources(&services_src, &services_src, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "legacy undefined-state message format found:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    fn scan_rs_sources(root: &std::path::Path, dir: &std::path::Path, offenders: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir).expect("directory readable");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_rs_sources(root, &path, offenders);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            if path.file_name().is_some_and(|name| name == "mod.rs")
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("engine"))
+            {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).expect("source file readable");
+            for (line_number, line) in contents.lines().enumerate() {
+                if line.contains("is not defined in workflow")
+                    && !line.contains("; defined states are:")
+                {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        path.strip_prefix(root).unwrap_or(&path).display(),
+                        line_number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
     }
 }

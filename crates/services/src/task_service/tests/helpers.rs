@@ -273,6 +273,31 @@ pub(super) async fn seed_failed_review(
     .expect("failed review creates")
 }
 
+pub(super) async fn seed_passed_review(
+    db: &SqliteDb,
+    task_id: &str,
+    execution_id: &str,
+    attempt_number: i64,
+) -> Review {
+    let now = now_rfc3339();
+    ReviewRepo::create(
+        db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            execution_id: execution_id.to_owned(),
+            attempt_number,
+            status: ReviewStatus::Passed,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("passed review creates")
+}
+
 pub(super) async fn seed_review_rejection_log(
     db: &SqliteDb,
     task_id: &str,

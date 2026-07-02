@@ -4,9 +4,9 @@
 
 The backend must be running on port 8080. From the repo root:
 
-    cargo run -p forge-cli -- --demo
+    FORGE_JWT_SECRET=test-jwt-secret-for-development cargo run -p forge-cli -- --data-dir ./test --demo
 
-This seeds demo data and starts the API server.
+This seeds demo data and starts the API server. The suite mints admin JWTs client-side in `auth-utils.ts`, so the backend JWT secret must match; override both sides with `FORGE_E2E_JWT_SECRET` (Playwright) and `FORGE_JWT_SECRET` (backend) if you use a different value.
 
 ## Running tests
 

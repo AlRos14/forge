@@ -29,7 +29,8 @@ pub async fn preview_effective_prompt(
     let project = ProjectRepo::get_by_id(&*db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+    let workflow =
+        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, "system");
     ensure_known_role(&workflow, role)?;
 
     let (preview_state, trigger_dispatch) =
@@ -80,7 +81,7 @@ fn preview_state_and_trigger_dispatch<'a>(
         .iter()
         .find(|state| state.name == current_state_name)
         .ok_or_else(|| ServiceError::InvalidOperation {
-            message: format!("state '{current_state_name}' is not defined in workflow"),
+            message: WorkflowEngine::undefined_state_message(current_state_name, workflow),
         })?;
 
     let Some(trigger) = trigger else {
@@ -117,7 +118,7 @@ fn workflow_state<'a>(
         .iter()
         .find(|state| state.name == state_name)
         .ok_or_else(|| ServiceError::InvalidOperation {
-            message: format!("state '{state_name}' is not defined in workflow"),
+            message: WorkflowEngine::undefined_state_message(state_name, workflow),
         })
 }
 

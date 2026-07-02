@@ -31,7 +31,11 @@ impl TaskService {
             Some(project) => project,
             None => return Ok(()),
         };
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         let Some(current_state) = workflow
             .states
             .iter()
@@ -301,7 +305,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         let Some(target) = workflow
             .auto_transition_target(&task.status)
             .map(str::to_owned)
@@ -477,7 +485,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Ok(());
         }
@@ -940,7 +952,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(&task, &project.workflow_definition);
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
         let current_state = workflow
             .states
             .iter()
@@ -1028,9 +1044,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for(
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
+            "system",
         );
         let review_state = workflow
             .states
@@ -1325,7 +1342,8 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
         Ok(workflow
             .states
             .iter()

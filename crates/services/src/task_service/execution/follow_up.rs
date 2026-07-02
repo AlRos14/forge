@@ -97,9 +97,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for(
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
+            "system",
         );
         if workflow
             .states

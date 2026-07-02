@@ -767,7 +767,8 @@ impl TerminalService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
         let state_kind = workflow
             .states
             .iter()
@@ -808,7 +809,8 @@ impl TerminalService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for(task, &project.workflow_definition);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
         let Some(role_name) = workflow
             .states
             .iter()
