@@ -5,6 +5,7 @@ use api_types::DaemonFrame;
 use forge_client::daemon_link::{
     run_with_reconnect, DaemonClient, DaemonCommandStream, DAEMON_HEARTBEAT_INTERVAL_SECS,
 };
+use forge_client::daemon_runtime::ActiveExecutionTracker;
 use tokio::{
     sync::{mpsc, watch},
     time,
@@ -15,13 +16,15 @@ use crate::commands;
 pub async fn run(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
+    active_executions: ActiveExecutionTracker,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let workspace_root = Arc::new(workspace_root);
     run_with_reconnect(client, move |stream| {
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
-        async move { dispatch_loop(stream, workspace_root, shutdown).await }
+        let active_executions = active_executions.clone();
+        async move { dispatch_loop(stream, workspace_root, shutdown, active_executions).await }
     })
     .await
 }
@@ -30,15 +33,17 @@ async fn dispatch_loop(
     mut stream: DaemonCommandStream,
     workspace_root: Arc<PathBuf>,
     mut shutdown: watch::Receiver<bool>,
+    active_executions: ActiveExecutionTracker,
 ) -> Result<()> {
     let (responses_tx, mut responses_rx) = mpsc::unbounded_channel::<DaemonFrame>();
     let terminal = crate::terminal::TerminalRuntime::new(
         responses_tx.clone(),
         workspace_root.as_ref().clone(),
     );
-    let daemon_runtime = forge_client::daemon_runtime::DaemonRuntime::new(
+    let daemon_runtime = forge_client::daemon_runtime::DaemonRuntime::new_with_tracker(
         responses_tx.clone(),
         workspace_root.as_ref().clone(),
+        active_executions,
     );
     let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
     heartbeat.tick().await;

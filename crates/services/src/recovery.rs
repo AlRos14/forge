@@ -1,19 +1,24 @@
-use crate::{workflow::engine::WorkflowEngine, Result, ServiceError, TaskService};
+use crate::{
+    daemon_transport::DaemonConnectionRegistry, embedded_daemon::is_embedded_daemon_machine,
+    workflow::engine::WorkflowEngine, Result, ServiceError, TaskService,
+};
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, ExecutionRepo, ExecutionStatus,
-    PageRequest, Project, ProjectRepo, ResumePolicy, SortBy, SortOrder, SqliteDb, StopReason, Task,
-    TaskListQuery, TaskRepo, UpdateAgent, UpdateExecution, UpdateTaskStatus,
+    now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, Daemon, DaemonRepo, Execution,
+    ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo, ResumePolicy, SortBy,
+    SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, UpdateAgent, UpdateExecution,
+    UpdateTaskStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use serde_json::json;
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
 
@@ -155,8 +160,11 @@ pub struct HeartbeatMonitor {
     event_bus: Arc<EventBus>,
     task_service: Option<Arc<TaskService>>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
+    daemon_connections: Option<Arc<DaemonConnectionRegistry>>,
     check_interval: Duration,
     execution_stall_timeout: Duration,
+    daemon_disconnect_grace: Duration,
+    disconnect_observed: Mutex<HashMap<String, Instant>>,
     stopped: AtomicBool,
     stop_notify: tokio::sync::Notify,
 }
@@ -164,6 +172,7 @@ pub struct HeartbeatMonitor {
 impl HeartbeatMonitor {
     const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
     const DEFAULT_EXECUTION_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+    const DEFAULT_DAEMON_DISCONNECT_GRACE: Duration = Duration::from_secs(120);
 
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self::with_check_interval(db, event_bus, Self::DEFAULT_CHECK_INTERVAL)
@@ -179,8 +188,11 @@ impl HeartbeatMonitor {
             event_bus,
             task_service: None,
             task_executor: None,
+            daemon_connections: None,
             check_interval,
             execution_stall_timeout: Self::DEFAULT_EXECUTION_STALL_TIMEOUT,
+            daemon_disconnect_grace: Self::DEFAULT_DAEMON_DISCONNECT_GRACE,
+            disconnect_observed: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             stop_notify: tokio::sync::Notify::new(),
         }
@@ -196,8 +208,21 @@ impl HeartbeatMonitor {
         self
     }
 
+    pub fn with_daemon_connections(
+        mut self,
+        daemon_connections: Arc<DaemonConnectionRegistry>,
+    ) -> Self {
+        self.daemon_connections = Some(daemon_connections);
+        self
+    }
+
     pub fn with_execution_stall_timeout(mut self, execution_stall_timeout: Duration) -> Self {
         self.execution_stall_timeout = execution_stall_timeout;
+        self
+    }
+
+    pub fn with_daemon_disconnect_grace(mut self, daemon_disconnect_grace: Duration) -> Self {
+        self.daemon_disconnect_grace = daemon_disconnect_grace;
         self
     }
 
@@ -315,7 +340,8 @@ impl HeartbeatMonitor {
             );
         }
         let stalled = self.check_stalled_executions().await?;
-        Ok(timed_out + stalled)
+        let disconnected = self.check_disconnected_daemon_executions().await?;
+        Ok(timed_out + stalled + disconnected)
     }
 
     #[tracing::instrument(skip(self))]
@@ -358,12 +384,19 @@ impl HeartbeatMonitor {
 
         for execution in executions {
             if let Some(task_executor) = self.task_executor.as_ref() {
-                if let Err(error) = task_executor.cancel(&execution.id).await {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %error,
-                        "failed to cancel stalled execution"
-                    );
+                // Agents without a daemon binding run in-process, so only a
+                // definitively remote-owned execution skips the embedded cancel.
+                if !execution_is_remote_owned(&self.db, &execution)
+                    .await
+                    .unwrap_or(false)
+                {
+                    if let Err(error) = task_executor.cancel(&execution.id).await {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            %error,
+                            "failed to cancel stalled execution"
+                        );
+                    }
                 }
             }
 
@@ -437,6 +470,87 @@ impl HeartbeatMonitor {
             );
         }
         Ok(stalled)
+    }
+
+    async fn check_disconnected_daemon_executions(&self) -> Result<u64> {
+        let Some(daemon_connections) = self.daemon_connections.as_ref() else {
+            return Ok(0);
+        };
+
+        let running = ExecutionRepo::list_running(&*self.db).await?;
+        let mut running_ids = HashMap::new();
+        for execution in &running {
+            running_ids.insert(execution.id.clone(), ());
+        }
+
+        {
+            let mut observed = self
+                .disconnect_observed
+                .lock()
+                .expect("disconnect observation lock");
+            observed.retain(|execution_id, _| running_ids.contains_key(execution_id));
+        }
+
+        let mut disconnected = 0_u64;
+        let now = Instant::now();
+
+        for execution in running {
+            let Some((daemon_id, daemon)) = resolve_execution_daemon(&self.db, &execution).await?
+            else {
+                continue;
+            };
+            if is_embedded_daemon_machine(&daemon.machine_id) {
+                continue;
+            }
+            if daemon_connections.is_connected(&daemon_id) {
+                self.disconnect_observed
+                    .lock()
+                    .expect("disconnect observation lock")
+                    .remove(&execution.id);
+                continue;
+            }
+
+            let first_observed = {
+                let mut observed = self
+                    .disconnect_observed
+                    .lock()
+                    .expect("disconnect observation lock");
+                observed
+                    .entry(execution.id.clone())
+                    .or_insert_with(|| now)
+                    .to_owned()
+            };
+            if now.duration_since(first_observed) < self.daemon_disconnect_grace {
+                continue;
+            }
+
+            let updated = fail_execution_daemon_disconnected(
+                &self.db,
+                &self.event_bus,
+                self.task_service.as_deref(),
+                FailDaemonDisconnectedExecution {
+                    execution: &execution,
+                    daemon_id: &daemon_id,
+                    error_message: format!("Remote daemon {daemon_id} disconnected"),
+                    stopped_by: "system:heartbeat_monitor",
+                    reconciliation_reason: "daemon_disconnected",
+                },
+            )
+            .await?;
+            self.disconnect_observed
+                .lock()
+                .expect("disconnect observation lock")
+                .remove(&updated.id);
+            disconnected += 1;
+        }
+
+        if disconnected > 0 {
+            tracing::info!(
+                disconnected_executions = disconnected,
+                "heartbeat monitor interrupted executions on disconnected daemons"
+            );
+        }
+        Ok(disconnected)
     }
 
     fn publish(&self, event: ForgeEvent) {
@@ -808,6 +922,161 @@ fn stalled_execution_should_block_task(execution: &db::Execution) -> bool {
     )
 }
 
+pub(crate) async fn resolve_execution_daemon(
+    db: &SqliteDb,
+    execution: &Execution,
+) -> Result<Option<(String, Daemon)>> {
+    let Some(agent_id) = execution.agent_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
+        return Ok(None);
+    };
+    let Some(daemon_id) = agent.daemon_id else {
+        return Ok(None);
+    };
+    let Some(daemon) = DaemonRepo::get_by_id(db, &daemon_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some((daemon_id, daemon)))
+}
+
+pub(crate) async fn execution_is_remote_owned(
+    db: &SqliteDb,
+    execution: &Execution,
+) -> Result<bool> {
+    let Some((_, daemon)) = resolve_execution_daemon(db, execution).await? else {
+        return Ok(false);
+    };
+    Ok(!is_embedded_daemon_machine(&daemon.machine_id))
+}
+
+pub(crate) struct FailDaemonDisconnectedExecution<'a> {
+    pub execution: &'a Execution,
+    pub daemon_id: &'a str,
+    pub error_message: String,
+    pub stopped_by: &'a str,
+    pub reconciliation_reason: &'a str,
+}
+
+pub(crate) async fn fail_execution_daemon_disconnected(
+    db: &SqliteDb,
+    event_bus: &EventBus,
+    task_service: Option<&TaskService>,
+    input: FailDaemonDisconnectedExecution<'_>,
+) -> Result<Execution> {
+    let FailDaemonDisconnectedExecution {
+        execution,
+        daemon_id,
+        error_message,
+        stopped_by,
+        reconciliation_reason,
+    } = input;
+    let now = now_rfc3339();
+    let updated = ExecutionRepo::update(
+        db,
+        UpdateExecution {
+            id: execution.id.clone(),
+            status: Some(ExecutionStatus::Failed),
+            stop_reason: Some(Some(StopReason::DaemonDisconnected)),
+            stopped_by: Some(Some(stopped_by.to_owned())),
+            resume_policy: Some(Some(ResumePolicy::Manual)),
+            stopped_at: Some(Some(now.clone())),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some(Some(now.clone())),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some(Some(error_message)),
+            executor_config_snapshot_json: None,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    event_bus.publish(ForgeEvent {
+        event_type: "execution.daemon_disconnected".to_owned(),
+        entity_id: updated.id.clone(),
+        timestamp: event_timestamp(),
+        context: EventContext::ExecutionDaemonDisconnected {
+            task_id: updated.task_id.clone(),
+            execution_id: updated.id.clone(),
+            daemon_id: daemon_id.to_owned(),
+        },
+    });
+    event_bus.publish(ForgeEvent {
+        event_type: "reconciliation.event".to_owned(),
+        entity_id: updated.task_id.clone(),
+        timestamp: event_timestamp(),
+        context: EventContext::ReconciliationEvent {
+            task_id: Some(updated.task_id.clone()),
+            execution_id: Some(updated.id.clone()),
+            reason: reconciliation_reason.to_owned(),
+        },
+    });
+
+    if stalled_execution_should_block_task(&updated) {
+        if let Some(task_service) = task_service {
+            if let Err(error) = task_service.annotate_executor_failure_block(&updated).await {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    task_id = %updated.task_id,
+                    %error,
+                    "failed to cascade daemon-disconnected execution"
+                );
+            }
+        }
+    }
+
+    Ok(updated)
+}
+
+pub(crate) const DAEMON_REPORT_RECONCILE_MIN_AGE: Duration = Duration::from_secs(60);
+
+pub(crate) async fn reconcile_daemon_report_executions(
+    db: &SqliteDb,
+    event_bus: &EventBus,
+    task_service: Option<&TaskService>,
+    daemon: &Daemon,
+    active_execution_ids: &[String],
+) -> Result<u64> {
+    if is_embedded_daemon_machine(&daemon.machine_id) {
+        return Ok(0);
+    }
+
+    let created_before = (Utc::now()
+        - ChronoDuration::seconds(DAEMON_REPORT_RECONCILE_MIN_AGE.as_secs() as i64))
+    .to_rfc3339();
+    let executions = ExecutionRepo::list_running_for_daemon_not_in(
+        db,
+        &daemon.id,
+        &created_before,
+        active_execution_ids,
+    )
+    .await?;
+
+    let mut interrupted = 0_u64;
+    for execution in executions {
+        fail_execution_daemon_disconnected(
+            db,
+            event_bus,
+            task_service,
+            FailDaemonDisconnectedExecution {
+                execution: &execution,
+                daemon_id: &daemon.id,
+                error_message: "daemon no longer running this execution".to_owned(),
+                stopped_by: "system:daemon_report",
+                reconciliation_reason: "daemon_disconnected",
+            },
+        )
+        .await?;
+        interrupted += 1;
+    }
+    Ok(interrupted)
+}
+
 fn agent_timed_out(agent: &Agent) -> bool {
     let Some(last_heartbeat_at) = &agent.last_heartbeat_at else {
         return true;
@@ -892,7 +1161,12 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{workflow::default_roles, TaskService};
+    use crate::{
+        daemon_service::{DaemonReportInput, DaemonService, DetectedCliInput},
+        daemon_transport::{DaemonConnection, DaemonConnectionRegistry},
+        workflow::default_roles,
+        TaskService,
+    };
     use db::{
         create_sqlite_pool, new_uuid_v4, run_migrations, CreateAgent, CreateExecution,
         CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo, DaemonStatus,
@@ -1327,16 +1601,21 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let agent = seed_agent(&db, AgentStatus::Idle, Some(now_rfc3339())).await;
+        let (agent_id, _) = seed_agent_with_daemon(
+            &db,
+            &crate::embedded_daemon::embedded_machine_id(),
+            AgentStatus::Idle,
+        )
+        .await;
         let task = seed_task(
             &db,
             project_id,
             repo_id,
             "in_progress".to_owned(),
-            Some(agent.id.clone()),
+            Some(agent_id.clone()),
         )
         .await;
-        let execution = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
         ExecutionRepo::update(
             &*db,
             UpdateExecution {
@@ -1796,6 +2075,538 @@ mod tests {
             .expect("task loads")
             .expect("task exists");
         assert_eq!(updated.error_annotation, None);
+    }
+
+    async fn seed_agent_with_daemon(
+        db: &SqliteDb,
+        machine_id: &str,
+        status: AgentStatus,
+    ) -> (String, Agent) {
+        let now = now_rfc3339();
+        let daemon_id = new_uuid_v4();
+        DaemonRepo::upsert_by_machine_id(
+            db,
+            UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id: machine_id.to_owned(),
+                hostname: "test-host".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: None,
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: None,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("daemon creates");
+
+        let agent = AgentRepo::create(
+            db,
+            CreateAgent {
+                id: new_uuid_v4(),
+                name: "remote".to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                daemon_id: Some(daemon_id),
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                prompt_template: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("agent creates");
+        (agent.id.clone(), agent)
+    }
+
+    async fn seed_running_execution_with_created_at(
+        db: &SqliteDb,
+        task_id: String,
+        agent_id: String,
+        created_at: &str,
+    ) -> db::Execution {
+        let execution = seed_running_execution(db, task_id, agent_id, None).await;
+        ExecutionRepo::update(
+            db,
+            UpdateExecution {
+                id: execution.id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: created_at.to_owned(),
+            },
+        )
+        .await
+        .expect("execution timestamp updates");
+        sqlx::query("UPDATE execution SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .expect("execution created_at updates");
+        ExecutionRepo::get_by_id(db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists")
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_fails_remote_execution_when_daemon_stays_disconnected() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) =
+            seed_agent_with_daemon(&db, "remote-machine-a", AgentStatus::Idle).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_daemon_connections(Arc::clone(&registry))
+            .with_daemon_disconnect_grace(Duration::from_millis(1));
+
+        monitor.check_once().await.expect("first check");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let interrupted = monitor.check_once().await.expect("second check");
+        assert_eq!(interrupted, 1);
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Failed);
+        assert_eq!(updated.stop_reason, Some(StopReason::DaemonDisconnected));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_leaves_remote_execution_alone_within_disconnect_grace() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) =
+            seed_agent_with_daemon(&db, "remote-machine-b", AgentStatus::Idle).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_daemon_connections(Arc::clone(&registry))
+            .with_daemon_disconnect_grace(Duration::from_secs(120));
+
+        let interrupted = monitor.check_once().await.expect("monitor checks");
+        assert_eq!(interrupted, 0);
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_clears_disconnect_tracking_when_daemon_reconnects() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, agent) =
+            seed_agent_with_daemon(&db, "remote-machine-c", AgentStatus::Idle).await;
+        let daemon_id = agent.daemon_id.clone().expect("daemon id");
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_daemon_connections(Arc::clone(&registry))
+            .with_daemon_disconnect_grace(Duration::from_secs(120));
+
+        monitor.check_once().await.expect("first check");
+        let (connection, _rx) = DaemonConnection::new(daemon_id.clone());
+        registry.register(daemon_id, connection);
+        let interrupted = monitor.check_once().await.expect("second check");
+        assert_eq!(interrupted, 0);
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_skips_embedded_daemon_executions_for_disconnect_check() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) = seed_agent_with_daemon(
+            &db,
+            &crate::embedded_daemon::embedded_machine_id(),
+            AgentStatus::Idle,
+        )
+        .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_daemon_connections(Arc::clone(&registry))
+            .with_daemon_disconnect_grace(Duration::from_millis(1));
+
+        monitor.check_once().await.expect("first check");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let interrupted = monitor.check_once().await.expect("second check");
+        assert_eq!(interrupted, 0);
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_does_not_cancel_remote_stalled_executions_via_embedded_executor() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) =
+            seed_agent_with_daemon(&db, "remote-machine-d", AgentStatus::Idle).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+        ExecutionRepo::update(
+            &*db,
+            UpdateExecution {
+                id: execution.id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: Some(Some("1970-01-01T00:00:00+00:00".to_owned())),
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("execution activity updates");
+
+        let executor = Arc::new(RecordingCancelExecutor::default());
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_task_executor(executor.clone())
+            .with_execution_stall_timeout(Duration::from_secs(1));
+
+        let stalled = monitor.check_once().await.expect("monitor checks");
+        assert_eq!(stalled, 1);
+        assert!(executor
+            .cancelled
+            .lock()
+            .expect("cancel log lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_cancels_stalled_executions_of_daemonless_agents() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let now = now_rfc3339();
+        let agent = AgentRepo::create(
+            &*db,
+            CreateAgent {
+                id: new_uuid_v4(),
+                name: "embedded-shell".to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 1,
+                max_missed_heartbeats: 1,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                prompt_template: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("daemonless agent creates");
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        ExecutionRepo::update(
+            &*db,
+            UpdateExecution {
+                id: execution.id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: Some(Some("1970-01-01T00:00:00+00:00".to_owned())),
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("execution activity updates");
+
+        let executor = Arc::new(RecordingCancelExecutor::default());
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_task_executor(executor.clone())
+            .with_execution_stall_timeout(Duration::from_secs(1));
+
+        let stalled = monitor.check_once().await.expect("monitor checks");
+        assert_eq!(stalled, 1);
+        assert_eq!(
+            executor
+                .cancelled
+                .lock()
+                .expect("cancel log lock")
+                .as_slice(),
+            std::slice::from_ref(&execution.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_report_reconcile_interrupts_missing_old_running_execution() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+        let service = DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_task_service(task_service);
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, agent) =
+            seed_agent_with_daemon(&db, "remote-machine-report", AgentStatus::Idle).await;
+        let daemon_id = agent.daemon_id.clone().expect("daemon id");
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution_with_created_at(
+            &db,
+            task.id.clone(),
+            agent_id,
+            "1970-01-01T00:00:00+00:00",
+        )
+        .await;
+
+        service
+            .ingest_report(
+                &daemon_id,
+                DaemonReportInput {
+                    detected_clis: vec![DetectedCliInput {
+                        kind: "shell".to_owned(),
+                        availability: "authenticated".to_owned(),
+                        config_path: None,
+                        version: None,
+                        path: None,
+                    }],
+                    runtimes: Vec::new(),
+                    labels: None,
+                    active_execution_ids: Some(Vec::new()),
+                },
+            )
+            .await
+            .expect("report ingests");
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Failed);
+        assert_eq!(updated.stop_reason, Some(StopReason::DaemonDisconnected));
+    }
+
+    #[tokio::test]
+    async fn daemon_report_reconcile_leaves_fresh_running_execution_untouched() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let service = DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, agent) =
+            seed_agent_with_daemon(&db, "remote-machine-fresh", AgentStatus::Idle).await;
+        let daemon_id = agent.daemon_id.clone().expect("daemon id");
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+
+        service
+            .ingest_report(
+                &daemon_id,
+                DaemonReportInput {
+                    detected_clis: vec![DetectedCliInput {
+                        kind: "shell".to_owned(),
+                        availability: "authenticated".to_owned(),
+                        config_path: None,
+                        version: None,
+                        path: None,
+                    }],
+                    runtimes: Vec::new(),
+                    labels: None,
+                    active_execution_ids: Some(Vec::new()),
+                },
+            )
+            .await
+            .expect("report ingests");
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn daemon_report_without_active_execution_ids_does_not_reconcile() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let service = DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, agent) =
+            seed_agent_with_daemon(&db, "remote-machine-none", AgentStatus::Idle).await;
+        let daemon_id = agent.daemon_id.clone().expect("daemon id");
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution_with_created_at(
+            &db,
+            task.id.clone(),
+            agent_id,
+            "1970-01-01T00:00:00+00:00",
+        )
+        .await;
+
+        service
+            .ingest_report(
+                &daemon_id,
+                DaemonReportInput {
+                    detected_clis: vec![DetectedCliInput {
+                        kind: "shell".to_owned(),
+                        availability: "authenticated".to_owned(),
+                        config_path: None,
+                        version: None,
+                        path: None,
+                    }],
+                    runtimes: Vec::new(),
+                    labels: None,
+                    active_execution_ids: None,
+                },
+            )
+            .await
+            .expect("report ingests");
+
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated.status, ExecutionStatus::Running);
     }
 
     #[tokio::test]

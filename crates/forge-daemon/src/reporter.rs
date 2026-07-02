@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, path::Path, path::PathBuf, sync::Arc, time::Dur
 use anyhow::Result;
 use api_types::{DaemonReportRequest, DaemonResponse, RuntimeReport};
 use forge_client::daemon_link::{report_with_retry, DaemonClient};
+use forge_client::daemon_runtime::ActiveExecutionTracker;
 use tokio::{sync::watch, time};
 
 use crate::detect;
@@ -12,6 +13,7 @@ pub async fn run(
     workspace_root: PathBuf,
     labels: BTreeMap<String, String>,
     interval_seconds: u64,
+    active_executions: ActiveExecutionTracker,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ticker = time::interval(Duration::from_secs(interval_seconds.max(1)));
@@ -25,7 +27,7 @@ pub async fn run(
                 }
             }
             _ = ticker.tick() => {
-                match report_once(&client, &workspace_root, &labels).await {
+                match report_once(&client, &workspace_root, &labels, &active_executions).await {
                     Ok(daemon) => {
                         tracing::info!(
                             daemon_id = %daemon.id,
@@ -50,19 +52,22 @@ pub async fn report_once(
     client: &DaemonClient,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    active_executions: &ActiveExecutionTracker,
 ) -> Result<DaemonResponse> {
-    let request = report_request(workspace_root, labels).await;
+    let request = report_request(workspace_root, labels, active_executions).await;
     report_with_retry(client, &request).await
 }
 
 pub async fn report_request(
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    active_executions: &ActiveExecutionTracker,
 ) -> DaemonReportRequest {
     DaemonReportRequest {
         detected_clis: detect::detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),
+        active_execution_ids: Some(active_executions.active_ids()),
     }
 }
 

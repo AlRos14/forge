@@ -98,6 +98,28 @@ filesystem can still browse paths under its own `--workspace-root`, but
 `execution.start` rejects server-only worktree paths until Forge has a remote
 workspace sync or git handoff path.
 
+### Daemon lifecycle and execution recovery
+
+Remote daemons periodically report local CLI availability and, when connected
+over the command stream, their currently running managed execution ids via
+`POST /api/v1/daemons/{id}/report` (`active_execution_ids`). The server uses
+that snapshot to reconcile orphaned server-side `running` executions owned by
+the daemon: any execution older than 60 seconds that is missing from the report
+is failed with `stop_reason = daemon_disconnected` and manual recovery only.
+
+Separately, the server `HeartbeatMonitor` (10s tick) watches remote executions
+whose owning daemon has no live WebSocket connection. After a 120s grace period
+from the first observed disconnect, it fails the execution with
+`daemon_disconnected`, publishes `execution.daemon_disconnected`, and emits the
+same `reconciliation.event` used for stalled executions so tasks enter the
+blocked/recovery UX. Embedded-server executions are excluded from the
+disconnect check; only embedded-owned stalled executions are cancelled via the
+in-process executor.
+
+If a remote execution keeps running but stops emitting activity, the existing
+stall detector still fails it after `execution_stall_timeout` (default 300s)
+with `stop_reason = execution_stalled`.
+
 ### Task terminal sessions
 
 Task terminal sessions are a separate API and daemon path for interactive shell

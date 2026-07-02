@@ -113,6 +113,7 @@ impl EmbeddedDaemon {
                     detected_clis,
                     runtimes,
                     labels: None,
+                    active_execution_ids: Some(Vec::new()),
                 },
             )
             .await?;
@@ -218,6 +219,10 @@ pub fn embedded_machine_id() -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     )
+}
+
+pub fn is_embedded_daemon_machine(machine_id: &str) -> bool {
+    machine_id == embedded_machine_id()
 }
 
 async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<String>) {

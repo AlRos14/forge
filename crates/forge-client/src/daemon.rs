@@ -174,7 +174,8 @@ impl DaemonArgs {
                     )
                 })?;
                 let labels = parse_labels(labels)?;
-                let daemon = report_once(client, &credentials, &workspace_root, &labels).await?;
+                let daemon =
+                    report_once(client, &credentials, &workspace_root, &labels, None).await?;
                 print_daemon(output, &daemon)?;
                 println!(
                     "daemon started as {}; reporting every {}s with command stream enabled",
@@ -208,7 +209,8 @@ impl DaemonArgs {
                     )
                 })?;
                 let labels = parse_labels(labels)?;
-                let daemon = report_once(client, &credentials, &workspace_root, &labels).await?;
+                let daemon =
+                    report_once(client, &credentials, &workspace_root, &labels, None).await?;
                 print_daemon(output, &daemon)
             }
         }
@@ -240,10 +242,12 @@ async fn run_daemon_loop(
         config.initial_credentials.daemon_id.clone(),
         config.initial_credentials.token.clone(),
     );
+    let active_executions = daemon_runtime::ActiveExecutionTracker::default();
     let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
         shutdown_rx,
+        active_executions.clone(),
     ));
     loop {
         tokio::select! {
@@ -263,7 +267,14 @@ async fn run_daemon_loop(
             () = tokio::time::sleep(Duration::from_secs(config.interval_seconds.max(1))) => {
                 let credentials = read_credentials(config.credentials_path)?
                     .ok_or_else(|| anyhow!("missing daemon credentials at {}", config.credentials_path.display()))?;
-                let daemon = report_once(client, &credentials, config.workspace_root, config.labels).await?;
+                let daemon = report_once(
+                    client,
+                    &credentials,
+                    config.workspace_root,
+                    config.labels,
+                    Some(&active_executions),
+                )
+                .await?;
                 if matches!(output, OutputFormat::Json) {
                     print_json(&daemon)?;
                 } else {
@@ -286,7 +297,7 @@ async fn link_and_report(
     // A supplied user token should claim/rotate the daemon even if old daemon credentials exist.
     if owner_token.is_none() {
         if let Some(credentials) = read_credentials(credentials_path)? {
-            match report_once(client, &credentials, workspace_root, labels).await {
+            match report_once(client, &credentials, workspace_root, labels, None).await {
                 Ok(daemon) => {
                     return Ok(LinkResult {
                         credentials,
@@ -310,7 +321,7 @@ async fn link_and_report(
     )
     .await?;
     write_credentials(credentials_path, &credentials)?;
-    let daemon = report_once(client, &credentials, workspace_root, labels).await?;
+    let daemon = report_once(client, &credentials, workspace_root, labels, None).await?;
     Ok(LinkResult {
         credentials,
         daemon,
@@ -352,11 +363,13 @@ async fn report_once(
     credentials: &DaemonCredentials,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    active_executions: Option<&daemon_runtime::ActiveExecutionTracker>,
 ) -> Result<DaemonResponse> {
     let request = DaemonReportRequest {
         detected_clis: detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),
+        active_execution_ids: active_executions.map(|tracker| tracker.active_ids()),
     };
     client
         .post_bearer(

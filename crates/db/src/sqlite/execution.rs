@@ -268,6 +268,62 @@ impl ExecutionRepo for SqliteDb {
         rows.into_iter().map(map_execution).collect()
     }
 
+    async fn list_running(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM execution
+             WHERE status = 'running'
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn list_running_for_daemon_not_in(
+        &self,
+        daemon_id: &str,
+        created_before: &str,
+        exclude_ids: &[String],
+    ) -> Result<Vec<Execution>> {
+        let rows = if exclude_ids.is_empty() {
+            sqlx::query(
+                "SELECT e.* FROM execution e
+                 INNER JOIN agent a ON a.id = e.agent_id
+                 WHERE e.status = 'running'
+                   AND a.daemon_id = ?
+                   AND e.created_at < ?
+                 ORDER BY e.created_at ASC, e.id ASC",
+            )
+            .bind(daemon_id)
+            .bind(created_before)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            let placeholders = exclude_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT e.* FROM execution e
+                 INNER JOIN agent a ON a.id = e.agent_id
+                 WHERE e.status = 'running'
+                   AND a.daemon_id = ?
+                   AND e.created_at < ?
+                   AND e.id NOT IN ({placeholders})
+                 ORDER BY e.created_at ASC, e.id ASC"
+            );
+            let mut query = sqlx::query(&query).bind(daemon_id).bind(created_before);
+            for execution_id in exclude_ids {
+                query = query.bind(execution_id);
+            }
+            query.fetch_all(&self.pool).await?
+        };
+
+        rows.into_iter().map(map_execution).collect()
+    }
+
     async fn get_logs_path(&self, id: &str) -> Result<Option<String>> {
         sqlx::query_scalar("SELECT logs_path FROM execution WHERE id = ?")
             .bind(id)

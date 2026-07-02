@@ -79,6 +79,7 @@ pub enum StopReason {
     CrashRecovery,
     AgentTimeout,
     ExecutionStalled,
+    DaemonDisconnected,
     ExecutorCancelled,
     ExecutorFailed,
     LegacyUnknown,

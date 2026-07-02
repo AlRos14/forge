@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -34,18 +35,65 @@ use crate::{
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 const EXECUTION_ERROR: &str = "execution_error";
 
+#[derive(Clone, Default)]
+pub struct ActiveExecutionTracker {
+    inner: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ActiveExecutionTracker {
+    pub fn track(&self, execution_id: String) -> ActiveExecutionGuard {
+        self.inner
+            .lock()
+            .expect("active execution tracker lock")
+            .insert(execution_id.clone());
+        ActiveExecutionGuard {
+            tracker: self.clone(),
+            execution_id,
+        }
+    }
+
+    pub fn active_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .inner
+            .lock()
+            .expect("active execution tracker lock")
+            .iter()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+pub struct ActiveExecutionGuard {
+    tracker: ActiveExecutionTracker,
+    execution_id: String,
+}
+
+impl Drop for ActiveExecutionGuard {
+    fn drop(&mut self) {
+        self.tracker
+            .inner
+            .lock()
+            .expect("active execution tracker lock")
+            .remove(&self.execution_id);
+    }
+}
+
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
 pub async fn run_command_stream(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
     shutdown: watch::Receiver<bool>,
+    active_executions: ActiveExecutionTracker,
 ) -> Result<()> {
     let workspace_root = Arc::new(workspace_root);
     run_with_reconnect(client, move |stream| {
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
-        async move { dispatch_loop(stream, workspace_root, shutdown).await }
+        let active_executions = active_executions.clone();
+        async move { dispatch_loop(stream, workspace_root, shutdown, active_executions).await }
     })
     .await
 }
@@ -54,9 +102,14 @@ async fn dispatch_loop(
     mut stream: DaemonCommandStream,
     workspace_root: Arc<PathBuf>,
     mut shutdown: watch::Receiver<bool>,
+    active_executions: ActiveExecutionTracker,
 ) -> Result<()> {
     let (responses_tx, mut responses_rx) = mpsc::unbounded_channel::<DaemonFrame>();
-    let runtime = DaemonRuntime::new(responses_tx.clone(), workspace_root.as_ref().clone());
+    let runtime = DaemonRuntime::new_with_tracker(
+        responses_tx.clone(),
+        workspace_root.as_ref().clone(),
+        active_executions,
+    );
     let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
     heartbeat.tick().await;
     let mut heartbeat_seq = 0_u64;
@@ -120,16 +173,30 @@ pub struct DaemonRuntime {
     workspace_root: PathBuf,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     executor: Arc<AdapterExecutor>,
+    active_executions: ActiveExecutionTracker,
 }
 
 impl DaemonRuntime {
     pub fn new(outbound: mpsc::UnboundedSender<DaemonFrame>, workspace_root: PathBuf) -> Arc<Self> {
+        Self::new_with_tracker(outbound, workspace_root, ActiveExecutionTracker::default())
+    }
+
+    pub fn new_with_tracker(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+        active_executions: ActiveExecutionTracker,
+    ) -> Arc<Self> {
         let registry = Arc::new(cli_adapters::default_registry());
         Arc::new(Self {
             workspace_root,
             outbound,
             executor: Arc::new(AdapterExecutor::new(registry)),
+            active_executions,
         })
+    }
+
+    pub fn active_execution_ids(&self) -> Vec<String> {
+        self.active_executions.active_ids()
     }
 
     pub async fn handle_request(self: &Arc<Self>, frame: DaemonFrame) -> DaemonFrame {
@@ -221,8 +288,9 @@ impl DaemonRuntime {
         let execution_id = params.execution_id.clone();
         let executor = Arc::clone(&self.executor);
         let outbound = self.outbound.clone();
+        let active_executions = self.active_executions.clone();
         tokio::spawn(async move {
-            run_execution_task(executor, outbound, ctx).await;
+            run_execution_task(executor, outbound, ctx, active_executions).await;
         });
 
         Ok(ExecutionStartResult {
@@ -250,7 +318,9 @@ async fn run_execution_task(
     executor: Arc<AdapterExecutor>,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     mut ctx: ExecutionContext,
+    active_executions: ActiveExecutionTracker,
 ) {
+    let _active_guard = active_executions.track(ctx.execution_id.clone());
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     ctx.log_sender = Some(log_tx);
     let log_outbound = outbound.clone();

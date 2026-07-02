@@ -243,7 +243,8 @@ async fn main() {
     let monitor = Arc::new(
         services::HeartbeatMonitor::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
             .with_task_service(Arc::clone(&state.task_service))
-            .with_task_executor(Arc::clone(&state.task_executor)),
+            .with_task_executor(Arc::clone(&state.task_executor))
+            .with_daemon_connections(Arc::clone(&state.daemon_connections)),
     );
     let monitor_handle = Arc::clone(&monitor).start();
     let task_dispatcher_handle = Arc::clone(&task_dispatcher).start();

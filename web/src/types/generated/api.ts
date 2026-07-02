@@ -19,6 +19,7 @@ export type StopReason =
   | 'executor_cancelled'
   | 'executor_failed'
   | 'execution_stalled'
+  | 'daemon_disconnected'
   | 'legacy_unknown'
 export type ResumePolicy = 'auto' | 'manual' | 'none'
 export type ExecutionBehaviorKind =

@@ -1,4 +1,4 @@
-use crate::{Result, ServiceError};
+use crate::{recovery::reconcile_daemon_report_executions, Result, ServiceError, TaskService};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateRuntime, Daemon,
@@ -17,6 +17,7 @@ use std::sync::Arc;
 pub struct DaemonService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
+    task_service: Option<Arc<TaskService>>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ pub struct DaemonReportInput {
     pub detected_clis: Vec<DetectedCliInput>,
     pub runtimes: Vec<RuntimeReportInput>,
     pub labels: Option<Value>,
+    pub active_execution_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +65,16 @@ pub struct RuntimeReportInput {
 
 impl DaemonService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
-        Self { db, event_bus }
+        Self {
+            db,
+            event_bus,
+            task_service: None,
+        }
+    }
+
+    pub fn with_task_service(mut self, task_service: Arc<TaskService>) -> Self {
+        self.task_service = Some(task_service);
+        self
     }
 
     #[tracing::instrument(
@@ -167,6 +178,24 @@ impl DaemonService {
         self.upsert_runtimes(daemon_id, input.runtimes).await?;
         self.ensure_agents_for_daemon(&daemon, &detected_clis)
             .await?;
+
+        if let Some(active_execution_ids) = input.active_execution_ids.as_ref() {
+            let interrupted = reconcile_daemon_report_executions(
+                &self.db,
+                &self.event_bus,
+                self.task_service.as_deref(),
+                &daemon,
+                active_execution_ids,
+            )
+            .await?;
+            if interrupted > 0 {
+                tracing::info!(
+                    daemon_id = %daemon_id,
+                    interrupted_executions = interrupted,
+                    "daemon report reconciled missing active executions"
+                );
+            }
+        }
 
         self.publish(ForgeEvent {
             event_type: "daemon.report_received".to_owned(),
@@ -625,6 +654,7 @@ mod tests {
             .collect(),
             runtimes: Vec::new(),
             labels: None,
+            active_execution_ids: None,
         };
 
         service

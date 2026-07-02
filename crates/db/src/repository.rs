@@ -133,6 +133,13 @@ pub trait ExecutionRepo: Send + Sync {
     async fn update(&self, input: UpdateExecution) -> Result<Execution>;
     async fn update_last_activity_at(&self, id: &str, timestamp: &str) -> Result<()>;
     async fn list_stalled_running(&self, stale_before: &str) -> Result<Vec<Execution>>;
+    async fn list_running(&self) -> Result<Vec<Execution>>;
+    async fn list_running_for_daemon_not_in(
+        &self,
+        daemon_id: &str,
+        created_before: &str,
+        exclude_ids: &[String],
+    ) -> Result<Vec<Execution>>;
     async fn get_logs_path(&self, id: &str) -> Result<Option<String>>;
 }
 

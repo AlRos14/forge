@@ -134,6 +134,11 @@ pub enum EventContext {
         execution_id: String,
         stale_before: String,
     },
+    ExecutionDaemonDisconnected {
+        task_id: String,
+        execution_id: String,
+        daemon_id: String,
+    },
     ReconciliationEvent {
         task_id: Option<String>,
         execution_id: Option<String>,

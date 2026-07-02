@@ -295,6 +295,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'execution.failed',
         'execution.cancelled',
         'execution.stalled',
+        'execution.daemon_disconnected',
         'agent.status_changed',
         'agent.created',
         'agent.deleted',
