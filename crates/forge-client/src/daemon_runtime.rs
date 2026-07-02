@@ -20,16 +20,11 @@ use executors::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tokio::{
-    sync::{mpsc, watch},
-    time,
-};
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     daemon_fs,
-    daemon_link::{
-        run_with_reconnect, DaemonClient, DaemonCommandStream, DAEMON_HEARTBEAT_INTERVAL_SECS,
-    },
+    daemon_link::{run_dispatch_loop, run_with_reconnect, DaemonClient},
 };
 
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
@@ -93,80 +88,24 @@ pub async fn run_command_stream(
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
         let active_executions = active_executions.clone();
-        async move { dispatch_loop(stream, workspace_root, shutdown, active_executions).await }
+        async move {
+            let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+            let runtime = DaemonRuntime::new_with_tracker(
+                responses_tx.clone(),
+                workspace_root.as_ref().clone(),
+                active_executions,
+            );
+            let handler = {
+                let runtime = Arc::clone(&runtime);
+                move |frame| {
+                    let runtime = Arc::clone(&runtime);
+                    async move { runtime.handle_request(frame).await }
+                }
+            };
+            run_dispatch_loop(stream, handler, shutdown, responses_tx, responses_rx).await
+        }
     })
     .await
-}
-
-async fn dispatch_loop(
-    mut stream: DaemonCommandStream,
-    workspace_root: Arc<PathBuf>,
-    mut shutdown: watch::Receiver<bool>,
-    active_executions: ActiveExecutionTracker,
-) -> Result<()> {
-    let (responses_tx, mut responses_rx) = mpsc::unbounded_channel::<DaemonFrame>();
-    let runtime = DaemonRuntime::new_with_tracker(
-        responses_tx.clone(),
-        workspace_root.as_ref().clone(),
-        active_executions,
-    );
-    let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
-    heartbeat.tick().await;
-    let mut heartbeat_seq = 0_u64;
-
-    loop {
-        tokio::select! {
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() {
-                    tracing::info!("daemon command stream shutdown requested");
-                    stream.close().await?;
-                    return Ok(());
-                }
-            }
-            frame = stream.recv() => {
-                match frame {
-                    Ok(frame @ DaemonFrame::Request { .. }) => {
-                        let responses_tx = responses_tx.clone();
-                        let runtime = Arc::clone(&runtime);
-                        tokio::spawn(async move {
-                            let response = runtime.handle_request(frame).await;
-                            if responses_tx.send(response).is_err() {
-                                tracing::warn!("daemon command response dropped because stream loop ended");
-                            }
-                        });
-                    }
-                    Ok(DaemonFrame::Heartbeat { seq }) => {
-                        tracing::trace!(seq, "daemon command heartbeat received");
-                    }
-                    Ok(DaemonFrame::Notification { method, .. }) => {
-                        tracing::warn!(%method, "unexpected daemon command notification received");
-                    }
-                    Ok(DaemonFrame::Response { id, .. }) => {
-                        tracing::warn!(%id, "unexpected daemon command response received");
-                    }
-                    Ok(DaemonFrame::Error { id, error }) => {
-                        tracing::warn!(
-                            id = ?id,
-                            code = %error.code,
-                            message = %error.message,
-                            "unexpected daemon command error received"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "daemon command stream receive failed");
-                        return Err(error);
-                    }
-                }
-            }
-            Some(response) = responses_rx.recv() => {
-                stream.send(&response).await?;
-            }
-            _ = heartbeat.tick() => {
-                heartbeat_seq = heartbeat_seq.saturating_add(1);
-                stream.send_heartbeat(heartbeat_seq).await?;
-            }
-        }
-    }
 }
 
 pub struct DaemonRuntime {
