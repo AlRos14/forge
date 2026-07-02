@@ -1,6 +1,6 @@
 use crate::{
-    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, LogKind, LogStream,
-    LogWriter, TaskExecutor,
+    build_shell_command_plan, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
+    LogKind, LogStream, LogWriter, ShellConfig, TaskExecutor,
 };
 use async_trait::async_trait;
 use std::{
@@ -21,11 +21,54 @@ use tokio::{
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const DEFAULT_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ShellExecutor {
     processes: Arc<Mutex<HashMap<String, Arc<RunningProcess>>>>,
+    cancel_grace_period: Duration,
+    shell_program: Option<String>,
+}
+
+impl Default for ShellExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShellExecutor {
+    pub fn new() -> Self {
+        Self {
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            cancel_grace_period: DEFAULT_CANCEL_GRACE_PERIOD,
+            shell_program: None,
+        }
+    }
+
+    pub fn with_cancel_grace_period(mut self, grace: Duration) -> Self {
+        self.cancel_grace_period = grace;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_shell_program(mut self, program: impl Into<String>) -> Self {
+        self.shell_program = Some(program.into());
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn has_process(&self, execution_id: &str) -> bool {
+        self.lock_processes()
+            .map(|processes| processes.contains_key(execution_id))
+            .unwrap_or(false)
+    }
+
+    #[doc(hidden)]
+    pub async fn running_child_pid(&self, execution_id: &str) -> Option<u32> {
+        let process = self.get_process(execution_id).ok()??;
+        let child = process.child.lock().await;
+        child.id()
+    }
 }
 
 struct RunningProcess {
@@ -50,21 +93,38 @@ impl TaskExecutor for ShellExecutor {
             writer.set_log_sender(sender);
         }
 
-        let mut command = Command::new("sh");
+        let shell_config: ShellConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        let mut plan = build_shell_command_plan(
+            &ctx.description,
+            &ctx.worktree_path,
+            ctx.max_turns,
+            Some(&shell_config),
+        );
+        if let Some(shell_program) = &self.shell_program {
+            plan.program = shell_program.clone();
+        }
+
+        let mut command = Command::new(&plan.program);
         command
-            .arg("-c")
-            .arg(&ctx.description)
-            .current_dir(&ctx.worktree_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
+            .args(&plan.args)
+            .current_dir(&plan.cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        configure_process_group(&mut command);
-        if let Some(max_turns) = ctx.max_turns {
-            command.env("FORGE_MAX_TURNS", max_turns.to_string());
+        for key in &plan.env_remove {
+            command.env_remove(key);
         }
-        let mut child = command.spawn()?;
+        for (key, value) in &plan.env_set {
+            command.env(key, value);
+        }
+        configure_process_group(&mut command);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return Err(ExecutorError::Io(error));
+            }
+        };
 
         let stdout = child
             .stdout
@@ -92,6 +152,8 @@ impl TaskExecutor for ShellExecutor {
     }
 
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
+        // Idempotent: the process may have finished (and been reaped) between the
+        // caller's decision to cancel and this call.
         let Some(process) = self.get_process(execution_id)? else {
             return Ok(());
         };
@@ -107,7 +169,7 @@ impl TaskExecutor for ShellExecutor {
             let _ = send_sigterm(child_id).await;
         }
 
-        let deadline = time::Instant::now() + CANCEL_GRACE_PERIOD;
+        let deadline = time::Instant::now() + self.cancel_grace_period;
         loop {
             {
                 let mut child = process.child.lock().await;
@@ -363,4 +425,28 @@ async fn send_signal(pid: u32, signal: &str) -> std::io::Result<()> {
         .status()
         .await
         .map(|_| ())
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+#[doc(hidden)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
