@@ -22,6 +22,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Updated the Rust lockfile to pull patched `quinn-proto` and `anyhow` releases so `cargo audit` passes for the 0.2.0 release.
+
 - User moves no longer fail with `state '<name>' is not defined in workflow` from downstream layers: the workflow is resolved once per transition and threaded through hooks and cascades; all undefined-state errors now enumerate the defined states. Any user move that changes state cancels in-flight executions, and parking a task to backlog keeps its agent assignment without relaunching.
 
 - The false "Recovered after server restart" banner: crash recovery now annotates only tasks whose running execution it actually cancelled, skips user-assigned tasks, and clears stale recovery banners automatically at startup.
