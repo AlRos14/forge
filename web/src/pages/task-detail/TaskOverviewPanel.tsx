@@ -171,9 +171,6 @@ export function TaskOverviewPanel({
   const [executionRetryOverride, setExecutionRetryOverride] = useState('')
   const [rejectingStateName, setRejectingStateName] = useState<string | null>(null)
   const [rejectReasonDraft, setRejectReasonDraft] = useState('')
-  const [confirmingAction, setConfirmingAction] = useState<WorkflowExceptionAction | null>(null)
-  const [recoveryReasonDraft, setRecoveryReasonDraft] = useState('')
-  const [recoveryGuidanceDraft, setRecoveryGuidanceDraft] = useState('')
 
   const projectId = task?.project_id ?? ''
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
@@ -297,58 +294,6 @@ export function TaskOverviewPanel({
     }
     onRejectGate(rejectingStateName, reason)
     closeRejectDialog()
-  }
-
-  const runWorkflowExceptionAction = (
-    action: WorkflowExceptionAction,
-    input?: { reason?: string; context?: string },
-  ) => {
-    if (!action.enabled) return
-    if (action.kind === 'open_interactive') {
-      onOpenWorkflowExceptionAction(action)
-      return
-    }
-    onRecover(action.kind, input)
-  }
-
-  const requestWorkflowExceptionAction = (action: WorkflowExceptionAction) => {
-    if (!action.enabled) return
-    if (action.kind === 'open_interactive') {
-      runWorkflowExceptionAction(action)
-      return
-    }
-    if (action.requires_reason || action.requires_guidance) {
-      setConfirmingAction(action)
-      setRecoveryReasonDraft('')
-      setRecoveryGuidanceDraft('')
-      return
-    }
-    runWorkflowExceptionAction(action)
-  }
-
-  const closeRecoveryDialog = () => {
-    setConfirmingAction(null)
-    setRecoveryReasonDraft('')
-    setRecoveryGuidanceDraft('')
-  }
-
-  const submitRecoveryDialog = () => {
-    if (!confirmingAction) return
-    const reason = recoveryReasonDraft.trim()
-    const guidance = recoveryGuidanceDraft.trim()
-    if (confirmingAction.requires_reason && !reason) {
-      toast.error('Reason is required')
-      return
-    }
-    if (confirmingAction.requires_guidance && !guidance) {
-      toast.error('Guidance is required')
-      return
-    }
-    runWorkflowExceptionAction(confirmingAction, {
-      reason: reason || undefined,
-      context: guidance || undefined,
-    })
-    closeRecoveryDialog()
   }
 
   const runExecutionAction = (action: ExecutionAction) => {
@@ -508,18 +453,11 @@ export function TaskOverviewPanel({
               recoverPending={recoverPending}
               terminal={terminal}
               cancelPending={cancelPending}
-              onRequestAction={requestWorkflowExceptionAction}
+              onRecover={onRecover}
+              onOpenInteractive={onOpenWorkflowExceptionAction}
               onCancelTask={onCancelTask}
             />
-            {!task.workflow_exception ? (
-              <TaskBlockingBanner
-                task={task}
-                disabled={recoverPending}
-                onRecover={onRecover}
-                onCancelTask={terminal ? undefined : onCancelTask}
-                cancelPending={cancelPending}
-              />
-            ) : null}
+            {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
             <TaskPrSummaryCard task={task} />
 
             {task.plan_progress || task.plan_artifact ? (
@@ -891,58 +829,6 @@ export function TaskOverviewPanel({
           </div>
         )}
       </div>
-      <Dialog
-        open={confirmingAction != null}
-        onOpenChange={(open) => {
-          if (!open) closeRecoveryDialog()
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{confirmingAction?.label ?? 'Confirm Recovery'}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4">
-            {confirmingAction?.requires_reason ? (
-              <div className="space-y-2">
-                <Label htmlFor="workflow-recovery-reason">Reason</Label>
-                <Input
-                  id="workflow-recovery-reason"
-                  value={recoveryReasonDraft}
-                  onChange={(event) => setRecoveryReasonDraft(event.target.value)}
-                  placeholder="Why is this recovery action needed?"
-                />
-              </div>
-            ) : null}
-            {confirmingAction?.requires_guidance ? (
-              <div className="space-y-2">
-                <Label htmlFor="workflow-recovery-guidance">Guidance</Label>
-                <Textarea
-                  id="workflow-recovery-guidance"
-                  value={recoveryGuidanceDraft}
-                  onChange={(event) => setRecoveryGuidanceDraft(event.target.value)}
-                  placeholder="Add instructions for the next workflow step"
-                  rows={4}
-                />
-              </div>
-            ) : null}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={closeRecoveryDialog}>
-              Cancel
-            </Button>
-            <Button
-              disabled={
-                recoverPending ||
-                (confirmingAction?.requires_reason && !recoveryReasonDraft.trim()) ||
-                (confirmingAction?.requires_guidance && !recoveryGuidanceDraft.trim())
-              }
-              onClick={submitRecoveryDialog}
-            >
-              Confirm
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
       <Dialog
         open={rejectingStateName != null}
         onOpenChange={(open) => {

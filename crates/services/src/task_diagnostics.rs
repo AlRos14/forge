@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use api_types::{
-    FailingStepSummary, HealthSeverity, RecoveryAction, RelatedEvidence, StateKind, TaskAnnotation,
-    TaskBlockingAnnotation, WorkflowDefinition, WorkflowExceptionAction, WorkflowExceptionSummary,
-    WorkflowHealthKind, WorkflowHealthSummary,
+    FailingStepSummary, FailureKind, HealthSeverity, RecoveryAction, RelatedEvidence, StateKind,
+    TaskAnnotation, TaskBlockingAnnotation, WorkflowDefinition, WorkflowExceptionAction,
+    WorkflowExceptionSummary, WorkflowHealthKind, WorkflowHealthSummary,
 };
 // use chrono::{DateTime, Utc};
 use db::{
@@ -229,6 +229,71 @@ pub fn derive_workflow_exception(
         .find(|state| state.name == task.status);
     let role = current_state.and_then(effective_role).map(str::to_owned);
 
+    // A hard failure supersedes any blocking annotation: recover_task only
+    // accepts ResetToInitial/CancelTask once failed_json is set, so offering
+    // annotation-derived retry actions here would produce guaranteed 400s.
+    if task.failed_json.is_some() {
+        return Some(task_failed_exception(
+            task,
+            workflow,
+            role,
+            latest_review,
+            latest_execution,
+        ));
+    }
+
+    // Interruption-era blocked metadata with a recoverable structured kind is
+    // classified directly from the typed kind — no synthesized annotation
+    // intermediate, no prose matching.
+    if let Some(metadata) = parse_blocked_metadata(task) {
+        if metadata.kind.is_retry_exhausted_metadata() {
+            let actions = retry_budget_exhausted_annotation_actions(
+                task,
+                workflow,
+                role.clone(),
+                latest_execution,
+            );
+            return Some(blocked_metadata_exception(
+                task,
+                &metadata,
+                "Task is blocked",
+                role,
+                latest_review,
+                latest_execution,
+                actions,
+            ));
+        }
+        if task.status == crate::workflow::default_states::MERGING
+            && metadata.kind == FailureKind::TargetRepoDirty
+        {
+            let actions =
+                merge_gate_annotation_actions(task, workflow, role.clone(), latest_execution);
+            return Some(blocked_metadata_exception(
+                task,
+                &metadata,
+                "Target repository needs attention",
+                role,
+                latest_review,
+                latest_execution,
+                actions,
+            ));
+        }
+        if task.status == crate::workflow::default_states::MERGE_FAILED
+            && metadata.kind.is_merge_recoverable()
+        {
+            let actions = merge_fix_annotation_actions(task, role.clone(), latest_execution);
+            return Some(blocked_metadata_exception(
+                task,
+                &metadata,
+                "Merge fix is blocked",
+                role,
+                latest_review,
+                latest_execution,
+                actions,
+            ));
+        }
+    }
+
     if let Some(annotation) = active_blocking_annotation(task) {
         let actions = annotation_actions(&annotation, workflow, task, latest_execution);
         let actions = if actions.is_empty() && is_retry_budget_exhausted(&annotation) {
@@ -246,7 +311,7 @@ pub fn derive_workflow_exception(
             actions
         };
         let mut summary = WorkflowExceptionSummary {
-            exception_type: annotation.annotation_type.clone(),
+            exception_type: annotation.annotation_type.to_string(),
             message: annotation
                 .message
                 .clone()
@@ -260,7 +325,9 @@ pub fn derive_workflow_exception(
             role: role.clone(),
             target_state: None,
             target_role: role.clone(),
-            failing_step: latest_failed_review(latest_review).and_then(parse_failing_step),
+            failing_step: latest_failed_review(latest_review)
+                .and_then(parse_failing_step)
+                .or_else(|| annotation_hook_failing_step(&annotation)),
             related_evidence: related_failed_review(latest_review),
             actions,
         };
@@ -270,37 +337,6 @@ pub fn derive_workflow_exception(
                 .push(cancel_action(false, task_is_terminal(workflow, task)));
         }
         return Some(summary);
-    }
-
-    if task.failed_json.is_some() {
-        return Some(WorkflowExceptionSummary {
-            exception_type: "task_failed".to_owned(),
-            message: interruption_message(task.failed_json.as_deref(), "Task failed")
-                .unwrap_or_else(|| "Task failed".to_owned()),
-            review_id: latest_failed_review(latest_review).map(|review| review.id.clone()),
-            execution_id: latest_execution.map(|execution| execution.id.clone()),
-            state: Some(task.status.clone()),
-            role,
-            target_state: workflow_initial_state(workflow),
-            target_role: None,
-            failing_step: latest_failed_review(latest_review).and_then(parse_failing_step),
-            related_evidence: related_failed_review(latest_review),
-            actions: vec![
-                action(
-                    RecoveryAction::ResetToInitial,
-                    "Restart Task",
-                    true,
-                    None,
-                    false,
-                    false,
-                    true,
-                    workflow_initial_state(workflow),
-                    None,
-                    None,
-                ),
-                cancel_action(true, task_is_terminal(workflow, task)),
-            ],
-        });
     }
 
     let is_gate_state = current_state.is_some_and(|state| state.kind == StateKind::Gate);
@@ -440,6 +476,64 @@ pub fn derive_workflow_exception(
     recovery_unavailable(task, workflow, role, latest_execution)
 }
 
+fn task_failed_exception(
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    role: Option<String>,
+    latest_review: Option<&Review>,
+    latest_execution: Option<&Execution>,
+) -> WorkflowExceptionSummary {
+    WorkflowExceptionSummary {
+        exception_type: "task_failed".to_owned(),
+        message: interruption_message(task.failed_json.as_deref(), "Task failed")
+            .unwrap_or_else(|| "Task failed".to_owned()),
+        review_id: latest_failed_review(latest_review).map(|review| review.id.clone()),
+        execution_id: latest_execution.map(|execution| execution.id.clone()),
+        state: Some(task.status.clone()),
+        role,
+        target_state: workflow_initial_state(workflow),
+        target_role: None,
+        failing_step: latest_failed_review(latest_review).and_then(parse_failing_step),
+        related_evidence: related_failed_review(latest_review),
+        actions: vec![
+            action(
+                RecoveryAction::ResetToInitial,
+                "Restart Task",
+                true,
+                None,
+                false,
+                false,
+                true,
+                workflow_initial_state(workflow),
+                None,
+                None,
+            ),
+            cancel_action(true, task_is_terminal(workflow, task)),
+        ],
+    }
+}
+
+fn annotation_hook_failing_step(annotation: &TaskBlockingAnnotation) -> Option<FailingStepSummary> {
+    let hook = annotation.hook.as_ref()?;
+    Some(FailingStepSummary {
+        index: hook
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0),
+        command: hook
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        exit_code: hook
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        output_tail: non_empty_string(hook.get("stdout")),
+        stderr_tail: non_empty_string(hook.get("stderr")),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn health(
     kind: WorkflowHealthKind,
@@ -559,169 +653,67 @@ fn stopped_execution_health(
 }
 
 pub fn is_retry_budget_exhausted(annotation: &TaskBlockingAnnotation) -> bool {
-    matches!(
-        annotation.annotation_type.as_str(),
-        "review_budget_exhausted"
-            | "retry_budget_exhausted"
-            | "retry_exhausted"
-            | "merge_fix_budget_exhausted"
-    ) || annotation
-        .blocking_reason
-        .to_ascii_lowercase()
-        .contains("retry budget exhausted")
-        || annotation
-            .blocking_reason
-            .to_ascii_lowercase()
-            .contains("rejection budget exhausted")
+    annotation.annotation_type.is_budget_exhausted_annotation()
 }
 
 fn active_blocking_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
-    if let Some(annotation) = retry_exhausted_blocked_metadata_annotation(task) {
-        return Some(annotation);
-    }
-    if let Some(annotation) = recoverable_merge_gate_blocked_metadata_annotation(task) {
-        return Some(annotation);
-    }
-    if let Some(annotation) = recoverable_merge_fix_blocked_metadata_annotation(task) {
-        return Some(annotation);
-    }
     match serde_json::from_str::<TaskAnnotation>(task.error_annotation.as_deref()?).ok()? {
         TaskAnnotation::Blocking(annotation) => Some(annotation),
         TaskAnnotation::Legacy(_) => None,
     }
 }
 
-fn retry_exhausted_blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
-    let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
-    let kind = metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("blocked");
-    let reason = metadata
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("Task is blocked")
-        .to_owned();
-    let retry_exhausted = matches!(
-        kind,
-        "review_gate_failed" | "retry_exhausted" | "merge_fix_budget_exhausted"
-    ) || reason.contains("retry budget exhausted")
-        || reason.contains("rejection budget exhausted");
-    if !retry_exhausted {
-        return None;
-    }
+struct BlockedMetadataSummary {
+    kind: FailureKind,
+    reason: Option<String>,
+    execution_id: Option<String>,
+}
 
-    let execution_id = metadata
-        .get("execution_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Some(TaskBlockingAnnotation {
-        annotation_type: kind.to_owned(),
-        blocking_reason: reason.clone(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: metadata
-            .get("created_at")
+fn parse_blocked_metadata(task: &Task) -> Option<BlockedMetadataSummary> {
+    let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
+    let kind = serde_json::from_value::<FailureKind>(metadata.get("kind")?.clone()).ok()?;
+    Some(BlockedMetadataSummary {
+        kind,
+        reason: metadata
+            .get("reason")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        blocked_execution_id: execution_id.clone(),
-        artifact: execution_id.map(|id| api_types::BlockingArtifact {
-            kind: "execution".to_owned(),
-            id: Some(id),
-            log_path: None,
-        }),
-        message: Some(reason),
-        hook: None,
-        recovery_actions: Vec::new(),
+        execution_id: metadata
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
-fn recoverable_merge_gate_blocked_metadata_annotation(
+#[allow(clippy::too_many_arguments)]
+fn blocked_metadata_exception(
     task: &Task,
-) -> Option<TaskBlockingAnnotation> {
-    if task.status != crate::workflow::default_states::MERGING {
-        return None;
+    metadata: &BlockedMetadataSummary,
+    default_reason: &str,
+    role: Option<String>,
+    latest_review: Option<&Review>,
+    latest_execution: Option<&Execution>,
+    actions: Vec<WorkflowExceptionAction>,
+) -> WorkflowExceptionSummary {
+    WorkflowExceptionSummary {
+        exception_type: metadata.kind.to_string(),
+        message: metadata
+            .reason
+            .clone()
+            .unwrap_or_else(|| default_reason.to_owned()),
+        review_id: latest_failed_review(latest_review).map(|review| review.id.clone()),
+        execution_id: metadata
+            .execution_id
+            .clone()
+            .or_else(|| latest_execution.map(|execution| execution.id.clone())),
+        state: Some(task.status.clone()),
+        role: role.clone(),
+        target_state: None,
+        target_role: role,
+        failing_step: latest_failed_review(latest_review).and_then(parse_failing_step),
+        related_evidence: related_failed_review(latest_review),
+        actions,
     }
-    let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
-    let kind = metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("blocked");
-    if !matches!(kind, "target_repo_dirty") {
-        return None;
-    }
-    let reason = metadata
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("Target repository needs attention")
-        .to_owned();
-    let execution_id = metadata
-        .get("execution_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Some(TaskBlockingAnnotation {
-        annotation_type: kind.to_owned(),
-        blocking_reason: reason.clone(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: metadata
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        blocked_execution_id: execution_id.clone(),
-        artifact: execution_id.map(|id| api_types::BlockingArtifact {
-            kind: "execution".to_owned(),
-            id: Some(id),
-            log_path: None,
-        }),
-        message: Some(reason),
-        hook: None,
-        recovery_actions: Vec::new(),
-    })
-}
-
-fn recoverable_merge_fix_blocked_metadata_annotation(
-    task: &Task,
-) -> Option<TaskBlockingAnnotation> {
-    if task.status != crate::workflow::default_states::MERGE_FAILED {
-        return None;
-    }
-    let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
-    let kind = metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("blocked");
-    if !matches!(
-        kind,
-        "merge_conflict" | "target_repo_dirty" | "dirty_worktree"
-    ) {
-        return None;
-    }
-    let reason = metadata
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("Merge fix is blocked")
-        .to_owned();
-    let execution_id = metadata
-        .get("execution_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Some(TaskBlockingAnnotation {
-        annotation_type: kind.to_owned(),
-        blocking_reason: reason.clone(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: metadata
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        blocked_execution_id: execution_id.clone(),
-        artifact: execution_id.map(|id| api_types::BlockingArtifact {
-            kind: "execution".to_owned(),
-            id: Some(id),
-            log_path: None,
-        }),
-        message: Some(reason),
-        hook: None,
-        recovery_actions: Vec::new(),
-    })
 }
 
 fn retry_budget_exhausted_annotation_actions(
@@ -823,18 +815,12 @@ fn gate_retry_label(task: &Task) -> &'static str {
 
 fn is_recoverable_merge_gate_annotation(task: &Task, annotation: &TaskBlockingAnnotation) -> bool {
     task.status == crate::workflow::default_states::MERGING
-        && matches!(
-            annotation.annotation_type.as_str(),
-            "merge_conflict" | "target_repo_dirty" | "dirty_worktree"
-        )
+        && annotation.annotation_type.is_merge_recoverable()
 }
 
 fn is_recoverable_merge_fix_annotation(task: &Task, annotation: &TaskBlockingAnnotation) -> bool {
     task.status == crate::workflow::default_states::MERGE_FAILED
-        && matches!(
-            annotation.annotation_type.as_str(),
-            "merge_conflict" | "target_repo_dirty" | "dirty_worktree"
-        )
+        && annotation.annotation_type.is_merge_recoverable()
 }
 
 fn merge_gate_annotation_actions(

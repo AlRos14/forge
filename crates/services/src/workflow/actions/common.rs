@@ -208,7 +208,15 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
     // is count > budget here; budget=0 blocks on the first conflict.
     if count > i64::from(budget) {
         let reason = "merge-fix follow-up failed: conflict";
-        if let Err(error) = block_task(ctx, &task, reason, "merge_conflict", None).await {
+        if let Err(error) = block_task(
+            ctx,
+            &task,
+            reason,
+            api_types::FailureKind::MergeConflict,
+            None,
+        )
+        .await
+        {
             return Some(HookResult::Failed {
                 reason: error.to_string(),
             });
@@ -291,7 +299,7 @@ pub(super) async fn create_system_comment(ctx: &HookContext, content: String) ->
 pub(super) async fn persist_merge_error(
     ctx: &HookContext,
     task: &db::Task,
-    error_type: &str,
+    error_type: api_types::FailureKind,
     message: &str,
 ) -> db::Result<()> {
     let detected_at = now_rfc3339();
@@ -328,14 +336,14 @@ pub(super) async fn persist_target_repo_dirty_error(
     message: &str,
     _files: &[String],
 ) -> db::Result<()> {
-    persist_merge_error(ctx, task, "target_repo_dirty", message).await
+    persist_merge_error(ctx, task, api_types::FailureKind::TargetRepoDirty, message).await
 }
 
 pub(super) async fn block_task(
     ctx: &HookContext,
     task: &db::Task,
     reason: &str,
-    kind: &str,
+    kind: api_types::FailureKind,
     source: Option<&str>,
 ) -> db::Result<()> {
     let now = now_rfc3339();
@@ -395,7 +403,7 @@ pub(super) async fn block_task(
         context: EventContext::TaskBlocked {
             project_id: ctx.project_id.clone(),
             reason: reason.to_string(),
-            kind: Some(kind.to_string()),
+            kind: Some(kind),
             source: source.map(str::to_string),
             execution_id: ctx.execution_id.clone(),
         },

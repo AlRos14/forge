@@ -57,7 +57,7 @@ pub enum EventContext {
     TaskBlocked {
         project_id: String,
         reason: String,
-        kind: Option<String>,
+        kind: Option<api_types::FailureKind>,
         source: Option<String>,
         execution_id: Option<String>,
     },
@@ -68,7 +68,7 @@ pub enum EventContext {
     TaskFailed {
         project_id: String,
         reason: String,
-        kind: Option<String>,
+        kind: Option<api_types::FailureKind>,
         execution_id: Option<String>,
     },
     TaskRestarted {

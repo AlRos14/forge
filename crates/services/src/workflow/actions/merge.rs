@@ -96,7 +96,8 @@ impl HookAction for RunMerge {
                     };
                 }
                 if let Err(error) =
-                    persist_merge_error(ctx, &task, "merge_conflict", &details).await
+                    persist_merge_error(ctx, &task, api_types::FailureKind::MergeConflict, &details)
+                        .await
                 {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -120,7 +121,8 @@ impl HookAction for RunMerge {
                     format!("worktree has uncommitted changes: {}", files.join(", "))
                 };
                 if let Err(error) =
-                    persist_merge_error(ctx, &task, "dirty_worktree", &details).await
+                    persist_merge_error(ctx, &task, api_types::FailureKind::DirtyWorktree, &details)
+                        .await
                 {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -166,8 +168,14 @@ impl HookAction for RunMerge {
                         reason: details.clone(),
                     },
                 });
-                if let Err(error) =
-                    block_task(ctx, &task, &details, "target_repo_dirty", None).await
+                if let Err(error) = block_task(
+                    ctx,
+                    &task,
+                    &details,
+                    api_types::FailureKind::TargetRepoDirty,
+                    None,
+                )
+                .await
                 {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -207,8 +215,14 @@ async fn merge_failure_result(ctx: &HookContext, task: &db::Task, reason: String
 
     if existing_follow_ups >= i64::from(budget) {
         let block_reason = "merge-fix retry budget exhausted";
-        if let Err(error) =
-            block_task(ctx, task, block_reason, "merge_fix_budget_exhausted", None).await
+        if let Err(error) = block_task(
+            ctx,
+            task,
+            block_reason,
+            api_types::FailureKind::MergeFixBudgetExhausted,
+            None,
+        )
+        .await
         {
             return HookResult::Failed {
                 reason: error.to_string(),

@@ -222,14 +222,11 @@ fn re_execute_unavailable_reason(
 }
 
 fn retry_budget_exhausted_reason(annotation: &TaskBlockingAnnotation) -> Option<String> {
-    let exhausted = annotation.annotation_type.contains("budget_exhausted")
-        || annotation
-            .annotation_type
-            .contains("retry_budget_exhausted")
-        || annotation
-            .blocking_reason
-            .to_ascii_lowercase()
-            .contains("retry budget exhausted");
+    // Annotations here may be synthesized from blocked metadata (see
+    // blocked_metadata_annotation in the api layer), so both exhaustion
+    // vocabularies apply.
+    let exhausted = annotation.annotation_type.is_budget_exhausted_annotation()
+        || annotation.annotation_type.is_retry_exhausted_metadata();
     exhausted.then(|| {
         format!(
             "Retry budget exhausted for {}",
@@ -239,13 +236,11 @@ fn retry_budget_exhausted_reason(annotation: &TaskBlockingAnnotation) -> Option<
 }
 
 fn retry_budget_gate(annotation: &TaskBlockingAnnotation) -> String {
-    annotation
-        .annotation_type
-        .strip_suffix("_retry_budget_exhausted")
-        .or_else(|| annotation.annotation_type.strip_suffix("_budget_exhausted"))
-        .filter(|gate| !gate.is_empty())
-        .unwrap_or(annotation.blocking_reason.as_str())
-        .to_owned()
+    match annotation.annotation_type {
+        api_types::FailureKind::ReviewBudgetExhausted => "review".to_owned(),
+        api_types::FailureKind::MergeFixBudgetExhausted => "merge_fix".to_owned(),
+        _ => annotation.blocking_reason.clone(),
+    }
 }
 
 fn action(

@@ -135,7 +135,7 @@ async fn ci_failure_on_re_review_clears_review_passed_at_and_blocks_task() {
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(
-        blocked.reason.contains("ci") || blocked.kind.as_deref() == Some("ci_failed"),
+        blocked.kind == Some(api_types::FailureKind::CiFailed),
         "blocked metadata should describe CI failure; got {:?}",
         blocked
     );

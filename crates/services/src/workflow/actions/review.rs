@@ -127,7 +127,9 @@ impl HookAction for RunCiSteps {
                     };
                 }
                 let reason = "merge-fix follow-up failed: ci";
-                if let Err(error) = block_task(ctx, &task, reason, "ci_failed", None).await {
+                if let Err(error) =
+                    block_task(ctx, &task, reason, api_types::FailureKind::CiFailed, None).await
+                {
                     return HookResult::Failed {
                         reason: error.to_string(),
                     };
@@ -257,7 +259,9 @@ impl HookAction for AutoCascadeOnReviewPass {
                         };
                     }
                     let reason = "merge-fix follow-up failed: ci";
-                    if let Err(error) = block_task(ctx, &task, reason, "ci_failed", None).await {
+                    if let Err(error) =
+                        block_task(ctx, &task, reason, api_types::FailureKind::CiFailed, None).await
+                    {
                         return HookResult::Failed {
                             reason: error.to_string(),
                         };
@@ -288,8 +292,14 @@ impl HookAction for AutoCascadeOnReviewPass {
                     };
                 if existing_count + 1 >= i64::from(budget) {
                     let reason = "review retry budget exhausted";
-                    if let Err(error) =
-                        block_task(ctx, &task, reason, "review_gate_failed", None).await
+                    if let Err(error) = block_task(
+                        ctx,
+                        &task,
+                        reason,
+                        api_types::FailureKind::ReviewGateFailed,
+                        None,
+                    )
+                    .await
                     {
                         return HookResult::Failed {
                             reason: error.to_string(),

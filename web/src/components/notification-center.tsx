@@ -34,8 +34,9 @@ type NotificationEventDetail = {
   body?: string
 }
 
-function severityFor(eventType: string | undefined): 'success' | 'warning' {
+function severityFor(eventType: string | undefined): 'success' | 'warning' | 'error' {
   if (eventType === 'task.done' || eventType === 'review.passed') return 'success'
+  if (eventType === 'task.failed' || eventType === 'task.recovery_required') return 'error'
   return 'warning'
 }
 
@@ -105,6 +106,8 @@ export function NotificationCenter({ projectId }: { projectId?: string }) {
 
         if (severity === 'success') {
           toast.success(detail.title ?? 'Task updated', { description: message, action })
+        } else if (severity === 'error') {
+          toast.error(detail.title ?? 'Task failed', { description: message, action })
         } else {
           toast.warning(detail.title ?? 'Task updated', { description: message, action })
         }

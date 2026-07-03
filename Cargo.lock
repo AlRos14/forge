@@ -738,6 +738,7 @@ dependencies = [
 name = "events"
 version = "0.3.0"
 dependencies = [
+ "api-types",
  "chrono",
  "serde",
  "serde_json",

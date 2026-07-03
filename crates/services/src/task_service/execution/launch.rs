@@ -647,7 +647,7 @@ impl TaskService {
             recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
         }
         let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: "manual_stop".to_owned(),
+            annotation_type: api_types::FailureKind::ManualStop,
             blocking_reason: "user_cancelled".to_owned(),
             blocked_by: Some("user:api".to_owned()),
             blocked_at: Some(now.clone()),

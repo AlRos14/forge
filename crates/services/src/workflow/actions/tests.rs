@@ -1321,7 +1321,7 @@ async fn auto_cascade_review_failure_budget_blocks_with_metadata() {
     match event.context {
         EventContext::TaskBlocked { reason, kind, .. } => {
             assert_eq!(reason, "review retry budget exhausted");
-            assert_eq!(kind.as_deref(), Some("review_gate_failed"));
+            assert_eq!(kind, Some(api_types::FailureKind::ReviewGateFailed));
         }
         other => panic!("expected task blocked event, got {other:?}"),
     }

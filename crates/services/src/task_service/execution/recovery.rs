@@ -304,7 +304,7 @@ impl TaskService {
         &self,
         task_id: impl Into<String>,
         reason: impl Into<String>,
-        kind: Option<String>,
+        kind: Option<api_types::FailureKind>,
         execution_id: Option<String>,
     ) -> Result<Task> {
         let task_id = task_id.into();
@@ -328,7 +328,7 @@ impl TaskService {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: None,
+                error_annotation: Some(None),
                 blocked_json: Some(None),
                 failed_json: Some(Some(failed_meta.to_string())),
                 task_state_config: None,
@@ -344,7 +344,7 @@ impl TaskService {
             context: EventContext::TaskFailed {
                 project_id: updated.project_id.clone(),
                 reason: reason.clone(),
-                kind: kind.clone(),
+                kind,
                 execution_id: execution_id.clone(),
             },
         });
@@ -1280,7 +1280,7 @@ impl TaskService {
             "user:recovery:reset_to_initial",
         );
         let initial_state = workflow_initial_state(&workflow)?;
-        let assignee_id = if should_clear_assignments_for_reset(&annotation.blocking_reason) {
+        let assignee_id = if should_clear_assignments_for_reset(annotation) {
             Some(None)
         } else {
             None
@@ -1871,11 +1871,13 @@ async fn clear_skip_before_work_hook_once_override(
     Ok(updated)
 }
 
-fn should_clear_assignments_for_reset(blocking_reason: &str) -> bool {
-    matches!(
-        blocking_reason,
-        "crash_recovery" | "agent_timeout" | "workspace_error"
-    )
+fn should_clear_assignments_for_reset(annotation: &api_types::TaskBlockingAnnotation) -> bool {
+    // recovery_required covers crash-recovery and agent-timeout interruptions;
+    // workspace failures arrive either as a live annotation
+    // (workspace_reset_required / workspace_error) or, once fail_task has
+    // cleared the annotation, synthesized from failed_json (workspace_failed).
+    annotation.annotation_type == api_types::FailureKind::RecoveryRequired
+        || annotation.annotation_type.is_workspace_failure()
 }
 
 fn workflow_initial_state(workflow: &api_types::WorkflowDefinition) -> Result<String> {
@@ -1903,12 +1905,20 @@ fn metadata_recovery_annotation(
         .get("execution_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let annotation_type = metadata
+        .get("kind")
+        .cloned()
+        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
+        .unwrap_or(api_types::FailureKind::Unknown);
+    // Unknown kinds are info-only: legacy rows the migration could not map
+    // must not offer actions the service cannot classify.
+    let recovery_actions = if annotation_type == api_types::FailureKind::Unknown {
+        Vec::new()
+    } else {
+        recovery_actions.to_vec()
+    };
     Ok(api_types::TaskBlockingAnnotation {
-        annotation_type: metadata
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("interrupted")
-            .to_owned(),
+        annotation_type,
         blocking_reason: reason.clone(),
         blocked_by: Some("system".to_owned()),
         blocked_at: metadata
@@ -1923,7 +1933,7 @@ fn metadata_recovery_annotation(
         }),
         message: Some(reason),
         hook: None,
-        recovery_actions: recovery_actions.to_vec(),
+        recovery_actions,
     })
 }
 
@@ -2053,60 +2063,32 @@ fn is_retry_exhausted_annotation(raw_annotation: &str) -> bool {
     }
 }
 
-fn is_retry_exhausted_blocked_metadata(raw_metadata: &str) -> bool {
-    serde_json::from_str::<Value>(raw_metadata)
-        .ok()
-        .is_some_and(|metadata| {
-            matches!(
-                metadata.get("kind").and_then(Value::as_str),
-                Some("review_gate_failed" | "retry_exhausted" | "merge_fix_budget_exhausted")
-            ) || metadata
-                .get("reason")
-                .and_then(Value::as_str)
-                .is_some_and(is_retry_exhausted_reason)
-        })
+fn blocked_metadata_kind(raw_metadata: &str) -> Option<api_types::FailureKind> {
+    let metadata: Value = serde_json::from_str(raw_metadata).ok()?;
+    serde_json::from_value(metadata.get("kind")?.clone()).ok()
 }
 
-fn is_retry_exhausted_reason(reason: &str) -> bool {
-    reason.contains("retry budget exhausted") || reason.contains("rejection budget exhausted")
+fn is_retry_exhausted_blocked_metadata(raw_metadata: &str) -> bool {
+    blocked_metadata_kind(raw_metadata)
+        .is_some_and(api_types::FailureKind::is_retry_exhausted_metadata)
 }
 
 fn is_recoverable_merge_gate_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    matches!(
-        annotation.annotation_type.as_str(),
-        "merge_conflict" | "target_repo_dirty" | "dirty_worktree"
-    )
+    annotation.annotation_type.is_merge_recoverable()
 }
 
 fn is_human_merge_gate_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    matches!(annotation.annotation_type.as_str(), "target_repo_dirty")
+    annotation.annotation_type == api_types::FailureKind::TargetRepoDirty
 }
 
 fn is_recoverable_merge_fix_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    matches!(
-        annotation.annotation_type.as_str(),
-        "merge_conflict" | "target_repo_dirty" | "dirty_worktree"
-    )
+    annotation.annotation_type.is_merge_recoverable()
 }
 
 fn is_recoverable_merge_gate_blocked_metadata(raw_metadata: &str) -> bool {
-    serde_json::from_str::<Value>(raw_metadata)
-        .ok()
-        .is_some_and(|metadata| {
-            matches!(
-                metadata.get("kind").and_then(Value::as_str),
-                Some("target_repo_dirty")
-            )
-        })
+    blocked_metadata_kind(raw_metadata) == Some(api_types::FailureKind::TargetRepoDirty)
 }
 
 fn is_recoverable_merge_fix_blocked_metadata(raw_metadata: &str) -> bool {
-    serde_json::from_str::<Value>(raw_metadata)
-        .ok()
-        .is_some_and(|metadata| {
-            matches!(
-                metadata.get("kind").and_then(Value::as_str),
-                Some("merge_conflict" | "target_repo_dirty" | "dirty_worktree")
-            )
-        })
+    blocked_metadata_kind(raw_metadata).is_some_and(api_types::FailureKind::is_merge_recoverable)
 }

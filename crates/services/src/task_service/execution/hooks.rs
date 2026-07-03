@@ -76,9 +76,9 @@ impl TaskService {
         failure: &LifecycleHookRun,
     ) -> Result<()> {
         let annotation_type = if failure.timed_out {
-            "before_work_hook_timeout"
+            api_types::FailureKind::BeforeWorkHookTimeout
         } else {
-            "before_work_hook_failed"
+            api_types::FailureKind::BeforeWorkHookFailed
         };
         let command = failure.command.clone().unwrap_or_default();
         let stderr_summary = truncate_annotation_output(&failure.stderr);

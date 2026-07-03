@@ -382,7 +382,7 @@ impl PrReconciler {
                 .await?;
                 set_task_awaiting_human(&self.db, &task, false).await?;
                 let blocked = json!({
-                    "kind": "pr_closed_without_merge",
+                    "kind": api_types::FailureKind::PrClosedWithoutMerge,
                     "reason": "pull request was closed without merge",
                     "provider_pr_id": metadata.provider_pr_id,
                     "pr_url": metadata.pr_url,

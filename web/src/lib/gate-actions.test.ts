@@ -34,7 +34,7 @@ function state(
 
 function workflow(
   states: StateDefinition[],
-  edges: Array<{ from: string; to: string; trigger: 'accept' | 'reject' | 'fail' | 'retry' }> = [],
+  edges: Array<{ from: string; to: string; trigger: string }> = [],
 ): WorkflowDefinition {
   for (const edge of edges) {
     const source = states.find((candidate) => candidate.name === edge.from)
@@ -187,5 +187,72 @@ describe('getHumanGateActions', () => {
     )
 
     expect(actions).toBeNull()
+  })
+})
+
+describe('explicit rejection targets', () => {
+  it('does not infer rejection from failure-suffixed state names', () => {
+    const actions = getHumanGateActions(
+      task('qa', 'reviewer'),
+      workflow(
+        [
+          state('qa', 'gate', 'reviewer'),
+          state('done', 'active', 'coder'),
+          state('qa_failed', 'custom', null),
+        ],
+        [
+          { from: 'qa', to: 'done', trigger: 'accept' },
+          { from: 'qa', to: 'qa_failed', trigger: 'route' },
+        ],
+      ),
+    )
+
+    // The qa_failed edge has no reject/fail trigger and no configured
+    // reject_target, so its name alone must not produce a reject button.
+    expect(actions?.approveLabel).toBe('Approve qa')
+    expect(actions?.rejectLabel).toBeUndefined()
+  })
+
+  it('offers rejection when the workflow declares it explicitly', () => {
+    const actions = getHumanGateActions(
+      task('qa', 'reviewer'),
+      workflow(
+        [
+          state('qa', 'gate', 'reviewer'),
+          state('done', 'active', 'coder'),
+          state('qa_failed', 'custom', null),
+        ],
+        [
+          { from: 'qa', to: 'done', trigger: 'accept' },
+          { from: 'qa', to: 'qa_failed', trigger: 'reject' },
+        ],
+      ),
+    )
+
+    expect(actions?.rejectLabel).toBe('Reject qa')
+  })
+})
+
+describe('no rejection inference from extra edges', () => {
+  it('does not infer rejection from a second active edge', () => {
+    const actions = getHumanGateActions(
+      task('qa', 'reviewer'),
+      workflow(
+        [
+          state('qa', 'gate', 'reviewer'),
+          state('done', 'active', 'coder'),
+          state('triage', 'active', 'coder'),
+        ],
+        [
+          { from: 'qa', to: 'done', trigger: 'accept' },
+          { from: 'qa', to: 'triage', trigger: 'route' },
+        ],
+      ),
+    )
+
+    // A second active-kind edge is not a rejection declaration; only a
+    // reject/fail trigger or gate_config.reject_target produces the button.
+    expect(actions?.approveLabel).toBe('Approve qa')
+    expect(actions?.rejectLabel).toBeUndefined()
   })
 })

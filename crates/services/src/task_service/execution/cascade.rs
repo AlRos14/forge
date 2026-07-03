@@ -372,7 +372,7 @@ impl TaskService {
         reason: &str,
     ) -> Result<()> {
         let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: "workflow_guard_rejected".to_owned(),
+            annotation_type: api_types::FailureKind::WorkflowGuardRejected,
             blocking_reason: guard.to_owned(),
             blocked_by: Some("system:workflow".to_owned()),
             blocked_at: Some(now_rfc3339()),
@@ -398,7 +398,7 @@ impl TaskService {
         let blocked_meta = json!({
             "reason": reason,
             "created_at": now_rfc3339(),
-            "kind": "workflow_guard_rejected",
+            "kind": api_types::FailureKind::WorkflowGuardRejected,
             "source": guard,
             "execution_id": execution.id,
         });
@@ -424,7 +424,7 @@ impl TaskService {
             context: EventContext::TaskBlocked {
                 project_id: updated.project_id,
                 reason: reason.to_owned(),
-                kind: Some("workflow_guard_rejected".to_owned()),
+                kind: Some(api_types::FailureKind::WorkflowGuardRejected),
                 source: Some(guard.to_owned()),
                 execution_id: Some(execution.id.clone()),
             },
@@ -563,7 +563,7 @@ impl TaskService {
             recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
         }
         let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: "executor_failed".to_owned(),
+            annotation_type: api_types::FailureKind::ExecutorFailed,
             blocking_reason: "executor_failed".to_owned(),
             blocked_by: Some("system:executor".to_owned()),
             blocked_at: Some(now_rfc3339()),
@@ -595,7 +595,7 @@ impl TaskService {
         let blocked_meta = json!({
             "reason": reason,
             "created_at": now_rfc3339(),
-            "kind": "internal_command_failed",
+            "kind": api_types::FailureKind::InternalCommandFailed,
             "execution_id": execution.id,
         });
 
@@ -628,7 +628,7 @@ impl TaskService {
             context: EventContext::TaskBlocked {
                 project_id: updated.project_id,
                 reason,
-                kind: Some("internal_command_failed".to_owned()),
+                kind: Some(api_types::FailureKind::InternalCommandFailed),
                 source: None,
                 execution_id: Some(execution.id.clone()),
             },
@@ -1085,12 +1085,12 @@ impl TaskService {
             let blocked_meta = json!({
                 "reason": reason,
                 "created_at": now_rfc3339(),
-                "kind": "review_gate_failed",
+                "kind": api_types::FailureKind::ReviewGateFailed,
                 "source": null,
                 "execution_id": execution_id,
             });
             let annotation = json!({
-                "type": "review_budget_exhausted",
+                "type": api_types::FailureKind::ReviewBudgetExhausted,
                 "blocking_reason": reason,
                 "message": reason,
                 "detected_at": now_rfc3339(),
@@ -1143,7 +1143,7 @@ impl TaskService {
                 context: EventContext::TaskBlocked {
                     project_id: task.project_id.clone(),
                     reason: reason.to_owned(),
-                    kind: Some("review_gate_failed".to_owned()),
+                    kind: Some(api_types::FailureKind::ReviewGateFailed),
                     source: None,
                     execution_id: execution_id.map(str::to_owned),
                 },

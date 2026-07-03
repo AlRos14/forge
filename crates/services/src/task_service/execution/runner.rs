@@ -648,7 +648,7 @@ impl TaskService {
             None => "Execution stopped after reaching max_turns".to_owned(),
         };
         let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: "max_turns_exceeded".to_owned(),
+            annotation_type: api_types::FailureKind::MaxTurnsExceeded,
             blocking_reason: "max_turns_exceeded".to_owned(),
             blocked_by: Some("system:executor".to_owned()),
             blocked_at: Some(now_rfc3339()),
@@ -698,7 +698,7 @@ impl TaskService {
             context: EventContext::TaskBlocked {
                 project_id: updated.project_id,
                 reason: "max_turns_exceeded".to_owned(),
-                kind: Some("max_turns_exceeded".to_owned()),
+                kind: Some(api_types::FailureKind::MaxTurnsExceeded),
                 source: None,
                 execution_id: Some(execution.id.clone()),
             },
