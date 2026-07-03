@@ -26,9 +26,7 @@ export function getHumanGateActions(
     return {
       stateName: task.status,
       approveLabel:
-        blockingAnnotation.blocking_reason === 'target_repo_dirty'
-          ? 'Resume Merge'
-          : 'Resume Task',
+        blockingAnnotation.type === 'target_repo_dirty' ? 'Resume Merge' : 'Resume Task',
     }
   }
   if (task.blocked || task.failed) return null
@@ -64,15 +62,30 @@ function gateApproveTransition(
   stateName: string,
 ): WorkflowEdge | undefined {
   const outgoing = outgoingTransitions(workflow, stateName)
+  const rejectTargets = explicitRejectTargets(workflow, stateName)
   return (
     outgoing.find((transition) => transition.trigger === 'accept') ??
     outgoing.find(
       (transition) =>
-        stateKind(workflow, transition.to) === 'active' &&
-        !isRejectionTarget(workflow, transition.to),
+        stateKind(workflow, transition.to) === 'active' && !rejectTargets.has(transition.to),
     ) ??
-    outgoing.find((transition) => !isRejectionTarget(workflow, transition.to))
+    outgoing.find((transition) => !rejectTargets.has(transition.to))
   )
+}
+
+// Rejection semantics come only from explicit workflow data: a reject/fail
+// trigger edge or gate_config.reject_target. State names carry no meaning.
+function explicitRejectTargets(workflow: WorkflowDefinition, stateName: string): Set<string> {
+  const targets = new Set<string>()
+  const configured = workflow.states.find((candidate) => candidate.name === stateName)
+    ?.gate_config?.reject_target
+  if (configured) targets.add(configured)
+  for (const transition of outgoingTransitions(workflow, stateName)) {
+    if (transition.trigger === 'reject' || transition.trigger === 'fail') {
+      targets.add(transition.to)
+    }
+  }
+  return targets
 }
 
 function gateRejectTransition(
@@ -94,17 +107,9 @@ function gateRejectTransition(
     if (configuredTransition) return configuredTransition
   }
 
-  const activeBounce = outgoing.find(
-    (transition) =>
-      transition.to !== approveTransition.to &&
-      stateKind(workflow, transition.to) === 'active',
-  )
-  if (activeBounce) return activeBounce
-
+  const rejectTargets = explicitRejectTargets(workflow, stateName)
   return outgoing.find(
-    (transition) =>
-      transition.to !== approveTransition.to &&
-      isRejectionTarget(workflow, transition.to),
+    (transition) => transition.to !== approveTransition.to && rejectTargets.has(transition.to),
   )
 }
 
@@ -114,20 +119,6 @@ function outgoingTransitions(workflow: WorkflowDefinition, stateName: string): W
 
 function stateKind(workflow: WorkflowDefinition, stateName: string): string | undefined {
   return workflow.states.find((state) => state.name === stateName)?.kind
-}
-
-function isRejectionTarget(workflow: WorkflowDefinition, stateName: string): boolean {
-  const normalized = stateName.toLowerCase()
-  if (
-    normalized === 'blocked' ||
-    normalized === 'failed' ||
-    normalized.endsWith('_failed') ||
-    normalized.endsWith('-failed')
-  ) {
-    return true
-  }
-  const state = workflow.states.find((candidate) => candidate.name === stateName)
-  return state?.kind === 'custom' && normalized.includes('fail')
 }
 
 function actionLabel(configured: string | null | undefined, fallback: string): string {

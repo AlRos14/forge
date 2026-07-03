@@ -36,7 +36,7 @@ async fn test_resolve_execution_actions_targets_current_role() {
     let workflow = crate::workflow::default_workflow::default_workflow();
     let executions = vec![coder_execution.clone(), reviewer_execution.clone()];
     let annotation = api_types::TaskBlockingAnnotation {
-        annotation_type: "executor_failed".to_owned(),
+        annotation_type: api_types::FailureKind::ExecutorFailed,
         blocking_reason: "executor failed".to_owned(),
         blocked_by: Some("system".to_owned()),
         blocked_at: Some(now_rfc3339()),

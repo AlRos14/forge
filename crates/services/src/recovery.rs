@@ -711,7 +711,7 @@ async fn recover_task(
         })
     });
     let annotation = json!({
-        "type": "recovery_required",
+        "type": api_types::FailureKind::RecoveryRequired,
         "blocking_reason": blocking_reason,
         "blocked_by": stopped_by,
         "blocked_at": now_rfc3339(),
@@ -1945,7 +1945,7 @@ mod tests {
         blocked_execution_id: Option<&str>,
     ) -> Task {
         let annotation = json!({
-            "type": "recovery_required",
+            "type": api_types::FailureKind::RecoveryRequired,
             "blocking_reason": "crash_recovery",
             "blocked_by": "system:crash_recovery",
             "blocked_at": now_rfc3339(),

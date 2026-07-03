@@ -28,6 +28,7 @@ import { TaskPrSummaryCard } from '@/components/task-detail/task-pr-summary-card
 import { TaskSubtasksPanel } from '@/components/task-detail/task-subtasks-panel'
 import { TaskDependenciesPanel } from '@/components/task-detail/task-dependencies-panel'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
+import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -37,7 +38,7 @@ import { getAvailableTaskTransitions } from '@/components/task-controls'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { getBlockingAnnotation } from '@/lib/workflow-utils'
-import type { Review } from '@/types/generated'
+import type { Review, WorkflowExceptionAction } from '@/types/generated'
 
 function formatDate(value?: string | null): string {
   if (!value) return '-'
@@ -236,14 +237,38 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     )
   }
 
-  const onRecoverTask = (action: Parameters<typeof recoverTask.mutate>[0]['action']) => {
+  const onRecoverTask = (
+    action: Parameters<typeof recoverTask.mutate>[0]['action'],
+    input?: { reason?: string; context?: string },
+  ) => {
     if (!task) return
     recoverTask.mutate(
-      { taskId: task.id, action },
+      { taskId: task.id, action, reason: input?.reason, context: input?.context },
       {
         onError: (error) => toast.error(getApiErrorMessage(error, 'Task recovery failed')),
       },
     )
+  }
+
+  const onOpenWorkflowExceptionAction = (action: WorkflowExceptionAction) => {
+    if (!task) return
+    onClose()
+    if (action.target_execution_id) {
+      void navigate({
+        to: '/tasks/$taskId/executions/$executionId',
+        params: { taskId: task.id, executionId: action.target_execution_id },
+        search: { followUp: true },
+      })
+      return
+    }
+    void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })
+  }
+
+  const onCancelTask = () => {
+    if (!task) return
+    cancelTask.mutate(task.id, {
+      onError: (error) => toast.error(getApiErrorMessage(error, 'Task cancellation failed')),
+    })
   }
 
   const onApproveGate = (stateName: string) => {
@@ -280,6 +305,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     task?.status === 'review' ||
     Boolean(task && task.role_assignments.some((r) => r.role_name === 'reviewer'))
   const cancellationState = workflow?.cancellation_state ?? 'cancelled'
+  const terminal = task?.status === 'done' || task?.status === cancellationState
   const hiddenTransitions = [cancellationState, 'merging']
   const availableTransitions = (
     workflow && task
@@ -333,7 +359,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
               />
             ) : task ? (
               <div className="space-y-6">
-                {errorInfo ? (
+                {errorInfo && !task.workflow_exception ? (
                   errorInfo.tone === 'workspace' ? (
                     <ModalWorkspaceErrorBanner
                       taskId={taskId}
@@ -354,11 +380,17 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                   )
                 ) : null}
 
-                <TaskBlockingBanner
+                <WorkflowExceptionPanel
                   task={task}
-                  disabled={recoverTask.isPending}
+                  actions={task.workflow_exception?.actions ?? []}
+                  recoverPending={recoverTask.isPending}
+                  terminal={terminal}
+                  cancelPending={cancelTask.isPending}
                   onRecover={onRecoverTask}
+                  onOpenInteractive={onOpenWorkflowExceptionAction}
+                  onCancelTask={onCancelTask}
                 />
+                {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
                 <TaskPrSummaryCard task={task} />
 

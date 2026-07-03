@@ -123,7 +123,10 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
         .blocked
         .as_ref()
         .expect("task should have blocked metadata");
-    assert_eq!(blocked.kind.as_deref(), Some("internal_command_failed"));
+    assert_eq!(
+        blocked.kind,
+        Some(api_types::FailureKind::InternalCommandFailed)
+    );
     assert!(
         task.error_annotation.is_some(),
         "blocked task records error annotation"

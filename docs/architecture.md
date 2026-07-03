@@ -322,6 +322,37 @@ to a nonexistent execution, or refers to an execution that is not in a stopped
 state awaiting user recovery. The sweep is idempotent and only ever clears
 annotations.
 
+### Failure classification
+
+Interruption kinds are a closed vocabulary: `FailureKind` in `api-types`
+(serialized snake_case, TS-exported). It is the only classification signal —
+`InterruptionMetadata.kind`, `TaskBlockingAnnotation.type`, and the
+`task.blocked`/`task.failed` event payloads all carry it, producers
+(`block_task`, `fail_task`, annotation writers) take the enum rather than
+strings, and recovery/exception derivation branches exclusively on its
+predicates (`is_retry_exhausted_metadata`, `is_budget_exhausted_annotation`,
+`is_merge_recoverable`, …). Reason/message prose carries no classification
+weight anywhere. Legacy database rows were normalized once by migration
+`V056__normalize_failure_kinds`; kinds that migration could not map
+deserialize to a read-only `Unknown` variant that renders info-only with no
+recovery actions. Producers must never construct `Unknown`. The web client
+likewise derives no failure semantics from workflow state names — gate
+reject/bounce targets come only from explicit `reject`/`fail` trigger edges or
+`gate_config.reject_target`.
+
+Hard failures and recovery states surface to the user as notifications:
+`task.failed` when `fail_task` sets `failed_json` (which also clears any stale
+blocking annotation), and `task.recovery_required` when crash recovery or an
+agent heartbeat timeout annotates a task for manual recovery.
+Graceful-shutdown recoveries auto-resume at the next startup and are not
+notified. In the derived `workflow_exception` summary, a hard failure
+supersedes any blocking annotation — `recover_task` only accepts
+`reset_to_initial`/`cancel_task` once `failed_json` is set, so only those
+actions are offered. The web UI renders one actionable recovery surface,
+`WorkflowExceptionPanel`, on both the task page and the board modal;
+`TaskBlockingBanner` is an informational fallback for interruption states
+without recovery actions.
+
 `transition_log` is the audit source of truth for state changes. The API
 exposes it via `GET /api/v1/tasks/{id}/transitions`.
 

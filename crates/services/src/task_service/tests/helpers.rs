@@ -325,7 +325,7 @@ pub(super) async fn seed_review_rejection_log(
 
 pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> Task {
     let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: "review_budget_exhausted".to_owned(),
+        annotation_type: api_types::FailureKind::ReviewBudgetExhausted,
         blocking_reason: "review retry budget exhausted".to_owned(),
         blocked_by: Some("system".to_owned()),
         blocked_at: Some(now_rfc3339()),

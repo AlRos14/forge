@@ -39,6 +39,7 @@ For the conceptual model behind these endpoints see
 | POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
+| POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
 | POST   | `/api/v1/tasks/{id}/review` | Re-run the CI steps without changing state |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
@@ -64,6 +65,10 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
 | GET    | `/api/v1/workspaces/{id}/diff` | Get workspace diff |
+| GET    | `/api/v1/notifications` | List notifications (paginated, filterable by `project_id`, `read`) |
+| GET    | `/api/v1/notifications/unread-count` | Unread notification count |
+| POST   | `/api/v1/notifications/mark-all-read` | Mark all notifications read |
+| PATCH  | `/api/v1/notifications/{id}/read` | Mark one notification read |
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
 
@@ -224,6 +229,17 @@ Response is a single `MemorySearchResultDto`:
 
 Errors: `400` for invalid query parameters, `404` for an unknown memory id or
 an item in a project the caller cannot access.
+
+## Notifications
+
+Notifications are created server-side from workflow events and delivered both
+through the REST endpoints above and as `notification.created` SSE events.
+`event_type` values: `task.done`, `task.blocked`, `task.failed`,
+`task.recovery_required`, `review.passed`, `review.failed`, `merge.failed`,
+and `project_hook.notify`. `task.recovery_required` fires when crash recovery
+or an agent heartbeat timeout leaves a task needing manual recovery;
+graceful-shutdown recoveries auto-resume at the next startup and are not
+notified.
 
 ## Pagination
 

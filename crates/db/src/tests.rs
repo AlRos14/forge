@@ -3829,3 +3829,144 @@ async fn refresh_token_expired_cleanup() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].token_hash, "valid-hash");
 }
+
+#[tokio::test]
+async fn test_normalize_failure_kinds_migration_backfill() {
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations(&pool).await.expect("migrations run");
+
+    // Seed legacy rows below the FK layer, then re-apply V056 over them.
+    let mut conn = pool.acquire().await.expect("connection acquires");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .expect("fk off");
+    let now = now_rfc3339();
+    let insert = |id: &str,
+                  error_annotation: Option<&str>,
+                  blocked: Option<&str>,
+                  failed: Option<&str>| {
+        sqlx::query(
+            "INSERT INTO task (id, project_id, repo_id, title, status, error_annotation, blocked_json, failed_json, created_at, updated_at)
+             VALUES (?, 'p', 'r', 'legacy', 'blocked', ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_owned())
+        .bind(error_annotation.map(str::to_owned))
+        .bind(blocked.map(str::to_owned))
+        .bind(failed.map(str::to_owned))
+        .bind(now.clone())
+        .bind(now.clone())
+    };
+    insert(
+        "t-alias",
+        Some(r#"{"type":"retry_budget_exhausted","blocking_reason":"x"}"#),
+        None,
+        None,
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("alias row inserts");
+    insert(
+        "t-prose",
+        None,
+        Some(r#"{"reason":"review retry budget exhausted after 3 attempts","created_at":"2026-01-01T00:00:00Z"}"#),
+        None,
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("prose row inserts");
+    insert(
+        "t-crash",
+        Some(r#"{"type":"crash","message":"boom"}"#),
+        None,
+        Some(r#"{"reason":"crashed","created_at":"2026-01-01T00:00:00Z","kind":"crash"}"#),
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("crash row inserts");
+    insert(
+        "t-malformed",
+        Some("{not json"),
+        Some("also not json"),
+        None,
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("malformed row inserts");
+    insert(
+        "t-unknown",
+        None,
+        Some(r#"{"reason":"strange","created_at":"2026-01-01T00:00:00Z","kind":"从未见过"}"#),
+        None,
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("unknown row inserts");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .expect("fk on");
+    drop(conn);
+
+    sqlx::query("DELETE FROM _migration WHERE version = 56")
+        .execute(&pool)
+        .await
+        .expect("migration marker clears");
+    run_migrations(&pool).await.expect("migration re-applies");
+
+    let field = |id: &str, column: &str| {
+        let sql = format!("SELECT {column} FROM task WHERE id = ?");
+        let pool = pool.clone();
+        let id = id.to_owned();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(&sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("row fetches")
+        }
+    };
+
+    // Alias type renamed.
+    let annotation = field("t-alias", "error_annotation").await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&annotation).unwrap()["type"],
+        "retry_exhausted"
+    );
+    // Prose-only row gains the structured kind; other fields untouched.
+    let blocked = field("t-prose", "blocked_json").await.unwrap();
+    let blocked: serde_json::Value = serde_json::from_str(&blocked).unwrap();
+    assert_eq!(blocked["kind"], "retry_exhausted");
+    assert_eq!(
+        blocked["reason"],
+        "review retry budget exhausted after 3 attempts"
+    );
+    // crash maps to executor_failed in both carriers.
+    let annotation = field("t-crash", "error_annotation").await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&annotation).unwrap()["type"],
+        "executor_failed"
+    );
+    let failed = field("t-crash", "failed_json").await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&failed).unwrap()["kind"],
+        "executor_failed"
+    );
+    // Malformed JSON is untouched.
+    assert_eq!(
+        field("t-malformed", "error_annotation").await.as_deref(),
+        Some("{not json")
+    );
+    assert_eq!(
+        field("t-malformed", "blocked_json").await.as_deref(),
+        Some("also not json")
+    );
+    // Unmappable kinds are untouched (they deserialize to Unknown at read time).
+    let blocked = field("t-unknown", "blocked_json").await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&blocked).unwrap()["kind"],
+        "从未见过"
+    );
+}

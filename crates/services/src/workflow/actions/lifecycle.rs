@@ -182,9 +182,9 @@ async fn annotate_before_work_hook_block(
     failure: &LifecycleHookRun,
 ) -> db::Result<()> {
     let annotation_type = if failure.timed_out {
-        "before_work_hook_timeout"
+        api_types::FailureKind::BeforeWorkHookTimeout
     } else {
-        "before_work_hook_failed"
+        api_types::FailureKind::BeforeWorkHookFailed
     };
     let annotation = json!({
         "type": annotation_type,

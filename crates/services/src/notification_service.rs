@@ -83,6 +83,42 @@ impl NotificationService {
                 )
                 .await?;
             }
+            EventContext::TaskFailed {
+                project_id, reason, ..
+            } => {
+                let Some(task) = TaskRepo::get_by_id(&*self.db, &event.entity_id, true).await?
+                else {
+                    return Ok(());
+                };
+                self.create_and_publish(
+                    project_id,
+                    Some(task.id),
+                    "task.failed".to_owned(),
+                    task.title,
+                    Some(reason),
+                )
+                .await?;
+            }
+            // TaskRecovered context is shared by task.recovered (manual recovery
+            // required), task.execution_resumed, and task.recovery_action; only
+            // the first needs the user's attention. Shutdown recoveries are
+            // auto-resumed at the next startup, so they are not notified either.
+            EventContext::TaskRecovered { project_id, reason }
+                if event.event_type == "task.recovered" && reason != "shutdown" =>
+            {
+                let Some(task) = TaskRepo::get_by_id(&*self.db, &event.entity_id, true).await?
+                else {
+                    return Ok(());
+                };
+                self.create_and_publish(
+                    project_id,
+                    Some(task.id),
+                    "task.recovery_required".to_owned(),
+                    task.title,
+                    Some(recovery_reason_message(&reason)),
+                )
+                .await?;
+            }
             EventContext::ReviewPassed { task_id, .. } => {
                 let Some(task) = TaskRepo::get_by_id(&*self.db, &task_id, true).await? else {
                     return Ok(());
@@ -168,6 +204,14 @@ impl NotificationService {
             },
         });
         Ok(notification)
+    }
+}
+
+fn recovery_reason_message(reason: &str) -> String {
+    match reason {
+        "crash_recovery" => "Needs manual recovery after a server restart".to_owned(),
+        "agent_timeout" => "Needs manual recovery after an agent heartbeat timeout".to_owned(),
+        other => format!("Needs manual recovery: {other}"),
     }
 }
 

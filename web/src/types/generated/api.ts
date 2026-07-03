@@ -149,8 +149,31 @@ export interface BlockingArtifact {
   log_path: string | null
 }
 
+export type FailureKind =
+  | 'merge_conflict'
+  | 'target_repo_dirty'
+  | 'dirty_worktree'
+  | 'ci_failed'
+  | 'review_gate_failed'
+  | 'review_budget_exhausted'
+  | 'retry_exhausted'
+  | 'merge_fix_budget_exhausted'
+  | 'workflow_guard_rejected'
+  | 'internal_command_failed'
+  | 'pr_closed_without_merge'
+  | 'executor_failed'
+  | 'workspace_failed'
+  | 'workspace_reset_required'
+  | 'workspace_error'
+  | 'before_work_hook_timeout'
+  | 'before_work_hook_failed'
+  | 'max_turns_exceeded'
+  | 'manual_stop'
+  | 'recovery_required'
+  | 'unknown'
+
 export interface TaskBlockingAnnotation {
-  type: string
+  type: FailureKind
   blocking_reason: string
   blocked_by: string | null
   blocked_at: string | null
@@ -246,7 +269,7 @@ export interface TaskMetadata {
 export interface InterruptionMetadata {
   reason: string
   created_at: string
-  kind?: string | null
+  kind?: FailureKind | null
   source?: string | null
   execution_id?: string | null
   details?: Record<string, unknown> | null

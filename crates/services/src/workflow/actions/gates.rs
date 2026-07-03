@@ -161,7 +161,15 @@ impl HookAction for CheckRetryBudget {
                 budget = i64::from(max_rejections),
                 "retry budget exhausted, blocking task"
             );
-            if let Err(error) = block_task(ctx, &task, &reason, "retry_exhausted", None).await {
+            if let Err(error) = block_task(
+                ctx,
+                &task,
+                &reason,
+                api_types::FailureKind::RetryExhausted,
+                None,
+            )
+            .await
+            {
                 return HookResult::Failed {
                     reason: error.to_string(),
                 };

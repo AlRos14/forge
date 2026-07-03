@@ -107,12 +107,13 @@ async fn merge_fix_zero_blocks_first_conflict_without_follow_up() {
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(
-        (blocked.reason.contains("merge-fix")
-            && (blocked.reason.contains("exhaust") || blocked.reason.contains("conflict")))
-            || matches!(
-                blocked.kind.as_deref(),
-                Some("merge_conflict" | "merge_fix_budget_exhausted")
-            ),
+        matches!(
+            blocked.kind,
+            Some(
+                api_types::FailureKind::MergeConflict
+                    | api_types::FailureKind::MergeFixBudgetExhausted
+            )
+        ),
         "blocked metadata should record merge-fix budget exhaustion; got {blocked:?}"
     );
 

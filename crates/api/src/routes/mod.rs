@@ -357,9 +357,9 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
     let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
     let kind = metadata
         .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("blocked")
-        .to_owned();
+        .cloned()
+        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
+        .unwrap_or(api_types::FailureKind::Unknown);
     let reason = metadata
         .get("reason")
         .and_then(Value::as_str)

@@ -4,6 +4,29 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Changed
+
+- Task interruption kinds are now a closed, typed vocabulary (`FailureKind`): `Task.blocked.kind`, `Task.failed.kind`, the blocking annotation `type`, and the `task.blocked`/`task.failed` event payloads carry an enum value instead of a free string. Wire values are unchanged for all known kinds; the generated TypeScript types narrow from `string` to the union. Classification of recovery actions now depends only on the structured kind — rewording a reason/message no longer changes which actions are offered.
+- Migration `V056__normalize_failure_kinds` renames legacy aliases in existing rows (`retry_budget_exhausted` → `retry_exhausted`, `crash` → `executor_failed`, `hook_failed` → `before_work_hook_failed`) and adds a structured kind to rows that were previously classified only by their reason phrasing. Unmappable kinds are preserved and render as info-only interruptions with no recovery actions.
+- The web client no longer infers gate rejection semantics from workflow state names (`*_failed` suffixes). Reject buttons appear only when the workflow declares a `reject`/`fail` trigger edge or `gate_config.reject_target`; workflows relying on naming conventions must declare the edge.
+
+### Added
+
+- Notifications for hard task failures (`task.failed`) and for crash-recovery or agent-timeout states that need manual intervention (`task.recovery_required`). Graceful-shutdown recoveries auto-resume at startup and are not notified; user-initiated recovery actions are not echoed back as notifications.
+- Failed lifecycle-hook details (command, exit code, stderr/stdout tails) now surface in the `workflow_exception.failing_step` summary, so the recovery panel shows them wherever it renders.
+
+### Changed
+
+- The task board modal now renders the same actionable recovery panel as the full task page, driven by `workflow_exception`. Failed tasks were previously a dead end in the modal (message with no actions); they now offer Restart Task / Cancel Task. `TaskBlockingBanner` is reduced to an informational fallback for interruption states without recovery actions.
+- Failure severity colors are no longer inverted in the task UI: hard failures render red, recoverable blocked states amber.
+
+### Fixed
+
+- A hard-failed task with a leftover blocking annotation no longer offers retry/resume actions that the server rejects with 400: `failed_json` now supersedes the annotation in the derived `workflow_exception` (offering only Restart/Cancel), and `fail_task` clears the stale annotation at write time.
+- The recovery panel no longer shows two "Cancel Task" buttons when the backend action list also contains `cancel_task`.
+
 ## [0.3.0] - 2026-07-02
 
 ### Added

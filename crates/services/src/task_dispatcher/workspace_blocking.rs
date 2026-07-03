@@ -11,7 +11,7 @@ impl TaskDispatcher {
         error: &ServiceError,
     ) -> Result<()> {
         let annotation = serde_json::json!({
-            "type": "workspace_reset_required",
+            "type": api_types::FailureKind::WorkspaceResetRequired,
             "blocking_reason": "workspace_error",
             "blocked_by": "system:task_dispatcher",
             "blocked_at": db::now_rfc3339(),
@@ -41,7 +41,7 @@ impl TaskDispatcher {
             .fail_task(
                 task.id.clone(),
                 format!("workspace reset required: {error}"),
-                Some("workspace_failed".to_owned()),
+                Some(api_types::FailureKind::WorkspaceFailed),
                 None,
             )
             .await?;
@@ -54,7 +54,7 @@ impl TaskDispatcher {
         error: &ServiceError,
     ) -> Result<()> {
         let annotation = serde_json::json!({
-            "type": "workspace_error",
+            "type": api_types::FailureKind::WorkspaceError,
             "blocking_reason": "workspace_error",
             "blocked_by": "system:task_dispatcher",
             "blocked_at": db::now_rfc3339(),
@@ -84,7 +84,7 @@ impl TaskDispatcher {
             .fail_task(
                 task.id.clone(),
                 format!("workspace error: {error}"),
-                Some("workspace_failed".to_owned()),
+                Some(api_types::FailureKind::WorkspaceFailed),
                 None,
             )
             .await?;

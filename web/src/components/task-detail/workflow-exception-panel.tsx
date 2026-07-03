@@ -1,14 +1,26 @@
+import { useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { CaretDown } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
 import { Tooltip } from '@/components/ui/tooltip'
 import { workflowLabelFromKind } from '@/components/workflow-health-badge'
+import { cn } from '@/lib/cn'
 import type {
   RecoveryAction,
   Task,
@@ -42,19 +54,43 @@ function actionKey(action: WorkflowExceptionAction, index: number) {
   return `${action.kind}:${action.target_execution_id ?? ''}:${index}`
 }
 
-function FailingStepDetails({ exception }: { exception: WorkflowExceptionSummary }) {
+function isFailureTone(exception: WorkflowExceptionSummary): boolean {
+  return exception.type === 'task_failed'
+}
+
+function FailingStepDetails({
+  exception,
+  failure,
+}: {
+  exception: WorkflowExceptionSummary
+  failure: boolean
+}) {
   const step = exception.failing_step
   if (!step) return null
 
   return (
-    <div className="space-y-2 rounded-md border border-amber-200 bg-white/70 p-3 text-xs dark:border-amber-800 dark:bg-black/20">
+    <div
+      className={cn(
+        'space-y-2 rounded-md border bg-white/70 p-3 text-xs dark:bg-black/20',
+        failure
+          ? 'border-red-200 dark:border-red-800'
+          : 'border-amber-200 dark:border-amber-800',
+      )}
+    >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <p className="font-medium">Failing step</p>
         <span>step {step.index}</span>
         {typeof step.exit_code === 'number' ? <span>exit {step.exit_code}</span> : null}
       </div>
       {step.command ? (
-        <p className="break-words font-mono text-amber-950 dark:text-amber-100">
+        <p
+          className={cn(
+            'break-words font-mono',
+            failure
+              ? 'text-red-950 dark:text-red-100'
+              : 'text-amber-950 dark:text-amber-100',
+          )}
+        >
           {step.command}
         </p>
       ) : null}
@@ -64,7 +100,14 @@ function FailingStepDetails({ exception }: { exception: WorkflowExceptionSummary
         </pre>
       ) : null}
       {step.output_tail ? (
-        <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded bg-amber-100/80 p-2 font-mono text-[11px] text-amber-950 dark:bg-amber-950/50 dark:text-amber-100">
+        <pre
+          className={cn(
+            'max-h-36 overflow-auto whitespace-pre-wrap rounded p-2 font-mono text-[11px]',
+            failure
+              ? 'bg-red-100/80 text-red-950 dark:bg-red-950/50 dark:text-red-100'
+              : 'bg-amber-100/80 text-amber-950 dark:bg-amber-950/50 dark:text-amber-100',
+          )}
+        >
           {step.output_tail}
         </pre>
       ) : null}
@@ -78,7 +121,8 @@ export function WorkflowExceptionPanel({
   recoverPending,
   terminal,
   cancelPending,
-  onRequestAction,
+  onRecover,
+  onOpenInteractive,
   onCancelTask,
 }: {
   task: Task
@@ -86,12 +130,18 @@ export function WorkflowExceptionPanel({
   recoverPending: boolean
   terminal: boolean
   cancelPending: boolean
-  onRequestAction: (action: WorkflowExceptionAction) => void
+  onRecover: (action: RecoveryAction, input?: { reason?: string; context?: string }) => void
+  onOpenInteractive: (action: WorkflowExceptionAction) => void
   onCancelTask: () => void
 }) {
+  const [confirmingAction, setConfirmingAction] = useState<WorkflowExceptionAction | null>(null)
+  const [reasonDraft, setReasonDraft] = useState('')
+  const [guidanceDraft, setGuidanceDraft] = useState('')
+
   const exception = task.workflow_exception
   if (!exception) return null
 
+  const failure = isFailureTone(exception)
   const title = workflowLabelFromKind(exception.type)
   const step = exception.failing_step
   const details = [
@@ -113,12 +163,58 @@ export function WorkflowExceptionPanel({
     null
   const secondaryRetries = retryActions.filter((a) => a !== primaryRetry)
   const openInteractive = actions.find((a) => a.kind === 'open_interactive') ?? null
+  // cancel_task gets the dedicated destructive button below; keep it out of
+  // the generic action row so the panel never shows two cancel buttons.
   const standaloneActions = actions.filter(
-    (a) => !EXCEPTION_RETRY_FAMILY.includes(a.kind) && a.kind !== 'open_interactive',
+    (a) =>
+      !EXCEPTION_RETRY_FAMILY.includes(a.kind) &&
+      a.kind !== 'open_interactive' &&
+      a.kind !== 'cancel_task',
   )
 
+  const requestAction = (action: WorkflowExceptionAction) => {
+    if (!action.enabled || recoverPending) return
+    if (action.kind === 'open_interactive') {
+      onOpenInteractive(action)
+      return
+    }
+    if (action.requires_reason || action.requires_guidance) {
+      setConfirmingAction(action)
+      setReasonDraft('')
+      setGuidanceDraft('')
+      return
+    }
+    onRecover(action.kind)
+  }
+
+  const closeDialog = () => {
+    setConfirmingAction(null)
+    setReasonDraft('')
+    setGuidanceDraft('')
+  }
+
+  const submitDialog = () => {
+    if (!confirmingAction) return
+    const reason = reasonDraft.trim()
+    const guidance = guidanceDraft.trim()
+    if (confirmingAction.requires_reason && !reason) return
+    if (confirmingAction.requires_guidance && !guidance) return
+    onRecover(confirmingAction.kind, {
+      reason: reason || undefined,
+      context: guidance || undefined,
+    })
+    closeDialog()
+  }
+
   return (
-    <section className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+    <section
+      className={cn(
+        'rounded-lg border p-4',
+        failure
+          ? 'border-red-300 bg-red-50 text-red-950 dark:border-red-800 dark:bg-red-950 dark:text-red-100'
+          : 'border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100',
+      )}
+    >
       <div className="space-y-3">
         <div className="space-y-1">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -154,7 +250,7 @@ export function WorkflowExceptionPanel({
           ) : null}
         </div>
 
-        {step ? <FailingStepDetails exception={exception} /> : null}
+        {step ? <FailingStepDetails exception={exception} failure={failure} /> : null}
 
         {exception.related_evidence.length > 0 ? (
           <div className="space-y-1 text-xs">
@@ -187,7 +283,7 @@ export function WorkflowExceptionPanel({
                       : (primaryRetry.disabled_reason ?? undefined)
                   }
                   className={secondaryRetries.length > 0 ? 'rounded-r-none border-r-0' : ''}
-                  onClick={() => onRequestAction(primaryRetry)}
+                  onClick={() => requestAction(primaryRetry)}
                 >
                   {primaryRetry.label}
                 </Button>
@@ -204,7 +300,7 @@ export function WorkflowExceptionPanel({
                         <DropdownMenuItem
                           key={actionKey(action, index)}
                           disabled={!action.enabled || recoverPending}
-                          onClick={() => onRequestAction(action)}
+                          onClick={() => requestAction(action)}
                         >
                           {action.label}
                         </DropdownMenuItem>
@@ -219,7 +315,7 @@ export function WorkflowExceptionPanel({
                 size="sm"
                 variant="outline"
                 disabled={!openInteractive.enabled || recoverPending}
-                onClick={() => onRequestAction(openInteractive)}
+                onClick={() => requestAction(openInteractive)}
               >
                 Open Interactive
               </Button>
@@ -231,7 +327,7 @@ export function WorkflowExceptionPanel({
                   size="sm"
                   variant="outline"
                   disabled={!action.enabled || recoverPending}
-                  onClick={() => onRequestAction(action)}
+                  onClick={() => requestAction(action)}
                 >
                   {action.label}
                 </Button>
@@ -260,6 +356,58 @@ export function WorkflowExceptionPanel({
           </div>
         ) : null}
       </div>
+      <Dialog
+        open={confirmingAction != null}
+        onOpenChange={(open) => {
+          if (!open) closeDialog()
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{confirmingAction?.label ?? 'Confirm Recovery'}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            {confirmingAction?.requires_reason ? (
+              <div className="space-y-2">
+                <Label htmlFor="workflow-recovery-reason">Reason</Label>
+                <Input
+                  id="workflow-recovery-reason"
+                  value={reasonDraft}
+                  onChange={(event) => setReasonDraft(event.target.value)}
+                  placeholder="Why is this recovery action needed?"
+                />
+              </div>
+            ) : null}
+            {confirmingAction?.requires_guidance ? (
+              <div className="space-y-2">
+                <Label htmlFor="workflow-recovery-guidance">Guidance</Label>
+                <Textarea
+                  id="workflow-recovery-guidance"
+                  value={guidanceDraft}
+                  onChange={(event) => setGuidanceDraft(event.target.value)}
+                  placeholder="Add instructions for the next workflow step"
+                  rows={4}
+                />
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={closeDialog}>
+              Cancel
+            </Button>
+            <Button
+              disabled={
+                recoverPending ||
+                (confirmingAction?.requires_reason && !reasonDraft.trim()) ||
+                (confirmingAction?.requires_guidance && !guidanceDraft.trim())
+              }
+              onClick={submitDialog}
+            >
+              Confirm
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
   )
 }
