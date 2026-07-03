@@ -4,16 +4,18 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
-## Unreleased
+## [0.3.0] - 2026-07-02
 
 ### Added
 
-- `DaemonReportRequest.active_execution_ids` — optional list of execution ids the reporting daemon is currently running. When present, the server reconciles stale server-side running executions owned by that daemon.
+- `DaemonReportRequest.active_execution_ids` — optional list of execution ids the reporting daemon is currently running. When present, the server reconciles stale server-side running executions owned by that daemon. Long-running daemon processes (`forge-daemon`, `forge-ctl daemon start`/`link`) claim their active set from startup onward; finished ids linger in reports for 120s so in-flight completions are never reconciled away.
+- New execution stop reason `daemon_disconnected` and SSE event `execution.daemon_disconnected`, emitted when the server interrupts an execution whose remote daemon went away (120s disconnect grace via the heartbeat monitor, or immediately when a restarted daemon reports without the execution).
 
 ### Fixed
 
-- Executions on a dead or disconnected remote daemon are now failed promptly with `stop_reason = daemon_disconnected` (120s disconnect grace via heartbeat monitor, plus reconcile-on-report for daemons that restart without those executions) instead of waiting for the 300s activity stall timeout and being mislabeled `execution_stalled`.
+- Executions on a dead or disconnected remote daemon are now failed promptly with `stop_reason = daemon_disconnected` instead of waiting for the 300s activity stall timeout and being mislabeled `execution_stalled`. Failed executions follow the normal retry budget before blocking the task.
 - The shell executor now honors `command`, `args`, and `env` from the agent config snapshot (previously silently ignored; empty configs keep the `sh -c <description>` default). Cancelling an execution whose process already finished is a no-op instead of an error.
+- The heartbeat monitor no longer routes stall-cancellation of remote-daemon executions through the embedded executor.
 
 ## [0.2.0] - 2026-07-01
 
