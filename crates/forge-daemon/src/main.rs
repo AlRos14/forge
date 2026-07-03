@@ -103,16 +103,19 @@ async fn main() -> Result<()> {
     }
 
     let client = Arc::new(client);
+    let active_executions = forge_client::daemon_runtime::ActiveExecutionTracker::default();
     let reporter_handle = tokio::spawn(reporter::run(
         Arc::clone(&client),
         workspace_root.clone(),
         labels.clone(),
         cli.interval_seconds,
+        active_executions.clone(),
         shutdown_rx.clone(),
     ));
     let connect_handle = tokio::spawn(connect::run(
         Arc::clone(&client),
         workspace_root.clone(),
+        active_executions,
         shutdown_rx.clone(),
     ));
 
@@ -148,7 +151,17 @@ async fn register_or_load_credentials(
     if owner_token.is_none() {
         if let Some(credentials) = credentials::load(credentials_path).await? {
             client.set_credentials(credentials.daemon_id.clone(), credentials.token.clone());
-            match reporter::report_once(client, workspace_root, labels).await {
+            // Fresh process: an empty active-execution claim (not None) is
+            // deliberate — it lets the server reconcile executions stranded
+            // by a previous daemon process as soon as we report.
+            match reporter::report_once(
+                client,
+                workspace_root,
+                labels,
+                &forge_client::daemon_runtime::ActiveExecutionTracker::default(),
+            )
+            .await
+            {
                 Ok(daemon) => {
                     tracing::info!(
                         daemon_id = %daemon.id,

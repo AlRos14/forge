@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod command;
 pub mod config;
 pub mod effective_policy;
 pub mod log_reader;
@@ -12,6 +13,7 @@ pub use adapter::{
     AdapterExecutor, AdapterRegistry, AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter,
     DiscoverContext, DiscoveredOptions, ExecutionOverrides, ExecutorKind,
 };
+pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     deserialize_config, merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig,
     CommandOverrides, CursorConfig, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy,
@@ -20,7 +22,7 @@ pub use config::{
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
 pub use log_writer::LogWriter;
-pub use shell::ShellExecutor;
+pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;
 

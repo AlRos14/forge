@@ -62,7 +62,7 @@ async fn resolve_provider_target(
     // daemon row for this server's embedded machine id may execute in-process.
     if registry.is_connected(daemon_id) {
         Ok(ProviderTarget::Remote)
-    } else if daemon.machine_id == crate::embedded_daemon::embedded_machine_id() {
+    } else if crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
         Ok(ProviderTarget::Embedded)
     } else {
         Err(ServiceError::DaemonUnavailable {

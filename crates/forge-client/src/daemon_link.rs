@@ -8,13 +8,18 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use api_types::DaemonFrame;
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
-use tokio::{net::TcpStream, sync::Mutex, time::sleep};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, watch, Mutex},
+    time::{self, sleep},
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -211,6 +216,137 @@ impl DaemonCommandStream {
             .close()
             .await
             .context("close daemon command WebSocket")
+    }
+}
+
+pub async fn run_dispatch_loop<H, Fut>(
+    stream: DaemonCommandStream,
+    handler: H,
+    shutdown: watch::Receiver<bool>,
+    responses_tx: mpsc::UnboundedSender<DaemonFrame>,
+    responses_rx: mpsc::UnboundedReceiver<DaemonFrame>,
+) -> Result<()>
+where
+    H: Fn(DaemonFrame) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = DaemonFrame> + Send,
+{
+    run_dispatch_loop_impl(
+        DispatchCommandStream::Live(stream),
+        handler,
+        shutdown,
+        responses_tx,
+        responses_rx,
+    )
+    .await
+}
+
+enum DispatchCommandStream {
+    Live(DaemonCommandStream),
+    #[cfg(test)]
+    Test(TestCommandStream),
+}
+
+impl DispatchCommandStream {
+    async fn recv(&mut self) -> Result<DaemonFrame> {
+        match self {
+            Self::Live(stream) => stream.recv().await,
+            #[cfg(test)]
+            Self::Test(stream) => stream.recv().await,
+        }
+    }
+
+    async fn send(&mut self, frame: &DaemonFrame) -> Result<()> {
+        match self {
+            Self::Live(stream) => stream.send(frame).await,
+            #[cfg(test)]
+            Self::Test(stream) => stream.send(frame).await,
+        }
+    }
+
+    async fn send_heartbeat(&mut self, seq: u64) -> Result<()> {
+        match self {
+            Self::Live(stream) => stream.send_heartbeat(seq).await,
+            #[cfg(test)]
+            Self::Test(stream) => stream.send_heartbeat(seq).await,
+        }
+    }
+
+    async fn close(self) -> Result<()> {
+        match self {
+            Self::Live(stream) => stream.close().await,
+            #[cfg(test)]
+            Self::Test(stream) => stream.close().await,
+        }
+    }
+}
+
+async fn run_dispatch_loop_impl<H, Fut>(
+    mut stream: DispatchCommandStream,
+    handler: H,
+    mut shutdown: watch::Receiver<bool>,
+    responses_tx: mpsc::UnboundedSender<DaemonFrame>,
+    mut responses_rx: mpsc::UnboundedReceiver<DaemonFrame>,
+) -> Result<()>
+where
+    H: Fn(DaemonFrame) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = DaemonFrame> + Send,
+{
+    let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
+    heartbeat.tick().await;
+    let mut heartbeat_seq = 0_u64;
+
+    loop {
+        tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    tracing::info!("daemon command stream shutdown requested");
+                    stream.close().await?;
+                    return Ok(());
+                }
+            }
+            frame = stream.recv() => {
+                match frame {
+                    Ok(frame @ DaemonFrame::Request { .. }) => {
+                        let responses_tx = responses_tx.clone();
+                        let handler = handler.clone();
+                        tokio::spawn(async move {
+                            let response = handler(frame).await;
+                            if responses_tx.send(response).is_err() {
+                                tracing::warn!("daemon command response dropped because stream loop ended");
+                            }
+                        });
+                    }
+                    Ok(DaemonFrame::Heartbeat { seq }) => {
+                        tracing::trace!(seq, "daemon command heartbeat received");
+                    }
+                    Ok(DaemonFrame::Notification { method, .. }) => {
+                        tracing::warn!(%method, "unexpected daemon command notification received");
+                    }
+                    Ok(DaemonFrame::Response { id, .. }) => {
+                        tracing::warn!(%id, "unexpected daemon command response received");
+                    }
+                    Ok(DaemonFrame::Error { id, error }) => {
+                        tracing::warn!(
+                            id = ?id,
+                            code = %error.code,
+                            message = %error.message,
+                            "unexpected daemon command error received"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "daemon command stream receive failed");
+                        return Err(error);
+                    }
+                }
+            }
+            Some(response) = responses_rx.recv() => {
+                stream.send(&response).await?;
+            }
+            _ = heartbeat.tick() => {
+                heartbeat_seq = heartbeat_seq.saturating_add(1);
+                stream.send_heartbeat(heartbeat_seq).await?;
+            }
+        }
     }
 }
 
@@ -451,8 +587,144 @@ impl fmt::Display for HttpStatusError {
 impl Error for HttpStatusError {}
 
 #[cfg(test)]
+struct TestCommandStream {
+    incoming: mpsc::UnboundedReceiver<DaemonFrame>,
+    outgoing: mpsc::UnboundedSender<DaemonFrame>,
+    closed: bool,
+}
+
+#[cfg(test)]
+impl TestCommandStream {
+    fn pair() -> (
+        mpsc::UnboundedSender<DaemonFrame>,
+        Self,
+        mpsc::UnboundedReceiver<DaemonFrame>,
+    ) {
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        (
+            in_tx,
+            Self {
+                incoming: in_rx,
+                outgoing: out_tx,
+                closed: false,
+            },
+            out_rx,
+        )
+    }
+
+    async fn recv(&mut self) -> Result<DaemonFrame> {
+        self.incoming.recv().await.ok_or_else(stream_closed_error)
+    }
+
+    async fn send(&mut self, frame: &DaemonFrame) -> Result<()> {
+        self.outgoing
+            .send(frame.clone())
+            .map_err(|_| stream_closed_error())
+    }
+
+    async fn send_heartbeat(&mut self, seq: u64) -> Result<()> {
+        self.send(&DaemonFrame::Heartbeat { seq }).await
+    }
+
+    async fn close(mut self) -> Result<()> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::DaemonClient;
+    use std::time::Duration;
+
+    use super::*;
+    use api_types::METHOD_FS_LIST;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn dispatch_loop_forwards_request_response_and_tolerates_heartbeat() {
+        let (in_tx, test_stream, mut out_rx) = TestCommandStream::pair();
+        let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handler = |frame: DaemonFrame| async move {
+            let DaemonFrame::Request { id, .. } = frame else {
+                panic!("expected request frame");
+            };
+            DaemonFrame::Response {
+                id,
+                result: serde_json::json!({ "ok": true }),
+            }
+        };
+
+        let loop_handle = tokio::spawn(run_dispatch_loop_impl(
+            DispatchCommandStream::Test(test_stream),
+            handler,
+            shutdown_rx,
+            responses_tx,
+            responses_rx,
+        ));
+
+        in_tx
+            .send(DaemonFrame::Request {
+                id: "req-1".to_owned(),
+                method: METHOD_FS_LIST.to_owned(),
+                params: serde_json::json!({ "path": "." }),
+            })
+            .expect("request sends");
+        in_tx
+            .send(DaemonFrame::Heartbeat { seq: 7 })
+            .expect("heartbeat sends");
+
+        let (id, result) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = out_rx.recv().await.expect("outgoing frame");
+                if let DaemonFrame::Response { id, result } = frame {
+                    return (id, result);
+                }
+            }
+        })
+        .await
+        .expect("response arrives");
+        assert_eq!(id, "req-1");
+        assert_eq!(result, serde_json::json!({ "ok": true }));
+
+        shutdown_tx.send(true).expect("shutdown signals");
+        loop_handle
+            .await
+            .expect("loop task joins")
+            .expect("loop exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn dispatch_loop_shutdown_closes_stream() {
+        let (in_tx, test_stream, _out_rx) = TestCommandStream::pair();
+        let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handler = |_frame: DaemonFrame| async {
+            DaemonFrame::Response {
+                id: "unused".to_owned(),
+                result: serde_json::json!(null),
+            }
+        };
+
+        let loop_handle = tokio::spawn(run_dispatch_loop_impl(
+            DispatchCommandStream::Test(test_stream),
+            handler,
+            shutdown_rx,
+            responses_tx,
+            responses_rx,
+        ));
+
+        shutdown_tx.send(true).expect("shutdown signals");
+
+        loop_handle
+            .await
+            .expect("loop task joins")
+            .expect("loop exits cleanly");
+        // Kept alive until the loop exits so the recv branch never observes a
+        // closed stream and races the shutdown branch in select!.
+        drop(in_tx);
+    }
 
     #[test]
     fn parses_server_url_and_rewrites_command_stream_scheme() {

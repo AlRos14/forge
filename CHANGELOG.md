@@ -4,6 +4,17 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## Unreleased
+
+### Added
+
+- `DaemonReportRequest.active_execution_ids` — optional list of execution ids the reporting daemon is currently running. When present, the server reconciles stale server-side running executions owned by that daemon.
+
+### Fixed
+
+- Executions on a dead or disconnected remote daemon are now failed promptly with `stop_reason = daemon_disconnected` (120s disconnect grace via heartbeat monitor, plus reconcile-on-report for daemons that restart without those executions) instead of waiting for the 300s activity stall timeout and being mislabeled `execution_stalled`.
+- The shell executor now honors `command`, `args`, and `env` from the agent config snapshot (previously silently ignored; empty configs keep the `sh -c <description>` default). Cancelling an execution whose process already finished is a no-op instead of an error.
+
 ## [0.2.0] - 2026-07-01
 
 ### Breaking

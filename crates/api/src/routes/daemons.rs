@@ -97,6 +97,7 @@ pub async fn report_daemon(
                     .map(runtime_report_input)
                     .collect(),
                 labels: request.labels,
+                active_execution_ids: request.active_execution_ids,
             },
         )
         .await?;

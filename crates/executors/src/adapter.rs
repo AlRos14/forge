@@ -195,7 +195,9 @@ fn resolve_context_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExecutionOutcome, ExecutionResult};
+    use crate::{build_shell_command_plan, ExecutionOutcome, ExecutionResult, ShellConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct CapturingAdapter;
 
@@ -241,6 +243,49 @@ mod tests {
         }
     }
 
+    struct CancelTrackingAdapter {
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CodingExecutorAdapter for CancelTrackingAdapter {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Shell
+        }
+
+        fn check_availability(&self) -> AvailabilityInfo {
+            AvailabilityInfo {
+                status: AvailabilityStatus::Authenticated,
+                authenticated_at: None,
+                config_path: None,
+            }
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: DiscoverContext,
+        ) -> Result<DiscoveredOptions, ExecutorError> {
+            Ok(DiscoveredOptions::default())
+        }
+
+        async fn execute(&self, _ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                after_sha: None,
+                agent_session_id: None,
+                summary: None,
+                error: None,
+                usage: None,
+            })
+        }
+
+        async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
+            assert_eq!(execution_id, "execution-to-cancel");
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn adapter_executor_dispatches_using_snapshot_config() {
         let mut registry = AdapterRegistry::new();
@@ -272,5 +317,78 @@ mod tests {
             .expect("dispatch succeeds");
 
         assert_eq!(result.status, ExecutionOutcome::Completed);
+    }
+
+    #[test]
+    fn resolve_context_config_builds_shell_command_plan() {
+        let snapshot = serde_json::json!({
+            "executor_type": "shell",
+            "config": {
+                "command": "bash",
+                "args": ["-lc", "make test"],
+                "permission_policy": "supervised",
+                "additional_params": ["--verbose"],
+                "env": { "CI": "1" }
+            }
+        });
+
+        let (kind, config) = resolve_context_config(&snapshot).expect("snapshot resolves");
+        assert_eq!(kind, ExecutorKind::Shell);
+
+        let shell_config: ShellConfig = serde_json::from_value(config).expect("shell config");
+        let plan =
+            build_shell_command_plan("ignored", "/tmp/worktree", Some(2), Some(&shell_config));
+
+        assert_eq!(plan.program, "bash");
+        assert_eq!(plan.args, vec!["-lc", "make test", "--verbose"]);
+        assert_eq!(plan.cwd.to_string_lossy(), "/tmp/worktree");
+        assert_eq!(plan.env_set.get("CI").map(String::as_str), Some("1"));
+        assert_eq!(
+            plan.env_set.get("FORGE_MAX_TURNS").map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn resolve_context_config_resolves_codex_snapshot() {
+        let snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {
+                "model": "gpt-5-codex",
+                "sandbox": "danger-full-access",
+                "model_reasoning_effort": "high",
+                "permission_policy": "auto",
+                "additional_params": ["--verbose"],
+                "env": { "CUSTOM": "1" }
+            }
+        });
+
+        let (kind, config) = resolve_context_config(&snapshot).expect("snapshot resolves");
+        assert_eq!(kind, ExecutorKind::Codex);
+
+        let codex_config: crate::CodexConfig =
+            serde_json::from_value(config).expect("codex config");
+        assert_eq!(codex_config.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(
+            codex_config.command_overrides.additional_params.as_deref(),
+            Some(["--verbose".to_owned()].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_executor_cancel_passthrough_reaches_registered_adapter() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = AdapterRegistry::new();
+        registry.register(Box::new(CancelTrackingAdapter {
+            cancel_calls: Arc::clone(&cancel_calls),
+        }));
+        let executor = AdapterExecutor::new(Arc::new(registry));
+
+        executor
+            .cancel("execution-to-cancel")
+            .await
+            .expect("cancel succeeds");
+
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
     }
 }

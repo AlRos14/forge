@@ -1,7 +1,8 @@
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -19,20 +20,99 @@ use executors::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tokio::{
-    sync::{mpsc, watch},
-    time,
-};
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     daemon_fs,
-    daemon_link::{
-        run_with_reconnect, DaemonClient, DaemonCommandStream, DAEMON_HEARTBEAT_INTERVAL_SECS,
-    },
+    daemon_link::{run_dispatch_loop, run_with_reconnect, DaemonClient},
 };
 
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 const EXECUTION_ERROR: &str = "execution_error";
+
+/// A finished execution's terminal notification is only queued for the command
+/// stream when its guard drops, so a report snapshot taken right after could
+/// omit the id before the server has processed the completion — and the server
+/// would reconcile the execution as daemon_disconnected. Finished ids therefore
+/// stay in reports for this long after the guard drops.
+const FINISHED_EXECUTION_LINGER: Duration = Duration::from_secs(120);
+
+#[derive(Clone)]
+pub struct ActiveExecutionTracker {
+    inner: Arc<Mutex<TrackerInner>>,
+    finished_linger: Duration,
+}
+
+#[derive(Default)]
+struct TrackerInner {
+    active: HashSet<String>,
+    recently_finished: HashMap<String, Instant>,
+}
+
+impl Default for ActiveExecutionTracker {
+    fn default() -> Self {
+        Self::with_finished_linger(FINISHED_EXECUTION_LINGER)
+    }
+}
+
+impl ActiveExecutionTracker {
+    pub fn with_finished_linger(finished_linger: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TrackerInner::default())),
+            finished_linger,
+        }
+    }
+
+    pub fn track(&self, execution_id: String) -> ActiveExecutionGuard {
+        {
+            let mut inner = self.inner.lock().expect("active execution tracker lock");
+            inner.recently_finished.remove(&execution_id);
+            inner.active.insert(execution_id.clone());
+        }
+        ActiveExecutionGuard {
+            tracker: self.clone(),
+            execution_id,
+        }
+    }
+
+    pub fn active_ids(&self) -> Vec<String> {
+        let now = Instant::now();
+        let linger = self.finished_linger;
+        let mut inner = self.inner.lock().expect("active execution tracker lock");
+        inner
+            .recently_finished
+            .retain(|_, finished_at| now.duration_since(*finished_at) < linger);
+        let mut ids: Vec<String> = inner
+            .active
+            .iter()
+            .chain(inner.recently_finished.keys())
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+}
+
+pub struct ActiveExecutionGuard {
+    tracker: ActiveExecutionTracker,
+    execution_id: String,
+}
+
+impl Drop for ActiveExecutionGuard {
+    fn drop(&mut self) {
+        let mut inner = self
+            .tracker
+            .inner
+            .lock()
+            .expect("active execution tracker lock");
+        if inner.active.remove(&self.execution_id) {
+            inner
+                .recently_finished
+                .insert(self.execution_id.clone(), Instant::now());
+        }
+    }
+}
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
@@ -40,96 +120,61 @@ pub async fn run_command_stream(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
     shutdown: watch::Receiver<bool>,
+    active_executions: ActiveExecutionTracker,
 ) -> Result<()> {
     let workspace_root = Arc::new(workspace_root);
     run_with_reconnect(client, move |stream| {
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
-        async move { dispatch_loop(stream, workspace_root, shutdown).await }
+        let active_executions = active_executions.clone();
+        async move {
+            let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+            let runtime = DaemonRuntime::new_with_tracker(
+                responses_tx.clone(),
+                workspace_root.as_ref().clone(),
+                active_executions,
+            );
+            let handler = {
+                let runtime = Arc::clone(&runtime);
+                move |frame| {
+                    let runtime = Arc::clone(&runtime);
+                    async move { runtime.handle_request(frame).await }
+                }
+            };
+            run_dispatch_loop(stream, handler, shutdown, responses_tx, responses_rx).await
+        }
     })
     .await
-}
-
-async fn dispatch_loop(
-    mut stream: DaemonCommandStream,
-    workspace_root: Arc<PathBuf>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let (responses_tx, mut responses_rx) = mpsc::unbounded_channel::<DaemonFrame>();
-    let runtime = DaemonRuntime::new(responses_tx.clone(), workspace_root.as_ref().clone());
-    let mut heartbeat = time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
-    heartbeat.tick().await;
-    let mut heartbeat_seq = 0_u64;
-
-    loop {
-        tokio::select! {
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() {
-                    tracing::info!("daemon command stream shutdown requested");
-                    stream.close().await?;
-                    return Ok(());
-                }
-            }
-            frame = stream.recv() => {
-                match frame {
-                    Ok(frame @ DaemonFrame::Request { .. }) => {
-                        let responses_tx = responses_tx.clone();
-                        let runtime = Arc::clone(&runtime);
-                        tokio::spawn(async move {
-                            let response = runtime.handle_request(frame).await;
-                            if responses_tx.send(response).is_err() {
-                                tracing::warn!("daemon command response dropped because stream loop ended");
-                            }
-                        });
-                    }
-                    Ok(DaemonFrame::Heartbeat { seq }) => {
-                        tracing::trace!(seq, "daemon command heartbeat received");
-                    }
-                    Ok(DaemonFrame::Notification { method, .. }) => {
-                        tracing::warn!(%method, "unexpected daemon command notification received");
-                    }
-                    Ok(DaemonFrame::Response { id, .. }) => {
-                        tracing::warn!(%id, "unexpected daemon command response received");
-                    }
-                    Ok(DaemonFrame::Error { id, error }) => {
-                        tracing::warn!(
-                            id = ?id,
-                            code = %error.code,
-                            message = %error.message,
-                            "unexpected daemon command error received"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "daemon command stream receive failed");
-                        return Err(error);
-                    }
-                }
-            }
-            Some(response) = responses_rx.recv() => {
-                stream.send(&response).await?;
-            }
-            _ = heartbeat.tick() => {
-                heartbeat_seq = heartbeat_seq.saturating_add(1);
-                stream.send_heartbeat(heartbeat_seq).await?;
-            }
-        }
-    }
 }
 
 pub struct DaemonRuntime {
     workspace_root: PathBuf,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     executor: Arc<AdapterExecutor>,
+    active_executions: ActiveExecutionTracker,
 }
 
 impl DaemonRuntime {
     pub fn new(outbound: mpsc::UnboundedSender<DaemonFrame>, workspace_root: PathBuf) -> Arc<Self> {
+        Self::new_with_tracker(outbound, workspace_root, ActiveExecutionTracker::default())
+    }
+
+    pub fn new_with_tracker(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+        active_executions: ActiveExecutionTracker,
+    ) -> Arc<Self> {
         let registry = Arc::new(cli_adapters::default_registry());
         Arc::new(Self {
             workspace_root,
             outbound,
             executor: Arc::new(AdapterExecutor::new(registry)),
+            active_executions,
         })
+    }
+
+    pub fn active_execution_ids(&self) -> Vec<String> {
+        self.active_executions.active_ids()
     }
 
     pub async fn handle_request(self: &Arc<Self>, frame: DaemonFrame) -> DaemonFrame {
@@ -221,8 +266,9 @@ impl DaemonRuntime {
         let execution_id = params.execution_id.clone();
         let executor = Arc::clone(&self.executor);
         let outbound = self.outbound.clone();
+        let active_executions = self.active_executions.clone();
         tokio::spawn(async move {
-            run_execution_task(executor, outbound, ctx).await;
+            run_execution_task(executor, outbound, ctx, active_executions).await;
         });
 
         Ok(ExecutionStartResult {
@@ -250,7 +296,9 @@ async fn run_execution_task(
     executor: Arc<AdapterExecutor>,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     mut ctx: ExecutionContext,
+    active_executions: ActiveExecutionTracker,
 ) {
+    let _active_guard = active_executions.track(ctx.execution_id.clone());
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     ctx.log_sender = Some(log_tx);
     let log_outbound = outbound.clone();
@@ -635,5 +683,36 @@ mod tests {
                 return notification;
             }
         }
+    }
+
+    #[test]
+    fn tracker_lingers_finished_executions_in_active_ids() {
+        let tracker = ActiveExecutionTracker::default();
+        let guard = tracker.track("exec-1".to_owned());
+        assert_eq!(tracker.active_ids(), ["exec-1"]);
+
+        drop(guard);
+        assert_eq!(
+            tracker.active_ids(),
+            ["exec-1"],
+            "finished execution must linger in reports until the terminal notification has settled"
+        );
+    }
+
+    #[test]
+    fn tracker_prunes_finished_executions_after_linger() {
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let guard = tracker.track("exec-1".to_owned());
+        drop(guard);
+        assert!(tracker.active_ids().is_empty());
+    }
+
+    #[test]
+    fn tracker_retrack_moves_id_back_to_active() {
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let first = tracker.track("exec-1".to_owned());
+        drop(first);
+        let _second = tracker.track("exec-1".to_owned());
+        assert_eq!(tracker.active_ids(), ["exec-1"]);
     }
 }

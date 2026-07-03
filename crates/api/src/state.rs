@@ -217,7 +217,10 @@ impl AppState {
             Arc::clone(&task_executor),
         );
         let agent_service = Arc::new(AgentService::new(Arc::clone(&db), Arc::clone(&event_bus)));
-        let daemon_service = Arc::new(DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+        let daemon_service = Arc::new(
+            DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus))
+                .with_task_service(Arc::clone(&task_service)),
+        );
         let terminal_cleanup_handler: Arc<
             dyn services::workspace_cleanup::WorkspaceCleanupObserver,
         > = terminal_service.clone();

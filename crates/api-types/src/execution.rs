@@ -157,6 +157,7 @@ pub struct DaemonReportRequest {
     pub detected_clis: Vec<DetectedCli>,
     pub runtimes: Option<Vec<RuntimeReport>>,
     pub labels: Option<Value>,
+    pub active_execution_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

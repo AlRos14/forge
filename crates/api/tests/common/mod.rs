@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+
+pub mod fake_daemon;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -424,7 +427,11 @@ pub struct TestDir {
 
 impl TestDir {
     pub fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        Self::new_in(&std::env::temp_dir(), prefix)
+    }
+
+    pub fn new_in(root: &Path, prefix: &str) -> Self {
+        let path = root.join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("temp dir creates");
         Self { path }
     }

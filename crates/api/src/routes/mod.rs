@@ -926,6 +926,7 @@ fn stop_reason_response(value: db::StopReason) -> api_types::StopReason {
         db::StopReason::CrashRecovery => api_types::StopReason::CrashRecovery,
         db::StopReason::AgentTimeout => api_types::StopReason::AgentTimeout,
         db::StopReason::ExecutionStalled => api_types::StopReason::ExecutionStalled,
+        db::StopReason::DaemonDisconnected => api_types::StopReason::DaemonDisconnected,
         db::StopReason::ExecutorCancelled => api_types::StopReason::ExecutorCancelled,
         db::StopReason::ExecutorFailed => api_types::StopReason::ExecutorFailed,
         db::StopReason::LegacyUnknown => api_types::StopReason::LegacyUnknown,
