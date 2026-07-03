@@ -151,6 +151,9 @@ async fn register_or_load_credentials(
     if owner_token.is_none() {
         if let Some(credentials) = credentials::load(credentials_path).await? {
             client.set_credentials(credentials.daemon_id.clone(), credentials.token.clone());
+            // Fresh process: an empty active-execution claim (not None) is
+            // deliberate — it lets the server reconcile executions stranded
+            // by a previous daemon process as soon as we report.
             match reporter::report_once(
                 client,
                 workspace_root,

@@ -1,8 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -30,17 +30,45 @@ use crate::{
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 const EXECUTION_ERROR: &str = "execution_error";
 
-#[derive(Clone, Default)]
+/// A finished execution's terminal notification is only queued for the command
+/// stream when its guard drops, so a report snapshot taken right after could
+/// omit the id before the server has processed the completion — and the server
+/// would reconcile the execution as daemon_disconnected. Finished ids therefore
+/// stay in reports for this long after the guard drops.
+const FINISHED_EXECUTION_LINGER: Duration = Duration::from_secs(120);
+
+#[derive(Clone)]
 pub struct ActiveExecutionTracker {
-    inner: Arc<Mutex<HashSet<String>>>,
+    inner: Arc<Mutex<TrackerInner>>,
+    finished_linger: Duration,
+}
+
+#[derive(Default)]
+struct TrackerInner {
+    active: HashSet<String>,
+    recently_finished: HashMap<String, Instant>,
+}
+
+impl Default for ActiveExecutionTracker {
+    fn default() -> Self {
+        Self::with_finished_linger(FINISHED_EXECUTION_LINGER)
+    }
 }
 
 impl ActiveExecutionTracker {
+    pub fn with_finished_linger(finished_linger: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TrackerInner::default())),
+            finished_linger,
+        }
+    }
+
     pub fn track(&self, execution_id: String) -> ActiveExecutionGuard {
-        self.inner
-            .lock()
-            .expect("active execution tracker lock")
-            .insert(execution_id.clone());
+        {
+            let mut inner = self.inner.lock().expect("active execution tracker lock");
+            inner.recently_finished.remove(&execution_id);
+            inner.active.insert(execution_id.clone());
+        }
         ActiveExecutionGuard {
             tracker: self.clone(),
             execution_id,
@@ -48,14 +76,20 @@ impl ActiveExecutionTracker {
     }
 
     pub fn active_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .inner
-            .lock()
-            .expect("active execution tracker lock")
+        let now = Instant::now();
+        let linger = self.finished_linger;
+        let mut inner = self.inner.lock().expect("active execution tracker lock");
+        inner
+            .recently_finished
+            .retain(|_, finished_at| now.duration_since(*finished_at) < linger);
+        let mut ids: Vec<String> = inner
+            .active
             .iter()
+            .chain(inner.recently_finished.keys())
             .cloned()
             .collect();
         ids.sort();
+        ids.dedup();
         ids
     }
 }
@@ -67,11 +101,16 @@ pub struct ActiveExecutionGuard {
 
 impl Drop for ActiveExecutionGuard {
     fn drop(&mut self) {
-        self.tracker
+        let mut inner = self
+            .tracker
             .inner
             .lock()
-            .expect("active execution tracker lock")
-            .remove(&self.execution_id);
+            .expect("active execution tracker lock");
+        if inner.active.remove(&self.execution_id) {
+            inner
+                .recently_finished
+                .insert(self.execution_id.clone(), Instant::now());
+        }
     }
 }
 
@@ -644,5 +683,36 @@ mod tests {
                 return notification;
             }
         }
+    }
+
+    #[test]
+    fn tracker_lingers_finished_executions_in_active_ids() {
+        let tracker = ActiveExecutionTracker::default();
+        let guard = tracker.track("exec-1".to_owned());
+        assert_eq!(tracker.active_ids(), ["exec-1"]);
+
+        drop(guard);
+        assert_eq!(
+            tracker.active_ids(),
+            ["exec-1"],
+            "finished execution must linger in reports until the terminal notification has settled"
+        );
+    }
+
+    #[test]
+    fn tracker_prunes_finished_executions_after_linger() {
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let guard = tracker.track("exec-1".to_owned());
+        drop(guard);
+        assert!(tracker.active_ids().is_empty());
+    }
+
+    #[test]
+    fn tracker_retrack_moves_id_back_to_active() {
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let first = tracker.track("exec-1".to_owned());
+        drop(first);
+        let _second = tracker.track("exec-1".to_owned());
+        assert_eq!(tracker.active_ids(), ["exec-1"]);
     }
 }

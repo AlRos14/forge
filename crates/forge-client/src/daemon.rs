@@ -145,6 +145,18 @@ impl DaemonArgs {
                     "daemon linked as {}; reporting every {}s with command stream enabled",
                     linked.credentials.daemon_id, interval_seconds
                 );
+                // This process is about to own the command stream, so claim an
+                // (empty) active-execution set: it lets the server reconcile
+                // executions stranded by a previous daemon process right away.
+                let active_executions = daemon_runtime::ActiveExecutionTracker::default();
+                report_once(
+                    client,
+                    &linked.credentials,
+                    &workspace_root,
+                    &labels,
+                    Some(&active_executions),
+                )
+                .await?;
                 run_daemon_loop(
                     client,
                     output,
@@ -155,6 +167,7 @@ impl DaemonArgs {
                         labels: &labels,
                         interval_seconds: *interval_seconds,
                         stopped_message: "daemon link stopped",
+                        active_executions: &active_executions,
                     },
                 )
                 .await
@@ -174,8 +187,18 @@ impl DaemonArgs {
                     )
                 })?;
                 let labels = parse_labels(labels)?;
-                let daemon =
-                    report_once(client, &credentials, &workspace_root, &labels, None).await?;
+                // Fresh process: nothing is running yet, so an empty
+                // active-execution claim is truthful and lets the server
+                // reconcile executions stranded by a previous daemon process.
+                let active_executions = daemon_runtime::ActiveExecutionTracker::default();
+                let daemon = report_once(
+                    client,
+                    &credentials,
+                    &workspace_root,
+                    &labels,
+                    Some(&active_executions),
+                )
+                .await?;
                 print_daemon(output, &daemon)?;
                 println!(
                     "daemon started as {}; reporting every {}s with command stream enabled",
@@ -191,6 +214,7 @@ impl DaemonArgs {
                         labels: &labels,
                         interval_seconds: *interval_seconds,
                         stopped_message: "daemon start stopped",
+                        active_executions: &active_executions,
                     },
                 )
                 .await
@@ -229,6 +253,7 @@ struct DaemonLoopConfig<'a> {
     labels: &'a BTreeMap<String, String>,
     interval_seconds: u64,
     stopped_message: &'a str,
+    active_executions: &'a daemon_runtime::ActiveExecutionTracker,
 }
 
 async fn run_daemon_loop(
@@ -242,7 +267,7 @@ async fn run_daemon_loop(
         config.initial_credentials.daemon_id.clone(),
         config.initial_credentials.token.clone(),
     );
-    let active_executions = daemon_runtime::ActiveExecutionTracker::default();
+    let active_executions = config.active_executions.clone();
     let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
