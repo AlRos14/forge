@@ -57,6 +57,7 @@ mod task;
 mod task_comment;
 mod task_dependency;
 mod task_media;
+mod task_move;
 mod task_terminal_session;
 mod user_auth;
 mod workflow;

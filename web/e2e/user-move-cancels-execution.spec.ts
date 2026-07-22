@@ -158,7 +158,8 @@ async function dragTaskToColumn(
   await taskCard.scrollIntoViewIfNeeded()
   await column.scrollIntoViewIfNeeded()
 
-  const taskBox = await taskCard.boundingBox()
+  const dragHandle = page.getByRole('button', { name: `Move ${taskTitle}`, exact: true })
+  const taskBox = await dragHandle.boundingBox()
   const columnBox = await column.boundingBox()
   if (!taskBox || !columnBox) {
     throw new Error(`Missing drag bounds for ${taskTitle} -> ${targetColumnLabel}`)

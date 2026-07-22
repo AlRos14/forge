@@ -108,6 +108,7 @@ export function routeSsePayload(
 
     if (
       eventType === 'task.status_changed' ||
+      eventType === 'task.moved' ||
       eventType === 'task.assigned' ||
       eventType === 'task.role_reassigned' ||
       eventType === 'task.cancelled' ||
@@ -261,6 +262,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
       const namedEvents = [
         'task.created',
         'task.status_changed',
+        'task.moved',
         'task.assigned',
         'task.role_reassigned',
         'task.blocked',

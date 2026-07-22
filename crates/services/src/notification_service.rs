@@ -67,6 +67,23 @@ impl NotificationService {
                 )
                 .await?;
             }
+            EventContext::TaskMoved(payload)
+                if payload.old_status != payload.new_status
+                    && payload.new_status == crate::workflow::default_states::DONE =>
+            {
+                let Some(task) = TaskRepo::get_by_id(&*self.db, &event.entity_id, true).await?
+                else {
+                    return Ok(());
+                };
+                self.create_and_publish(
+                    payload.project_id,
+                    Some(task.id),
+                    "task.done".to_owned(),
+                    task.title,
+                    None,
+                )
+                .await?;
+            }
             EventContext::TaskBlocked {
                 project_id, reason, ..
             } => {

@@ -39,6 +39,7 @@ For the conceptual model behind these endpoints see
 | POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
+| POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
 | POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
 | POST   | `/api/v1/tasks/{id}/review` | Re-run the CI steps without changing state |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
@@ -97,6 +98,71 @@ required action strings such as `dispatch_agent.agent_id`.
 state, the server auto-escalates to the user-routing-override path. MCP
 `forge_transition_task` is unchanged — it still emits `triggered_by="system"`
 and does not support user override (REST-only for now).
+
+## Task board snapshots and moves
+
+`GET /api/v1/projects/{id}/tasks` includes `board_revision` alongside the
+normal pagination fields:
+
+```json
+{
+  "items": [],
+  "next_cursor": null,
+  "has_more": false,
+  "total_count": null,
+  "board_revision": 42
+}
+```
+
+The revision is a monotonic project token for task creation/deletion and
+changes to status, board position, archive state, or soft-deletion state. Each
+page is assembled against one stable revision. Revisions can skip values when
+position renormalization updates several rows. A board may enable ordering only
+after it has loaded all pages and every page carries the same revision.
+
+`POST /api/v1/tasks/{id}/move` replaces the removed
+`PUT /api/v1/tasks/{id}/position` endpoint. It accepts one idempotent atomic
+move command:
+
+```json
+{
+  "operation_id": "3c1e9eb9-b4cf-4f6a-b7a7-0d172ccb09c7",
+  "task_version": 7,
+  "board_revision": 42,
+  "target_status": "review",
+  "before_id": "preceding-task-id-or-null",
+  "after_id": "following-task-id-or-null"
+}
+```
+
+Neighbors describe the unfiltered destination order after removing the moved
+task. Both are null only for an empty destination workflow column group. The
+server validates task and board versions, the target workflow column, neighbor
+project/column membership and adjacency, then writes status and position in one
+transaction. Same-column moves skip status hooks; cross-column moves retain
+workflow guards, cancellation, audit, hooks, dispatch, and cascades.
+
+The response contains the final task after synchronous cascades, the final
+board revision, and the submitted operation ID:
+
+```json
+{
+  "task": { "id": "task-id", "version": 8, "status": "review" },
+  "board_revision": 43,
+  "operation_id": "3c1e9eb9-b4cf-4f6a-b7a7-0d172ccb09c7"
+}
+```
+
+Retrying the same operation ID with the same normalized request returns its
+stored result without another write, hook run, or live event. A different
+request with that ID returns `409 operation_conflict`. Other move-specific
+errors are `409 version_conflict` with `expected_task_version` and
+`actual_task_version`, `409 board_revision_conflict` with
+`expected_board_revision` and `actual_board_revision`, `409
+operation_incomplete` after a detectable commit-to-side-effect crash gap, `412
+guard_rejected`, and `422 invalid_task_move`/`invalid_transition`. Clients must
+reconcile from current task-list truth after conflicts and must not retry with
+newer versions automatically.
 
 ## Task Diffs
 
@@ -614,7 +680,7 @@ Common HTTP mappings:
 |--------|------|
 | 400 | Validation failure |
 | 404 | Resource not found |
-| 409 | Optimistic version conflict, role assignment conflict |
+| 409 | Optimistic task/board version conflict, move operation conflict, role assignment conflict |
 | 412 | Workflow guard rejection (`before_exit` blocked the transition) |
 | 422 | Illegal state transition |
 | 500 | Internal error |
@@ -623,10 +689,18 @@ Common HTTP mappings:
 
 `GET /api/v1/events` streams `ForgeEvent` payloads from the in-memory event
 bus. Useful for the web UI and for long-running scripts that want to react to
-state changes (`task.status_changed`, `execution.completed`, …) without
+state changes (`task.status_changed`, `task.moved`, `execution.completed`, …) without
 polling. Daemon command-stream lifecycle changes emit `daemon.connected` and
 `daemon.offline` so clients can refresh daemon availability without waiting for
 polling or stale-heartbeat cleanup.
+
+Each newly committed board move publishes exactly one `task.moved` event. Its
+context contains `project_id`, `operation_id`, `old_status`, `new_status`,
+`old_board_position`, `new_board_position`, `task_version`, `board_revision`,
+`before_id`, and `after_id`. Status-changing moves drive the same internal
+lifecycle consumers as normal transitions but do not also publish a direct
+`task.status_changed` event. Synchronous cascades remain separate transitions
+and can publish their own status events.
 
 ## MCP tools
 

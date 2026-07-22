@@ -21,7 +21,6 @@ pub trait TaskRepo: Send + Sync {
         ordered_ids: &[String],
         updated_at: &str,
     ) -> Result<()>;
-    async fn reorder_task(&self, id: &str, new_position: f64, updated_at: &str) -> Result<Task>;
     async fn update(&self, input: UpdateTask) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
@@ -50,6 +49,24 @@ pub trait TaskRepo: Send + Sync {
         input: ClaimTask,
     ) -> Result<ClaimedTask>;
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task>;
+}
+
+#[async_trait]
+pub trait TaskBoardRepo: Send + Sync {
+    async fn board_revision(&self, project_id: &str) -> Result<i64>;
+    async fn replay_move_task(
+        &self,
+        operation_id: &str,
+        identity: &MoveTaskIdentity,
+    ) -> Result<Option<MoveTaskResult>>;
+    async fn compare_and_move_task(&self, input: CompareAndMoveTask)
+        -> Result<MoveTaskPersistence>;
+    async fn complete_move_operation(
+        &self,
+        operation_id: &str,
+        result: &MoveTaskResult,
+        updated_at: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait]

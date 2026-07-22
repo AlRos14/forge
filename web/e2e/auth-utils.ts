@@ -1,10 +1,8 @@
-import { createHmac } from 'node:crypto'
 import { type APIRequestContext, type APIResponse } from '@playwright/test'
 
 const DEFAULT_EMAIL = 'e2e-default@test.forge'
 const DEFAULT_PASSWORD = 'Password123!'
 const DEFAULT_DISPLAY_NAME = 'E2E Default User'
-const JWT_SECRET = process.env.FORGE_E2E_JWT_SECRET ?? 'test-jwt-secret-for-development'
 
 type AuthResponse = {
   access_token: string
@@ -45,14 +43,12 @@ export async function ensureDefaultAuth(request: APIRequestContext): Promise<E2E
 
   const auth = await loginOrRegister(request, email, password)
   const user = await getMe(request, auth.access_token)
-  const e2eUser = { ...user, is_admin: true }
-  const accessToken = createE2EJwt(e2eUser)
 
   return {
-    accessToken,
+    accessToken: auth.access_token,
     refreshToken: auth.refresh_token,
-    apiToken: accessToken,
-    user: e2eUser,
+    apiToken: auth.access_token,
+    user,
   }
 }
 
@@ -126,25 +122,6 @@ async function getMe(request: APIRequestContext, accessToken: string): Promise<U
 
 function authHeader(token: string): Record<string, string> {
   return { authorization: `Bearer ${token}` }
-}
-
-function createE2EJwt(user: UserResponse): string {
-  const now = Math.floor(Date.now() / 1000)
-  const header = { alg: 'HS256', typ: 'JWT' }
-  const claims = {
-    sub: user.id,
-    email: user.email,
-    is_admin: true,
-    iat: now,
-    exp: now + 24 * 60 * 60,
-  }
-  const body = `${base64UrlJson(header)}.${base64UrlJson(claims)}`
-  const signature = createHmac('sha256', JWT_SECRET).update(body).digest('base64url')
-  return `${body}.${signature}`
-}
-
-function base64UrlJson(value: unknown): string {
-  return Buffer.from(JSON.stringify(value)).toString('base64url')
 }
 
 async function expectOk(response: APIResponse, label: string): Promise<void> {

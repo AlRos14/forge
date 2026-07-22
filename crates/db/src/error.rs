@@ -13,6 +13,21 @@ pub enum DbError {
     #[error("version conflict")]
     VersionConflict,
 
+    #[error("task version conflict: expected {expected}, actual {actual}")]
+    TaskVersionConflict { expected: i64, actual: i64 },
+
+    #[error("board revision conflict: expected {expected}, actual {actual}")]
+    BoardRevisionConflict { expected: i64, actual: i64 },
+
+    #[error("move operation conflict: {operation_id}")]
+    MoveOperationConflict { operation_id: String },
+
+    #[error("move operation is incomplete: {operation_id}")]
+    MoveOperationIncomplete { operation_id: String },
+
+    #[error("invalid task move: {0}")]
+    InvalidTaskMove(String),
+
     #[error("invalid transition")]
     InvalidTransition,
 

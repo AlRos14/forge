@@ -42,61 +42,76 @@ pub async fn list_tasks(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
-) -> ApiResult<Json<PaginatedResponse<TaskResponse>>> {
-    let page = TaskRepo::list(
-        &*state.db,
-        TaskListQuery {
-            project_id,
-            q: params.q.clone(),
-            statuses: parse_csv::<db::TaskStatus>(params.status.as_ref(), "status")?,
-            agent_ids: parse_csv::<String>(params.agent_id.as_ref(), "agent_id")?,
-            assignee_types: parse_csv::<db::AssigneeKind>(
-                params.assignee_type.as_ref(),
-                "assignee_type",
-            )?
+) -> ApiResult<Json<TasksResponse>> {
+    // Task decoration performs additional reads, so bracket the assembled page with
+    // revision reads and retry if a board mutation races the response.
+    for _ in 0..3 {
+        let board_revision = TaskBoardRepo::board_revision(&*state.db, &project_id).await?;
+        let page = TaskRepo::list(
+            &*state.db,
+            TaskListQuery {
+                project_id: project_id.clone(),
+                q: params.q.clone(),
+                statuses: parse_csv::<db::TaskStatus>(params.status.as_ref(), "status")?,
+                agent_ids: parse_csv::<String>(params.agent_id.as_ref(), "agent_id")?,
+                assignee_types: parse_csv::<db::AssigneeKind>(
+                    params.assignee_type.as_ref(),
+                    "assignee_type",
+                )?
+                .into_iter()
+                .map(|kind| kind.to_string())
+                .collect(),
+                assignee_ids: parse_csv::<String>(params.assignee_id.as_ref(), "assignee_id")?,
+                priority: params.priority,
+                include_archived: params.include_archived.unwrap_or(false),
+                include_cancelled: params.include_cancelled.unwrap_or(false),
+                include_deleted: false,
+                page: task_page_request(&params)?,
+            },
+        )
+        .await?;
+        let has_more = page.next_cursor.is_some();
+        let task_ids = page
+            .items
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        let latest_reviews = ReviewRepo::list_latest_reviews_for_tasks(&*state.db, &task_ids)
+            .await?
             .into_iter()
-            .map(|kind| kind.to_string())
-            .collect(),
-            assignee_ids: parse_csv::<String>(params.assignee_id.as_ref(), "assignee_id")?,
-            priority: params.priority,
-            include_archived: params.include_archived.unwrap_or(false),
-            include_cancelled: params.include_cancelled.unwrap_or(false),
-            include_deleted: false,
-            page: task_page_request(&params)?,
-        },
-    )
-    .await?;
-    let has_more = page.next_cursor.is_some();
-    let task_ids = page
-        .items
-        .iter()
-        .map(|task| task.id.as_str())
-        .collect::<Vec<_>>();
-    let latest_reviews = ReviewRepo::list_latest_reviews_for_tasks(&*state.db, &task_ids)
-        .await?
-        .into_iter()
-        .map(|review| (review.task_id.clone(), review))
-        .collect::<std::collections::HashMap<_, _>>();
-    let latest_executions = ExecutionRepo::list_latest_executions_for_tasks(&*state.db, &task_ids)
-        .await?
-        .into_iter()
-        .map(|execution| (execution.task_id.clone(), execution))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut items = Vec::with_capacity(page.items.len());
-    for task in page.items {
-        let latest_review = latest_reviews.get(&task.id).cloned();
-        let latest_execution = latest_executions.get(&task.id).cloned();
-        items.push(
-            task_response_light_with_latest(&state.db, task, latest_review, latest_execution)
-                .await?,
-        );
+            .map(|review| (review.task_id.clone(), review))
+            .collect::<std::collections::HashMap<_, _>>();
+        let latest_executions =
+            ExecutionRepo::list_latest_executions_for_tasks(&*state.db, &task_ids)
+                .await?
+                .into_iter()
+                .map(|execution| (execution.task_id.clone(), execution))
+                .collect::<std::collections::HashMap<_, _>>();
+        let mut items = Vec::with_capacity(page.items.len());
+        for task in page.items {
+            let latest_review = latest_reviews.get(&task.id).cloned();
+            let latest_execution = latest_executions.get(&task.id).cloned();
+            items.push(
+                task_response_light_with_latest(&state.db, task, latest_review, latest_execution)
+                    .await?,
+            );
+        }
+        let current_revision = TaskBoardRepo::board_revision(&*state.db, &project_id).await?;
+        if current_revision == board_revision {
+            return Ok(Json(TasksResponse {
+                items,
+                next_cursor: page.next_cursor,
+                has_more,
+                total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
+                board_revision,
+            }));
+        }
     }
-    Ok(Json(PaginatedResponse {
-        items,
-        next_cursor: page.next_cursor,
-        has_more,
-        total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
-    }))
+
+    Err(ApiError::conflict_with_code(
+        "board_snapshot_changed",
+        "board changed while the task page was assembled; retry the request",
+    ))
 }
 
 pub async fn get_task(
@@ -166,17 +181,26 @@ pub async fn reorder_subtasks(
     Ok(Json(task_response(&state.db, task).await?))
 }
 
-pub async fn reorder_task_position(
+pub async fn move_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<PositionRequest>,
-) -> ApiResult<Json<PositionResponse>> {
-    let task = state
+    Json(request): Json<MoveTaskRequest>,
+) -> ApiResult<Json<MoveTaskResponse>> {
+    let operation_id = request.operation_id.clone();
+    let result = state
         .task_service
-        .reorder_task(id, request.before_id, request.after_id)
-        .await?;
-    Ok(Json(PositionResponse {
-        task: task_response(&state.db, task).await?,
+        .move_task(id, request)
+        .await
+        .map_err(|error| match error {
+            ServiceError::InvalidOperation { message } => {
+                ApiError::unprocessable("invalid_transition", message)
+            }
+            other => ApiError::from(other),
+        })?;
+    Ok(Json(MoveTaskResponse {
+        task: task_response(&state.db, result.task).await?,
+        board_revision: result.board_revision,
+        operation_id,
     }))
 }
 

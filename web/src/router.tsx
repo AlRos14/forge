@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react'
 import {
   Outlet,
   createRootRouteWithContext,
@@ -13,23 +14,98 @@ import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
 import { useSSE } from '@/api/sse'
 import { AppShell } from '@/components/app-shell'
-import { KanbanBoard } from '@/components/kanban-board'
-import { AgentsPage } from '@/pages/AgentsPage'
-import { DaemonsPage } from '@/pages/DaemonsPage'
-import { OperationsPage } from '@/pages/OperationsPage'
-import { ExecutionDetailPage } from '@/pages/ExecutionDetailPage'
-import { ChatPage } from '@/pages/ChatPage'
-import { ProjectSettingsPage, isProjectSettingsTab } from '@/pages/ProjectSettingsPage'
-import { ForgeSettingsPage, isForgeSettingsTab } from '@/pages/ForgeSettingsPage'
-import { AccountPage, isAccountTab } from '@/pages/AccountPage'
-import { TaskDetailPage, isTaskDetailTab } from '@/pages/TaskDetailPage'
 import type { ExecutionViewerMode } from '@/components/execution-viewer'
-import { TaskListPage, type TaskListSortBy, type TaskListSortOrder } from '@/pages/TaskListPage'
+import type { AccountTab } from '@/pages/AccountPage'
+import type { ForgeSettingsTab } from '@/pages/ForgeSettingsPage'
+import type { ProjectSettingsTab } from '@/pages/ProjectSettingsPage'
+import type { TaskDetailTab } from '@/pages/TaskDetailPage'
+import type { TaskListSortBy, TaskListSortOrder } from '@/pages/TaskListPage'
 import type { PaginatedResponse, Project } from '@/types/generated'
-import { LoginPage } from '@/pages/LoginPage'
-import { OAuthAuthorizePage } from '@/pages/OAuthAuthorizePage'
-import { RegisterPage } from '@/pages/RegisterPage'
 import { useAuthStore } from '@/stores/auth'
+
+const AccountPage = lazy(() =>
+  import('@/pages/AccountPage').then((module) => ({ default: module.AccountPage })),
+)
+const AgentsPage = lazy(() =>
+  import('@/pages/AgentsPage').then((module) => ({ default: module.AgentsPage })),
+)
+const BoardPage = lazy(() =>
+  import('@/features/board/BoardPage').then((module) => ({ default: module.BoardPage })),
+)
+const ChatPage = lazy(() =>
+  import('@/pages/ChatPage').then((module) => ({ default: module.ChatPage })),
+)
+const DaemonsPage = lazy(() =>
+  import('@/pages/DaemonsPage').then((module) => ({ default: module.DaemonsPage })),
+)
+const ExecutionDetailPage = lazy(() =>
+  import('@/pages/ExecutionDetailPage').then((module) => ({ default: module.ExecutionDetailPage })),
+)
+const ForgeSettingsPage = lazy(() =>
+  import('@/pages/ForgeSettingsPage').then((module) => ({ default: module.ForgeSettingsPage })),
+)
+const LoginPage = lazy(() =>
+  import('@/pages/LoginPage').then((module) => ({ default: module.LoginPage })),
+)
+const OAuthAuthorizePage = lazy(() =>
+  import('@/pages/OAuthAuthorizePage').then((module) => ({ default: module.OAuthAuthorizePage })),
+)
+const OperationsPage = lazy(() =>
+  import('@/pages/OperationsPage').then((module) => ({ default: module.OperationsPage })),
+)
+const ProjectSettingsPage = lazy(() =>
+  import('@/pages/ProjectSettingsPage').then((module) => ({
+    default: module.ProjectSettingsPage,
+  })),
+)
+const RegisterPage = lazy(() =>
+  import('@/pages/RegisterPage').then((module) => ({ default: module.RegisterPage })),
+)
+const TaskDetailPage = lazy(() =>
+  import('@/pages/TaskDetailPage').then((module) => ({ default: module.TaskDetailPage })),
+)
+const TaskListPage = lazy(() =>
+  import('@/pages/TaskListPage').then((module) => ({ default: module.TaskListPage })),
+)
+
+const accountTabs = new Set<AccountTab>(['profile', 'tokens'])
+const forgeSettingsTabs = new Set<ForgeSettingsTab>(['server', 'agent', 'paths'])
+const projectSettingsTabs = new Set<ProjectSettingsTab>([
+  'general',
+  'repos',
+  'members',
+  'linked-agents',
+  'mcp',
+  'hooks',
+  'analytics',
+  'workflow',
+  'danger',
+])
+const taskDetailTabs = new Set<TaskDetailTab>([
+  'overview',
+  'executions',
+  'review',
+  'diff',
+  'terminal',
+  'comments',
+  'history',
+])
+
+function isAccountTab(value: string | undefined): value is AccountTab {
+  return value !== undefined && accountTabs.has(value as AccountTab)
+}
+
+function isForgeSettingsTab(value: string | undefined): value is ForgeSettingsTab {
+  return value !== undefined && forgeSettingsTabs.has(value as ForgeSettingsTab)
+}
+
+function isProjectSettingsTab(value: string | undefined): value is ProjectSettingsTab {
+  return value !== undefined && projectSettingsTabs.has(value as ProjectSettingsTab)
+}
+
+function isTaskDetailTab(value: string | undefined): value is TaskDetailTab {
+  return value !== undefined && taskDetailTabs.has(value as TaskDetailTab)
+}
 
 type RouterContext = {
   queryClient: QueryClient
@@ -63,15 +139,19 @@ function RootRouteComponent() {
   const pathname = useRouterState({ select: (s) => s.location.pathname })
   useSSE(queryClient, accessToken)
 
-  if (PUBLIC_PATHS.includes(pathname)) {
-    return <Outlet />
-  }
-
-  return (
-    <AppShell>
+  const content = (
+    <Suspense
+      fallback={
+        <div className="flex min-h-48 items-center justify-center" aria-label="Loading page" />
+      }
+    >
       <Outlet />
-    </AppShell>
+    </Suspense>
   )
+
+  if (PUBLIC_PATHS.includes(pathname)) return content
+
+  return <AppShell>{content}</AppShell>
 }
 
 const indexRoute = createRoute({
@@ -137,7 +217,7 @@ function BoardRouteComponent() {
     enableOnFormTags: false,
     preventDefault: true,
   })
-  return <KanbanBoard projectId={projectId} />
+  return <BoardPage projectId={projectId} />
 }
 
 type TaskListRouteSearch = {
@@ -187,16 +267,28 @@ function TaskListRouteComponent() {
 
   const agentIds = search.agentIds ? search.agentIds.split(',').filter(Boolean) : []
 
-  const setFilter = (patch: { agentIds?: string[]; blockedOnly?: boolean; includeCancelled?: boolean; includeArchived?: boolean; priorityMin?: number; priorityMax?: number }) => {
+  const setFilter = (patch: {
+    agentIds?: string[]
+    blockedOnly?: boolean
+    includeCancelled?: boolean
+    includeArchived?: boolean
+    priorityMin?: number
+    priorityMax?: number
+  }) => {
     void navigate({
       search: (prev) => ({
         ...prev,
-        agentIds: 'agentIds' in patch
-          ? (patch.agentIds && patch.agentIds.length > 0 ? patch.agentIds.join(',') : undefined)
-          : prev.agentIds,
+        agentIds:
+          'agentIds' in patch
+            ? patch.agentIds && patch.agentIds.length > 0
+              ? patch.agentIds.join(',')
+              : undefined
+            : prev.agentIds,
         blockedOnly: 'blockedOnly' in patch ? patch.blockedOnly || undefined : prev.blockedOnly,
-        includeCancelled: 'includeCancelled' in patch ? patch.includeCancelled || undefined : prev.includeCancelled,
-        includeArchived: 'includeArchived' in patch ? patch.includeArchived || undefined : prev.includeArchived,
+        includeCancelled:
+          'includeCancelled' in patch ? patch.includeCancelled || undefined : prev.includeCancelled,
+        includeArchived:
+          'includeArchived' in patch ? patch.includeArchived || undefined : prev.includeArchived,
         priorityMin: 'priorityMin' in patch ? patch.priorityMin : prev.priorityMin,
         priorityMax: 'priorityMax' in patch ? patch.priorityMax : prev.priorityMax,
       }),
@@ -270,7 +362,9 @@ const executionDetailRoute = createRoute({
 function ExecutionDetailRouteComponent() {
   const { taskId, executionId } = executionDetailRoute.useParams()
   const { view } = executionDetailRoute.useSearch()
-  return <ExecutionDetailPage taskId={taskId} executionId={executionId} viewerMode={view ?? 'chat'} />
+  return (
+    <ExecutionDetailPage taskId={taskId} executionId={executionId} viewerMode={view ?? 'chat'} />
+  )
 }
 
 const agentsRoute = createRoute({
@@ -453,9 +547,12 @@ function AccountTabRouteComponent() {
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/login',
-  validateSearch: (search: Record<string, unknown>): { redirect: string | undefined; redirect_params?: string } => ({
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { redirect: string | undefined; redirect_params?: string } => ({
     redirect: typeof search.redirect === 'string' ? search.redirect : undefined,
-    redirect_params: typeof search.redirect_params === 'string' ? search.redirect_params : undefined,
+    redirect_params:
+      typeof search.redirect_params === 'string' ? search.redirect_params : undefined,
   }),
   beforeLoad: () => {
     const { accessToken } = useAuthStore.getState()

@@ -26,22 +26,23 @@ export function AgentFilterGroup({
 }) {
   if (agents.length === 0 && !showUserOption) return null
 
+  const selectedAgentIdSet = new Set(selectedAgentIds)
   const visibleAgents = agents.slice(0, MAX_VISIBLE)
   const hiddenAgents = agents.slice(MAX_VISIBLE)
-  const hasHiddenSelected = hiddenAgents.some((a) => selectedAgentIds.includes(a.id))
-  const userSelected = selectedAgentIds.includes('user')
+  const hasHiddenSelected = hiddenAgents.some((agent) => selectedAgentIdSet.has(agent.id))
+  const userSelected = selectedAgentIdSet.has('user')
 
   const toggle = (id: string) => {
-    const next = selectedAgentIds.includes(id)
+    const next = selectedAgentIdSet.has(id)
       ? selectedAgentIds.filter((a) => a !== id)
       : [...selectedAgentIds, id]
     onSelect(next)
   }
 
   return (
-    <div className="flex items-center -space-x-1.5">
+    <div className="flex items-center gap-1">
       {visibleAgents.map((agent) => {
-        const isSelected = selectedAgentIds.includes(agent.id)
+        const isSelected = selectedAgentIdSet.has(agent.id)
         return (
           <button
             key={agent.id}
@@ -92,7 +93,7 @@ export function AgentFilterGroup({
           </DropdownMenuTrigger>
           <DropdownMenuContent className="w-52">
             {agents.map((agent) => {
-              const isSelected = selectedAgentIds.includes(agent.id)
+              const isSelected = selectedAgentIdSet.has(agent.id)
               return (
                 <DropdownMenuItem
                   key={agent.id}
@@ -113,11 +114,7 @@ export function AgentFilterGroup({
             {showUserOption && (
               <>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  className="gap-2 p-2"
-                  keepOpen
-                  onClick={() => toggle('user')}
-                >
+                <DropdownMenuItem className="gap-2 p-2" keepOpen onClick={() => toggle('user')}>
                   <Checkbox
                     checked={userSelected}
                     onChange={() => {}}

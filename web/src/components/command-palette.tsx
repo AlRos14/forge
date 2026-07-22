@@ -1,13 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { Command } from 'cmdk'
 import { MagnifyingGlass } from '@phosphor-icons/react'
 import { useTasksQuery } from '@/api/hooks'
-import { TaskCreateDialog } from '@/components/task-create-dialog'
 import { useLayoutStore } from '@/stores/layout'
 import type { Task } from '@/types/generated'
 
-const recentTasksKey = 'recentTasks'
+const TaskCreateDialog = lazy(() =>
+  import('@/components/task-create-dialog').then((module) => ({
+    default: module.TaskCreateDialog,
+  })),
+)
+
+const recentTasksKey = 'recentTasks:v1'
 
 type RecentTask = Pick<Task, 'id' | 'title'>
 
@@ -62,7 +67,11 @@ export function CommandPalette({ projectId }: { projectId: string }) {
 
   return (
     <>
-      <button type="button" className="inline-flex items-center gap-2 rounded-md border px-2 py-1 text-sm" onClick={() => setOpen(true)}>
+      <button
+        type="button"
+        className="inline-flex items-center gap-2 rounded-md border px-2 py-1 text-sm"
+        onClick={() => setOpen(true)}
+      >
         <MagnifyingGlass size={14} />
         Search
       </button>
@@ -74,9 +83,17 @@ export function CommandPalette({ projectId }: { projectId: string }) {
         }}
         label="Command palette"
       >
-        <div className="fixed inset-0 z-50 bg-black/30" onClick={() => setOpen(false)} />
+        <button
+          type="button"
+          aria-label="Close command palette"
+          className="fixed inset-0 z-50 bg-black/30"
+          onClick={() => setOpen(false)}
+        />
         <div className="fixed left-1/2 top-20 z-50 w-full max-w-xl -translate-x-1/2 rounded-md border bg-card p-2 shadow-lg">
-          <Command.Input className="w-full rounded-md border px-3 py-2 text-sm outline-none" placeholder="Type a command or search task..." />
+          <Command.Input
+            className="w-full rounded-md border px-3 py-2 text-sm outline-none"
+            placeholder="Type a command or search task..."
+          />
           <Command.List className="mt-2 max-h-80 overflow-auto">
             <Command.Empty className="p-2 text-sm text-muted-foreground">No results</Command.Empty>
             {recentTasks.length > 0 ? (
@@ -105,7 +122,13 @@ export function CommandPalette({ projectId }: { projectId: string }) {
               >
                 Create task
               </Command.Item>
-              <Command.Item className="cursor-pointer rounded p-2 text-sm aria-selected:bg-muted" onSelect={() => { setOpen(false); void navigate({ to: '/projects/$projectId/board', params: { projectId } }) }}>
+              <Command.Item
+                className="cursor-pointer rounded p-2 text-sm aria-selected:bg-muted"
+                onSelect={() => {
+                  setOpen(false)
+                  void navigate({ to: '/projects/$projectId/board', params: { projectId } })
+                }}
+              >
                 Go to board
               </Command.Item>
               <Command.Item
@@ -121,10 +144,22 @@ export function CommandPalette({ projectId }: { projectId: string }) {
               >
                 Go to tasks
               </Command.Item>
-              <Command.Item className="cursor-pointer rounded p-2 text-sm aria-selected:bg-muted" onSelect={() => { setOpen(false); void navigate({ to: '/agents' }) }}>
+              <Command.Item
+                className="cursor-pointer rounded p-2 text-sm aria-selected:bg-muted"
+                onSelect={() => {
+                  setOpen(false)
+                  void navigate({ to: '/agents' })
+                }}
+              >
                 Go to agents
               </Command.Item>
-              <Command.Item className="cursor-pointer rounded p-2 text-sm aria-selected:bg-muted" onSelect={() => { setOpen(false); void navigate({ to: '/projects/$projectId/settings', params: { projectId } }) }}>
+              <Command.Item
+                className="cursor-pointer rounded p-2 text-sm aria-selected:bg-muted"
+                onSelect={() => {
+                  setOpen(false)
+                  void navigate({ to: '/projects/$projectId/settings', params: { projectId } })
+                }}
+              >
                 Go to settings
               </Command.Item>
               <Command.Item
@@ -152,7 +187,11 @@ export function CommandPalette({ projectId }: { projectId: string }) {
           </Command.List>
         </div>
       </Command.Dialog>
-      <TaskCreateDialog open={createOpen} projectId={projectId} onOpenChange={setCreateOpen} />
+      {createOpen ? (
+        <Suspense fallback={null}>
+          <TaskCreateDialog open projectId={projectId} onOpenChange={setCreateOpen} />
+        </Suspense>
+      ) : null}
     </>
   )
 }

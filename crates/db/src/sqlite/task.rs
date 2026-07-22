@@ -281,23 +281,6 @@ impl TaskRepo for SqliteDb {
         Ok(())
     }
 
-    async fn reorder_task(&self, id: &str, new_position: f64, updated_at: &str) -> Result<Task> {
-        let result = sqlx::query(
-            "UPDATE task SET board_position = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-        )
-        .bind(new_position)
-        .bind(updated_at)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound);
-        }
-        TaskRepo::get_by_id(self, id, true)
-            .await?
-            .ok_or(DbError::NotFound)
-    }
-
     async fn update(&self, input: UpdateTask) -> Result<Task> {
         let mut task = self.get_task_required(&input.id, true).await?;
         if task.deleted_at.is_some() {

@@ -4,6 +4,21 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Breaking
+
+- Replaced `PUT /api/v1/tasks/{id}/position` and its `PositionRequest`/`PositionResponse` types with the atomic, versioned `POST /api/v1/tasks/{id}/move` command. Project task-list pages now include `board_revision`; board clients must submit both that revision and the moved task's version.
+- Board status moves now publish the canonical `task.moved` SSE event instead of a `task.status_changed` event for the direct move. The payload includes operation identity, old/new status and position, resulting task and board versions, and requested neighbors.
+
+### Added
+
+- Persisted project board revisions and idempotent move-operation records, with transactional neighbor validation, position renormalization, actionable concurrency conflicts, and replay of completed operation IDs.
+
+### Changed
+
+- The production web client now lazy-loads route screens and editor-backed dialogs, and the server Brotli/gzip compresses eligible responses while retaining immutable cache headers for hashed assets.
+
 ## [0.4.0] - 2026-07-03
 
 ### Changed

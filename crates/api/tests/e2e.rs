@@ -7,8 +7,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentAvailabilityResponse, AgentResponse, ErrorResponse, PaginatedResponse, PositionResponse,
-    ProjectResponse, RepoResponse, TaskDependency, TaskResponse,
+    AgentAvailabilityResponse, AgentResponse, ErrorResponse, MoveTaskResponse, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskDependency, TaskResponse, TasksResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -113,7 +113,7 @@ async fn forge_mvp_rest_api_flow() {
         json!({ "status": "in_progress", "version": cancelled_task.version }),
     )
     .await;
-    assert_eq!(terminal_error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(terminal_error.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let delete_response =
         raw_empty_request(&app, Method::DELETE, &format!("/api/v1/tasks/{task_id}")).await;
@@ -237,7 +237,7 @@ async fn remove_dependency_succeeds() {
 }
 
 #[tokio::test]
-async fn reorder_task_position_endpoint_updates_board_order() {
+async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let first: TaskResponse = json_request(
@@ -273,21 +273,120 @@ async fn reorder_task_position_endpoint_updates_board_order() {
     )
     .await;
 
-    let response: PositionResponse = json_request(
+    let initial_page: TasksResponse = empty_request(
         &app,
-        Method::PUT,
-        &format!("/api/v1/tasks/{}/position", third.id),
-        json!({ "before_id": first.id, "after_id": second.id }),
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        StatusCode::OK,
+    )
+    .await;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let move_body = json!({
+        "operation_id": operation_id,
+        "task_version": third.version,
+        "board_revision": initial_page.board_revision,
+        "target_status": third.status,
+        "before_id": first.id,
+        "after_id": second.id,
+    });
+    let response: MoveTaskResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/move", third.id),
+        move_body.clone(),
         StatusCode::OK,
     )
     .await;
 
     assert_eq!(response.task.id, third.id);
+    assert_eq!(response.operation_id, operation_id);
+    assert!(response.board_revision > initial_page.board_revision);
     assert!((response.task.board_position - 1.5).abs() < 1e-9);
     assert!(response.task.role_assignments.iter().any(|assignment| {
         assignment.role_name == "coder" && assignment.assignee_id.as_deref() == Some("test-user-id")
     }));
-    let tasks: PaginatedResponse<TaskResponse> = empty_request(
+    let replay: MoveTaskResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/move", third.id),
+        move_body,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay.task.version, response.task.version);
+    assert_eq!(replay.board_revision, response.board_revision);
+
+    let operation_conflict = raw_json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/move", third.id),
+        json!({
+            "operation_id": operation_id,
+            "task_version": third.version,
+            "board_revision": initial_page.board_revision,
+            "target_status": third.status,
+            "before_id": second.id,
+            "after_id": null,
+        }),
+    )
+    .await;
+    let operation_error: ErrorResponse =
+        parse_response(operation_conflict, StatusCode::CONFLICT).await;
+    assert_eq!(operation_error.code, "operation_conflict");
+    assert_eq!(
+        operation_error.details,
+        Some(json!({ "operation_id": operation_id }))
+    );
+
+    let version_conflict = raw_json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/move", third.id),
+        json!({
+            "operation_id": uuid::Uuid::new_v4().to_string(),
+            "task_version": third.version,
+            "board_revision": response.board_revision,
+            "target_status": third.status,
+            "before_id": first.id,
+            "after_id": second.id,
+        }),
+    )
+    .await;
+    let version_error: ErrorResponse = parse_response(version_conflict, StatusCode::CONFLICT).await;
+    assert_eq!(version_error.code, "version_conflict");
+    assert_eq!(
+        version_error.details,
+        Some(json!({
+            "expected_task_version": third.version,
+            "actual_task_version": response.task.version,
+        }))
+    );
+
+    let board_conflict = raw_json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/move", third.id),
+        json!({
+            "operation_id": uuid::Uuid::new_v4().to_string(),
+            "task_version": response.task.version,
+            "board_revision": initial_page.board_revision,
+            "target_status": third.status,
+            "before_id": first.id,
+            "after_id": second.id,
+        }),
+    )
+    .await;
+    let board_error: ErrorResponse = parse_response(board_conflict, StatusCode::CONFLICT).await;
+    assert_eq!(board_error.code, "board_revision_conflict");
+    assert_eq!(
+        board_error.details,
+        Some(json!({
+            "expected_board_revision": initial_page.board_revision,
+            "actual_board_revision": response.board_revision,
+        }))
+    );
+
+    let tasks: TasksResponse = empty_request(
         &app,
         Method::GET,
         &format!("/api/v1/projects/{project_id}/tasks"),
@@ -303,6 +402,66 @@ async fn reorder_task_position_endpoint_updates_board_order() {
         ids,
         vec![first.id.as_str(), third.id.as_str(), second.id.as_str()]
     );
+
+    let removed_endpoint = raw_json_request(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/tasks/{}/position", third.id),
+        json!({ "before_id": first.id, "after_id": second.id }),
+    )
+    .await;
+    assert_eq!(removed_endpoint.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn project_task_pages_include_revision_tokens_for_pagination() {
+    let app = test_app().await;
+    let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
+    for title in ["First", "Second", "Third"] {
+        let _: TaskResponse = json_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/projects/{project_id}/tasks"),
+            json!({ "title": title }),
+            StatusCode::OK,
+        )
+        .await;
+    }
+
+    let first_page: TasksResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks?limit=1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(first_page.has_more);
+    let cursor = first_page.next_cursor.clone().expect("next page cursor");
+    let second_page: TasksResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks?limit=1&cursor={cursor}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(second_page.board_revision, first_page.board_revision);
+
+    let _: TaskResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Concurrent insert" }),
+        StatusCode::OK,
+    )
+    .await;
+    let changed_page: TasksResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks?limit=1&cursor={cursor}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(changed_page.board_revision > first_page.board_revision);
 }
 
 #[tokio::test]

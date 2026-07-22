@@ -11,6 +11,7 @@ use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -58,6 +59,7 @@ pub fn build_router(state: AppState, web_dist_dir: impl Into<PathBuf>) -> Router
         .with_state(state.clone())
         .merge(api_router(state))
         .fallback_service(static_service)
+        .layer(CompressionLayer::new())
         .layer(middleware::cors_middleware(&cors_origins))
         .layer(from_fn(cache_control_middleware))
         .layer(from_fn(middleware::request_id_middleware))
@@ -257,10 +259,7 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/tasks/{id}/subtasks/reorder",
             post(routes::tasks::reorder_subtasks),
         )
-        .route(
-            "/api/v1/tasks/{id}/position",
-            put(routes::tasks::reorder_task_position),
-        )
+        .route("/api/v1/tasks/{id}/move", post(routes::tasks::move_task))
         .route(
             "/api/v1/tasks/{id}/workspace",
             get(routes::tasks::get_task_workspace),
@@ -664,6 +663,41 @@ async fn router_serves_spa_fallback() {
         .expect("router response");
 
     assert_ne!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn router_compresses_static_assets() {
+    use tower::util::ServiceExt;
+
+    let web_dist_dir = std::env::temp_dir().join(format!(
+        "forge-api-compression-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let assets_dir = web_dist_dir.join("assets");
+    std::fs::create_dir_all(&assets_dir).expect("create asset dir");
+    std::fs::write(
+        assets_dir.join("app.css"),
+        ".board{display:grid;}".repeat(100),
+    )
+    .expect("write asset");
+
+    let router = build_router(test_state().await, web_dist_dir);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.css")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(axum::body::Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_ENCODING),
+        Some(&HeaderValue::from_static("gzip"))
+    );
 }
 
 #[tokio::test]

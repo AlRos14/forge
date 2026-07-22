@@ -15,6 +15,8 @@ export function KanbanColumn({
   column,
   tasks,
   dragDisabled,
+  dragDisabledReason,
+  movePending,
   validDropStatuses,
   activeDropStatus,
   quickCreateOpen,
@@ -42,6 +44,8 @@ export function KanbanColumn({
   column: ColumnGroup
   tasks: Task[]
   dragDisabled: boolean
+  dragDisabledReason?: string
+  movePending: boolean
   validDropStatuses: string[]
   activeDropStatus?: string
   quickCreateOpen: boolean
@@ -73,7 +77,9 @@ export function KanbanColumn({
     const sentinel = sentinelRef.current
     if (!sentinel) return
     const observer = new IntersectionObserver(
-      ([entry]) => { if (entry.isIntersecting) onLoadMore() },
+      ([entry]) => {
+        if (entry.isIntersecting) onLoadMore()
+      },
       { threshold: 0 },
     )
     observer.observe(sentinel)
@@ -88,8 +94,7 @@ export function KanbanColumn({
           {...provided.droppableProps}
           aria-label={`${column.columnName} column`}
           className={cn(
-            'flex min-w-[200px] flex-1 flex-col rounded-xl border border-border-subtle bg-background p-2 transition-colors',
-            column.isTerminal && 'opacity-60',
+            'flex w-[var(--board-column-width)] min-w-[var(--board-column-width)] flex-none flex-col rounded-xl border border-border-subtle bg-background p-2 transition-colors',
             validDropStatuses.includes(column.primaryState) &&
               (activeDropStatus === column.primaryState
                 ? 'bg-primary/5 ring-2 ring-primary/30'
@@ -178,7 +183,7 @@ export function KanbanColumn({
             </div>
           )}
 
-          <div className="min-h-0 flex-1 overflow-y-auto space-y-1.5">
+          <div className="min-h-0 flex-1 space-y-1.5">
             {tasks.map((task, index) => (
               <KanbanTaskCard
                 key={task.id}
@@ -187,6 +192,8 @@ export function KanbanColumn({
                 showSubStateBadge={column.states.length > 1}
                 subStateLabel={column.stateLabels?.[task.status]}
                 dragDisabled={dragDisabled}
+                dragDisabledReason={dragDisabledReason}
+                movePending={movePending}
                 agentPickerTaskId={agentPickerTaskId}
                 agents={agents}
                 agentNamesById={agentNamesById}

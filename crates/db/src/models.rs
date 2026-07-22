@@ -362,7 +362,7 @@ pub struct CreateNotification {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub project_id: String,
@@ -395,6 +395,71 @@ pub struct Task {
 }
 
 pub type TaskStatus = String;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveTaskIdentity {
+    pub project_id: String,
+    pub task_id: String,
+    pub task_version: i64,
+    pub board_revision: i64,
+    pub target_status: String,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompareAndMoveTask {
+    pub operation_id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub task_version: i64,
+    pub board_revision: i64,
+    pub target_status: String,
+    pub target_column_statuses: Vec<String>,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+    pub entry_barrier_json: Option<String>,
+    pub transition_log_id: String,
+    pub trigger_name: Option<String>,
+    pub triggered_by: String,
+    pub trigger_reason: String,
+    pub rejection: bool,
+    pub updated_at: String,
+}
+
+impl CompareAndMoveTask {
+    pub fn identity(&self) -> MoveTaskIdentity {
+        MoveTaskIdentity {
+            project_id: self.project_id.clone(),
+            task_id: self.task_id.clone(),
+            task_version: self.task_version,
+            board_revision: self.board_revision,
+            target_status: self.target_status.clone(),
+            before_id: self.before_id.clone(),
+            after_id: self.after_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoveTaskResult {
+    pub task: Task,
+    pub board_revision: i64,
+    pub operation_id: String,
+    pub old_status: String,
+    pub old_board_position: f64,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MoveTaskPersistence {
+    Committed {
+        result: Box<MoveTaskResult>,
+        transition_log: Box<TransitionLog>,
+    },
+    Replayed(Box<MoveTaskResult>),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Execution {

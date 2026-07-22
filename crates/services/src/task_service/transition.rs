@@ -155,7 +155,7 @@ impl TaskService {
         })
     }
 
-    async fn ensure_planning_plan_ready_before_leaving(
+    pub(super) async fn ensure_planning_plan_ready_before_leaving(
         &self,
         task: &Task,
         new_status: &TaskStatus,
@@ -545,7 +545,7 @@ impl TaskService {
 }
 
 impl TaskService {
-    async fn cancel_active_execution_for_user_transition(
+    pub(super) async fn cancel_active_execution_for_user_transition(
         &self,
         task: &Task,
         target_status: &str,
@@ -720,7 +720,10 @@ async fn clear_manual_advance_error_annotation(
     .map_err(Into::into)
 }
 
-async fn clear_manual_review_awaiting_metadata(db: &SqliteDb, task: &Task) -> Result<Task> {
+pub(super) async fn clear_manual_review_awaiting_metadata(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<Task> {
     let current = TaskRepo::get_by_id(db, &task.id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
@@ -744,7 +747,7 @@ async fn clear_manual_review_awaiting_metadata(db: &SqliteDb, task: &Task) -> Re
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
 }
 
-fn should_clear_transient_error_annotation(task: &Task) -> bool {
+pub(super) fn should_clear_transient_error_annotation(task: &Task) -> bool {
     if task.status.as_str() == default_states::MERGE_FAILED {
         return false;
     }
@@ -754,7 +757,7 @@ fn should_clear_transient_error_annotation(task: &Task) -> bool {
         .is_some_and(is_transient_error_annotation)
 }
 
-fn should_clear_review_passed_at(
+pub(super) fn should_clear_review_passed_at(
     workflow: &api_types::WorkflowDefinition,
     from: &str,
     to: &str,

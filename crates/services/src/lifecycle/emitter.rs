@@ -66,6 +66,18 @@ impl LifecycleEventEmitter {
                 self.handle_status_changed(&entity_id, &project_id, &old_status, &new_status)
                     .await
             }
+            EventContext::TaskMoved(payload)
+                if event_type == events::TASK_MOVED_EVENT
+                    && payload.old_status != payload.new_status =>
+            {
+                self.handle_status_changed(
+                    &entity_id,
+                    &payload.project_id,
+                    &payload.old_status,
+                    &payload.new_status,
+                )
+                .await
+            }
             EventContext::TaskAssigned {
                 project_id,
                 agent_id,

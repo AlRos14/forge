@@ -522,33 +522,6 @@ async fn wait_until_execution_has_logs_path(db: &SqliteDb, execution_id: &str) {
     }
 }
 
-fn assert_position(actual: f64, expected: f64) {
-    assert!(
-        (actual - expected).abs() < 1e-9,
-        "expected position {expected}, got {actual}"
-    );
-}
-
-async fn set_board_position(db: &SqliteDb, task_id: &str, position: f64) {
-    sqlx::query("UPDATE task SET board_position = ?, updated_at = ? WHERE id = ?")
-        .bind(position)
-        .bind(now_rfc3339())
-        .bind(task_id)
-        .execute(db.pool())
-        .await
-        .expect("task board position updates");
-}
-
-async fn board_positions(db: &SqliteDb, project_id: &str) -> Vec<f64> {
-    sqlx::query_scalar::<_, f64>(
-        "SELECT board_position FROM task WHERE project_id = ? AND deleted_at IS NULL ORDER BY board_position ASC, id ASC",
-    )
-    .bind(project_id)
-    .fetch_all(db.pool())
-    .await
-    .expect("board positions load")
-}
-
 async fn seed_running_coder_execution(
     db: &SqliteDb,
     task_id: &str,

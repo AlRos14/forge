@@ -1,4 +1,13 @@
-import { useEffect, useState, type ComponentType, type ReactNode } from 'react'
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import type { IconWeight } from '@phosphor-icons/react'
 import {
@@ -26,7 +35,6 @@ import { useTranslation } from 'react-i18next'
 import { useCreateProject, useProjectsInfiniteQuery } from '@/api/hooks'
 import { logoutApi } from '@/api/auth'
 import { Avatar } from '@/components/ui/avatar'
-import { CommandPalette } from '@/components/command-palette'
 import { NotificationCenter } from '@/components/notification-center'
 import {
   DropdownMenu,
@@ -47,6 +55,12 @@ import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/cn'
 import { useLayoutStore } from '@/stores/layout'
 import { useAuthStore } from '@/stores/auth'
+
+const CommandPalette = lazy(() =>
+  import('@/components/command-palette').then((module) => ({
+    default: module.CommandPalette,
+  })),
+)
 
 type NavItem = {
   to: string
@@ -104,7 +118,9 @@ function ProjectSwitcher({
       {projects.map((p) => (
         <DropdownMenuItem
           key={p.id}
-          onClick={() => void navigate({ to: '/projects/$projectId/board', params: { projectId: p.id } })}
+          onClick={() =>
+            void navigate({ to: '/projects/$projectId/board', params: { projectId: p.id } })
+          }
         >
           <Avatar name={p.name} seed={p.id} size="xs" className="mr-2 rounded" />
           <span className="min-w-0 flex-1 truncate text-left" title={p.name}>
@@ -382,6 +398,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   const setSidebarCollapsed = useLayoutStore((s) => s.setSidebarCollapsed)
   const theme = useLayoutStore((s) => s.theme)
   const setTheme = useLayoutStore((s) => s.setTheme)
+  const shellMode = useShellMode()
+  const [railExpanded, setRailExpanded] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
   const params = useRouterState({
     select: (state) => state.matches.at(-1)?.params as { projectId?: string } | undefined,
   })
@@ -389,14 +409,37 @@ export function AppShell({ children }: { children: ReactNode }) {
   const storedProjectId = useLayoutStore((s) => s.selectedProjectId)
   const setSelectedProjectId = useLayoutStore((s) => s.setSelectedProjectId)
   const routeProjectId = params?.projectId
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
+  const isBoardRoute = /^\/projects\/[^/]+\/board$/.test(pathname)
   const firstProjectId = projectsQuery.data?.pages[0]?.items[0]?.id
   const projectId = routeProjectId ?? storedProjectId ?? firstProjectId
+  const effectiveCollapsed =
+    shellMode === 'full' ? sidebarCollapsed : shellMode === 'rail' ? !railExpanded : false
+
+  const closeDrawer = useCallback((restoreFocus = true) => {
+    setDrawerOpen(false)
+    if (restoreFocus) requestAnimationFrame(() => menuButtonRef.current?.focus())
+  }, [])
 
   useEffect(() => {
     if (routeProjectId && routeProjectId !== storedProjectId) {
       setSelectedProjectId(routeProjectId)
     }
   }, [routeProjectId, storedProjectId, setSelectedProjectId])
+
+  useEffect(() => {
+    setRailExpanded(false)
+    if (shellMode !== 'overlay') setDrawerOpen(false)
+  }, [shellMode])
+
+  useEffect(() => {
+    if (!drawerOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeDrawer()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [closeDrawer, drawerOpen])
 
   const projectNavItems = navItems.filter((item) => item.section === 'project')
   const globalNavItems = navItems.filter((item) => {
@@ -417,13 +460,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           key={item.key}
           className={cn(
             'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] leading-none text-muted-foreground/50',
-            sidebarCollapsed && 'justify-center px-0',
+            effectiveCollapsed && 'justify-center px-0',
           )}
           disabled
           type="button"
         >
           <Icon size={16} />
-          {!sidebarCollapsed && <span>{t(`appShell.navigation.${item.key}`)}</span>}
+          {!effectiveCollapsed && <span>{t(`appShell.navigation.${item.key}`)}</span>}
         </button>
       )
     }
@@ -436,9 +479,13 @@ export function AppShell({ children }: { children: ReactNode }) {
       <Link
         key={item.key}
         {...linkProps}
+        aria-label={t(`appShell.navigation.${item.key}`)}
+        onClick={() => {
+          if (shellMode === 'overlay') closeDrawer(false)
+        }}
         className={cn(
           'group relative flex items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-[13px] leading-none font-medium transition-colors hover:bg-sidebar-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
-          sidebarCollapsed && 'justify-center px-0',
+          effectiveCollapsed && 'justify-center px-0',
         )}
         inactiveProps={{
           className: 'text-sidebar-foreground',
@@ -449,13 +496,16 @@ export function AppShell({ children }: { children: ReactNode }) {
         }}
       >
         <Icon size={16} />
-        {!sidebarCollapsed && <span>{t(`appShell.navigation.${item.key}`)}</span>}
+        {!effectiveCollapsed && <span>{t(`appShell.navigation.${item.key}`)}</span>}
       </Link>
     )
   }
 
   return (
-    <div className="flex h-screen bg-background">
+    <div
+      className="flex h-[100dvh] min-h-[100svh] overflow-hidden bg-background"
+      data-shell-mode={shellMode}
+    >
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:ring-2 focus:ring-ring"
@@ -463,78 +513,121 @@ export function AppShell({ children }: { children: ReactNode }) {
         Skip to main content
       </a>
 
-      {/* Sidebar */}
-      <aside
-        className={cn(
-          'flex flex-col border-r border-sidebar-border bg-sidebar motion-safe:transition-all motion-safe:duration-200',
-          sidebarCollapsed ? 'w-14' : 'w-60',
-        )}
-      >
-        {/* Sidebar header */}
-        <div
+      {shellMode === 'overlay' && drawerOpen ? (
+        <button
+          type="button"
+          aria-label="Close navigation"
+          className="fixed inset-0 z-40 cursor-default bg-black/35 backdrop-blur-[1px]"
+          onClick={() => closeDrawer()}
+        />
+      ) : null}
+
+      {shellMode !== 'overlay' || drawerOpen ? (
+        <aside
+          id="forge-navigation-drawer"
+          aria-label="Primary navigation"
+          data-navigation-state={effectiveCollapsed ? 'collapsed' : 'expanded'}
           className={cn(
-            'flex h-14 shrink-0 items-center border-b border-sidebar-border',
-            sidebarCollapsed ? 'justify-center px-1' : 'justify-between px-3',
+            'flex shrink-0 flex-col border-r border-sidebar-border bg-sidebar motion-safe:transition-[width,transform] motion-safe:duration-200',
+            effectiveCollapsed ? 'w-14' : 'w-60',
+            shellMode === 'overlay' && 'fixed inset-y-0 left-0 z-50 shadow-float',
           )}
         >
-          {!sidebarCollapsed && (
-            <div className="flex items-center gap-2">
-              <img src="/logo.png" alt="Forge" className="h-7 w-7 rounded-lg" />
-              <span className="text-sm font-semibold tracking-tight text-foreground">Forge</span>
-            </div>
-          )}
-          <button
-            type="button"
-            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          {/* Sidebar header */}
+          <div
+            className={cn(
+              'flex h-14 shrink-0 items-center border-b border-sidebar-border',
+              effectiveCollapsed ? 'justify-center px-1' : 'justify-between px-3',
+            )}
           >
-            <SidebarSimple size={16} weight={sidebarCollapsed ? 'regular' : 'fill'} />
-          </button>
-        </div>
+            {!effectiveCollapsed && (
+              <div className="flex items-center gap-2">
+                <img src="/logo.png" alt="Forge" className="h-7 w-7 rounded-lg" />
+                <span className="text-sm font-semibold tracking-tight text-foreground">Forge</span>
+              </div>
+            )}
+            <button
+              type="button"
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => {
+                if (shellMode === 'full') setSidebarCollapsed(!sidebarCollapsed)
+                else if (shellMode === 'rail') setRailExpanded((expanded) => !expanded)
+                else closeDrawer()
+              }}
+              aria-label={effectiveCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            >
+              <SidebarSimple size={16} weight={effectiveCollapsed ? 'regular' : 'fill'} />
+            </button>
+          </div>
 
-        {/* Navigation */}
-        <nav className="flex flex-1 flex-col gap-4 overflow-y-auto py-3">
-          {/* Project switcher */}
-          <ProjectSwitcher projectId={projectId} collapsed={sidebarCollapsed} />
+          {/* Navigation */}
+          <nav className="flex flex-1 flex-col gap-4 overflow-y-auto py-3">
+            {/* Project switcher */}
+            <ProjectSwitcher projectId={projectId} collapsed={effectiveCollapsed} />
 
-          {/* Project nav */}
-          <NavSection
-            label={t('appShell.navigation.project', 'Project')}
-            collapsed={sidebarCollapsed}
-          >
-            {projectNavItems.map(renderNavLink)}
-          </NavSection>
+            {/* Project nav */}
+            <NavSection
+              label={t('appShell.navigation.project', 'Project')}
+              collapsed={effectiveCollapsed}
+            >
+              {projectNavItems.map(renderNavLink)}
+            </NavSection>
 
-          {/* Global nav */}
-          <NavSection
-            label={t('appShell.navigation.workspace', 'Workspace')}
-            collapsed={sidebarCollapsed}
-          >
-            {globalNavItems.map(renderNavLink)}
-          </NavSection>
-        </nav>
-      </aside>
+            {/* Global nav */}
+            <NavSection
+              label={t('appShell.navigation.workspace', 'Workspace')}
+              collapsed={effectiveCollapsed}
+            >
+              {globalNavItems.map(renderNavLink)}
+            </NavSection>
+          </nav>
+        </aside>
+      ) : null}
 
       {/* Main content */}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {/* Header */}
-        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-sidebar-border bg-background px-5">
-          {projectId ? (
-            <CommandPalette projectId={projectId} />
-          ) : (
-            <button
-              className="flex min-w-[280px] items-center gap-2 rounded-lg border border-input bg-card px-3 py-1.5 text-ui text-muted-foreground opacity-50"
-              disabled
-              type="button"
-            >
-              <MagnifyingGlass size={14} />
-              <span>{t('commandPalette.button')}</span>
-              <kbd className="ml-auto rounded bg-muted px-1.5 py-0.5 font-mono text-micro text-muted-foreground">
-                ⌘K
-              </kbd>
-            </button>
-          )}
+        <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-sidebar-border bg-background px-3 sm:px-4 lg:px-5">
+          <div className="flex min-w-0 items-center gap-2">
+            {shellMode === 'overlay' ? (
+              <button
+                ref={menuButtonRef}
+                type="button"
+                aria-controls="forge-navigation-drawer"
+                aria-expanded={drawerOpen}
+                aria-label="Open navigation"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-input bg-card text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => setDrawerOpen(true)}
+              >
+                <List size={17} />
+              </button>
+            ) : null}
+            {projectId ? (
+              <Suspense
+                fallback={
+                  <button
+                    className="flex min-w-0 items-center gap-2 rounded-lg border border-input bg-card px-3 py-1.5 text-ui text-muted-foreground opacity-50"
+                    disabled
+                    type="button"
+                  >
+                    <MagnifyingGlass size={14} />
+                    <span>{t('commandPalette.button')}</span>
+                  </button>
+                }
+              >
+                <CommandPalette projectId={projectId} />
+              </Suspense>
+            ) : (
+              <button
+                className="flex min-w-0 items-center gap-2 rounded-lg border border-input bg-card px-3 py-1.5 text-ui text-muted-foreground opacity-50"
+                disabled
+                type="button"
+              >
+                <MagnifyingGlass size={14} />
+                <span>{t('commandPalette.button')}</span>
+              </button>
+            )}
+          </div>
           <div className="flex items-center gap-2">
             <NotificationCenter projectId={projectId} />
             <button
@@ -548,8 +641,36 @@ export function AppShell({ children }: { children: ReactNode }) {
             <UserMenu />
           </div>
         </header>
-        <main id="main-content" className="min-h-0 flex-1 overflow-auto bg-card p-5">{children}</main>
+        <main
+          id="main-content"
+          className={cn(
+            'min-h-0 flex-1 bg-card p-3 sm:p-4 lg:p-5',
+            isBoardRoute ? 'overflow-hidden' : 'overflow-auto',
+          )}
+        >
+          {children}
+        </main>
       </div>
     </div>
   )
+}
+
+type ShellMode = 'full' | 'rail' | 'overlay'
+
+function shellModeForWidth(width: number): ShellMode {
+  if (width >= 1440) return 'full'
+  if (width >= 1024) return 'rail'
+  return 'overlay'
+}
+
+function useShellMode(): ShellMode {
+  const [mode, setMode] = useState<ShellMode>(() =>
+    typeof window === 'undefined' ? 'full' : shellModeForWidth(window.innerWidth),
+  )
+  useEffect(() => {
+    const update = () => setMode(shellModeForWidth(window.innerWidth))
+    window.addEventListener('resize', update)
+    return () => window.removeEventListener('resize', update)
+  }, [])
+  return mode
 }

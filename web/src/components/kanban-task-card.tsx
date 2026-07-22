@@ -1,6 +1,6 @@
 import type { MouseEvent, ReactNode } from 'react'
 import { Draggable } from '@hello-pangea/dnd'
-import { DotsThree, UserCircle, Warning } from '@phosphor-icons/react'
+import { CircleNotch, DotsSixVertical, DotsThree, UserCircle, Warning } from '@phosphor-icons/react'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { AgentAssigneeDropdown } from '@/components/task-controls'
 import { Avatar } from '@/components/ui/avatar'
@@ -11,11 +11,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
-import {
-  getBlockingAnnotation,
-  getStateColors,
-  taskHasError,
-} from '@/lib/workflow-utils'
+import { getBlockingAnnotation, getStateColors, taskHasError } from '@/lib/workflow-utils'
 import type { Agent, Task } from '@/types/generated'
 
 export type TaskCardMenuRenderer = (task: Task) => ReactNode
@@ -31,6 +27,8 @@ export function KanbanTaskCard({
   showSubStateBadge,
   subStateLabel,
   dragDisabled,
+  dragDisabledReason,
+  movePending,
   agentPickerTaskId,
   agentNamesById,
   claimPending,
@@ -45,6 +43,8 @@ export function KanbanTaskCard({
   showSubStateBadge: boolean
   subStateLabel?: string
   dragDisabled: boolean
+  dragDisabledReason?: string
+  movePending: boolean
   agentPickerTaskId?: string
   agents: Agent[]
   agentNamesById: Map<string, string>
@@ -70,26 +70,38 @@ export function KanbanTaskCard({
   const blockedReason = task.blocked?.reason ?? pausedAnnotation?.blocking_reason
   const isPaused = task.status !== 'cancelled' && Boolean(blockedReason)
   const hasActiveError = taskHasError(task)
+  const otherAssignments = task.role_assignments.filter(
+    (assignment) => assignment.role_name !== 'coder' && assignment.assignee_id,
+  )
 
   return (
-    <Draggable draggableId={task.id} index={index} isDragDisabled={dragDisabled}>
+    <Draggable
+      draggableId={task.id}
+      index={index}
+      isDragDisabled={dragDisabled}
+      disableInteractiveElementBlocking
+    >
       {(drag) => (
         <article
           ref={drag.innerRef}
           {...drag.draggableProps}
-          {...drag.dragHandleProps}
           className={cn(
-            'group cursor-pointer rounded-lg border border-t-border-subtle border-r-border-subtle border-b-border-subtle border-l-[3px] bg-card p-2.5 text-left shadow-soft transition-[border-color,box-shadow,opacity] hover:border-t-border hover:border-r-border hover:border-b-border hover:shadow-card-hover',
+            'group relative cursor-pointer rounded-lg border border-t-border-subtle border-r-border-subtle border-b-border-subtle border-l-[3px] bg-card p-2.5 text-left shadow-soft transition-[border-color,box-shadow,opacity] hover:border-t-border hover:border-r-border hover:border-b-border hover:shadow-card-hover',
             getStateColors(task.status).accent,
             task.status === 'in_progress' &&
               'animate-pulse-ember border-l-4 hover:shadow-[var(--shadow-card-hover),inset_6px_0_8px_-6px_rgba(249,115,22,0.5)]',
             (task.status === 'done' || task.status === 'cancelled') &&
               'opacity-55 hover:opacity-75',
           )}
-          onClick={() => onClick(task)}
           onContextMenu={(e) => onContextMenu(e, task)}
         >
-          <div className="flex items-start gap-2">
+          <button
+            type="button"
+            className="absolute inset-0 z-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1"
+            aria-label={`Open ${task.title}`}
+            onClick={() => onClick(task)}
+          />
+          <div className="pointer-events-none relative z-10 flex items-start gap-2">
             <div className="min-w-0 flex-1">
               <div className="flex items-start gap-1">
                 <p className="line-clamp-2 min-w-0 flex-1 text-ui font-medium leading-snug">
@@ -127,33 +139,31 @@ export function KanbanTaskCard({
                   <WorkflowHealthBadge health={task.workflow_health} compact />
                 ) : null}
               </div>
-              {task.role_assignments.filter((ra) => ra.role_name !== 'coder' && ra.assignee_id).length > 0 && (
+              {otherAssignments.length > 0 && (
                 <div className="mt-1 flex flex-wrap items-center gap-1">
-                  {task.role_assignments
-                    .filter((ra) => ra.role_name !== 'coder' && ra.assignee_id)
-                    .map((ra) => {
-                      const name =
-                        ra.assignee_type === 'agent' && ra.assignee_id
-                          ? agentNamesById.get(ra.assignee_id)
-                          : undefined
-                      return (
-                        <span
-                          key={ra.role_name}
-                          className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground"
-                          title={name ? `${ra.role_name}: ${name}` : ra.role_name}
-                        >
-                          {ra.assignee_type === 'agent' && ra.assignee_id ? (
-                            <Avatar
-                              name={name ?? ra.role_name}
-                              seed={ra.assignee_id}
-                              size="xs"
-                              className="h-3 w-3 rounded text-[7px]"
-                            />
-                          ) : null}
-                          <span className="truncate max-w-[60px]">{ra.role_name}</span>
-                        </span>
-                      )
-                    })}
+                  {otherAssignments.map((ra) => {
+                    const name =
+                      ra.assignee_type === 'agent' && ra.assignee_id
+                        ? agentNamesById.get(ra.assignee_id)
+                        : undefined
+                    return (
+                      <span
+                        key={ra.role_name}
+                        className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground"
+                        title={name ? `${ra.role_name}: ${name}` : ra.role_name}
+                      >
+                        {ra.assignee_type === 'agent' && ra.assignee_id ? (
+                          <Avatar
+                            name={name ?? ra.role_name}
+                            seed={ra.assignee_id}
+                            size="xs"
+                            className="h-3 w-3 rounded text-[7px]"
+                          />
+                        ) : null}
+                        <span className="truncate max-w-[60px]">{ra.role_name}</span>
+                      </span>
+                    )
+                  })}
                 </div>
               )}
               <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -161,7 +171,7 @@ export function KanbanTaskCard({
                   <button
                     type="button"
                     className={cn(
-                      'flex min-w-0 items-center gap-1.5 rounded transition-colors',
+                      'pointer-events-auto flex min-w-0 items-center gap-1.5 rounded transition-colors',
                       onAgentClick && 'cursor-pointer hover:text-foreground',
                     )}
                     onClick={
@@ -193,11 +203,30 @@ export function KanbanTaskCard({
               </div>
             </div>
             <div
-              className="opacity-0 transition-opacity group-hover:opacity-100"
+              className="pointer-events-auto flex shrink-0 items-center gap-0.5"
               onClick={(e) => e.stopPropagation()}
             >
+              <button
+                type="button"
+                {...drag.dragHandleProps}
+                aria-label={`Move ${task.title}`}
+                aria-busy={movePending}
+                disabled={dragDisabled}
+                title={dragDisabled ? dragDisabledReason : `Move ${task.title}`}
+                className="flex h-8 w-8 cursor-grab items-center justify-center rounded-md text-muted-foreground opacity-70 transition-[background,color,opacity] hover:bg-accent hover:text-foreground hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-30"
+                onClick={(event) => event.stopPropagation()}
+              >
+                {movePending ? (
+                  <CircleNotch size={15} className="motion-safe:animate-spin" />
+                ) : (
+                  <DotsSixVertical size={16} weight="bold" />
+                )}
+              </button>
               <DropdownMenu>
-                <DropdownMenuTrigger className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+                <DropdownMenuTrigger
+                  aria-label={`Open actions for ${task.title}`}
+                  className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[background,color,opacity] hover:bg-accent hover:text-foreground group-hover:opacity-100 focus:opacity-100"
+                >
                   <DotsThree size={16} weight="bold" />
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">{menuItems}</DropdownMenuContent>
@@ -206,7 +235,7 @@ export function KanbanTaskCard({
           </div>
           {agentPickerTaskId === task.id && (
             <div
-              className="mt-2"
+              className="pointer-events-auto relative z-10 mt-2"
               onClick={(e) => e.stopPropagation()}
               onMouseDown={(e) => e.stopPropagation()}
             >

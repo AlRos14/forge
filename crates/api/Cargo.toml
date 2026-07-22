@@ -30,7 +30,7 @@ services = { path = "../services" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "cors", "fs", "set-header", "trace"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = { workspace = true }
 url = "2"

@@ -44,6 +44,7 @@ import {
 } from '@/api/client'
 import { qk } from '@/api/query-keys'
 import { getApiErrorCode } from '@/lib/api-error'
+import { useAuthStore } from '@/stores/auth'
 import type {
   Agent,
   AgentAvailability,
@@ -76,8 +77,6 @@ import type {
   OAuthApproveResponse,
   OAuthAuthorizeContext,
   PaginatedResponse,
-  PositionRequest,
-  PositionResponse,
   Project,
   Repo,
   Review,
@@ -524,23 +523,26 @@ export function useUpdateTask() {
   })
 }
 
+type TransitionTaskMutation = {
+  taskId: string
+  body: TransitionTaskRequest
+  currentStatus?: string
+}
+
+function transitionTask(taskId: string, body: TransitionTaskRequest) {
+  return apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/transition`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
 export function useTransitionTask() {
   const queryClient = useQueryClient()
-  type TransitionTaskMutation = {
-    taskId: string
-    body: TransitionTaskRequest
-    currentStatus?: string
-  }
-  const transition = (taskId: string, body: TransitionTaskRequest) =>
-    apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/transition`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
 
   return useMutation({
     mutationFn: async ({ taskId, body, currentStatus }: TransitionTaskMutation) => {
       try {
-        return await transition(taskId, body)
+        return await transitionTask(taskId, body)
       } catch (error) {
         if (
           !(error instanceof ApiError) ||
@@ -558,7 +560,7 @@ export function useTransitionTask() {
         if (latest.status !== currentStatus) {
           throw error
         }
-        return transition(taskId, { ...body, version: latest.version })
+        return transitionTask(taskId, { ...body, version: latest.version })
       }
     },
     onMutate: ({ taskId }) => {
@@ -569,16 +571,6 @@ export function useTransitionTask() {
       void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
       void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
     },
-  })
-}
-
-export function useReorderTask() {
-  return useMutation({
-    mutationFn: ({ taskId, body }: { taskId: string; body: PositionRequest }) =>
-      apiFetch<PositionResponse>(`/tasks/${taskId}/position`, {
-        method: 'PUT',
-        body: JSON.stringify(body),
-      }),
   })
 }
 
@@ -1791,6 +1783,7 @@ export function useRemoveDependency(taskId: string) {
 export function useUpdateMe() {
   return useMutation({
     mutationFn: (body: { email?: string | null; display_name?: string | null }) => updateMe(body),
+    onSuccess: (user) => useAuthStore.getState().updateUser(user),
   })
 }
 

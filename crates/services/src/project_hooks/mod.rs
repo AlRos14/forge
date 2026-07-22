@@ -81,6 +81,12 @@ fn evaluation_cause_from_event(event: &ForgeEvent) -> Option<(String, Evaluation
                 task_id: event.entity_id.clone(),
             },
         )),
+        EventContext::TaskMoved(payload) if payload.old_status != payload.new_status => Some((
+            payload.project_id.clone(),
+            EvaluationCause::TaskTransitioned {
+                task_id: event.entity_id.clone(),
+            },
+        )),
         EventContext::TaskUpdated { project_id } if event.event_type == "task.archived" => Some((
             project_id.clone(),
             EvaluationCause::TaskArchived {

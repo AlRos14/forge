@@ -10,6 +10,13 @@ import { createAppRouter } from './router'
 import './lib/i18n'
 import { applyThemeFromStorage } from './stores/layout'
 
+const devToolsEnabled = import.meta.env.DEV && import.meta.env.VITE_DISABLE_REACT_DEVTOOLS !== '1'
+
+if (devToolsEnabled) {
+  void import('react-grab')
+  void import('react-scan')
+}
+
 applyThemeFromStorage()
 
 const queryClient = new QueryClient({
@@ -31,7 +38,7 @@ createRoot(document.getElementById('root')!).render(
       <NiceModal.Provider>
         <RouterProvider router={router} />
         <Toaster richColors position="bottom-right" />
-        <ReactQueryDevtools initialIsOpen={false} />
+        {devToolsEnabled ? <ReactQueryDevtools initialIsOpen={false} /> : null}
       </NiceModal.Provider>
     </QueryClientProvider>
   </StrictMode>,

@@ -160,7 +160,7 @@ describe('getHumanGateActions', () => {
   })
 
   it('does not show approve/reject controls for blocked gate states', () => {
-    const blockedTask = {
+    const blockedTask: Task = {
       ...task('merging', 'coder'),
       blocked: {
         reason: 'target repository has uncommitted changes',

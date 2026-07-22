@@ -13,6 +13,7 @@ export default defineConfig({
   },
   webServer: {
     command: 'pnpm run dev',
+    env: { VITE_DISABLE_REACT_DEVTOOLS: '1' },
     url: 'http://localhost:5173',
     reuseExistingServer: true,
     timeout: 120000,
@@ -20,7 +21,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], channel: 'chrome' },
     },
   ],
 })

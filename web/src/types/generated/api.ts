@@ -678,13 +678,46 @@ export interface UnreadCountResponse {
   count: number
 }
 
-export interface PositionRequest {
+export interface MoveTaskRequest {
+  operation_id: string
+  task_version: number
+  board_revision: number
+  target_status: string
   before_id: string | null
   after_id: string | null
 }
 
-export interface PositionResponse {
+export interface MoveTaskResponse {
   task: Task
+  board_revision: number
+  operation_id: string
+}
+
+export interface OperationConflictDetails {
+  operation_id: string
+}
+
+export interface TaskVersionConflictDetails {
+  expected_task_version: number
+  actual_task_version: number
+}
+
+export interface BoardRevisionConflictDetails {
+  expected_board_revision: number
+  actual_board_revision: number
+}
+
+export interface TaskMovedEventPayload {
+  project_id: string
+  operation_id: string
+  old_status: string
+  new_status: string
+  old_board_position: number
+  new_board_position: number
+  task_version: number
+  board_revision: number
+  before_id: string | null
+  after_id: string | null
 }
 
 // --- Error (matches api_types::ErrorResponse) ---
@@ -1126,7 +1159,7 @@ export interface ReorderSubtasksRequest {
 export type ExecutionsResponse = PaginatedResponse<Execution>
 export type AgentsResponse = PaginatedResponse<Agent>
 export type ProjectsResponse = PaginatedResponse<Project>
-export type TasksResponse = PaginatedResponse<Task>
+export type TasksResponse = PaginatedResponse<Task> & { board_revision: number }
 
 // --- Events (matches events::ForgeEvent/EventContext) ---
 
@@ -1145,6 +1178,7 @@ export type EventContext =
       old_status: string
       new_status: string
     }
+  | TaskMovedEventPayload
   | {
       task_id: string
       from: string

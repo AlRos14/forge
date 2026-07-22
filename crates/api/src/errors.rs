@@ -410,8 +410,45 @@ impl From<DbError> for ApiError {
                 message: "resource version conflict".to_owned(),
                 details: None,
             },
+            DbError::TaskVersionConflict { expected, actual } => Self {
+                status: StatusCode::CONFLICT,
+                code: "version_conflict",
+                message: "task version changed before the move committed".to_owned(),
+                details: Some(json!({
+                    "expected_task_version": expected,
+                    "actual_task_version": actual,
+                })),
+            },
+            DbError::BoardRevisionConflict { expected, actual } => Self {
+                status: StatusCode::CONFLICT,
+                code: "board_revision_conflict",
+                message: "board changed before the move committed".to_owned(),
+                details: Some(json!({
+                    "expected_board_revision": expected,
+                    "actual_board_revision": actual,
+                })),
+            },
+            DbError::MoveOperationConflict { operation_id } => Self {
+                status: StatusCode::CONFLICT,
+                code: "operation_conflict",
+                message: "operation ID was already used for a different move".to_owned(),
+                details: Some(json!({ "operation_id": operation_id })),
+            },
+            DbError::MoveOperationIncomplete { operation_id } => Self {
+                status: StatusCode::CONFLICT,
+                code: "operation_incomplete",
+                message: "move committed but its workflow result is incomplete; reconcile from board truth"
+                    .to_owned(),
+                details: Some(json!({ "operation_id": operation_id })),
+            },
+            DbError::InvalidTaskMove(message) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_task_move",
+                message,
+                details: None,
+            },
             DbError::InvalidTransition => Self {
-                status: StatusCode::BAD_REQUEST,
+                status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "invalid_transition",
                 message: "invalid status transition".to_owned(),
                 details: None,

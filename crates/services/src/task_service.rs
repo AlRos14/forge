@@ -28,8 +28,14 @@ use executors::{
     ExecutorKind, TaskExecutor,
 };
 use serde_json::{json, Value};
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod action_resolver;
@@ -41,8 +47,8 @@ mod create_subtasks;
 mod execution;
 mod lifecycle_test;
 pub(crate) mod logs;
+mod move_task;
 mod reorder_subtasks;
-mod reorder_task;
 mod review;
 mod review_config;
 mod roles;
@@ -108,6 +114,7 @@ pub struct TaskService {
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     workspace_root: PathBuf,
     memory_service: Arc<MemoryService>,
+    move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug)]
@@ -182,6 +189,7 @@ impl TaskService {
             repo_cache_locks: None,
             workspace_root: default_workspace_root(),
             memory_service,
+            move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

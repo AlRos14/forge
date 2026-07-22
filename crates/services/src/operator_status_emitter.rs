@@ -93,6 +93,7 @@ mod tests {
     #[test]
     fn status_affecting_event_matches_expected_types() {
         assert!(is_status_affecting_event("task.status_changed"));
+        assert!(is_status_affecting_event("task.moved"));
         assert!(is_status_affecting_event("execution.started"));
         assert!(is_status_affecting_event("daemon.registered"));
         assert!(is_status_affecting_event("workspace.created"));

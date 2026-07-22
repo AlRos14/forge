@@ -99,8 +99,12 @@ fn export_typescript() {
     TerminalClientFrame::export().expect("export TerminalClientFrame");
     TerminalServerFrame::export().expect("export TerminalServerFrame");
     TasksResponse::export().expect("export TasksResponse");
-    PositionRequest::export().expect("export PositionRequest");
-    PositionResponse::export().expect("export PositionResponse");
+    MoveTaskRequest::export().expect("export MoveTaskRequest");
+    MoveTaskResponse::export().expect("export MoveTaskResponse");
+    OperationConflictDetails::export().expect("export OperationConflictDetails");
+    TaskVersionConflictDetails::export().expect("export TaskVersionConflictDetails");
+    BoardRevisionConflictDetails::export().expect("export BoardRevisionConflictDetails");
+    TaskMovedEventPayload::export().expect("export TaskMovedEventPayload");
     Agent::export().expect("export Agent");
     AgentsResponse::export().expect("export AgentsResponse");
     Project::export().expect("export Project");

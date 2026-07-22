@@ -1,11 +1,14 @@
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
 
-use api_types::{FailurePolicy, StateDefinition, StateKind, WorkflowDefinition, WorkflowTrigger};
-use db::{
-    new_uuid_v4, now_rfc3339, CreateTransitionLog, ProjectRepo, TaskRepo, TransitionLogRepo,
-    UpdateTask,
+use api_types::{
+    FailurePolicy, StateDefinition, StateKind, TaskMovedEventPayload, WorkflowDefinition,
+    WorkflowTrigger,
 };
-use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
+use db::{
+    new_uuid_v4, now_rfc3339, CompareAndMoveTask, CreateTransitionLog, MoveTaskPersistence,
+    MoveTaskResult, ProjectRepo, TaskBoardRepo, TaskRepo, TransitionLogRepo, UpdateTask,
+};
+use events::{event_timestamp, EventBus, EventContext, ForgeEvent, TASK_MOVED_EVENT};
 use executors::TaskExecutor;
 use sqlx::query;
 use tracing::Instrument;
@@ -51,6 +54,23 @@ pub struct TransitionResult {
     pub task: db::Task,
     pub review: Option<db::Review>,
     pub cascaded: bool,
+    pub board_move: Option<BoardMoveOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoardMoveRequest {
+    pub operation_id: String,
+    pub project_id: String,
+    pub board_revision: i64,
+    pub target_column_statuses: Vec<String>,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BoardMoveOutcome {
+    Committed(MoveTaskResult),
+    Replayed(MoveTaskResult),
 }
 
 impl WorkflowEngine {
@@ -111,6 +131,34 @@ impl WorkflowEngine {
             rejection,
             false,
             defer_dispatch_until,
+            None,
+            0,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn move_task(
+        &self,
+        task_id: &str,
+        target_state: &str,
+        version: i64,
+        workflow: &WorkflowDefinition,
+        triggered_by: &str,
+        reason: &str,
+        move_request: BoardMoveRequest,
+    ) -> crate::Result<TransitionResult> {
+        self.transition_inner(
+            task_id.to_owned(),
+            target_state.to_owned(),
+            version,
+            workflow,
+            triggered_by.to_owned(),
+            reason.to_owned(),
+            false,
+            false,
+            None,
+            Some(move_request),
             0,
         )
         .await
@@ -134,6 +182,7 @@ impl WorkflowEngine {
             reason.to_string(),
             rejection,
             true,
+            None,
             None,
             0,
         )
@@ -335,6 +384,7 @@ impl WorkflowEngine {
                 task,
                 review,
                 cascaded: false,
+                board_move: None,
             });
         }
 
@@ -410,6 +460,7 @@ impl WorkflowEngine {
                     false,
                     false,
                     None,
+                    None,
                     1,
                 )
                 .await?;
@@ -422,6 +473,7 @@ impl WorkflowEngine {
             task,
             review,
             cascaded: false,
+            board_move: None,
         })
     }
 
@@ -459,6 +511,7 @@ impl WorkflowEngine {
                 reason.to_string(),
                 false,
                 true,
+                None,
                 None,
                 0,
             )
@@ -551,6 +604,7 @@ impl WorkflowEngine {
         rejection: bool,
         skip_before_exit: bool,
         defer_dispatch_until: Option<String>,
+        board_move: Option<BoardMoveRequest>,
         depth: u8,
     ) -> Pin<Box<dyn Future<Output = crate::Result<TransitionResult>> + Send + 'a>> {
         let span = tracing::info_span!(
@@ -581,7 +635,15 @@ impl WorkflowEngine {
                     triggered_by = %triggered_by,
                     "workflow transition rejected by version conflict"
                 );
-                return Err(db::DbError::VersionConflict.into());
+                return Err(if board_move.is_some() {
+                    db::DbError::TaskVersionConflict {
+                        expected: version,
+                        actual: task.version,
+                    }
+                    .into()
+                } else {
+                    db::DbError::VersionConflict.into()
+                });
             }
 
             let current_status = task.status.to_string();
@@ -855,9 +917,96 @@ impl WorkflowEngine {
                 }
             }
 
+            if board_move.is_some() {
+                for hook in &to_state.hooks.before_enter {
+                    if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                        log_hook_skipped_by_audience(
+                            &task.id,
+                            &current_status,
+                            &target_state,
+                            "before_enter",
+                            hook,
+                            &triggered_by,
+                        );
+                        continue;
+                    }
+                    let action = registry::resolve_action(&hook.action)?;
+                    log_hook_start(
+                        &task.id,
+                        &current_status,
+                        &target_state,
+                        "before_enter",
+                        hook,
+                        &triggered_by,
+                    );
+                    let started = Instant::now();
+                    let result = action.execute(&enter_ctx).await;
+                    let duration_ms = elapsed_ms(started);
+                    log_hook_result(
+                        &task.id,
+                        &current_status,
+                        &target_state,
+                        "before_enter",
+                        hook,
+                        &result,
+                        duration_ms,
+                    );
+                    hook_results.push(hook_result_entry(
+                        &hook.action,
+                        "before_enter",
+                        &result,
+                        duration_ms,
+                    ));
+                    match result {
+                        HookResult::Failed { reason: error }
+                            if matches!(hook.on_failure, FailurePolicy::Block) =>
+                        {
+                            self.event_bus.publish(ForgeEvent {
+                                event_type: "transition.guard_rejected".to_owned(),
+                                entity_id: task.id.clone(),
+                                timestamp: event_timestamp(),
+                                context: EventContext::TransitionGuardRejected {
+                                    task_id: task.id.clone(),
+                                    from_state: current_status.clone(),
+                                    to_state: target_state.clone(),
+                                    guard_name: hook.action.clone(),
+                                    reason: error.clone(),
+                                },
+                            });
+                            return Err(ServiceError::GuardRejection {
+                                guard: hook.action.clone(),
+                                reason: error,
+                            });
+                        }
+                        HookResult::Failed { reason: error } => {
+                            self.event_bus.publish(ForgeEvent {
+                                event_type: "transition.effect_failed".to_owned(),
+                                entity_id: task.id.clone(),
+                                timestamp: event_timestamp(),
+                                context: EventContext::TransitionEffectFailed {
+                                    task_id: task.id.clone(),
+                                    from_state: current_status.clone(),
+                                    to_state: target_state.clone(),
+                                    action: hook.action.clone(),
+                                    error,
+                                },
+                            });
+                        }
+                        HookResult::Cascade {
+                            to,
+                            reason: cascade_reason,
+                        } => {
+                            cascade = Some((to, cascade_reason));
+                            break;
+                        }
+                        HookResult::Ok | HookResult::Skipped { .. } => {}
+                    }
+                }
+            }
+
             let updated_at = now_rfc3339();
             let entry_barrier_started_at = updated_at.clone();
-            let entry_barrier_json = has_blocking_before_enter
+            let entry_barrier_json = (board_move.is_none() && has_blocking_before_enter)
                 .then(|| {
                     serde_json::json!({
                         "state": target_state.as_str(),
@@ -869,35 +1018,96 @@ impl WorkflowEngine {
             let reopens_visible_work = from_state.kind == StateKind::Terminal
                 && to_state.kind != StateKind::Terminal
                 && !task.is_automation;
-            let mut transaction = self.db.pool().begin().await?;
-            let update = query(
-                "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
-            )
-            .bind(&target_state)
-            .bind(&updated_at)
-            .bind(entry_barrier_json.as_deref())
-            .bind(&task_id)
-            .bind(version)
-            .execute(&mut *transaction)
-            .await?;
+            let (mut task, transition_log, board_move_outcome) =
+                if let Some(move_request) = board_move {
+                    let persistence = TaskBoardRepo::compare_and_move_task(
+                        &*self.db,
+                        CompareAndMoveTask {
+                            operation_id: move_request.operation_id,
+                            project_id: move_request.project_id,
+                            task_id: task_id.clone(),
+                            task_version: version,
+                            board_revision: move_request.board_revision,
+                            target_status: target_state.clone(),
+                            target_column_statuses: move_request.target_column_statuses,
+                            before_id: move_request.before_id,
+                            after_id: move_request.after_id,
+                            entry_barrier_json: entry_barrier_json.clone(),
+                            transition_log_id: new_uuid_v4(),
+                            trigger_name: trigger_name.clone(),
+                            triggered_by: triggered_by.clone(),
+                            trigger_reason: reason.clone(),
+                            rejection,
+                            updated_at: updated_at.clone(),
+                        },
+                    )
+                    .await?;
+                    match persistence {
+                        MoveTaskPersistence::Replayed(result) => {
+                            let review = latest_review(&self.db, &result.task.id).await?;
+                            return Ok(TransitionResult {
+                                task: result.task.clone(),
+                                review,
+                                cascaded: false,
+                                board_move: Some(BoardMoveOutcome::Replayed(*result)),
+                            });
+                        }
+                        MoveTaskPersistence::Committed {
+                            result,
+                            transition_log,
+                        } => (
+                            result.task.clone(),
+                            *transition_log,
+                            Some(BoardMoveOutcome::Committed(*result)),
+                        ),
+                    }
+                } else {
+                    let mut transaction = self.db.pool().begin().await?;
+                    let update = query(
+                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
+                    )
+                    .bind(&target_state)
+                    .bind(&updated_at)
+                    .bind(entry_barrier_json.as_deref())
+                    .bind(&task_id)
+                    .bind(version)
+                    .execute(&mut *transaction)
+                    .await?;
 
-            if update.rows_affected() != 1 {
-                return Err(db::DbError::VersionConflict.into());
-            }
-            if reopens_visible_work {
-                ProjectRepo::increment_project_work_epoch(
-                    &*self.db,
-                    &mut transaction,
-                    &task.project_id,
-                    1,
-                )
-                .await?;
-            }
-            transaction.commit().await?;
-
-            let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+                    if update.rows_affected() != 1 {
+                        return Err(db::DbError::VersionConflict.into());
+                    }
+                    if reopens_visible_work {
+                        ProjectRepo::increment_project_work_epoch(
+                            &*self.db,
+                            &mut transaction,
+                            &task.project_id,
+                            1,
+                        )
+                        .await?;
+                    }
+                    transaction.commit().await?;
+                    let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+                    let transition_log = TransitionLogRepo::insert(
+                        &*self.db,
+                        CreateTransitionLog {
+                            id: new_uuid_v4(),
+                            task_id: task.id.clone(),
+                            from_state: current_status.clone(),
+                            to_state: target_state.clone(),
+                            trigger_name: trigger_name.clone(),
+                            triggered_by: triggered_by.clone(),
+                            trigger_reason: reason.clone(),
+                            hook_results_json: None,
+                            rejection,
+                            created_at: updated_at.clone(),
+                        },
+                    )
+                    .await?;
+                    (task, transition_log, None)
+                };
             let should_defer_dispatch = defer_dispatch_until.is_some()
                 && to_state.kind != StateKind::Active
                 && to_state
@@ -923,23 +1133,6 @@ impl WorkflowEngine {
                     .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
             }
 
-            let transition_log = TransitionLogRepo::insert(
-                &*self.db,
-                CreateTransitionLog {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    from_state: current_status.clone(),
-                    to_state: target_state.clone(),
-                    trigger_name,
-                    triggered_by: triggered_by.clone(),
-                    trigger_reason: reason.clone(),
-                    hook_results_json: None,
-                    rejection,
-                    created_at: updated_at,
-                },
-            )
-            .await?;
-
             tracing::info!(
                 task_id = %task.id,
                 from_state = %current_status,
@@ -958,16 +1151,36 @@ impl WorkflowEngine {
                 tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
             }
 
-            self.event_bus.publish(ForgeEvent {
-                event_type: "task.status_changed".to_string(),
-                entity_id: task.id.clone(),
-                timestamp: event_timestamp(),
-                context: EventContext::TaskStatusChanged {
-                    project_id: task.project_id.clone(),
-                    old_status: current_status.clone(),
-                    new_status: task.status.to_string(),
-                },
-            });
+            if let Some(BoardMoveOutcome::Committed(result)) = &board_move_outcome {
+                self.event_bus.publish(ForgeEvent {
+                    event_type: TASK_MOVED_EVENT.to_owned(),
+                    entity_id: task.id.clone(),
+                    timestamp: event_timestamp(),
+                    context: EventContext::TaskMoved(TaskMovedEventPayload {
+                        project_id: task.project_id.clone(),
+                        operation_id: result.operation_id.clone(),
+                        old_status: result.old_status.clone(),
+                        new_status: result.task.status.clone(),
+                        old_board_position: result.old_board_position,
+                        new_board_position: result.task.board_position,
+                        task_version: result.task.version,
+                        board_revision: result.board_revision,
+                        before_id: result.before_id.clone(),
+                        after_id: result.after_id.clone(),
+                    }),
+                });
+            } else {
+                self.event_bus.publish(ForgeEvent {
+                    event_type: "task.status_changed".to_string(),
+                    entity_id: task.id.clone(),
+                    timestamp: event_timestamp(),
+                    context: EventContext::TaskStatusChanged {
+                        project_id: task.project_id.clone(),
+                        old_status: current_status.clone(),
+                        new_status: task.status.to_string(),
+                    },
+                });
+            }
 
             for hook in &from_state.hooks.on_exit {
                 if !hook_audience_matches(hook.applies_to, &triggered_by) {
@@ -1044,7 +1257,7 @@ impl WorkflowEngine {
                 }
             }
 
-            if cascade.is_none() {
+            if board_move_outcome.is_none() && cascade.is_none() {
                 let mut before_enter_blocked = false;
                 let mut before_enter_barrier_resolved = false;
                 for hook in &to_state.hooks.before_enter {
@@ -1459,6 +1672,7 @@ impl WorkflowEngine {
                         task,
                         review,
                         cascaded: false,
+                        board_move: board_move_outcome,
                     });
                 }
 
@@ -1510,10 +1724,12 @@ impl WorkflowEngine {
                             cascade_rejection,
                             false,
                             None,
+                            None,
                             depth + 1,
                         )
                         .await?;
                     cascaded.cascaded = true;
+                    cascaded.board_move = board_move_outcome;
                     return Ok(cascaded);
                 }
             }
@@ -1524,6 +1740,7 @@ impl WorkflowEngine {
                 task,
                 review,
                 cascaded: false,
+                board_move: board_move_outcome,
             })
         }
         .instrument(span))

@@ -89,15 +89,6 @@ export function TaskReviewTab({
   const showMergeSelect = canAct && latestReview?.status === 'passed'
   const workflowExceptionActions = task.workflow_exception?.actions ?? []
 
-  const requestWorkflowExceptionAction = (action: WorkflowExceptionAction) => {
-    if (!action.enabled) return
-    if (action.kind === 'open_interactive') {
-      onOpenWorkflowExceptionAction(action)
-      return
-    }
-    onRecover(action.kind, undefined)
-  }
-
   return (
     <div className="space-y-3">
       <WorkflowExceptionPanel
@@ -106,7 +97,8 @@ export function TaskReviewTab({
         recoverPending={recoverPending}
         terminal={terminal}
         cancelPending={cancelPending}
-        onRequestAction={requestWorkflowExceptionAction}
+        onRecover={onRecover}
+        onOpenInteractive={onOpenWorkflowExceptionAction}
         onCancelTask={onCancelTask}
       />
       {/* Header card — attempt info + actions */}

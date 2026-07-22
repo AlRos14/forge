@@ -59,6 +59,14 @@ The `db` crate defines async traits (`TaskRepo`, `AgentRepo`, …) in
 `AppState::new()` which constructs `TaskService` and `AgentService` internally.
 `AppState` is `Clone` (all fields are `Arc`) and used as Axum state.
 
+### HTTP shell and web assets
+
+The API router also serves the built React application with an SPA fallback.
+Hashed JavaScript and CSS assets receive immutable one-year cache headers and
+eligible responses are Brotli/gzip compressed; HTML navigation responses remain
+uncached so deployments pick up the current asset graph. The production client
+keeps route screens and editor-backed dialogs behind dynamic import boundaries.
+
 ### Event bus
 
 The `events` crate wraps `tokio::sync::broadcast`. Services publish
@@ -247,6 +255,34 @@ defined states.
 5. Backfill `transition_log.hook_results_json`.
 6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
+
+Board moves use the same engine through `TaskService::move_task` and its board
+persistence seam. A project owns a monotonic `board_revision`, advanced by
+database triggers for board-affecting task inserts, deletes, status/position
+updates, archives, and soft deletes. The public move command compares both the
+task version and board revision after acquiring the SQLite write lock, validates
+the destination workflow column and adjacent neighbor IDs, and writes status
+plus board position once in a single transaction. Tight numeric gaps are
+renormalized inside that transaction, so revisions are monotonic but not
+gapless.
+
+Same-column moves use the repository transaction directly and skip status
+hooks. Cross-column moves run `before_exit`/`before_enter` guards before the
+write, then reuse engine audit, `on_exit`, `on_enter`, `after_enter`, dispatch,
+and cascade behavior from the committed task. The direct persistence step
+increments the task version exactly once; a later cascade is a separate normal
+transition and can increment it again. Rejected guards write no task, move
+operation, or transition log.
+
+`task_move_operation` stores normalized request identity, processing/direct
+commit state, and the completed logical result. A same-ID/same-request retry
+replays the result; different reuse conflicts. An incomplete record makes the
+existing post-commit crash gap detectable, while board/task refetch remains the
+recovery source of truth. Each newly committed direct move publishes exactly
+one `task.moved` event after commit. Status-changing move events feed lifecycle,
+project-hook, notification, and operation-status consumers in place of a second
+direct `task.status_changed`; any synchronous cascade emits its own normal
+transition event.
 
 **User routing override:** When a user actor's move would be rejected solely
 because (a) no trigger edge connects the states or (b) the matching trigger is

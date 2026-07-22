@@ -9,7 +9,6 @@ import { useAuthStore } from '@/stores/auth'
 
 export function ProfileTab() {
   const user = useAuthStore((s) => s.user)
-  const updateUser = useAuthStore((s) => s.updateUser)
   const updateMe = useUpdateMe()
 
   const [displayName, setDisplayName] = useState(user?.display_name ?? '')
@@ -34,11 +33,10 @@ export function ProfileTab() {
     }
 
     try {
-      const updated = await updateMe.mutateAsync({
+      await updateMe.mutateAsync({
         email: trimmedEmail !== user?.email ? trimmedEmail : undefined,
         display_name: trimmedName !== (user?.display_name ?? '') ? trimmedName || null : undefined,
       })
-      updateUser(updated)
       toast.success('Profile updated')
     } catch (err) {
       setError(getApiErrorMessage(err, 'Failed to update profile'))

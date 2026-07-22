@@ -1,10 +1,10 @@
 use api_types::{
     AddDependencyRequest, ApproveGateRequest, AssignRoleRequest, AuthorType, ClaimTaskRequest,
     CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope, HookResultEntry,
-    LaunchExecutionRequest, LaunchExecutionResponse, PaginatedResponse, PositionRequest,
-    PositionResponse, PromptPreviewResponse, RecoverTaskRequest, RejectGateRequest,
+    LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest, MoveTaskResponse,
+    PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest, RejectGateRequest,
     RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig, ReviewDecisionResponse, StateKind,
-    TaskDependency, TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse,
+    TaskDependency, TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TasksResponse,
     TransitionLogEntry, TransitionSource, TransitionTaskRequest, TransitionTaskResponse,
     UpdateTaskRequest, WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
 };
@@ -15,9 +15,9 @@ use axum::{
 };
 use db::{
     now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskCommentRepo,
-    TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo, TaskRoleAssignmentRepo,
-    TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskBoardRepo,
+    TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
+    TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ mod workspace;
 pub use comments::{create_comment, delete_comment, list_comments};
 pub use crud::{
     advance_task, archive_task, cancel_task, create_task, delete_task, duplicate_task, get_task,
-    list_tasks, recover_task, reorder_subtasks, reorder_task_position, update_task,
+    list_tasks, move_task, recover_task, reorder_subtasks, update_task,
 };
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
