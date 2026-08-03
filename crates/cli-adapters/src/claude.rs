@@ -18,7 +18,7 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CLAUDE_VERSION: &str = "2.1.150";
+const DEFAULT_CLAUDE_VERSION: &str = "2.1.220";
 const DEFAULT_CLAUDE_ROUTER_VERSION: &str = "2.0.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const PROMPT_SEND_TIMEOUT_SECONDS: u64 = 10;
@@ -311,12 +311,22 @@ impl CodingExecutorAdapter for ClaudeCodeAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![
-                "claude-sonnet-4-6".into(),
-                "claude-opus-4-6".into(),
+                "claude-fable-5".into(),
+                "claude-opus-5".into(),
+                "claude-sonnet-5".into(),
                 "claude-haiku-4-5".into(),
             ],
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
-            cli_specific: serde_json::json!({}),
+            cli_specific: serde_json::json!({
+                "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                "model_reasoning_efforts": {
+                    "claude-fable-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                    "claude-opus-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                    "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                    "claude-haiku-4-5": []
+                },
+                "claude_version": DEFAULT_CLAUDE_VERSION,
+            }),
         })
     }
 
@@ -916,7 +926,7 @@ mod tests {
             args,
             vec![
                 "-y",
-                "@anthropic-ai/claude-code@2.1.150",
+                "@anthropic-ai/claude-code@2.1.220",
                 "-p",
                 "--verbose",
                 "--output-format=stream-json",
@@ -929,6 +939,32 @@ mod tests {
                 "--resume",
                 "session-123"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_advertises_current_models_and_per_model_efforts() {
+        let discovered = ClaudeCodeAdapter::new()
+            .discover_options(DiscoverContext { project_path: None })
+            .await
+            .expect("Claude Code options should be discoverable");
+
+        assert_eq!(
+            discovered.models,
+            vec![
+                "claude-fable-5",
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-haiku-4-5",
+            ]
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["claude-fable-5"],
+            serde_json::json!(["low", "medium", "high", "xhigh", "max", "ultracode"])
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["claude-haiku-4-5"],
+            serde_json::json!([])
         );
     }
 

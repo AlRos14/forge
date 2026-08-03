@@ -21,7 +21,7 @@ export type DiscoveredExecutionOptions = {
 }
 
 type AgentDiscoveredOptionsResponse = {
-  models?: Array<{ id: string; name?: string; reasoning_options?: string[] }> | string[]
+  models?: Array<{ id: string; name?: string; reasoning_options?: string[] } | string>
   permission_policies?: string[]
   cli_specific?: unknown
 }
@@ -60,19 +60,46 @@ function reasoningFromCliSpecific(cliSpecific: unknown, hasModels: boolean): str
   return hasModels ? ['low', 'medium', 'high'] : []
 }
 
-function normalizeDiscoveredOptions(
+function reasoningByModelFromCliSpecific(cliSpecific: unknown): Map<string, string[]> {
+  const result = new Map<string, string[]>()
+  if (!cliSpecific || typeof cliSpecific !== 'object') return result
+
+  const raw = (cliSpecific as Record<string, unknown>).model_reasoning_efforts
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return result
+
+  for (const [modelId, efforts] of Object.entries(raw as Record<string, unknown>)) {
+    if (Array.isArray(efforts)) result.set(modelId, uniqueStrings(efforts))
+  }
+  return result
+}
+
+export function normalizeDiscoveredOptions(
   response: AgentDiscoveredOptionsResponse,
 ): DiscoveredExecutionOptions {
   const allReasoningIds = new Set<string>()
   const models: DiscoveredModelOption[] = []
+  const hasModels = Boolean(response.models?.length)
+  const sharedReasoningIds = reasoningFromCliSpecific(response.cli_specific, hasModels)
+  const reasoningByModel = reasoningByModelFromCliSpecific(response.cli_specific)
+
+  sharedReasoningIds.forEach((id) => allReasoningIds.add(id))
 
   if (Array.isArray(response.models)) {
     for (const entry of response.models) {
       if (typeof entry === 'string') {
-        models.push({ id: entry, displayName: entry, provider: providerForModel(entry), reasoningOptions: [] })
+        const reasoningOptions = reasoningByModel.get(entry) ?? sharedReasoningIds
+        reasoningOptions.forEach((id) => allReasoningIds.add(id))
+        models.push({
+          id: entry,
+          displayName: entry,
+          provider: providerForModel(entry),
+          reasoningOptions,
+        })
       } else if (entry && typeof entry === 'object') {
         const id = entry.id ?? ''
-        const reasoningOptions = entry.reasoning_options ?? []
+        const reasoningOptions = Array.isArray(entry.reasoning_options)
+          ? uniqueStrings(entry.reasoning_options)
+          : (reasoningByModel.get(id) ?? sharedReasoningIds)
         reasoningOptions.forEach((r) => allReasoningIds.add(r))
         models.push({
           id,
@@ -84,10 +111,7 @@ function normalizeDiscoveredOptions(
     }
   }
 
-  const reasoningIds =
-    allReasoningIds.size > 0
-      ? Array.from(allReasoningIds)
-      : reasoningFromCliSpecific(response.cli_specific, models.length > 0)
+  const reasoningIds = allReasoningIds.size > 0 ? Array.from(allReasoningIds) : sharedReasoningIds
 
   const policies = uniqueStrings(response.permission_policies)
 
@@ -96,6 +120,16 @@ function normalizeDiscoveredOptions(
     reasoningOptions: reasoningIds.map((id) => ({ id, label: titleCase(id) })),
     permissionPolicies: policies.length > 0 ? policies : ['auto', 'supervised', 'plan'],
   }
+}
+
+export function getReasoningOptionsForModel(
+  options: DiscoveredExecutionOptions | undefined,
+  modelId: string | null | undefined,
+): ReasoningOption[] {
+  if (!options || !modelId) return options?.reasoningOptions ?? []
+  const model = options.models.find((entry) => entry.id === modelId)
+  if (!model) return options.reasoningOptions
+  return model.reasoningOptions.map((id) => ({ id, label: titleCase(id) }))
 }
 
 export function useDiscoveredOptions(

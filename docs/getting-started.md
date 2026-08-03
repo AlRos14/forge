@@ -126,6 +126,16 @@ For Cursor, use `"executor_type": "cursor"`. Forge runs `cursor-agent` in
 headless print mode with stream JSON output; set `CURSOR_API_KEY` or run
 `cursor-agent login` first so the daemon reports it as authenticated.
 
+The agent form discovers model and reasoning choices from the selected
+adapter. Codex exposes the current GPT-5.6 family and model-specific effort
+levels (including `max` and `ultra` where supported); Claude Code exposes the
+current Claude 5 family and its supported `xhigh`, `max`, and `ultracode`
+choices. The model field also accepts custom ids for provider-specific or
+account-specific models. Gemini advertises the CLI's stable `auto`, `pro`,
+`flash`, and `flash-lite` aliases alongside its current Gemini 3.x and 2.5
+models. Cursor and OpenCode keep the custom-model field open because their
+catalogs are provider- or installation-defined.
+
 The `shell` executor is always available and useful for scripted tests — see the
 walkthrough below.
 

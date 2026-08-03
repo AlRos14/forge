@@ -18,6 +18,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Changed
 
 - The production web client now lazy-loads route screens and editor-backed dialogs, and the server Brotli/gzip compresses eligible responses while retaining immutable cache headers for hashed assets.
+- Updated the Forge-managed Codex CLI to 0.146.0 and Claude Code CLI to 2.1.220. Adapter discovery now advertises the current GPT-5.6 and Claude 5 model families plus model-specific reasoning choices, including Codex `max`/`ultra` and Claude Code `xhigh`/`max`/`ultracode`; Gemini discovery now includes its stable model aliases and current Gemini 3.x catalog, and the web selectors filter effort choices for the selected model.
 
 ## [0.4.0] - 2026-07-03
 

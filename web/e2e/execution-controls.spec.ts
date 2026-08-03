@@ -155,7 +155,26 @@ async function setupRoutes(
       route.fulfill({ status: 400, body: 'workspace.not_found' }),
     ),
     page.route('**/api/v1/agents*', (route) =>
-      route.fulfill({ json: { items: [{ id: 'agent-1', name: 'Test Agent', status: 'idle', model: null, reasoning_effort: null, permission_policy: null, version: 1, created_at: '2026-04-25T00:00:00Z', updated_at: '2026-04-25T00:00:00Z' }], has_more: false } }),
+      route.fulfill({
+        json: {
+          items: [
+            {
+              id: 'agent-1',
+              name: 'Test Agent',
+              executor_type: 'codex',
+              status: 'idle',
+              effective_status: 'active',
+              model: null,
+              reasoning_effort: null,
+              permission_policy: null,
+              version: 1,
+              created_at: '2026-04-25T00:00:00Z',
+              updated_at: '2026-04-25T00:00:00Z',
+            },
+          ],
+          has_more: false,
+        },
+      }),
     ),
     page.route('**/api/v1/events*', (route) =>
       route.fulfill({ status: 200, body: '', contentType: 'text/event-stream' }),
@@ -226,6 +245,60 @@ test.describe('execution controls (mocked)', () => {
     await page.getByRole('button', { name: 'Start Manual Execution' }).click()
     await expect(page.getByRole('heading', { name: 'Launch Execution' })).toBeVisible({ timeout: 5000 })
     await expect(page.getByLabel('Summary')).toBeVisible()
+  })
+
+  test('model-specific reasoning options work across supported viewports', async ({ page }) => {
+    const task = mockTask({ execution_actions: actionsForActiveTask() })
+    await setupRoutes(page, task, [mockExecution()])
+    await page.route('**/api/v1/agents/agent-1/discovered-options*', (route) =>
+      route.fulfill({
+        json: {
+          models: ['gpt-5.6-sol', 'gpt-5.6-luna'],
+          permission_policies: ['auto', 'supervised', 'plan'],
+          cli_specific: {
+            reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+            model_reasoning_efforts: {
+              'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+              'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
+            },
+          },
+          available_daemons: [],
+          warning: null,
+        },
+      }),
+    )
+
+    for (const viewport of [
+      { width: 375, height: 812 },
+      { width: 768, height: 1024 },
+      { width: 1280, height: 900 },
+    ]) {
+      await page.setViewportSize(viewport)
+      await page.goto(`/tasks/${TASK_ID}`)
+      await page.getByRole('button', { name: 'Start Manual Execution' }).click()
+
+      await page.getByRole('button', { name: 'Agent', exact: true }).click()
+      await page.getByRole('option', { name: 'Test Agent' }).click()
+
+      await page.getByLabel('Model').click()
+      await page.getByRole('option', { name: /gpt-5\.6-luna/ }).click()
+      await page.getByLabel('Reasoning').click()
+      await expect(page.getByRole('option', { name: 'Max' })).toBeVisible()
+      await expect(page.getByRole('option', { name: 'Ultra' })).toHaveCount(0)
+      await page.getByRole('option', { name: 'Max' }).click()
+
+      await page.getByLabel('Model').click()
+      await page.getByRole('option', { name: /gpt-5\.6-sol/ }).click()
+      await page.getByLabel('Reasoning').click()
+      await expect(page.getByRole('option', { name: 'Ultra' })).toBeVisible()
+      await page.getByRole('option', { name: 'Ultra' }).click()
+
+      const hasHorizontalOverflow = await page.evaluate(
+        () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      )
+      expect(hasHorizontalOverflow).toBe(false)
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+    }
   })
 
   test('cancel task calls API', async ({ page }) => {

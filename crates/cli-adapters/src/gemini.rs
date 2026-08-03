@@ -118,9 +118,18 @@ impl CodingExecutorAdapter for GeminiAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![
+                "auto".into(),
+                "pro".into(),
+                "flash".into(),
+                "flash-lite".into(),
+                "gemini-3.5-flash".into(),
+                "gemini-3.1-pro-preview".into(),
+                "gemini-3.1-flash-lite".into(),
+                "gemini-3-pro-preview".into(),
+                "gemini-3-flash-preview".into(),
                 "gemini-2.5-pro".into(),
                 "gemini-2.5-flash".into(),
-                "gemini-2.0-flash".into(),
+                "gemini-2.5-flash-lite".into(),
             ],
             permission_policies: vec!["auto".into(), "supervised".into()],
             cli_specific: serde_json::json!({}),
@@ -431,6 +440,23 @@ fn executable_in_path(name: &str) -> bool {
 mod tests {
     use super::*;
     use executors::CommandOverrides;
+
+    #[tokio::test]
+    async fn discovery_advertises_current_models_and_aliases() {
+        let discovered = GeminiAdapter::new()
+            .discover_options(DiscoverContext { project_path: None })
+            .await
+            .expect("discovery should succeed");
+
+        assert!(discovered.models.contains(&"auto".to_owned()));
+        assert!(discovered.models.contains(&"gemini-3.5-flash".to_owned()));
+        assert!(
+            discovered
+                .models
+                .contains(&"gemini-3.1-pro-preview".to_owned())
+        );
+        assert!(!discovered.models.contains(&"gemini-2.0-flash".to_owned()));
+    }
 
     #[test]
     fn command_builder_maps_model_and_yolo() {

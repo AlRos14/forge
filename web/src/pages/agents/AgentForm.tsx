@@ -12,7 +12,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
+import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
 import type { Daemon } from '@/types/generated'
 import { executorDisplayNames, executorTypes } from './constants'
 import type { AgentFormState } from './form-utils'
@@ -39,15 +39,10 @@ export function AgentForm({
   const discoveredOptions = useDiscoveredOptions(proxyId, mode === 'create' ? form.executor_type : null)
   const opts = discoveredOptions.data
 
-  const reasoningOptionsForModel = useMemo(() => {
-    if (!form.model || !opts) return opts?.reasoningOptions ?? []
-    const modelEntry = opts.models.find((m) => m.id === form.model)
-    if (!modelEntry?.reasoningOptions.length) return opts.reasoningOptions
-    return modelEntry.reasoningOptions.map((id) => ({
-      id,
-      label: id.charAt(0).toUpperCase() + id.slice(1),
-    }))
-  }, [form.model, opts])
+  const reasoningOptionsForModel = useMemo(
+    () => getReasoningOptionsForModel(opts, form.model),
+    [form.model, opts],
+  )
 
   const handleExecutorTypeChange = (executorType: string) => {
     update({ executor_type: executorType, model: '', reasoning_effort: '', config_json: '{}' })

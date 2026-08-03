@@ -961,9 +961,11 @@ export interface UpdateAgentRequest {
 }
 
 export interface AgentDiscoveredOptions {
-  models: Array<{ id: string; name: string; reasoning_options: string[] }>
+  models: string[]
   permission_policies: string[]
+  cli_specific: Record<string, unknown>
   available_daemons: Array<{ id: string; name: string; status: string }>
+  warning: string | null
 }
 
 export interface AgentAvailability {

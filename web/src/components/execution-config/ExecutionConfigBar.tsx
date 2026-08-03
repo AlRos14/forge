@@ -9,6 +9,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useExecutionOverrides, type ExecutionConfigValue } from '@/hooks/useExecutionOverrides'
+import { getReasoningOptionsForModel } from '@/hooks/useDiscoveredOptions'
 import { getRecentExecutionSelection } from '@/lib/execution-config-storage'
 import { cn } from '@/lib/cn'
 
@@ -55,13 +56,17 @@ export function ExecutionConfigBar({
   })
 
   const selectedAgent = visibleAgents.find((a) => a.id === config.agentId) ?? null
-  const agentDefaults = selectedAgent
-    ? {
-        model: selectedAgent.model,
-        reasoning_effort: selectedAgent.reasoning_effort,
-        permission_policy: selectedAgent.permission_policy,
-      }
-    : null
+  const agentDefaults = useMemo(
+    () =>
+      selectedAgent
+        ? {
+            model: selectedAgent.model,
+            reasoning_effort: selectedAgent.reasoning_effort,
+            permission_policy: selectedAgent.permission_policy,
+          }
+        : null,
+    [selectedAgent],
+  )
 
   const discoveredOptions = config.discoveredOptions.data
   const recentModelIds = useMemo(
@@ -69,17 +74,10 @@ export function ExecutionConfigBar({
     [config.agentId],
   )
 
-  const reasoningOptionsForModel = useMemo(() => {
-    if (!config.modelId || !discoveredOptions) return discoveredOptions?.reasoningOptions ?? []
-    const modelEntry = discoveredOptions.models.find((m) => m.id === config.modelId)
-    if (!modelEntry || !('reasoningOptions' in modelEntry) || !modelEntry.reasoningOptions.length) {
-      return discoveredOptions.reasoningOptions
-    }
-    return (modelEntry.reasoningOptions as string[]).map((id) => ({
-      id,
-      label: id.charAt(0).toUpperCase() + id.slice(1),
-    }))
-  }, [config.modelId, discoveredOptions])
+  const reasoningOptionsForModel = useMemo(
+    () => getReasoningOptionsForModel(discoveredOptions, config.modelId),
+    [config.modelId, discoveredOptions],
+  )
 
   const hasCustomValues = useMemo(() => {
     if (!agentDefaults) return false
@@ -122,10 +120,10 @@ export function ExecutionConfigBar({
 
   useEffect(() => {
     if (!discoveredOptions || !config.reasoningEffort) return
-    if (!discoveredOptions.reasoningOptions.some((o) => o.id === config.reasoningEffort)) {
+    if (!reasoningOptionsForModel.some((o) => o.id === config.reasoningEffort)) {
       config.setReasoningEffort(null)
     }
-  }, [config, discoveredOptions])
+  }, [config, discoveredOptions, reasoningOptionsForModel])
 
   if (agentsQuery.isLoading) {
     return (

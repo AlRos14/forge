@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CODEX_VERSION: &str = "0.133.0";
+const DEFAULT_CODEX_VERSION: &str = "0.146.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
 
@@ -253,6 +253,9 @@ impl CodingExecutorAdapter for CodexAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![
+                "gpt-5.6-sol".into(),
+                "gpt-5.6-terra".into(),
+                "gpt-5.6-luna".into(),
                 "gpt-5.5".into(),
                 "gpt-5.4".into(),
                 "gpt-5.4-mini".into(),
@@ -262,7 +265,16 @@ impl CodingExecutorAdapter for CodexAdapter {
             cli_specific: json!({
                 "sandbox_modes": ["read-only", "workspace-write", "danger-full-access"],
                 "approval_modes": ["never", "on-request", "on-failure", "unless-trusted"],
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "model_reasoning_efforts": {
+                    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                    "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                    "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+                    "gpt-5.5": ["low", "medium", "high", "xhigh"],
+                    "gpt-5.4": ["low", "medium", "high", "xhigh"],
+                    "gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
+                    "gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"]
+                },
                 "codex_version": DEFAULT_CODEX_VERSION,
             }),
         })
@@ -827,7 +839,36 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-y", "@openai/codex@0.133.0", "app-server", "--verbose"]
+            vec!["-y", "@openai/codex@0.146.0", "app-server", "--verbose"]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_advertises_current_models_and_per_model_efforts() {
+        let discovered = CodexAdapter::new()
+            .discover_options(DiscoverContext { project_path: None })
+            .await
+            .expect("Codex options should be discoverable");
+
+        assert_eq!(
+            discovered.models,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-sol"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-luna"],
+            json!(["low", "medium", "high", "xhigh", "max"])
         );
     }
 

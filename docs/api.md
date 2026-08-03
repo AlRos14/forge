@@ -62,6 +62,8 @@ For the conceptual model behind these endpoints see
 | POST   | `/api/v1/agents` | Register agent |
 | GET    | `/api/v1/agents` | List agents |
 | GET    | `/api/v1/agents/{id}` | Get agent |
+| GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
+| GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
@@ -89,6 +91,24 @@ empty array clears all rules.
 Project hook validation rejects unsupported trigger and action types, the
 `task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
 required action strings such as `dispatch_agent.agent_id`.
+
+## Agent execution options
+
+The two `discovered-options` endpoints return the adapter's selectable
+`models`, `permission_policies`, adapter-specific capability metadata under
+`cli_specific`, and the daemons that can run that executor. Model ids remain a
+string array for API compatibility. When an adapter has model-specific
+reasoning controls, `cli_specific.model_reasoning_efforts` maps each model id
+to its supported values; `cli_specific.reasoning_efforts` is the union used
+when no model is selected.
+
+Codex currently advertises GPT-5.6 Sol, Terra, and Luna plus supported older
+picker models. Claude Code advertises Claude Fable 5, Opus 5, Sonnet 5, and
+Haiku 4.5. The web client uses the per-model map so, for example, Codex
+`ultra` is not offered for Luna and reasoning controls are not offered for
+Claude Haiku 4.5. Clients may still submit a custom model id because providers
+and account entitlements can expose additional models. Gemini advertises its
+stable aliases plus the current visible Gemini 3.x and 2.5 CLI models.
 
 ## Task transitions
 
