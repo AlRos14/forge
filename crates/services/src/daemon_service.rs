@@ -534,6 +534,7 @@ fn executor_display_name(executor_type: &str) -> &str {
         "gemini" => "Gemini",
         "opencode" => "OpenCode",
         "shell" => "Shell",
+        "smith" => "Smith",
         "null" => "Null",
         _ => executor_type,
     }
@@ -642,6 +643,7 @@ mod tests {
                 "gemini",
                 "opencode",
                 "shell",
+                "smith",
             ]
             .into_iter()
             .map(|kind| DetectedCliInput {

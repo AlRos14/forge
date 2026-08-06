@@ -12,6 +12,7 @@ const EXECUTOR_LABELS: Record<string, string> = {
   gemini: 'Gemini',
   opencode: 'OpenCode',
   shell: 'Shell',
+  smith: 'Smith',
 }
 
 const EFFECTIVE_STATUS_DOT: Record<string, string> = {

@@ -144,6 +144,21 @@ pub struct GeminiConfig {
     pub command_overrides: CommandOverrides,
 }
 
+/// Smith CLI executor config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SmithConfig {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub profile: Option<String>,
+    pub yolo: Option<bool>,
+    pub approval: Option<String>,
+    pub resume_session_id: Option<String>,
+    pub permission_policy: Option<PermissionPolicy>,
+    pub prompt_template: Option<String>,
+    #[serde(flatten)]
+    pub command_overrides: CommandOverrides,
+}
+
 /// Null executor config. Completes after a configurable delay.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NullConfig {
@@ -175,6 +190,7 @@ pub fn deserialize_config(
         ExecutorKind::Cursor => deserialize_typed::<CursorConfig>(kind, json),
         ExecutorKind::Opencode => deserialize_typed::<OpencodeConfig>(kind, json),
         ExecutorKind::Gemini => deserialize_typed::<GeminiConfig>(kind, json),
+        ExecutorKind::Smith => deserialize_typed::<SmithConfig>(kind, json),
         ExecutorKind::Null => deserialize_typed::<NullConfig>(kind, json),
     }
 }
@@ -226,6 +242,7 @@ pub fn resolve_config_value(
         ExecutorKind::Cursor => normalize_typed::<CursorConfig>(kind, &merged),
         ExecutorKind::Opencode => normalize_typed::<OpencodeConfig>(kind, &merged),
         ExecutorKind::Gemini => normalize_typed::<GeminiConfig>(kind, &merged),
+        ExecutorKind::Smith => normalize_typed::<SmithConfig>(kind, &merged),
         ExecutorKind::Null => normalize_typed::<NullConfig>(kind, &merged),
     }
 }

@@ -106,6 +106,7 @@ fn default_agent_name(kind: &ExecutorKind) -> String {
         ExecutorKind::Cursor => "Cursor",
         ExecutorKind::Opencode => "OpenCode",
         ExecutorKind::Gemini => "Gemini",
+        ExecutorKind::Smith => "Smith",
         ExecutorKind::Null => "Null",
     };
     format!("{display_name} Default")

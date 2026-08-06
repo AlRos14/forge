@@ -46,6 +46,7 @@ async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<St
         ExecutorKind::Cursor => binary_path_and_version("cursor-agent").await,
         ExecutorKind::Opencode => binary_path_and_version("opencode").await,
         ExecutorKind::Gemini => binary_path_and_version("gemini").await,
+        ExecutorKind::Smith => binary_path_and_version("smith").await,
         ExecutorKind::Null => (None, None),
     }
 }

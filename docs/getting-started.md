@@ -68,7 +68,7 @@ By default the server:
 - Creates `~/.forge/forge.db` (SQLite, WAL mode).
 - Boots an embedded daemon that auto-registers and reports installed CLIs
   (`shell` always, plus `codex` / `claude_code` / `cursor` / `gemini` /
-  `opencode` when on `PATH`).
+  `opencode` / `smith` when on `PATH`).
 - Upserts default executor profiles from the adapter registry.
 
 Open the `management_url` printed in the server logs for the web UI. For raw

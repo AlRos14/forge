@@ -9,6 +9,7 @@ pub mod gemini;
 pub mod null;
 pub mod opencode;
 pub mod shell;
+pub mod smith;
 
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
@@ -17,6 +18,7 @@ pub use gemini::GeminiAdapter;
 pub use null::NullAdapter;
 pub use opencode::OpencodeAdapter;
 pub use shell::ShellAdapter;
+pub use smith::SmithAdapter;
 
 use executors::AdapterRegistry;
 
@@ -29,5 +31,6 @@ pub fn default_registry() -> AdapterRegistry {
     registry.register(Box::new(CursorAdapter::new()));
     registry.register(Box::new(OpencodeAdapter::new()));
     registry.register(Box::new(GeminiAdapter::new()));
+    registry.register(Box::new(SmithAdapter::new()));
     registry
 }

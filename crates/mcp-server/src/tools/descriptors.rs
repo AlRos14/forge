@@ -135,7 +135,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             "Register an agent executor.",
             json!({
                 "name": { "type": "string" },
-                "executor_type": { "type": "string", "enum": ["shell", "codex", "claude_code", "cursor", "gemini", "opencode"] },
+                "executor_type": { "type": "string", "enum": ["shell", "codex", "claude_code", "cursor", "gemini", "opencode", "smith"] },
                 "daemon_id": { "type": "string" }
             }),
             &["name", "executor_type"],

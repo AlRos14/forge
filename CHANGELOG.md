@@ -4,6 +4,12 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Added
+
+- First-class support for `Smith` (`smith`) CLI agent executor across `executors`, `cli-adapters`, embedded daemons, MCP tool descriptors, database migrations, and the web UI.
+
 ## [0.5.0] - 2026-08-03
 
 ### Breaking

@@ -108,6 +108,7 @@ fn resolve_isolation_posture(
         ExecutorKind::Shell
         | ExecutorKind::Opencode
         | ExecutorKind::Gemini
+        | ExecutorKind::Smith
         | ExecutorKind::Null => "not_applicable".to_owned(),
     }
 }

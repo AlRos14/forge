@@ -17,7 +17,7 @@ pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     deserialize_config, merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig,
     CommandOverrides, CursorConfig, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy,
-    ShellConfig,
+    ShellConfig, SmithConfig,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};

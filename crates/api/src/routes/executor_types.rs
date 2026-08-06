@@ -6,7 +6,7 @@ use axum::{
 use db::DaemonRepo;
 use executors::{
     ClaudeCodeConfig, CodexConfig, CursorConfig, DiscoverContext, ExecutorKind, GeminiConfig,
-    OpencodeConfig, ShellConfig,
+    OpencodeConfig, ShellConfig, SmithConfig,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
@@ -43,6 +43,7 @@ pub async fn list_executor_types() -> Json<Vec<ExecutorTypeDescriptor>> {
             "Gemini",
             schema_to_value(schema_for!(GeminiConfig)),
         ),
+        descriptor::<SmithConfig>("smith", "Smith", schema_to_value(schema_for!(SmithConfig))),
     ])
 }
 

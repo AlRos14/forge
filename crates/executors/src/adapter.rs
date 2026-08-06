@@ -16,6 +16,7 @@ pub enum ExecutorKind {
     Cursor,
     Opencode,
     Gemini,
+    Smith,
     Null,
 }
 
@@ -28,6 +29,7 @@ impl std::fmt::Display for ExecutorKind {
             Self::Cursor => write!(f, "cursor"),
             Self::Opencode => write!(f, "opencode"),
             Self::Gemini => write!(f, "gemini"),
+            Self::Smith => write!(f, "smith"),
             Self::Null => write!(f, "null"),
         }
     }
@@ -43,6 +45,7 @@ impl std::str::FromStr for ExecutorKind {
             "cursor" => Ok(Self::Cursor),
             "opencode" => Ok(Self::Opencode),
             "gemini" => Ok(Self::Gemini),
+            "smith" => Ok(Self::Smith),
             "null" => Ok(Self::Null),
             other => Err(format!("unknown executor kind: {other}")),
         }

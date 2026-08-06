@@ -31,10 +31,10 @@ Running two coding agents against the same repo is how you lose diffs. Forge fix
 that: every task runs in its own git worktree, hits your CI gate, and waits for
 review before it merges. **Agents collaborate; they don't collide.**
 
-- **One isolated git worktree per task** — Claude Code, Codex, Cursor, and Gemini can each work in parallel without overwriting each other or polluting your main checkout.
+- **One isolated git worktree per task** — Claude Code, Codex, Cursor, Gemini, and Smith can each work in parallel without overwriting each other or polluting your main checkout.
 - **Review gate with your CI** — define `ci_steps` per task; the review runner blocks merge until they pass. Human approval is an explicit transition, not an afterthought.
 - **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with an audit log and explicit cancellation paths so handoffs between agents (and humans) are legible.
-- **BYO agent** — first-class adapters for Claude Code, Codex, Cursor, Gemini, opencode, and a generic shell executor. Add your own with a small adapter.
+- **BYO agent** — first-class adapters for Claude Code, Codex, Cursor, Gemini, opencode, Smith, and a generic shell executor. Add your own with a small adapter.
 - **One binary, every surface** — REST API, MCP JSON-RPC, `forge-ctl` CLI, and a React web UI ship together. Drive Forge from a script, an editor, or a browser.
 - **Local-first by default** — single binary, SQLite, loopback-only server with a persisted local port. No telemetry, no SaaS, your data stays on disk.
 
