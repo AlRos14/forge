@@ -4,6 +4,13 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Changed
+
+- Smith execution options are now discovered from the user's `~/.smith/config.toml` — configured models, main-enabled profiles with their provider/model pairings, and provider names — instead of a hardcoded model list. Hosts without a Smith config discover empty lists.
+- Bumped managed CLI pins: `@anthropic-ai/claude-code` 2.1.220 → 2.1.226, `@openai/codex` 0.146.0 → 0.147.0. `@musistudio/claude-code-router` stays on 2.0.0: v3 replaced the `ccr code <args>` pass-through with profile-based invocation and needs its own adapter rework.
+
 ## [0.6.0] - 2026-08-07
 
 ### Added

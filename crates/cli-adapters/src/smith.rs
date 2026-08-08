@@ -157,14 +157,25 @@ impl CodingExecutorAdapter for SmithAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        // Smith models, providers, and profiles are user-configured in
+        // `~/.smith/config.toml`, not a fixed vendor list — surface whatever
+        // the user actually has. Missing or unparsable config yields empty
+        // lists rather than an error so unconfigured hosts still discover.
+        let surface = match smith_user_config_path() {
+            Some(path) => match tokio::fs::read_to_string(&path).await {
+                Ok(text) => parse_smith_config_surface(&text),
+                Err(_) => SmithConfigSurface::default(),
+            },
+            None => SmithConfigSurface::default(),
+        };
+
         Ok(DiscoveredOptions {
-            models: vec![
-                "gemini-3.6-flash".into(),
-                "claude-3-7-sonnet".into(),
-                "gpt-4o".into(),
-            ],
+            models: surface.models,
             permission_policies: vec!["auto".into(), "supervised".into()],
-            cli_specific: serde_json::json!({}),
+            cli_specific: serde_json::json!({
+                "profiles": surface.profiles,
+                "providers": surface.providers,
+            }),
         })
     }
 
@@ -675,6 +686,73 @@ fn smith_config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|dir| dir.join(".smith"))
 }
 
+fn smith_user_config_path() -> Option<PathBuf> {
+    smith_config_dir().map(|dir| dir.join("config.toml"))
+}
+
+#[derive(Default)]
+struct SmithConfigSurface {
+    models: Vec<String>,
+    providers: Vec<String>,
+    profiles: Vec<serde_json::Value>,
+}
+
+/// Extract the user-facing selection surface from a Smith `config.toml`.
+///
+/// Smith validates `--profile` / `--provider` / `--model` against the user's
+/// config: profiles must be main-enabled (no `use` list, or one containing
+/// `"main"`), and models resolve as bare names against the selected provider's
+/// `[models."provider/model"]` catalog entries. Anything unparsable degrades to
+/// an empty surface.
+fn parse_smith_config_surface(text: &str) -> SmithConfigSurface {
+    let Ok(root) = text.parse::<toml::Table>() else {
+        return SmithConfigSurface::default();
+    };
+
+    let mut surface = SmithConfigSurface::default();
+    let mut seen_models = std::collections::HashSet::new();
+
+    if let Some(profiles) = root.get("profiles").and_then(|v| v.as_table()) {
+        for (name, entry) in profiles {
+            let Some(entry) = entry.as_table() else {
+                continue;
+            };
+            let main_enabled = match entry.get("use").and_then(|v| v.as_array()) {
+                Some(uses) => uses.iter().any(|u| u.as_str() == Some("main")),
+                None => true,
+            };
+            if !main_enabled {
+                continue;
+            }
+            let provider = entry.get("provider").and_then(|v| v.as_str());
+            let model = entry.get("model").and_then(|v| v.as_str());
+            if let Some(model) = model.filter(|m| seen_models.insert((*m).to_owned())) {
+                surface.models.push(model.to_owned());
+            }
+            surface.profiles.push(serde_json::json!({
+                "name": name,
+                "provider": provider,
+                "model": model,
+            }));
+        }
+    }
+
+    if let Some(models) = root.get("models").and_then(|v| v.as_table()) {
+        for key in models.keys() {
+            let bare = key.split_once('/').map_or(key.as_str(), |(_, model)| model);
+            if seen_models.insert(bare.to_owned()) {
+                surface.models.push(bare.to_owned());
+            }
+        }
+    }
+
+    if let Some(providers) = root.get("providers").and_then(|v| v.as_table()) {
+        surface.providers = providers.keys().cloned().collect();
+    }
+
+    surface
+}
+
 fn smith_run_error(status: std::process::ExitStatus, stderr_tail: &str) -> String {
     let mut message = format!("smith run exited with status {status}");
     if !stderr_tail.trim().is_empty() {
@@ -895,5 +973,78 @@ mod tests {
         assert!(args.contains(&"work".to_string()));
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"gemini-3.6-flash".to_string()));
+    }
+
+    #[test]
+    fn config_surface_extracts_profiles_providers_and_models() {
+        let config = r#"
+[providers.google]
+api = "gemini"
+
+[providers.zai]
+api = "anthropic"
+
+[profiles.code]
+use = ["main", "child"]
+provider = "chatgpt"
+model = "gpt-5.6-terra"
+
+[profiles.gemini]
+use = ["main"]
+provider = "google"
+model = "gemini-3.6-flash"
+
+[profiles.child-only]
+use = ["child"]
+provider = "zai"
+model = "glm-4.7"
+
+[profiles.no-use-list]
+provider = "zai"
+model = "glm-5.2"
+
+[models."chatgpt/gpt-5.6-terra"]
+context_tokens = 400000
+
+[models."zai/glm-5.2"]
+context_tokens = 200000
+"#;
+
+        let surface = parse_smith_config_surface(config);
+
+        let profile_names: Vec<_> = surface
+            .profiles
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(profile_names.contains(&"code".to_owned()));
+        assert!(profile_names.contains(&"gemini".to_owned()));
+        // Profiles without a `use` list are main-enabled by default.
+        assert!(profile_names.contains(&"no-use-list".to_owned()));
+        assert!(!profile_names.contains(&"child-only".to_owned()));
+
+        assert!(surface.models.contains(&"gpt-5.6-terra".to_owned()));
+        assert!(surface.models.contains(&"gemini-3.6-flash".to_owned()));
+        assert!(surface.models.contains(&"glm-5.2".to_owned()));
+        assert!(!surface.models.contains(&"glm-4.7".to_owned()));
+        // Catalog keys are deduplicated against profile models.
+        assert_eq!(
+            surface
+                .models
+                .iter()
+                .filter(|m| *m == "gpt-5.6-terra")
+                .count(),
+            1
+        );
+
+        assert_eq!(surface.providers, vec!["google", "zai"]);
+    }
+
+    #[test]
+    fn config_surface_degrades_to_empty_on_invalid_toml() {
+        let surface = parse_smith_config_surface("not [valid toml");
+        assert!(surface.models.is_empty());
+        assert!(surface.providers.is_empty());
+        assert!(surface.profiles.is_empty());
     }
 }

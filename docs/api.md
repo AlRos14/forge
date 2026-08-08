@@ -122,6 +122,13 @@ Claude Haiku 4.5. Clients may still submit a custom model id because providers
 and account entitlements can expose additional models. Gemini advertises its
 stable aliases plus the current visible Gemini 3.x and 2.5 CLI models.
 
+Smith's options are not a fixed vendor list: they are discovered from the
+user's `~/.smith/config.toml` on the discovering host — configured models
+(from profiles and the model catalog) in `models`, plus main-enabled
+profiles with their provider/model pairings under `cli_specific.profiles`
+and configured provider names under `cli_specific.providers`. Hosts without
+a Smith config discover empty lists.
+
 ## Task transitions
 
 `POST /api/v1/tasks/{id}/transition` accepts `status`, `version`, optional
