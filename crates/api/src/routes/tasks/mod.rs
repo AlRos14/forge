@@ -1,12 +1,13 @@
 use api_types::{
-    AddDependencyRequest, ApproveGateRequest, AssignRoleRequest, AuthorType, ClaimTaskRequest,
-    CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope, HookResultEntry,
-    LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest, MoveTaskResponse,
-    PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest, RejectGateRequest,
-    RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig, ReviewDecisionResponse, StateKind,
-    TaskDependency, TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TasksResponse,
-    TransitionLogEntry, TransitionSource, TransitionTaskRequest, TransitionTaskResponse,
-    UpdateTaskRequest, WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
+    AddDependencyRequest, ApproveGateRequest, AssignRoleRequest, AuthorType, CanonicalPhase,
+    ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope,
+    HookResultEntry, LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest,
+    MoveTaskResponse, PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest,
+    RejectGateRequest, RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig,
+    ReviewDecisionResponse, StateKind, TaskDependency, TaskMediaResponse, TaskResponse,
+    TaskRoleAssignmentResponse, TasksResponse, TransitionLogEntry, TransitionSource,
+    TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest, WorkflowDefinition,
+    WorkflowTrigger, WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},

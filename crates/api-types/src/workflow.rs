@@ -1,6 +1,7 @@
 use crate::assignee::AssigneeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use ts_rs::TS;
 
 fn default_hook_timeout() -> u64 {
@@ -160,6 +161,21 @@ pub enum CanonicalPhase {
     Working,
     Review,
     Done,
+}
+
+impl FromStr for CanonicalPhase {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "backlog" => Ok(Self::Backlog),
+            "ready" => Ok(Self::Ready),
+            "working" => Ok(Self::Working),
+            "review" => Ok(Self::Review),
+            "done" => Ok(Self::Done),
+            _ => Err(format!("unknown canonical phase: {value}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

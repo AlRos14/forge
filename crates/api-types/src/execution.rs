@@ -3,10 +3,10 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, ConversationMessageRole, ConversationMessageStatus, ConversationStatus,
-    ExecutionAction, ExecutionBehavior, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
-    TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
+    AgentStatus, CanonicalPhase, ConversationMessageRole, ConversationMessageStatus,
+    ConversationStatus, ExecutionAction, ExecutionBehavior, ExecutionRole, ExecutionStatus,
+    InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason,
+    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
     WorkflowHealthSummary, WorkspaceResponse,
 };
 
@@ -23,6 +23,7 @@ pub struct TaskResponse {
     pub description: Option<String>,
     pub task_type: TaskType,
     pub status: TaskStatus,
+    pub canonical_phase: CanonicalPhase,
     #[serde(default)]
     pub awaiting_human: bool,
     pub priority: i64,

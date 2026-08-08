@@ -112,6 +112,13 @@ it explicitly for every state. Legacy definitions without the field remain
 readable; their phase is derived from the state column, known legacy state
 names, and state kind, with unknown states defaulting to `working`.
 
+## Task responses
+
+`TaskResponse` includes the additive `canonical_phase` field. It is derived at
+response-build time from the project's resolved workflow and the task's current
+`status`; it is not persisted. The value is one of `backlog`, `ready`,
+`working`, `review`, or `done`. Cancelled workflow states map to `done`.
+
 ## Agent execution options
 
 The two `discovered-options` endpoints return the adapter's selectable
@@ -369,10 +376,11 @@ rows to determine `has_more`. The response field is `items` (not `data`).
 | `sort_by` | `created_at`, `updated_at`, `priority`, `board_position`, `title`, `status`, `agent`, `task_type`, `id` |
 | `sort_order` | `asc`, `desc` |
 | `status` | Comma-separated status filter |
+| `canonical_phase` | Comma-separated canonical phase filter (`backlog`, `ready`, `working`, `review`, `done`) |
 | `agent_id` | Comma-separated agent filter |
 | `assignee_type` | Comma-separated assignee type filter (`agent`, `user`) |
 | `assignee_id` | Comma-separated assignee id / user-handle filter |
-| `include_cancelled` | Include cancelled tasks (default false unless `status` includes `cancelled`) |
+| `include_cancelled` | Include cancelled tasks (default false unless `status` includes `cancelled`; `canonical_phase=done` includes cancelled tasks because cancelled maps to `done`) |
 | `include_archived` | Include archived tasks (default false) |
 | `include_total` | Include total count in response |
 

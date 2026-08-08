@@ -43,6 +43,43 @@ pub async fn list_tasks(
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<TasksResponse>> {
+    let canonical_phases =
+        parse_csv::<CanonicalPhase>(params.canonical_phase.as_ref(), "canonical_phase")?;
+    let mut statuses = parse_csv::<String>(params.status.as_ref(), "status")?;
+    if !canonical_phases.is_empty() {
+        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+        let requested_phases: std::collections::HashSet<CanonicalPhase> =
+            canonical_phases.iter().copied().collect();
+        let phase_statuses = workflow
+            .states
+            .iter()
+            .filter(|state| {
+                requested_phases.contains(&workflow.canonical_phase_for_state(&state.name))
+            })
+            .map(|state| state.name.clone())
+            .collect::<Vec<_>>();
+
+        if statuses.is_empty() {
+            // An empty status list means "no status filter" to the database layer. Use a
+            // status that cannot be a workflow state when a requested phase has no states.
+            statuses = if phase_statuses.is_empty() {
+                vec!["__no_matching_canonical_phase__".to_owned()]
+            } else {
+                phase_statuses
+            };
+        } else {
+            statuses.retain(|status| phase_statuses.iter().any(|phase| phase == status));
+            if statuses.is_empty() {
+                statuses = vec!["__no_matching_canonical_phase__".to_owned()];
+            }
+        }
+        // `cancelled` is mapped to the Done phase, so phase=done intentionally opts into
+        // the existing include-cancelled behavior through the resolved status list.
+    }
+
     // Task decoration performs additional reads, so bracket the assembled page with
     // revision reads and retry if a board mutation races the response.
     for _ in 0..3 {
@@ -52,7 +89,7 @@ pub async fn list_tasks(
             TaskListQuery {
                 project_id: project_id.clone(),
                 q: params.q.clone(),
-                statuses: parse_csv::<db::TaskStatus>(params.status.as_ref(), "status")?,
+                statuses: statuses.clone(),
                 agent_ids: parse_csv::<String>(params.agent_id.as_ref(), "agent_id")?,
                 assignee_types: parse_csv::<db::AssigneeKind>(
                     params.assignee_type.as_ref(),
