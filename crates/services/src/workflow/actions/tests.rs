@@ -411,7 +411,7 @@ async fn build_role_dispatch_harness(
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
             workflow,
-            triggered_by: "system:test".to_owned(),
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
@@ -463,7 +463,7 @@ async fn build_no_repo_dispatch_harness(
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
             workflow,
-            triggered_by: "system:test".to_owned(),
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
@@ -548,7 +548,7 @@ async fn build_test_ctx(
         event_bus: Arc::new(EventBus::new(16)),
         gate_config,
         workflow,
-        triggered_by: "system:test".to_owned(),
+        triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
         review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
@@ -574,7 +574,7 @@ async fn dependency_gate_skips_user_managed_transitions() {
         None,
     )
     .await;
-    ctx.triggered_by = "user:api".to_owned();
+    ctx.triggered_by = api_types::Actor::user(api_types::UserActionSource::Api);
 
     let result = DependencyGate.execute(&ctx).await;
 
@@ -1675,7 +1675,7 @@ async fn build_reviewer_dispatch_harness(
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
             workflow,
-            triggered_by: "system:test".to_owned(),
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,

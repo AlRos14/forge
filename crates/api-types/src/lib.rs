@@ -3,6 +3,7 @@
 pub mod assignee;
 mod auth;
 
+mod actor;
 mod analytics;
 mod core;
 mod daemon_transport;
@@ -22,6 +23,7 @@ mod settings;
 mod terminal;
 mod workflow;
 
+pub use actor::*;
 pub use analytics::*;
 pub use auth::*;
 pub use core::*;

@@ -11,7 +11,7 @@ use crate::{
 };
 use ::review::{ReviewRequest, ReviewRunner};
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
-use api_types::ProjectSettings;
+use api_types::{Actor, ProjectSettings, UserActionSource};
 use cli_adapters::codex::protocol::RESUME_THREAD_ID_CONFIG_KEY;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
@@ -126,7 +126,7 @@ pub struct TransitionResult {
 pub struct TransitionOptions {
     pub version: i64,
     pub reason: Option<String>,
-    pub triggered_by: String,
+    pub triggered_by: Actor,
     pub rejection: bool,
     pub defer_dispatch_seconds: Option<i64>,
 }
@@ -136,7 +136,7 @@ impl From<i64> for TransitionOptions {
         Self {
             version,
             reason: None,
-            triggered_by: "system".to_owned(),
+            triggered_by: Actor::system(api_types::SystemComponent::General),
             rejection: false,
             defer_dispatch_seconds: None,
         }
@@ -148,7 +148,7 @@ impl From<(i64, Option<String>)> for TransitionOptions {
         Self {
             version,
             reason,
-            triggered_by: "user:api".to_owned(),
+            triggered_by: Actor::user(UserActionSource::Api),
             rejection: false,
             defer_dispatch_seconds: None,
         }
@@ -160,7 +160,7 @@ impl From<(i64, Option<String>, bool)> for TransitionOptions {
         Self {
             version,
             reason,
-            triggered_by: "user:api".to_owned(),
+            triggered_by: Actor::user(UserActionSource::Api),
             rejection,
             defer_dispatch_seconds: None,
         }
@@ -301,7 +301,9 @@ impl TaskService {
             "cancelled" => (
                 ExecutionStatus::Cancelled,
                 Some(Some(db::StopReason::ExecutorCancelled)),
-                Some(Some("system:daemon".to_owned())),
+                Some(Some(
+                    Actor::system(api_types::SystemComponent::Executor).display(),
+                )),
                 Some(Some(db::ResumePolicy::Manual)),
                 Some(Some(notification.ts.clone())),
                 Some(None),
@@ -309,7 +311,9 @@ impl TaskService {
             _ => (
                 ExecutionStatus::Failed,
                 Some(Some(db::StopReason::ExecutorFailed)),
-                Some(Some("system:daemon".to_owned())),
+                Some(Some(
+                    Actor::system(api_types::SystemComponent::Executor).display(),
+                )),
                 Some(Some(db::ResumePolicy::Manual)),
                 Some(Some(notification.ts.clone())),
                 Some(Some(remote_terminal_error_message(

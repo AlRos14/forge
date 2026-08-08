@@ -285,7 +285,7 @@ mod tests {
                 default_states::REVIEW,
                 subtask.version,
                 &workflow,
-                "user:test",
+                &api_types::Actor::user(api_types::UserActionSource::Test),
                 "attempt review",
                 false,
             )

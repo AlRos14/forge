@@ -48,7 +48,7 @@ impl CrashRecovery {
                 &self.db,
                 task,
                 StopReason::CrashRecovery,
-                "system:crash_recovery",
+                &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
             )
             .await?;
 
@@ -313,7 +313,7 @@ impl HeartbeatMonitor {
                     &self.db,
                     task,
                     StopReason::AgentTimeout,
-                    "system:heartbeat_monitor",
+                    &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor),
                 )
                 .await?;
 
@@ -407,7 +407,10 @@ impl HeartbeatMonitor {
                     id: execution.id.clone(),
                     status: Some(ExecutionStatus::Failed),
                     stop_reason: Some(Some(StopReason::ExecutionStalled)),
-                    stopped_by: Some(Some("system:heartbeat_monitor".to_owned())),
+                    stopped_by: Some(Some(
+                        api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor)
+                            .display(),
+                    )),
                     resume_policy: Some(Some(ResumePolicy::Manual)),
                     stopped_at: Some(Some(now.clone())),
                     agent_session_id: None,
@@ -532,7 +535,10 @@ impl HeartbeatMonitor {
                     execution: &execution,
                     daemon_id: &daemon_id,
                     error_message: format!("Remote daemon {daemon_id} disconnected"),
-                    stopped_by: "system:heartbeat_monitor",
+                    stopped_by: &api_types::Actor::system(
+                        api_types::SystemComponent::HeartbeatMonitor,
+                    )
+                    .display(),
                     reconciliation_reason: "daemon_disconnected",
                 },
             )
@@ -618,7 +624,7 @@ async fn recover_task(
     db: &SqliteDb,
     task: Task,
     stop_reason: StopReason,
-    stopped_by: &str,
+    stopped_by: &api_types::Actor,
 ) -> Result<RecoverTaskOutcome> {
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
@@ -713,7 +719,7 @@ async fn recover_task(
     let annotation = json!({
         "type": api_types::FailureKind::RecoveryRequired,
         "blocking_reason": blocking_reason,
-        "blocked_by": stopped_by,
+        "blocked_by": stopped_by.display(),
         "blocked_at": now_rfc3339(),
         "blocked_execution_id": blocked_execution_id,
         "artifact": artifact,
@@ -837,7 +843,7 @@ pub(crate) async fn cancel_running_executions(
     db: &SqliteDb,
     task_id: &str,
     stop_reason: StopReason,
-    stopped_by: &str,
+    stopped_by: &api_types::Actor,
     resume_policy: ResumePolicy,
 ) -> Result<Vec<CancelledExecution>> {
     let page = ExecutionRepo::list_by_task(
@@ -867,7 +873,7 @@ pub(crate) async fn cancel_running_executions(
                 id: execution.id,
                 status: Some(ExecutionStatus::Cancelled),
                 stop_reason: Some(Some(stop_reason.clone())),
-                stopped_by: Some(Some(stopped_by.to_owned())),
+                stopped_by: Some(Some(stopped_by.display())),
                 resume_policy: Some(Some(resume_policy.clone())),
                 stopped_at: Some(Some(now_rfc3339())),
                 agent_session_id: None,
@@ -1067,7 +1073,8 @@ pub(crate) async fn reconcile_daemon_report_executions(
                 execution: &execution,
                 daemon_id: &daemon.id,
                 error_message: "daemon no longer running this execution".to_owned(),
-                stopped_by: "system:daemon_report",
+                stopped_by: &api_types::Actor::system(api_types::SystemComponent::DaemonReport)
+                    .display(),
                 reconciliation_reason: "daemon_disconnected",
             },
         )
@@ -1828,7 +1835,7 @@ mod tests {
             &db,
             &task.id,
             StopReason::CrashRecovery,
-            "system:crash_recovery",
+            &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
             ResumePolicy::Manual,
         )
         .await

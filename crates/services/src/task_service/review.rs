@@ -1,4 +1,5 @@
 use super::*;
+use api_types::{Actor, UserActionSource};
 
 impl TaskService {
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
@@ -77,7 +78,17 @@ impl TaskService {
             },
         });
         let transitioned = self
-            .transition(task_id, "merging".to_owned(), task.version)
+            .transition(
+                task_id,
+                "merging".to_owned(),
+                TransitionOptions {
+                    version: task.version,
+                    reason: None,
+                    triggered_by: Actor::user(UserActionSource::Api),
+                    rejection: false,
+                    defer_dispatch_seconds: None,
+                },
+            )
             .await?;
         Ok((transitioned.task, review))
     }
@@ -145,10 +156,42 @@ impl TaskService {
             },
         });
 
-        self.transition(task_id.clone(), "in_progress".to_owned(), task.version)
-            .await?;
+        self.transition(
+            task_id.clone(),
+            "in_progress".to_owned(),
+            TransitionOptions {
+                version: task.version,
+                reason: Some(reason.clone()),
+                triggered_by: Actor::user(UserActionSource::Api),
+                rejection: true,
+                defer_dispatch_seconds: None,
+            },
+        )
+        .await?;
         let remaining_retries = self.remaining_retries(&task_id).await?;
-        if remaining_retries > 0 {
+        let follow_up_already_dispatched = ExecutionRepo::list_by_task_and_role(
+            &*self.db,
+            &task_id,
+            crate::workflow::default_roles::CODER,
+            PageRequest {
+                cursor: None,
+                limit: 20,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?
+        .items
+        .into_iter()
+        .any(|execution| {
+            execution.parent_execution_id.as_deref() == Some(review.execution_id.as_str())
+                && matches!(
+                    execution.status,
+                    ExecutionStatus::Running | ExecutionStatus::Completed
+                )
+        });
+        if remaining_retries > 0 && !follow_up_already_dispatched {
             self.dispatch_follow_up(
                 &task_id,
                 ::review::ReviewOutcome::AuditorFailed { reason },

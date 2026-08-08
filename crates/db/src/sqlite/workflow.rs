@@ -161,6 +161,7 @@ impl TransitionLogRepo for SqliteDb {
         task_id: &str,
         current_state: &str,
         action_kind: &str,
+        triggered_by: &str,
         reason: &str,
     ) -> std::result::Result<TransitionLog, DbError> {
         self.insert(CreateTransitionLog {
@@ -169,7 +170,7 @@ impl TransitionLogRepo for SqliteDb {
             from_state: current_state.to_owned(),
             to_state: current_state.to_owned(),
             trigger_name: Some(action_kind.to_owned()),
-            triggered_by: format!("user:recovery:{action_kind}"),
+            triggered_by: triggered_by.to_owned(),
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: false,

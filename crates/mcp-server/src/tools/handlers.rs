@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use api_types::{LifecycleEvent, LifecycleHookDef, ProjectSettings};
+use api_types::{Actor, LifecycleEvent, LifecycleHookDef, ProjectSettings, SystemComponent};
 use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentRepo, CreateProject, ExecutionRepo, MemoryItem,
     MemoryRepository, ProjectRepo, TaskDependencyRepo, TaskListQuery, TaskRepo, UpdateProject,
@@ -481,9 +481,23 @@ pub(super) async fn forge_transition_task(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: TransitionTaskParams = parse_params(params)?;
+    // MCP currently carries no agent execution identity, so transitions made
+    // through this tool use the explicit MCP system component. If MCP context
+    // later exposes an agent id, this is the single attribution site to switch
+    // to Actor::Agent.
     let task = state
         .task_service
-        .transition(params.task_id, params.status.into(), params.version)
+        .transition(
+            params.task_id,
+            params.status.into(),
+            services::task_service::TransitionOptions {
+                version: params.version,
+                reason: None,
+                triggered_by: Actor::system(SystemComponent::Mcp),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        )
         .await?;
     Ok(task_value(task.task))
 }

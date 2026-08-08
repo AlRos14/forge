@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use api_types::{FailurePolicy, HookAudience, HookSpec, StateDefinition, StateKind};
+use api_types::{Actor, FailurePolicy, HookAudience, HookSpec, StateDefinition, StateKind};
 use serde_json::json;
 use serde_json::Value;
 
@@ -90,11 +90,13 @@ fn merge_project_review_config(merged: &mut Value, project: Option<&db::Project>
     }
 }
 
-pub(super) fn hook_audience_matches(audience: HookAudience, triggered_by: &str) -> bool {
+pub(super) fn hook_audience_matches(audience: HookAudience, actor: &Actor) -> bool {
     match audience {
         HookAudience::All => true,
-        HookAudience::AgentOnly => triggered_by.starts_with("agent:") || triggered_by == "system",
-        HookAudience::UserOnly => triggered_by.starts_with("user:"),
+        // System transitions run the autonomous workflow just like agent
+        // transitions. This includes component-specific system actors.
+        HookAudience::AgentOnly => actor.is_agent() || actor.is_system(),
+        HookAudience::UserOnly => actor.is_user(),
     }
 }
 
@@ -138,7 +140,7 @@ pub(super) fn log_hook_skipped_by_audience(
     to_state: &str,
     phase: &str,
     hook: &HookSpec,
-    triggered_by: &str,
+    actor: &Actor,
 ) {
     tracing::debug!(
         task_id = %task_id,
@@ -147,7 +149,7 @@ pub(super) fn log_hook_skipped_by_audience(
         phase = %phase,
         action = %hook.action,
         audience = ?hook.applies_to,
-        triggered_by = %triggered_by,
+        actor = %actor,
         "workflow hook skipped because triggered_by does not match audience"
     );
 }
@@ -158,7 +160,7 @@ pub(super) fn log_hook_start(
     to_state: &str,
     phase: &str,
     hook: &HookSpec,
-    triggered_by: &str,
+    actor: &Actor,
 ) {
     tracing::debug!(
         task_id = %task_id,
@@ -168,7 +170,7 @@ pub(super) fn log_hook_start(
         action = %hook.action,
         audience = ?hook.applies_to,
         on_failure = ?hook.on_failure,
-        triggered_by = %triggered_by,
+        actor = %actor,
         "workflow hook executing"
     );
 }
@@ -232,6 +234,31 @@ pub(super) fn log_hook_result(
                 "workflow hook completed with cascade"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::hook_audience_matches;
+    use api_types::{Actor, HookAudience, SystemComponent, UserActionSource};
+
+    #[test]
+    fn hook_audience_matrix_is_exhaustive_for_actor_kinds() {
+        let actors = [
+            Actor::user(UserActionSource::Test),
+            Actor::agent("worker"),
+            Actor::system(SystemComponent::TaskDispatcher),
+        ];
+
+        for actor in &actors {
+            assert!(hook_audience_matches(HookAudience::All, actor));
+        }
+        assert!(!hook_audience_matches(HookAudience::AgentOnly, &actors[0]));
+        assert!(hook_audience_matches(HookAudience::AgentOnly, &actors[1]));
+        assert!(hook_audience_matches(HookAudience::AgentOnly, &actors[2]));
+        assert!(hook_audience_matches(HookAudience::UserOnly, &actors[0]));
+        assert!(!hook_audience_matches(HookAudience::UserOnly, &actors[1]));
+        assert!(!hook_audience_matches(HookAudience::UserOnly, &actors[2]));
     }
 }
 

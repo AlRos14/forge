@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::engine::{BoardMoveOutcome, BoardMoveRequest};
-use api_types::{MoveTaskRequest, TaskMovedEventPayload};
+use api_types::{Actor, MoveTaskRequest, TaskMovedEventPayload, UserActionSource};
 use db::{
     CompareAndMoveTask, MoveTaskIdentity, MoveTaskPersistence, MoveTaskResult, TaskBoardRepo,
 };
@@ -10,8 +10,6 @@ use super::transition::{
     clear_manual_review_awaiting_metadata, should_clear_review_passed_at,
     should_clear_transient_error_annotation,
 };
-
-const BOARD_MOVE_ACTOR: &str = "user:board_drag";
 
 impl TaskService {
     pub async fn move_task(
@@ -87,10 +85,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &source_task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", source_task.project_id.clone()))?;
+        let actor = Actor::user(UserActionSource::BoardDrag);
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &source_task,
             &project.workflow_definition,
-            BOARD_MOVE_ACTOR,
+            &actor,
         );
         let target_state = workflow
             .states
@@ -126,7 +125,7 @@ impl TaskService {
             &source_task,
             &request.target_status,
             &workflow,
-            BOARD_MOVE_ACTOR,
+            &actor,
         )
         .await?;
 
@@ -161,7 +160,7 @@ impl TaskService {
                 &request.target_status,
                 request.task_version,
                 &workflow,
-                BOARD_MOVE_ACTOR,
+                &actor,
                 "board drag",
                 BoardMoveRequest {
                     operation_id: request.operation_id.clone(),
@@ -195,13 +194,7 @@ impl TaskService {
                 },
             });
         }
-        if should_clear_review_passed_at(
-            &workflow,
-            &previous_status,
-            &task.status,
-            false,
-            BOARD_MOVE_ACTOR,
-        ) {
+        if should_clear_review_passed_at(&workflow, &previous_status, &task.status, false, &actor) {
             task =
                 TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
         }
@@ -286,7 +279,7 @@ impl TaskService {
                 entry_barrier_json: task.entry_barrier_json,
                 transition_log_id: new_uuid_v4(),
                 trigger_name: None,
-                triggered_by: BOARD_MOVE_ACTOR.to_owned(),
+                triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
                 trigger_reason: "board reorder".to_owned(),
                 rejection: false,
                 updated_at: now_rfc3339(),

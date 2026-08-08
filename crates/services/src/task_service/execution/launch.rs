@@ -118,7 +118,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
@@ -258,7 +258,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
@@ -493,7 +493,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
         // Verify the execution role matches the current state effective role for cascade eligibility
         let current_state = workflow.states.iter().find(|s| s.name == task.status);
@@ -656,7 +656,7 @@ impl TaskService {
             &execution,
             &reason,
             db::StopReason::UserCancelled,
-            "user:api",
+            &api_types::Actor::user(api_types::UserActionSource::Api),
             db::ResumePolicy::Manual,
         )
         .await?;
@@ -674,7 +674,7 @@ impl TaskService {
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ManualStop,
             blocking_reason: "user_cancelled".to_owned(),
-            blocked_by: Some("user:api".to_owned()),
+            blocked_by: Some(api_types::Actor::user(api_types::UserActionSource::Api).display()),
             blocked_at: Some(now.clone()),
             blocked_execution_id: Some(execution.id.clone()),
             artifact: Some(api_types::BlockingArtifact {

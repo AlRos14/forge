@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use api_types::{GateConfig, StateDefinition, StateKind, WorkflowDefinition};
+use api_types::{Actor, GateConfig, StateDefinition, StateKind, WorkflowDefinition};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -27,7 +27,7 @@ pub struct HookContext {
     pub event_bus: Arc<events::EventBus>,
     pub gate_config: Option<GateConfig>,
     pub workflow: Arc<WorkflowDefinition>,
-    pub triggered_by: String,
+    pub triggered_by: Actor,
     pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,

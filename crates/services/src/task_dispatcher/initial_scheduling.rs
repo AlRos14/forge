@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use api_types::{StateKind, WorkflowDefinition};
+use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
 use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
 
 use crate::{
@@ -95,7 +95,7 @@ impl TaskDispatcher {
                 TransitionOptions {
                     version: task.version,
                     reason: Some("scheduled by task dispatcher".to_owned()),
-                    triggered_by: "system:task_dispatcher".to_owned(),
+                    triggered_by: Actor::system(SystemComponent::TaskDispatcher),
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },
