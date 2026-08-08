@@ -12,6 +12,7 @@ pub mod generic_prompt;
 pub mod loader;
 pub mod planner_prompt;
 pub mod reviewer_prompt;
+pub mod worker_prompt;
 
 #[cfg(test)]
 mod tests;
@@ -19,6 +20,9 @@ mod tests;
 pub const BUILDER_ID_CODER_IMPLEMENTATION_V2: &str = "coder.implementation.v2";
 pub const BUILDER_ID_CODER_REVIEW_FIX_V2: &str = "coder.review_fix.v2";
 pub const BUILDER_ID_CODER_MERGE_FIX_V2: &str = "coder.merge_fix.v2";
+pub const BUILDER_ID_WORKER_AUTONOMOUS_V1: &str = "worker.autonomous.v1";
+pub const BUILDER_ID_WORKER_REVIEW_FIX_V1: &str = "worker.review_fix.v1";
+pub const BUILDER_ID_WORKER_MERGE_FIX_V1: &str = "worker.merge_fix.v1";
 pub const BUILDER_ID_REVIEWER_DEFAULT_V2: &str = "reviewer.default.v2";
 pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
 pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
@@ -97,10 +101,13 @@ static DEFAULT_ROLE_BUILDERS: OnceLock<DefaultRoleBuilderMap> = OnceLock::new();
 fn registry() -> &'static BuilderRegistry {
     PROMPT_BUILDERS.get_or_init(|| {
         let mut builders: HashMap<String, Arc<dyn PromptBuilder>> = HashMap::new();
-        let defaults: [Arc<dyn PromptBuilder>; 6] = [
+        let defaults: [Arc<dyn PromptBuilder>; 9] = [
             Arc::new(coder_prompt::CoderImplementationPromptBuilder),
             Arc::new(coder_prompt::CoderReviewFixPromptBuilder),
             Arc::new(coder_prompt::CoderMergeFixPromptBuilder),
+            Arc::new(worker_prompt::WorkerAutonomousPromptBuilder),
+            Arc::new(worker_prompt::WorkerReviewFixPromptBuilder),
+            Arc::new(worker_prompt::WorkerMergeFixPromptBuilder),
             Arc::new(reviewer_prompt::ReviewerPromptBuilder),
             Arc::new(planner_prompt::PlannerPromptBuilder),
             Arc::new(generic_prompt::GenericPromptBuilder),
@@ -128,6 +135,10 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
             (
                 default_roles::PLANNER.to_string(),
                 BUILDER_ID_PLANNER_DEFAULT_V2.to_string(),
+            ),
+            (
+                default_roles::WORKER.to_string(),
+                BUILDER_ID_WORKER_AUTONOMOUS_V1.to_string(),
             ),
         ]);
         Arc::new(RwLock::new(defaults))
@@ -192,6 +203,26 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             label: "Coder (Merge Fix)",
             compatible_role_hints: &[default_roles::CODER],
             description: "Merge-conflict fix prompt for merge retry loops.",
+        },
+        PromptBuilderRegistryEntry {
+            id: BUILDER_ID_WORKER_AUTONOMOUS_V1,
+            label: "Worker (Autonomous)",
+            compatible_role_hints: &[default_roles::WORKER],
+            description:
+                "Single-agent prompt for planning, implementation, self-validation, and recovery.",
+        },
+        PromptBuilderRegistryEntry {
+            id: BUILDER_ID_WORKER_REVIEW_FIX_V1,
+            label: "Worker (Review Fix)",
+            compatible_role_hints: &[default_roles::WORKER],
+            description: "Same-worker prompt for addressing review and validation feedback.",
+        },
+        PromptBuilderRegistryEntry {
+            id: BUILDER_ID_WORKER_MERGE_FIX_V1,
+            label: "Worker (Merge Fix)",
+            compatible_role_hints: &[default_roles::WORKER],
+            description:
+                "Same-worker prompt for resolving merge conflicts and revalidating the delivery.",
         },
         PromptBuilderRegistryEntry {
             id: BUILDER_ID_REVIEWER_DEFAULT_V2,
@@ -332,7 +363,7 @@ pub fn build_effective_prompt(
 
 pub(crate) fn default_tool_names(role: &str) -> Vec<String> {
     match role {
-        default_roles::CODER => vec![
+        default_roles::CODER | default_roles::WORKER => vec![
             "read_files".to_string(),
             "edit_files".to_string(),
             "run_tests".to_string(),

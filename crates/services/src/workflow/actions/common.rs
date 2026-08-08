@@ -79,7 +79,7 @@ pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execu
     .ok()?;
     page.items
         .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder"))
+        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
 }
 
 pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {

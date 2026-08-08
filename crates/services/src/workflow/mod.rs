@@ -52,6 +52,7 @@ pub enum HookResult {
 }
 
 pub mod actions;
+pub mod default_autonomous_workflow;
 pub mod default_roles;
 pub mod default_states;
 pub mod default_workflow;

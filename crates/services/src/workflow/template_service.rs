@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    workflow::{default_workflow::default_workflow, validation::validate_workflow},
+    workflow::{
+        default_autonomous_workflow::default_autonomous_workflow,
+        default_workflow::default_workflow, validation::validate_workflow,
+    },
     Result, ServiceError,
 };
 
@@ -357,6 +360,15 @@ fn builtin_default_template() -> TemplateDocument {
     }
 }
 
+fn builtin_autonomous_v1_template() -> TemplateDocument {
+    TemplateDocument {
+        display_name: "Autonomous v1".to_owned(),
+        description: "Single-worker workflow with hard validation and human review approval."
+            .to_owned(),
+        definition: default_autonomous_workflow(),
+    }
+}
+
 fn builtin_user_approval_review_template() -> TemplateDocument {
     let mut definition = default_workflow();
     if let Some(gate_config) = definition
@@ -402,9 +414,10 @@ fn builtin_no_user_approval_template() -> TemplateDocument {
     }
 }
 
-fn builtin_templates() -> [(&'static str, TemplateDocument); 3] {
+fn builtin_templates() -> [(&'static str, TemplateDocument); 4] {
     [
         ("default", builtin_default_template()),
+        ("autonomous_v1", builtin_autonomous_v1_template()),
         (
             "user-approval-review",
             builtin_user_approval_review_template(),
@@ -416,7 +429,7 @@ fn builtin_templates() -> [(&'static str, TemplateDocument); 3] {
 fn is_builtin_template_name(name: &str) -> bool {
     matches!(
         name,
-        "default" | "user-approval-review" | "no-user-approval"
+        "default" | "autonomous_v1" | "user-approval-review" | "no-user-approval"
     )
 }
 
@@ -424,7 +437,9 @@ fn is_builtin_template_name(name: &str) -> bool {
 mod tests {
     use std::fs;
 
-    use super::{builtin_default_template, WorkflowTemplateService};
+    use super::{
+        builtin_autonomous_v1_template, builtin_default_template, WorkflowTemplateService,
+    };
 
     fn temp_workflows_dir() -> std::path::PathBuf {
         let path =
@@ -504,6 +519,27 @@ definition:
             .expect("review gate config")
             .requires_user_approval());
         assert!(!template.definition.configuration.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initialize_adds_autonomous_v1_template() {
+        let workflows_dir = temp_workflows_dir();
+        let service = WorkflowTemplateService::new(workflows_dir);
+
+        service.initialize().await.expect("initialize succeeds");
+
+        let template = service
+            .get_template("autonomous_v1")
+            .await
+            .expect("autonomous template loads");
+        assert!(template.is_builtin);
+        assert_eq!(template.display_name, "Autonomous v1");
+        assert_eq!(
+            template.definition,
+            builtin_autonomous_v1_template().definition
+        );
+        assert_eq!(template.definition.roles.len(), 1);
+        assert_eq!(template.definition.roles[0].name, "worker");
     }
 
     #[tokio::test]
