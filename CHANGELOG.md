@@ -4,7 +4,7 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
-## [Unreleased]
+## [0.6.1] - 2026-08-08
 
 ### Changed
 
