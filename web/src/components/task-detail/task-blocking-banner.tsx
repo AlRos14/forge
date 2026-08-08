@@ -4,6 +4,7 @@ import {
   getStaleBlockingAnnotation,
   getTaskWorkflowWarning,
 } from '@/lib/workflow-utils'
+import { productTerm } from '@/lib/i18n'
 
 // Informational fallback for interruption states that carry no recovery
 // actions. Actionable failures are rendered by WorkflowExceptionPanel, which
@@ -65,8 +66,11 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
     return (
       <section className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
         <div className="space-y-1.5">
-          <p className="text-sm font-semibold">Previous Execution Warning</p>
-          <p className="text-sm">Superseded by a later execution or manual state change.</p>
+          <p className="text-sm font-semibold">Previous {productTerm('run')} Warning</p>
+          <p className="text-sm">
+            Superseded by a later {productTerm('run').toLowerCase()} or manual{' '}
+            {productTerm('phase').toLowerCase()} change.
+          </p>
           {staleAnnotation.message ? <p className="text-sm">{staleAnnotation.message}</p> : null}
           {staleAnnotation.blocked_execution_id ? (
             <p className="break-all font-mono text-xs opacity-80">

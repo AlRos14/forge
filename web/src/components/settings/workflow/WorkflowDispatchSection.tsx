@@ -7,6 +7,7 @@ import { CollapsibleSection } from '@/components/ui/collapsible-section'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { productTerm } from '@/lib/i18n'
 import type { StateDefinition, WorkflowDefinition } from '@/types/generated'
 import {
   type ColumnGroup,
@@ -48,11 +49,11 @@ export function WorkflowDispatchSection({
   return (
     <SettingsSection
       title="Dispatch"
-      description="Configure state and trigger dispatch intent. Trigger dispatch uses the target state's role automatically."
+      description={`Configure ${productTerm('phase').toLowerCase()} and trigger dispatch intent. Trigger dispatch uses the target ${productTerm('phase').toLowerCase()}'s role automatically.`}
     >
       {dispatchColumnGroups.length === 0 ? (
         <p className="rounded-md border px-3 py-2 text-xs text-muted-foreground">
-          This workflow does not define any states.
+          This workflow does not define any {productTerm('phase', 0).toLowerCase()}.
         </p>
       ) : (
         <div className="rounded-md border">
@@ -136,9 +137,9 @@ export function WorkflowDispatchSection({
                       />
                     </div>
                     <div className="space-y-1.5">
-                      <Label>Execution policy</Label>
+                      <Label>{productTerm('run')} policy</Label>
                       <Select
-                        aria-label="Select execution policy"
+                        aria-label={`Select ${productTerm('run').toLowerCase()} policy`}
                         value={readDispatchExecutionPolicy(activeStateDef)}
                         placeholder="Default policy"
                         options={executionPolicyOptions}
@@ -212,11 +213,11 @@ export function WorkflowDispatchSection({
                               {isOpen && (
                                 <div className="space-y-3 border-t p-3">
                                   <div className="space-y-1.5">
-                                    <Label>Target state</Label>
+                                    <Label>Target {productTerm('phase')}</Label>
                                     <Select
-                                      aria-label="Select target state"
+                                      aria-label={`Select target ${productTerm('phase').toLowerCase()}`}
                                       value={targetState}
-                                      placeholder="Select target state…"
+                                      placeholder={`Select target ${productTerm('phase').toLowerCase()}…`}
                                       options={stateOptions}
                                       onChange={(value) =>
                                         updateDispatchDraft((_nextWorkflow, states) => {
@@ -257,9 +258,9 @@ export function WorkflowDispatchSection({
                                       />
                                     </div>
                                     <div className="space-y-1.5">
-                                      <Label>Execution policy</Label>
+                                      <Label>{productTerm('run')} policy</Label>
                                       <Select
-                                        aria-label="Select execution policy"
+                                        aria-label={`Select ${productTerm('run').toLowerCase()} policy`}
                                         value={readDispatchExecutionPolicy(trigger)}
                                         placeholder="Default policy"
                                         options={executionPolicyOptions}

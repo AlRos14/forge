@@ -18,6 +18,7 @@ import {
   useProjectTasksForSubtasks,
 } from '@/components/task-detail/task-subtasks-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
+import { productTerm } from '@/lib/i18n'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -186,7 +187,7 @@ export function TaskDetailSidebar({
           </div>
         ) : task ? (
           <div className="p-5">
-            <SidebarField label="Status">
+            <SidebarField label={productTerm('phase')}>
               {gateActions ? (
                 <div className={gateActions.rejectLabel ? 'mb-2 grid grid-cols-2 gap-2' : 'mb-2'}>
                   <Button

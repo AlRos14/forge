@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type {
   ActiveExecutionSummary,
   AgentPressureSummary,
@@ -151,7 +152,7 @@ function formatRateLimitSnapshot(snapshot: Record<string, unknown> | null): stri
 
 function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSummary[] }) {
   return (
-    <Section title="Active Executions" count={executions.length}>
+    <Section title={`Active ${productTerm('run', 0)}`} count={executions.length}>
       <div className="divide-y">
         {executions.map((execution) => (
           <div
@@ -238,7 +239,7 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
 
 function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
   return (
-    <Section title="Daemon Pressure" count={items.length}>
+    <Section title={`${productTerm('runtime')} Pressure`} count={items.length}>
       <div className="divide-y">
         {items.map((item) => (
           <div
@@ -348,7 +349,7 @@ function BlockedTasksSection({
 
 function DaemonIssuesSection({ issues }: { issues: DaemonIssueSummary[] }) {
   return (
-    <Section title="Daemon Issues" count={issues.length}>
+    <Section title={`${productTerm('runtime')} Issues`} count={issues.length}>
       <div className="divide-y">
         {issues.map((issue) => (
           <div
@@ -552,7 +553,7 @@ export function OperationsPage() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
         <StatCard label="Active" value={status.active_executions.length} />
         <StatCard label="Blocked" value={status.blocked_tasks.length} />
-        <StatCard label="Daemons" value={status.daemon_issues.length} />
+        <StatCard label={productTerm('runtime', 0)} value={status.daemon_issues.length} />
         <StatCard label="Cleanup" value={status.workspace_cleanup.length} />
         <StatCard label="Retries" value={status.retry_pressure.length} />
         <StatCard label="Errors" value={status.recent_errors.length} />
@@ -584,7 +585,8 @@ export function OperationsPage() {
           </div>
           <p className="text-sm font-medium text-foreground">All systems healthy</p>
           <p className="mt-1.5 text-sm text-muted-foreground">
-            No active executions, blocked tasks, daemon issues, or recent errors.
+            No active {productTerm('run', 0).toLowerCase()}, blocked tasks,{' '}
+            {productTerm('runtime').toLowerCase()} issues, or recent errors.
           </p>
         </div>
       ) : null}

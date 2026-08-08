@@ -11,6 +11,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { buildExecutionChains, roleDisplayName, turnLabel } from '@/lib/execution-utils'
+import { productTerm } from '@/lib/i18n'
 import type { Execution, Review, Task } from '@/types/generated'
 
 const executionStatusColors: Record<Execution['status'], string> = {
@@ -66,7 +67,7 @@ export function TaskExecutionsPanel({
   if (executions.length === 0) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
-        No executions yet
+        No {productTerm('run', 0).toLowerCase()} yet
       </div>
     )
   }

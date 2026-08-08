@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
+import { productTerm } from '@/lib/i18n'
 import type { Daemon } from '@/types/generated'
 import { executorDisplayNames, executorTypes } from './constants'
 import type { AgentFormState } from './form-utils'
@@ -94,12 +95,18 @@ export function AgentForm({
       </AgentSection>
 
       {showDaemonSelector ? (
-        <AgentSection title="Daemon" description="Which daemon runs this agent's tasks. Leave blank to use any available.">
-          <FormField label="Pinned daemon (optional)" htmlFor="agent-daemon">
+        <AgentSection
+          title={productTerm('runtime')}
+          description={`Which ${productTerm('runtime').toLowerCase()} runs this agent's tasks. Leave blank to use any available.`}
+        >
+          <FormField
+            label={`Pinned ${productTerm('runtime').toLowerCase()} (optional)`}
+            htmlFor="agent-daemon"
+          >
             <Select
               id="agent-daemon"
               value={form.daemon_id}
-              placeholder="Any available daemon"
+              placeholder={`Any available ${productTerm('runtime').toLowerCase()}`}
               options={daemons.map((d) => ({
                 value: d.id,
                 label: (d.hostname || d.machine_id) + (d.status !== 'online' ? ' (offline)' : ''),
@@ -108,7 +115,9 @@ export function AgentForm({
               onChange={(v) => update({ daemon_id: v })}
             />
             {daemons.length === 0 && (
-              <p className="mt-1 text-[11px] text-muted-foreground">No daemons registered — agent will use any available</p>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                No {productTerm('runtime', 0).toLowerCase()} registered — agent will use any available
+              </p>
             )}
           </FormField>
         </AgentSection>

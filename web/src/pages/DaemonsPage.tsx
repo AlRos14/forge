@@ -25,6 +25,7 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type { Agent, Daemon, ForgeSettingResponse } from '@/types/generated'
 
 const EMPTY_DAEMONS: Daemon[] = []
@@ -106,7 +107,7 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
         <header className="flex shrink-0 items-center justify-between border-b px-4 py-3">
           <div>
             <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
-              Daemons
+              {productTerm('runtime', daemons.length)}
             </p>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
               {daemons.filter((d) => d.status === 'online').length}/{daemons.length} online
@@ -115,8 +116,8 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
           <Button
             variant="ghost"
             size="icon-sm"
-            aria-label="Link daemon"
-            title="Link daemon"
+            aria-label={`Link ${productTerm('runtime')}`}
+            title={`Link ${productTerm('runtime')}`}
             onClick={() => setLinkDialogOpen(true)}
           >
             <Plus size={14} weight="bold" />
@@ -128,7 +129,7 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
             <div className="p-3">
               <ErrorBanner
                 error={daemonsQuery.error}
-                fallback="Failed to load daemons"
+                fallback={`Failed to load ${productTerm('runtime', 0).toLowerCase()}`}
                 onRetry={() => void daemonsQuery.refetch()}
               />
             </div>
@@ -146,9 +147,9 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
               <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-muted">
                 <Desktop size={20} className="text-muted-foreground" />
               </div>
-              <p className="text-sm font-medium">No daemons</p>
+              <p className="text-sm font-medium">No {productTerm('runtime', 0).toLowerCase()}</p>
               <p className="mt-1 text-xs text-muted-foreground">
-                Start a daemon to make it appear here
+                Start a {productTerm('runtime').toLowerCase()} to make it appear here
               </p>
             </div>
           ) : (
@@ -265,16 +266,19 @@ function DaemonLinkDialog({
     setCopied(false)
     try {
       const result = await createPat.mutateAsync({
-        name: `Daemon link ${new Date().toLocaleString()}`,
+        name: `${productTerm('runtime')} link ${new Date().toLocaleString()}`,
         expires_at: null,
       })
       if (!result.token) {
         throw new Error('Token was not returned')
       }
       setLinkToken(result.token)
-      toast.success('Daemon link token created')
+      toast.success(`${productTerm('runtime')} link token created`)
     } catch (error) {
-      const message = getApiErrorMessage(error, 'Failed to create daemon link token')
+      const message = getApiErrorMessage(
+        error,
+        `Failed to create ${productTerm('runtime').toLowerCase()} link token`,
+      )
       setTokenError(message)
       toast.error(message)
     }
@@ -284,7 +288,7 @@ function DaemonLinkDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Link daemon</DialogTitle>
+          <DialogTitle>Link {productTerm('runtime').toLowerCase()}</DialogTitle>
           <DialogDescription>
             Create a personal link token, then run the command on the machine that should report
             local CLIs, browse paths, and run agent work for Forge.
@@ -319,7 +323,7 @@ function DaemonLinkDialog({
               <button
                 type="button"
                 className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                aria-label="Copy daemon link command"
+                aria-label={`Copy ${productTerm('runtime').toLowerCase()} link command`}
                 onClick={handleCopy}
                 disabled={!command}
               >
@@ -369,9 +373,9 @@ function EmptyPanel() {
         <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
           <Desktop size={24} className="text-muted-foreground" />
         </div>
-        <p className="text-sm font-medium">Select a daemon</p>
+        <p className="text-sm font-medium">Select a {productTerm('runtime').toLowerCase()}</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Choose a daemon from the list to view its details
+          Choose a {productTerm('runtime').toLowerCase()} from the list to view its details
         </p>
       </div>
     </div>
@@ -690,7 +694,9 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
             Agents ({agents.length})
           </h3>
           {agents.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No agents registered on this daemon</p>
+            <p className="text-sm text-muted-foreground">
+              No agents registered on this {productTerm('runtime').toLowerCase()}
+            </p>
           ) : (
             <div className="flex flex-wrap gap-2">
               {agents.map((agent) => (

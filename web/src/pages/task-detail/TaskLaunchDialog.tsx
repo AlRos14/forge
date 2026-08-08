@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { productTerm } from '@/lib/i18n'
 
 interface TaskLaunchDialogProps {
   open: boolean
@@ -39,7 +40,7 @@ export function TaskLaunchDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Launch Execution</DialogTitle>
+          <DialogTitle>Launch {productTerm('run')}</DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
           <div className="space-y-1">

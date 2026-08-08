@@ -26,6 +26,7 @@ import { Button } from '@/components/ui/button'
 import { Select } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useLayoutStore } from '@/stores/layout'
+import { productTerm } from '@/lib/i18n'
 import type { StateDefinition, WorkflowDefinition } from '@/types/generated'
 
 export function WorkflowTab({
@@ -83,7 +84,9 @@ export function WorkflowTab({
         },
         onError: (error) => {
           if (error instanceof ApiError && error.status === 409) {
-            toast.error('Cannot apply template: tasks exist in states that would be removed')
+            toast.error(
+              `Cannot apply template: tasks exist in ${productTerm('phase', 0).toLowerCase()} that would be removed`,
+            )
             return
           }
           toast.error(settingsErrorMessage(error, 'Template apply failed'))
@@ -98,7 +101,7 @@ export function WorkflowTab({
     try {
       parsed = JSON.parse(workflowJson)
     } catch {
-      toast.error('Workflow is not valid JSON')
+          toast.error('Workflow is not valid JSON')
       return
     }
     updateWorkflow.mutate(
@@ -116,7 +119,9 @@ export function WorkflowTab({
         },
         onError: (error) => {
           if (error instanceof ApiError && error.status === 409) {
-            toast.error('Cannot update workflow: tasks exist in states that would be removed')
+            toast.error(
+              `Cannot update workflow: tasks exist in ${productTerm('phase', 0).toLowerCase()} that would be removed`,
+            )
             return
           }
           toast.error(settingsErrorMessage(error, 'Workflow update failed'))
@@ -160,7 +165,9 @@ export function WorkflowTab({
         },
         onError: (error) => {
           if (error instanceof ApiError && error.status === 409) {
-            toast.error('Cannot update workflow: tasks exist in states that would be removed')
+            toast.error(
+              `Cannot update workflow: tasks exist in ${productTerm('phase', 0).toLowerCase()} that would be removed`,
+            )
             return
           }
           toast.error(settingsErrorMessage(error, 'Workflow configuration update failed'))
@@ -188,7 +195,7 @@ export function WorkflowTab({
   }))
   const executionPolicyOptions = [
     { value: '', label: 'Default policy' },
-    { value: 'new_execution', label: 'New execution' },
+    { value: 'new_execution', label: `New ${productTerm('run').toLowerCase()}` },
     { value: 'resume_latest_target_role_thread', label: 'Resume latest target-role thread' },
   ]
   const dispatchStates = stateRecords(dispatchDraft ?? workflowQuery.data)
@@ -200,7 +207,7 @@ export function WorkflowTab({
         <div>
           <h2 className="text-page font-semibold tracking-tight">Workflow definition</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            The state machine every task in this project moves through. Roles defined here surface
+            The {productTerm('phase', 0).toLowerCase()} every task in this project moves through. Roles defined here surface
             in the agent register flow.
           </p>
         </div>

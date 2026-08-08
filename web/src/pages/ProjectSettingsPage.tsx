@@ -60,6 +60,7 @@ import {
 } from '@/components/ui/dialog'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import type { DefaultRoleAssignment, LifecycleHooks } from '@/types/generated'
 
@@ -506,7 +507,9 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
           </p>
           {daemons.length > 1 && (
             <div className="mt-4 flex items-center justify-center gap-2">
-              <label className="text-sm text-muted-foreground">Browse via daemon:</label>
+              <label className="text-sm text-muted-foreground">
+                Browse via {productTerm('runtime').toLowerCase()}:
+              </label>
               <select
                 className="h-8 rounded-md border border-border bg-background px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                 value={activeDaemonId ?? ''}

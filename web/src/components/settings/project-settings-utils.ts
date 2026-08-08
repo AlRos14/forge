@@ -1,5 +1,6 @@
 import { ApiError } from '@/api/client'
 import { getApiErrorMessage } from '@/lib/api-error'
+import { productTerm } from '@/lib/i18n'
 import type { AssigneeSelection } from '@/components/task-controls'
 import type { LifecycleEvent, LifecycleHookDef, LifecycleHooks, Repo } from '@/types/generated'
 import type { RepoFormState } from '@/components/settings/RepoForm'
@@ -24,7 +25,7 @@ export const LIFECYCLE_EVENTS: Array<{
   {
     key: 'before_work',
     label: 'Before Work',
-    description: 'Fires when a task is about to enter an active state',
+    description: `Fires when a task is about to enter an active ${productTerm('phase').toLowerCase()}`,
   },
   {
     key: 'on_work_start',

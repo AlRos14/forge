@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import { getStateColors } from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
 
@@ -132,7 +133,7 @@ export function TaskStatusDropdown({
   return (
     <DropdownMenu className="block w-full">
       <DropdownMenuTrigger
-        aria-label={`Move status from ${formatTaskStatus(status)}`}
+        aria-label={`Move ${productTerm('phase').toLowerCase()} from ${formatTaskStatus(status)}`}
         className={cn(
           'inline-flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-[3px] text-xs font-medium transition-colors hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50',
           colors.bg,

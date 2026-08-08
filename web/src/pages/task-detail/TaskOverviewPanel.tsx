@@ -28,6 +28,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { productTerm } from '@/lib/i18n'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip } from '@/components/ui/tooltip'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
@@ -268,7 +269,7 @@ export function TaskOverviewPanel({
     }
     const review = parseDraft('Review retries', reviewRetryOverride)
     const mergeFix = parseDraft('Merge-fix retries', mergeFixRetryOverride)
-    const execution = parseDraft('Execution retries', executionRetryOverride)
+    const execution = parseDraft(`${productTerm('run')} retries`, executionRetryOverride)
     if (review === null || mergeFix === null || execution === null) {
       return
     }
@@ -341,7 +342,7 @@ export function TaskOverviewPanel({
   const executionActionDisabledReason = (action: ExecutionAction) => {
     if (action.action === 'manual_launch' && !hasAgents) return 'No agents available'
     if (action.action === 'stop_execution' && !(action.target_execution_id ?? runningExecutionId)) {
-      return action.disabled_reason ?? 'No running execution'
+      return action.disabled_reason ?? `No running ${productTerm('run').toLowerCase()}`
     }
     return action.disabled_reason ?? ''
   }
@@ -417,7 +418,7 @@ export function TaskOverviewPanel({
                     params={{ taskId: task.id, executionId: task.workflow_health.execution_id }}
                     className="font-mono text-xs text-primary hover:underline"
                   >
-                    Execution {task.workflow_health.execution_id.slice(0, 8)}
+                    {productTerm('run')} {task.workflow_health.execution_id.slice(0, 8)}
                   </Link>
                 ) : null}
                 {task.workflow_health.review_id ? (
@@ -553,7 +554,7 @@ export function TaskOverviewPanel({
                           disabled={!hasAgents || executionActionPending}
                           onClick={onOpenLaunchDialog}
                         >
-                          Launch Execution
+                          Launch {productTerm('run')}
                         </Button>
                       ) : null}
                       <Button
@@ -637,7 +638,9 @@ export function TaskOverviewPanel({
                   />
                 </span>
                 {manualAdvanceTarget ? (
-                  <Tooltip content="Stop any running execution and advance to the next workflow state.">
+                  <Tooltip
+                    content={`Stop any running ${productTerm('run').toLowerCase()} and advance to the next ${productTerm('phase').toLowerCase()}.`}
+                  >
                     <Button
                       className="gap-1.5"
                       disabled={
@@ -780,7 +783,7 @@ export function TaskOverviewPanel({
                   </p>
                 </div>
                 <div className="space-y-1">
-                  <Label htmlFor="task-execution-retry-budget">Execution retries</Label>
+                  <Label htmlFor="task-execution-retry-budget">{productTerm('run')} retries</Label>
                   <Input
                     id="task-execution-retry-budget"
                     type="number"

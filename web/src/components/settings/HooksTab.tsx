@@ -1,4 +1,5 @@
 import { Fragment, useState } from 'react'
+import { productTerm } from '@/lib/i18n'
 import {
   ArrowDown,
   ArrowRight,
@@ -249,9 +250,10 @@ export function HooksTab({
                     value={testTaskId}
                     onChange={(e) => setTestTaskId(e.target.value)}
                   />
-                  <p className="text-xs text-muted-foreground">
-                    Tests run hook scripts with production hook context but do not transition task
-                    state or launch agent executions.
+                    <p className="text-xs text-muted-foreground">
+                    Tests run hook scripts with production hook context but do not transition task{' '}
+                    {productTerm('phase').toLowerCase()} or launch agent{' '}
+                    {productTerm('run', 0).toLowerCase()}.
                   </p>
                 </div>
 

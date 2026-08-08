@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { productTerm } from '@/lib/i18n'
 import { useProjectAnalytics } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { SettingsSection } from '@/components/settings/SettingsSection'
@@ -191,7 +192,7 @@ export function AnalyticsTab({ projectId }: { projectId: string }) {
                   </p>
                 </div>
                 <div className="rounded-md border p-3">
-                  <p className="text-xs text-muted-foreground">Executions</p>
+                  <p className="text-xs text-muted-foreground">{productTerm('run', 0)}</p>
                   <p className="mt-1 text-xl font-semibold">{tokenUsage?.execution_count ?? 0}</p>
                 </div>
               </div>
@@ -212,7 +213,7 @@ export function AnalyticsTab({ projectId }: { projectId: string }) {
                           <th className="px-3 py-2 font-medium">Cache Read</th>
                           <th className="px-3 py-2 font-medium">Cache Write</th>
                           <th className="px-3 py-2 font-medium">Cost</th>
-                          <th className="px-3 py-2 font-medium">Executions</th>
+                          <th className="px-3 py-2 font-medium">{productTerm('run', 0)}</th>
                         </tr>
                       </thead>
                       <tbody>

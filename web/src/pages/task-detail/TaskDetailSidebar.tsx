@@ -11,6 +11,7 @@ import { Link } from '@tanstack/react-router'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type { Task, TaskStatus } from '@/types/generated'
 import { stripRunSuffix } from './utils'
 
@@ -61,7 +62,7 @@ export function TaskDetailSidebar({
     },
     {
       id: 'executions' as const,
-      label: 'Executions',
+      label: productTerm('run', 0),
       Icon: Play,
       badge: executionCount > 0 ? String(executionCount) : undefined,
     },
