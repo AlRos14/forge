@@ -359,6 +359,9 @@ fn is_known_prompt_builder_id(builder_id: &str) -> bool {
             | "coder.implementation.v2"
             | "coder.review_fix.v2"
             | "coder.merge_fix.v2"
+            | "worker.autonomous.v1"
+            | "worker.review_fix.v1"
+            | "worker.merge_fix.v1"
             | "reviewer.default.v2"
     )
 }

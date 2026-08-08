@@ -9,7 +9,8 @@ use crate::workflow::{
         DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
         BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2,
         BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2,
-        BUILDER_ID_REVIEWER_DEFAULT_V2,
+        BUILDER_ID_REVIEWER_DEFAULT_V2, BUILDER_ID_WORKER_AUTONOMOUS_V1,
+        BUILDER_ID_WORKER_MERGE_FIX_V1, BUILDER_ID_WORKER_REVIEW_FIX_V1,
     },
 };
 
@@ -139,6 +140,21 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             ],
         ),
         (
+            BUILDER_ID_WORKER_AUTONOMOUS_V1,
+            default_roles::WORKER,
+            vec!["Worker boundary:", "plan internally", "self-validation"],
+        ),
+        (
+            BUILDER_ID_WORKER_REVIEW_FIX_V1,
+            default_roles::WORKER,
+            vec!["Worker boundary:", "plan internally", "self-validation"],
+        ),
+        (
+            BUILDER_ID_WORKER_MERGE_FIX_V1,
+            default_roles::WORKER,
+            vec!["Worker boundary:", "plan internally", "self-validation"],
+        ),
+        (
             BUILDER_ID_GENERIC_DEFAULT_V2,
             "security_engineer",
             vec![
@@ -175,6 +191,37 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             );
         }
     }
+}
+
+#[test]
+fn worker_prompt_builders_cover_autonomous_handoff_and_use_coder_tools() {
+    let worker_tools = resolve_prompt_builder(BUILDER_ID_WORKER_AUTONOMOUS_V1)
+        .build(&fake_context(default_roles::WORKER))
+        .tools;
+    let coder_tools = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2)
+        .build(&fake_context(default_roles::CODER))
+        .tools;
+    assert_eq!(worker_tools, coder_tools);
+
+    let autonomous = resolve_prompt_builder(BUILDER_ID_WORKER_AUTONOMOUS_V1)
+        .build(&fake_context(default_roles::WORKER));
+    assert!(autonomous.system.contains("plan internally"));
+    assert!(autonomous.system.contains("repair failures"));
+    assert!(autonomous.system.contains("STRUCTURED"));
+    assert!(autonomous.system.contains("Uncertainty | Scope Changes"));
+    assert!(autonomous.user.contains("Objective:"));
+
+    let mut review_ctx = fake_context(default_roles::WORKER);
+    review_ctx.continuation_of_execution_id = Some("worker-execution-1".to_owned());
+    review_ctx.latest_review_feedback = Some("Add evidence for the edge case".to_owned());
+    let review_fix = resolve_prompt_builder(BUILDER_ID_WORKER_REVIEW_FIX_V1).build(&review_ctx);
+    assert!(review_fix.user.contains("review and validation findings"));
+    assert!(review_fix.user.contains("Add evidence for the edge case"));
+    assert!(review_fix.user.contains("worker-execution-1"));
+
+    let merge_fix = resolve_prompt_builder(BUILDER_ID_WORKER_MERGE_FIX_V1)
+        .build(&fake_context(default_roles::WORKER));
+    assert!(merge_fix.user.contains("Merge repair is required"));
 }
 
 #[test]

@@ -5,6 +5,23 @@ impl TaskService {
         let page = ExecutionRepo::list_by_task_and_role(
             &*self.db,
             task_id,
+            crate::workflow::default_roles::WORKER,
+            PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?;
+        if let Some(execution) = page.items.into_iter().next() {
+            return Ok(execution);
+        }
+
+        let page = ExecutionRepo::list_by_task_and_role(
+            &*self.db,
+            task_id,
             "coder",
             PageRequest {
                 cursor: None,

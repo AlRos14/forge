@@ -191,6 +191,18 @@ All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 `backlog → todo → planning → in_progress → review → merging → done` and
 `merge_failed`, `blocked`, `cancelled` as auxiliary/failure/terminal states.
 
+The built-in `autonomous_v1` preset lives in
+`crates/services/src/workflow/default_autonomous_workflow.rs`. It is a
+single-worker graph: `backlog → ready → working → review → merging → done`,
+with `merge_failed` returning to worker execution and `cancelled` as the
+terminal cancellation target. `working` and `merge_failed` explicitly use the
+`worker` role; `review` has no reviewer role and requires human approval.
+Entering review runs the before-work hooks and CI steps as blocking guards.
+Review rejection and merge repair resume the latest worker thread. The worker
+plans internally, implements, self-tests, repairs failures, and reports
+verification evidence, so the preset has no planning state or plan-checklist
+gate.
+
 ### Workflow engine (in progress)
 
 Flexible workflow work is partially implemented. `WorkflowEngine` in

@@ -237,6 +237,53 @@ async fn project_workflow_can_be_applied_from_template() {
 }
 
 #[tokio::test]
+async fn project_workflow_can_apply_autonomous_v1_from_builtin_template() {
+    let app = setup().await;
+
+    let (status, project) = request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        Some(json!({ "name": "Autonomous Workflow Project" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let project_id = project["id"].as_str().expect("project id");
+
+    let (status, body) = request(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        Some(json!({ "template_name": "autonomous_v1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["roles"].as_array().expect("roles"),
+        &vec![json!({
+            "name": "worker",
+            "display_name": "Worker",
+            "description": "Owns planning, implementation, self-validation, and routine recovery for the task."
+        })]
+    );
+    assert!(body["states"]
+        .as_array()
+        .expect("states")
+        .iter()
+        .any(|state| state["name"] == "working" && state["canonical_phase"] == "working"));
+
+    let (status, project) = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(project["workflow_template_name"], "autonomous_v1");
+}
+
+#[tokio::test]
 async fn deleting_default_workflow_template_is_forbidden() {
     let app = setup().await;
 
