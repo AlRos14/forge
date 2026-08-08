@@ -1,6 +1,7 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
 use std::sync::Arc;
 
+use api_types::Actor;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AssigneeKind, CreateProject,
     CreateRepo, CreateTask, CreateTaskRoleAssignment, ProjectRepo, RepoRepo, SqliteDb, TaskRepo,
@@ -32,7 +33,7 @@ async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
             TransitionOptions {
                 version: 1,
                 reason: Some("ready for review".to_owned()),
-                triggered_by: "agent:coder-agent".to_owned(),
+                triggered_by: Actor::agent("coder-agent"),
                 rejection: false,
                 defer_dispatch_seconds: None,
             },

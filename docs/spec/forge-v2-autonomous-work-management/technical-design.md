@@ -591,6 +591,11 @@ pub enum Actor {
 
 Keep a separate human-readable `reason` field.
 
+Forge's current single-user product represents the user variant as
+`User { user_id: None, source }`. The user id remains intentionally unset
+until the multi-user story is implemented; action sources and audit display
+formats are still typed and preserved.
+
 Benefits:
 
 - correct hook audience semantics;
@@ -1360,4 +1365,3 @@ This sequencing allows UX validation before deep policy automation.
 13. REST, MCP, CLI, and web clients continue to operate against legacy workflows.
 14. All new API types regenerate clean TypeScript bindings.
 15. The Playwright suite covers both autonomous and legacy project paths.
-

@@ -1,4 +1,5 @@
 use super::*;
+use api_types::{Actor, UserActionSource};
 
 pub async fn transition_task(
     State(state): State<AppState>,
@@ -7,7 +8,7 @@ pub async fn transition_task(
 ) -> ApiResult<Json<TransitionTaskResponse>> {
     let mut options = TransitionOptions::from((request.version, request.reason));
     if request.source == Some(TransitionSource::BoardDrag) {
-        options.triggered_by = "user:board_drag".to_owned();
+        options.triggered_by = Actor::user(UserActionSource::BoardDrag);
         options.defer_dispatch_seconds = Some(10);
     }
     let result = state

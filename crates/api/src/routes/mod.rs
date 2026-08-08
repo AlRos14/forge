@@ -231,8 +231,11 @@ async fn task_response_inner(
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow =
-        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, "system");
+    let workflow = WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &api_types::Actor::system(api_types::SystemComponent::General),
+    );
     let canonical_phase = workflow.canonical_phase_for_state(&task.status);
     let mut remaining_retries = HashMap::new();
     for state in &workflow.states {

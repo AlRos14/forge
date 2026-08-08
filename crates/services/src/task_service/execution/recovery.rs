@@ -28,7 +28,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
@@ -468,7 +468,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "user:recovery:resume_session",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ResumeSession,
+            )),
         );
         let now = now_rfc3339();
         let execution = ExecutionRepo::create(
@@ -578,7 +580,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "user:recovery:reexecute",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::Reexecute,
+            )),
         );
         let state = workflow
             .states
@@ -742,6 +746,10 @@ impl TaskService {
             &task.id,
             &gate_state,
             "reset_retry_window",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ResetRetryWindow,
+            ))
+            .display(),
             &reason,
         )
         .await?;
@@ -782,6 +790,10 @@ impl TaskService {
                 &task.id,
                 &task.status,
                 "proceed_once",
+                &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                    api_types::RecoveryAction::ProceedOnce,
+                ))
+                .display(),
                 &reason,
             )
             .await?;
@@ -817,6 +829,10 @@ impl TaskService {
             &task.id,
             &gate_state,
             "proceed_once",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ProceedOnce,
+            ))
+            .display(),
             &transition_reason,
         )
         .await?;
@@ -826,7 +842,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "user:recovery:proceed_once",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ProceedOnce,
+            )),
         );
         let target = workflow
             .states
@@ -842,7 +860,9 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: Some(transition_reason),
-                    triggered_by: "user:recovery:proceed_once".to_owned(),
+                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
+                        api_types::RecoveryAction::ProceedOnce,
+                    )),
                     rejection: true,
                     defer_dispatch_seconds: None,
                 },
@@ -942,6 +962,10 @@ impl TaskService {
             &task.id,
             &plan.gate_state,
             "resume_process",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ResumeProcess,
+            ))
+            .display(),
             &transition_reason,
         )
         .await?;
@@ -950,7 +974,9 @@ impl TaskService {
                 &task,
                 plan.target_state,
                 transition_reason,
-                "user:recovery:resume_process",
+                &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                    api_types::RecoveryAction::ResumeProcess,
+                )),
             )
             .await?;
         self.publish_recovery_applied(
@@ -967,16 +993,13 @@ impl TaskService {
         task: &Task,
         target_state: String,
         reason: String,
-        triggered_by: &str,
+        actor: &api_types::Actor,
     ) -> Result<Task> {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            triggered_by,
-        );
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, actor);
         let uses_system_only_trigger = workflow
             .trigger_between(&task.status, &target_state)
             .is_some_and(|trigger| trigger.system_only());
@@ -1001,6 +1024,7 @@ impl TaskService {
                     &target_state,
                     task.version,
                     &workflow,
+                    actor.clone(),
                     &reason,
                     true,
                 )
@@ -1015,7 +1039,7 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: Some(reason),
-                    triggered_by: triggered_by.to_owned(),
+                    triggered_by: actor.clone(),
                     rejection: true,
                     defer_dispatch_seconds: None,
                 },
@@ -1031,7 +1055,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            "user:recovery:resume_process",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ResumeProcess,
+            )),
         );
         let state = workflow
             .states
@@ -1070,7 +1096,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            "user:recovery",
+            &api_types::Actor::user(api_types::UserActionSource::Api),
         );
         let state = workflow
             .states
@@ -1234,7 +1260,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            "user:recovery",
+            &api_types::Actor::user(api_types::UserActionSource::Api),
         );
         Ok(workflow
             .states
@@ -1277,7 +1303,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "user:recovery:reset_to_initial",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::ResetToInitial,
+            )),
         );
         let initial_state = workflow_initial_state(&workflow)?;
         let assignee_id = if should_clear_assignments_for_reset(annotation) {
@@ -1363,7 +1391,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "user:recovery:mark_reviewed",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::MarkReviewed,
+            )),
         );
         let pass_target = workflow
             .auto_transition_target(&task.status)
@@ -1468,7 +1498,7 @@ impl TaskService {
             let workflow = WorkflowEngine::resolve_workflow_for_task(
                 &task,
                 &project.workflow_definition,
-                "user:retry_hook",
+                &api_types::Actor::user(api_types::UserActionSource::RetryHook),
             );
             let engine = WorkflowEngine {
                 db: Arc::clone(&self.db),
@@ -1488,7 +1518,7 @@ impl TaskService {
                     &task.id,
                     task.version,
                     &workflow,
-                    "user:retry_hook",
+                    &api_types::Actor::user(api_types::UserActionSource::RetryHook),
                     reason.as_deref().unwrap_or("retry_hook"),
                 )
                 .await?
@@ -1530,7 +1560,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &cleared,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::user(api_types::UserActionSource::RetryHook),
         );
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
@@ -1551,6 +1581,7 @@ impl TaskService {
                 &cleared.status,
                 cleared.version,
                 &workflow,
+                api_types::Actor::user(api_types::UserActionSource::RetryHook),
                 &reason,
                 false,
             )
@@ -1575,7 +1606,9 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "user:recovery:retry_review",
+            &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                api_types::RecoveryAction::RetryHook,
+            )),
         );
         let state = workflow
             .states
@@ -1604,7 +1637,9 @@ impl TaskService {
                 &task,
                 reject_target,
                 format!("retry review: {reason_text}"),
-                "user:recovery:retry_review",
+                &api_types::Actor::user(api_types::UserActionSource::Recovery(
+                    api_types::RecoveryAction::RetryHook,
+                )),
             )
             .await?;
         let fresh = TaskRepo::get_by_id(&*self.db, &bounced.id, false)
@@ -1617,7 +1652,9 @@ impl TaskService {
                 TransitionOptions {
                     version: fresh.version,
                     reason: Some(format!("retry review: {reason_text}")),
-                    triggered_by: "user:recovery:retry_review".to_owned(),
+                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
+                        api_types::RecoveryAction::RetryHook,
+                    )),
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },
@@ -1706,7 +1743,7 @@ impl TaskService {
             let workflow = WorkflowEngine::resolve_workflow_for_task(
                 &task,
                 &project.workflow_definition,
-                "user:skip_hook_once",
+                &api_types::Actor::user(api_types::UserActionSource::SkipHookOnce),
             );
             let barrier_state = task
                 .entry_barrier_json
@@ -1761,7 +1798,7 @@ impl TaskService {
                     &updated.id,
                     updated.version,
                     &workflow,
-                    "user:skip_hook_once",
+                    &api_types::Actor::user(api_types::UserActionSource::SkipHookOnce),
                     reason.as_deref().unwrap_or("skip_hook_once"),
                 )
                 .await?
@@ -1920,7 +1957,7 @@ fn metadata_recovery_annotation(
     Ok(api_types::TaskBlockingAnnotation {
         annotation_type,
         blocking_reason: reason.clone(),
-        blocked_by: Some("system".to_owned()),
+        blocked_by: Some(api_types::Actor::system(api_types::SystemComponent::Workflow).display()),
         blocked_at: metadata
             .get("created_at")
             .and_then(Value::as_str)

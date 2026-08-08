@@ -148,7 +148,7 @@ impl TaskService {
             &active_execution,
             "cancelled by role reassignment",
             db::StopReason::RoleReassigned,
-            "user:role_reassignment",
+            &api_types::Actor::user(api_types::UserActionSource::RoleReassignment),
             db::ResumePolicy::None,
         )
         .await?;
@@ -165,7 +165,7 @@ impl TaskService {
                 &initial_state,
                 task.version,
                 &workflow,
-                "user:reassignment",
+                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
                 "coder reassigned",
             )
             .await?;
@@ -236,7 +236,7 @@ impl TaskService {
             &active_execution,
             "cancelled by role reassignment",
             db::StopReason::RoleReassigned,
-            "user:role_reassignment",
+            &api_types::Actor::user(api_types::UserActionSource::RoleReassignment),
             db::ResumePolicy::None,
         )
         .await?;
@@ -251,7 +251,7 @@ impl TaskService {
                 &initial_state,
                 task.version,
                 &workflow,
-                "user:reassignment",
+                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
                 "coder reassigned",
             )
             .await?;
@@ -387,7 +387,7 @@ impl TaskService {
         execution: &Execution,
         reason: &str,
         stop_reason: db::StopReason,
-        stopped_by: &str,
+        actor: &api_types::Actor,
         resume_policy: db::ResumePolicy,
     ) -> Result<()> {
         let reconciliation_reason = match &stop_reason {
@@ -412,7 +412,7 @@ impl TaskService {
                 id: execution.id.clone(),
                 status: Some(ExecutionStatus::Cancelled),
                 stop_reason: Some(Some(stop_reason)),
-                stopped_by: Some(Some(stopped_by.to_owned())),
+                stopped_by: Some(Some(actor.display())),
                 resume_policy: Some(Some(resume_policy)),
                 stopped_at: Some(Some(now_rfc3339())),
                 agent_session_id: None,

@@ -955,6 +955,7 @@ pub trait TransitionLogRepo: Send + Sync {
         task_id: &str,
         current_state: &str,
         action_kind: &str,
+        triggered_by: &str,
         reason: &str,
     ) -> std::result::Result<TransitionLog, crate::DbError>;
     async fn list_by_task(

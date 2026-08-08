@@ -189,7 +189,7 @@ async fn annotate_before_work_hook_block(
     let annotation = json!({
         "type": annotation_type,
         "blocking_reason": annotation_type,
-        "blocked_by": "system:lifecycle_hook",
+        "blocked_by": api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
         "blocked_at": now_rfc3339(),
         "blocked_execution_id": null,
         "message": failure.error.clone().unwrap_or_else(|| "blocking before_work hook failed".to_owned()),

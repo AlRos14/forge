@@ -29,8 +29,11 @@ pub async fn preview_effective_prompt(
     let project = ProjectRepo::get_by_id(&*db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-    let workflow =
-        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, "system");
+    let workflow = WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &api_types::Actor::system(api_types::SystemComponent::General),
+    );
     ensure_known_role(&workflow, role)?;
 
     let (preview_state, trigger_dispatch) =

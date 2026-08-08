@@ -2,8 +2,9 @@
 use std::sync::Arc;
 
 use api_types::{
-    CanonicalPhase, FailurePolicy, HookAudience, HookResultEntry, HookSpec, StateDefinition,
-    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    Actor, CanonicalPhase, FailurePolicy, HookAudience, HookResultEntry, HookSpec, StateDefinition,
+    StateHooks, StateKind, UserActionSource, WorkflowDefinition, WorkflowTrigger,
+    WorkflowTriggerDefinition,
 };
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
@@ -31,7 +32,7 @@ async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_gu
             "qa",
             todo.version,
             &workflow,
-            "user:tester",
+            &Actor::user(UserActionSource::Test),
             "ready for qa",
             false,
         )
@@ -46,7 +47,7 @@ async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_gu
             "cancelled",
             qa.version,
             &workflow,
-            "user:tester",
+            &Actor::user(UserActionSource::Test),
             "cancel explicitly",
             false,
         )

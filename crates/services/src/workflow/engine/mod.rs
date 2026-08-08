@@ -1,7 +1,7 @@
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
 
 use api_types::{
-    FailurePolicy, StateDefinition, StateKind, TaskMovedEventPayload, WorkflowDefinition,
+    Actor, FailurePolicy, StateDefinition, StateKind, TaskMovedEventPayload, WorkflowDefinition,
     WorkflowTrigger,
 };
 use db::{
@@ -80,7 +80,7 @@ impl WorkflowEngine {
             task_id = %task_id,
             target_state = %target_state,
             version = version,
-            triggered_by = %triggered_by,
+            actor = %actor,
             reason = %reason,
             rejection = rejection,
         )
@@ -92,7 +92,7 @@ impl WorkflowEngine {
         target_state: &str,
         version: i64,
         workflow: &WorkflowDefinition,
-        triggered_by: &str,
+        actor: &Actor,
         reason: &str,
         rejection: bool,
     ) -> crate::Result<TransitionResult> {
@@ -101,7 +101,7 @@ impl WorkflowEngine {
             target_state,
             version,
             workflow,
-            triggered_by,
+            actor,
             reason,
             rejection,
             None,
@@ -116,7 +116,7 @@ impl WorkflowEngine {
         target_state: &str,
         version: i64,
         workflow: &WorkflowDefinition,
-        triggered_by: &str,
+        actor: &Actor,
         reason: &str,
         rejection: bool,
         defer_dispatch_until: Option<String>,
@@ -126,7 +126,7 @@ impl WorkflowEngine {
             target_state.to_string(),
             version,
             workflow,
-            triggered_by.to_string(),
+            actor.clone(),
             reason.to_string(),
             rejection,
             false,
@@ -144,7 +144,7 @@ impl WorkflowEngine {
         target_state: &str,
         version: i64,
         workflow: &WorkflowDefinition,
-        triggered_by: &str,
+        actor: &Actor,
         reason: &str,
         move_request: BoardMoveRequest,
     ) -> crate::Result<TransitionResult> {
@@ -153,7 +153,7 @@ impl WorkflowEngine {
             target_state.to_owned(),
             version,
             workflow,
-            triggered_by.to_owned(),
+            actor.clone(),
             reason.to_owned(),
             false,
             false,
@@ -164,12 +164,14 @@ impl WorkflowEngine {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn manual_override_transition(
         &self,
         task_id: &str,
         target_state: &str,
         version: i64,
         workflow: &WorkflowDefinition,
+        actor: Actor,
         reason: &str,
         rejection: bool,
     ) -> crate::Result<TransitionResult> {
@@ -178,7 +180,7 @@ impl WorkflowEngine {
             target_state.to_string(),
             version,
             workflow,
-            "system".to_string(),
+            actor,
             reason.to_string(),
             rejection,
             true,
@@ -194,7 +196,7 @@ impl WorkflowEngine {
         task_id: &str,
         version: i64,
         workflow: &WorkflowDefinition,
-        triggered_by: &str,
+        actor: &Actor,
         reason: &str,
     ) -> crate::Result<TransitionResult> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
@@ -289,7 +291,7 @@ impl WorkflowEngine {
             event_bus: Arc::clone(&self.event_bus),
             gate_config: state.gate_config.clone(),
             workflow: Arc::clone(&workflow_ctx),
-            triggered_by: triggered_by.to_owned(),
+            triggered_by: actor.clone(),
             review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
@@ -310,14 +312,14 @@ impl WorkflowEngine {
         let mut cascade: Option<(String, String)> = None;
         let mut blocked = false;
         for hook in &state.hooks.before_enter {
-            if !hook_audience_matches(hook.applies_to, triggered_by) {
+            if !hook_audience_matches(hook.applies_to, actor) {
                 log_hook_skipped_by_audience(
                     &task.id,
                     &target_state,
                     &target_state,
                     "before_enter",
                     hook,
-                    triggered_by,
+                    actor,
                 );
                 continue;
             }
@@ -328,7 +330,7 @@ impl WorkflowEngine {
                 &target_state,
                 "before_enter",
                 hook,
-                triggered_by,
+                actor,
             );
             let started = Instant::now();
             let result = action.execute(&enter_ctx).await;
@@ -413,7 +415,7 @@ impl WorkflowEngine {
             .await?;
 
             for hook in &state.hooks.on_enter {
-                if !hook_audience_matches(hook.applies_to, triggered_by) {
+                if !hook_audience_matches(hook.applies_to, actor) {
                     continue;
                 }
                 let action = registry::resolve_action(&hook.action)?;
@@ -432,7 +434,7 @@ impl WorkflowEngine {
         if cascade.is_none() {
             let effective_after_enter_hooks = effective_after_enter_hooks(state);
             for hook in &effective_after_enter_hooks {
-                if !hook_audience_matches(hook.applies_to, triggered_by) {
+                if !hook_audience_matches(hook.applies_to, actor) {
                     continue;
                 }
                 let action = registry::resolve_action(&hook.action)?;
@@ -455,7 +457,7 @@ impl WorkflowEngine {
                     cascade_to,
                     task.version,
                     workflow,
-                    "system".to_string(),
+                    Actor::system(api_types::SystemComponent::Workflow),
                     cascade_reason,
                     false,
                     false,
@@ -479,7 +481,7 @@ impl WorkflowEngine {
 
     #[tracing::instrument(
         skip(self, workflow),
-        fields(task_id = %task_id, target_state = %target_state, version = version, triggered_by = %triggered_by, reason = %reason)
+        fields(task_id = %task_id, target_state = %target_state, version = version, actor = %actor, reason = %reason)
     )]
     pub async fn reset_to_initial(
         &self,
@@ -487,7 +489,7 @@ impl WorkflowEngine {
         target_state: &str,
         version: i64,
         workflow: &WorkflowDefinition,
-        triggered_by: &str,
+        actor: &Actor,
         reason: &str,
     ) -> crate::Result<db::Task> {
         let to_state = Self::find_state(workflow, target_state).ok_or_else(|| {
@@ -507,7 +509,7 @@ impl WorkflowEngine {
                 target_state.to_string(),
                 version,
                 workflow,
-                triggered_by.to_string(),
+                actor.clone(),
                 reason.to_string(),
                 false,
                 true,
@@ -571,7 +573,7 @@ impl WorkflowEngine {
     pub fn resolve_workflow_for_task(
         task: &db::Task,
         workflow_definition_json: &str,
-        triggered_by: &str,
+        actor: &Actor,
     ) -> WorkflowDefinition {
         let project_workflow = Self::resolve_workflow(workflow_definition_json);
         if task.parent_task_id.is_none() {
@@ -586,7 +588,7 @@ impl WorkflowEngine {
         if !current_in_subtask {
             return project_workflow;
         }
-        if triggered_by.starts_with("user:") {
+        if actor.is_user() {
             return project_workflow;
         }
         subtask_wf
@@ -599,7 +601,7 @@ impl WorkflowEngine {
         target_state: String,
         version: i64,
         workflow: &'a WorkflowDefinition,
-        triggered_by: String,
+        actor: Actor,
         reason: String,
         rejection: bool,
         skip_before_exit: bool,
@@ -612,7 +614,7 @@ impl WorkflowEngine {
             task_id = %task_id,
             target_state = %target_state,
             version = version,
-            triggered_by = %triggered_by,
+            actor = %actor,
             reason = %reason,
             rejection = rejection,
             skip_before_exit = skip_before_exit,
@@ -632,7 +634,7 @@ impl WorkflowEngine {
                     actual_version = task.version,
                     current_state = %task.status,
                     target_state = %target_state,
-                    triggered_by = %triggered_by,
+                    actor = %actor,
                     "workflow transition rejected by version conflict"
                 );
                 return Err(if board_move.is_some() {
@@ -651,7 +653,7 @@ impl WorkflowEngine {
                 task_id = %task.id,
                 from_state = %current_status,
                 to_state = %target_state,
-                triggered_by = %triggered_by,
+                actor = %actor,
                 reason = %reason,
                 depth = depth,
                 "workflow transition requested"
@@ -668,7 +670,7 @@ impl WorkflowEngine {
             })?;
             let transition = workflow.trigger_between(&current_status, &target_state);
             let trigger_name = transition.map(|trigger| trigger.as_str().to_owned());
-            let is_user_actor = triggered_by.starts_with("user:");
+            let is_user_actor = actor.is_user();
             let none_allowance = transition.is_none()
                 && (((current_status == target_state || to_state.kind == StateKind::Initial)
                     && skip_before_exit)
@@ -680,19 +682,14 @@ impl WorkflowEngine {
                 Some(trigger)
                     if !skip_before_exit
                         && Self::transition_requires_system_actor(trigger, from_state, to_state)
-                        && triggered_by != "system"
+                        && !actor.is_system()
             );
-            let mut triggered_by = triggered_by;
+            let mut actor = actor;
             let effective_skip_before_exit = if is_user_actor
                 && from_state.kind != StateKind::Terminal
                 && (strict_missing_edge || strict_system_only)
             {
-                if !triggered_by.starts_with("user:override:") {
-                    let source = triggered_by
-                        .strip_prefix("user:")
-                        .unwrap_or(&triggered_by);
-                    triggered_by = format!("user:override:{source}");
-                }
+                actor = actor.into_override();
                 false
             } else {
                 match transition {
@@ -703,7 +700,7 @@ impl WorkflowEngine {
                                 from_state = %current_status,
                                 to_state = %target_state,
                                 workflow_trigger = ?transition,
-                                triggered_by = %triggered_by,
+                                actor = %actor,
                                 "workflow transition rejected because it is system-only"
                             );
                             return Err(ServiceError::InvalidOperation {
@@ -729,7 +726,7 @@ impl WorkflowEngine {
                             to_state = %target_state,
                             from_kind = ?from_state.kind,
                             to_kind = ?to_state.kind,
-                            triggered_by = %triggered_by,
+                            actor = %actor,
                             reason = %reason,
                             "workflow transition rejected because no transition is defined"
                         );
@@ -744,7 +741,7 @@ impl WorkflowEngine {
                 from_kind = ?from_state.kind,
                 to_kind = ?to_state.kind,
                 workflow_trigger = ?transition,
-                triggered_by = %triggered_by,
+                actor = %actor,
                 reason = %reason,
                 rejection = rejection,
                 skip_before_exit = effective_skip_before_exit,
@@ -788,7 +785,7 @@ impl WorkflowEngine {
                 event_bus: Arc::clone(&self.event_bus),
                 gate_config: from_state.gate_config.clone(),
                 workflow: Arc::clone(&workflow_ctx),
-                triggered_by: triggered_by.clone(),
+                triggered_by: actor.clone(),
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
@@ -814,7 +811,7 @@ impl WorkflowEngine {
                 event_bus: Arc::clone(&self.event_bus),
                 gate_config: to_state.gate_config.clone(),
                 workflow: Arc::clone(&workflow_ctx),
-                triggered_by: triggered_by.clone(),
+                triggered_by: actor.clone(),
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
@@ -843,14 +840,14 @@ impl WorkflowEngine {
 
             if !effective_skip_before_exit {
                 for hook in &from_state.hooks.before_exit {
-                    if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                    if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
                             &task.id,
                             &current_status,
                             &target_state,
                             "before_exit",
                             hook,
-                            &triggered_by,
+                            &actor,
                         );
                         continue;
                     }
@@ -861,7 +858,7 @@ impl WorkflowEngine {
                         &target_state,
                         "before_exit",
                         hook,
-                        &triggered_by,
+                        &actor,
                     );
                     let started = Instant::now();
                     let result = action.execute(&exit_ctx).await;
@@ -919,14 +916,14 @@ impl WorkflowEngine {
 
             if board_move.is_some() {
                 for hook in &to_state.hooks.before_enter {
-                    if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                    if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
                             &task.id,
                             &current_status,
                             &target_state,
                             "before_enter",
                             hook,
-                            &triggered_by,
+                            &actor,
                         );
                         continue;
                     }
@@ -937,7 +934,7 @@ impl WorkflowEngine {
                         &target_state,
                         "before_enter",
                         hook,
-                        &triggered_by,
+                        &actor,
                     );
                     let started = Instant::now();
                     let result = action.execute(&enter_ctx).await;
@@ -1035,7 +1032,7 @@ impl WorkflowEngine {
                             entry_barrier_json: entry_barrier_json.clone(),
                             transition_log_id: new_uuid_v4(),
                             trigger_name: trigger_name.clone(),
-                            triggered_by: triggered_by.clone(),
+                            triggered_by: actor.display(),
                             trigger_reason: reason.clone(),
                             rejection,
                             updated_at: updated_at.clone(),
@@ -1098,7 +1095,7 @@ impl WorkflowEngine {
                             from_state: current_status.clone(),
                             to_state: target_state.clone(),
                             trigger_name: trigger_name.clone(),
-                            triggered_by: triggered_by.clone(),
+                            triggered_by: actor.display(),
                             trigger_reason: reason.clone(),
                             hook_results_json: None,
                             rejection,
@@ -1137,7 +1134,7 @@ impl WorkflowEngine {
                 task_id = %task.id,
                 from_state = %current_status,
                 to_state = %target_state,
-                triggered_by = %triggered_by,
+                actor = %actor,
                 reason = %reason,
                 transition_log_id = %transition_log.id,
                 "workflow transition applied"
@@ -1183,14 +1180,14 @@ impl WorkflowEngine {
             }
 
             for hook in &from_state.hooks.on_exit {
-                if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                if !hook_audience_matches(hook.applies_to, &actor) {
                     log_hook_skipped_by_audience(
                         &task.id,
                         &current_status,
                         &target_state,
                         "on_exit",
                         hook,
-                        &triggered_by,
+                        &actor,
                     );
                     continue;
                 }
@@ -1202,7 +1199,7 @@ impl WorkflowEngine {
                     &target_state,
                     "on_exit",
                     hook,
-                    &triggered_by,
+                    &actor,
                 );
                 let started = Instant::now();
                 let result = action.execute(&exit_ctx).await;
@@ -1261,14 +1258,14 @@ impl WorkflowEngine {
                 let mut before_enter_blocked = false;
                 let mut before_enter_barrier_resolved = false;
                 for hook in &to_state.hooks.before_enter {
-                    if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                    if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
                             &task.id,
                             &current_status,
                             &target_state,
                             "before_enter",
                             hook,
-                            &triggered_by,
+                            &actor,
                         );
                         continue;
                     }
@@ -1279,7 +1276,7 @@ impl WorkflowEngine {
                         &target_state,
                         "before_enter",
                         hook,
-                        &triggered_by,
+                        &actor,
                     );
                     let started = Instant::now();
                     let result = action.execute(&enter_ctx).await;
@@ -1454,14 +1451,14 @@ impl WorkflowEngine {
 
             if cascade.is_none() && !skip_target_enter_hooks {
                 for hook in &to_state.hooks.on_enter {
-                    if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                    if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
                             &task.id,
                             &current_status,
                             &target_state,
                             "on_enter",
                             hook,
-                            &triggered_by,
+                            &actor,
                         );
                         continue;
                     }
@@ -1489,7 +1486,7 @@ impl WorkflowEngine {
                         &target_state,
                         "on_enter",
                         hook,
-                        &triggered_by,
+                        &actor,
                     );
                     let started = Instant::now();
                     let result = action.execute(&enter_ctx).await;
@@ -1548,14 +1545,14 @@ impl WorkflowEngine {
             if cascade.is_none() && !skip_target_enter_hooks {
                 let effective_after_enter_hooks = effective_after_enter_hooks(to_state);
                 for hook in &effective_after_enter_hooks {
-                    if !hook_audience_matches(hook.applies_to, &triggered_by) {
+                    if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
                             &task.id,
                             &current_status,
                             &target_state,
                             "after_enter",
                             hook,
-                            &triggered_by,
+                            &actor,
                         );
                         continue;
                     }
@@ -1567,7 +1564,7 @@ impl WorkflowEngine {
                         &target_state,
                         "after_enter",
                         hook,
-                        &triggered_by,
+                        &actor,
                     );
                     let started = Instant::now();
                     let result = action.execute(&enter_ctx).await;
@@ -1719,7 +1716,7 @@ impl WorkflowEngine {
                             cascade_to,
                             task.version,
                             workflow,
-                            "system".to_string(),
+                            Actor::system(api_types::SystemComponent::Workflow),
                             cascade_reason,
                             cascade_rejection,
                             false,
@@ -1839,12 +1836,18 @@ mod resolve_workflow_tests {
     fn root_task_always_uses_project_workflow() {
         let wf_json = project_workflow_json();
         for (status, actor) in [
-            (default_states::TODO, "user:board"),
-            (default_states::IN_PROGRESS, "system"),
-            (default_states::REVIEW, "agent:abc"),
+            (
+                default_states::TODO,
+                api_types::Actor::user(api_types::UserActionSource::Board),
+            ),
+            (
+                default_states::IN_PROGRESS,
+                api_types::Actor::system(api_types::SystemComponent::General),
+            ),
+            (default_states::REVIEW, api_types::Actor::agent("abc")),
         ] {
             let resolved =
-                WorkflowEngine::resolve_workflow_for_task(&task(None, status), &wf_json, actor);
+                WorkflowEngine::resolve_workflow_for_task(&task(None, status), &wf_json, &actor);
             assert!(
                 uses_project_workflow(&resolved),
                 "root task in {status} with actor {actor} must use project workflow"
@@ -1855,11 +1858,15 @@ mod resolve_workflow_tests {
     #[test]
     fn subtask_in_shared_state_uses_subtask_workflow_for_non_user_actors() {
         let wf_json = project_workflow_json();
-        for actor in ["system", "agent:runner", "daemon:embedded"] {
+        for actor in [
+            api_types::Actor::system(api_types::SystemComponent::General),
+            api_types::Actor::agent("runner"),
+            api_types::Actor::system(api_types::SystemComponent::Dispatch),
+        ] {
             let resolved = WorkflowEngine::resolve_workflow_for_task(
                 &task(Some(new_uuid_v4()), default_states::IN_PROGRESS),
                 &wf_json,
-                actor,
+                &actor,
             );
             assert!(
                 uses_subtask_workflow(&resolved),
@@ -1875,11 +1882,17 @@ mod resolve_workflow_tests {
     #[test]
     fn subtask_in_shared_state_uses_project_workflow_for_user_actors() {
         let wf_json = project_workflow_json();
-        for actor in ["user:board", "user:override:api", "user:test"] {
+        for actor in [
+            api_types::Actor::user(api_types::UserActionSource::Board),
+            api_types::Actor::user(api_types::UserActionSource::Override(Box::new(
+                api_types::UserActionSource::Api,
+            ))),
+            api_types::Actor::user(api_types::UserActionSource::Test),
+        ] {
             let resolved = WorkflowEngine::resolve_workflow_for_task(
                 &task(Some(new_uuid_v4()), default_states::TODO),
                 &wf_json,
-                actor,
+                &actor,
             );
             assert!(
                 uses_project_workflow(&resolved),
@@ -1891,11 +1904,15 @@ mod resolve_workflow_tests {
     #[test]
     fn subtask_in_project_only_state_uses_project_workflow_for_all_actors() {
         let wf_json = project_workflow_json();
-        for actor in ["user:board", "system", "agent:runner"] {
+        for actor in [
+            api_types::Actor::user(api_types::UserActionSource::Board),
+            api_types::Actor::system(api_types::SystemComponent::General),
+            api_types::Actor::agent("runner"),
+        ] {
             let resolved = WorkflowEngine::resolve_workflow_for_task(
                 &task(Some(new_uuid_v4()), default_states::REVIEW),
                 &wf_json,
-                actor,
+                &actor,
             );
             assert!(
                 uses_project_workflow(&resolved),

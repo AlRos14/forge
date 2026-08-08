@@ -100,7 +100,7 @@ impl TaskService {
         let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Dispatch),
         );
         if workflow
             .states

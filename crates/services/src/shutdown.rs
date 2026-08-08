@@ -65,7 +65,7 @@ impl GracefulShutdown {
                 &self.db,
                 &id,
                 StopReason::GracefulShutdown,
-                "system:graceful_shutdown",
+                &api_types::Actor::system(api_types::SystemComponent::GracefulShutdown),
                 ResumePolicy::Auto,
             )
             .await

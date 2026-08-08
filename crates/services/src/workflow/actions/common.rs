@@ -126,7 +126,7 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
                 default_states::IN_PROGRESS,
                 current.version,
                 &workflow,
-                "system",
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
                 "root done propagation",
                 false,
             )
@@ -141,7 +141,7 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
             target_state,
             current.version,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "root subtask cascade",
             false,
         )
