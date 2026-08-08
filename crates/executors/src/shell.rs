@@ -308,6 +308,7 @@ impl ShellExecutor {
                 summary: None,
                 error: None,
                 usage: None,
+                ..Default::default()
             });
         }
 
@@ -319,6 +320,7 @@ impl ShellExecutor {
                 summary: None,
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         } else {
             Ok(ExecutionResult {
@@ -328,6 +330,7 @@ impl ShellExecutor {
                 summary: None,
                 error: Some(format!("shell command exited with status {status}")),
                 usage: None,
+                ..Default::default()
             })
         }
     }

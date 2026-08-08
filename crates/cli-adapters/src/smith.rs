@@ -16,6 +16,28 @@ use tokio::sync::Mutex as AsyncMutex;
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 500;
 
+/// Terminal `result` statuses that mean the provider's quota pool is
+/// exhausted (Smith has already rotated through the provider's credentials).
+const SMITH_LIMIT_STATUSES: &[&str] = &[
+    "usage_limited",
+    "budget_limited",
+    "limit_reached",
+    "limit_exhausted",
+    "rate_limited",
+];
+
+/// Structured runtime-event error kinds that signal quota exhaustion.
+const SMITH_LIMIT_ERROR_KINDS: &[&str] = &["rate_limited", "limit_exhausted"];
+
+/// Structured runtime-event error kinds that signal an auth failure a wait
+/// cannot cure.
+const SMITH_AUTH_ERROR_KINDS: &[&str] = &[
+    "unauthorized",
+    "credential_expired",
+    "credential_invalid",
+    "credential_missing",
+];
+
 struct RunningExecution {
     child: Arc<AsyncMutex<Child>>,
     cancelled: Arc<AtomicBool>,
@@ -245,7 +267,12 @@ impl CodingExecutorAdapter for SmithAdapter {
                 summary: stream.summary,
                 error: None,
                 usage: stream.usage,
+                ..Default::default()
             });
+        }
+
+        if let Some(availability) = availability_error(&stream, status.success()) {
+            return Err(availability);
         }
 
         if let Some(error) = stream.error {
@@ -256,6 +283,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 summary: stream.summary,
                 error: Some(error),
                 usage: stream.usage,
+                ..Default::default()
             });
         }
 
@@ -267,6 +295,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 summary: stream.summary,
                 error: Some(smith_run_error(status, &stream.stderr_tail)),
                 usage: stream.usage,
+                ..Default::default()
             });
         }
 
@@ -290,6 +319,7 @@ impl CodingExecutorAdapter for SmithAdapter {
             summary: stream.summary,
             error: None,
             usage: stream.usage,
+            ..Default::default()
         })
     }
 
@@ -314,6 +344,11 @@ impl CodingExecutorAdapter for SmithAdapter {
     }
 }
 
+#[derive(Clone, Default)]
+struct LimitSignal {
+    retry_after: Option<std::time::Duration>,
+}
+
 #[derive(Default)]
 struct StreamResult {
     agent_session_id: Option<String>,
@@ -321,6 +356,78 @@ struct StreamResult {
     error: Option<String>,
     stderr_tail: String,
     usage: Option<TokenUsage>,
+    /// Limit signal from the terminal `result` line — always classifies.
+    terminal_limit: Option<LimitSignal>,
+    /// Limit signal from a mid-run runtime event — classifies only when the
+    /// run also ends badly (Smith may have recovered internally).
+    observed_limit: Option<LimitSignal>,
+    /// Structured auth-failure kind observed in runtime events.
+    auth_failure: Option<String>,
+}
+
+/// Availability classification from structured stream signals only.
+/// Assistant output text is never an input to this decision.
+fn availability_error(stream: &StreamResult, exit_ok: bool) -> Option<ExecutorError> {
+    let ended_badly = stream.error.is_some() || !exit_ok;
+    let limit = stream.terminal_limit.clone().or_else(|| {
+        if ended_badly {
+            stream.observed_limit.clone()
+        } else {
+            None
+        }
+    });
+    if let Some(signal) = limit {
+        return Some(ExecutorError::UsageExhausted {
+            retry_after: signal.retry_after,
+            usage: stream.usage.clone(),
+        });
+    }
+    match &stream.auth_failure {
+        Some(kind) if ended_badly => Some(ExecutorError::Unavailable(format!(
+            "smith authentication failure: {kind}"
+        ))),
+        _ => None,
+    }
+}
+
+/// Extract a retry hint from `retry_after_ms` (relative) or
+/// `limit_resets_at_ms` (epoch), directly or one level down.
+fn parse_retry_after(value: &serde_json::Value) -> Option<std::time::Duration> {
+    fn direct(value: &serde_json::Value) -> Option<std::time::Duration> {
+        if let Some(ms) = value.get("retry_after_ms").and_then(|v| v.as_u64()) {
+            return Some(std::time::Duration::from_millis(ms));
+        }
+        if let Some(resets_at) = value.get("limit_resets_at_ms").and_then(|v| v.as_u64()) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            return Some(std::time::Duration::from_millis(
+                resets_at.saturating_sub(now_ms),
+            ));
+        }
+        None
+    }
+    direct(value).or_else(|| {
+        ["error", "rate_limit", "limits", "usage"]
+            .iter()
+            .find_map(|key| value.get(key).and_then(direct))
+    })
+}
+
+/// Structured error kind carried by a runtime event payload, if any.
+fn runtime_error_kind(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("error")
+        .and_then(|error| error.get("kind"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            if payload.get("event").and_then(|v| v.as_str()) == Some("error") {
+                payload.get("kind").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        })
 }
 
 async fn stream_run_output(
@@ -430,6 +537,15 @@ async fn process_smith_stdout_line(
                 }
 
                 if let Some(payload) = payload {
+                    if let Some(kind) = runtime_error_kind(payload) {
+                        if SMITH_LIMIT_ERROR_KINDS.contains(&kind) {
+                            result.observed_limit = Some(LimitSignal {
+                                retry_after: parse_retry_after(payload),
+                            });
+                        } else if SMITH_AUTH_ERROR_KINDS.contains(&kind) {
+                            result.auth_failure = Some(kind.to_owned());
+                        }
+                    }
                     let event_kind = payload.get("event").and_then(|v| v.as_str());
                     match event_kind {
                         Some("text_delta") => {
@@ -486,6 +602,11 @@ async fn process_smith_stdout_line(
             }
 
             let status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if SMITH_LIMIT_STATUSES.contains(&status) {
+                result.terminal_limit = Some(LimitSignal {
+                    retry_after: parse_retry_after(&parsed),
+                });
+            }
             if status == "approval_required" {
                 let approval_details = parsed
                     .get("approval_required")
@@ -615,6 +736,138 @@ mod git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stream_fixture(lines: &[serde_json::Value]) -> StreamResult {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = LogWriter::new(
+            dir.path().join("fixture.jsonl"),
+            "exec-fixture".to_owned(),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let mut result = StreamResult::default();
+        let mut chunks = Vec::new();
+        for line in lines {
+            process_smith_stdout_line(&line.to_string(), &mut writer, &mut result, &mut chunks)
+                .await
+                .expect("fixture line processes");
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn terminal_limit_status_classifies_as_usage_exhausted() {
+        let stream = stream_fixture(&[serde_json::json!({
+            "type": "result",
+            "status": "usage_limited",
+            "session_id": "session-1",
+            "retry_after_ms": 90_000,
+            "usage": {"current_turn": {"input_uncached": 100, "output": 40}},
+        })])
+        .await;
+
+        let error = availability_error(&stream, false).expect("classifies");
+        match error {
+            ExecutorError::UsageExhausted { retry_after, usage } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_millis(90_000)));
+                assert_eq!(usage.expect("partial usage carried").output_tokens, 40);
+            }
+            other => panic!("expected UsageExhausted, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_limit_error_classifies_only_when_run_ends_badly() {
+        let limit_event = serde_json::json!({
+            "type": "runtime_event",
+            "event": {
+                "session": "session-1",
+                "payload": {
+                    "event": "provider_attempt_finished",
+                    "error": {"kind": "limit_exhausted", "retry_after_ms": 30_000},
+                },
+            },
+        });
+
+        // Non-zero exit after the structured limit event → classified.
+        let bad = stream_fixture(std::slice::from_ref(&limit_event)).await;
+        assert!(matches!(
+            availability_error(&bad, false),
+            Some(ExecutorError::UsageExhausted { .. })
+        ));
+
+        // Smith recovered (ok result, zero exit) → no classification.
+        let recovered = stream_fixture(&[
+            limit_event,
+            serde_json::json!({"type": "result", "status": "ok", "output": "done"}),
+        ])
+        .await;
+        assert!(availability_error(&recovered, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_error_kind_classifies_as_unavailable() {
+        let stream = stream_fixture(&[serde_json::json!({
+            "type": "runtime_event",
+            "event": {
+                "payload": {
+                    "event": "error",
+                    "error": {"kind": "credential_expired"},
+                },
+            },
+        })])
+        .await;
+
+        match availability_error(&stream, false) {
+            Some(ExecutorError::Unavailable(reason)) => {
+                assert!(reason.contains("credential_expired"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_text_mentioning_rate_limit_never_classifies() {
+        let stream = stream_fixture(&[
+            serde_json::json!({
+                "type": "runtime_event",
+                "event": {
+                    "payload": {
+                        "event": "text_delta",
+                        "text": "we hit a rate limit in the API under test; usage limit reached",
+                    },
+                },
+            }),
+            serde_json::json!({"type": "result", "status": "error"}),
+        ])
+        .await;
+
+        // Even though the run ended badly, prose is not a signal.
+        assert!(availability_error(&stream, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn limit_resets_at_epoch_produces_relative_retry() {
+        let resets_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        let stream = stream_fixture(&[serde_json::json!({
+            "type": "result",
+            "status": "limit_reached",
+            "rate_limit": {"limit_resets_at_ms": resets_at_ms},
+        })])
+        .await;
+
+        match availability_error(&stream, false) {
+            Some(ExecutorError::UsageExhausted { retry_after, .. }) => {
+                let retry = retry_after.expect("relative retry derived");
+                assert!(retry <= std::time::Duration::from_millis(60_000));
+                assert!(retry >= std::time::Duration::from_millis(50_000));
+            }
+            other => panic!("expected UsageExhausted, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_build_command() {

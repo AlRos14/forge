@@ -298,10 +298,25 @@ impl TaskService {
             })?
             .to_owned();
         if parent_executor_type != agent.executor_type {
-            return Err(ServiceError::invalid_operation(format!(
-                "follow-up requires same executor type: parent used '{}' but agent '{}' uses '{}'",
-                parent_executor_type, agent.id, agent.executor_type
-            )));
+            // A routed agent may legitimately have run its parent execution
+            // on a cross-CLI fallback candidate; accept any executor family
+            // present in the agent's configured route.
+            let parent_family_routed = serde_json::from_str::<Value>(&agent.config_json)
+                .ok()
+                .and_then(|config| config.get(executors::FALLBACKS_CONFIG_KEY).cloned())
+                .and_then(|fallbacks| fallbacks.as_array().cloned())
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("executor_type").and_then(Value::as_str)
+                            == Some(parent_executor_type.as_str())
+                    })
+                });
+            if !parent_family_routed {
+                return Err(ServiceError::invalid_operation(format!(
+                    "follow-up requires same executor type: parent used '{}' but agent '{}' uses '{}'",
+                    parent_executor_type, agent.id, agent.executor_type
+                )));
+            }
         }
 
         self.ensure_no_running_interactive_execution(&task.id)
@@ -316,11 +331,21 @@ impl TaskService {
         .await?;
         let mut executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
-        if let Some(snapshot_json) = executor_config_snapshot_json.as_deref() {
-            executor_config_snapshot_json = Some(executor_snapshot_with_resume_thread(
-                snapshot_json,
-                &parent_agent_session_id,
-            )?);
+        if let (Some(snapshot_json), Some(parent_snapshot_json)) = (
+            executor_config_snapshot_json.as_deref(),
+            parent_execution.executor_config_snapshot_json.as_deref(),
+        ) {
+            // Resume is candidate-identity-aware: the parent's winning
+            // candidate is promoted when still routed; a candidate switch
+            // starts a fresh session instead of replaying another
+            // account's session id.
+            executor_config_snapshot_json = Some(
+                crate::task_service::config::executor_snapshot_with_sticky_resume(
+                    snapshot_json,
+                    parent_snapshot_json,
+                    &parent_agent_session_id,
+                )?,
+            );
         }
 
         let now = now_rfc3339();

@@ -544,6 +544,7 @@ impl CodexAdapter {
                 summary,
                 error,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
+                ..Default::default()
             });
         }
 
@@ -558,6 +559,7 @@ impl CodexAdapter {
                 summary,
                 error: None,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
+                ..Default::default()
             });
         }
         let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
@@ -577,6 +579,7 @@ impl CodexAdapter {
                         summary,
                         error: Some(error.to_string()),
                         usage: usage.map(|usage| usage_with_model(usage, &config)),
+                        ..Default::default()
                     });
                 }
             };
@@ -588,6 +591,7 @@ impl CodexAdapter {
             summary,
             error: None,
             usage: usage.map(|usage| usage_with_model(usage, &config)),
+            ..Default::default()
         })
     }
 }

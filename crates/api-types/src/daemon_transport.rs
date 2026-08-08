@@ -155,6 +155,44 @@ pub struct ExecutionTerminalNotification {
     pub after_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RemoteTokenUsage>,
+    /// Structured failure disposition. Absent on older daemons — the server
+    /// then falls back to generic executor-failed handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<RemoteExecutionFailureClass>,
+    /// RFC3339 time when an unavailable executor route is worth retrying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_candidate: Option<RemoteResolvedCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_attempts: Option<Vec<RemoteRouteAttempt>>,
+}
+
+/// Structured failure class carried across the daemon protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteExecutionFailureClass {
+    TaskFailed,
+    ExecutorUnavailable,
+}
+
+/// The executor candidate that actually ran a remote execution.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteResolvedCandidate {
+    pub candidate_key: String,
+    pub executor_type: String,
+    #[ts(type = "Record<string, unknown>")]
+    pub config: serde_json::Value,
+}
+
+/// One candidate attempt outcome from a remote execution's fallback route.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteRouteAttempt {
+    pub candidate_key: String,
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

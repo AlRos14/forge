@@ -52,6 +52,7 @@ impl CodingExecutorAdapter for NullAdapter {
             summary: Some("Null executor completed successfully.".to_owned()),
             error: None,
             usage: None,
+            ..Default::default()
         })
     }
 

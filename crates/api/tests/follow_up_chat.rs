@@ -327,6 +327,7 @@ impl CodingExecutorAdapter for CompletingShellAdapter {
                 summary: Some("interactive execution completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }

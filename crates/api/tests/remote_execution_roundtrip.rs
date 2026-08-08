@@ -367,3 +367,176 @@ async fn remote_daemon_disconnect_fails_running_execution() {
         "disconnect failure should expose recovery annotation"
     );
 }
+
+/// Fallback-chain round-trip over the daemon protocol: the snapshot carries
+/// the route to the daemon, and the structured terminal notification carries
+/// disposition, attempts, and the winner back for persistence.
+#[tokio::test]
+async fn remote_executor_unavailable_defers_and_persists_route() {
+    let mut fixture = setup_remote_roundtrip("remote-unavailable").await;
+
+    // A routed agent: shell primary with a null-executor fallback.
+    let routed_agent: AgentResponse = json_request_with_bearer(
+        &fixture.harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        &admin_jwt(),
+        json!({
+            "name": "remote-unavailable-routed-agent",
+            "executor_type": "shell",
+            "daemon_id": fixture.registration.daemon_id,
+            "config_json": {
+                "fallbacks": [ { "executor_type": "null", "config": {} } ]
+            },
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let created_task: TaskResponse = json_request(
+        &fixture.harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", fixture.project_id),
+        json!({
+            "title": "Remote unavailable roundtrip",
+            "description": "exhaust every candidate",
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task_id = created_task.id.clone();
+
+    let claim_app = fixture.harness.app.clone();
+    let claim_agent_id = routed_agent.id.clone();
+    let claim_task_id = task_id.clone();
+    let claim_handle = tokio::spawn(async move {
+        json_request::<TaskResponse>(
+            &claim_app,
+            Method::POST,
+            &format!("/api/v1/tasks/{claim_task_id}/claim"),
+            json!({ "agent_id": claim_agent_id, "overrides": null }),
+            StatusCode::OK,
+        )
+        .await
+    });
+
+    let (start_id, start_params) =
+        next_daemon_request(&mut fixture.daemon_socket, METHOD_EXECUTION_START).await;
+    let execution_id = start_params["execution_id"]
+        .as_str()
+        .expect("execution id in start params")
+        .to_owned();
+    // Server → daemon: the snapshot carries the full route.
+    let routing = &start_params["executor_config"]["routing"];
+    assert_eq!(routing["policy"], "ordered_fallback_v1");
+    assert_eq!(
+        routing["candidates"].as_array().expect("candidates").len(),
+        2
+    );
+
+    send_daemon_response(
+        &mut fixture.daemon_socket,
+        start_id,
+        api_types::ExecutionStartResult {
+            execution_id: execution_id.clone(),
+            accepted: true,
+        },
+    )
+    .await;
+    claim_handle.await.expect("claim task joins");
+
+    // Daemon → server: every candidate exhausted, retry known in ~90s.
+    let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc3339();
+    common::fake_daemon::send_daemon_notification(
+        &mut fixture.daemon_socket,
+        api_types::METHOD_EXECUTION_TERMINAL,
+        api_types::ExecutionTerminalNotification {
+            execution_id: execution_id.clone(),
+            exit_code: Some(1),
+            signal: None,
+            error: Some("no executor candidate available".to_owned()),
+            ts: db::now_rfc3339(),
+            status: Some("failed".to_owned()),
+            agent_session_id: None,
+            summary: None,
+            after_sha: None,
+            usage: None,
+            failure_class: Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable),
+            retry_at: Some(retry_at),
+            resolved_candidate: None,
+            route_attempts: Some(vec![
+                api_types::RemoteRouteAttempt {
+                    candidate_key: "shell#primary".to_owned(),
+                    outcome: "usage_exhausted".to_owned(),
+                },
+                api_types::RemoteRouteAttempt {
+                    candidate_key: "null#fallback".to_owned(),
+                    outcome: "unavailable".to_owned(),
+                },
+            ]),
+        },
+    )
+    .await;
+
+    let failed = poll_until_execution_status(
+        &fixture.harness.state,
+        &execution_id,
+        DbExecutionStatus::Failed,
+    )
+    .await;
+    assert_eq!(failed.status, DbExecutionStatus::Failed);
+
+    // Transient unavailability: deferred dispatch scheduled, no retry budget
+    // consumed, task not blocked.
+    let mut deferred_seen = false;
+    for _ in 0..200 {
+        let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
+            .await
+            .expect("task lookup")
+            .expect("task exists");
+        let metadata: Value = task
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        if metadata.get("deferred_dispatch").is_some() {
+            assert!(
+                metadata.get("execution_retry_count").is_none(),
+                "executor unavailability must not consume the retry budget; metadata: {metadata}"
+            );
+            assert!(
+                task.blocked_json.is_none(),
+                "transient unavailability must not block the task; blocked: {:?}",
+                task.blocked_json
+            );
+            deferred_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        deferred_seen,
+        "expected a deferred dispatch to be scheduled"
+    );
+
+    // Attempts and disposition are persisted on the execution snapshot.
+    let stored = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &execution_id)
+        .await
+        .expect("execution lookup")
+        .expect("execution exists");
+    let snapshot: Value = serde_json::from_str(
+        stored
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("snapshot present"),
+    )
+    .expect("snapshot parses");
+    assert_eq!(
+        snapshot["routing"]["attempts"][0]["outcome"],
+        "usage_exhausted"
+    );
+    assert_eq!(
+        snapshot["routing"]["disposition"]["failure_class"],
+        "executor_unavailable"
+    );
+}

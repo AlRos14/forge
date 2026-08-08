@@ -658,6 +658,10 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
             summary: None,
             after_sha: None,
             usage: None,
+            failure_class: None,
+            retry_at: None,
+            resolved_candidate: None,
+            route_attempts: None,
         })
         .expect("terminal notification serializes"),
     };
@@ -733,6 +737,10 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
             summary: None,
             after_sha: None,
             usage: None,
+            failure_class: None,
+            retry_at: None,
+            resolved_candidate: None,
+            route_attempts: None,
         },
     )
     .await;

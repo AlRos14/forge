@@ -499,6 +499,7 @@ impl CodingExecutorAdapter for DelayedCodexAdapter {
                 summary: Some("follow-up deferred".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }

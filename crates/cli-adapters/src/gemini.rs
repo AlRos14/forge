@@ -224,6 +224,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
                         summary: stream.summary,
                         error: Some(e.to_string()),
                         usage: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -238,6 +239,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
             summary: stream.summary,
             error,
             usage: None,
+            ..Default::default()
         })
     }
 

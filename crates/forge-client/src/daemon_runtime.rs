@@ -10,13 +10,15 @@ use anyhow::Result;
 use api_types::{
     DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
     ExecutionStartParams, ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
-    FsListParams, RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
+    FsListParams, RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt,
+    RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
     METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
     METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
     METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use executors::{
-    AdapterExecutor, ExecutionContext, ExecutionOutcome, ExecutionResult, LogEntry, TaskExecutor,
+    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, FallbackExecutor,
+    LogEntry, TaskExecutor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -150,7 +152,7 @@ pub async fn run_command_stream(
 pub struct DaemonRuntime {
     workspace_root: PathBuf,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
-    executor: Arc<AdapterExecutor>,
+    executor: Arc<FallbackExecutor>,
     active_executions: ActiveExecutionTracker,
 }
 
@@ -168,7 +170,7 @@ impl DaemonRuntime {
         Arc::new(Self {
             workspace_root,
             outbound,
-            executor: Arc::new(AdapterExecutor::new(registry)),
+            executor: Arc::new(FallbackExecutor::new(registry)),
             active_executions,
         })
     }
@@ -293,7 +295,7 @@ impl DaemonRuntime {
 }
 
 async fn run_execution_task(
-    executor: Arc<AdapterExecutor>,
+    executor: Arc<FallbackExecutor>,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     mut ctx: ExecutionContext,
     active_executions: ActiveExecutionTracker,
@@ -340,6 +342,10 @@ async fn run_execution_task(
             summary: None,
             after_sha: None,
             usage: None,
+            failure_class: None,
+            retry_at: None,
+            resolved_candidate: None,
+            route_attempts: None,
         },
     };
     emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification);
@@ -372,6 +378,38 @@ fn terminal_notification_from_result(
             cost_usd: usage.cost_usd,
             model: usage.model,
         }),
+        failure_class: result.failure_class.map(|class| match class {
+            ExecutionFailureClass::TaskFailed => RemoteExecutionFailureClass::TaskFailed,
+            ExecutionFailureClass::ExecutorUnavailable => {
+                RemoteExecutionFailureClass::ExecutorUnavailable
+            }
+        }),
+        retry_at: result.retry_after.and_then(|retry_after| {
+            (OffsetDateTime::now_utc() + retry_after)
+                .format(&Rfc3339)
+                .ok()
+        }),
+        resolved_candidate: result
+            .resolved_candidate
+            .map(|candidate| RemoteResolvedCandidate {
+                candidate_key: candidate.candidate_key,
+                executor_type: candidate.executor_type.to_string(),
+                config: candidate.config,
+            }),
+        route_attempts: if result.route_attempts.is_empty() {
+            None
+        } else {
+            Some(
+                result
+                    .route_attempts
+                    .into_iter()
+                    .map(|attempt| RemoteRouteAttempt {
+                        candidate_key: attempt.candidate_key,
+                        outcome: attempt.outcome.as_str().to_owned(),
+                    })
+                    .collect(),
+            )
+        },
     }
 }
 

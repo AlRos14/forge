@@ -9,6 +9,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Added
 
 - First-class support for `Smith` (`smith`) CLI agent executor across `executors`, `cli-adapters`, embedded daemons, MCP tool descriptors, database migrations, and the web UI.
+- Executor fallback chains: an agent's `config_json` may declare ordered `fallbacks: [{executor_type, config}]` candidates (e.g. multiple Smith provider profiles, or a cross-CLI fallback). Both the embedded path and remote daemons dispatch through a `FallbackExecutor` that advances only on structured availability failures (quota exhaustion, missing CLI, failed auth), keeps in-memory per-account cooldowns, aggregates token usage across attempted candidates, and logs every hop to the execution's JSONL log. The Smith and Claude Code adapters classify quota/auth signatures from structured stream signals only.
+- New `FailureKind::ExecutorUnavailable`: when every candidate is unavailable, the task defers dispatch to the structured retry time **without consuming the execution retry budget** (transient), or blocks for manual reconfiguration (permanent). The generated `FailureKind` TypeScript union gains `'executor_unavailable'`.
+- Daemon protocol: `ExecutionTerminalNotification` gains optional `failure_class`, `retry_at`, `resolved_candidate`, and `route_attempts` fields (additive — older daemons degrade to generic executor-failed handling).
+- Session resume is now candidate-identity-aware: follow-ups promote the parent execution's winning candidate when it is still routed, and a candidate switch (including a different Smith profile on the same executor) starts a fresh session instead of replaying another account's session id. Smith executions now inject `resume_session_id` on follow-up like Claude Code/Cursor.
 
 ## [0.5.0] - 2026-08-03
 

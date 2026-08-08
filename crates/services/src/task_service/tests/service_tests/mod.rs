@@ -31,6 +31,7 @@ impl TaskExecutor for NoDiffExecutor {
             summary: None,
             error: None,
             usage: None,
+            ..Default::default()
         })
     }
 
@@ -70,6 +71,7 @@ impl TaskExecutor for BurstLogExecutor {
             summary: None,
             error: None,
             usage: None,
+            ..Default::default()
         })
     }
 
@@ -122,6 +124,7 @@ impl TaskExecutor for CountingExecutor {
             summary: None,
             error: None,
             usage: None,
+            ..Default::default()
         })
     }
 

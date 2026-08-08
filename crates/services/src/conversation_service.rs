@@ -1212,6 +1212,7 @@ mod tests {
                 summary: Some("Acknowledged".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         }
 
@@ -1280,6 +1281,7 @@ mod tests {
                 summary: Some("Tool completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         }
 

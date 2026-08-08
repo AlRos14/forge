@@ -219,6 +219,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                     summary: Some("auditor passed the implementation".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
 
@@ -240,6 +241,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                     summary: Some("executor completed conflicting change".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 })
             } else {
                 while !allow_follow_up.load(Ordering::SeqCst) {
@@ -255,6 +257,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                     summary: Some("coder resolved merge conflict".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 })
             }
         })

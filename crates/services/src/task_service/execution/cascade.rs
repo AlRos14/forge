@@ -474,6 +474,155 @@ impl TaskService {
             .await
     }
 
+    /// Handle an execution that failed because no executor candidate could
+    /// run (`FailureKind::ExecutorUnavailable`). Never consumes the task's
+    /// execution retry budget: transient exhaustion (a retry time is known)
+    /// schedules a deferred dispatch; permanent unavailability blocks the
+    /// task for manual reconfiguration with no automatic redispatch loop.
+    pub(crate) async fn annotate_executor_unavailable_block(
+        &self,
+        execution: &Execution,
+        retry_at: Option<String>,
+        attempts: Value,
+    ) -> Result<()> {
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            "system",
+        );
+        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
+            return Ok(());
+        }
+
+        if execution.role != "interactive" {
+            if let Some(retry_at) = retry_at.as_deref() {
+                let dispatch_at = executor_unavailable_dispatch_time(retry_at, &task.id);
+                crate::deferred_dispatch::set(
+                    &self.db,
+                    &task,
+                    &task.status,
+                    &dispatch_at,
+                    "executor unavailable; retrying when usage recovers",
+                )
+                .await?;
+                ExecutionRepo::update(
+                    &*self.db,
+                    db::UpdateExecution {
+                        id: execution.id.clone(),
+                        status: None,
+                        stop_reason: None,
+                        stopped_by: None,
+                        resume_policy: Some(Some(db::ResumePolicy::Auto)),
+                        stopped_at: None,
+                        agent_session_id: None,
+                        agent_message_id: None,
+                        last_activity_at: None,
+                        summary: None,
+                        logs_path: None,
+                        before_sha: None,
+                        after_sha: None,
+                        error: None,
+                        executor_config_snapshot_json: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+                tracing::info!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    %dispatch_at,
+                    "all executor candidates unavailable; deferred dispatch scheduled without consuming retry budget"
+                );
+                return Ok(());
+            }
+        }
+
+        let annotation = api_types::TaskBlockingAnnotation {
+            annotation_type: api_types::FailureKind::ExecutorUnavailable,
+            blocking_reason: "executor_unavailable".to_owned(),
+            blocked_by: Some("system:executor".to_owned()),
+            blocked_at: Some(now_rfc3339()),
+            blocked_execution_id: Some(execution.id.clone()),
+            artifact: Some(api_types::BlockingArtifact {
+                kind: "execution".to_owned(),
+                id: Some(execution.id.clone()),
+                log_path: execution.logs_path.clone(),
+            }),
+            message: Some(execution.error.clone().unwrap_or_else(|| {
+                "No executor candidate is available (check CLI installs and authentication)"
+                    .to_owned()
+            })),
+            hook: None,
+            recovery_actions: vec![
+                api_types::RecoveryAction::Reexecute,
+                api_types::RecoveryAction::ResetToInitial,
+                api_types::RecoveryAction::CancelTask,
+            ],
+        };
+        let annotation = serde_json::to_string(&annotation).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to serialize executor-unavailable annotation: {error}"
+            ))
+        })?;
+
+        let reason = execution
+            .error
+            .clone()
+            .unwrap_or_else(|| "no executor candidate available".to_owned());
+        let blocked_meta = json!({
+            "reason": reason,
+            "created_at": now_rfc3339(),
+            "kind": api_types::FailureKind::ExecutorUnavailable,
+            "execution_id": execution.id,
+            "details": {
+                "retry_at": retry_at,
+                "attempts": attempts,
+            },
+        });
+
+        let updated = TaskRepo::update_status(
+            &*self.db,
+            UpdateTaskStatus {
+                id: task.id.clone(),
+                expected_version: task.version,
+                status: task.status.clone(),
+                assignee_id: None,
+                error_annotation: Some(Some(annotation)),
+                blocked_json: Some(Some(blocked_meta.to_string())),
+                failed_json: Some(None),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+
+        tracing::info!(
+            task_id = %task.id,
+            execution_id = %execution.id,
+            status = %task.status,
+            kind = "executor_unavailable",
+            "task blocked: no executor candidate available"
+        );
+        self.publish(ForgeEvent {
+            event_type: "task.blocked".to_owned(),
+            entity_id: updated.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskBlocked {
+                project_id: updated.project_id,
+                reason,
+                kind: Some(api_types::FailureKind::ExecutorUnavailable),
+                source: None,
+                execution_id: Some(execution.id.clone()),
+            },
+        });
+        Ok(())
+    }
+
     async fn annotate_executor_failure_block_with_retry(
         &self,
         execution: &Execution,
@@ -1470,6 +1619,25 @@ fn append_reviewer_log_text(payload: &Value, message: &mut String) {
             }
         }
     }
+}
+
+/// Dispatch time for a transient executor-unavailable retry: the structured
+/// retry hint plus a small deterministic jitter, floored at ten seconds out
+/// so a stale hint cannot hot-loop.
+fn executor_unavailable_dispatch_time(retry_at: &str, task_id: &str) -> String {
+    let jitter_seconds = i64::from(
+        task_id
+            .bytes()
+            .fold(0u8, |acc, byte| acc.wrapping_add(byte))
+            % 30,
+    );
+    let hinted = chrono::DateTime::parse_from_rfc3339(retry_at)
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::minutes(15));
+    let floor = chrono::Utc::now() + chrono::Duration::seconds(10);
+    (hinted + chrono::Duration::seconds(jitter_seconds))
+        .max(floor)
+        .to_rfc3339()
 }
 
 pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> bool {

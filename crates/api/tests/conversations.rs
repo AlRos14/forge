@@ -64,6 +64,7 @@ impl TaskExecutor for StreamingCancelableExecutor {
                     summary: Some(content),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
         }
@@ -89,6 +90,7 @@ impl TaskExecutor for StreamingCancelableExecutor {
             summary: Some(content),
             error: None,
             usage: None,
+            ..Default::default()
         })
     }
 

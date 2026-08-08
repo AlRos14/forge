@@ -320,6 +320,33 @@ impl TaskService {
             ),
         };
 
+        let executor_unavailable = notification.failure_class
+            == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable);
+        let route_outcome = crate::task_service::config::RouteOutcome {
+            selected: notification.resolved_candidate.as_ref().map(|candidate| {
+                (
+                    candidate.candidate_key.clone(),
+                    candidate.executor_type.clone(),
+                    candidate.config.clone(),
+                )
+            }),
+            attempts: notification
+                .route_attempts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|attempt| (attempt.candidate_key.clone(), attempt.outcome.clone()))
+                .collect(),
+            unavailable_retry_at: executor_unavailable.then(|| notification.retry_at.clone()),
+        };
+        let snapshot_update = match current_execution.executor_config_snapshot_json.as_deref() {
+            Some(snapshot) => crate::task_service::config::apply_route_outcome_to_snapshot(
+                snapshot,
+                &route_outcome,
+            )?,
+            None => None,
+        };
+
         let execution_id = notification.execution_id.clone();
         let terminal_ts = notification.ts.clone();
         let updated = ExecutionRepo::update(
@@ -339,7 +366,7 @@ impl TaskService {
                 before_sha: None,
                 after_sha: notification.after_sha.map(Some),
                 error,
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: snapshot_update.map(Some),
                 updated_at: now_rfc3339(),
             },
         )
@@ -410,6 +437,34 @@ impl TaskService {
                         "failed to mark planning awaiting review"
                     );
                 }
+            }
+        } else if updated.status == ExecutionStatus::Failed
+            && executor_unavailable
+            && execution::should_block_task_for_failed_execution(&updated)
+        {
+            let attempts = serde_json::Value::Array(
+                route_outcome
+                    .attempts
+                    .iter()
+                    .map(|(candidate_key, outcome)| {
+                        serde_json::json!({"candidate_key": candidate_key, "outcome": outcome})
+                    })
+                    .collect(),
+            );
+            if let Err(error) = self
+                .annotate_executor_unavailable_block(
+                    &updated,
+                    notification.retry_at.clone(),
+                    attempts,
+                )
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    task_id = %updated.task_id,
+                    %error,
+                    "failed to handle executor-unavailable daemon execution"
+                );
             }
         } else if updated.status == ExecutionStatus::Failed
             && execution::should_block_task_for_failed_execution(&updated)

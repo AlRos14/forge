@@ -374,6 +374,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                     summary: Some("coder addressed review feedback".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
 
@@ -389,6 +390,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                     summary: Some("auditor failed the implementation".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
 
@@ -405,6 +407,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }

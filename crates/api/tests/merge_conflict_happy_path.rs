@@ -256,6 +256,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                     summary: Some("auditor passed the implementation".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
 
@@ -268,6 +269,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                     summary: Some("merge conflict resolved".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
 
@@ -278,6 +280,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }
@@ -390,6 +393,7 @@ impl CodingExecutorAdapter for CompletingCodexAdapter {
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }

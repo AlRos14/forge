@@ -273,6 +273,215 @@ where
     })
 }
 
+/// Authored agent-config key holding the ordered fallback candidates.
+/// Extracted before config normalization (which drops unknown fields).
+pub const FALLBACKS_CONFIG_KEY: &str = "fallbacks";
+
+/// Snapshot key carrying the resolved route.
+pub const ROUTING_SNAPSHOT_KEY: &str = "routing";
+
+/// The only routing policy currently defined.
+pub const ROUTING_POLICY_ORDERED_FALLBACK_V1: &str = "ordered_fallback_v1";
+
+/// Config fields that bind a session to a prior run. Excluded from candidate
+/// identity so an injected resume id does not change which candidate a config
+/// belongs to.
+const SESSION_SCOPED_CONFIG_KEYS: &[&str] = &[
+    "resume_session_id",
+    "resume_thread_id",
+    "resume_thread_in_place",
+    "resume_fallback_prompt",
+];
+
+/// One executor candidate in an ordered fallback route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutorCandidate {
+    pub executor_type: ExecutorKind,
+    pub config: Value,
+}
+
+/// Outcome of one candidate attempt, persisted for route provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteAttemptOutcome {
+    UsageExhausted,
+    Unavailable,
+    SkippedCooldown,
+    Failed,
+    Cancelled,
+    Completed,
+}
+
+impl RouteAttemptOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UsageExhausted => "usage_exhausted",
+            Self::Unavailable => "unavailable",
+            Self::SkippedCooldown => "skipped_cooldown",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteAttempt {
+    pub candidate_key: String,
+    pub outcome: RouteAttemptOutcome,
+}
+
+/// First-class route carried on the executor config snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutorRouting {
+    pub policy: String,
+    pub candidates: Vec<ExecutorCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_candidate_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<RouteAttempt>,
+}
+
+/// Stable identity of a candidate: executor kind + human-readable
+/// discriminators + a hash over the session-stripped config. Keys ordering,
+/// sticky selection, and session compatibility.
+pub fn candidate_key(kind: &ExecutorKind, config: &Value) -> String {
+    let mut discriminators = vec![kind.to_string()];
+    for field in ["profile", "provider", "model"] {
+        if let Some(value) = config.get(field).and_then(Value::as_str) {
+            discriminators.push(format!("{field}={value}"));
+        }
+    }
+    format!(
+        "{}#{:08x}",
+        discriminators.join(":"),
+        stable_config_hash(config)
+    )
+}
+
+/// Identity of the quota pool a candidate consumes. Candidates sharing an
+/// account key share cooldowns. For Smith the pool is the provider (Smith
+/// rotates that provider's credentials natively); for Codex it is the
+/// profile; other executors have one machine-level account.
+pub fn account_key(kind: &ExecutorKind, config: &Value) -> String {
+    let discriminator = match kind {
+        ExecutorKind::Smith => config
+            .get("provider")
+            .and_then(Value::as_str)
+            .or_else(|| config.get("profile").and_then(Value::as_str)),
+        ExecutorKind::Codex => config.get("profile").and_then(Value::as_str),
+        _ => None,
+    };
+    match discriminator {
+        Some(value) => format!("{kind}:{value}"),
+        None => kind.to_string(),
+    }
+}
+
+/// FNV-1a over a canonical (key-sorted, session-stripped) rendering of the
+/// config. Deliberately not `DefaultHasher`, whose output may change across
+/// releases — these keys persist in execution snapshots.
+fn stable_config_hash(config: &Value) -> u32 {
+    fn canonicalize(value: &Value, out: &mut String, strip_session_keys: bool) {
+        match value {
+            Value::Object(map) => {
+                out.push('{');
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for key in keys {
+                    if strip_session_keys && SESSION_SCOPED_CONFIG_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    out.push_str(key);
+                    out.push(':');
+                    canonicalize(&map[key], out, false);
+                    out.push(',');
+                }
+                out.push('}');
+            }
+            Value::Array(items) => {
+                out.push('[');
+                for item in items {
+                    canonicalize(item, out, false);
+                    out.push(',');
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+
+    let mut canonical = String::new();
+    canonicalize(config, &mut canonical, true);
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in canonical.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+/// Build and validate an ordered-fallback route from a normalized primary
+/// candidate plus the raw authored `fallbacks` entries.
+pub fn build_ordered_fallback_routing(
+    primary_kind: ExecutorKind,
+    primary_config: Value,
+    fallbacks: &[Value],
+) -> Result<ExecutorRouting, ExecutorError> {
+    let mut candidates = vec![ExecutorCandidate {
+        executor_type: primary_kind,
+        config: primary_config,
+    }];
+    for (index, entry) in fallbacks.iter().enumerate() {
+        let object = entry.as_object().ok_or_else(|| {
+            ExecutorError::Other(format!("fallbacks[{index}] must be a JSON object"))
+        })?;
+        let executor_type = object
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ExecutorError::Other(format!("fallbacks[{index}] is missing executor_type"))
+            })?;
+        let kind = executor_type.parse::<ExecutorKind>().map_err(|_| {
+            ExecutorError::Other(format!(
+                "fallbacks[{index}] names unknown executor type: {executor_type}"
+            ))
+        })?;
+        let raw_config = object
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if !raw_config.is_object() {
+            return Err(ExecutorError::Other(format!(
+                "fallbacks[{index}] config must be a JSON object"
+            )));
+        }
+        let normalized =
+            resolve_config_value(kind.clone(), &raw_config, &ExecutionOverrides::default())?;
+        candidates.push(ExecutorCandidate {
+            executor_type: kind,
+            config: normalized,
+        });
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for candidate in &candidates {
+        let key = candidate_key(&candidate.executor_type, &candidate.config);
+        if !seen.insert(key.clone()) {
+            return Err(ExecutorError::Other(format!(
+                "duplicate executor candidate: {key}"
+            )));
+        }
+    }
+
+    Ok(ExecutorRouting {
+        policy: ROUTING_POLICY_ORDERED_FALLBACK_V1.to_owned(),
+        candidates,
+        selected_candidate_key: None,
+        attempts: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +562,105 @@ mod tests {
                 .expect("shell config resolves");
 
         assert_eq!(resolved["permission_policy"], "auto");
+    }
+
+    #[test]
+    fn routing_normalizes_each_candidate_and_preserves_order() {
+        let routing = build_ordered_fallback_routing(
+            ExecutorKind::Smith,
+            serde_json::json!({"profile": "acct-1"}),
+            &[
+                serde_json::json!({"executor_type": "smith", "config": {"profile": "acct-2", "unknown_field": true}}),
+                serde_json::json!({"executor_type": "claude_code", "config": {}}),
+            ],
+        )
+        .expect("routing builds");
+
+        assert_eq!(routing.policy, ROUTING_POLICY_ORDERED_FALLBACK_V1);
+        assert_eq!(routing.candidates.len(), 3);
+        assert_eq!(routing.candidates[0].executor_type, ExecutorKind::Smith);
+        assert_eq!(routing.candidates[1].config["profile"], "acct-2");
+        assert!(routing.candidates[1].config.get("unknown_field").is_none());
+        assert_eq!(
+            routing.candidates[2].executor_type,
+            ExecutorKind::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn routing_rejects_unknown_executor_type_and_non_object_config() {
+        let unknown = build_ordered_fallback_routing(
+            ExecutorKind::Smith,
+            serde_json::json!({}),
+            &[serde_json::json!({"executor_type": "warp", "config": {}})],
+        )
+        .expect_err("unknown type rejects");
+        assert!(unknown.to_string().contains("unknown executor type"));
+
+        let non_object = build_ordered_fallback_routing(
+            ExecutorKind::Smith,
+            serde_json::json!({}),
+            &[serde_json::json!({"executor_type": "smith", "config": "profile"})],
+        )
+        .expect_err("non-object config rejects");
+        assert!(non_object.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn routing_rejects_duplicate_candidates() {
+        let error = build_ordered_fallback_routing(
+            ExecutorKind::Smith,
+            resolve_config_value(
+                ExecutorKind::Smith,
+                &serde_json::json!({"profile": "acct-1"}),
+                &ExecutionOverrides::default(),
+            )
+            .expect("primary resolves"),
+            &[serde_json::json!({"executor_type": "smith", "config": {"profile": "acct-1"}})],
+        )
+        .expect_err("duplicate rejects");
+        assert!(error.to_string().contains("duplicate executor candidate"));
+    }
+
+    #[test]
+    fn candidate_key_ignores_session_scoped_fields() {
+        let base = resolve_config_value(
+            ExecutorKind::Smith,
+            &serde_json::json!({"profile": "acct-1"}),
+            &ExecutionOverrides::default(),
+        )
+        .expect("config resolves");
+        let mut with_session = base.clone();
+        with_session["resume_session_id"] = serde_json::json!("session-9");
+
+        assert_eq!(
+            candidate_key(&ExecutorKind::Smith, &base),
+            candidate_key(&ExecutorKind::Smith, &with_session)
+        );
+        assert!(candidate_key(&ExecutorKind::Smith, &base).starts_with("smith:profile=acct-1#"));
+    }
+
+    #[test]
+    fn account_key_pools_by_provider_for_smith() {
+        let glm_sonnet = serde_json::json!({"provider": "zai", "model": "glm-5"});
+        let glm_flash = serde_json::json!({"provider": "zai", "model": "glm-5-flash"});
+        let other = serde_json::json!({"provider": "google", "model": "gemini-3.6-flash"});
+
+        assert_eq!(
+            account_key(&ExecutorKind::Smith, &glm_sonnet),
+            account_key(&ExecutorKind::Smith, &glm_flash)
+        );
+        assert_ne!(
+            account_key(&ExecutorKind::Smith, &glm_sonnet),
+            account_key(&ExecutorKind::Smith, &other)
+        );
+        assert_eq!(
+            account_key(
+                &ExecutorKind::ClaudeCode,
+                &serde_json::json!({"model": "opus"})
+            ),
+            "claude_code"
+        );
     }
 
     #[test]

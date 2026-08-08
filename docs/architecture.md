@@ -469,6 +469,56 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   `claim_task` auto-dispatches the executor.
 - **executors** — `LogWriter` appends JSONL with schema version + sequence
   numbers. `ShellExecutor` spawns child processes with heartbeat supervision.
+
+### Executor fallback chains
+
+Both execution paths (embedded `AppState.task_executor` and the remote
+daemon runtime) dispatch through `FallbackExecutor`, which walks an ordered
+candidate route instead of a single adapter:
+
+- **Authoring** — an agent's `config_json` may carry
+  `fallbacks: [{executor_type, config}]`. The snapshot builder extracts it
+  *before* typed-config normalization (which drops unknown fields),
+  normalizes each candidate under its own `ExecutorKind`, and writes a
+  first-class `routing` block
+  (`{policy: "ordered_fallback_v1", candidates, selected_candidate_key,
+  attempts}`) on the execution snapshot. Snapshots without `routing` behave
+  exactly as single-candidate executions.
+- **Fallback trigger** — only structured availability errors advance the
+  chain: `ExecutorError::UsageExhausted { retry_after, usage }` and
+  `ExecutorError::Unavailable`, plus a failed per-candidate availability
+  precheck (`check_candidate_availability`, defaulting to the family-level
+  check). Real task failures terminate the chain immediately. Adapters
+  classify only structured signals (Smith stream events / result statuses,
+  Claude Code stderr and `is_error` result events); assistant output text is
+  never an input, and unclassifiable failures stay generic (no fallback).
+- **Cooldowns** — an in-memory, process-lifetime registry keyed by
+  `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile,
+  else the executor family). Exhausted accounts are skipped until
+  `retry_after` (default 15 min); all candidates cooling fails fast without
+  spawning. Candidate identity (`CandidateKey`) is separate: kind +
+  discriminators + a stable hash of the session-stripped config.
+- **Terminal disposition** — the chain reports `Ok(ExecutionResult)` with
+  `failure_class` (`TaskFailed` | `ExecutorUnavailable`), `retry_after`,
+  `resolved_candidate`, and `route_attempts`. The daemon protocol carries
+  the same fields additively on `ExecutionTerminalNotification`
+  (`failure_class`, `retry_at`, `resolved_candidate`, `route_attempts`);
+  notifications without them degrade to generic executor-failed handling.
+  The service layer maps `ExecutorUnavailable` to
+  `FailureKind::ExecutorUnavailable` from these fields only — never prose.
+- **Availability recovery** — `executor_unavailable` bypasses the execution
+  retry budget entirely. Transient exhaustion (retry time known) schedules a
+  deferred dispatch at the structured `retry_at` plus deterministic jitter;
+  permanent unavailability (auth/install failure everywhere) blocks the task
+  for manual reconfiguration with no automatic redispatch.
+- **Sticky selection and resume** — the winner's resolved config is written
+  back to the execution snapshot (top-level `executor_type`/`config`, plus
+  `routing.selected_candidate_key` and per-candidate `attempts` for
+  provenance). Follow-ups resume via candidate identity: the parent's
+  winning candidate is promoted to the front of a fresh route only when the
+  exact `CandidateKey` is still present; any candidate switch starts a fresh
+  session (`resume_session_id` never crosses accounts — executor-family
+  equality is not sufficient).
 - **mcp-server** — JSON-RPC dispatch over `POST /mcp` with its own `McpState`.
   Does not depend on the `api` crate.
 - **workspace** — File-based locking via `.forge.lock`. Path validation

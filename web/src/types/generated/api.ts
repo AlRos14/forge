@@ -170,6 +170,7 @@ export type FailureKind =
   | 'max_turns_exceeded'
   | 'manual_stop'
   | 'recovery_required'
+  | 'executor_unavailable'
   | 'unknown'
 
 export interface TaskBlockingAnnotation {

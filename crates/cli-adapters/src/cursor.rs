@@ -219,6 +219,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 summary: stream.summary,
                 error: None,
                 usage: None,
+                ..Default::default()
             });
         }
 
@@ -230,6 +231,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 summary: stream.summary,
                 error: Some(error),
                 usage: None,
+                ..Default::default()
             });
         }
 
@@ -241,6 +243,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 summary: stream.summary,
                 error: Some(cursor_run_error(status, &stream.stderr_tail)),
                 usage: None,
+                ..Default::default()
             });
         }
 
@@ -268,6 +271,7 @@ impl CodingExecutorAdapter for CursorAdapter {
             summary: stream.summary,
             error: None,
             usage: None,
+            ..Default::default()
         })
     }
 

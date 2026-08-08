@@ -256,6 +256,7 @@ impl CodingExecutorAdapter for CompletingCodexAdapter {
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }

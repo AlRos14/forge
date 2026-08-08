@@ -197,6 +197,10 @@ pub enum FailureKind {
     MaxTurnsExceeded,
     ManualStop,
     RecoveryRequired,
+    /// No executor candidate could run the task (usage exhausted, missing
+    /// CLI, or failed authentication across the whole fallback route).
+    /// Bypasses the execution retry budget.
+    ExecutorUnavailable,
     #[serde(other)]
     Unknown,
 }

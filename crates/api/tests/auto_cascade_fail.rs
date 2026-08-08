@@ -196,6 +196,7 @@ impl CodingExecutorAdapter for FailingCodexAdapter {
                 summary: Some("executor failed intentionally".to_owned()),
                 error: Some("synthetic executor failure".to_owned()),
                 usage: None,
+                ..Default::default()
             })
         })
     }

@@ -353,6 +353,41 @@ impl TaskService {
             return Ok(current_execution);
         }
 
+        let executor_unavailable =
+            result.failure_class == Some(executors::ExecutionFailureClass::ExecutorUnavailable);
+        let unavailable_retry_at = result.retry_after.map(|retry_after| {
+            let delay = chrono::Duration::from_std(retry_after)
+                .unwrap_or_else(|_| chrono::Duration::minutes(15));
+            (chrono::Utc::now() + delay).to_rfc3339()
+        });
+        let route_outcome = crate::task_service::config::RouteOutcome {
+            selected: result.resolved_candidate.as_ref().map(|candidate| {
+                (
+                    candidate.candidate_key.clone(),
+                    candidate.executor_type.to_string(),
+                    candidate.config.clone(),
+                )
+            }),
+            attempts: result
+                .route_attempts
+                .iter()
+                .map(|attempt| {
+                    (
+                        attempt.candidate_key.clone(),
+                        attempt.outcome.as_str().to_owned(),
+                    )
+                })
+                .collect(),
+            unavailable_retry_at: executor_unavailable.then(|| unavailable_retry_at.clone()),
+        };
+        let snapshot_update = match current_execution.executor_config_snapshot_json.as_deref() {
+            Some(snapshot) => crate::task_service::config::apply_route_outcome_to_snapshot(
+                snapshot,
+                &route_outcome,
+            )?,
+            None => None,
+        };
+
         let now = now_rfc3339();
         let (status, stop_reason, stopped_by, resume_policy, stopped_at) = match result.status {
             ExecutionOutcome::Completed => (ExecutionStatus::Completed, None, None, None, None),
@@ -396,7 +431,7 @@ impl TaskService {
                 before_sha: None,
                 after_sha: Some(result.after_sha),
                 error: Some(result.error),
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: snapshot_update.map(Some),
                 updated_at: now_rfc3339(),
             },
         )
@@ -478,6 +513,30 @@ impl TaskService {
                     task_id = %updated.task_id,
                     %error,
                     "failed to block task after max turns exceeded"
+                );
+            }
+        } else if updated.status == ExecutionStatus::Failed
+            && executor_unavailable
+            && should_block_task_for_failed_execution(&updated)
+        {
+            let attempts = serde_json::Value::Array(
+                route_outcome
+                    .attempts
+                    .iter()
+                    .map(|(candidate_key, outcome)| {
+                        serde_json::json!({"candidate_key": candidate_key, "outcome": outcome})
+                    })
+                    .collect(),
+            );
+            if let Err(error) = self
+                .annotate_executor_unavailable_block(&updated, unavailable_retry_at, attempts)
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    task_id = %updated.task_id,
+                    %error,
+                    "failed to handle executor-unavailable execution"
                 );
             }
         } else if updated.status == ExecutionStatus::Failed

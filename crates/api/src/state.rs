@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use config::{default_config_path, ForgeConfig};
 use db::SqliteDb;
 use events::EventBus;
-use executors::{AdapterExecutor, AdapterRegistry, TaskExecutor};
+use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
 use services::{
     AgentService, AuthService, ConversationService, DaemonService, MemoryService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
@@ -167,7 +167,7 @@ impl AppState {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
         let task_executor: Arc<dyn TaskExecutor> =
-            Arc::new(AdapterExecutor::new(Arc::clone(&adapter_registry)));
+            Arc::new(FallbackExecutor::new(Arc::clone(&adapter_registry)));
         let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         let terminal_activity = Arc::new(TerminalActivityTracker::default());

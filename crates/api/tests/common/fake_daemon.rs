@@ -391,6 +391,10 @@ pub async fn send_execution_terminal_completed(
             summary: summary.map(str::to_owned),
             after_sha: None,
             usage: None,
+            failure_class: None,
+            retry_at: None,
+            resolved_candidate: None,
+            route_attempts: None,
         },
     )
     .await;
@@ -415,6 +419,10 @@ pub async fn send_execution_terminal_failed(
             summary: None,
             after_sha: None,
             usage: None,
+            failure_class: None,
+            retry_at: None,
+            resolved_candidate: None,
+            route_attempts: None,
         },
     )
     .await;

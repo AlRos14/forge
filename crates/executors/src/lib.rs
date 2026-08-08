@@ -11,13 +11,16 @@ pub mod shell;
 
 pub use adapter::{
     AdapterExecutor, AdapterRegistry, AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter,
-    DiscoverContext, DiscoveredOptions, ExecutionOverrides, ExecutorKind,
+    DiscoverContext, DiscoveredOptions, ExecutionOverrides, ExecutorKind, FallbackExecutor,
+    DEFAULT_ACCOUNT_COOLDOWN,
 };
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
-    deserialize_config, merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig,
-    CommandOverrides, CursorConfig, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy,
-    ShellConfig, SmithConfig,
+    account_key, build_ordered_fallback_routing, candidate_key, deserialize_config,
+    merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig, CommandOverrides,
+    CursorConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig, NullConfig, OpencodeConfig,
+    PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig, SmithConfig,
+    FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
@@ -51,8 +54,45 @@ pub struct TokenUsage {
     pub model: Option<String>,
 }
 
-/// Result from an executor run.
+impl TokenUsage {
+    /// Fold another candidate's usage into this one (fallback chains aggregate
+    /// usage across every candidate that consumed billable tokens).
+    pub fn absorb(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.cost_usd = match (self.cost_usd, other.cost_usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        if self.model.is_none() {
+            self.model = other.model.clone();
+        }
+    }
+}
+
+/// Structured disposition of a failed execution. `TaskFailed` keeps the
+/// existing budgeted retry semantics; `ExecutorUnavailable` means no
+/// executor candidate could run (quota, missing CLI, or auth) and must not
+/// consume task retry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionFailureClass {
+    TaskFailed,
+    ExecutorUnavailable,
+}
+
+/// The candidate that actually ran an execution, as resolved by the
+/// fallback layer. Persisted by the service layer for sticky selection.
 #[derive(Debug, Clone)]
+pub struct ResolvedExecutorCandidate {
+    pub candidate_key: String,
+    pub executor_type: ExecutorKind,
+    pub config: serde_json::Value,
+}
+
+/// Result from an executor run.
+#[derive(Debug, Clone, Default)]
 pub struct ExecutionResult {
     pub status: ExecutionOutcome,
     pub after_sha: Option<String>,
@@ -60,11 +100,19 @@ pub struct ExecutionResult {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage: Option<TokenUsage>,
+    pub failure_class: Option<ExecutionFailureClass>,
+    pub retry_after: Option<std::time::Duration>,
+    pub resolved_candidate: Option<ResolvedExecutorCandidate>,
+    /// Per-candidate attempt outcomes, in attempt order (route provenance).
+    pub route_attempts: Vec<config::RouteAttempt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExecutionOutcome {
     Completed,
+    /// Default so `..Default::default()` in constructors can never fabricate
+    /// a success.
+    #[default]
     Failed,
     Cancelled,
 }
@@ -80,8 +128,31 @@ pub enum ExecutorError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The candidate's quota or rate limit is exhausted. Candidate-level
+    /// control flow for the fallback layer only — never the terminal channel.
+    /// Carries any usage the candidate accumulated before hitting the cap so
+    /// fallback chains keep accounting truthful.
+    #[error("usage exhausted")]
+    UsageExhausted {
+        retry_after: Option<std::time::Duration>,
+        usage: Option<TokenUsage>,
+    },
+
+    /// The candidate's CLI is missing or unauthenticated. Candidate-level
+    /// control flow for the fallback layer only — never the terminal channel.
+    #[error("executor unavailable: {0}")]
+    Unavailable(String),
+
     #[error("executor error: {0}")]
     Other(String),
+}
+
+impl ExecutorError {
+    /// Availability failures are the only errors that may advance a
+    /// fallback chain.
+    pub fn is_availability(&self) -> bool {
+        matches!(self, Self::UsageExhausted { .. } | Self::Unavailable(_))
+    }
 }
 
 #[cfg(test)]

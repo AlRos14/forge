@@ -39,6 +39,111 @@ struct StreamResult {
     agent_session_id: Option<String>,
     summary: Option<String>,
     usage: Option<executors::TokenUsage>,
+    availability: AvailabilitySignals,
+}
+
+/// Availability signals collected from error channels only (stderr lines and
+/// `is_error` result events). Assistant output text is never an input.
+#[derive(Default)]
+struct AvailabilitySignals {
+    limit_retry_after: Option<Option<Duration>>,
+    auth_failure: Option<String>,
+    saw_error_result: bool,
+}
+
+impl AvailabilitySignals {
+    /// Classify one line from an error channel. Recognizes the structured
+    /// API error JSON claude-code echoes (`error.type`) and the CLI's fixed
+    /// usage-limit signature (`... usage limit reached|<epoch-seconds>`).
+    fn classify_error_channel_line(&mut self, line: &str) {
+        let structured_kind = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("type"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
+        if let Some(kind) = structured_kind {
+            match kind.as_str() {
+                "rate_limit_error" => {
+                    self.limit_retry_after.get_or_insert(None);
+                }
+                "authentication_error" | "permission_error" => {
+                    self.auth_failure.get_or_insert(kind);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let lowered = line.to_ascii_lowercase();
+        if lowered.contains("usage limit reached") {
+            let retry_after = line.rsplit('|').next().and_then(|suffix| {
+                let epoch_seconds = suffix.trim().parse::<u64>().ok()?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs();
+                Some(Duration::from_secs(epoch_seconds.saturating_sub(now)))
+            });
+            // A later line with an epoch hint may upgrade an earlier bare one.
+            match &mut self.limit_retry_after {
+                Some(existing) if existing.is_none() => *existing = retry_after,
+                Some(_) => {}
+                slot @ None => *slot = Some(retry_after),
+            }
+        } else if lowered.contains("invalid api key")
+            || lowered.contains("please run /login")
+            || lowered.contains("oauth token has expired")
+        {
+            self.auth_failure
+                .get_or_insert_with(|| line.trim().to_owned());
+        }
+    }
+
+    /// Classify a raw stdout stream-json event. Only `is_error` result
+    /// events participate; assistant/tool events are ignored by design.
+    fn classify_stdout_event(&mut self, line: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("result") {
+            return;
+        }
+        let is_error = value
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || value
+                .get("subtype")
+                .and_then(|v| v.as_str())
+                .is_some_and(|subtype| subtype != "success");
+        if !is_error {
+            return;
+        }
+        self.saw_error_result = true;
+        if let Some(text) = value.get("result").and_then(|v| v.as_str()) {
+            self.classify_error_channel_line(text);
+        }
+    }
+
+    fn into_availability_error(
+        self,
+        exit_ok: bool,
+        usage: Option<executors::TokenUsage>,
+    ) -> Option<ExecutorError> {
+        if exit_ok && !self.saw_error_result {
+            return None;
+        }
+        if let Some(retry_after) = self.limit_retry_after {
+            return Some(ExecutorError::UsageExhausted { retry_after, usage });
+        }
+        self.auth_failure.map(|reason| {
+            ExecutorError::Unavailable(format!("claude-code authentication failure: {reason}"))
+        })
+    }
 }
 
 impl ClaudeCodeAdapter {
@@ -209,6 +314,15 @@ impl ClaudeCodeAdapter {
         let stream = stream_result?;
         let status = status_result?;
 
+        if !stream.cancelled {
+            let availability = stream
+                .availability
+                .into_availability_error(status.success(), stream.usage.clone());
+            if let Some(availability) = availability {
+                return Err(availability);
+            }
+        }
+
         let (status, error) = if stream.cancelled {
             (ExecutionOutcome::Cancelled, None)
         } else if status.success() {
@@ -248,6 +362,7 @@ impl ClaudeCodeAdapter {
                         summary: stream.summary,
                         error: Some(error.to_string()),
                         usage: stream.usage,
+                        ..Default::default()
                     });
                 }
             }
@@ -262,6 +377,7 @@ impl ClaudeCodeAdapter {
             summary: stream.summary,
             error,
             usage: stream.usage,
+            ..Default::default()
         })
     }
 
@@ -435,6 +551,7 @@ async fn stream_child_output(
     let mut agent_session_id = None;
     let mut summary = None;
     let mut usage: Option<executors::TokenUsage> = None;
+    let mut availability = AvailabilitySignals::default();
     let mut cancelled = false;
     let mut saw_child_output = false;
     let mut waiting_elapsed_seconds = 0;
@@ -473,6 +590,7 @@ async fn stream_child_output(
                 match line {
                     Ok(Some(line)) => {
                         saw_child_output = true;
+                        availability.classify_stdout_event(&line);
                         if let Some(entry) = normalize::normalize(&line) {
                             write_normalized_entry(
                                 &mut writer,
@@ -491,6 +609,7 @@ async fn stream_child_output(
                 match line {
                     Ok(Some(line)) => {
                         saw_child_output = true;
+                        availability.classify_error_channel_line(&line);
                         writer
                             .write(
                                 LogKind::Stderr,
@@ -529,6 +648,7 @@ async fn stream_child_output(
         agent_session_id,
         summary,
         usage,
+        availability,
     })
 }
 
@@ -840,6 +960,86 @@ mod tests {
     use super::*;
     use executors::CommandOverrides;
     use std::time::Duration;
+
+    #[test]
+    fn usage_limit_signature_with_epoch_classifies() {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let mut signals = AvailabilitySignals::default();
+        signals.classify_error_channel_line(&format!("Claude AI usage limit reached|{epoch}"));
+
+        match signals.into_availability_error(false, None) {
+            Some(ExecutorError::UsageExhausted { retry_after, .. }) => {
+                let retry = retry_after.expect("epoch converts to relative retry");
+                assert!(retry <= Duration::from_secs(3600));
+                assert!(retry >= Duration::from_secs(3590));
+            }
+            other => panic!("expected UsageExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_api_rate_limit_error_classifies() {
+        let mut signals = AvailabilitySignals::default();
+        signals.classify_error_channel_line(
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your per-minute rate limit"}}"#,
+        );
+        assert!(matches!(
+            signals.into_availability_error(false, None),
+            Some(ExecutorError::UsageExhausted {
+                retry_after: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn auth_failure_classifies_as_unavailable() {
+        let mut signals = AvailabilitySignals::default();
+        signals.classify_error_channel_line("Invalid API key · Please run /login");
+        match signals.into_availability_error(false, None) {
+            Some(ExecutorError::Unavailable(reason)) => {
+                assert!(reason.to_ascii_lowercase().contains("invalid api key"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_result_event_with_limit_text_classifies() {
+        let mut signals = AvailabilitySignals::default();
+        signals.classify_stdout_event(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"5-hour usage limit reached ∙ resets 3am"}"#,
+        );
+        // Error result marks the run bad even when the exit code is 0.
+        assert!(matches!(
+            signals.into_availability_error(true, None),
+            Some(ExecutorError::UsageExhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn assistant_events_and_clean_exits_never_classify() {
+        let mut signals = AvailabilitySignals::default();
+        // Assistant event containing limit-like prose is not a result event.
+        signals.classify_stdout_event(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"the API returned: usage limit reached"}]}}"#,
+        );
+        // Successful result mentioning limits in its text is not an error.
+        signals.classify_stdout_event(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"documented the usage limit reached error path"}"#,
+        );
+        assert!(signals.into_availability_error(true, None).is_none());
+
+        // A stray stderr limit line on a run that still exited 0 with no
+        // error result does not classify.
+        let mut recovered = AvailabilitySignals::default();
+        recovered.classify_error_channel_line("usage limit reached");
+        assert!(recovered.into_availability_error(true, None).is_none());
+    }
 
     #[test]
     fn claude_sessions_dir_encodes_slashes_and_dots() {

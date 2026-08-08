@@ -1193,6 +1193,7 @@ mod tests {
                 summary: None,
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         }
 

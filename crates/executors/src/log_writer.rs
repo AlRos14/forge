@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+/// Default cap on bytes written to one execution's JSONL log.
+pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+
 pub struct LogWriter {
     path: PathBuf,
     execution_id: String,

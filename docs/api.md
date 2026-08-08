@@ -75,6 +75,18 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
 
+## Agents
+
+An agent's `config_json` may include an ordered `fallbacks` array of
+`{"executor_type": "...", "config": {...}}` candidates. When the primary
+executor reports quota exhaustion or is unavailable, execution falls back to
+the next candidate (same CLI with a different account profile, or a
+different CLI); a task interrupted because every candidate is unavailable
+carries the `executor_unavailable` failure kind and does not consume its
+execution retry budget. Duplicate candidates and unknown executor types are
+rejected at dispatch time; an empty `{}` candidate config is valid. See
+[architecture.md](architecture.md#executor-fallback-chains).
+
 ## Projects
 
 `ProjectResponse` includes `project_hooks`, an array of project-wide hook

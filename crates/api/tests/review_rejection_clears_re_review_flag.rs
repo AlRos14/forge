@@ -185,6 +185,7 @@ impl CodingExecutorAdapter for RejectClearsFlagCodexAdapter {
                     summary: Some("auditor passed after reviewer rejection".to_owned()),
                     error: None,
                     usage: None,
+                    ..Default::default()
                 });
             }
 
@@ -204,6 +205,7 @@ impl CodingExecutorAdapter for RejectClearsFlagCodexAdapter {
                 summary: Some("coder follow-up completed".to_owned()),
                 error: None,
                 usage: None,
+                ..Default::default()
             })
         })
     }
