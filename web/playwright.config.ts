@@ -21,7 +21,13 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'], channel: 'chrome' },
+      // Locally, use the installed Google Chrome so devs don't need
+      // `playwright install`; CI's playwright container only ships the
+      // bundled Chromium, so no channel there.
+      use: {
+        ...devices['Desktop Chrome'],
+        ...(process.env.CI ? {} : { channel: 'chrome' }),
+      },
     },
   ],
 })

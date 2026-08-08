@@ -170,26 +170,35 @@ impl TaskExecutor for ShellExecutor {
         }
 
         let deadline = time::Instant::now() + self.cancel_grace_period;
-        loop {
+        let direct_child_exited = loop {
             {
                 let mut child = process.child.lock().await;
                 if child.try_wait()?.is_some() {
-                    return Ok(());
+                    break true;
                 }
             }
 
             if time::Instant::now() >= deadline {
-                break;
+                break false;
             }
 
             time::sleep(COMPLETION_POLL_INTERVAL).await;
-        }
+        };
 
-        let mut child = process.child.lock().await;
-        if let Some(child_id) = child.id() {
+        // Always SIGKILL the process group, even when the direct child exited
+        // during the grace period: TERM-ignoring descendants in the group can
+        // outlive it and keep the output pipes open, which would stall the
+        // supervisor's drain loop until they exit on their own. Signalling an
+        // already-dead group is a no-op (ESRCH).
+        if let Some(child_id) = child_id {
             let _ = send_sigkill(child_id).await;
         }
-        child.start_kill()?;
+        if !direct_child_exited {
+            // Tolerate the child exiting between the deadline check and here;
+            // start_kill errors on an already-reaped process.
+            let mut child = process.child.lock().await;
+            let _ = child.start_kill();
+        }
 
         Ok(())
     }

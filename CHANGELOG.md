@@ -14,6 +14,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Daemon protocol: `ExecutionTerminalNotification` gains optional `failure_class`, `retry_at`, `resolved_candidate`, and `route_attempts` fields (additive — older daemons degrade to generic executor-failed handling).
 - Session resume is now candidate-identity-aware: follow-ups promote the parent execution's winning candidate when it is still routed, and a candidate switch (including a different Smith profile on the same executor) starts a fresh session instead of replaying another account's session id. Smith executions now inject `resume_session_id` on follow-up like Claude Code/Cursor.
 
+### Fixed
+
+- Cancelling a shell execution now always SIGKILLs the whole process group after the grace period. Previously, if the direct child died to SIGTERM while a TERM-ignoring descendant survived, the escalation was skipped and the execution stalled until the descendant exited on its own (deterministic on Linux).
+- Playwright smoke tests in CI use the container's bundled Chromium instead of requiring a Google Chrome install; local runs still use the `chrome` channel.
+
 ## [0.5.0] - 2026-08-03
 
 ### Breaking
