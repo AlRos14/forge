@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use api_types::{
-    FailurePolicy, HookAudience, HookResultEntry, HookSpec, StateDefinition, StateHooks, StateKind,
-    WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    FailurePolicy, GateConfig, HookAudience, HookResultEntry, HookSpec, StateDefinition,
+    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
@@ -207,6 +207,60 @@ fn with_trigger(mut state: StateDefinition, trigger: WorkflowTrigger, to: &str) 
         },
     );
     state
+}
+
+fn user_approval_review_workflow(
+    before_enter_hook: HookSpec,
+    after_enter_hooks: Vec<HookSpec>,
+) -> WorkflowDefinition {
+    let working = with_trigger(
+        state("working", StateKind::Active, None, StateHooks::default()),
+        WorkflowTrigger::Accept,
+        "review",
+    );
+    let mut review = state(
+        "review",
+        StateKind::Gate,
+        None,
+        StateHooks {
+            before_enter: vec![before_enter_hook],
+            after_enter: after_enter_hooks,
+            ..StateHooks::default()
+        },
+    );
+    review.gate_config = Some(GateConfig {
+        reject_target: Some("working".to_owned()),
+        max_rejections: Some(3),
+        approve_label: Some("Approve".to_owned()),
+        reject_label: Some("Reject".to_owned()),
+        requires_user_approval: Some(true),
+        optional_when_unassigned: Some(false),
+    });
+    review.triggers.insert(
+        WorkflowTrigger::Accept,
+        WorkflowTriggerDefinition {
+            to: "done".to_owned(),
+            dispatch: None,
+        },
+    );
+    review.triggers.insert(
+        WorkflowTrigger::Reject,
+        WorkflowTriggerDefinition {
+            to: "working".to_owned(),
+            dispatch: None,
+        },
+    );
+
+    WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![
+            working,
+            review,
+            state("done", StateKind::Terminal, None, StateHooks::default()),
+        ],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    }
 }
 
 fn phases(results: &[HookResultEntry]) -> Vec<&str> {
@@ -1283,6 +1337,80 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .await
         .expect("qa → coding (reject)");
     assert_eq!(result.task.status, "coding");
+}
+
+#[tokio::test]
+async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_target() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let workflow =
+        user_approval_review_workflow(hook("run_ci_steps", FailurePolicy::Block), Vec::new());
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(r#"{"review":{"ci_steps":"not-an-array"}}"#)
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("task review config updates");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            &task_id,
+            "review",
+            1,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "submit for validation",
+            false,
+        )
+        .await
+        .expect("failed validation cascades back to working");
+
+    assert_eq!(result.task.status, "working");
+    assert!(result.task.entry_barrier_json.is_none());
+    let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
+        .await
+        .expect("transition logs load");
+    assert!(
+        logs.iter().any(|entry| {
+            entry.from_state == "review" && entry.to_state == "working" && entry.rejection
+        }),
+        "validation rejection should be recorded on the automatic reject cascade"
+    );
+}
+
+#[tokio::test]
+async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let workflow = user_approval_review_workflow(
+        hook("check_retry_budget", FailurePolicy::Block),
+        vec![hook("auto_cascade_on_completion", FailurePolicy::Log)],
+    );
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            &task_id,
+            "review",
+            1,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "submit for validation",
+            false,
+        )
+        .await
+        .expect("passing validation pauses for human approval");
+
+    assert_eq!(result.task.status, "review");
+    assert!(result.task.entry_barrier_json.is_none());
+    assert!(!result.cascaded);
+    let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
+        .await
+        .expect("transition logs load");
+    assert!(!logs.iter().any(|entry| entry.rejection));
 }
 
 #[tokio::test]

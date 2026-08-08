@@ -1,8 +1,8 @@
 use api_types::{
-    CanonicalPhase, FailurePolicy, GateConfig, HookAudience, HookSpec, RoleDefinition,
-    StateDefinition, StateHooks, StateKind, WorkflowConfigBinding, WorkflowConfigField,
-    WorkflowConfigValueType, WorkflowDefinition, WorkflowDispatch, WorkflowExecutionPolicy,
-    WorkflowPromptConfig, WorkflowTrigger, WorkflowTriggerDefinition,
+    CanonicalPhase, CleanupPolicy, FailurePolicy, GateConfig, HookAudience, HookSpec,
+    RoleDefinition, StateDefinition, StateHooks, StateKind, WorkflowConfigBinding,
+    WorkflowConfigField, WorkflowConfigValueType, WorkflowDefinition, WorkflowDispatch,
+    WorkflowExecutionPolicy, WorkflowPromptConfig, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use serde_json::json;
 
@@ -33,6 +33,15 @@ fn blocking_hook(action: &str) -> HookSpec {
         action: action.to_owned(),
         params: json!({}),
         applies_to: HookAudience::All,
+        on_failure: FailurePolicy::Block,
+    }
+}
+
+fn agent_blocking_hook(action: &str) -> HookSpec {
+    HookSpec {
+        action: action.to_owned(),
+        params: json!({}),
+        applies_to: HookAudience::AgentOnly,
         on_failure: FailurePolicy::Block,
     }
 }
@@ -81,7 +90,7 @@ pub fn default_autonomous_workflow() -> WorkflowDefinition {
             None,
             CanonicalPhase::Ready,
             StateHooks {
-                before_exit: vec![blocking_hook("dependency_gate")],
+                before_exit: vec![agent_blocking_hook("dependency_gate")],
                 ..StateHooks::default()
             },
         ),
@@ -151,7 +160,10 @@ pub fn default_autonomous_workflow() -> WorkflowDefinition {
             "Done",
             None,
             CanonicalPhase::Done,
-            StateHooks::default(),
+            StateHooks {
+                on_enter: vec![hook("cleanup_workspace_now")],
+                ..StateHooks::default()
+            },
         ),
         state(
             CANCELLED,
@@ -160,11 +172,20 @@ pub fn default_autonomous_workflow() -> WorkflowDefinition {
             "Cancelled",
             None,
             CanonicalPhase::Done,
-            StateHooks::default(),
+            StateHooks {
+                on_enter: vec![hook("schedule_workspace_cleanup")],
+                ..StateHooks::default()
+            },
         ),
     ];
 
     for state in &mut states {
+        if state.name == DONE {
+            state.cleanup = Some(CleanupPolicy::Immediate);
+        }
+        if state.name == CANCELLED {
+            state.cleanup = Some(CleanupPolicy::Delayed { seconds: 86_400 });
+        }
         if state.name == WORKING {
             // A normal first entry has no terminal worker execution to resume, so the
             // dispatch loader falls back to a new run. Returning from failed validation
@@ -406,7 +427,10 @@ pub fn default_autonomous_workflow() -> WorkflowDefinition {
 
 #[cfg(test)]
 mod tests {
-    use api_types::{CanonicalPhase, StateKind, WorkflowExecutionPolicy, WorkflowTrigger};
+    use api_types::{
+        CanonicalPhase, CleanupPolicy, HookAudience, StateKind, WorkflowExecutionPolicy,
+        WorkflowTrigger,
+    };
 
     use super::{default_autonomous_workflow, CANCELLED, MERGE_FAILED, MERGING, REVIEW, WORKING};
     use crate::workflow::{default_roles, validation::validate_workflow};
@@ -458,6 +482,50 @@ mod tests {
             assert_eq!(state.canonical_phase, Some(phase));
             assert_eq!(state.role.as_deref(), role);
         }
+
+        let ready = workflow
+            .states
+            .iter()
+            .find(|state| state.name == super::READY)
+            .expect("ready state");
+        assert_eq!(
+            ready.hooks.before_exit[0].applies_to,
+            HookAudience::AgentOnly
+        );
+
+        let done = workflow
+            .states
+            .iter()
+            .find(|state| state.name == super::DONE)
+            .expect("done state");
+        assert_eq!(done.cleanup, Some(CleanupPolicy::Immediate));
+        assert_eq!(
+            done.hooks
+                .on_enter
+                .iter()
+                .map(|hook| hook.action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cleanup_workspace_now"]
+        );
+
+        let cancelled = workflow
+            .states
+            .iter()
+            .find(|state| state.name == CANCELLED)
+            .expect("cancelled state");
+        assert_eq!(
+            cancelled.cleanup,
+            Some(CleanupPolicy::Delayed { seconds: 86_400 })
+        );
+        assert_eq!(
+            cancelled
+                .hooks
+                .on_enter
+                .iter()
+                .map(|hook| hook.action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["schedule_workspace_cleanup"]
+        );
     }
 
     #[test]

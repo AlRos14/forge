@@ -831,6 +831,7 @@ impl WorkflowEngine {
 
             let mut hook_results = Vec::new();
             let mut cascade: Option<(String, String)> = None;
+            let mut before_enter_rejection_cascade = false;
             let mut skip_target_enter_hooks = false;
             let has_blocking_before_enter = to_state
                 .hooks
@@ -1372,6 +1373,7 @@ impl WorkflowEngine {
                                             )
                                             .await?;
                                             before_enter_barrier_resolved = true;
+                                            before_enter_rejection_cascade = true;
                                             cascade = Some((reject_target, error));
                                         }
                                     } else {
@@ -1652,6 +1654,7 @@ impl WorkflowEngine {
                         .gate_config
                         .as_ref()
                         .is_some_and(|gate_config| gate_config.requires_user_approval())
+                    && !before_enter_rejection_cascade
                     && !to_state.gate_config.as_ref().is_some_and(|gate_config| {
                         gate_config.optional_when_unassigned()
                             && cascade_reason.starts_with("gate skipped:")

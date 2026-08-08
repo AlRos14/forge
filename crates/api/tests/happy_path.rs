@@ -304,6 +304,94 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let completed = poll_until_task_status(&harness.app, &task.id, "done".to_owned()).await;
     assert_eq!(completed.status, "done".to_owned());
 
+    let ci_failure_task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": "Autonomous validation retry",
+            "description": "printf 'validation retry\\n' > autonomous-ci-retry.txt && git add autonomous-ci-retry.txt && git commit --allow-empty -m autonomous-ci-retry",
+            "review_config": { "ci_steps": ["false"] }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let claimed_ci_failure: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", ci_failure_task.id),
+        json!({ "agent_id": agent.id, "overrides": null }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(claimed_ci_failure.status, "working".to_owned());
+    let first_ci_execution = single_execution_for_task(&harness.app, &ci_failure_task.id).await;
+
+    let failed_follow_up =
+        poll_until_follow_up_execution(&harness.app, &ci_failure_task.id, &first_ci_execution.id)
+            .await;
+    assert_eq!(
+        failed_follow_up.parent_execution_id.as_deref(),
+        Some(first_ci_execution.id.as_str())
+    );
+    let after_ci_failure: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", ci_failure_task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(after_ci_failure.status, "working".to_owned());
+    assert!(!after_ci_failure.awaiting_human);
+
+    let passing_review_config = serde_json::to_string(&json!({
+        "review": { "ci_steps": ["true"] }
+    }))
+    .expect("passing review config serializes");
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(passing_review_config)
+        .bind(&ci_failure_task.id)
+        .execute(harness.state.db.pool())
+        .await
+        .expect("passing review config updates");
+    let _: Value = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/transition", ci_failure_task.id),
+        json!({
+            "status": "review",
+            "version": after_ci_failure.version,
+            "reason": "retry validation after CI configuration was corrected"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let ci_review =
+        poll_until_task_status(&harness.app, &ci_failure_task.id, "review".to_owned()).await;
+    assert!(ci_review.awaiting_human);
+    let ci_approved: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/gates/review/approve", ci_failure_task.id),
+        json!({ "version": ci_review.version, "reason": "human approval" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(matches!(ci_approved.status.as_str(), "merging" | "done"));
+    let ci_completed =
+        poll_until_task_status(&harness.app, &ci_failure_task.id, "done".to_owned()).await;
+    assert_eq!(ci_completed.status, "done".to_owned());
+    let ci_reviews = ReviewRepo::list_by_task(&*harness.state.db, &ci_failure_task.id)
+        .await
+        .expect("CI retry reviews load");
+    assert!(
+        ci_reviews
+            .iter()
+            .any(|review| review.status == db::ReviewStatus::Failed),
+        "the first validation attempt should be recorded as failed"
+    );
+
     let second_task: TaskResponse = json_request(
         &harness.app,
         Method::POST,
