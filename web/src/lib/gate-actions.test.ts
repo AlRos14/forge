@@ -24,6 +24,7 @@ function state(
     display_name: name.replace(/_/g, ' '),
     role,
     hooks: emptyHooks,
+    canonical_phase: null,
     cleanup: null,
     gate_config: gateConfig,
     dispatch: null,

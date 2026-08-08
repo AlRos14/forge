@@ -32,6 +32,7 @@ function state(
     display_name: displayName,
     role: null,
     hooks: emptyHooks,
+    canonical_phase: null,
     cleanup: null,
     gate_config: null,
     dispatch: null,

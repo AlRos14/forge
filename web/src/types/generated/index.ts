@@ -1,4 +1,5 @@
 export * from './api'
+export type { CanonicalPhase } from './bindings/CanonicalPhase'
 export type { StateDefinition } from './bindings/StateDefinition'
 export type { WorkflowDefinition } from './bindings/WorkflowDefinition'
 export type { WorkflowDispatch } from './bindings/WorkflowDispatch'

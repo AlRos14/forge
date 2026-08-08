@@ -9,8 +9,9 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    ProjectResponse, RepoResponse, StateDefinition, StateHooks, StateKind, TaskResponse,
-    TransitionTaskResponse, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    CanonicalPhase, ProjectResponse, RepoResponse, StateDefinition, StateHooks, StateKind,
+    TaskResponse, TransitionTaskResponse, WorkflowDefinition, WorkflowTrigger,
+    WorkflowTriggerDefinition,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -450,6 +451,14 @@ fn workflow_state(name: &str, kind: StateKind) -> StateDefinition {
         role: None,
         hooks: StateHooks::default(),
         cleanup: None,
+        canonical_phase: Some(match kind {
+            StateKind::Backlog => CanonicalPhase::Backlog,
+            StateKind::Initial => CanonicalPhase::Ready,
+            StateKind::Active => CanonicalPhase::Working,
+            StateKind::Gate => CanonicalPhase::Working,
+            StateKind::Terminal => CanonicalPhase::Done,
+            StateKind::Custom => CanonicalPhase::Working,
+        }),
         gate_config: None,
         dispatch: None,
         triggers: std::collections::BTreeMap::new(),

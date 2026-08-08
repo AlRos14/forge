@@ -104,6 +104,14 @@ Project hook validation rejects unsupported trigger and action types, the
 `task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
 required action strings such as `dispatch_agent.agent_id`.
 
+## Workflow canonical phases
+
+Workflow state definitions may include the optional `canonical_phase` field:
+`backlog`, `ready`, `working`, `review`, or `done`. New workflow saves must set
+it explicitly for every state. Legacy definitions without the field remain
+readable; their phase is derived from the state column, known legacy state
+names, and state kind, with unknown states defaulting to `working`.
+
 ## Agent execution options
 
 The two `discovered-options` endpoints return the adapter's selectable

@@ -131,6 +131,7 @@ fn export_typescript() {
     GateConfig::export().expect("export GateConfig");
     HookSpec::export().expect("export HookSpec");
     StateHooks::export().expect("export StateHooks");
+    CanonicalPhase::export().expect("export CanonicalPhase");
     StateDefinition::export().expect("export StateDefinition");
     WorkflowTrigger::export().expect("export WorkflowTrigger");
     WorkflowExecutionStrategy::export().expect("export WorkflowExecutionStrategy");

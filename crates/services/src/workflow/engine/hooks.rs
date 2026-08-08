@@ -261,7 +261,7 @@ pub(super) fn hook_result_entry(
 
 #[cfg(test)]
 mod tests {
-    use api_types::{StateDefinition, StateHooks, StateKind};
+    use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind};
     use serde_json::json;
 
     use super::merged_state_config;
@@ -275,6 +275,7 @@ mod tests {
             role: Some(crate::workflow::default_roles::REVIEWER.to_owned()),
             hooks: StateHooks::default(),
             cleanup: None,
+            canonical_phase: Some(CanonicalPhase::Review),
             gate_config: None,
             dispatch: None,
             triggers: Default::default(),

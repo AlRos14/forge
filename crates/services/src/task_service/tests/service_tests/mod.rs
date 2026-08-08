@@ -4,7 +4,7 @@ use crate::workflow::default_roles;
 use crate::workspace_execution_lock::WorkspaceExecutionLockManager;
 use ::workspace::RepoCacheLockManager;
 use api_types::{
-    FailurePolicy, HookAudience, HookSpec, StateDefinition, StateHooks, StateKind,
+    CanonicalPhase, FailurePolicy, HookAudience, HookSpec, StateDefinition, StateHooks, StateKind,
     WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use async_trait::async_trait;
@@ -436,6 +436,14 @@ fn workflow_state(
         role: role.map(str::to_owned),
         hooks,
         cleanup: None,
+        canonical_phase: Some(match kind {
+            StateKind::Backlog => CanonicalPhase::Backlog,
+            StateKind::Initial => CanonicalPhase::Ready,
+            StateKind::Active => CanonicalPhase::Working,
+            StateKind::Gate => CanonicalPhase::Working,
+            StateKind::Terminal => CanonicalPhase::Done,
+            StateKind::Custom => CanonicalPhase::Working,
+        }),
         gate_config: None,
         dispatch: None,
         triggers: std::collections::BTreeMap::new(),

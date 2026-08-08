@@ -89,9 +89,9 @@ fn minimal_workflow() -> Value {
     json!({
         "roles": [],
         "states": [
-            {"name": "todo", "kind": "initial", "column": "Todo", "display_name": "Todo", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "in_progress", "dispatch": null}}, "config": {}},
-            {"name": "in_progress", "kind": "active", "column": "In Progress", "display_name": "In Progress", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "done", "dispatch": null}}, "config": {}},
-            {"name": "done", "kind": "terminal", "column": "Done", "display_name": "Done", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {}, "config": {}}
+            {"name": "todo", "kind": "initial", "canonical_phase": "ready", "column": "Todo", "display_name": "Todo", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "in_progress", "dispatch": null}}, "config": {}},
+            {"name": "in_progress", "kind": "active", "canonical_phase": "working", "column": "In Progress", "display_name": "In Progress", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "done", "dispatch": null}}, "config": {}},
+            {"name": "done", "kind": "terminal", "canonical_phase": "done", "column": "Done", "display_name": "Done", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {}, "config": {}}
         ],
         "configuration": [],
         "cancellation_state": null
@@ -338,13 +338,13 @@ async fn applying_template_blocked_by_active_task_in_removed_state() {
     let no_todo_workflow = json!({
         "roles": [],
         "states": [
-            {"name": "start", "kind": "initial", "column": "Start", "display_name": "Start",
+            {"name": "start", "kind": "initial", "canonical_phase": "ready", "column": "Start", "display_name": "Start",
              "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []},
              "cleanup": null, "gate_config": null, "triggers": {"accept": {"to": "running", "dispatch": null}}, "config": {}},
-            {"name": "running", "kind": "active", "column": "Running", "display_name": "Running",
+            {"name": "running", "kind": "active", "canonical_phase": "working", "column": "Running", "display_name": "Running",
              "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []},
              "cleanup": null, "gate_config": null, "triggers": {"accept": {"to": "done", "dispatch": null}}, "config": {}},
-            {"name": "done", "kind": "terminal", "column": "Done", "display_name": "Done",
+            {"name": "done", "kind": "terminal", "canonical_phase": "done", "column": "Done", "display_name": "Done",
              "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []},
              "cleanup": null, "gate_config": null, "triggers": {}, "config": {}}
         ],
@@ -455,9 +455,9 @@ async fn applying_template_that_removes_state_with_active_tasks_is_rejected() {
             "definition": {
                 "roles": [],
                 "states": [
-                    {"name": "todo", "kind": "initial", "column": "Todo", "display_name": "Todo", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "coding", "dispatch": null}}, "config": {}},
-                    {"name": "coding", "kind": "active", "column": "Coding", "display_name": "Coding", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "done", "dispatch": null}}, "config": {}},
-                    {"name": "done", "kind": "terminal", "column": "Done", "display_name": "Done", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {}, "config": {}}
+                    {"name": "todo", "kind": "initial", "canonical_phase": "ready", "column": "Todo", "display_name": "Todo", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "coding", "dispatch": null}}, "config": {}},
+                    {"name": "coding", "kind": "active", "canonical_phase": "working", "column": "Coding", "display_name": "Coding", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {"accept": {"to": "done", "dispatch": null}}, "config": {}},
+                    {"name": "done", "kind": "terminal", "canonical_phase": "done", "column": "Done", "display_name": "Done", "role": null, "hooks": {"before_exit": [], "on_exit": [], "before_enter": [], "on_enter": [], "after_enter": []}, "cleanup": null, "gate_config": null, "dispatch": null, "triggers": {}, "config": {}}
                 ],
                 "cancellation_state": null
             }

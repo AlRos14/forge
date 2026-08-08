@@ -21,6 +21,7 @@
       "name": "backlog",
       "kind": "backlog",
       "column": "Backlog",
+      "canonical_phase": "backlog",
       "display_name": "Backlog",
       "role": null,
       "hooks": {
@@ -49,6 +50,7 @@
       "name": "todo",
       "kind": "initial",
       "column": "Todo",
+      "canonical_phase": "ready",
       "display_name": "Todo",
       "role": null,
       "hooks": {
@@ -92,6 +94,7 @@
       "name": "planning",
       "kind": "gate",
       "column": "In Progress",
+      "canonical_phase": "working",
       "display_name": "Planning",
       "role": "planner",
       "hooks": {
@@ -156,6 +159,7 @@
       "name": "in_progress",
       "kind": "active",
       "column": "In Progress",
+      "canonical_phase": "working",
       "display_name": "In Progress",
       "role": "coder",
       "hooks": {
@@ -215,6 +219,7 @@
       "name": "review",
       "kind": "gate",
       "column": "Review",
+      "canonical_phase": "review",
       "display_name": "Review",
       "role": "reviewer",
       "hooks": {
@@ -306,6 +311,7 @@
       "name": "merging",
       "kind": "gate",
       "column": "Review",
+      "canonical_phase": "review",
       "display_name": "Merging",
       "role": null,
       "hooks": {
@@ -363,6 +369,7 @@
       "name": "merge_failed",
       "kind": "active",
       "column": "Review",
+      "canonical_phase": "review",
       "display_name": "Merge Failed",
       "role": "coder",
       "hooks": {
@@ -430,6 +437,7 @@
       "name": "done",
       "kind": "terminal",
       "column": "Done",
+      "canonical_phase": "done",
       "display_name": "Done",
       "role": null,
       "hooks": {
@@ -468,6 +476,7 @@
       "name": "cancelled",
       "kind": "terminal",
       "column": "Done",
+      "canonical_phase": "done",
       "display_name": "Cancelled",
       "role": null,
       "hooks": {

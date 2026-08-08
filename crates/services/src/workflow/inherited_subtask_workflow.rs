@@ -1,6 +1,6 @@
 use api_types::{
-    FailurePolicy, HookAudience, HookSpec, RoleDefinition, StateDefinition, StateHooks, StateKind,
-    WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    CanonicalPhase, FailurePolicy, HookAudience, HookSpec, RoleDefinition, StateDefinition,
+    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use serde_json::json;
 
@@ -21,6 +21,7 @@ fn state(
     column: &str,
     display_name: &str,
     role: Option<&str>,
+    canonical_phase: CanonicalPhase,
     hooks: StateHooks,
 ) -> StateDefinition {
     StateDefinition {
@@ -31,6 +32,7 @@ fn state(
         role: role.map(str::to_owned),
         hooks,
         cleanup: None,
+        canonical_phase: Some(canonical_phase),
         gate_config: None,
         dispatch: None,
         triggers: std::collections::BTreeMap::new(),
@@ -45,6 +47,7 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
         "Todo",
         "Todo",
         None,
+        CanonicalPhase::Ready,
         StateHooks::default(),
     );
     todo.triggers.insert(
@@ -67,6 +70,7 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
         "In Progress",
         "In Progress",
         Some(default_roles::CODER),
+        CanonicalPhase::Working,
         StateHooks {
             on_enter: vec![hook("dispatch_role_agent")],
             ..StateHooks::default()
@@ -101,6 +105,7 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
                 "Done",
                 "Done",
                 None,
+                CanonicalPhase::Done,
                 StateHooks::default(),
             ),
             state(
@@ -109,6 +114,7 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
                 "Done",
                 "Cancelled",
                 None,
+                CanonicalPhase::Done,
                 StateHooks::default(),
             ),
         ],

@@ -60,6 +60,14 @@ pub fn validate_workflow(def: &WorkflowDefinition) -> Result<(), ServiceError> {
     }
 
     for state in &def.states {
+        if state.canonical_phase.is_none() {
+            return Err(ServiceError::InvalidOperation {
+                message: format!(
+                    "state '{}' must define canonical_phase when saving a workflow",
+                    state.name
+                ),
+            });
+        }
         validate_hooks(&state.name, &state.hooks)?;
         // "assignee" is reserved as the implicit role for active states; no role-declaration check is enforced (engine is role-name-agnostic by design).
         if state.role.as_deref() == Some(default_roles::ASSIGNEE) && state.kind != StateKind::Active
@@ -379,9 +387,9 @@ fn validate_hooks(state_name: &str, hooks: &StateHooks) -> Result<(), ServiceErr
 #[cfg(test)]
 mod tests {
     use api_types::{
-        GateConfig, HookSpec, StateDefinition, StateHooks, StateKind, WorkflowConfigBinding,
-        WorkflowConfigField, WorkflowConfigValueType, WorkflowDefinition, WorkflowDispatch,
-        WorkflowExecutionPolicy, WorkflowTrigger, WorkflowTriggerDefinition,
+        CanonicalPhase, GateConfig, HookSpec, StateDefinition, StateHooks, StateKind,
+        WorkflowConfigBinding, WorkflowConfigField, WorkflowConfigValueType, WorkflowDefinition,
+        WorkflowDispatch, WorkflowExecutionPolicy, WorkflowTrigger, WorkflowTriggerDefinition,
     };
     use serde_json::json;
 
@@ -400,6 +408,14 @@ mod tests {
             role: role.map(str::to_owned),
             hooks: StateHooks::default(),
             cleanup: None,
+            canonical_phase: Some(match kind {
+                StateKind::Backlog => CanonicalPhase::Backlog,
+                StateKind::Initial => CanonicalPhase::Ready,
+                StateKind::Active => CanonicalPhase::Working,
+                StateKind::Gate => CanonicalPhase::Working,
+                StateKind::Terminal => CanonicalPhase::Done,
+                StateKind::Custom => CanonicalPhase::Working,
+            }),
             gate_config: None,
             dispatch: None,
             triggers: std::collections::BTreeMap::new(),
@@ -657,5 +673,32 @@ mod tests {
     #[test]
     fn validation_accepts_default_workflow() {
         validate_workflow(&default_workflow()).expect("default workflow should validate");
+    }
+
+    #[test]
+    fn validation_rejects_state_without_explicit_canonical_phase() {
+        let mut workflow = WorkflowDefinition {
+            roles: Vec::new(),
+            states: vec![
+                state("todo", StateKind::Initial, None),
+                state(
+                    "in_progress",
+                    StateKind::Active,
+                    Some(default_roles::ASSIGNEE),
+                ),
+                state("done", StateKind::Terminal, None),
+            ],
+            configuration: Vec::new(),
+            cancellation_state: None,
+        };
+        workflow.states[1].canonical_phase = None;
+
+        match validate_workflow(&workflow) {
+            Err(ServiceError::InvalidOperation { message }) => {
+                assert!(message.contains("canonical_phase"));
+                assert!(message.contains("in_progress"));
+            }
+            other => panic!("expected missing canonical phase error, got {other:?}"),
+        }
     }
 }

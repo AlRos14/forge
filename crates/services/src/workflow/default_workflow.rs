@@ -1,8 +1,8 @@
 use api_types::{
-    CleanupPolicy, FailurePolicy, GateConfig, HookAudience, HookSpec, RoleDefinition,
-    StateDefinition, StateHooks, StateKind, WorkflowConfigBinding, WorkflowConfigField,
-    WorkflowConfigValueType, WorkflowDefinition, WorkflowDispatch, WorkflowExecutionPolicy,
-    WorkflowPromptConfig, WorkflowTrigger, WorkflowTriggerDefinition,
+    CanonicalPhase, CleanupPolicy, FailurePolicy, GateConfig, HookAudience, HookSpec,
+    RoleDefinition, StateDefinition, StateHooks, StateKind, WorkflowConfigBinding,
+    WorkflowConfigField, WorkflowConfigValueType, WorkflowDefinition, WorkflowDispatch,
+    WorkflowExecutionPolicy, WorkflowPromptConfig, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use serde_json::json;
 
@@ -41,6 +41,7 @@ fn state(
     column: &str,
     display_name: &str,
     role: Option<&str>,
+    canonical_phase: CanonicalPhase,
     hooks: StateHooks,
 ) -> StateDefinition {
     StateDefinition {
@@ -51,6 +52,7 @@ fn state(
         role: role.map(str::to_string),
         hooks,
         cleanup: None,
+        canonical_phase: Some(canonical_phase),
         gate_config: None,
         dispatch: None,
         triggers: std::collections::BTreeMap::new(),
@@ -66,6 +68,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Backlog",
             "Backlog",
             None,
+            CanonicalPhase::Backlog,
             StateHooks::default(),
         ),
         state(
@@ -74,6 +77,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Todo",
             "Todo",
             None,
+            CanonicalPhase::Ready,
             StateHooks {
                 before_exit: vec![agent_blocking_hook("dependency_gate")],
                 ..StateHooks::default()
@@ -85,6 +89,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "In Progress",
             "Planning",
             Some(default_roles::PLANNER),
+            CanonicalPhase::Working,
             StateHooks {
                 before_enter: vec![blocking_hook("run_before_work_hooks")],
                 on_enter: vec![hook("dispatch_role_agent")],
@@ -98,6 +103,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "In Progress",
             "In Progress",
             Some(default_roles::CODER),
+            CanonicalPhase::Working,
             StateHooks {
                 before_exit: vec![
                     blocking_hook("subtask_sequence_complete"),
@@ -114,6 +120,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Review",
             "Review",
             Some(default_roles::REVIEWER),
+            CanonicalPhase::Review,
             StateHooks {
                 before_enter: vec![
                     blocking_hook("run_before_work_hooks"),
@@ -134,6 +141,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Review",
             "Merging",
             None,
+            CanonicalPhase::Review,
             StateHooks {
                 on_enter: vec![hook("run_merge")],
                 after_enter: vec![hook("auto_cascade_on_merge_result")],
@@ -146,6 +154,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Review",
             "Merge Failed",
             Some(default_roles::CODER),
+            CanonicalPhase::Review,
             StateHooks {
                 before_enter: vec![blocking_hook("run_before_work_hooks")],
                 on_enter: vec![hook("notify_role_holder"), hook("dispatch_role_agent")],
@@ -158,6 +167,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Done",
             "Done",
             None,
+            CanonicalPhase::Done,
             StateHooks {
                 on_enter: vec![
                     hook("cleanup_workspace_now"),
@@ -173,6 +183,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             "Done",
             "Cancelled",
             None,
+            CanonicalPhase::Done,
             StateHooks {
                 on_enter: vec![
                     hook("schedule_workspace_cleanup"),
@@ -561,5 +572,34 @@ mod tests {
                 .map(|(_, target)| target),
             Some(default_states::IN_PROGRESS.to_string())
         );
+    }
+
+    #[test]
+    fn every_default_state_has_its_decided_canonical_phase() {
+        let workflow = default_workflow();
+        let expected = [
+            (default_states::BACKLOG, CanonicalPhase::Backlog),
+            (default_states::TODO, CanonicalPhase::Ready),
+            (default_states::PLANNING, CanonicalPhase::Working),
+            (default_states::IN_PROGRESS, CanonicalPhase::Working),
+            (default_states::REVIEW, CanonicalPhase::Review),
+            (default_states::MERGING, CanonicalPhase::Review),
+            (default_states::MERGE_FAILED, CanonicalPhase::Review),
+            (default_states::DONE, CanonicalPhase::Done),
+            (default_states::CANCELLED, CanonicalPhase::Done),
+        ];
+
+        for (state, phase) in expected {
+            assert_eq!(workflow.canonical_phase_for_state(state), phase);
+            assert_eq!(
+                workflow
+                    .states
+                    .iter()
+                    .find(|definition| definition.name == state)
+                    .and_then(|definition| definition.canonical_phase),
+                Some(phase),
+                "default state {state} must set canonical_phase explicitly"
+            );
+        }
     }
 }

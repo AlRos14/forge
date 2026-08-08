@@ -2,8 +2,8 @@
 use std::sync::Arc;
 
 use api_types::{
-    FailurePolicy, HookAudience, HookSpec, RoleDefinition, StateDefinition, StateHooks, StateKind,
-    WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    CanonicalPhase, FailurePolicy, HookAudience, HookSpec, RoleDefinition, StateDefinition,
+    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
@@ -262,6 +262,14 @@ fn state(name: &str, kind: StateKind, role: Option<&str>, hooks: StateHooks) -> 
         role: role.map(str::to_owned),
         hooks,
         cleanup: None,
+        canonical_phase: Some(match kind {
+            StateKind::Backlog => CanonicalPhase::Backlog,
+            StateKind::Initial => CanonicalPhase::Ready,
+            StateKind::Active => CanonicalPhase::Working,
+            StateKind::Gate => CanonicalPhase::Working,
+            StateKind::Terminal => CanonicalPhase::Done,
+            StateKind::Custom => CanonicalPhase::Working,
+        }),
         gate_config: None,
         dispatch: None,
         triggers: std::collections::BTreeMap::new(),

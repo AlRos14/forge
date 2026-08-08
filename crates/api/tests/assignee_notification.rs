@@ -118,7 +118,14 @@ async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResp
 }
 
 fn state(name: &str, kind: &str, role: impl Into<Value>, hooks: Value, triggers: Value) -> Value {
-    json!({ "name": name, "kind": kind, "column": name, "display_name": name, "role": role.into(), "hooks": hooks, "gate_config": null, "triggers": triggers, "config": {} })
+    let canonical_phase = match kind {
+        "backlog" => "backlog",
+        "initial" => "ready",
+        "gate" => "review",
+        "terminal" => "done",
+        _ => "working",
+    };
+    json!({ "name": name, "kind": kind, "column": name, "display_name": name, "role": role.into(), "hooks": hooks, "canonical_phase": canonical_phase, "gate_config": null, "triggers": triggers, "config": {} })
 }
 
 async fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<ForgeEvent>) -> Vec<ForgeEvent> {
