@@ -29,6 +29,26 @@ pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;
 
+const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
+
+/// Mark an executor config so the runtime restores the worktree after execution.
+pub fn mark_worktree_read_only(config: &mut serde_json::Value) {
+    if let Some(object) = config.as_object_mut() {
+        object.insert(
+            READ_ONLY_WORKTREE_KEY.to_owned(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
+/// Whether the runtime must discard all tracked and untracked worktree changes.
+pub fn is_worktree_read_only(config: &serde_json::Value) -> bool {
+    config
+        .get(READ_ONLY_WORKTREE_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Context passed to an executor when running a task.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
@@ -41,6 +61,22 @@ pub struct ExecutionContext {
     pub heartbeat_interval_seconds: u64,
     pub max_turns: Option<u32>,
     pub log_sender: Option<tokio::sync::mpsc::UnboundedSender<LogEntry>>,
+}
+
+#[cfg(test)]
+mod worktree_policy_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_worktree_policy_is_opt_in() {
+        let mut config = serde_json::json!({ "executor_type": "claude_code" });
+        assert!(!is_worktree_read_only(&config));
+
+        mark_worktree_read_only(&mut config);
+
+        assert!(is_worktree_read_only(&config));
+        assert_eq!(config["executor_type"], "claude_code");
+    }
 }
 
 /// Accumulated token usage from an executor run.

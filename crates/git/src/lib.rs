@@ -143,6 +143,16 @@ pub async fn status_porcelain(worktree_path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Restore a managed worktree to an exact commit and remove untracked files.
+///
+/// This enforces read-only execution roles even when an underlying CLI creates
+/// commits automatically.
+pub async fn restore_worktree(worktree_path: &Path, commit_sha: &str) -> Result<()> {
+    run_git(worktree_path, &["reset", "--hard", commit_sha]).await?;
+    run_git(worktree_path, &["clean", "-fd"]).await?;
+    Ok(())
+}
+
 /// Check out a branch in a repo or worktree.
 pub async fn branch_exists(repo_path: &Path, branch_name: &str) -> Result<bool> {
     let result = run_git(
@@ -552,6 +562,36 @@ mod tests {
 
         // Cleanup
         remove_worktree(&repo_path, &worktree_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_worktree_discards_commits_and_untracked_files() {
+        let (_dir, repo_path) = setup_repo().await;
+        let original_sha = get_current_sha(&repo_path).await.unwrap();
+
+        fs::write(repo_path.join("README.md"), "changed by reviewer")
+            .await
+            .unwrap();
+        fs::write(repo_path.join("reviewer.tmp"), "untracked")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "reviewer mutation").await.unwrap();
+        fs::write(repo_path.join("leftover.tmp"), "untracked")
+            .await
+            .unwrap();
+
+        restore_worktree(&repo_path, &original_sha).await.unwrap();
+
+        assert_eq!(get_current_sha(&repo_path).await.unwrap(), original_sha);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))
+                .await
+                .unwrap(),
+            "# Test"
+        );
+        assert!(!repo_path.join("reviewer.tmp").exists());
+        assert!(!repo_path.join("leftover.tmp").exists());
+        assert!(is_worktree_clean(&repo_path).await.unwrap());
     }
 
     #[tokio::test]

@@ -17,8 +17,8 @@ use api_types::{
     METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use executors::{
-    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, FallbackExecutor,
-    LogEntry, TaskExecutor,
+    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
+    FallbackExecutor, LogEntry, TaskExecutor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -316,7 +316,42 @@ async fn run_execution_task(
     );
 
     let execution_id = ctx.execution_id.clone();
-    let result = executor.execute(ctx).await;
+    let read_only_path = executors::is_worktree_read_only(&ctx.agent_config)
+        .then(|| PathBuf::from(&ctx.worktree_path));
+    let read_only_head = match read_only_path.as_deref() {
+        Some(path) => git::get_current_sha(path).await.map(Some).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to capture read-only worktree state: {error}"
+            ))
+        }),
+        None => Ok(None),
+    };
+    let result = match read_only_head {
+        Ok(read_only_head) => {
+            let execution_result = executor.execute(ctx).await;
+            let restore_result = match (read_only_path.as_deref(), read_only_head.as_deref()) {
+                (Some(path), Some(head)) => {
+                    git::restore_worktree(path, head).await.map_err(|error| {
+                        ExecutorError::Other(format!(
+                            "failed to restore read-only worktree state: {error}"
+                        ))
+                    })
+                }
+                _ => Ok(()),
+            };
+            match (execution_result, restore_result) {
+                (_, Err(error)) => Err(error),
+                (Ok(mut result), Ok(())) => {
+                    if let Some(head) = read_only_head {
+                        result.after_sha = Some(head);
+                    }
+                    Ok(result)
+                }
+                (Err(error), Ok(())) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
     // The executor owns the only log sender in ctx, so completion should close the
     // channel and let the forwarder drain. If an executor holds a sender clone or
     // emits a very large trailing burst, the timeout favors terminal notification

@@ -1,4 +1,5 @@
 use super::*;
+use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, CreateProject,
     CreateRepo, CreateTask, CreateWorkspace, DaemonRepo, DaemonStatus, ProjectRepo, RepoRepo,
@@ -13,6 +14,7 @@ struct SeededReview {
     event_bus: Arc<EventBus>,
     task_id: Uuid,
     executor_execution_id: Uuid,
+    auditor_agent_id: String,
     workspace: TempDir,
     logs_path: String,
 }
@@ -188,7 +190,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
         CreateExecution {
             id: executor_execution_id.to_string(),
             task_id: task_id.to_string(),
-            agent_id: Some(agent_id),
+            agent_id: Some(agent_id.clone()),
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -218,6 +220,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
         event_bus,
         task_id,
         executor_execution_id,
+        auditor_agent_id: agent_id,
         workspace,
         logs_path,
     }
@@ -234,6 +237,74 @@ fn request(seed: &SeededReview) -> ReviewRequest {
         review_prompt: None,
         executor_thread_id: None,
     }
+}
+
+struct MutatingAuditor;
+
+#[async_trait]
+impl TaskExecutor for MutatingAuditor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> Result<executors::ExecutionResult, executors::ExecutorError> {
+        let worktree = Path::new(&ctx.worktree_path);
+        tokio::fs::write(worktree.join("reviewer-created.txt"), "must be discarded\n").await?;
+        let committed_sha = git::commit_all(worktree, "reviewer mutation")
+            .await
+            .map_err(|error| executors::ExecutorError::Other(error.to_string()))?;
+
+        let mut writer = LogWriter::new(&ctx.logs_path, ctx.execution_id, MAX_LOG_BYTES);
+        writer
+            .write(
+                LogKind::Assistant,
+                LogStream::Main,
+                json!({ "text": "No issues.\n===REVIEW: PASS===" }),
+            )
+            .await?;
+
+        Ok(executors::ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            after_sha: Some(committed_sha),
+            agent_session_id: Some("auditor-session".to_owned()),
+            summary: Some("review passed".to_owned()),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn auditor_worktree_mutations_are_discarded_before_review_completes() {
+    let seed = seeded_review(Vec::new()).await;
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("baseline.txt"), "baseline\n")
+        .await
+        .unwrap();
+    let original_sha = git::commit_all(seed.workspace.path(), "baseline")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(MutatingAuditor),
+    );
+
+    let (_review, outcome) = runner.run(req).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    assert_eq!(
+        git::get_current_sha(seed.workspace.path()).await.unwrap(),
+        original_sha
+    );
+    assert!(!seed.workspace.path().join("reviewer-created.txt").exists());
+    assert!(git::is_worktree_clean(seed.workspace.path()).await.unwrap());
 }
 
 async fn write_jsonl_log(path: &Path, entries: Vec<(LogKind, Value)>) {

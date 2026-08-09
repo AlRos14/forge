@@ -627,8 +627,10 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
         .expect("task exists");
     let now = now_rfc3339();
     let workspace_id = new_uuid_v4();
-    let worktree_path = std::env::temp_dir().join("forge-workflow-action-test");
+    let worktree_path = std::env::temp_dir().join(format!("forge-workflow-action-{workspace_id}"));
     std::fs::create_dir_all(&worktree_path).expect("worktree path creates");
+    setup_git_repo(&worktree_path);
+    let before_sha = run_git(&worktree_path, &["rev-parse", "HEAD"]);
     WorkspaceRepo::create(
         &*ctx.db,
         CreateWorkspace {
@@ -638,7 +640,7 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             branch: ::workspace::task_branch_name(&ctx.task_id),
             status: WorkspaceStatus::Ready,
-            before_sha: None,
+            before_sha: Some(before_sha.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -665,8 +667,8 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
             last_activity_at: None,
             summary: Some("executor summary".to_owned()),
             logs_path: None,
-            before_sha: None,
-            after_sha: None,
+            before_sha: Some(before_sha.clone()),
+            after_sha: Some(before_sha),
             error: None,
             executor_config_snapshot_json: None,
             workspace_id: Some(workspace_id),

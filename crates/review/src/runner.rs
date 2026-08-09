@@ -79,6 +79,9 @@ pub enum ReviewError {
     #[error(transparent)]
     Executor(#[from] executors::ExecutorError),
 
+    #[error(transparent)]
+    Git(#[from] git::GitError),
+
     #[error("executor execution not found: {0}")]
     ExecutorExecutionNotFound(Uuid),
 
@@ -393,6 +396,7 @@ impl ReviewRunner {
             review_prompt,
         );
         let auditor_execution_id = new_uuid_v4();
+        let auditor_before_sha = git::get_current_sha(&req.workspace_path).await?;
         let auditor_logs_path = auditor_logs_path(&req.logs_path, &auditor_execution_id);
         let executor_type = executor_type_for_execution(&self.db, executor_execution).await?;
         let extra_config = auditor_resume_thread_extra_config(
@@ -445,6 +449,21 @@ impl ReviewRunner {
                 log_sender: None,
             })
             .await;
+        let restore_result = git::restore_worktree(&req.workspace_path, &auditor_before_sha)
+            .await
+            .map_err(|error| {
+                executors::ExecutorError::Other(format!(
+                    "failed to restore auditor worktree state: {error}"
+                ))
+            });
+        let execution_result = match (execution_result, restore_result) {
+            (_, Err(error)) => Err(error),
+            (Ok(mut result), Ok(())) => {
+                result.after_sha = Some(auditor_before_sha);
+                Ok(result)
+            }
+            (Err(error), Ok(())) => Err(error),
+        };
 
         let result = match execution_result {
             Ok(result) => result,

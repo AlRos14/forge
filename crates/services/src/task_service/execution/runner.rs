@@ -93,7 +93,10 @@ impl TaskService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
-        let agent_config = parse_json_value("executor config snapshot", snapshot)?;
+        let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
+        if execution.role == crate::workflow::default_roles::REVIEWER {
+            executors::mark_worktree_read_only(&mut agent_config);
+        }
         let max_turns = self.resolve_max_turns(&task).await?;
         let logs_path = self
             .resolve_execution_logs_path(&execution, &task, &workspace, &execution_id)
@@ -318,11 +321,16 @@ impl TaskService {
             }
         });
 
-        let mut result = executor
+        let read_only_head = if executors::is_worktree_read_only(&agent_config) {
+            Some(git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?)
+        } else {
+            None
+        };
+        let execution_result = executor
             .execute(ExecutionContext {
                 task_id: task.id.clone(),
                 execution_id: execution_id.clone(),
-                worktree_path: workspace.worktree_path,
+                worktree_path: workspace.worktree_path.clone(),
                 description,
                 agent_config,
                 logs_path: logs_path.clone(),
@@ -330,7 +338,19 @@ impl TaskService {
                 max_turns,
                 log_sender: Some(log_tx),
             })
-            .await?;
+            .await;
+        let restore_result = if let Some(head) = read_only_head.as_deref() {
+            git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
+                .await
+                .map_err(ServiceError::from)
+        } else {
+            Ok(())
+        };
+        let mut result = execution_result?;
+        restore_result?;
+        if let Some(head) = read_only_head {
+            result.after_sha = Some(head);
+        }
         let max_turns_exceeded = max_turns_exceeded.load(std::sync::atomic::Ordering::SeqCst);
         let assistant_turn_count = assistant_turn_count.load(std::sync::atomic::Ordering::SeqCst);
         if max_turns_exceeded {
@@ -642,7 +662,10 @@ impl TaskService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
-        let executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        if execution.role == crate::workflow::default_roles::REVIEWER {
+            executors::mark_worktree_read_only(&mut executor_config);
+        }
         let executor_type = executor_config
             .get("executor_type")
             .and_then(Value::as_str)
