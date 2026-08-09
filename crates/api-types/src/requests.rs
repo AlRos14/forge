@@ -139,6 +139,15 @@ pub struct RecoverTaskRequest {
     pub context: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskActionRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub version: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApproveGateRequest {
     pub reason: Option<String>,

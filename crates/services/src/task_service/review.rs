@@ -22,6 +22,15 @@ impl TaskService {
     }
 
     pub async fn approve_review(&self, task_id: impl Into<String>) -> Result<(Task, Review)> {
+        self.approve_review_as(task_id, Actor::user(UserActionSource::Api))
+            .await
+    }
+
+    pub async fn approve_review_as(
+        &self,
+        task_id: impl Into<String>,
+        actor: Actor,
+    ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -84,7 +93,7 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: None,
-                    triggered_by: Actor::user(UserActionSource::Api),
+                    triggered_by: actor,
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },
@@ -97,6 +106,16 @@ impl TaskService {
         &self,
         task_id: impl Into<String>,
         reason: Option<String>,
+    ) -> Result<(Task, Review)> {
+        self.reject_review_as(task_id, reason, Actor::user(UserActionSource::Api))
+            .await
+    }
+
+    pub async fn reject_review_as(
+        &self,
+        task_id: impl Into<String>,
+        reason: Option<String>,
+        actor: Actor,
     ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
@@ -162,7 +181,7 @@ impl TaskService {
             TransitionOptions {
                 version: task.version,
                 reason: Some(reason.clone()),
-                triggered_by: Actor::user(UserActionSource::Api),
+                triggered_by: actor,
                 rejection: true,
                 defer_dispatch_seconds: None,
             },

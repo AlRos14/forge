@@ -139,6 +139,19 @@ impl ApiError {
         }
     }
 
+    pub fn conflict_with_code_and_details(
+        code: &'static str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+            details: Some(details),
+        }
+    }
+
     pub fn unauthorized_with_code(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -224,6 +237,17 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::invalid_operation(message),
+            ServiceError::TaskActionUnavailable {
+                available_actions,
+                reason,
+            } => Self::conflict_with_code_and_details(
+                "task_action.unavailable",
+                reason.clone(),
+                json!({
+                    "available_actions": available_actions,
+                    "reason": reason,
+                }),
+            ),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,

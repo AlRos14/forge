@@ -72,6 +72,8 @@ fn export_typescript() {
     LifecycleHookTestResponse::export().expect("export LifecycleHookTestResponse");
     TaskMetadata::export().expect("export TaskMetadata");
     Task::export().expect("export Task");
+    TaskAction::export().expect("export TaskAction");
+    TaskActionResponse::export().expect("export TaskActionResponse");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
     RecoveryAction::export().expect("export RecoveryAction");
@@ -124,6 +126,7 @@ fn export_typescript() {
     AuthorType::export().expect("export AuthorType");
     TaskMediaResponse::export().expect("export TaskMediaResponse");
     RecoverTaskRequest::export().expect("export RecoverTaskRequest");
+    TaskActionRequest::export().expect("export TaskActionRequest");
     TestLifecycleHookRequest::export().expect("export TestLifecycleHookRequest");
     CreateCommentRequest::export().expect("export CreateCommentRequest");
     StateKind::export().expect("export StateKind");

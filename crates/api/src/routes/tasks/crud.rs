@@ -241,14 +241,6 @@ pub async fn move_task(
     }))
 }
 
-pub async fn cancel_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<TaskResponse>> {
-    let task = state.task_service.cancel_task(id).await?;
-    Ok(Json(task_response(&state.db, task).await?))
-}
-
 pub async fn archive_task(
     State(state): State<AppState>,
     Path(id): Path<String>,

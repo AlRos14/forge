@@ -36,6 +36,12 @@ For the conceptual model behind these endpoints see
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim task (auto-dispatches the executor) |
+| POST   | `/api/v1/tasks/{id}/start` | Start task work (claims an available agent and dispatches the first active state) |
+| POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
+| POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
+| POST   | `/api/v1/tasks/{id}/submit` | Fire the current active state's `accept` trigger |
+| POST   | `/api/v1/tasks/{id}/request-changes` | Reject the current review/gate and resume its configured worker path |
+| POST   | `/api/v1/tasks/{id}/approve` | Approve an awaiting-human review or an approval-required gate |
 | POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
@@ -152,6 +158,36 @@ a Smith config discover empty lists.
 state, the server auto-escalates to the user-routing-override path. MCP
 `forge_transition_task` is unchanged — it still emits `triggered_by="system"`
 and does not support user override (REST-only for now).
+
+## Task intent actions
+
+Intent endpoints accept an optional `TaskActionRequest` body:
+
+```json
+{ "reason": "ready for review", "version": 7 }
+```
+
+Both fields are optional. Successful responses are the normal `TaskResponse`.
+The action service resolves the project's workflow at request time, so clients
+do not need to encode concrete state names. `start` claims an available agent
+when needed and enters the first claimable active/gate state; `submit` follows
+the active state's `accept` trigger; `approve` and `request-changes` use the
+latest awaiting-human review when present and otherwise use gate capabilities.
+`pause` stops the running execution without a state transition and records a
+manual-stop annotation plus an audit comment. `resume` uses the existing
+session-follow-up/recovery primitives and falls back to a fresh dispatch.
+
+When an action is not available, the endpoint returns `409` with
+`code: "task_action.unavailable"` and structured `details`:
+
+```json
+{
+  "available_actions": ["cancel", "start"],
+  "reason": "action 'approve' is not available while task is in Active state 'working'"
+}
+```
+
+The raw `/transition` endpoint remains available for advanced workflow clients.
 
 ## Task board snapshots and moves
 

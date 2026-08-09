@@ -379,6 +379,11 @@ impl TaskService {
     }
 
     pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task> {
+        self.cancel_task_as(task_id, Actor::system(SystemComponent::CancelTask))
+            .await
+    }
+
+    pub async fn cancel_task_as(&self, task_id: impl Into<String>, actor: Actor) -> Result<Task> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -403,7 +408,7 @@ impl TaskService {
         self.cancel_running_executions_for_task(
             &task,
             "cancelled by task cancellation",
-            Actor::system(SystemComponent::CancelTask),
+            actor.clone(),
         )
         .await?;
         let result = self
@@ -413,7 +418,7 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: Some("cancel task".to_owned()),
-                    triggered_by: Actor::system(SystemComponent::CancelTask),
+                    triggered_by: actor,
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },

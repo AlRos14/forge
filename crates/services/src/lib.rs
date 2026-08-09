@@ -100,6 +100,12 @@ pub enum ServiceError {
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },
 
+    #[error("task action unavailable: {reason}")]
+    TaskActionUnavailable {
+        available_actions: Vec<api_types::TaskAction>,
+        reason: String,
+    },
+
     #[error("conflict: {0}")]
     Conflict(String),
 

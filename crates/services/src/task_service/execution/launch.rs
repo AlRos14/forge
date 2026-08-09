@@ -641,6 +641,39 @@ impl TaskService {
         execution_id: impl Into<String>,
         reason: String,
     ) -> Result<Execution> {
+        self.stop_execution_with_actor(
+            execution_id,
+            reason,
+            api_types::Actor::user(api_types::UserActionSource::Api),
+            "user_cancelled",
+            "Execution stopped by user",
+        )
+        .await
+    }
+
+    pub async fn pause_execution(
+        &self,
+        execution_id: impl Into<String>,
+        reason: String,
+    ) -> Result<Execution> {
+        self.stop_execution_with_actor(
+            execution_id,
+            reason,
+            api_types::Actor::user(api_types::UserActionSource::Api),
+            "user_paused",
+            "Task paused by user",
+        )
+        .await
+    }
+
+    async fn stop_execution_with_actor(
+        &self,
+        execution_id: impl Into<String>,
+        reason: String,
+        actor: api_types::Actor,
+        blocking_reason: &str,
+        annotation_message: &str,
+    ) -> Result<Execution> {
         let execution_id = execution_id.into();
         let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
@@ -656,7 +689,7 @@ impl TaskService {
             &execution,
             &reason,
             db::StopReason::UserCancelled,
-            &api_types::Actor::user(api_types::UserActionSource::Api),
+            &actor,
             db::ResumePolicy::Manual,
         )
         .await?;
@@ -673,8 +706,8 @@ impl TaskService {
         }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ManualStop,
-            blocking_reason: "user_cancelled".to_owned(),
-            blocked_by: Some(api_types::Actor::user(api_types::UserActionSource::Api).display()),
+            blocking_reason: blocking_reason.to_owned(),
+            blocked_by: Some(actor.display()),
             blocked_at: Some(now.clone()),
             blocked_execution_id: Some(execution.id.clone()),
             artifact: Some(api_types::BlockingArtifact {
@@ -682,7 +715,7 @@ impl TaskService {
                 id: Some(execution.id.clone()),
                 log_path: None,
             }),
-            message: Some("Execution stopped by user".to_owned()),
+            message: Some(annotation_message.to_owned()),
             hook: None,
             recovery_actions,
         };

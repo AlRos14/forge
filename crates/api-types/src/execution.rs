@@ -10,6 +10,26 @@ use crate::{
     WorkflowHealthSummary, WorkspaceResponse,
 };
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TaskAction {
+    Start,
+    Pause,
+    Resume,
+    Submit,
+    RequestChanges,
+    Approve,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskActionResponse {
+    pub task: TaskResponse,
+    pub action: TaskAction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskResponse {

@@ -39,6 +39,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod action_resolver;
+mod actions;
 mod claim;
 mod common;
 pub(crate) mod config;
@@ -57,6 +58,7 @@ mod transition;
 mod validation;
 pub(crate) mod workspace;
 
+pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
 pub use execution::subtasks::build_first_turn_prompt_from_context;
 pub use subtask::{is_root_task, is_subtask, root_for};

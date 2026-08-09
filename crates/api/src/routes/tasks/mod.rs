@@ -4,10 +4,10 @@ use api_types::{
     HookResultEntry, LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest,
     MoveTaskResponse, PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest,
     RejectGateRequest, RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig,
-    ReviewDecisionResponse, StateKind, TaskDependency, TaskMediaResponse, TaskResponse,
-    TaskRoleAssignmentResponse, TasksResponse, TransitionLogEntry, TransitionSource,
-    TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest, WorkflowDefinition,
-    WorkflowTrigger, WorkspaceResponse,
+    ReviewDecisionResponse, StateKind, TaskAction, TaskActionRequest, TaskDependency,
+    TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TasksResponse, TransitionLogEntry,
+    TransitionSource, TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest,
+    WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -41,6 +41,7 @@ use crate::{
     state::AppState,
 };
 
+mod actions;
 mod comments;
 mod crud;
 mod dependencies;
@@ -53,10 +54,14 @@ mod roles;
 mod transitions;
 mod workspace;
 
+pub use actions::{
+    approve_task, cancel_task, pause_task, request_changes_task, resume_task, start_task,
+    submit_task,
+};
 pub use comments::{create_comment, delete_comment, list_comments};
 pub use crud::{
-    advance_task, archive_task, cancel_task, create_task, delete_task, duplicate_task, get_task,
-    list_tasks, move_task, recover_task, reorder_subtasks, update_task,
+    advance_task, archive_task, create_task, delete_task, duplicate_task, get_task, list_tasks,
+    move_task, recover_task, reorder_subtasks, update_task,
 };
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
