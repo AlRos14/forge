@@ -25,9 +25,8 @@ pub enum TaskAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct TaskActionResponse {
-    pub task: TaskResponse,
-    pub action: TaskAction,
+pub struct TaskActionsResponse {
+    pub available_actions: Vec<TaskAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

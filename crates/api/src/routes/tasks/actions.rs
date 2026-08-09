@@ -1,5 +1,13 @@
 use super::*;
 
+pub async fn list_task_actions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::TaskActionsResponse>> {
+    let available_actions = state.task_service.available_task_actions(id).await?;
+    Ok(Json(api_types::TaskActionsResponse { available_actions }))
+}
+
 pub async fn start_task(
     State(state): State<AppState>,
     Path(id): Path<String>,

@@ -73,7 +73,7 @@ fn export_typescript() {
     TaskMetadata::export().expect("export TaskMetadata");
     Task::export().expect("export Task");
     TaskAction::export().expect("export TaskAction");
-    TaskActionResponse::export().expect("export TaskActionResponse");
+    TaskActionsResponse::export().expect("export TaskActionsResponse");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
     RecoveryAction::export().expect("export RecoveryAction");

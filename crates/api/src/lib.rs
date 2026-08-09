@@ -285,6 +285,10 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/tasks/{id}/cancel",
             post(routes::tasks::cancel_task),
         )
+        .route(
+            "/api/v1/tasks/{id}/actions",
+            get(routes::tasks::list_task_actions),
+        )
         .route("/api/v1/tasks/{id}/start", post(routes::tasks::start_task))
         .route("/api/v1/tasks/{id}/pause", post(routes::tasks::pause_task))
         .route(

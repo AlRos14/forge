@@ -50,13 +50,22 @@ impl TaskService {
         let actor = Actor::user(UserActionSource::Api);
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+        // A stale client version is a conflict for every action, not only the ones whose
+        // inner path happens to re-check it.
+        if let Some(version) = requested_version {
+            if version != task.version {
+                return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
+                    expected: version,
+                    actual: task.version,
+                }));
+            }
+        }
+
         // Cancelling an already-cancelled task stays an idempotent no-op, matching the
-        // pre-facade POST /tasks/{id}/cancel contract.
+        // pre-facade POST /tasks/{id}/cancel contract. cancellation_target falls back to a
+        // terminal "cancelled" state for workflows with no explicit cancellation_state.
         if action == TaskAction::Cancel
-            && workflow
-                .cancellation_state
-                .as_deref()
-                .is_some_and(|cancelled| cancelled == task.status)
+            && cancellation_target(&workflow).is_some_and(|cancelled| cancelled == task.status)
         {
             return Ok(TaskActionResult { task, action });
         }

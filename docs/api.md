@@ -36,6 +36,7 @@ For the conceptual model behind these endpoints see
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim task (auto-dispatches the executor) |
+| GET    | `/api/v1/tasks/{id}/actions` | List the intent actions currently available for the task (`{"available_actions": [...]}`), so clients need not provoke a 409 to discover them |
 | POST   | `/api/v1/tasks/{id}/start` | Start task work (claims an available agent and dispatches the first active state) |
 | POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
 | POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |

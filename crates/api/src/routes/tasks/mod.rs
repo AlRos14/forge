@@ -55,8 +55,8 @@ mod transitions;
 mod workspace;
 
 pub use actions::{
-    approve_task, cancel_task, pause_task, request_changes_task, resume_task, start_task,
-    submit_task,
+    approve_task, cancel_task, list_task_actions, pause_task, request_changes_task, resume_task,
+    start_task, submit_task,
 };
 pub use comments::{create_comment, delete_comment, list_comments};
 pub use crud::{
