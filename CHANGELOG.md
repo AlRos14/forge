@@ -4,6 +4,12 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [0.7.2] - 2026-08-09
+
+### Fixed
+
+- Claude Code auditor verdicts are now read from Claude's nested assistant-message and successful-result log formats, preventing valid reviews from failing with `verdict marker missing`.
+
 ## [0.7.1] - 2026-08-09
 
 ### Fixed
