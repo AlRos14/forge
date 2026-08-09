@@ -45,6 +45,12 @@ export function AgentList({
                   </Badge>
                 ) : null}
               </div>
+              {agent.model ? (
+                <p className="truncate font-mono text-micro text-muted-foreground">
+                  {agent.model}
+                  {agent.reasoning_effort ? ` · ${agent.reasoning_effort}` : ''}
+                </p>
+              ) : null}
             </div>
             <span
               className={cn(
