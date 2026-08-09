@@ -297,6 +297,56 @@ async fn assistant_entry_with_pass_marker_parses_as_passed() {
 }
 
 #[tokio::test]
+async fn claude_assistant_message_content_parses_as_passed() {
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let logs_path = tempdir.path().join("auditor.jsonl");
+    write_jsonl_log(
+        &logs_path,
+        vec![(
+            LogKind::Assistant,
+            json!({
+                "message": {
+                    "content": [{
+                        "type": "text",
+                        "text": "No issues found.\n===REVIEW: PASS==="
+                    }]
+                }
+            }),
+        )],
+    )
+    .await;
+
+    let message = last_assistant_message(logs_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+}
+
+#[tokio::test]
+async fn claude_success_result_parses_as_passed() {
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let logs_path = tempdir.path().join("auditor.jsonl");
+    write_jsonl_log(
+        &logs_path,
+        vec![(
+            LogKind::SessionInfo,
+            json!({
+                "subtype": "success",
+                "result": "No issues found.\n===REVIEW: PASS==="
+            }),
+        )],
+    )
+    .await;
+
+    let message = last_assistant_message(logs_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+}
+
+#[tokio::test]
 async fn assistant_delta_entries_alone_do_not_count_for_verdict_text() {
     let tempdir = tempfile::tempdir().expect("tempdir creates");
     let logs_path = tempdir.path().join("auditor.jsonl");

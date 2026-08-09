@@ -802,12 +802,38 @@ async fn last_assistant_message(logs_path: &str) -> Result<String, ReviewError> 
             continue;
         };
         if entry.kind == LogKind::Assistant {
-            if let Some(text) = entry.payload.get("text").and_then(Value::as_str) {
-                message.push_str(text);
+            append_assistant_log_text(&entry.payload, &mut message);
+        } else if entry.kind == LogKind::SessionInfo
+            && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
+        {
+            if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
+                message.push_str(result);
             }
         }
     }
     Ok(message)
+}
+
+fn append_assistant_log_text(payload: &Value, message: &mut String) {
+    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+        message.push_str(text);
+    }
+
+    let Some(content) = payload
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+
+    for item in content {
+        if item.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                message.push_str(text);
+            }
+        }
+    }
 }
 
 fn combined_output(stdout: &str, stderr: &str) -> String {
