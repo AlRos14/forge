@@ -1,4 +1,5 @@
 use super::*;
+use api_types::{Actor, UserActionSource};
 
 impl TaskService {
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
@@ -21,6 +22,15 @@ impl TaskService {
     }
 
     pub async fn approve_review(&self, task_id: impl Into<String>) -> Result<(Task, Review)> {
+        self.approve_review_as(task_id, Actor::user(UserActionSource::Api))
+            .await
+    }
+
+    pub async fn approve_review_as(
+        &self,
+        task_id: impl Into<String>,
+        actor: Actor,
+    ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -77,7 +87,17 @@ impl TaskService {
             },
         });
         let transitioned = self
-            .transition(task_id, "merging".to_owned(), task.version)
+            .transition(
+                task_id,
+                "merging".to_owned(),
+                TransitionOptions {
+                    version: task.version,
+                    reason: None,
+                    triggered_by: actor,
+                    rejection: false,
+                    defer_dispatch_seconds: None,
+                },
+            )
             .await?;
         Ok((transitioned.task, review))
     }
@@ -86,6 +106,16 @@ impl TaskService {
         &self,
         task_id: impl Into<String>,
         reason: Option<String>,
+    ) -> Result<(Task, Review)> {
+        self.reject_review_as(task_id, reason, Actor::user(UserActionSource::Api))
+            .await
+    }
+
+    pub async fn reject_review_as(
+        &self,
+        task_id: impl Into<String>,
+        reason: Option<String>,
+        actor: Actor,
     ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
@@ -145,10 +175,42 @@ impl TaskService {
             },
         });
 
-        self.transition(task_id.clone(), "in_progress".to_owned(), task.version)
-            .await?;
+        self.transition(
+            task_id.clone(),
+            "in_progress".to_owned(),
+            TransitionOptions {
+                version: task.version,
+                reason: Some(reason.clone()),
+                triggered_by: actor,
+                rejection: true,
+                defer_dispatch_seconds: None,
+            },
+        )
+        .await?;
         let remaining_retries = self.remaining_retries(&task_id).await?;
-        if remaining_retries > 0 {
+        let follow_up_already_dispatched = ExecutionRepo::list_by_task_and_role(
+            &*self.db,
+            &task_id,
+            crate::workflow::default_roles::CODER,
+            PageRequest {
+                cursor: None,
+                limit: 20,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?
+        .items
+        .into_iter()
+        .any(|execution| {
+            execution.parent_execution_id.as_deref() == Some(review.execution_id.as_str())
+                && matches!(
+                    execution.status,
+                    ExecutionStatus::Running | ExecutionStatus::Completed
+                )
+        });
+        if remaining_retries > 0 && !follow_up_already_dispatched {
             self.dispatch_follow_up(
                 &task_id,
                 ::review::ReviewOutcome::AuditorFailed { reason },

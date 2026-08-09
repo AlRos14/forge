@@ -1,6 +1,7 @@
 // Types aligned with the backend api-types crate responses.
 // PaginatedResponse<T> = { data: T[], next_cursor?, has_more, total_count? }
 
+import type { CanonicalPhase } from './bindings/CanonicalPhase'
 import type { ProjectHookRule } from './bindings/ProjectHookRule'
 
 export type TaskStatus = string
@@ -435,6 +436,7 @@ export interface Task {
   description?: string | null
   task_type: TaskType
   status: TaskStatus
+  canonical_phase?: CanonicalPhase
   priority: number
   board_position: number
   subtask_order?: number | null

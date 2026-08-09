@@ -39,6 +39,7 @@ import { Button } from '@/components/ui/button'
 import { ComboSelect } from '@/components/ui/combo-select'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import type { CreateRepoRequest, Project, Repo, UpdateRepoRequest } from '@/types/generated/api'
 
@@ -384,7 +385,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
                     <div className="flex items-center gap-1.5">
                       {showBranchEditorUnavailable ? (
                         <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs text-red-700 dark:text-red-300">
-                          Daemon offline — branches unavailable
+                          {productTerm('runtime')} offline — branches unavailable
                         </div>
                       ) : branchQuery.isFetching ? (
                         <CircleNotch size={14} className="animate-spin text-muted-foreground" />

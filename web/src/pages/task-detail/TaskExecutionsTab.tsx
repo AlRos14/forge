@@ -11,6 +11,7 @@ import { Tooltip } from '@/components/ui/tooltip'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { buildExecutionChains, roleDisplayName, turnLabel } from '@/lib/execution-utils'
+import { productTerm } from '@/lib/i18n'
 import type { Execution, LaunchExecutionResponse } from '@/types/generated'
 
 const statusColors: Record<Execution['status'], string> = {
@@ -38,7 +39,7 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-      toast.success('Execution stopped')
+      toast.success(`${productTerm('run')} stopped`)
     },
     onError: (error) => toast.error(getApiErrorMessage(error, 'Stop failed')),
   })
@@ -91,7 +92,7 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
   if (executions.length === 0) {
     return (
       <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-        No executions yet
+        No {productTerm('run', 0).toLowerCase()} yet
       </div>
     )
   }
@@ -140,7 +141,7 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
               <div className="flex items-center gap-2 shrink-0">
                 {/* Action buttons on the session header */}
                 {isRunning && (
-                  <Tooltip content="Stop this execution">
+                  <Tooltip content={`Stop this ${productTerm('run').toLowerCase()}`}>
                     <Button
                       size="sm"
                       variant="outline"
@@ -176,7 +177,7 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
                   </Tooltip>
                 )}
                 {isTerminal && !hasSession && (
-                  <Tooltip content="Start a new execution with the same role">
+                  <Tooltip content={`Start a new ${productTerm('run').toLowerCase()} with the same role`}>
                     <Button
                       size="sm"
                       variant="outline"

@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
-use api_types::{StateKind, WorkflowDefinition};
+use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
 
 impl TaskService {
     pub async fn claim_task(
@@ -32,7 +32,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &Actor::system(SystemComponent::General),
         );
         WorkflowEngine::validate_claimable(&workflow, &task.status)?;
         let target_status = resolve_claim_target(&workflow, &task.status)?;
@@ -223,8 +223,11 @@ impl TaskService {
         let Ok(Some(project)) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await else {
             return;
         };
-        let workflow =
-            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &Actor::system(SystemComponent::General),
+        );
         let Some(state) = workflow
             .states
             .iter()
@@ -252,7 +255,10 @@ impl TaskService {
             event_bus: Arc::clone(&self.event_bus),
             gate_config,
             workflow: Arc::new(workflow),
-            triggered_by: "agent:claim".to_owned(),
+            triggered_by: Actor::Agent {
+                agent_id: task.assignee_id.clone().unwrap_or_default(),
+                execution_id: Some(execution_id.to_owned()),
+            },
             review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
@@ -308,8 +314,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow =
-            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &Actor::system(SystemComponent::General),
+        );
         Ok(workflow
             .states
             .iter()

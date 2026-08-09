@@ -148,7 +148,7 @@ impl TaskService {
             &active_execution,
             "cancelled by role reassignment",
             db::StopReason::RoleReassigned,
-            "user:role_reassignment",
+            &api_types::Actor::user(api_types::UserActionSource::RoleReassignment),
             db::ResumePolicy::None,
         )
         .await?;
@@ -165,7 +165,7 @@ impl TaskService {
                 &initial_state,
                 task.version,
                 &workflow,
-                "user:reassignment",
+                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
                 "coder reassigned",
             )
             .await?;
@@ -236,7 +236,7 @@ impl TaskService {
             &active_execution,
             "cancelled by role reassignment",
             db::StopReason::RoleReassigned,
-            "user:role_reassignment",
+            &api_types::Actor::user(api_types::UserActionSource::RoleReassignment),
             db::ResumePolicy::None,
         )
         .await?;
@@ -251,7 +251,7 @@ impl TaskService {
                 &initial_state,
                 task.version,
                 &workflow,
-                "user:reassignment",
+                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
                 "coder reassigned",
             )
             .await?;
@@ -387,13 +387,14 @@ impl TaskService {
         execution: &Execution,
         reason: &str,
         stop_reason: db::StopReason,
-        stopped_by: &str,
+        actor: &api_types::Actor,
         resume_policy: db::ResumePolicy,
     ) -> Result<()> {
         let reconciliation_reason = match &stop_reason {
             db::StopReason::RoleReassigned => "stopped because task moved".to_owned(),
             _ => reason.to_owned(),
         };
+        let preserve_resume_context = resume_policy == db::ResumePolicy::Manual;
         if self.daemon_connections.is_some() || self.task_executor.is_some() {
             if let Err(error) = self.cancel_execution_with_provider(execution, reason).await {
                 if matches!(error, ServiceError::DaemonUnavailable { .. }) {
@@ -412,10 +413,13 @@ impl TaskService {
                 id: execution.id.clone(),
                 status: Some(ExecutionStatus::Cancelled),
                 stop_reason: Some(Some(stop_reason)),
-                stopped_by: Some(Some(stopped_by.to_owned())),
+                stopped_by: Some(Some(actor.display())),
                 resume_policy: Some(Some(resume_policy)),
                 stopped_at: Some(Some(now_rfc3339())),
-                agent_session_id: None,
+                // Manual user stops retain the session and executor snapshot so the
+                // task façade can resume the same worker thread. Lifecycle and task
+                // cancellation paths still clear those fields.
+                agent_session_id: (!preserve_resume_context).then_some(None),
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -423,7 +427,7 @@ impl TaskService {
                 before_sha: None,
                 after_sha: None,
                 error: Some(Some(reason.to_owned())),
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: (!preserve_resume_context).then_some(None),
                 updated_at: now_rfc3339(),
             },
         )

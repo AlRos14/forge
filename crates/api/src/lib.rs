@@ -286,6 +286,28 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::cancel_task),
         )
         .route(
+            "/api/v1/tasks/{id}/actions",
+            get(routes::tasks::list_task_actions),
+        )
+        .route("/api/v1/tasks/{id}/start", post(routes::tasks::start_task))
+        .route("/api/v1/tasks/{id}/pause", post(routes::tasks::pause_task))
+        .route(
+            "/api/v1/tasks/{id}/resume",
+            post(routes::tasks::resume_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/submit",
+            post(routes::tasks::submit_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/request-changes",
+            post(routes::tasks::request_changes_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/approve",
+            post(routes::tasks::approve_task),
+        )
+        .route(
             "/api/v1/tasks/{id}/archive",
             post(routes::tasks::archive_task),
         )

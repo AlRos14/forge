@@ -122,9 +122,17 @@ async fn create_project_and_repo(app: &Router, name: &str) -> (String, String) {
 }
 
 fn state(name: &str, kind: &str, column: &str, triggers: Value) -> Value {
+    let canonical_phase = match kind {
+        "backlog" => "backlog",
+        "initial" => "ready",
+        "gate" => "review",
+        "terminal" => "done",
+        _ => "working",
+    };
     json!({
         "name": name,
         "kind": kind,
+        "canonical_phase": canonical_phase,
         "column": column,
         "display_name": column,
         "role": null,

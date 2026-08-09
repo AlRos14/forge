@@ -1,6 +1,7 @@
 use crate::assignee::AssigneeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use ts_rs::TS;
 
 fn default_hook_timeout() -> u64 {
@@ -151,6 +152,32 @@ pub enum StateKind {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CanonicalPhase {
+    Backlog,
+    Ready,
+    Working,
+    Review,
+    Done,
+}
+
+impl FromStr for CanonicalPhase {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "backlog" => Ok(Self::Backlog),
+            "ready" => Ok(Self::Ready),
+            "working" => Ok(Self::Working),
+            "review" => Ok(Self::Review),
+            "done" => Ok(Self::Done),
+            _ => Err(format!("unknown canonical phase: {value}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -248,6 +275,8 @@ pub struct StateDefinition {
     pub hooks: StateHooks,
     #[serde(default)]
     pub cleanup: Option<CleanupPolicy>,
+    #[serde(default)]
+    pub canonical_phase: Option<CanonicalPhase>,
     pub gate_config: Option<GateConfig>,
     #[serde(default)]
     pub dispatch: Option<WorkflowDispatch>,
@@ -403,6 +432,47 @@ impl WorkflowDefinition {
             .map(|state| state.kind)
     }
 
+    pub fn canonical_phase_for_state(&self, status: &str) -> CanonicalPhase {
+        let state = self.states.iter().find(|state| state.name == status);
+
+        if let Some(phase) = state.and_then(|state| state.canonical_phase) {
+            return phase;
+        }
+
+        if let Some(phase) = state.and_then(|state| canonical_phase_for_column(&state.column)) {
+            return phase;
+        }
+
+        let normalized_status = status.trim().to_ascii_lowercase();
+        if let Some(phase) = canonical_phase_for_legacy_state_name(&normalized_status) {
+            return phase;
+        }
+
+        if let Some(state) = state {
+            return match state.kind {
+                StateKind::Backlog => CanonicalPhase::Backlog,
+                StateKind::Initial => CanonicalPhase::Ready,
+                StateKind::Active => CanonicalPhase::Working,
+                StateKind::Gate => {
+                    let normalized_name = state.name.to_ascii_lowercase();
+                    if normalized_name.contains("review") || normalized_name.contains("merge") {
+                        CanonicalPhase::Review
+                    } else {
+                        CanonicalPhase::Working
+                    }
+                }
+                StateKind::Terminal => CanonicalPhase::Done,
+                StateKind::Custom => CanonicalPhase::Working,
+            };
+        }
+
+        tracing::warn!(
+            status = %status,
+            "unknown workflow state has no canonical phase; defaulting to working"
+        );
+        CanonicalPhase::Working
+    }
+
     pub fn auto_transition_target(&self, from: &str) -> Option<&str> {
         self.states
             .iter()
@@ -504,11 +574,33 @@ impl WorkflowDefinition {
     }
 }
 
+fn canonical_phase_for_column(column: &str) -> Option<CanonicalPhase> {
+    match column.trim().to_ascii_lowercase().as_str() {
+        "backlog" => Some(CanonicalPhase::Backlog),
+        "todo" | "ready" => Some(CanonicalPhase::Ready),
+        "in progress" | "working" => Some(CanonicalPhase::Working),
+        "review" => Some(CanonicalPhase::Review),
+        "done" => Some(CanonicalPhase::Done),
+        _ => None,
+    }
+}
+
+fn canonical_phase_for_legacy_state_name(name: &str) -> Option<CanonicalPhase> {
+    match name {
+        "backlog" => Some(CanonicalPhase::Backlog),
+        "todo" => Some(CanonicalPhase::Ready),
+        "planning" | "in_progress" => Some(CanonicalPhase::Working),
+        "review" | "merging" | "merge_failed" => Some(CanonicalPhase::Review),
+        "done" | "cancelled" => Some(CanonicalPhase::Done),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        StateDefinition, StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger,
-        WorkflowTriggerDefinition,
+        CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition,
+        WorkflowTrigger, WorkflowTriggerDefinition,
     };
 
     fn state(name: &str, kind: StateKind) -> StateDefinition {
@@ -520,6 +612,7 @@ mod tests {
             role: None,
             hooks: StateHooks::default(),
             cleanup: None,
+            canonical_phase: None,
             gate_config: None,
             dispatch: None,
             triggers: Default::default(),
@@ -588,6 +681,78 @@ mod tests {
         assert_eq!(workflow.auto_transition_target("done"), None);
         assert_eq!(workflow.trigger_between("done", "archived"), None);
         assert!(workflow.outgoing_trigger_targets("done").next().is_none());
+    }
+
+    #[test]
+    fn canonical_phase_uses_the_documented_fallback_order() {
+        let mut explicit = state("explicit", StateKind::Custom);
+        explicit.column = "Backlog".to_owned();
+        explicit.canonical_phase = Some(CanonicalPhase::Done);
+
+        let mut column = state("column", StateKind::Custom);
+        column.column = "Ready".to_owned();
+
+        let mut legacy = state("merge_failed", StateKind::Custom);
+        legacy.column = "Other".to_owned();
+
+        let mut gate = state("approval", StateKind::Gate);
+        gate.column = "Other".to_owned();
+
+        let mut review_gate = state("code_review", StateKind::Gate);
+        review_gate.column = "Other".to_owned();
+
+        let workflow = workflow(vec![explicit, column, legacy, gate, review_gate]);
+
+        assert_eq!(
+            workflow.canonical_phase_for_state("explicit"),
+            CanonicalPhase::Done
+        );
+        assert_eq!(
+            workflow.canonical_phase_for_state("column"),
+            CanonicalPhase::Ready
+        );
+        assert_eq!(
+            workflow.canonical_phase_for_state("merge_failed"),
+            CanonicalPhase::Review
+        );
+        assert_eq!(
+            workflow.canonical_phase_for_state("approval"),
+            CanonicalPhase::Working
+        );
+        assert_eq!(
+            workflow.canonical_phase_for_state("code_review"),
+            CanonicalPhase::Review
+        );
+    }
+
+    #[test]
+    fn unknown_state_defaults_to_working() {
+        let workflow = workflow(Vec::new());
+
+        assert_eq!(
+            workflow.canonical_phase_for_state("unknown"),
+            CanonicalPhase::Working
+        );
+    }
+
+    #[test]
+    fn legacy_state_definition_without_canonical_phase_deserializes() {
+        let workflow: WorkflowDefinition = serde_json::from_value(serde_json::json!({
+            "roles": [],
+            "states": [{
+                "name": "todo",
+                "kind": "initial",
+                "column": "Todo",
+                "display_name": "Todo",
+                "role": null,
+                "hooks": {},
+                "gate_config": null,
+                "config": {}
+            }]
+        }))
+        .expect("legacy workflow should deserialize");
+
+        assert_eq!(workflow.states[0].canonical_phase, None);
     }
 }
 

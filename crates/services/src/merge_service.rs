@@ -364,7 +364,7 @@ async fn latest_executor_execution(db: &SqliteDb, task_id: &str) -> Result<Execu
     .await?;
     page.items
         .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder"))
+        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
         .ok_or_else(|| ServiceError::InvalidOperation {
             message: format!("task {task_id} has no executor execution"),
         })

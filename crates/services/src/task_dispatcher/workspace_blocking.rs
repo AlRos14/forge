@@ -13,7 +13,7 @@ impl TaskDispatcher {
         let annotation = serde_json::json!({
             "type": api_types::FailureKind::WorkspaceResetRequired,
             "blocking_reason": "workspace_error",
-            "blocked_by": "system:task_dispatcher",
+            "blocked_by": api_types::Actor::system(api_types::SystemComponent::TaskDispatcher).display(),
             "blocked_at": db::now_rfc3339(),
             "message": error.to_string(),
             "recovery_actions": ["reset_to_initial", "cancel_task"],
@@ -56,7 +56,7 @@ impl TaskDispatcher {
         let annotation = serde_json::json!({
             "type": api_types::FailureKind::WorkspaceError,
             "blocking_reason": "workspace_error",
-            "blocked_by": "system:task_dispatcher",
+            "blocked_by": api_types::Actor::system(api_types::SystemComponent::TaskDispatcher).display(),
             "blocked_at": db::now_rfc3339(),
             "message": error.to_string(),
             "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],

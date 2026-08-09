@@ -63,6 +63,7 @@ pub struct ListParams {
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     pub status: Option<String>,
+    pub canonical_phase: Option<String>,
     pub agent_id: Option<String>,
     pub assignee_type: Option<String>,
     pub assignee_id: Option<String>,
@@ -230,8 +231,12 @@ async fn task_response_inner(
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow =
-        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, "system");
+    let workflow = WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &api_types::Actor::system(api_types::SystemComponent::General),
+    );
+    let canonical_phase = workflow.canonical_phase_for_state(&task.status);
     let mut remaining_retries = HashMap::new();
     for state in &workflow.states {
         if state.kind != StateKind::Gate {
@@ -320,6 +325,7 @@ async fn task_response_inner(
         description: task.description,
         task_type: parse_task_type(&task.task_type),
         status: task.status,
+        canonical_phase,
         awaiting_human,
         priority: task.priority,
         board_position: task.board_position,

@@ -150,6 +150,10 @@ pub struct SmithConfig {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub profile: Option<String>,
+    /// Reasoning effort name, forwarded as `--effort`. Populated from the agent's
+    /// `reasoning_effort`. Smith validates the value against the selected
+    /// provider/model ladder and refuses an unsupported one.
+    pub effort: Option<String>,
     pub yolo: Option<bool>,
     pub approval: Option<String>,
     pub resume_session_id: Option<String>,

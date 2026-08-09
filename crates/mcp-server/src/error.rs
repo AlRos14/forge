@@ -46,6 +46,13 @@ impl From<ServiceError> for McpToolError {
             ServiceError::DependencyGate => Self::new(-32029, "dependency gate"),
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::new(-32602, message),
+            ServiceError::TaskActionUnavailable {
+                available_actions,
+                reason,
+            } => Self::new(-32029, reason.clone()).with_data(json!({
+                "available_actions": available_actions,
+                "reason": reason,
+            })),
             ServiceError::Conflict(message) => Self::new(-32602, message),
             ServiceError::MissingPrimaryRepo { project_id } => Self::new(
                 -32002,

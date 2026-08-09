@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type { Daemon, WorkMode } from '@/types/generated/api'
 import {
   ArrowCounterClockwise,
@@ -118,7 +119,8 @@ function DaemonStatusChip({ daemon, unavailable }: { daemon: Daemon; unavailable
 function DaemonUnavailableBanner() {
   return (
     <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300">
-      This daemon is currently unavailable. Restart it or pick a different daemon.
+      This {productTerm('runtime').toLowerCase()} is currently unavailable. Restart it or pick a
+      different {productTerm('runtime').toLowerCase()}.
     </div>
   )
 }
@@ -302,12 +304,12 @@ export function RepoForm({
           <div className="space-y-4 rounded-md border border-border-subtle bg-muted/20 p-3">
             {showDaemonSelector ? (
               <div className="space-y-1.5">
-                <Label htmlFor="repo-daemon">Daemon</Label>
+                <Label htmlFor="repo-daemon">{productTerm('runtime')}</Label>
                 <div className="flex items-center gap-2">
                   <Select
                     id="repo-daemon"
                     value={daemonId ?? ''}
-                    placeholder="Select daemon..."
+                    placeholder={`Select ${productTerm('runtime').toLowerCase()}...`}
                     className="min-w-0 flex-1"
                     options={daemons.map((daemon) => ({
                       value: daemon.id,
@@ -411,11 +413,11 @@ export function RepoForm({
                   <div className="max-h-52 overflow-y-auto">
                     {needsDaemonSelection ? (
                       <p className="p-3 text-sm text-muted-foreground">
-                        Select a daemon to browse folders.
+                        Select a {productTerm('runtime').toLowerCase()} to browse folders.
                       </p>
                     ) : !daemonId ? (
                       <p className="p-3 text-sm text-muted-foreground">
-                        No daemon is available to browse folders.
+                        No {productTerm('runtime').toLowerCase()} is available to browse folders.
                       </p>
                     ) : fsQuery.isLoading ? (
                       <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">

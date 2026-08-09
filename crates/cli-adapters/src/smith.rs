@@ -98,6 +98,11 @@ impl SmithAdapter {
             adapter_args.push(model.clone());
         }
 
+        if let Some(ref effort) = config.effort {
+            adapter_args.push("--effort".to_owned());
+            adapter_args.push(effort.clone());
+        }
+
         if let Some(ref resume) = config.resume_session_id {
             adapter_args.push("--resume".to_owned());
             adapter_args.push(resume.clone());
@@ -973,6 +978,45 @@ mod tests {
         assert!(args.contains(&"work".to_string()));
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"gemini-3.6-flash".to_string()));
+    }
+
+    #[test]
+    fn build_command_forwards_reasoning_effort_as_effort_flag() {
+        let config = SmithConfig {
+            profile: Some("forge-coder".to_owned()),
+            effort: Some("max".to_owned()),
+            ..SmithConfig::default()
+        };
+
+        let cmd = SmithAdapter::build_command(&config, "test prompt");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+
+        let effort_at = args
+            .iter()
+            .position(|arg| arg == "--effort")
+            .expect("--effort is forwarded");
+        assert_eq!(args[effort_at + 1], "max");
+    }
+
+    #[test]
+    fn build_command_omits_effort_flag_when_unset() {
+        let config = SmithConfig {
+            profile: Some("forge-coder".to_owned()),
+            ..SmithConfig::default()
+        };
+
+        let cmd = SmithAdapter::build_command(&config, "test prompt");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(!args.contains(&"--effort".to_string()));
     }
 
     #[test]

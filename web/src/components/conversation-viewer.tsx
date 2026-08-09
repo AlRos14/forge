@@ -27,6 +27,7 @@ import {
 import { cn } from '@/lib/cn'
 import { logsToChatEntries } from '@/lib/logs-to-chat'
 import type { LogEntry } from '@/types/generated'
+import { productTerm } from '@/lib/i18n'
 
 type ConversationViewerProps = {
   logs: LogEntry[]
@@ -145,7 +146,7 @@ export function ConversationViewer({
         sequence: Number.MAX_SAFE_INTEGER,
         timestamp: processedLogs[processedLogs.length - 1]?.timestamp ?? '',
         kind: 'error' as const,
-        title: 'Execution Error',
+        title: `${productTerm('run')} Error`,
         message: trimmedError,
         payload: { message: trimmedError },
       },

@@ -47,6 +47,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type { Project, TaskType } from '@/types/generated'
 import type { ProjectHookAction } from '@/types/generated/bindings/ProjectHookAction'
 import type { ProjectHookRule } from '@/types/generated/bindings/ProjectHookRule'
@@ -890,7 +891,7 @@ export function ProjectHooksSection({
                             <th className="px-3 py-2 font-medium">Status</th>
                             <th className="px-3 py-2 font-medium">Source task</th>
                             <th className="px-3 py-2 font-medium">Automation task</th>
-                            <th className="px-3 py-2 font-medium">Execution</th>
+                            <th className="px-3 py-2 font-medium">{productTerm('run')}</th>
                             <th className="px-3 py-2 font-medium">Reason</th>
                           </tr>
                         </thead>
@@ -1153,7 +1154,7 @@ export function ProjectHooksSection({
                             ) : null}
                             {run.execution_id ? (
                               <span>
-                                exec <ExecutionLink run={run} />
+                                {productTerm('run').toLowerCase()} <ExecutionLink run={run} />
                               </span>
                             ) : null}
                           </div>

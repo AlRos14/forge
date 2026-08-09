@@ -1,0 +1,606 @@
+{
+  "roles": [
+    {
+      "name": "planner",
+      "display_name": "Planner",
+      "description": "Plans the work"
+    },
+    {
+      "name": "coder",
+      "display_name": "Coder",
+      "description": "Implements the work"
+    },
+    {
+      "name": "reviewer",
+      "display_name": "Reviewer",
+      "description": "Validates the work"
+    }
+  ],
+  "states": [
+    {
+      "name": "backlog",
+      "kind": "backlog",
+      "column": "Backlog",
+      "canonical_phase": "backlog",
+      "display_name": "Backlog",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {
+        "accept": {
+          "to": "todo",
+          "dispatch": null
+        },
+        "reject": {
+          "to": "cancelled",
+          "dispatch": null
+        }
+      },
+      "config": {}
+    },
+    {
+      "name": "todo",
+      "kind": "initial",
+      "column": "Todo",
+      "canonical_phase": "ready",
+      "display_name": "Todo",
+      "role": null,
+      "hooks": {
+        "before_exit": [
+          {
+            "action": "dependency_gate",
+            "params": {},
+            "applies_to": "agent_only",
+            "on_failure": "block"
+          }
+        ],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {
+        "accept": {
+          "to": "planning",
+          "dispatch": null
+        },
+        "reject": {
+          "to": "backlog",
+          "dispatch": null
+        },
+        "fail": {
+          "to": "cancelled",
+          "dispatch": null
+        },
+        "retry": {
+          "to": "in_progress",
+          "dispatch": null
+        }
+      },
+      "config": {}
+    },
+    {
+      "name": "planning",
+      "kind": "gate",
+      "column": "In Progress",
+      "canonical_phase": "working",
+      "display_name": "Planning",
+      "role": "planner",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [
+          {
+            "action": "run_before_work_hooks",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          }
+        ],
+        "on_enter": [
+          {
+            "action": "dispatch_role_agent",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": [
+          {
+            "action": "auto_cascade_on_unassigned_role",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ]
+      },
+      "cleanup": null,
+      "gate_config": {
+        "reject_target": "planning",
+        "max_rejections": 2,
+        "approve_label": "Approve plan",
+        "reject_label": "Reject plan",
+        "requires_user_approval": true,
+        "optional_when_unassigned": true
+      },
+      "dispatch": {
+        "builder": "planner.default.v2",
+        "execution_policy": null,
+        "prompt": null
+      },
+      "triggers": {
+        "accept": {
+          "to": "in_progress",
+          "dispatch": null
+        },
+        "reject": {
+          "to": "planning",
+          "dispatch": null
+        }
+      },
+      "config": {
+        "prompt": {
+          "user_append": ""
+        }
+      }
+    },
+    {
+      "name": "in_progress",
+      "kind": "active",
+      "column": "In Progress",
+      "canonical_phase": "working",
+      "display_name": "In Progress",
+      "role": "coder",
+      "hooks": {
+        "before_exit": [
+          {
+            "action": "subtask_sequence_complete",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          },
+          {
+            "action": "require_plan_checklist_complete",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          }
+        ],
+        "on_exit": [],
+        "before_enter": [
+          {
+            "action": "run_before_work_hooks",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          }
+        ],
+        "on_enter": [
+          {
+            "action": "dispatch_role_agent",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": {
+        "builder": "coder.implementation.v2",
+        "execution_policy": null,
+        "prompt": null
+      },
+      "triggers": {
+        "accept": {
+          "to": "review",
+          "dispatch": null
+        }
+      },
+      "config": {
+        "prompt": {
+          "user_append": ""
+        }
+      }
+    },
+    {
+      "name": "review",
+      "kind": "gate",
+      "column": "Review",
+      "canonical_phase": "review",
+      "display_name": "Review",
+      "role": "reviewer",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [
+          {
+            "action": "run_before_work_hooks",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          },
+          {
+            "action": "run_ci_steps",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          }
+        ],
+        "on_enter": [
+          {
+            "action": "dispatch_role_agent",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": [
+          {
+            "action": "auto_cascade_on_review_pass",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
+            "action": "auto_cascade_on_unconfigured_review",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
+            "action": "check_retry_budget",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ]
+      },
+      "cleanup": null,
+      "gate_config": {
+        "reject_target": "in_progress",
+        "max_rejections": 2,
+        "approve_label": "Approve review",
+        "reject_label": "Request changes",
+        "requires_user_approval": false,
+        "optional_when_unassigned": false
+      },
+      "dispatch": {
+        "builder": "reviewer.default.v2",
+        "execution_policy": null,
+        "prompt": null
+      },
+      "triggers": {
+        "accept": {
+          "to": "merging",
+          "dispatch": null
+        },
+        "reject": {
+          "to": "in_progress",
+          "dispatch": {
+            "builder": "coder.review_fix.v2",
+            "execution_policy": "resume_latest_target_role_thread",
+            "prompt": {
+              "user_prefix": null,
+              "user_append": "Address all review feedback before resubmitting.",
+              "system_prefix": null,
+              "system_append": null
+            }
+          }
+        }
+      },
+      "config": {
+        "prompt": {
+          "user_append": ""
+        }
+      }
+    },
+    {
+      "name": "merging",
+      "kind": "gate",
+      "column": "Review",
+      "canonical_phase": "review",
+      "display_name": "Merging",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [
+          {
+            "action": "run_merge",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": [
+          {
+            "action": "auto_cascade_on_merge_result",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ]
+      },
+      "cleanup": null,
+      "gate_config": {
+        "reject_target": "merge_failed",
+        "max_rejections": 1,
+        "approve_label": "Merge",
+        "reject_label": "Fix merge",
+        "requires_user_approval": false,
+        "optional_when_unassigned": false
+      },
+      "dispatch": null,
+      "triggers": {
+        "accept": {
+          "to": "done",
+          "dispatch": null
+        },
+        "fail": {
+          "to": "cancelled",
+          "dispatch": null
+        },
+        "retry": {
+          "to": "merge_failed",
+          "dispatch": null
+        }
+      },
+      "config": {
+        "retry_budgets": {
+          "merge_fix": 1
+        }
+      }
+    },
+    {
+      "name": "merge_failed",
+      "kind": "active",
+      "column": "Review",
+      "canonical_phase": "review",
+      "display_name": "Merge Failed",
+      "role": "coder",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [
+          {
+            "action": "run_before_work_hooks",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          }
+        ],
+        "on_enter": [
+          {
+            "action": "notify_role_holder",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
+            "action": "dispatch_role_agent",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": {
+        "builder": "coder.merge_fix.v2",
+        "execution_policy": "resume_latest_target_role_thread",
+        "prompt": null
+      },
+      "triggers": {
+        "accept": {
+          "to": "review",
+          "dispatch": null
+        },
+        "fail": {
+          "to": "cancelled",
+          "dispatch": null
+        },
+        "retry": {
+          "to": "in_progress",
+          "dispatch": {
+            "builder": "coder.merge_fix.v2",
+            "execution_policy": "resume_latest_target_role_thread",
+            "prompt": null
+          }
+        }
+      },
+      "config": {
+        "prompt": {
+          "user_append": ""
+        },
+        "retry_budgets": {
+          "merge_fix": 1
+        }
+      }
+    },
+    {
+      "name": "done",
+      "kind": "terminal",
+      "column": "Done",
+      "canonical_phase": "done",
+      "display_name": "Done",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [
+          {
+            "action": "cleanup_workspace_now",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
+            "action": "satisfy_dependents",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
+            "action": "propagate_done_to_subtasks",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": []
+      },
+      "cleanup": "immediate",
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {},
+      "config": {}
+    },
+    {
+      "name": "cancelled",
+      "kind": "terminal",
+      "column": "Done",
+      "canonical_phase": "done",
+      "display_name": "Cancelled",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [
+          {
+            "action": "schedule_workspace_cleanup",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
+            "action": "cancel_pending_subtasks",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          }
+        ],
+        "after_enter": []
+      },
+      "cleanup": {
+        "delayed": {
+          "seconds": 86400
+        }
+      },
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {},
+      "config": {}
+    }
+  ],
+  "configuration": [
+    {
+      "id": "review_retries",
+      "label": "Review retries",
+      "description": "Rejected review cycles allowed before the task is blocked.",
+      "value_type": "integer",
+      "min": 0,
+      "default_value": 2,
+      "binding": {
+        "type": "gate_config",
+        "state": "review",
+        "field": "max_rejections"
+      }
+    },
+    {
+      "id": "merge_fix_retries",
+      "label": "Merge-fix retries",
+      "description": "Merge-conflict fix attempts allowed before the task is blocked.",
+      "value_type": "integer",
+      "min": 0,
+      "default_value": 1,
+      "binding": {
+        "type": "gate_config",
+        "state": "merging",
+        "field": "max_rejections"
+      }
+    },
+    {
+      "id": "planner_prompt_instructions",
+      "label": "Planner prompt instructions",
+      "description": "Extra instructions appended to planner dispatch prompts.",
+      "value_type": "text",
+      "min": null,
+      "default_value": "",
+      "binding": {
+        "type": "state_config",
+        "state": "planning",
+        "path": [
+          "prompt",
+          "user_append"
+        ]
+      }
+    },
+    {
+      "id": "coder_prompt_instructions",
+      "label": "Coder prompt instructions",
+      "description": "Extra instructions appended to coder dispatch prompts.",
+      "value_type": "text",
+      "min": null,
+      "default_value": "",
+      "binding": {
+        "type": "state_config",
+        "state": "in_progress",
+        "path": [
+          "prompt",
+          "user_append"
+        ]
+      }
+    },
+    {
+      "id": "reviewer_prompt_instructions",
+      "label": "Reviewer prompt instructions",
+      "description": "Extra instructions appended to reviewer dispatch prompts.",
+      "value_type": "text",
+      "min": null,
+      "default_value": "",
+      "binding": {
+        "type": "state_config",
+        "state": "review",
+        "path": [
+          "prompt",
+          "user_append"
+        ]
+      }
+    },
+    {
+      "id": "merge_fix_prompt_instructions",
+      "label": "Merge-fix prompt instructions",
+      "description": "Extra instructions appended to merge-conflict fix prompts.",
+      "value_type": "text",
+      "min": null,
+      "default_value": "",
+      "binding": {
+        "type": "state_config",
+        "state": "merge_failed",
+        "path": [
+          "prompt",
+          "user_append"
+        ]
+      }
+    }
+  ],
+  "cancellation_state": "cancelled"
+}

@@ -34,7 +34,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         let Some(current_state) = workflow
             .states
@@ -308,7 +308,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         let Some(target) = workflow
             .auto_transition_target(&task.status)
@@ -325,7 +325,7 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: Some("all subtasks completed".to_owned()),
-                    triggered_by: "system".to_owned(),
+                    triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow),
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },
@@ -374,7 +374,9 @@ impl TaskService {
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::WorkflowGuardRejected,
             blocking_reason: guard.to_owned(),
-            blocked_by: Some("system:workflow".to_owned()),
+            blocked_by: Some(
+                api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            ),
             blocked_at: Some(now_rfc3339()),
             blocked_execution_id: Some(execution.id.clone()),
             artifact: Some(api_types::BlockingArtifact {
@@ -494,7 +496,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Ok(());
@@ -546,7 +548,9 @@ impl TaskService {
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorUnavailable,
             blocking_reason: "executor_unavailable".to_owned(),
-            blocked_by: Some("system:executor".to_owned()),
+            blocked_by: Some(
+                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+            ),
             blocked_at: Some(now_rfc3339()),
             blocked_execution_id: Some(execution.id.clone()),
             artifact: Some(api_types::BlockingArtifact {
@@ -637,7 +641,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Ok(());
@@ -714,7 +718,9 @@ impl TaskService {
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorFailed,
             blocking_reason: "executor_failed".to_owned(),
-            blocked_by: Some("system:executor".to_owned()),
+            blocked_by: Some(
+                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+            ),
             blocked_at: Some(now_rfc3339()),
             blocked_execution_id: Some(execution.id.clone()),
             artifact: Some(api_types::BlockingArtifact {
@@ -1104,7 +1110,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         let current_state = workflow
             .states
@@ -1196,7 +1202,7 @@ impl TaskService {
         let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
         let review_state = workflow
             .states
@@ -1455,7 +1461,7 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: Some(reason.to_owned()),
-                    triggered_by: "system".to_owned(),
+                    triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow),
                     rejection,
                     defer_dispatch_seconds: None,
                 },
@@ -1491,8 +1497,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow =
-            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+        );
         Ok(workflow
             .states
             .iter()

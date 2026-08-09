@@ -1,0 +1,302 @@
+{
+  "roles": [
+    {
+      "name": "analyst",
+      "display_name": "Analyst",
+      "description": "Clarifies the requested work"
+    },
+    {
+      "name": "implementer",
+      "display_name": "Implementer",
+      "description": "Builds the requested change"
+    },
+    {
+      "name": "verifier",
+      "display_name": "Verifier",
+      "description": "Checks the completed work"
+    }
+  ],
+  "states": [
+    {
+      "name": "ideas",
+      "kind": "backlog",
+      "column": "Backlog",
+      "display_name": "Ideas",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {
+        "accept": { "to": "triage", "dispatch": null },
+        "reject": { "to": "abandoned", "dispatch": null },
+        "retry": { "to": "waiting_on_customer", "dispatch": null }
+      },
+      "config": {}
+    },
+    {
+      "name": "triage",
+      "kind": "initial",
+      "column": "Todo",
+      "display_name": "Triage",
+      "role": "analyst",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {
+        "accept": { "to": "building", "dispatch": null },
+        "reject": { "to": "ideas", "dispatch": null },
+        "fail": { "to": "abandoned", "dispatch": null }
+      },
+      "config": {}
+    },
+    {
+      "name": "building",
+      "kind": "active",
+      "column": "In Progress",
+      "display_name": "Building",
+      "role": "implementer",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": {
+        "builder": "generic.default.v2",
+        "execution_policy": "new_execution",
+        "prompt": {
+          "user_prefix": null,
+          "user_append": "Keep the change narrowly scoped.",
+          "system_prefix": null,
+          "system_append": null
+        }
+      },
+      "triggers": {
+        "accept": { "to": "verification", "dispatch": null }
+      },
+      "config": {
+        "prompt": {
+          "user_append": "Keep the change narrowly scoped."
+        }
+      }
+    },
+    {
+      "name": "verification",
+      "kind": "gate",
+      "column": "Review",
+      "display_name": "Verification",
+      "role": "verifier",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": {
+        "reject_target": "building",
+        "max_rejections": 3,
+        "approve_label": "Verify",
+        "reject_label": "Send back",
+        "requires_user_approval": true,
+        "optional_when_unassigned": false
+      },
+      "dispatch": null,
+      "triggers": {
+        "accept": { "to": "shipping", "dispatch": null },
+        "reject": {
+          "to": "building",
+          "dispatch": {
+            "builder": "coder.review_fix.v2",
+            "execution_policy": "resume_latest_target_role_thread",
+            "prompt": {
+              "user_prefix": null,
+              "user_append": "Address verification feedback before returning.",
+              "system_prefix": null,
+              "system_append": null
+            }
+          }
+        }
+      },
+      "config": {}
+    },
+    {
+      "name": "shipping",
+      "kind": "gate",
+      "column": "Review",
+      "display_name": "Shipping",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": {
+        "reject_target": "merge_blocked",
+        "max_rejections": 1,
+        "approve_label": "Ship",
+        "reject_label": "Repair merge",
+        "requires_user_approval": true,
+        "optional_when_unassigned": false
+      },
+      "dispatch": null,
+      "triggers": {
+        "accept": { "to": "released", "dispatch": null },
+        "reject": { "to": "merge_blocked", "dispatch": null },
+        "fail": { "to": "abandoned", "dispatch": null }
+      },
+      "config": {
+        "retry_budgets": {
+          "merge_fix": 1
+        }
+      }
+    },
+    {
+      "name": "merge_blocked",
+      "kind": "active",
+      "column": "Review",
+      "display_name": "Merge blocked",
+      "role": "implementer",
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": {
+        "builder": "coder.merge_fix.v2",
+        "execution_policy": "resume_latest_target_role_thread",
+        "prompt": null
+      },
+      "triggers": {
+        "accept": { "to": "verification", "dispatch": null },
+        "retry": { "to": "building", "dispatch": null },
+        "fail": { "to": "abandoned", "dispatch": null }
+      },
+      "config": {
+        "retry_budgets": {
+          "merge_fix": 1
+        }
+      }
+    },
+    {
+      "name": "waiting_on_customer",
+      "kind": "custom",
+      "column": "Todo",
+      "display_name": "Waiting on customer",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": null,
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {
+        "accept": { "to": "building", "dispatch": null },
+        "reject": { "to": "ideas", "dispatch": null }
+      },
+      "config": {
+        "prompt": {
+          "user_append": "Resume only after the customer responds."
+        }
+      }
+    },
+    {
+      "name": "released",
+      "kind": "terminal",
+      "column": "Done",
+      "display_name": "Released",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": "immediate",
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {},
+      "config": {}
+    },
+    {
+      "name": "abandoned",
+      "kind": "terminal",
+      "column": "Done",
+      "display_name": "Abandoned",
+      "role": null,
+      "hooks": {
+        "before_exit": [],
+        "on_exit": [],
+        "before_enter": [],
+        "on_enter": [],
+        "after_enter": []
+      },
+      "cleanup": {
+        "delayed": { "seconds": 172800 }
+      },
+      "gate_config": null,
+      "dispatch": null,
+      "triggers": {},
+      "config": {}
+    }
+  ],
+  "configuration": [
+    {
+      "id": "verification_retries",
+      "label": "Verification retries",
+      "description": "Rejected verification cycles allowed before escalation.",
+      "value_type": "integer",
+      "min": 0,
+      "default_value": 3,
+      "binding": {
+        "type": "gate_config",
+        "state": "verification",
+        "field": "max_rejections"
+      }
+    },
+    {
+      "id": "implementer_notes",
+      "label": "Implementer notes",
+      "description": "Extra guidance shown to the implementer.",
+      "value_type": "text",
+      "min": null,
+      "default_value": "",
+      "binding": {
+        "type": "state_config",
+        "state": "building",
+        "path": ["prompt", "user_append"]
+      }
+    }
+  ],
+  "cancellation_state": "abandoned"
+}

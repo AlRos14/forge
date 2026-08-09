@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsSection } from '@/components/settings/SettingsSection'
+import { productTerm } from '@/lib/i18n'
 import type { WorkflowConfigField } from '@/types/generated'
 
 export function WorkflowConfigurationSection({
@@ -22,7 +23,7 @@ export function WorkflowConfigurationSection({
   return (
     <SettingsSection
       title="Configuration"
-      description="Runtime knobs read from the workflow definition while executing this project's pipeline."
+      description={`${productTerm('runtime')} knobs read from the workflow definition while running this project's pipeline.`}
     >
       <div className="space-y-4">
         {fields.length === 0 && (

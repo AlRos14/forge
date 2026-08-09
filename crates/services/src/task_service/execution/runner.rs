@@ -394,14 +394,18 @@ impl TaskService {
             ExecutionOutcome::Failed => (
                 ExecutionStatus::Failed,
                 Some(Some(db::StopReason::ExecutorFailed)),
-                Some(Some("system:executor".to_owned())),
+                Some(Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                )),
                 Some(Some(db::ResumePolicy::Manual)),
                 Some(Some(now.clone())),
             ),
             ExecutionOutcome::Cancelled => (
                 ExecutionStatus::Cancelled,
                 Some(Some(db::StopReason::ExecutorCancelled)),
-                Some(Some("system:executor".to_owned())),
+                Some(Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                )),
                 Some(Some(db::ResumePolicy::Manual)),
                 Some(Some(now.clone())),
             ),
@@ -709,7 +713,9 @@ impl TaskService {
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::MaxTurnsExceeded,
             blocking_reason: "max_turns_exceeded".to_owned(),
-            blocked_by: Some("system:executor".to_owned()),
+            blocked_by: Some(
+                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+            ),
             blocked_at: Some(now_rfc3339()),
             blocked_execution_id: Some(execution.id.clone()),
             artifact: Some(api_types::BlockingArtifact {
@@ -781,8 +787,11 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow =
-            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, "system");
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Executor),
+        );
         if let Some(value) = workflow
             .states
             .iter()

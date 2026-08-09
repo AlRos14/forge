@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use api_types::{
-    FailurePolicy, HookAudience, HookResultEntry, HookSpec, StateDefinition, StateHooks, StateKind,
-    WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    FailurePolicy, GateConfig, HookAudience, HookResultEntry, HookSpec, StateDefinition,
+    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
@@ -183,6 +183,14 @@ fn state(name: &str, kind: StateKind, role: Option<&str>, hooks: StateHooks) -> 
         role: role.map(str::to_owned),
         hooks,
         cleanup: None,
+        canonical_phase: Some(match kind {
+            StateKind::Backlog => api_types::CanonicalPhase::Backlog,
+            StateKind::Initial => api_types::CanonicalPhase::Ready,
+            StateKind::Active => api_types::CanonicalPhase::Working,
+            StateKind::Gate => api_types::CanonicalPhase::Working,
+            StateKind::Terminal => api_types::CanonicalPhase::Done,
+            StateKind::Custom => api_types::CanonicalPhase::Working,
+        }),
         gate_config: None,
         dispatch: None,
         triggers: std::collections::BTreeMap::new(),
@@ -199,6 +207,60 @@ fn with_trigger(mut state: StateDefinition, trigger: WorkflowTrigger, to: &str) 
         },
     );
     state
+}
+
+fn user_approval_review_workflow(
+    before_enter_hook: HookSpec,
+    after_enter_hooks: Vec<HookSpec>,
+) -> WorkflowDefinition {
+    let working = with_trigger(
+        state("working", StateKind::Active, None, StateHooks::default()),
+        WorkflowTrigger::Accept,
+        "review",
+    );
+    let mut review = state(
+        "review",
+        StateKind::Gate,
+        None,
+        StateHooks {
+            before_enter: vec![before_enter_hook],
+            after_enter: after_enter_hooks,
+            ..StateHooks::default()
+        },
+    );
+    review.gate_config = Some(GateConfig {
+        reject_target: Some("working".to_owned()),
+        max_rejections: Some(3),
+        approve_label: Some("Approve".to_owned()),
+        reject_label: Some("Reject".to_owned()),
+        requires_user_approval: Some(true),
+        optional_when_unassigned: Some(false),
+    });
+    review.triggers.insert(
+        WorkflowTrigger::Accept,
+        WorkflowTriggerDefinition {
+            to: "done".to_owned(),
+            dispatch: None,
+        },
+    );
+    review.triggers.insert(
+        WorkflowTrigger::Reject,
+        WorkflowTriggerDefinition {
+            to: "working".to_owned(),
+            dispatch: None,
+        },
+    );
+
+    WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![
+            working,
+            review,
+            state("done", StateKind::Terminal, None, StateHooks::default()),
+        ],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    }
 }
 
 fn phases(results: &[HookResultEntry]) -> Vec<&str> {
@@ -272,7 +334,7 @@ async fn lifecycle_ordering() {
             default_states::PLANNING,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
         )
@@ -309,7 +371,7 @@ async fn default_workflow_allows_user_to_leave_planning() {
             default_states::IN_PROGRESS,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work after planning",
             false,
         )
@@ -337,7 +399,7 @@ async fn default_workflow_allows_user_to_start_work_from_todo() {
             default_states::IN_PROGRESS,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start human work",
             false,
         )
@@ -379,7 +441,7 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
             default_states::PLANNING,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "enter planning",
             false,
         )
@@ -417,7 +479,7 @@ async fn default_workflow_keeps_planning_when_planner_is_human() {
             default_states::PLANNING,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "enter planning",
             false,
         )
@@ -445,7 +507,7 @@ async fn default_workflow_skips_system_review_when_no_checks_or_reviewer_are_ass
             default_states::REVIEW,
             current_task.version,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::General),
             "request review after agent completion",
             false,
         )
@@ -481,7 +543,7 @@ async fn default_workflow_keeps_user_requested_review_when_unassigned() {
             default_states::REVIEW,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "request human review",
             false,
         )
@@ -530,7 +592,7 @@ async fn default_workflow_keeps_review_when_reviewer_is_human() {
             default_states::REVIEW,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "request review",
             false,
         )
@@ -599,7 +661,7 @@ async fn guard_rejection_returns_412_error() {
             default_states::IN_PROGRESS,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
         )
@@ -680,7 +742,7 @@ async fn effect_failure_log_policy_continues() {
             default_states::IN_PROGRESS,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
         )
@@ -815,7 +877,7 @@ async fn cancellation_implicit_edge() {
             default_states::CANCELLED,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "cancel",
             false,
         )
@@ -963,7 +1025,7 @@ async fn custom_workflow_renamed_states_lifecycle() {
             "working",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "claim",
             false,
         )
@@ -977,7 +1039,7 @@ async fn custom_workflow_renamed_states_lifecycle() {
             "checking",
             r1.task.version,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::General),
             "completed",
             false,
         )
@@ -991,7 +1053,7 @@ async fn custom_workflow_renamed_states_lifecycle() {
             "shipped",
             r2.task.version,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::General),
             "approved",
             false,
         )
@@ -1023,7 +1085,7 @@ async fn implicit_accept_transition_moves_to_next_declared_state() {
             "working",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "accept",
             false,
         )
@@ -1178,7 +1240,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             "coding",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
         )
@@ -1196,7 +1258,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             "qa",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "request qa",
             false,
         )
@@ -1214,7 +1276,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             "released",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate approved",
             false,
         )
@@ -1232,7 +1294,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             "coding",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
         )
@@ -1250,7 +1312,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             "qa",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "request qa",
             false,
         )
@@ -1268,13 +1330,87 @@ async fn gate_approve_reject_on_custom_gate_states() {
             "coding",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected",
             true,
         )
         .await
         .expect("qa → coding (reject)");
     assert_eq!(result.task.status, "coding");
+}
+
+#[tokio::test]
+async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_target() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let workflow =
+        user_approval_review_workflow(hook("run_ci_steps", FailurePolicy::Block), Vec::new());
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(r#"{"review":{"ci_steps":"not-an-array"}}"#)
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("task review config updates");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            &task_id,
+            "review",
+            1,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "submit for validation",
+            false,
+        )
+        .await
+        .expect("failed validation cascades back to working");
+
+    assert_eq!(result.task.status, "working");
+    assert!(result.task.entry_barrier_json.is_none());
+    let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
+        .await
+        .expect("transition logs load");
+    assert!(
+        logs.iter().any(|entry| {
+            entry.from_state == "review" && entry.to_state == "working" && entry.rejection
+        }),
+        "validation rejection should be recorded on the automatic reject cascade"
+    );
+}
+
+#[tokio::test]
+async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let workflow = user_approval_review_workflow(
+        hook("check_retry_budget", FailurePolicy::Block),
+        vec![hook("auto_cascade_on_completion", FailurePolicy::Log)],
+    );
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            &task_id,
+            "review",
+            1,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "submit for validation",
+            false,
+        )
+        .await
+        .expect("passing validation pauses for human approval");
+
+    assert_eq!(result.task.status, "review");
+    assert!(result.task.entry_barrier_json.is_none());
+    assert!(!result.cascaded);
+    let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
+        .await
+        .expect("transition logs load");
+    assert!(!logs.iter().any(|entry| entry.rejection));
 }
 
 #[tokio::test]
@@ -1345,7 +1481,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
             "coding",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
         )
@@ -1363,7 +1499,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
             "review",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "request review",
             false,
         )
@@ -1394,7 +1530,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
             "coding",
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected",
             true,
         )
@@ -1411,7 +1547,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
         "review",
         current_task.version,
         &workflow,
-        "user:test",
+        &api_types::Actor::user(api_types::UserActionSource::Test),
         "request review again",
         false,
     )
@@ -1528,7 +1664,7 @@ async fn planning_gate_reject_back_to_itself() {
             default_states::PLANNING,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "enter planning",
             false,
         )
@@ -1546,7 +1682,7 @@ async fn planning_gate_reject_back_to_itself() {
             default_states::PLANNING,
             current_task.version,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected",
             true,
         )
@@ -1616,7 +1752,7 @@ async fn gate_reject_back_to_itself() {
             reject_target,
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected: needs more detail",
             true,
         )
@@ -1745,7 +1881,7 @@ async fn user_override_succeeds_across_missing_edge() {
             "done",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "override",
             false,
         )
@@ -1771,7 +1907,7 @@ async fn user_override_does_not_reopen_terminal_state() {
             "working",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "override",
             false,
         )
@@ -1802,7 +1938,7 @@ async fn user_override_succeeds_along_system_only_edge() {
             "failed",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "user override along fail edge",
             false,
         )
@@ -1818,7 +1954,7 @@ async fn user_override_succeeds_along_system_only_edge() {
             "failed",
             1,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::General),
             "system fail transition",
             false,
         )
@@ -1834,7 +1970,7 @@ async fn user_override_succeeds_along_system_only_edge() {
             "failed",
             1,
             &workflow,
-            "agent:unit",
+            &api_types::Actor::agent("unit"),
             "agent attempt",
             false,
         )
@@ -1859,7 +1995,13 @@ async fn override_not_granted_to_agents_or_system() {
     let workflow = missing_edge_workflow();
     let eng = engine(Arc::clone(&db), event_bus);
 
-    for (actor, label) in [("system", "system"), ("agent:unit", "agent")] {
+    for (actor, label) in [
+        (
+            api_types::Actor::system(api_types::SystemComponent::General),
+            "system",
+        ),
+        (api_types::Actor::agent("unit"), "agent"),
+    ] {
         let task_id = new_uuid_v4();
         seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
         let result = eng
@@ -1868,7 +2010,7 @@ async fn override_not_granted_to_agents_or_system() {
                 "done",
                 1,
                 &workflow,
-                actor,
+                &actor,
                 "should not override",
                 false,
             )
@@ -1899,7 +2041,7 @@ async fn override_to_undefined_target_rejected_with_enumerated_states() {
             "nonexistent",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "invalid target",
             false,
         )
@@ -1941,7 +2083,7 @@ async fn custom_workflow_lacking_review_rejects_with_enumerated_states() {
             "review",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "request review",
             false,
         )
@@ -2024,7 +2166,7 @@ async fn content_guard_blocks_user_override() {
             "done",
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "override blocked by guard",
             false,
         )
@@ -2061,7 +2203,7 @@ async fn version_conflict_still_applies_to_override() {
             "done",
             2,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "stale version",
             false,
         )
@@ -2084,9 +2226,17 @@ async fn override_is_auditable() {
     let reason = "audit this override";
     let eng = engine(Arc::clone(&db), event_bus);
 
-    eng.transition(&task_id, "done", 1, &workflow, "user:test", reason, false)
-        .await
-        .expect("override transition succeeds");
+    eng.transition(
+        &task_id,
+        "done",
+        1,
+        &workflow,
+        &api_types::Actor::user(api_types::UserActionSource::Test),
+        reason,
+        false,
+    )
+    .await
+    .expect("override transition succeeds");
 
     let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
         .await
@@ -2123,7 +2273,7 @@ async fn subtask_user_override_into_review_no_workspace_no_reviewer_completes() 
             default_states::REVIEW,
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask into review",
             false,
         )
@@ -2157,7 +2307,7 @@ async fn subtask_user_override_into_review_with_ci_steps_completes_or_fails_grac
             default_states::REVIEW,
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask review with ci",
             false,
         )
@@ -2201,7 +2351,7 @@ async fn subtask_user_override_into_review_empty_ci_auto_passes() {
             default_states::REVIEW,
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask review no ci",
             false,
         )
@@ -2235,7 +2385,7 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
             default_states::MERGING,
             1,
             &workflow,
-            "user:test",
+            &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask into merging",
             false,
         )

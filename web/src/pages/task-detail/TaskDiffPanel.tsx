@@ -8,6 +8,7 @@ import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import { useLayoutStore } from '@/stores/layout'
 import type { DiffEnvelope } from '@/types/generated'
 import { diffStatusStyles, splitDiffIntoFiles } from './utils'
@@ -149,11 +150,11 @@ export function TaskDiffPanel({
       ) : diffIsWorkspaceMissing ? (
         <EmptyState
           title="No workspace yet"
-          description="Launch an execution to start working on this task."
+          description={`Launch a ${productTerm('run').toLowerCase()} to start working on this task.`}
           action={
             canLaunch ? (
               <Button size="sm" variant="outline" disabled={!hasAgents} onClick={onOpenLaunchDialog}>
-                Launch Execution
+                Launch {productTerm('run')}
               </Button>
             ) : undefined
           }

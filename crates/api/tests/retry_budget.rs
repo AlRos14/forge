@@ -92,7 +92,14 @@ async fn gate_reject(app: &Router, task: &TaskResponse) -> TaskResponse {
 }
 
 fn state(name: &str, kind: &str, gate_config: Value, triggers: Value) -> Value {
-    json!({ "name": name, "kind": kind, "column": name, "display_name": name, "role": null, "hooks": {}, "gate_config": gate_config, "triggers": triggers, "config": {} })
+    let canonical_phase = match kind {
+        "backlog" => "backlog",
+        "initial" => "ready",
+        "gate" => "review",
+        "terminal" => "done",
+        _ => "working",
+    };
+    json!({ "name": name, "kind": kind, "canonical_phase": canonical_phase, "column": name, "display_name": name, "role": null, "hooks": {}, "gate_config": gate_config, "triggers": triggers, "config": {} })
 }
 
 fn trigger(to: &str) -> Value {

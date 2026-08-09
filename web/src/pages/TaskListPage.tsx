@@ -26,6 +26,7 @@ import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
 import { Funnel, Plus, UserCircle, X } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
 import { toastApiError } from '@/lib/api-error'
+import { productTerm } from '@/lib/i18n'
 import { getBlockingAnnotation } from '@/lib/workflow-utils'
 import type { Task, TaskStatus } from '@/types/generated'
 
@@ -43,7 +44,7 @@ const cancellableStatuses = new Set<TaskStatus>([
 const tableColumns: Array<{ key: TaskListSortBy; label: string }> = [
   { key: 'title', label: 'Title' },
   { key: 'priority', label: 'Pri' },
-  { key: 'status', label: 'State' },
+  { key: 'status', label: productTerm('phase') },
   { key: 'agent', label: 'Agent' },
   { key: 'updated_at', label: 'Updated' },
 ]
@@ -538,7 +539,7 @@ export function TaskListPage({
                           P{task.priority}
                         </span>
                       </td>
-                      {/* State */}
+                      {/* Phase */}
                       <td className="w-36 px-3 py-[10px]">
                         <div className="flex flex-col gap-1">
                           <TaskStatusDropdown

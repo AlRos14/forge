@@ -38,6 +38,7 @@ import { getAvailableTaskTransitions } from '@/components/task-controls'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { getBlockingAnnotation } from '@/lib/workflow-utils'
+import { productTerm } from '@/lib/i18n'
 import type { Review, WorkflowExceptionAction } from '@/types/generated'
 
 function formatDate(value?: string | null): string {
@@ -458,7 +459,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                 <Tabs defaultValue="executions">
                   <TabsList>
                     <TabsTrigger value="executions">
-                      Executions
+                      {productTerm('run', 0)}
                       {executions.length > 0 && (
                         <span className="ml-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-muted-foreground/10 px-1.5 text-micro font-medium">
                           {executions.length}

@@ -1,4 +1,5 @@
 import { Robot } from '@phosphor-icons/react'
+import { productTerm } from '@/lib/i18n'
 
 type ChatEmptyStateProps = {
   title?: string
@@ -7,7 +8,7 @@ type ChatEmptyStateProps = {
 
 export function ChatEmptyState({
   title = 'Waiting for activity',
-  description = 'Execution logs will appear here once the agent starts working.',
+  description = `${productTerm('run', 0)} logs will appear here once the agent starts working.`,
 }: ChatEmptyStateProps) {
   return (
     <div className="flex min-h-48 flex-col items-center justify-center px-6 py-16 text-center">

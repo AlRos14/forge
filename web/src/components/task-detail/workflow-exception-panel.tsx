@@ -21,6 +21,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Tooltip } from '@/components/ui/tooltip'
 import { workflowLabelFromKind } from '@/components/workflow-health-badge'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type {
   RecoveryAction,
   Task,
@@ -235,7 +236,7 @@ export function WorkflowExceptionPanel({
                   params={{ taskId: task.id, executionId: exception.execution_id }}
                   className="font-mono text-primary hover:underline"
                 >
-                  Execution {exception.execution_id.slice(0, 8)}
+                  {productTerm('run')} {exception.execution_id.slice(0, 8)}
                 </Link>
               ) : null}
             </div>

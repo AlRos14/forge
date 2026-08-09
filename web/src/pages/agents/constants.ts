@@ -1,4 +1,5 @@
 import type { Agent, AgentStatus, Daemon } from '@/types/generated'
+import { productTerm } from '@/lib/i18n'
 
 export const executorTypes = ['claude_code', 'codex', 'cursor', 'gemini', 'opencode', 'shell', 'smith', 'null'] as const
 
@@ -26,6 +27,6 @@ export const statusConfig: Record<AgentStatus, { dot: string; label: string }> =
 
 export const effectiveStatusLabels: Record<string, string> = {
   error: 'Error',
-  daemon_offline: 'Daemon offline',
+  daemon_offline: `${productTerm('runtime')} offline`,
   deactivated: 'CLI not authenticated',
 }

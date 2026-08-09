@@ -36,6 +36,13 @@ For the conceptual model behind these endpoints see
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim task (auto-dispatches the executor) |
+| GET    | `/api/v1/tasks/{id}/actions` | List the intent actions currently available for the task (`{"available_actions": [...]}`), so clients need not provoke a 409 to discover them |
+| POST   | `/api/v1/tasks/{id}/start` | Start task work (claims an available agent and dispatches the first active state) |
+| POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
+| POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
+| POST   | `/api/v1/tasks/{id}/submit` | Fire the current active state's `accept` trigger |
+| POST   | `/api/v1/tasks/{id}/request-changes` | Reject the current review/gate and resume its configured worker path |
+| POST   | `/api/v1/tasks/{id}/approve` | Approve an awaiting-human review or an approval-required gate |
 | POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
@@ -104,6 +111,21 @@ Project hook validation rejects unsupported trigger and action types, the
 `task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
 required action strings such as `dispatch_agent.agent_id`.
 
+## Workflow canonical phases
+
+Workflow state definitions may include the optional `canonical_phase` field:
+`backlog`, `ready`, `working`, `review`, or `done`. New workflow saves must set
+it explicitly for every state. Legacy definitions without the field remain
+readable; their phase is derived from the state column, known legacy state
+names, and state kind, with unknown states defaulting to `working`.
+
+## Task responses
+
+`TaskResponse` includes the additive `canonical_phase` field. It is derived at
+response-build time from the project's resolved workflow and the task's current
+`status`; it is not persisted. The value is one of `backlog`, `ready`,
+`working`, `review`, or `done`. Cancelled workflow states map to `done`.
+
 ## Agent execution options
 
 The two `discovered-options` endpoints return the adapter's selectable
@@ -129,6 +151,12 @@ profiles with their provider/model pairings under `cli_specific.profiles`
 and configured provider names under `cli_specific.providers`. Hosts without
 a Smith config discover empty lists.
 
+A Smith agent's `reasoning_effort` is forwarded as `--effort`; Smith validates
+it against the selected provider/model effort ladder and refuses an
+unsupported value. Agents that set no `reasoning_effort` emit no flag, leaving
+effort to the named Smith profile, `SMITH_REASONING_EFFORT`, or the model
+default. A `--effort` flag requires a Smith build that accepts it.
+
 ## Task transitions
 
 `POST /api/v1/tasks/{id}/transition` accepts `status`, `version`, optional
@@ -137,6 +165,36 @@ a Smith config discover empty lists.
 state, the server auto-escalates to the user-routing-override path. MCP
 `forge_transition_task` is unchanged — it still emits `triggered_by="system"`
 and does not support user override (REST-only for now).
+
+## Task intent actions
+
+Intent endpoints accept an optional `TaskActionRequest` body:
+
+```json
+{ "reason": "ready for review", "version": 7 }
+```
+
+Both fields are optional. Successful responses are the normal `TaskResponse`.
+The action service resolves the project's workflow at request time, so clients
+do not need to encode concrete state names. `start` claims an available agent
+when needed and enters the first claimable active/gate state; `submit` follows
+the active state's `accept` trigger; `approve` and `request-changes` use the
+latest awaiting-human review when present and otherwise use gate capabilities.
+`pause` stops the running execution without a state transition and records a
+manual-stop annotation plus an audit comment. `resume` uses the existing
+session-follow-up/recovery primitives and falls back to a fresh dispatch.
+
+When an action is not available, the endpoint returns `409` with
+`code: "task_action.unavailable"` and structured `details`:
+
+```json
+{
+  "available_actions": ["cancel", "start"],
+  "reason": "action 'approve' is not available while task is in Active state 'working'"
+}
+```
+
+The raw `/transition` endpoint remains available for advanced workflow clients.
 
 ## Task board snapshots and moves
 
@@ -361,10 +419,11 @@ rows to determine `has_more`. The response field is `items` (not `data`).
 | `sort_by` | `created_at`, `updated_at`, `priority`, `board_position`, `title`, `status`, `agent`, `task_type`, `id` |
 | `sort_order` | `asc`, `desc` |
 | `status` | Comma-separated status filter |
+| `canonical_phase` | Comma-separated canonical phase filter (`backlog`, `ready`, `working`, `review`, `done`) |
 | `agent_id` | Comma-separated agent filter |
 | `assignee_type` | Comma-separated assignee type filter (`agent`, `user`) |
 | `assignee_id` | Comma-separated assignee id / user-handle filter |
-| `include_cancelled` | Include cancelled tasks (default false unless `status` includes `cancelled`) |
+| `include_cancelled` | Include cancelled tasks (default false unless `status` includes `cancelled`; `canonical_phase=done` includes cancelled tasks because cancelled maps to `done`) |
 | `include_archived` | Include archived tasks (default false) |
 | `include_total` | Include total count in response |
 

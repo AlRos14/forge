@@ -159,7 +159,9 @@ impl TaskService {
                 id: execution_id.to_owned(),
                 status: Some(ExecutionStatus::Failed),
                 stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
-                stopped_by: Some(Some("system:dispatch".to_owned())),
+                stopped_by: Some(Some(
+                    api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
+                )),
                 resume_policy: Some(Some(db::ResumePolicy::Manual)),
                 stopped_at: Some(Some(now_rfc3339())),
                 agent_session_id: None,

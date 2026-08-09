@@ -441,7 +441,14 @@ async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResp
 }
 
 fn state(name: &str, kind: &str, hooks: Value, config: Value, triggers: Value) -> Value {
-    json!({ "name": name, "kind": kind, "column": name, "display_name": name, "role": null, "hooks": hooks, "gate_config": null, "triggers": triggers, "config": config })
+    let canonical_phase = match kind {
+        "backlog" => "backlog",
+        "initial" => "ready",
+        "gate" => "review",
+        "terminal" => "done",
+        _ => "working",
+    };
+    json!({ "name": name, "kind": kind, "canonical_phase": canonical_phase, "column": name, "display_name": name, "role": null, "hooks": hooks, "gate_config": null, "triggers": triggers, "config": config })
 }
 
 fn trigger(to: &str) -> Value {

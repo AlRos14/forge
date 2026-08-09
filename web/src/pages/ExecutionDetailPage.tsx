@@ -35,6 +35,7 @@ import { Tooltip } from '@/components/ui/tooltip'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { roleDisplayName } from '@/lib/execution-utils'
+import { productTerm } from '@/lib/i18n'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
 import { useAuthStore } from '@/stores/auth'
 import {
@@ -377,7 +378,7 @@ export function ExecutionDetailPage({
   const recoveryExecution = useMutation({
     mutationFn: () => {
       if (!execution) {
-        throw new Error('Execution not found')
+        throw new Error(`${productTerm('run')} not found`)
       }
       if (executionAgentSessionId) {
         const body: FollowUpRequest = { message: 'Resume' }
@@ -404,12 +405,12 @@ export function ExecutionDetailPage({
 
   const cancelExecution = useMutation({
     mutationFn: () => {
-      if (!execution) throw new Error('Execution not found')
+      if (!execution) throw new Error(`${productTerm('run')} not found`)
       return apiFetch<Execution>(`/executions/${execution.id}/cancel`, { method: 'POST' })
     },
     onSuccess: () => {
       void executionQuery.refetch()
-      toast.success('Execution cancelled')
+      toast.success(`${productTerm('run')} cancelled`)
     },
     onError: (error) => toast.error(getApiErrorMessage(error, 'Cancel failed')),
   })
@@ -478,7 +479,7 @@ export function ExecutionDetailPage({
           Task
         </button>
         <span className="text-muted-foreground/50">/</span>
-        <span className="text-foreground font-medium">Execution</span>
+        <span className="text-foreground font-medium">{productTerm('run')}</span>
       </nav>
 
       <PanelGroup direction="horizontal" className="flex-1 min-h-0 rounded-xl border border-border-subtle bg-card shadow-soft overflow-hidden">

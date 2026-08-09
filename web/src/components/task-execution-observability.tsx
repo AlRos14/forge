@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type { TaskExecutionObservability } from '@/types/generated'
 
 export function formatRuntimeSeconds(value?: number | null): string {
@@ -67,7 +68,7 @@ export function TaskExecutionObservabilityPanel({
           className,
         )}
       >
-        No execution metrics yet.
+        No {productTerm('run').toLowerCase()} metrics yet.
       </p>
     )
   }
@@ -75,7 +76,7 @@ export function TaskExecutionObservabilityPanel({
   const active = value.active_execution_id
     ? {
         id: value.active_execution_id,
-        role: value.active_role ?? 'execution',
+        role: value.active_role ?? productTerm('run').toLowerCase(),
         startedAt: value.active_started_at,
         elapsedSeconds: value.active_elapsed_seconds,
       }
@@ -83,7 +84,7 @@ export function TaskExecutionObservabilityPanel({
   const latest = value.latest_execution_id
     ? {
         id: value.latest_execution_id,
-        role: value.latest_role ?? 'execution',
+        role: value.latest_role ?? productTerm('run').toLowerCase(),
         status: value.latest_execution_status,
         stoppedAt: value.latest_stopped_at,
         runtimeSeconds: value.latest_runtime_seconds,
@@ -93,7 +94,7 @@ export function TaskExecutionObservabilityPanel({
   return (
     <section className={cn('space-y-3', className)}>
       <div className="grid grid-cols-2 gap-2">
-        <Metric label="Executions" value={formatTokenCount(value.execution_count)} />
+        <Metric label={productTerm('run', 0)} value={formatTokenCount(value.execution_count)} />
         <Metric label="Runtime" value={formatRuntimeSeconds(value.total_runtime_seconds)} />
         <Metric
           label="Tokens"
@@ -121,7 +122,7 @@ export function TaskExecutionObservabilityPanel({
         />
       ) : (
         <p className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
-          No executions yet.
+          No {productTerm('run', 0).toLowerCase()} yet.
         </p>
       )}
     </section>

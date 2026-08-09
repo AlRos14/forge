@@ -165,7 +165,7 @@ pub async fn credit_in_progress_subtask_commit(
             default_states::DONE,
             subtask.version,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "credit subtask commit despite executor failure",
             false,
         )
@@ -353,7 +353,7 @@ async fn start_turn_for(
                 default_states::IN_PROGRESS,
                 subtask.version,
                 &workflow,
-                "system",
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
                 "ordered turn started",
                 false,
             )
@@ -486,7 +486,7 @@ pub async fn finish_current_turn_and_begin_next(
                 default_states::DONE,
                 subtask.version,
                 &workflow,
-                "system",
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
                 "subtask turn completed",
                 false,
             )
@@ -535,7 +535,7 @@ pub async fn finish_current_turn_and_begin_next(
                     default_states::IN_PROGRESS,
                     subtask.version,
                     &workflow,
-                    "system",
+                    &api_types::Actor::system(api_types::SystemComponent::Workflow),
                     "credit pre-existing commit",
                     false,
                 )
@@ -546,7 +546,7 @@ pub async fn finish_current_turn_and_begin_next(
                     default_states::DONE,
                     intermediate.task.version,
                     &workflow,
-                    "system",
+                    &api_types::Actor::system(api_types::SystemComponent::Workflow),
                     "subtask turn completed",
                     false,
                 )

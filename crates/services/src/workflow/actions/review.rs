@@ -229,7 +229,6 @@ impl HookAction for AutoCascadeOnReviewPass {
             Ok(review) => review,
             Err(reason) => return HookResult::Failed { reason },
         };
-
         match latest_review {
             Some(review)
                 if review.status == ReviewStatus::Passed
@@ -382,9 +381,7 @@ fn gate_requires_user_approval(ctx: &HookContext) -> bool {
 }
 
 fn human_review_requested(ctx: &HookContext, reviewer_assigned: bool) -> bool {
-    ctx.triggered_by.starts_with("user:")
-        && ctx.to_state == default_states::REVIEW
-        && !reviewer_assigned
+    ctx.triggered_by.is_user() && ctx.to_state == default_states::REVIEW && !reviewer_assigned
 }
 
 fn review_rejections_since_boundary(entries: &[TransitionLog]) -> i64 {

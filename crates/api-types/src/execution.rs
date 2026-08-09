@@ -3,12 +3,31 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, ConversationMessageRole, ConversationMessageStatus, ConversationStatus,
-    ExecutionAction, ExecutionBehavior, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
-    TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
+    AgentStatus, CanonicalPhase, ConversationMessageRole, ConversationMessageStatus,
+    ConversationStatus, ExecutionAction, ExecutionBehavior, ExecutionRole, ExecutionStatus,
+    InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason,
+    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
     WorkflowHealthSummary, WorkspaceResponse,
 };
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TaskAction {
+    Start,
+    Pause,
+    Resume,
+    Submit,
+    RequestChanges,
+    Approve,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskActionsResponse {
+    pub available_actions: Vec<TaskAction>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -23,6 +42,7 @@ pub struct TaskResponse {
     pub description: Option<String>,
     pub task_type: TaskType,
     pub status: TaskStatus,
+    pub canonical_phase: CanonicalPhase,
     #[serde(default)]
     pub awaiting_human: bool,
     pub priority: i64,

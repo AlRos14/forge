@@ -168,7 +168,7 @@ describe('OperationsPage', () => {
       within(screen.getByText('Blocked').parentElement as HTMLElement).getByText('1'),
     ).toBeTruthy()
     expect(
-      within(screen.getByText('Daemons').parentElement as HTMLElement).getByText('1'),
+      within(screen.getByText('Runtimes').parentElement as HTMLElement).getByText('1'),
     ).toBeTruthy()
     expect(
       within(screen.getByText('Cleanup').parentElement as HTMLElement).getByText('1'),
@@ -214,7 +214,7 @@ describe('OperationsPage', () => {
   it('renders pressure and active execution observability fields', () => {
     render(<OperationsPage />)
 
-    expect(screen.getByText('Daemon Pressure')).toBeTruthy()
+    expect(screen.getByText('Runtime Pressure')).toBeTruthy()
     expect(screen.getByText('Agent Pressure')).toBeTruthy()
     expect(screen.getByText('3 turns')).toBeTruthy()
     expect(screen.getByText('Agent Agent One')).toBeTruthy()

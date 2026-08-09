@@ -12,6 +12,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
 import { isResumeExecution, roleDisplayName } from '@/lib/execution-utils'
+import { productTerm } from '@/lib/i18n'
 import type { Execution, ExecutionUsage, LogEntry } from '@/types/generated'
 
 function CopyableId({ value, label }: { value: string; label?: string }) {
@@ -134,8 +135,10 @@ export function ExecutionDetailSidebar({
                 <Badge variant="outline" className="text-xs">{execution.role}</Badge>
               </div>
               <div className="space-y-1">
-                <p className="text-micro font-medium uppercase tracking-wider text-muted-foreground">Execution ID</p>
-                <CopyableId value={execution.id} label="execution ID" />
+                <p className="text-micro font-medium uppercase tracking-wider text-muted-foreground">
+                  {productTerm('run')} ID
+                </p>
+                <CopyableId value={execution.id} label={`${productTerm('run').toLowerCase()} ID`} />
               </div>
               {execution.agent_id && (
                 <div className="space-y-1">
@@ -163,9 +166,9 @@ export function ExecutionDetailSidebar({
                     <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
                       <p className="font-semibold">Task Still In Progress</p>
                       <p className="mt-1">
-                        This execution completed, but {remainingPlanItems} plan checklist{' '}
+                        This {productTerm('run').toLowerCase()} completed, but {remainingPlanItems} plan checklist{' '}
                         {remainingPlanItems === 1 ? 'item is' : 'items are'} still unchecked. The
-                        workflow will not move to review until the checklist is complete.
+                        current {productTerm('phase').toLowerCase()} will not move to review until the checklist is complete.
                       </p>
                     </div>
                   ) : null}
@@ -291,7 +294,7 @@ export function ExecutionDetailSidebar({
         ) : (
           <div className="flex flex-col items-center justify-center py-8 text-center">
             <Info className="h-8 w-8 text-muted-foreground/40 mb-2" />
-            <p className="text-sm text-muted-foreground">Execution not found</p>
+            <p className="text-sm text-muted-foreground">{productTerm('run')} not found</p>
           </div>
         )}
       </div>
@@ -299,7 +302,7 @@ export function ExecutionDetailSidebar({
       {hasActions && (
         <div className="shrink-0 border-t px-4 py-3 flex flex-wrap gap-2">
           {actions?.onStop && (
-            <Tooltip content="Stop this execution without cancelling the task">
+            <Tooltip content={`Stop this ${productTerm('run').toLowerCase()} without cancelling the task`}>
               <Button
                 size="sm"
                 variant="outline"
@@ -312,7 +315,7 @@ export function ExecutionDetailSidebar({
                 ) : (
                   <StopCircle className="h-3.5 w-3.5" />
                 )}
-                Stop Execution
+                Stop {productTerm('run')}
               </Button>
             </Tooltip>
           )}

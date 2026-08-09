@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import type { Agent, AgentStatus, Daemon } from '@/types/generated'
 import { effectiveStatusLabels, executorDisplayNames, statusConfig } from './constants'
 import { formatDate, formatDuration, formatPercent } from './form-utils'
@@ -48,9 +49,9 @@ export function ViewPanel({
     { key: 'model', value: agent.model || 'default', mono: true },
     ...(showDaemonDetails
       ? pinnedDaemon
-        ? [{ key: 'daemon', value: pinnedDaemon.hostname || pinnedDaemon.machine_id, mono: true }]
+        ? [{ key: productTerm('runtime').toLowerCase(), value: pinnedDaemon.hostname || pinnedDaemon.machine_id, mono: true }]
         : agent.daemon_id
-          ? [{ key: 'daemon', value: agent.daemon_id, mono: true }]
+          ? [{ key: productTerm('runtime').toLowerCase(), value: agent.daemon_id, mono: true }]
           : []
       : []),
     ...(agent.permission_policy ? [{ key: 'policy', value: agent.permission_policy, mono: true }] : []),

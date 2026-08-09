@@ -10,9 +10,9 @@ use std::{
 };
 
 use api_types::{
-    AgentResponse, AgentStatus, ClaimTaskRequest, CreateAgentRequest, CreateProjectRequest,
-    CreateRepoRequest, CreateTaskRequest, DaemonResponse, PaginatedResponse, ProjectResponse,
-    RepoResponse, TaskExecutionObservability, TaskResponse, TaskType, WorkMode,
+    AgentResponse, AgentStatus, CanonicalPhase, ClaimTaskRequest, CreateAgentRequest,
+    CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, DaemonResponse, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskExecutionObservability, TaskResponse, TaskType, WorkMode,
 };
 use axum::{
     extract::{Path as AxumPath, State},
@@ -542,6 +542,7 @@ fn task_response(
         description: None,
         task_type,
         status: status.to_owned(),
+        canonical_phase: canonical_phase_for_status(status),
         awaiting_human: false,
         priority: 0,
         board_position: 0.0,
@@ -585,6 +586,16 @@ fn task_response(
         version: 1,
         created_at: now(),
         updated_at: now(),
+    }
+}
+
+fn canonical_phase_for_status(status: &str) -> CanonicalPhase {
+    match status {
+        "backlog" => CanonicalPhase::Backlog,
+        "todo" => CanonicalPhase::Ready,
+        "review" | "merging" | "merge_failed" => CanonicalPhase::Review,
+        "done" | "cancelled" => CanonicalPhase::Done,
+        _ => CanonicalPhase::Working,
     }
 }
 

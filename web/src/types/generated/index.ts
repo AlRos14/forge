@@ -1,4 +1,8 @@
 export * from './api'
+export type { TaskAction } from './bindings/TaskAction'
+export type { TaskActionRequest } from './bindings/TaskActionRequest'
+export type { TaskActionsResponse } from './bindings/TaskActionsResponse'
+export type { CanonicalPhase } from './bindings/CanonicalPhase'
 export type { StateDefinition } from './bindings/StateDefinition'
 export type { WorkflowDefinition } from './bindings/WorkflowDefinition'
 export type { WorkflowDispatch } from './bindings/WorkflowDispatch'

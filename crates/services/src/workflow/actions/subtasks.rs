@@ -286,7 +286,7 @@ mod subtask_hook_test_support {
                 event_bus: Arc::new(EventBus::new(16)),
                 gate_config: None,
                 workflow: Arc::new(default_workflow::default_workflow()),
-                triggered_by: "system:test".to_owned(),
+                triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
                 review_runner: None,
                 merge_service: None,
                 cleanup_scheduler: None,

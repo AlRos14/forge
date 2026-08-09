@@ -86,7 +86,7 @@ describe('WorkflowTab dispatch editor', () => {
     expect(screen.getByText('Dispatch')).toBeTruthy()
     fireEvent.click(await screen.findByText('Trigger dispatch'))
     fireEvent.click(await screen.findByText('reject'))
-    expect(screen.getByRole('button', { name: /select target state/i }).textContent).toContain(
+    expect(screen.getByRole('button', { name: /select target phase/i }).textContent).toContain(
       'In Progress',
     )
     expect(screen.getByDisplayValue('Address review feedback.')).toBeTruthy()

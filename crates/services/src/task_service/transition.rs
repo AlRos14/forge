@@ -1,4 +1,5 @@
 use super::*;
+use api_types::{Actor, SystemComponent, UserActionSource};
 use db::UpdateTask;
 
 impl TaskService {
@@ -262,7 +263,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &Actor::system(SystemComponent::General),
         );
         let Some(state) = workflow
             .states
@@ -359,7 +360,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &Actor::system(SystemComponent::General),
         );
         let state = workflow
             .states
@@ -378,6 +379,11 @@ impl TaskService {
     }
 
     pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task> {
+        self.cancel_task_as(task_id, Actor::system(SystemComponent::CancelTask))
+            .await
+    }
+
+    pub async fn cancel_task_as(&self, task_id: impl Into<String>, actor: Actor) -> Result<Task> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -389,7 +395,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &Actor::system(SystemComponent::General),
         );
         let cancel_target = workflow
             .cancellation_state
@@ -402,7 +408,7 @@ impl TaskService {
         self.cancel_running_executions_for_task(
             &task,
             "cancelled by task cancellation",
-            "system:cancel_task",
+            actor.clone(),
         )
         .await?;
         let result = self
@@ -412,7 +418,7 @@ impl TaskService {
                 TransitionOptions {
                     version: task.version,
                     reason: Some("cancel task".to_owned()),
-                    triggered_by: "system".to_owned(),
+                    triggered_by: actor,
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },
@@ -434,7 +440,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &Actor::user(UserActionSource::ManualAdvance),
         );
         let target = next_workflow_state(&workflow, &task.status)?;
 
@@ -459,6 +465,7 @@ impl TaskService {
                 &target,
                 task.version,
                 &workflow,
+                Actor::user(UserActionSource::ManualAdvance),
                 "manual advance",
                 false,
             )
@@ -479,7 +486,7 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            "system",
+            &Actor::system(SystemComponent::General),
         );
         if matches!(
             workflow.state_kind(&task.status),
@@ -550,9 +557,9 @@ impl TaskService {
         task: &Task,
         target_status: &str,
         workflow: &api_types::WorkflowDefinition,
-        triggered_by: &str,
+        actor: &Actor,
     ) -> Result<()> {
-        if !triggered_by.starts_with("user:") {
+        if !actor.is_user() {
             return Ok(());
         }
 
@@ -589,7 +596,7 @@ impl TaskService {
                 &execution,
                 "cancelled by user transition",
                 db::StopReason::UserCancelled,
-                "user:transition",
+                actor,
                 db::ResumePolicy::None,
             )
             .await?;
@@ -601,7 +608,7 @@ impl TaskService {
         self.cancel_running_executions_for_task(
             task,
             "cancelled by manual advance",
-            "user:manual_advance",
+            Actor::user(UserActionSource::ManualAdvance),
         )
         .await
     }
@@ -610,7 +617,7 @@ impl TaskService {
         &self,
         task: &Task,
         reason: &str,
-        triggered_by: &str,
+        actor: Actor,
     ) -> Result<()> {
         let page = ExecutionRepo::list_by_task(
             &*self.db,
@@ -633,7 +640,7 @@ impl TaskService {
                 &execution,
                 reason,
                 db::StopReason::TaskCancelled,
-                triggered_by,
+                &actor,
                 db::ResumePolicy::None,
             )
             .await?;
@@ -762,7 +769,7 @@ pub(super) fn should_clear_review_passed_at(
     from: &str,
     to: &str,
     rejection: bool,
-    triggered_by: &str,
+    actor: &Actor,
 ) -> bool {
     let from_kind = workflow.state_kind(from);
     let to_kind = workflow.state_kind(to);
@@ -778,7 +785,7 @@ pub(super) fn should_clear_review_passed_at(
     {
         return true;
     }
-    if triggered_by.starts_with("user:") {
+    if actor.is_user() {
         let from_is_work = matches!(
             from_kind,
             Some(api_types::StateKind::Active | api_types::StateKind::Gate)

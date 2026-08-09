@@ -1,0 +1,972 @@
+spec_version: 1
+project:
+  id: forge-v2-autonomous-work-management
+  title: Forge V2 — Autonomous Work Management
+  repository: ForgeAILab/forge
+  default_workflow: autonomous_v1
+  principles:
+  - one primary agent per task by default
+  - many tasks in parallel
+  - external Forge validation
+  - risk- and exception-driven human attention
+  - task survives runs and agents
+  - advanced workflow engine retained
+milestones:
+- id: M0
+  title: Baseline and decisions
+  goal: Protect existing behavior and establish safety dependencies.
+- id: M1
+  title: Workflow foundation
+  goal: Introduce canonical phases and the one-worker autonomous preset.
+- id: M2
+  title: Global work surfaces
+  goal: Create Home, Work, and user-oriented navigation.
+- id: M3
+  title: Task and review experience
+  goal: Simplify task creation, task detail, runs, checks, and delivery review.
+- id: M4
+  title: Contracts and validation
+  goal: Add enforceable task contracts, project policy, and validation profiles.
+- id: M5
+  title: Risk and escalation
+  goal: Make gates, reviewer agents, recovery, and transfer conditional and auditable.
+- id: M6
+  title: Agent and runtime simplification
+  goal: Present agents as teammates and runtime infrastructure as automatic compute.
+- id: M7
+  title: Migration and release
+  goal: Migrate safely and make autonomous work the new-project default.
+tasks:
+- id: F2-000
+  milestone: M0
+  title: Commit Forge V2 specification package
+  size: S
+  risk: low
+  agent_profile: documentation
+  review_policy: standard
+  depends_on: []
+  code_areas:
+  - docs/spec
+  deliverables:
+  - Specification index and linked package
+  acceptance:
+  - All documents render and internal links resolve
+- id: F2-001
+  milestone: M0
+  title: Capture legacy workflow and database compatibility fixtures
+  size: M
+  risk: medium
+  agent_profile: backend-test
+  review_policy: standard
+  depends_on:
+  - F2-000
+  code_areas:
+  - crates/api/tests
+  - crates/services workflow tests
+  - web/e2e
+  deliverables:
+  - Serialized strict/custom workflows
+  - Representative database fixture
+  - Regression tests
+  acceptance:
+  - Fixtures reproduce current task lifecycle and can seed migration tests
+- id: F2-002
+  milestone: M0
+  title: Introduce typed transition actor
+  size: L
+  risk: high
+  agent_profile: senior-backend
+  review_policy: independent-required
+  depends_on:
+  - F2-001
+  code_areas:
+  - api-types
+  - task_service/transition
+  - workflow/engine
+  - API/MCP emitters
+  deliverables:
+  - Actor User/Agent/System model
+  - Correct audit attribution
+  - Remove prefix-based policy control
+  acceptance:
+  - No control-flow checks use actor string prefixes
+  - All actor paths covered
+- id: F2-003
+  milestone: M0
+  title: Add user-facing terminology adapter
+  size: S
+  risk: low
+  agent_profile: frontend-platform
+  review_policy: standard
+  depends_on: []
+  code_areas:
+  - web locales
+  - shared formatters
+  - docs glossary
+  deliverables:
+  - Run/Runtime/Phase copy mapping
+  acceptance:
+  - Normal UI avoids execution/daemon jargon while existing URLs remain
+- id: F2-100
+  milestone: M1
+  title: Add CanonicalPhase to workflow schema
+  size: M
+  risk: medium
+  agent_profile: backend
+  review_policy: standard
+  depends_on:
+  - F2-001
+  code_areas:
+  - api-types/workflow
+  - generated bindings
+  - workflow validation
+  deliverables:
+  - CanonicalPhase enum
+  - Optional state mapping
+  - Legacy fallback
+  acceptance:
+  - Legacy JSON loads and every current state resolves
+- id: F2-101
+  milestone: M1
+  title: Expose canonical phase in task APIs and filters
+  size: M
+  risk: medium
+  agent_profile: backend-api
+  review_policy: standard
+  depends_on:
+  - F2-100
+  code_areas:
+  - task response
+  - task query service
+  - generated bindings
+  deliverables:
+  - Task canonical_phase
+  - Phase query filter
+  acceptance:
+  - Derived phase cannot drift and paginated queries remain stable
+- id: F2-102
+  milestone: M1
+  title: Implement autonomous_v1 workflow preset
+  size: L
+  risk: high
+  agent_profile: workflow-backend
+  review_policy: independent-required
+  depends_on:
+  - F2-100
+  code_areas:
+  - workflow preset
+  - prompt builders
+  - integration tests
+  deliverables:
+  - Worker-only normal path
+  - No plan gate
+  - Hard validation before review
+  - Hidden merge states
+  acceptance:
+  - One worker reaches human review and strict workflow remains green
+- id: F2-103
+  milestone: M1
+  title: Register workflow presets and project preset metadata
+  size: M
+  risk: medium
+  agent_profile: backend-api
+  review_policy: standard
+  depends_on:
+  - F2-102
+  code_areas:
+  - workflow registry
+  - project settings
+  - create/update routes
+  deliverables:
+  - Autonomous/Strict/Custom preset IDs
+  - Project preset selection
+  acceptance:
+  - Preset projects create successfully and edited presets become custom
+- id: F2-104
+  milestone: M1
+  title: Add intent-oriented task action facade
+  size: L
+  risk: high
+  agent_profile: backend-service
+  review_policy: independent-required
+  depends_on:
+  - F2-102
+  code_areas:
+  - task action service
+  - API routes
+  deliverables:
+  - Start/pause/resume/submit/request-changes/approve actions
+  acceptance:
+  - Clients do not need state names and raw transitions remain compatible
+- id: F2-105
+  milestone: M1
+  title: Make same-worker follow-up the autonomous default
+  size: M
+  risk: medium
+  agent_profile: backend-execution
+  review_policy: standard
+  depends_on:
+  - F2-102
+  code_areas:
+  - execution/follow_up
+  - recovery context
+  deliverables:
+  - Resume worker after validation failure, review feedback, and merge repair
+  acceptance:
+  - Task/workspace persist and fallback to a new run is explicit
+- id: F2-200
+  milestone: M2
+  title: Build normalized attention derivation service
+  size: L
+  risk: high
+  agent_profile: backend-domain
+  review_policy: independent-required
+  depends_on:
+  - F2-101
+  code_areas:
+  - attention_service
+  - diagnostics
+  - review/execution/runtime queries
+  deliverables:
+  - Attention kinds
+  - Severity
+  - Recommended actions
+  acceptance:
+  - Deterministic table-driven results without duplicate mutable state
+- id: F2-201
+  milestone: M2
+  title: Add Home API
+  size: M
+  risk: medium
+  agent_profile: backend-api
+  review_policy: standard
+  depends_on:
+  - F2-200
+  code_areas:
+  - home service/route
+  - operator status reuse
+  deliverables:
+  - Needs attention
+  - Awaiting review
+  - Running
+  - Recent delivery/system summary
+  acceptance:
+  - Bounded response with user-facing task summaries
+- id: F2-202
+  milestone: M2
+  title: Add global Work API
+  size: L
+  risk: medium
+  agent_profile: backend-query
+  review_policy: standard
+  depends_on:
+  - F2-101
+  - F2-200
+  code_areas:
+  - task query service
+  - DB indexes
+  - API route
+  deliverables:
+  - Cross-project query
+  - Composable filters
+  - Cursor pagination
+  acceptance:
+  - No duplicate task records and query performs on large fixture
+- id: F2-203
+  milestone: M2
+  title: Implement Home page
+  size: L
+  risk: medium
+  agent_profile: frontend
+  review_policy: independent-recommended
+  depends_on:
+  - F2-201
+  code_areas:
+  - HomePage
+  - API hooks
+  - SSE invalidation
+  deliverables:
+  - Attention/review/running/delivery sections
+  - Responsive states
+  acceptance:
+  - No daemon IDs or workspace paths in normal view
+  - Playwright live updates
+- id: F2-204
+  milestone: M2
+  title: Implement global Work list and board
+  size: L
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-202
+  code_areas:
+  - WorkPage
+  - board/list primitives
+  - filters
+  deliverables:
+  - Built-in saved views
+  - Five-phase board
+  - List default
+  acceptance:
+  - List and board show identical task IDs under same filter
+- id: F2-205
+  milestone: M2
+  title: Restructure global and project navigation
+  size: M
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-203
+  - F2-204
+  code_areas:
+  - app-shell
+  - router
+  - locales
+  deliverables:
+  - Home/Work/Projects/Agents/Settings nav
+  - Advanced routes
+  acceptance:
+  - Responsive and accessible navigation; old URLs remain
+- id: F2-206
+  milestone: M2
+  title: Preserve Operator Diagnostics under advanced settings
+  size: S
+  risk: low
+  agent_profile: frontend-maintenance
+  review_policy: standard
+  depends_on:
+  - F2-203
+  - F2-205
+  code_areas:
+  - OperationsPage
+  - settings routes
+  deliverables:
+  - Operator diagnostics route with existing detail
+  acceptance:
+  - Operators retain execution/runtime/retry visibility
+- id: F2-300
+  milestone: M3
+  title: Simplify task creation
+  size: M
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-104
+  code_areas:
+  - task-create-dialog
+  - project default hooks
+  deliverables:
+  - Title-first basic form
+  - Advanced disclosure
+  - Create and start
+  acceptance:
+  - Title-only autonomous task starts without roles/runtime selection
+- id: F2-301
+  milestone: M3
+  title: Add current Run summary DTO
+  size: M
+  risk: low
+  agent_profile: backend-api
+  review_policy: standard
+  depends_on:
+  - F2-101
+  code_areas:
+  - execution summary
+  - task response
+  - bindings
+  deliverables:
+  - Current run status/activity/agent/time/cost summary
+  acceptance:
+  - UI no longer reconstructs current run from raw execution data
+- id: F2-302
+  milestone: M3
+  title: Restructure task detail around user questions
+  size: L
+  risk: high
+  agent_profile: frontend
+  review_policy: independent-required
+  depends_on:
+  - F2-301
+  - F2-200
+  code_areas:
+  - TaskDetailPage
+  - task detail panels
+  deliverables:
+  - Overview/Activity/Changes/Checks/Runs
+  - Attention banner
+  - Primary actions
+  acceptance:
+  - Objective, actor, progress, changes, and safety are immediately legible
+- id: F2-303
+  milestone: M3
+  title: Rename execution UI to Run and isolate diagnostics
+  size: M
+  risk: low
+  agent_profile: frontend-maintenance
+  review_policy: standard
+  depends_on:
+  - F2-003
+  - F2-302
+  code_areas:
+  - execution detail
+  - task run panels
+  - copy
+  deliverables:
+  - Run terminology
+  - Diagnostics subview
+  acceptance:
+  - Existing execution URLs work and raw detail remains accessible
+- id: F2-304
+  milestone: M3
+  title: Persist and generate versioned delivery reports
+  size: L
+  risk: high
+  agent_profile: backend-domain
+  review_policy: independent-required
+  depends_on:
+  - F2-102
+  - F2-105
+  code_areas:
+  - DB migration
+  - delivery service
+  - git/validation/review/PR integration
+  deliverables:
+  - Immutable report versions
+  - Scope/diff/commits/checks/reviews/outcome
+  acceptance:
+  - Every review submission has exact base/head and evidence
+- id: F2-305
+  milestone: M3
+  title: Build delivery report and Checks UI
+  size: L
+  risk: high
+  agent_profile: frontend
+  review_policy: independent-required
+  depends_on:
+  - F2-304
+  - F2-302
+  code_areas:
+  - delivery components
+  - Changes/Checks tabs
+  - review actions
+  deliverables:
+  - Evidence-centered review experience
+  acceptance:
+  - Reviewer can decide without raw logs and stale/incomplete evidence is clear
+- id: F2-306
+  milestone: M3
+  title: Add global review queue
+  size: M
+  risk: medium
+  agent_profile: fullstack
+  review_policy: standard
+  depends_on:
+  - F2-304
+  code_areas:
+  - review queue API
+  - Work saved view
+  - notifications
+  deliverables:
+  - Cross-project review list with risk and check summary
+  acceptance:
+  - Only current review-ready report versions appear and update live
+- id: F2-400
+  milestone: M4
+  title: Add task contract schema and persistence
+  size: L
+  risk: high
+  agent_profile: backend-api
+  review_policy: independent-required
+  depends_on:
+  - F2-001
+  code_areas:
+  - api-types
+  - DB migration
+  - task CRUD
+  deliverables:
+  - Objective/criteria/scope/risk/profile/budget/permissions/merge override
+  acceptance:
+  - Existing tasks default safely and active edits are audited
+- id: F2-401
+  milestone: M4
+  title: Build task contract editor
+  size: M
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-400
+  code_areas:
+  - task create advanced
+  - Overview tab
+  - contract components
+  deliverables:
+  - Criteria/scope/risk/validation/budget UI
+  acceptance:
+  - Basic users can ignore it; inherited values are visible
+- id: F2-402
+  milestone: M4
+  title: Add project autonomy policy and effective policy service
+  size: L
+  risk: high
+  agent_profile: backend-policy
+  review_policy: independent-required
+  depends_on:
+  - F2-002
+  - F2-400
+  code_areas:
+  - project settings
+  - policy service
+  - API
+  deliverables:
+  - Standard/Trusted/Strict/Custom
+  - Gate/merge/retry/transfer resolution
+  - Reasons
+  acceptance:
+  - Resolution is deterministic, explainable, and lowering risk is audited
+- id: F2-403
+  milestone: M4
+  title: Build project autonomy policy UI
+  size: M
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-402
+  code_areas:
+  - Project Settings
+  - policy forms
+  deliverables:
+  - Preset selection
+  - Consequence summary
+  - Advanced controls
+  acceptance:
+  - Dangerous changes require confirmation and task effective policy is visible
+- id: F2-404
+  milestone: M4
+  title: Add validation profile persistence and service facade
+  size: L
+  risk: high
+  agent_profile: backend-validation
+  review_policy: independent-required
+  depends_on:
+  - F2-400
+  code_areas:
+  - DB migration
+  - validation service
+  - profile API
+  deliverables:
+  - Named command/provider/scope/diff checks
+  - Immutable evidence
+  acceptance:
+  - Existing CI can be adapted and required checks cannot be redefined by agent
+- id: F2-405
+  milestone: M4
+  title: Build validation profile UI and repository suggestions
+  size: L
+  risk: medium
+  agent_profile: fullstack
+  review_policy: standard
+  depends_on:
+  - F2-404
+  code_areas:
+  - Settings Validation Profiles
+  - repository detection
+  - profile test UI
+  deliverables:
+  - Profile editor/test
+  - Suggested commands with confirmation
+  acceptance:
+  - No suggestion becomes mandatory silently
+- id: F2-406
+  milestone: M4
+  title: Enforce scope and validation on submission
+  size: L
+  risk: high
+  agent_profile: backend-security
+  review_policy: independent-required
+  depends_on:
+  - F2-400
+  - F2-404
+  - F2-304
+  code_areas:
+  - validation service
+  - submission action
+  - delivery report
+  - recovery
+  deliverables:
+  - Scope comparison
+  - Protected path elevation
+  - Required checks
+  - Exception path
+  acceptance:
+  - Out-of-scope work is not verified without authorized exception
+- id: F2-500
+  milestone: M5
+  title: Implement explainable risk inference rules
+  size: L
+  risk: high
+  agent_profile: backend-policy-security
+  review_policy: independent-required
+  depends_on:
+  - F2-402
+  - F2-406
+  code_areas:
+  - policy service
+  - risk rules
+  - tests
+  deliverables:
+  - Path/size/domain/test-removal signals
+  - Policy reasons
+  acceptance:
+  - Rules only elevate automatic minimum risk and matrix covers all levels
+- id: F2-501
+  milestone: M5
+  title: Add conditional independent review
+  size: L
+  risk: high
+  agent_profile: workflow-backend
+  review_policy: independent-required
+  depends_on:
+  - F2-500
+  - F2-304
+  code_areas:
+  - review dispatch
+  - read-only snapshot
+  - delivery report
+  deliverables:
+  - Risk/user-triggered reviewer
+  - Structured findings
+  acceptance:
+  - Low risk skips reviewer; high risk includes reviewer evidence
+- id: F2-502
+  milestone: M5
+  title: Implement risk-based human gate and low-risk auto-merge
+  size: L
+  risk: critical
+  agent_profile: senior-backend-security
+  review_policy: independent-mandatory
+  depends_on:
+  - F2-002
+  - F2-500
+  - F2-501
+  - F2-406
+  code_areas:
+  - policy/workflow/merge actions
+  - audit
+  deliverables:
+  - Standard manual gate
+  - Trusted eligible auto-merge
+  - Freshness checks
+  acceptance:
+  - No protected/high/critical or exception-bearing delivery auto-merges
+- id: F2-503
+  milestone: M5
+  title: Normalize structured agent questions
+  size: M
+  risk: medium
+  agent_profile: fullstack
+  review_policy: standard
+  depends_on:
+  - F2-200
+  - F2-105
+  code_areas:
+  - conversation/comment schema
+  - attention
+  - Activity UI
+  - notifications
+  deliverables:
+  - Question context/options/recommendation/impact
+  - Open/resolved flow
+  acceptance:
+  - Questions are attention, answers resume task, and decisions are audited
+- id: F2-504
+  milestone: M5
+  title: Add task transfer service
+  size: L
+  risk: high
+  agent_profile: backend-execution
+  review_policy: independent-required
+  depends_on:
+  - F2-105
+  - F2-400
+  - F2-304
+  code_areas:
+  - recovery/transfer
+  - routing compatibility
+  - action API
+  deliverables:
+  - Transfer package
+  - Continue-workspace strategy
+  - Execution lock
+  acceptance:
+  - Destination inherits context and only one mutating owner exists
+- id: F2-505
+  milestone: M5
+  title: Add adaptive recovery and escalation recommendations
+  size: M
+  risk: high
+  agent_profile: backend-recovery
+  review_policy: standard
+  depends_on:
+  - F2-504
+  - F2-500
+  code_areas:
+  - recovery service
+  - attention recommendations
+  - capability matching
+  deliverables:
+  - Continue/transfer/ask/split/exception/cancel recommendations
+  acceptance:
+  - Recommendations are explainable and risky actions are not silent
+- id: F2-600
+  milestone: M6
+  title: Redesign Agents page as team roster
+  size: L
+  risk: medium
+  agent_profile: frontend
+  review_policy: independent-recommended
+  depends_on:
+  - F2-301
+  - F2-202
+  code_areas:
+  - AgentsPage
+  - agent summary API
+  deliverables:
+  - Availability/current task/capabilities/model/concurrency/access
+  - Basic/advanced split
+  acceptance:
+  - Agent can be configured without daemon selection when auto routing exists
+- id: F2-601
+  milestone: M6
+  title: Move runtime management under Settings Compute
+  size: M
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-205
+  - F2-003
+  code_areas:
+  - navigation
+  - DaemonsPage
+  - Settings
+  deliverables:
+  - Runtime terminology
+  - Preserved deep links
+  acceptance:
+  - Runtime page leaves primary nav and existing technical controls remain
+- id: F2-602
+  milestone: M6
+  title: Add automatic runtime resolution and explanation
+  size: M
+  risk: high
+  agent_profile: backend-routing
+  review_policy: independent-required
+  depends_on:
+  - F2-600
+  code_areas:
+  - daemon router
+  - agent service
+  - task launch
+  deliverables:
+  - Candidate evaluation
+  - Automatic selection
+  - Unavailable explanation
+  acceptance:
+  - Normal launch needs no runtime input and security constraints are respected
+- id: F2-603
+  milestone: M6
+  title: Add explainable task agent recommendation
+  size: M
+  risk: medium
+  agent_profile: backend-routing
+  review_policy: standard
+  depends_on:
+  - F2-202
+  - F2-600
+  code_areas:
+  - agent capability/capacity
+  - task create/start API
+  - selector
+  deliverables:
+  - Automatic recommendation with reason
+  - Manual override
+  acceptance:
+  - Unauthorized/unavailable agents excluded and assignment is stable after start
+- id: F2-604
+  milestone: M6
+  title: Improve runtime and agent failure copy
+  size: S
+  risk: low
+  agent_profile: frontend-ux
+  review_policy: standard
+  depends_on:
+  - F2-602
+  code_areas:
+  - error mapping
+  - attention cards
+  - task/Home UI
+  deliverables:
+  - Affected-agent/task messages
+  - Expandable technical detail
+  - Remedies
+  acceptance:
+  - Primary errors are actionable and diagnostics retain exact data
+- id: F2-700
+  milestone: M7
+  title: Build project migration preview
+  size: L
+  risk: high
+  agent_profile: backend-migration
+  review_policy: independent-required
+  depends_on:
+  - F2-103
+  - F2-001
+  code_areas:
+  - workflow migration service
+  - API
+  - fixtures
+  deliverables:
+  - State mapping preview
+  - Active task/hook compatibility analysis
+  acceptance:
+  - Preview mutates nothing and detects unsafe cases
+- id: F2-701
+  milestone: M7
+  title: Implement atomic migration to autonomous_v1
+  size: L
+  risk: critical
+  agent_profile: senior-backend-migration
+  review_policy: independent-mandatory
+  depends_on:
+  - F2-700
+  code_areas:
+  - migration transaction
+  - audit
+  - integration tests
+  deliverables:
+  - Atomic workflow/task mapping
+  - Migration report
+  - Rollback
+  acceptance:
+  - History/workspaces/reviews remain and injected failure commits nothing
+- id: F2-702
+  milestone: M7
+  title: Add migration UI
+  size: M
+  risk: medium
+  agent_profile: frontend
+  review_policy: standard
+  depends_on:
+  - F2-700
+  - F2-701
+  code_areas:
+  - Project Settings Workflow
+  - preview/report UI
+  - E2E
+  deliverables:
+  - Mapping/blocker explanation
+  - Guarded force path
+  acceptance:
+  - User understands impact and completed migration updates live
+- id: F2-703
+  milestone: M7
+  title: Reposition README and getting started
+  size: M
+  risk: low
+  agent_profile: product-documentation
+  review_policy: standard
+  depends_on:
+  - F2-203
+  - F2-305
+  - F2-600
+  code_areas:
+  - README
+  - getting-started
+  - architecture docs
+  - screenshots
+  deliverables:
+  - Reliable delegation positioning
+  - Autonomous first-task tutorial
+  - Advanced strict docs
+  acceptance:
+  - Product is understandable without workflow/daemon knowledge
+- id: F2-704
+  milestone: M7
+  title: Add local product metrics
+  size: M
+  risk: medium
+  agent_profile: backend-analytics
+  review_policy: standard
+  depends_on:
+  - F2-304
+  - F2-402
+  code_areas:
+  - analytics service
+  - Analytics UI
+  - privacy docs
+  deliverables:
+  - Activation/attention/one-agent/retry/transfer/review/merge metrics
+  acceptance:
+  - No prompt/source export and metrics can be inspected/cleared
+- id: F2-705
+  milestone: M7
+  title: Make autonomous_v1 the new-project default
+  size: S
+  risk: high
+  agent_profile: release-platform
+  review_policy: independent-required
+  depends_on:
+  - F2-701
+  - F2-703
+  - F2-704
+  - F2-604
+  code_areas:
+  - server defaults
+  - release flags
+  - smoke tests
+  deliverables:
+  - Default switch
+  - Rollback configuration
+  - Release notes
+  acceptance:
+  - New projects autonomous Standard; existing projects unchanged
+- id: F2-706
+  milestone: M7
+  title: Audit and deprecate mandatory default-role assumptions
+  size: M
+  risk: medium
+  agent_profile: maintenance-test
+  review_policy: standard
+  depends_on:
+  - F2-705
+  code_areas:
+  - prompts
+  - role constants
+  - UI copy
+  - docs
+  - tests
+  deliverables:
+  - Worker-only compatibility
+  - Strict helpers retained
+  - Deprecation notes
+  acceptance:
+  - Autonomous project requires no planner/reviewer and strict project still passes
+recommended_first_batch:
+- F2-001
+- F2-100
+- F2-102
+- F2-101
+- F2-104
+- F2-002
+global_release_gates:
+- legacy strict and custom workflow tests pass
+- typed actor is deployed before automatic risk actions
+- delivery reports preserve exact evidence
+- project migration is atomic and rollback-tested
+- runtime and operator details remain accessible under advanced settings
+- autonomous new-project default is feature-flagged and reversible

@@ -31,6 +31,7 @@ import { TaskCommentsPanel } from '@/components/task-detail/task-comments-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { getApiErrorMessage } from '@/lib/api-error'
+import { productTerm } from '@/lib/i18n'
 import { outgoingWorkflowEdges, workflowTriggerTargets } from '@/lib/workflow-utils'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
 import { getHumanGateActions } from '@/lib/gate-actions'
@@ -149,7 +150,7 @@ export function TaskDetailPage({
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.agents })
-      toast.success('Execution stopped')
+      toast.success(`${productTerm('run')} stopped`)
     },
     onError: (error) => toast.error(getApiErrorMessage(error, 'Stop failed')),
   })
@@ -282,7 +283,7 @@ export function TaskDetailPage({
           (execution) => execution.status === 'running' && execution.role === gateRole,
         )
   const gateDecisionDisabledReason = runningGateExecution
-    ? `${gateRole} is still running. Wait for the execution to finish before approving or rejecting.`
+    ? `${gateRole} is still running. Wait for the ${productTerm('run').toLowerCase()} to finish before approving or rejecting.`
     : undefined
   const gateDecisionPending = approveGate.isPending || rejectGate.isPending
   const terminal =
@@ -545,13 +546,16 @@ export function TaskDetailPage({
                 {
                   onError: (error) =>
                     toast.error(
-                      getApiErrorMessage(error, 'Execution launched, but agent update failed'),
+                      getApiErrorMessage(
+                        error,
+                        `${productTerm('run')} launched, but agent update failed`,
+                      ),
                     ),
                 },
               )
             }
           }
-          toast.success('Execution launched')
+          toast.success(`${productTerm('run')} launched`)
           setLaunchDialogOpen(false)
           void navigate({
             to: '/tasks/$taskId/$tab',

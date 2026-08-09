@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use api_types::{GateConfig, StateDefinition, StateKind, WorkflowDefinition};
+use api_types::{Actor, GateConfig, StateDefinition, StateKind, WorkflowDefinition};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -27,7 +27,7 @@ pub struct HookContext {
     pub event_bus: Arc<events::EventBus>,
     pub gate_config: Option<GateConfig>,
     pub workflow: Arc<WorkflowDefinition>,
-    pub triggered_by: String,
+    pub triggered_by: Actor,
     pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
@@ -52,6 +52,7 @@ pub enum HookResult {
 }
 
 pub mod actions;
+pub mod default_autonomous_workflow;
 pub mod default_roles;
 pub mod default_states;
 pub mod default_workflow;
@@ -77,7 +78,7 @@ pub fn effective_role(state: &StateDefinition) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use api_types::{StateDefinition, StateHooks, StateKind};
+    use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind};
     use serde_json::json;
 
     use super::effective_role;
@@ -91,6 +92,14 @@ mod tests {
             role: role.map(str::to_owned),
             hooks: StateHooks::default(),
             cleanup: None,
+            canonical_phase: Some(match kind {
+                StateKind::Backlog => CanonicalPhase::Backlog,
+                StateKind::Initial => CanonicalPhase::Ready,
+                StateKind::Active => CanonicalPhase::Working,
+                StateKind::Gate => CanonicalPhase::Working,
+                StateKind::Terminal => CanonicalPhase::Done,
+                StateKind::Custom => CanonicalPhase::Working,
+            }),
             gate_config: None,
             dispatch: None,
             triggers: std::collections::BTreeMap::new(),

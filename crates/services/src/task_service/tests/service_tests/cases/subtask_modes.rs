@@ -16,7 +16,7 @@ async fn batch_5_4_subtask_management_allows_manual_child_transition() {
             TransitionOptions {
                 version: child.version,
                 reason: None,
-                triggered_by: "user:api".to_owned(),
+                triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),
                 rejection: false,
                 defer_dispatch_seconds: None,
             },

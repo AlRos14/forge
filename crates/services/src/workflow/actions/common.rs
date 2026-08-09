@@ -79,7 +79,7 @@ pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execu
     .ok()?;
     page.items
         .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder"))
+        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
 }
 
 pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {
@@ -126,7 +126,7 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
                 default_states::IN_PROGRESS,
                 current.version,
                 &workflow,
-                "system",
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
                 "root done propagation",
                 false,
             )
@@ -141,7 +141,7 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
             target_state,
             current.version,
             &workflow,
-            "system",
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "root subtask cascade",
             false,
         )

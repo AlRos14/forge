@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
+import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import type {
   TerminalAvailability,
@@ -68,9 +69,11 @@ function availabilityBlockMessage(availability: TerminalAvailability): string | 
   if (!availability.enabled) return 'Terminal access is disabled in server settings.'
   if (!availability.workspace_ready) return 'Task workspace not ready.'
   if (availability.active_execution) {
-    return 'A managed execution is running; terminal disabled until it finishes.'
+    return `A managed ${productTerm('run').toLowerCase()} is running; terminal disabled until it finishes.`
   }
-  if (!availability.daemon_reachable) return 'Workspace daemon unavailable.'
+  if (!availability.daemon_reachable) {
+    return `Workspace ${productTerm('runtime').toLowerCase()} unavailable.`
+  }
   return null
 }
 
