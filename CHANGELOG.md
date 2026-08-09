@@ -4,6 +4,26 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Breaking
+
+- Saving a workflow (workflow template save or project workflow update) now requires an explicit `canonical_phase` on every state; definitions without phases are rejected with a field-level error naming the offending state. Existing stored workflows continue to load and run unchanged — only re-saves must add phases.
+
+### Added
+
+- `CanonicalPhase` (`backlog`/`ready`/`working`/`review`/`done`) as the product-wide grouping language: optional `canonical_phase` on workflow states with ordered fallback derivation for legacy definitions, an additive `canonical_phase` field on task responses (derived at read time, never persisted), and a `canonical_phase` filter on project task lists that composes with existing filters (`phase=done` includes cancelled tasks).
+- `autonomous_v1` builtin workflow preset: one `worker` role owns plan → implement → self-test; no planning gate; Forge-run `ci_steps` validation gates review and a failure automatically resumes the same worker thread; review requires human approval with no auto-dispatched reviewer; merge states stay within the Review phase; worktrees are cleaned up on done/cancelled.
+- Intent-oriented task action endpoints: `POST /api/v1/tasks/{id}/{start|pause|resume|submit|request-changes|approve|cancel}` resolve the project workflow to the correct transition without clients hardcoding state names; unavailable actions return a structured 409 with `available_actions` and `reason`. The raw `/transition` endpoint is unchanged.
+- Typed transition actor (`Actor`: User/Agent/System) replaces string-prefix actor checks throughout the engine, services, API, and MCP server. Audit log strings are format-compatible.
+- Product terminology adapter in the web UI: user-facing copy now says Run (execution), Runtime (daemon), and Phase; routes and API names unchanged.
+- Legacy workflow/DB compatibility fixtures with schema-parity regression tests, seeding future migration tests.
+
+### Changed
+
+- Attribution fixes from the typed-actor refactor: human review approvals/rejections and MCP-initiated transitions are no longer audit-logged as `system`; claim hooks attribute the actual assignee. `AgentOnly` workflow hooks now match all system components, so the dependency gate applies to dispatcher-initiated launches. Human review rejections now record `rejection: true` and count toward the review retry budget. Display values: `system:daemon` → `system:executor` (execution `stopped_by`), `system` → `system:workflow` (recovery `blocked_by`).
+- The task list `status` filter accepts custom-workflow state names instead of only built-in statuses.
+
 ## [0.6.1] - 2026-08-08
 
 ### Changed
