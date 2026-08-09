@@ -4,6 +4,12 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Fixed
+
+- `forge-ctl login` now hides interactively entered passwords, restores terminal settings after success, failure, cancellation, or EOF, and directs non-interactive callers to `--password-stdin` instead of consuming piped input implicitly.
+
 ## [0.7.0] - 2026-08-08
 
 ### Breaking

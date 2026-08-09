@@ -38,6 +38,10 @@ token and stores it under the Forge data directory. Later commands, including
 `forge-ctl mcp install`, reuse that stored token automatically for the same
 server URL.
 
+When run in a terminal, `forge-ctl login` prompts for the password without
+displaying it. For scripts or piped input, pass `--password-stdin`; an implicit
+password prompt fails with guidance when standard input is not a terminal.
+
 ```bash
 printf '%s\n' "$FORGE_PASSWORD" | forge-ctl login \
   --email you@example.com \

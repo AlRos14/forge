@@ -11,6 +11,7 @@ pub mod daemon_runtime;
 pub mod mcp;
 pub mod memory;
 pub mod output;
+mod password_prompt;
 pub mod project;
 pub mod repo;
 pub mod run;

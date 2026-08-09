@@ -9,7 +9,7 @@ use api_types::{AuthResponse, CreateTokenRequest, LoginRequest, TokenResponse};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
-use crate::{client::ForgeClient, output::print_json, OutputFormat};
+use crate::{client::ForgeClient, output::print_json, password_prompt, OutputFormat};
 
 const CREDENTIALS_FILE: &str = "forge_ctl_credentials.json";
 const DEFAULT_TOKEN_NAME: &str = "forge-ctl";
@@ -126,31 +126,53 @@ impl LoginArgs {
     }
 
     fn resolve_password(&self) -> Result<String> {
-        if let Some(password) = self
-            .password
-            .as_deref()
-            .map(str::to_owned)
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(password);
-        }
-
-        if self.password_stdin {
-            let mut password = String::new();
-            io::stdin()
-                .read_to_string(&mut password)
-                .context("read password from stdin")?;
-            return Ok(password.trim_end_matches(['\r', '\n']).to_owned());
-        }
-
-        eprint!("Password: ");
-        io::stderr().flush().ok();
-        let mut password = String::new();
-        io::stdin()
-            .read_line(&mut password)
-            .context("read password from stdin")?;
-        Ok(password.trim_end_matches(['\r', '\n']).to_owned())
+        resolve_password_with_sources(
+            self.password.as_deref(),
+            self.password_stdin,
+            password_prompt::stdin_is_terminal,
+            || {
+                let mut password = String::new();
+                io::stdin()
+                    .read_to_string(&mut password)
+                    .context("read password from stdin")?;
+                Ok(trim_stdin_password(password))
+            },
+            password_prompt::prompt_password,
+        )
     }
+}
+
+fn resolve_password_with_sources<IsTerminal, ReadStdin, Prompt>(
+    explicit_password: Option<&str>,
+    password_stdin: bool,
+    is_terminal: IsTerminal,
+    read_stdin: ReadStdin,
+    prompt: Prompt,
+) -> Result<String>
+where
+    IsTerminal: FnOnce() -> bool,
+    ReadStdin: FnOnce() -> Result<String>,
+    Prompt: FnOnce() -> Result<String>,
+{
+    if let Some(password) = explicit_password.filter(|value| !value.is_empty()) {
+        return Ok(password.to_owned());
+    }
+
+    if password_stdin {
+        return read_stdin();
+    }
+
+    if !is_terminal() {
+        return Err(anyhow!(
+            "cannot prompt for a password because stdin is not a terminal; use --password-stdin"
+        ));
+    }
+
+    prompt()
+}
+
+fn trim_stdin_password(password: String) -> String {
+    password.trim_end_matches(['\r', '\n']).to_owned()
 }
 
 impl LogoutArgs {
@@ -328,7 +350,89 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn password_resolution_prefers_explicit_value_without_touching_stdin() {
+        let password = resolve_password_with_sources(
+            Some("explicit-value"),
+            false,
+            || panic!("terminal state must not be inspected"),
+            || panic!("stdin must not be read"),
+            || panic!("interactive prompt must not run"),
+        )
+        .expect("explicit password resolves");
+
+        assert_eq!(password, "explicit-value");
+    }
+
+    #[test]
+    fn password_stdin_remains_available_without_a_terminal() {
+        let password = resolve_password_with_sources(
+            None,
+            true,
+            || panic!("terminal state must not be inspected"),
+            || Ok(trim_stdin_password("stdin-value\r\n".to_owned())),
+            || panic!("interactive prompt must not run"),
+        )
+        .expect("stdin password resolves");
+
+        assert_eq!(password, "stdin-value");
+    }
+
+    #[test]
+    fn implicit_non_terminal_input_fails_before_reading_or_prompting() {
+        let read_called = Cell::new(false);
+        let prompt_called = Cell::new(false);
+
+        let error = resolve_password_with_sources(
+            None,
+            false,
+            || false,
+            || {
+                read_called.set(true);
+                Ok("must-not-be-read".to_owned())
+            },
+            || {
+                prompt_called.set(true);
+                Ok("must-not-be-prompted".to_owned())
+            },
+        )
+        .expect_err("implicit non-terminal input must fail");
+
+        assert!(error.to_string().contains("--password-stdin"));
+        assert!(!read_called.get());
+        assert!(!prompt_called.get());
+    }
+
+    #[test]
+    fn implicit_terminal_input_uses_hidden_prompt() {
+        let password = resolve_password_with_sources(
+            None,
+            false,
+            || true,
+            || panic!("stdin reader must not run"),
+            || Ok("prompt-value".to_owned()),
+        )
+        .expect("interactive password resolves");
+
+        assert_eq!(password, "prompt-value");
+    }
+
+    #[test]
+    fn hidden_prompt_errors_propagate_without_reading_stdin() {
+        let error = resolve_password_with_sources(
+            None,
+            false,
+            || true,
+            || panic!("stdin reader must not run"),
+            || Err(anyhow!("password input cancelled")),
+        )
+        .expect_err("prompt error propagates");
+
+        assert_eq!(error.to_string(), "password input cancelled");
+    }
 
     #[test]
     fn stored_token_matches_normalized_server_url() {
