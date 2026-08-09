@@ -151,6 +151,12 @@ profiles with their provider/model pairings under `cli_specific.profiles`
 and configured provider names under `cli_specific.providers`. Hosts without
 a Smith config discover empty lists.
 
+A Smith agent's `reasoning_effort` is forwarded as `--effort`; Smith validates
+it against the selected provider/model effort ladder and refuses an
+unsupported value. Agents that set no `reasoning_effort` emit no flag, leaving
+effort to the named Smith profile, `SMITH_REASONING_EFFORT`, or the model
+default. A `--effort` flag requires a Smith build that accepts it.
+
 ## Task transitions
 
 `POST /api/v1/tasks/{id}/transition` accepts `status`, `version`, optional

@@ -18,6 +18,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Typed transition actor (`Actor`: User/Agent/System) replaces string-prefix actor checks throughout the engine, services, API, and MCP server. Audit log strings are format-compatible.
 - Product terminology adapter in the web UI: user-facing copy now says Run (execution), Runtime (daemon), and Phase; routes and API names unchanged.
 - Legacy workflow/DB compatibility fixtures with schema-parity regression tests, seeding future migration tests.
+- Smith agents forward `reasoning_effort` to the CLI as `--effort`. `SmithConfig` gains an `effort` field, populated from the agent record like `model` already is; when the agent sets no `reasoning_effort`, no flag is emitted and behavior is unchanged. Requires a Smith build that accepts `--effort` — older Smith releases select effort only through a named profile or `SMITH_REASONING_EFFORT`.
 
 ### Changed
 
