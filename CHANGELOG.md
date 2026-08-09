@@ -4,6 +4,12 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [0.7.3] - 2026-08-09
+
+### Fixed
+
+- Reviewer and auditor executions now restore the task worktree to its exact pre-review commit and remove untracked review artifacts on both embedded and remote runtimes, preventing accidental reviewer edits or auto-commits from entering the task diff.
+
 ## [0.7.2] - 2026-08-09
 
 ### Fixed
