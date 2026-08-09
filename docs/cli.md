@@ -66,7 +66,8 @@ pipelines.
 ```bash
 forge-ctl project create --name "My Project"
 forge-ctl repo create --project-id <ID> --name "main-repo" \
-                      --url /abs/path/to/repo --default-branch main
+                      --kind local --local-path /abs/path/to/repo \
+                      --default-branch main
 
 forge-ctl agent register --name "Claude" --executor-type shell
 
