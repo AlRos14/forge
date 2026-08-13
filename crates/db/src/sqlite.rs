@@ -1,26 +1,44 @@
 use crate::{
-    Agent, AgentListQuery, AgentRepo, AgentStatus, AgentTaskListQuery, CiStepStats, ClaimTask,
-    ClaimedTask, Conversation, ConversationListQuery, ConversationMessage,
-    ConversationMessageListQuery, ConversationMessageRepo, ConversationRepo, CreateAgent,
-    CreateConversation, CreateConversationMessage, CreateExecution, CreateNotification,
-    CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAgentLink,
-    CreateProjectHookRun, CreateProjectIntegration, CreateRepo, CreateReview, CreateRuntime,
-    CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia,
-    CreateTerminalSession, CreateWorkspace, Daemon, DaemonRepo, DbError, Execution, ExecutionRepo,
-    ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo,
-    ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page, PageRequest,
-    PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentLink,
-    ProjectAgentLinkRepo, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
-    ProjectHookRunStatus, ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
-    Repo, RepoRepo, Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery,
-    RuntimeRepo, Skill, SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo,
-    TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo,
-    TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
-    UpdateConversation, UpdateConversationMessage, UpdateDaemonReport, UpdateExecution,
+    new_uuid_v4, AccountMainAgentBinding, AccountMainAgentBindingRepo, AdmitAgentChatTurn,
+    AdmitAgentHandoff, AdmittedAgentChatTurn, AdmittedAgentHandoff, Agent, AgentAction,
+    AgentActionApproval, AgentActionExecution, AgentActionListQuery, AgentActionRepo, AgentChat,
+    AgentChatInstructionRevision, AgentChatMessage, AgentChatMessageListQuery,
+    AgentChatMessageRepo, AgentChatRepo, AgentChatSourceRef, AgentChatTransactionRepo,
+    AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentCommitment,
+    AgentCommitmentEvidence, AgentCommitmentLifecycle, AgentCommitmentListQuery,
+    AgentCommitmentRepo, AgentCommitmentStatus, AgentCommitmentTransfer, AgentHandoff,
+    AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery, AgentInboxRepo, AgentListQuery,
+    AgentProfile, AgentProfileRepo, AgentQuestion, AgentQuestionListQuery, AgentRepo, AgentStatus,
+    AgentTaskListQuery, AnswerAgentQuestion, AttentionConsumerHealth, AttentionListQuery,
+    AttentionProjection, AttentionRepo, CancelAgentChatTurn, CiStepStats, ClaimDomainEvents,
+    ClaimTask, ClaimedTask, CompleteAgentChatTurn, CompleteAgentCommitment, CompleteDomainEvent,
+    CompletedAgentChatTurn, CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction,
+    CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage,
+    CreateAgentChatTurnJob, CreateAgentCommitment, CreateAgentCommitmentEvidence,
+    CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem, CreateAgentProfile,
+    CreateAgentQuestion, CreateAttentionProjection, CreateDomainEvent, CreateExecution,
+    CreateNotification, CreatePrMetadata, CreatePrProviderConfig, CreateProject,
+    CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration, CreateRepo,
+    CreateReview, CreateRuntime, CreateSkill, CreateTask, CreateTaskComment,
+    CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession, CreateWorkspace, Daemon,
+    DaemonRepo, DbError, DomainEvent, DomainEventRepo, EventConsumerCursor, Execution,
+    ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
+    FailAgentChatTurn, IntegrationRepo, ModelTokenBreakdown, Notification, NotificationListQuery,
+    NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
+    PrProviderConfigRepo, Project, ProjectAgentBinding, ProjectAgentBindingRepo,
+    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
+    ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
+    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo, Result, Review,
+    ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, SelectAgentProfile, Skill,
+    SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo,
+    TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary,
+    TerminalSession, TerminalSessionRepo, TerminalSessionStatus, TransferAgentCommitment,
+    UpdateAgent, UpdateAgentAction, UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment,
+    UpdateAgentInboxItem, UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution,
     UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
     UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
-    UpdateTerminalSessionStatus, UpsertDaemon, UpsertExecutionUsage, Workspace, WorkspaceRepo,
-    WorkspaceStatus,
+    UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth, UpsertDaemon, UpsertExecutionUsage,
+    Workspace, WorkspaceRepo, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -28,14 +46,21 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 
+mod action;
 mod agent;
+mod agent_chat;
 mod analytics;
-mod conversations;
+mod attention;
+mod commitment;
 mod daemon;
+mod domain_event;
+mod embedded_agent;
 mod execution;
 mod execution_usage;
 mod external_link;
+mod inbox;
 mod integration;
+mod lcm;
 mod memory;
 mod notification;
 mod oauth_authorization_code;
@@ -45,7 +70,6 @@ mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;
 mod project;
-mod project_agent_link;
 mod project_hook_run;
 mod project_member;
 mod repo;
@@ -121,9 +145,7 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
         (SortBy::Priority, SortOrder::Asc) => "created_at ASC, id ASC",
         (SortBy::Priority, SortOrder::Desc) => "created_at DESC, id DESC",
         (SortBy::BoardPosition, SortOrder::Asc) => "board_position ASC, created_at ASC, id ASC",
-        (SortBy::BoardPosition, SortOrder::Desc) => {
-            "board_position DESC, created_at DESC, id DESC"
-        }
+        (SortBy::BoardPosition, SortOrder::Desc) => "board_position DESC, created_at DESC, id DESC",
         (SortBy::Title, SortOrder::Asc) => "title ASC, id ASC",
         (SortBy::Title, SortOrder::Desc) => "title DESC, id DESC",
         (SortBy::Status, SortOrder::Asc) => "status ASC, id ASC",
@@ -254,13 +276,18 @@ fn map_agent(row: SqliteRow) -> Result<Agent> {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         description: row.try_get("description")?,
+        profile_id: row.try_get("profile_id")?,
+        backend_kind: row.try_get("backend_kind")?,
         executor_type: row.try_get("executor_type")?,
+        provider: row.try_get("provider")?,
         model: row.try_get("model")?,
         reasoning_effort: row.try_get("reasoning_effort")?,
         permission_policy: row.try_get("permission_policy")?,
         prompt_template: row.try_get("prompt_template")?,
         capabilities_json: row.try_get("capabilities_json")?,
+        tool_policy_json: row.try_get("tool_policy_json")?,
         config_json: row.try_get("config_json")?,
+        credential_ref: row.try_get("credential_ref")?,
         daemon_id: row.try_get("daemon_id")?,
         max_concurrent_tasks: row.try_get("max_concurrent_tasks")?,
         heartbeat_interval_seconds: row.try_get("heartbeat_interval_seconds")?,
@@ -271,6 +298,28 @@ fn map_agent(row: SqliteRow) -> Result<Agent> {
         paused: row.try_get::<i64, _>("paused")? != 0,
         owner_id: row.try_get("owner_id")?,
         visibility: row.try_get::<String, _>("visibility")?,
+        version: row.try_get("version")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_agent_profile(row: SqliteRow) -> Result<AgentProfile> {
+    Ok(AgentProfile {
+        id: row.try_get("id")?,
+        identity_id: row.try_get("identity_id")?,
+        backend_kind: row.try_get("backend_kind")?,
+        executor_type: row.try_get("executor_type")?,
+        provider: row.try_get("provider")?,
+        model: row.try_get("model")?,
+        reasoning_effort: row.try_get("reasoning_effort")?,
+        permission_policy: row.try_get("permission_policy")?,
+        prompt_template: row.try_get("prompt_template")?,
+        capabilities_json: row.try_get("capabilities_json")?,
+        tool_policy_json: row.try_get("tool_policy_json")?,
+        config_json: row.try_get("config_json")?,
+        credential_ref: row.try_get("credential_ref")?,
+        daemon_id: row.try_get("daemon_id")?,
         version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -333,40 +382,6 @@ fn map_skill(row: SqliteRow) -> Result<Skill> {
         project_id: row.try_get("project_id")?,
         name: row.try_get("name")?,
         content: row.try_get("content")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn map_conversation(row: SqliteRow) -> Result<Conversation> {
-    Ok(Conversation {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        agent_id: row.try_get("agent_id")?,
-        title: row.try_get("title")?,
-        status: parse_enum(row.try_get::<String, _>("status")?)?,
-        system_prompt: row.try_get("system_prompt")?,
-        message_count: row.try_get("message_count")?,
-        last_message_at: row.try_get("last_message_at")?,
-        agent_session_id: row.try_get("agent_session_id")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn map_conversation_message(row: SqliteRow) -> Result<ConversationMessage> {
-    Ok(ConversationMessage {
-        id: row.try_get("id")?,
-        conversation_id: row.try_get("conversation_id")?,
-        role: parse_enum(row.try_get::<String, _>("role")?)?,
-        content: row.try_get("content")?,
-        status: parse_enum(row.try_get::<String, _>("status")?)?,
-        model: row.try_get("model")?,
-        token_usage_json: row.try_get("token_usage_json")?,
-        duration_ms: row.try_get("duration_ms")?,
-        error: row.try_get("error")?,
-        sequence: row.try_get("sequence")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

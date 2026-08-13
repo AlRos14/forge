@@ -1,9 +1,14 @@
 # Architecture
 
-Forge is a Rust workspace (12 crates) plus a React/TypeScript frontend. This
-doc explains the crate layout, the task state machine, the database, and the
-event bus. For runtime configuration see [getting-started.md](getting-started.md);
+Forge is a Rust workspace plus a React/TypeScript frontend. This doc explains
+the crate layout, the agent/scope model, the task state machine, the database,
+and durable events. For runtime configuration see [getting-started.md](getting-started.md);
 for the HTTP surface see [api.md](api.md).
+
+The product model is one global Main Agent and exactly one Project Agent for
+each operational Project, each with one durable Agent Chat. Forward-only
+`V071+` migrations preserve historical collaboration data while the public
+runtime uses the singular binding, chat, and handoff model described below.
 
 ## Crate layout
 
@@ -14,6 +19,7 @@ crates/
 ├── forge-daemon/  # Local daemon detection and reporting
 ├── api/           # Axum REST endpoints, SSE, middleware
 ├── api-types/     # Shared request/response types (zero internal deps)
+├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
 ├── db/            # SQLite schema, migrations, repository implementations
 ├── services/      # Business logic (task state machine, workflow engine)
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
@@ -31,6 +37,7 @@ crates/
 ```
 forge-cli → api → services → db
                 → events      ↑
+                → agent-host → agent-runtime
           → mcp-server -------┘
           → executors (log schema, shell executor)
           → workspace → git
@@ -55,9 +62,111 @@ The `db` crate defines async traits (`TaskRepo`, `AgentRepo`, …) in
 
 ### AppState wiring
 
-`forge-cli/main.rs` creates `Arc<SqliteDb>` and `Arc<EventBus>`, passes them to
-`AppState::new()` which constructs `TaskService` and `AgentService` internally.
-`AppState` is `Clone` (all fields are `Arc`) and used as Axum state.
+`forge-cli/main.rs` passes
+`Arc<SqliteDb>`, `Arc<EventBus>`, the Forge agent host/backends, and background
+workers to `AppState`. The revised `AppState` constructs the Task,
+identity/profile, Main/Project Agent Chat, embedded-session, memory,
+commitment, and Attention-facing services. `AppState` is `Clone` (shared fields
+are `Arc`) and used as Axum state.
+
+### Identity, profiles, and explicit authority
+
+`agent_identity` is the stable account-owned product identity. A connected
+identity may remain unbound, serve as the account's Main Agent, or serve as a
+Project Agent through explicit bindings. Runtime and model configuration lives
+in immutable `agent_profile` revisions; selecting a profile updates only the
+identity's versioned pointer. CLI profiles preserve the existing executor path,
+while native profiles select the Forge-hosted Agent Runtime backend. Credentials
+are write-only protected values referenced by opaque handles, never profile
+fields.
+
+`MainAgentBinding` is the account's single active global assistant binding.
+`ProjectAgentBinding` is the single active manager binding for each operational
+Project. Binding cardinality is unconditional: a Task Worker or reviewer
+assignment cannot satisfy a Project Agent binding, and there is no
+role/`is_primary` combination to resolve. Connection health never grants
+Project, Task, or filesystem access; an identity appears in the chat switcher
+only when it is explicitly bound as Main or Project Agent.
+
+Every persistent agent session binds to one canonical scope:
+
+| Scope | Authority source | Filesystem |
+| --- | --- | --- |
+| Main Agent Chat | active Main Agent binding and account policy | denied |
+| Project Agent Chat | active Project Agent binding and Project policy | denied |
+| Task | admitted assignment, workflow role, and Task Workspace | role-bounded Task Workspace only |
+
+Effective permissions are a fail-closed intersection of the account, selected
+profile, canonical scope, tool, approval, and applicable binding or
+Task-assignment layers. Opaque record IDs are references, not capabilities.
+
+### Main and Project Agent Chats
+
+An account has one global Main Agent Chat (visible in setup state even before a
+binding is selected), and each operational Project has one Project Agent Chat.
+Chat ownership is account/Project-scoped rather than tied
+to a replaceable identity, so binding replacement preserves message, handoff,
+memory, and session provenance. Connected but unbound identities do not create
+additional chats. There are no participants, addressing rules, responder
+policies, arbitrary threads, or bounded multi-agent rounds.
+
+Creating an operational Project creates its Project Agent binding and Project
+Agent Chat atomically. A migrated Project with no single safe binding is
+explicitly `agent_setup_required` and keeps its Project/Task data readable, but
+cannot admit Project Agent turns until the user resolves the identity.
+
+User-message or handoff admission atomically appends the guarded immutable
+message, its durable domain event, and one queued turn job. A turn exposes the
+finite states `queued`, `leased`, `retry_wait`, `succeeded`, `failed`, or
+`cancelled`. Database-backed leases, optimistic versions, finite retry budgets,
+and idempotency keys prevent duplicate turns and silent success after a failed
+response commit. Authorized non-terminal turns may be cancelled with their
+current optimistic version and an idempotency key; stale or terminal
+cancellation attempts are rejected. Progressive output is transient; success or failure appends
+one immutable canonical assistant outcome with provenance, usage, duration,
+correlation, and causation metadata.
+
+The chat worker selects the session backend from the bound identity's profile.
+A native profile uses the embedded host and an Agent Chat-scoped continuity
+timeline; a safely migrated CLI profile may use an explicit constrained chat
+backend and must advertise its actual limitations. Main and Project chats have
+deny-all filesystem access. Project Agent Task actions go through the existing
+`TaskService` and workflow; repository mutation remains limited to admitted
+Task Worker/reviewer executions in their Task Workspaces.
+
+Main Agent tools cover discovery, configured web search, Project lifecycle,
+bounded portfolio summaries, and explicit handoff. Main Agent sessions cannot
+create, edit, assign, transition, review, merge, or deliver Tasks. A Project
+Agent may manage Tasks only in its bound Project. A handoff is an immutable,
+bounded, provenance-linked publication from the Main Chat to the target Project
+Chat and schedules at most one target turn; it never copies credentials,
+private memory, hidden global history, or Main Agent authority.
+
+### Direct Agent Runtime host and LCM
+
+`forge-agent-host` composes Agent Runtime directly at immutable revision
+`a7075b1d2dd1cee05db63bc480ff46b0f97ec239`. It owns provider construction,
+protected credential/checkpoint/session stores, interaction handling, runtime
+events, content guards, usage mapping, cancellation/steering capabilities,
+typed tools, and scope-derived workspaces. Forge does not depend on the sibling
+TUI and does not add a Smith-native backend; Smith remains an existing CLI Task
+executor/profile.
+
+Lossless Context Memory continuity is keyed by `(identity_id, scope_type,
+scope_id)`, never by a replaceable runtime session. Main/Project Agent Chats
+use their own canonical timelines and native Task work uses a Task timeline.
+SQLite implements the Agent
+Runtime LCM reader/writer contracts with host-minted view authority on every
+operation, immutable admitted entries, transactional DAG compare-and-swap,
+operation fingerprints, and restart recovery. Session rotation follows the
+same authorized timeline; histories from different canonical scopes cannot be
+opened or merged by possessing a timeline/node ID.
+
+Forge selects and authorizes domain context; Agent Runtime alone budgets and
+serializes final model context. `context_manifest` records the offered source
+IDs/revisions and selection reasons, links the runtime run-manifest fingerprint,
+and records included/summarized/omitted dispositions without duplicating token
+planning. Protected bodies never enter either manifest.
 
 ### HTTP shell and web assets
 
@@ -67,27 +176,67 @@ eligible responses are Brotli/gzip compressed; HTML navigation responses remain
 uncached so deployments pick up the current asset graph. The production client
 keeps route screens and editor-backed dialogs behind dynamic import boundaries.
 
-### Event bus
+### Durable events and the in-process event bus
 
-The `events` crate wraps `tokio::sync::broadcast`. Services publish
-`ForgeEvent` on state changes; the SSE endpoint at `/api/v1/events` subscribes
-and streams them to web clients and other listeners.
+Agent-critical mutations commit a monotonic `domain_event` row in the same
+SQLite transaction as their authoritative state. Events carry canonical scope,
+actor, correlation/causation, bounded reaction depth, and dedupe identity.
+Consumers claim durable cursors/leases and checkpoint only after idempotent
+projection, so lag and restart replay cannot duplicate chat turn jobs,
+Attention rows, actions, memory indexing, or commitment reconciliation.
+The `agent-coordination-outcomes` consumer is started by `forge-cli`; it turns
+terminal Task transition events into one task-outcome inbox item and, for a
+scope-validated originating commitment, one delivery evidence/lifecycle
+projection.  Its event-derived dedupe keys make a crash between projection
+and receipt checkpoint safe to replay.
 
-### Memory Layer
+The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
+`/api/v1/events` still drives live clients. For durable events it is a
+post-commit delivery/cache-invalidation projection, not authoritative history
+and never sufficient by itself to wake an agent.
 
-The memory layer is a read-only retrieval index over execution summaries,
-reviews, comments, failure-bearing transition logs, and conversations. It
-stores attributed memory items separately from the source records, with every
-result carrying the memory id, source type, source id, project id, optional task
-id, creation time, and creator attribution.
+### Scoped semantic memory and context provenance
 
-Retrieval is layered: callers request a `layer` value in the `0-255` contract
-space, and the first tranche implements layers `1`, `2`, and `3` with
-`token_budget` mapping for cheap-first disclosure. REST and MCP both call
-`MemoryService` for search/get behavior. MCP responses add an explicit
-injection guardrail that frames retrieved bodies as background context, not
-agent instructions or directives. Raw execution JSONL log payloads are not
-indexed or returned by the memory layer.
+The append-only memory layer continues to index execution summaries, reviews,
+comments, failure-bearing transitions, and finalized Agent Chat messages. Every row
+now carries canonical scope, visibility, owner identity, authority, provenance,
+publication/supersession links, validity, and source event. Publication creates
+a new wider-visible record; retraction, dispute, expiry, and supersession are
+append-only lifecycle assertions rather than body edits.
+
+Search and get apply authorization inside the SQL candidate query before FTS
+matching, snippets, counts, cursor construction, or ranking. Inaccessible rows
+therefore cannot be inferred from response differences. MCP responses retain
+the context-not-instructions guardrail; repository/memory text cannot grant
+tools, permissions, approvals, or a broader scope.
+
+`ForgeMemorySource` is constructed with immutable identity and canonical-scope
+bindings and returns already-authorized, ranked, bounded Agent Runtime memory
+records. It suppresses raw chat-derived memories already represented in the
+active LCM/recent history. LCM summaries remain derived episodic continuity,
+not verified semantic facts.
+
+### Commitments, Attention, and Mission Control
+
+Inbox items, commitments, and typed action/proposal envelopes are durable
+coordination records. Commitment completion requires authorized evidence;
+profile or session replacement does not erase an obligation. Mutating agent
+actions carry scope, payload hash, dedupe, correlation/causation, requested
+permission, and an `allowed`, `approval_required`, or `denied` policy result.
+Protected actions cannot be self-approved. Task proposals enter the existing
+Task service/workflow and do not become authoritative work before persistence.
+
+Attention is a deterministic, rebuildable projection of human input,
+validation/review state, stalls, health, budget thresholds, and overdue
+commitments. Any model wake occurs only after deterministic admission with
+budget, cooldown, batching, dedupe, incident lease, self-event suppression,
+and reaction-depth limits.
+
+Mission Control and Agent detail are bounded read models over authoritative
+Task/identity/session/commitment/event state. They show needs-attention,
+review-ready and active work, embedded-agent health/current scope/focus,
+commitments, recent outcomes, and capacity; they do not introduce a second
+mutable Task or Agent truth.
 
 ### Daemon command transport
 
@@ -336,9 +485,18 @@ path; `on_exit` and cancellation-state `on_enter` hooks still run.
 
 Roles are declared by workflow (`roles[]`) and states can require a role
 (`state.role`). Per-task assignments live in `task_role_assignment` keyed by
-`(task_id, role_name)` with either `agent_id` or `user_handle`. Claiming
-auto-assigns the claimed state's role to the claiming agent when no assignment
-exists; a conflicting pre-assignment returns HTTP 409.
+`(task_id, role_name)` with either a stable agent identity or user. Claiming
+auto-assigns the claimed state's role to the claiming identity when no
+assignment exists; a conflicting pre-assignment returns HTTP 409. Replacing or
+selecting a new profile therefore does not rewrite Task ownership/history.
+
+CLI profiles continue through the existing executor/daemon path. A compatible
+native profile enters work through the same claim, assignment, workflow,
+Workspace, validation, review, and delivery services; it does not get an
+alternate repository-mutation route. Only the admitted Task session derives
+the role-bounded Workspace/tools and Task LCM timeline. Other simultaneous
+sessions for that identity retain their own denied Main/Project Agent Chat
+workspaces.
 
 `assignee` is an engine-reserved role name. Active states without explicit
 `state.role` implicitly bind `assignee`. This fallback applies only to Active
@@ -447,9 +605,31 @@ app-generated UUID v4; all timestamps are app-generated RFC3339.
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=5000` per connection.
 
-Tables: `project`, `repo`, `agent`, `skill`, `task`, `execution`, `review`,
-`task_role_assignment`, `transition_log`, `task_terminal_session`,
-`_migration`.
+The revised schema adds `account_main_agent_binding`,
+`project_agent_binding`, `agent_chat`, immutable `agent_chat_message`, bounded
+`agent_chat_turn_job`, and immutable `agent_handoff` records to the existing
+identity/profile, session, LCM, memory, commitment, event, Attention, Task,
+execution, review, and terminal tables. It enforces one active Main binding per
+account, one active Project binding per operational Project, one global chat per
+account, and one Project chat per Project. Historical collaboration tables are
+migration inputs rather than public product concepts.
+
+Migrations V059–V070 remain immutable history. V071 or later performs the
+forward-only correction: it creates the singular binding/chat records and
+migrates legacy Conversation and pre-release collaboration messages,
+metadata, instruction provenance, sessions, LCM/memory references, protected
+content audit links, and turn jobs without changing message IDs or bodies.
+When multiple source threads map to one chat, ordering is deterministic by
+original timestamp, source ID, and source sequence, with source provenance
+preserved. A binding is inferred only from one safe eligible responder;
+ambiguous or invalid cases become explicit `agent_setup_required` state, and a
+primary Worker is never promoted. Expired or ambiguous leases become finite
+retry/terminal states rather than remaining silently leased. Historical
+migration files are never edited. V075 quarantines the retired Room and
+Project-agent-membership tables under `legacy_*`, remaps Room-scoped semantic
+memory to the owning Agent Chat, and adds database guards that reject new Room
+context, LCM, memory-binding, or manifest authority. Historical source IDs and
+sequences remain available only as provenance.
 
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.
@@ -466,17 +646,23 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
 - **db** — Enum serialization uses `Display`/`FromStr` (in `models.rs`) for
   SQLite TEXT columns. Row mapping is manual via `sqlx::Row::get()`, not
   compile-time checked macros.
+- **agent-host** — Direct Agent Runtime composition, protected credentials and
+  checkpoints, capability-aware native/CLI Agent Chat backends, content guards,
+  and scope-derived workspace adapters.
 - **services** — `TaskService.transition()` handles side effects (event
   emission, counter increments, `ReviewRunner` on `→ review`, `MergeService`
   on `review → merging`, `WorkspaceCleanupScheduler` on `→ done` /
   `→ cancelled`). Background tasks: `CrashRecovery` at startup (orphan
   execution recovery and stale-annotation sweep), `HeartbeatMonitor`,
-  `DaemonMonitor`, `WorkspaceCleanupScheduler`.
+  `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
+  projection, and `WorkspaceCleanupScheduler`.
 - **review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc`
   commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
   execution sharing the executor's workspace. Depends only on `db`, `events`,
   `executors` — not on `api` or `services`.
-- **api** — Routes in `routes/{projects,tasks,terminals,agents,repos,executions,events,daemons,clis,profiles,executor_types}.rs`.
+- **api** — Routes include projects, Tasks, Main/Project Agent bindings and
+  chats, embedded agents/sessions, memory/context, commitments/actions, Mission Control,
+  terminals, repos, executions, events, daemons, CLIs, and executor types.
   Error module is `errors.rs` (plural). Middleware adds request IDs and CORS.
   `claim_task` auto-dispatches the executor.
 - **executors** — `LogWriter` appends JSONL with schema version + sequence

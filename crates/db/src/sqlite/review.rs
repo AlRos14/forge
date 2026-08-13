@@ -1,4 +1,5 @@
 use super::*;
+use crate::new_uuid_v4;
 
 #[async_trait]
 impl ReviewRepo for SqliteDb {
@@ -28,8 +29,13 @@ impl ReviewRepo for SqliteDb {
         finished_at: Option<String>,
         updated_at: &str,
     ) -> Result<Review> {
-        let review = ReviewRepo::get_by_id(self, id)
+        let mut transaction = self.pool.begin().await?;
+        let review = sqlx::query("SELECT * FROM review WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
             .await?
+            .map(map_review)
+            .transpose()?
             .ok_or(DbError::NotFound)?;
         if !review_transition_allowed(&review.status, &status) {
             return Err(DbError::InvalidTransition);
@@ -42,14 +48,56 @@ impl ReviewRepo for SqliteDb {
         .bind(finished_at.as_deref())
         .bind(updated_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        ReviewRepo::get_by_id(self, id)
-            .await?
-            .ok_or(DbError::NotFound)
+
+        let task_project_id =
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(&review.task_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(DbError::NotFound)?;
+        let event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "review.status_changed".to_owned(),
+            entity_type: "review".to_owned(),
+            entity_id: review.id.clone(),
+            actor_type: "review_runner".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: review.task_id.clone(),
+            correlation_id: review.task_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!(
+                "review-status:{}:{}:{}",
+                review.id,
+                status,
+                finished_at.as_deref().unwrap_or(updated_at)
+            )),
+            payload_json: serde_json::json!({
+                "review_id": review.id,
+                "task_id": review.task_id,
+                "project_id": task_project_id,
+                "attempt_number": review.attempt_number,
+                "status": status.to_string(),
+                "finished": finished_at.is_some(),
+            })
+            .to_string(),
+            created_at: updated_at.to_owned(),
+        };
+        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+
+        let updated_row = sqlx::query("SELECT * FROM review WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let updated = map_review(updated_row)?;
+        transaction.commit().await?;
+        Ok(updated)
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<Review>> {

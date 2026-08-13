@@ -66,6 +66,37 @@ impl ForgeClient {
         decode_json(response).await
     }
 
+    pub async fn post_empty<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let response = self
+            .apply_auth(self.http.post(self.url(path)))
+            .json(body)
+            .send()
+            .await?;
+        decode_empty(response).await
+    }
+
+    pub async fn patch<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .apply_auth(self.http.patch(self.url(path)))
+            .json(body)
+            .send()
+            .await?;
+        decode_json(response).await
+    }
+
+    pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        let response = self
+            .apply_auth(self.http.put(self.url(path)))
+            .json(body)
+            .send()
+            .await?;
+        decode_json(response).await
+    }
+
     pub async fn post_multipart<T: DeserializeOwned>(&self, path: &str, form: Form) -> Result<T> {
         let response = self
             .apply_auth(self.http.post(self.url(path)))
@@ -107,6 +138,14 @@ impl ForgeClient {
         ))
     }
 
+    pub async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self
+            .apply_auth(self.http.delete(self.url(path)))
+            .send()
+            .await?;
+        decode_json(response).await
+    }
+
     pub fn url(&self, path: &str) -> String {
         if path.starts_with('/') {
             format!("{}{}", self.base_url, path)
@@ -136,6 +175,15 @@ async fn decode_json<T: DeserializeOwned>(response: reqwest::Response) -> Result
     }
 
     serde_json::from_slice(&body).map_err(Into::into)
+}
+
+async fn decode_empty(response: reqwest::Response) -> Result<()> {
+    let status = response.status();
+    let body = response.bytes().await?;
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(request_error(status, String::from_utf8_lossy(&body).into()))
 }
 
 fn request_error(status: StatusCode, body: String) -> anyhow::Error {

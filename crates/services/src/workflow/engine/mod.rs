@@ -5,8 +5,9 @@ use api_types::{
     WorkflowTrigger,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CompareAndMoveTask, CreateTransitionLog, MoveTaskPersistence,
-    MoveTaskResult, ProjectRepo, TaskBoardRepo, TaskRepo, TransitionLogRepo, UpdateTask,
+    new_uuid_v4, now_rfc3339, CompareAndMoveTask, CreateDomainEvent, DomainEventRepo,
+    MoveTaskPersistence, MoveTaskResult, ProjectRepo, TaskBoardRepo, TaskRepo, TransitionLog,
+    TransitionLogRepo, UpdateTask,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent, TASK_MOVED_EVENT};
 use executors::TaskExecutor;
@@ -1016,6 +1017,7 @@ impl WorkflowEngine {
             let reopens_visible_work = from_state.kind == StateKind::Terminal
                 && to_state.kind != StateKind::Terminal
                 && !task.is_automation;
+            let transition_log_id = new_uuid_v4();
             let (mut task, transition_log, board_move_outcome) =
                 if let Some(move_request) = board_move {
                     let persistence = TaskBoardRepo::compare_and_move_task(
@@ -1031,7 +1033,7 @@ impl WorkflowEngine {
                             before_id: move_request.before_id,
                             after_id: move_request.after_id,
                             entry_barrier_json: entry_barrier_json.clone(),
-                            transition_log_id: new_uuid_v4(),
+                            transition_log_id: transition_log_id.clone(),
                             trigger_name: trigger_name.clone(),
                             triggered_by: actor.display(),
                             trigger_reason: reason.clone(),
@@ -1084,28 +1086,65 @@ impl WorkflowEngine {
                         )
                         .await?;
                     }
+                    let event = CreateDomainEvent::task_transition(
+                        transition_log_id.clone(),
+                        task_id.clone(),
+                        task.project_id.clone(),
+                        &current_status,
+                        &target_state,
+                        trigger_name.as_deref(),
+                        actor.display(),
+                        &reason,
+                        rejection,
+                        updated_at.clone(),
+                    );
+                    DomainEventRepo::append_event_in_tx(&*self.db, &mut transaction, &event).await?;
+                    sqlx::query(
+                        "INSERT INTO transition_log (
+                            id, task_id, from_state, to_state, trigger_name, triggered_by,
+                            trigger_reason, hook_results_json, rejection, created_at
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                    )
+                    .bind(&transition_log_id)
+                    .bind(&task.id)
+                    .bind(&current_status)
+                    .bind(&target_state)
+                    .bind(trigger_name.as_deref())
+                    .bind(actor.display())
+                    .bind(&reason)
+                    .bind(if rejection { 1_i64 } else { 0_i64 })
+                    .bind(&updated_at)
+                    .execute(&mut *transaction)
+                    .await?;
                     transaction.commit().await?;
                     let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-                    let transition_log = TransitionLogRepo::insert(
-                        &*self.db,
-                        CreateTransitionLog {
-                            id: new_uuid_v4(),
-                            task_id: task.id.clone(),
-                            from_state: current_status.clone(),
-                            to_state: target_state.clone(),
-                            trigger_name: trigger_name.clone(),
-                            triggered_by: actor.display(),
-                            trigger_reason: reason.clone(),
-                            hook_results_json: None,
-                            rejection,
-                            created_at: updated_at.clone(),
-                        },
-                    )
-                    .await?;
+                    let transition_log = TransitionLog {
+                        id: transition_log_id.clone(),
+                        task_id: task.id.clone(),
+                        from_state: current_status.clone(),
+                        to_state: target_state.clone(),
+                        trigger_name: trigger_name.clone(),
+                        triggered_by: actor.display(),
+                        trigger_reason: reason.clone(),
+                        hook_results_json: None,
+                        rejection,
+                        created_at: updated_at.clone(),
+                    };
                     (task, transition_log, None)
                 };
+
+            // The authoritative event was committed with the task mutation.
+            // Fetching by the transition-log/event id also makes replayed board
+            // moves publish at most the already-committed event.
+            if let Some(event) = DomainEventRepo::get_event(&*self.db, &transition_log.id).await? {
+                crate::DomainEventService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                )
+                .publish_committed(&event);
+            }
             let should_defer_dispatch = defer_dispatch_until.is_some()
                 && to_state.kind != StateKind::Active
                 && to_state

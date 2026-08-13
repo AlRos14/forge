@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CommentAuthorType,
-    ConversationMessageRepo, ConversationRepo, ConversationStatus, CreateConversation,
-    CreateConversationMessage, CreateExecution, CreateProject, CreateReview, CreateTask,
-    CreateTaskComment, CreateTransitionLog, ExecutionRepo, ExecutionStatus, MemoryConfidence,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentChatRepo, CommentAuthorType,
+    CreateDomainEvent, CreateExecution, CreateProject, CreateReview, CreateTask, CreateTaskComment,
+    CreateTransitionLog, DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryConfidence,
     MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskCommentRepo,
     TaskRepo, TransitionLogRepo,
 };
 use serde_json::json;
-use services::{MemoryItemInput, MemoryService, TaskService};
+use services::{AgentChatMemoryConsumer, MemoryItemInput, MemoryService, TaskService};
 use uuid::Uuid;
 
 async fn sqlite_db() -> Arc<SqliteDb> {
@@ -65,6 +64,159 @@ async fn seed_project_and_task(db: &SqliteDb, status: &str) -> (Uuid, String) {
     .await
     .expect("task creates");
     (project_id, task_id)
+}
+
+#[tokio::test]
+async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after_restart() {
+    let db = sqlite_db().await;
+    let (project_id, _task_id) = seed_project_and_task(&db, "review").await;
+    let message_id = new_uuid_v4();
+    let event_id = new_uuid_v4();
+    let now = "2026-08-12T00:00:00.000Z";
+    let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id.to_string())
+        .await
+        .expect("project chat reads")
+        .expect("project creation provisions the singular chat")
+        .id;
+
+    // Append the durable event before its source row to simulate a process
+    // crash between event admission and projection. The first consumer run
+    // claims the event but cannot complete it, leaving only an expiring lease.
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: event_id.clone(),
+            event_type: "agent_chat.message.admitted".to_owned(),
+            entity_type: "agent_chat_message".to_owned(),
+            entity_id: message_id.clone(),
+            actor_type: "user".to_owned(),
+            actor_id: None,
+            // V060's historical scope check predates the singular Chat
+            // vocabulary; the projection keys by entity type and chat id
+            // while the follow-up migration expands this value to agent_chat.
+            scope_type: "project".to_owned(),
+            scope_id: chat_id.clone(),
+            correlation_id: event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("agent-chat-memory-replay:{message_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("event appends");
+    let _first = AgentChatMemoryConsumer::new(Arc::clone(&db), "consumer-before-crash")
+        .run_once(10)
+        .await
+        .expect("failed projection is retryable");
+    // Project/task setup may have produced unrelated durable events before
+    // this source event. They are checkpointed by the shared ledger consumer,
+    // but the missing message itself must remain leased for retry.
+    let first_receipt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_projection_receipt
+         WHERE consumer_name = ? AND event_id = ?",
+    )
+    .bind(services::memory_consumer_name())
+    .bind(&event_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("missing source remains uncheckpointed");
+    assert_eq!(first_receipt, 0);
+
+    sqlx::query(
+        "INSERT INTO agent_chat_message (
+            id, chat_id, sequence, author_type, content, status, correlation_id,
+            source_type, source_metadata_json, created_at
+         ) VALUES (?, ?, 0, 'user', ?, 'complete', ?, 'native', '{}', ?)",
+    )
+    .bind(&message_id)
+    .bind(&chat_id)
+    .bind("durable room message")
+    .bind(&event_id)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .expect("message inserts after source recovery");
+    sqlx::query(
+        "UPDATE event_processing_lease
+         SET leased_until = '2000-01-01T00:00:00Z'
+         WHERE consumer_name = ?",
+    )
+    .bind(services::memory_consumer_name())
+    .execute(db.pool())
+    .await
+    .expect("lease expires");
+
+    let second = AgentChatMemoryConsumer::new(Arc::clone(&db), "consumer-after-restart")
+        .run_once(10)
+        .await
+        .expect("expired event replays");
+    assert_eq!(second, 1);
+    let third = AgentChatMemoryConsumer::new(Arc::clone(&db), "consumer-third-process")
+        .run_once(10)
+        .await
+        .expect("receipt suppresses duplicate");
+    assert_eq!(third, 0);
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM memory_item WHERE source_type = 'agent_chat' AND json_extract(metadata_json, '$.source_ref') = ?",
+    )
+    .bind(&message_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("projected source count loads");
+    assert_eq!(count, 1);
+    let canonical_scope_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM memory_item
+         WHERE source_type = 'agent_chat' AND scope_type = 'agent_chat' AND scope_id = ?",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Agent Chat memory scope count loads");
+    assert_eq!(canonical_scope_count, 1);
+}
+
+#[tokio::test]
+async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying_them() {
+    let db = sqlite_db().await;
+    let (project_id, _task_id) = seed_project_and_task(&db, "review").await;
+    let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id.to_string())
+        .await
+        .expect("project chat reads")
+        .expect("project chat exists")
+        .id;
+    let job_id = new_uuid_v4();
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "agent_chat.turn.failed".to_owned(),
+            entity_type: "agent_chat_turn_job".to_owned(),
+            entity_id: job_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat_id,
+            correlation_id: "failure-correlation".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("failure-event:{job_id}")),
+            payload_json: json!({
+                "status": "failed",
+                "error_code": "adapter_failed",
+                "error_message": "bounded failure",
+            })
+            .to_string(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("failure event appends");
+
+    let consumer = AgentChatMemoryConsumer::new(Arc::clone(&db), "failure-consumer");
+    assert!(consumer.run_once(10).await.expect("failure event consumes") >= 1);
+    assert_eq!(consumer.run_once(10).await.expect("replay is empty"), 0);
 }
 
 #[tokio::test]
@@ -222,45 +374,6 @@ async fn memory_backfill_all_is_idempotent() {
     )
     .await
     .expect("transition creates");
-    let conversation_id = new_uuid_v4();
-    ConversationRepo::create(
-        &*db,
-        CreateConversation {
-            id: conversation_id.clone(),
-            project_id: project_id.to_string(),
-            agent_id: None,
-            title: "Conversation".to_owned(),
-            status: ConversationStatus::Active,
-            system_prompt: None,
-            message_count: 1,
-            last_message_at: Some(now.clone()),
-            agent_session_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("conversation creates");
-    ConversationMessageRepo::create(
-        &*db,
-        CreateConversationMessage {
-            id: new_uuid_v4(),
-            conversation_id,
-            role: db::ConversationMessageRole::User,
-            content: "conversation content".to_owned(),
-            status: db::ConversationMessageStatus::Complete,
-            model: None,
-            token_usage_json: None,
-            duration_ms: None,
-            error: None,
-            sequence: 1,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("conversation message creates");
-
     let first = MemoryService::backfill_all(Arc::clone(&db))
         .await
         .expect("first backfill succeeds");
@@ -268,17 +381,17 @@ async fn memory_backfill_all_is_idempotent() {
         .await
         .expect("second backfill succeeds");
 
-    assert_eq!(first.indexed, 5);
+    assert_eq!(first.indexed, 4);
     assert_eq!(first.skipped, 0);
     assert_eq!(second.indexed, 0);
-    assert_eq!(second.skipped, 5);
+    assert_eq!(second.skipped, 4);
     let count =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_item WHERE project_id = ?")
             .bind(project_id.to_string())
             .fetch_one(db.pool())
             .await
             .expect("memory count loads");
-    assert_eq!(count, 5);
+    assert_eq!(count, 4);
 }
 
 #[tokio::test]
@@ -291,7 +404,6 @@ async fn memory_search_token_budget_shapes_layers() {
             project_id,
             task_id: Some(task_id),
             execution_id: None,
-            conversation_id: None,
             source_type: MemorySourceType::Comment,
             source_ref: new_uuid_v4(),
             kind: MemoryKind::Comment,

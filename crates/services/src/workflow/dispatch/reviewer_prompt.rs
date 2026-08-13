@@ -8,8 +8,7 @@ use crate::workflow::{
 
 pub struct ReviewerPromptBuilder;
 
-const VERDICT_INSTRUCTION: &str =
-    "End your response with EXACTLY ONE verdict marker in the existing format:\n===REVIEW: PASS===\n===REVIEW: FAIL: <short reason>===";
+const VERDICT_INSTRUCTION: &str = "End your response with EXACTLY ONE verdict marker in the existing format:\n===REVIEW: PASS===\n===REVIEW: FAIL: <short reason>===";
 
 const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:

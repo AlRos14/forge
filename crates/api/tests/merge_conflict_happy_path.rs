@@ -242,13 +242,6 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
         Box::pin(async move {
             if ctx.description.contains("===REVIEW: PASS===") {
                 write_auditor_pass(&ctx).await?;
-                if !conflict_prepared.swap(true, Ordering::SeqCst) {
-                    replace_claimed_worktree_with_conflict(
-                        &repo_path,
-                        Path::new(&ctx.worktree_path),
-                        &ctx.task_id,
-                    );
-                }
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
@@ -271,6 +264,18 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                     usage: None,
                     ..Default::default()
                 });
+            }
+
+            // Establish the conflicting branch during the coder execution.
+            // Auditor worktree mutations are intentionally restored by the
+            // review runner, so creating the fixture from the auditor would
+            // erase the feature commit before the merge gate runs.
+            if !conflict_prepared.swap(true, Ordering::SeqCst) {
+                replace_claimed_worktree_with_conflict(
+                    &repo_path,
+                    Path::new(&ctx.worktree_path),
+                    &ctx.task_id,
+                );
             }
 
             Ok(ExecutionResult {

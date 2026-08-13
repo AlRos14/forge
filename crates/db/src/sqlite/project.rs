@@ -1,9 +1,26 @@
 use super::*;
-use crate::now_rfc3339;
+use crate::{new_uuid_v4, now_rfc3339};
+
+const DEFAULT_PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
+        self.create_with_agent_binding(input, None, None).await
+    }
+
+    async fn create_with_agent_binding(
+        &self,
+        input: CreateProject,
+        identity_id: Option<String>,
+        profile_id: Option<String>,
+    ) -> Result<Project> {
+        if identity_id.is_some() != profile_id.is_some() {
+            return Err(DbError::Check(
+                "Project Agent identity and profile must be selected together".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
         sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, '[]', 0, ?, ?)")
             .bind(&input.id)
             .bind(&input.name)
@@ -13,8 +30,169 @@ impl ProjectRepo for SqliteDb {
             .bind(&input.owner_id)
             .bind(&input.created_at)
             .bind(&input.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+
+        if let (Some(identity_id), Some(profile_id)) = (identity_id, profile_id) {
+            let current: (String, i64) = sqlx::query_as(
+                "UPDATE project_agent_binding
+                 SET state = 'replaced', replaced_by_binding_id = NULL,
+                     replacement_reason = 'project creation binding selection',
+                     version = version + 1, updated_at = ?
+                 WHERE project_id = ? AND state = 'agent_setup_required' AND version = 1
+                 RETURNING id, version",
+            )
+            .bind(&input.updated_at)
+            .bind(&input.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| DbError::Check("project setup binding was not created".to_owned()))?;
+            let binding_id = new_uuid_v4();
+            sqlx::query(
+                "INSERT INTO project_agent_binding (
+                    id, project_id, identity_id, profile_id, state,
+                    autonomy_policy_json, permission_ceiling_json, subscriptions_json,
+                    wake_budget, version, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 'active', '{}', ?, '[]', 0, ?, ?, ?)",
+            )
+            .bind(&binding_id)
+            .bind(&input.id)
+            .bind(&identity_id)
+            .bind(&profile_id)
+            .bind(DEFAULT_PROJECT_AGENT_PERMISSION_CEILING)
+            .bind(current.1)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE project_agent_binding
+                 SET replaced_by_binding_id = ?
+                 WHERE id = ? AND state = 'replaced'",
+            )
+            .bind(&binding_id)
+            .bind(&current.0)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE agent_chat
+                 SET status = 'ready', version = version + 1, updated_at = ?
+                 WHERE kind = 'project' AND project_id = ? AND status = 'agent_setup_required'",
+            )
+            .bind(&input.updated_at)
+            .bind(&input.id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        // V071 triggers create the canonical Project Chat and setup binding
+        // in this transaction.  Record all three durable facts before the
+        // commit as well, so a rollback can never leave a ledger that claims
+        // a Project exists without its singular chat/binding state.
+        let (chat_id, chat_status): (String, String) = sqlx::query_as(
+            "SELECT id, status FROM agent_chat
+             WHERE kind = 'project' AND project_id = ?",
+        )
+        .bind(&input.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let (binding_id, binding_state, binding_identity_id, binding_profile_id, binding_version): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT id, state, identity_id, profile_id, version
+             FROM project_agent_binding
+             WHERE project_id = ? AND state IN ('active', 'agent_setup_required')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&input.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let correlation_id = new_uuid_v4();
+        let actor_type = if input.owner_id.is_some() {
+            "user"
+        } else {
+            "system"
+        }
+        .to_owned();
+        let actor_id = input.owner_id.clone();
+        let events = vec![
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "project.created".to_owned(),
+                entity_type: "project".to_owned(),
+                entity_id: input.id.clone(),
+                actor_type: actor_type.clone(),
+                actor_id: actor_id.clone(),
+                scope_type: "project".to_owned(),
+                scope_id: input.id.clone(),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("project-created:{}", input.id)),
+                payload_json: serde_json::json!({
+                    "project_id": input.id,
+                    "name": input.name,
+                    "agent_chat_id": chat_id,
+                    "project_agent_binding_id": binding_id,
+                })
+                .to_string(),
+                created_at: input.created_at.clone(),
+            },
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "project_agent_binding.created".to_owned(),
+                entity_type: "project_agent_binding".to_owned(),
+                entity_id: binding_id.clone(),
+                actor_type: actor_type.clone(),
+                actor_id: actor_id.clone(),
+                scope_type: "project".to_owned(),
+                scope_id: input.id.clone(),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("project-agent-binding-created:{}", binding_id)),
+                payload_json: serde_json::json!({
+                    "project_id": input.id,
+                    "binding_id": binding_id,
+                    "state": binding_state,
+                    "identity_id": binding_identity_id,
+                    "profile_id": binding_profile_id,
+                    "version": binding_version,
+                })
+                .to_string(),
+                created_at: input.created_at.clone(),
+            },
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "agent_chat.created".to_owned(),
+                entity_type: "agent_chat".to_owned(),
+                entity_id: chat_id.clone(),
+                actor_type,
+                actor_id,
+                scope_type: "agent_chat".to_owned(),
+                scope_id: chat_id.clone(),
+                correlation_id,
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("agent-chat-created:{}", chat_id)),
+                payload_json: serde_json::json!({
+                    "chat_id": chat_id,
+                    "project_id": input.id,
+                    "kind": "project",
+                    "status": chat_status,
+                })
+                .to_string(),
+                created_at: input.created_at.clone(),
+            },
+        ];
+        for event in events {
+            DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        }
+        transaction.commit().await?;
         ProjectRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)

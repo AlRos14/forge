@@ -99,6 +99,30 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::auth::create_pat).get(routes::auth::list_pats),
         )
         .route("/api/v1/auth/tokens/{id}", delete(routes::auth::delete_pat))
+        .route(
+            "/api/v1/account/main-agent",
+            get(routes::agent_chats::get_main_agent).put(routes::agent_chats::set_main_agent),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis",
+            post(routes::product_genesis::start_product_genesis),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/active",
+            get(routes::product_genesis::get_active_product_genesis),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/{session_id}",
+            get(routes::product_genesis::get_product_genesis),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/{session_id}/ready",
+            post(routes::product_genesis::ready_product_genesis),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/{session_id}/cancel",
+            post(routes::product_genesis::cancel_product_genesis),
+        )
         .route("/api/v1/admin/users", get(routes::admin::list_users))
         .route(
             "/api/v1/admin/users/{id}",
@@ -114,6 +138,26 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::admin::backfill_memory),
         )
         .route("/api/v1/memory/{id}", get(routes::memory::get_memory_item))
+        .route(
+            "/api/v1/memory/{id}/publish",
+            post(routes::scoped_memory::publish_memory),
+        )
+        .route(
+            "/api/v1/memory/{id}/lifecycle",
+            post(routes::scoped_memory::assert_memory_lifecycle),
+        )
+        .route(
+            "/api/v1/memory/{id}/provenance",
+            get(routes::scoped_memory::get_memory_provenance),
+        )
+        .route(
+            "/api/v1/context-manifests/{id}",
+            get(routes::scoped_memory::get_context_manifest),
+        )
+        .route(
+            "/api/v1/agents/{id}/context-manifests",
+            get(routes::scoped_memory::list_context_manifests),
+        )
         .route(
             "/api/v1/projects",
             post(routes::projects::create_project).get(routes::projects::list_projects),
@@ -158,13 +202,38 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::project_agents::list_project_agents),
         )
         .route(
-            "/api/v1/projects/{id}/agent-links",
-            get(routes::project_agents::list_project_agent_links)
-                .post(routes::project_agents::create_project_agent_link),
+            "/api/v1/projects/{id}/project-agent",
+            get(routes::agent_chats::get_project_agent).put(routes::agent_chats::set_project_agent),
         )
         .route(
-            "/api/v1/projects/{id}/agent-links/{agent_id}",
-            delete(routes::project_agents::delete_project_agent_link),
+            "/api/v1/agent-chats",
+            get(routes::agent_chats::list_agent_chats),
+        )
+        .route(
+            "/api/v1/agent-chats/{chat_id}",
+            get(routes::agent_chats::get_agent_chat),
+        )
+        .route(
+            "/api/v1/agent-chats/{chat_id}/messages",
+            get(routes::agent_chats::list_agent_chat_messages)
+                .post(routes::agent_chats::send_agent_chat_message),
+        )
+        .route(
+            "/api/v1/agent-chats/{chat_id}/turns",
+            get(routes::agent_chats::list_agent_chat_turns),
+        )
+        .route(
+            "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel",
+            post(routes::agent_chats::cancel_agent_chat_turn),
+        )
+        .route(
+            "/api/v1/projects/{id}/agent-handoffs",
+            get(routes::agent_chats::list_agent_handoffs)
+                .post(routes::agent_chats::create_agent_handoff),
+        )
+        .route(
+            "/api/v1/projects/{id}/agent-handoffs/{handoff_id}",
+            get(routes::agent_chats::get_agent_handoff),
         )
         .route(
             "/api/v1/projects/{id}/workflow",
@@ -189,29 +258,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/workflow/prompt-builders",
             get(routes::workflow::list_prompt_builders),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/conversations",
-            post(routes::conversations::create_conversation)
-                .get(routes::conversations::list_conversations),
-        )
-        .route(
-            "/api/v1/conversations/{id}",
-            get(routes::conversations::get_conversation)
-                .patch(routes::conversations::update_conversation)
-                .delete(routes::conversations::archive_conversation),
-        )
-        .route(
-            "/api/v1/conversations/{id}/messages",
-            post(routes::conversations::send_message).get(routes::conversations::list_messages),
-        )
-        .route(
-            "/api/v1/conversations/{id}/logs",
-            get(routes::conversations::get_logs),
-        )
-        .route(
-            "/api/v1/conversations/{id}/cancel",
-            post(routes::conversations::cancel_response),
         )
         .route(
             "/api/v1/workflow-templates",
@@ -449,6 +495,30 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::operations::refresh_operations),
         )
         .route(
+            "/api/v1/mission-control",
+            get(routes::mission_control::home),
+        )
+        .route(
+            "/api/v1/mission-control/attention",
+            get(routes::mission_control::list_attention),
+        )
+        .route(
+            "/api/v1/mission-control/attention/{id}/acknowledge",
+            post(routes::mission_control::acknowledge),
+        )
+        .route(
+            "/api/v1/mission-control/attention/{id}/snooze",
+            post(routes::mission_control::snooze),
+        )
+        .route(
+            "/api/v1/mission-control/attention/{id}/resolve",
+            post(routes::mission_control::resolve),
+        )
+        .route(
+            "/api/v1/mission-control/agents/{identity_id}",
+            get(routes::mission_control::agent_detail),
+        )
+        .route(
             "/api/v1/settings",
             get(routes::settings::get_settings).put(routes::settings::update_settings),
         )
@@ -460,11 +530,32 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/agents/{id}",
             get(routes::agents::get_agent)
                 .patch(routes::agents::update_agent)
-                .delete(routes::agents::delete_agent),
+                .delete(routes::agents::archive_agent),
         )
         .route(
             "/api/v1/agents/{id}/tasks",
             get(routes::agents::list_agent_tasks),
+        )
+        .route(
+            "/api/v1/agents/{id}/commitments",
+            get(routes::coordination::list_commitments)
+                .post(routes::coordination::create_commitment),
+        )
+        .route(
+            "/api/v1/agents/{id}/inbox",
+            get(routes::coordination::list_inbox),
+        )
+        .route(
+            "/api/v1/agents/{id}/questions",
+            get(routes::coordination::list_questions).post(routes::coordination::ask_question),
+        )
+        .route(
+            "/api/v1/agents/{id}/actions",
+            get(routes::coordination::list_actions).post(routes::coordination::propose_action),
+        )
+        .route(
+            "/api/v1/agents/{id}/task-proposals",
+            post(routes::coordination::propose_task),
         )
         .route(
             "/api/v1/agents/{id}/pause",
@@ -485,6 +576,124 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/agents/{id}/duplicate",
             post(routes::agents::duplicate_agent),
+        )
+        .route(
+            "/api/v1/embedded-agents/connect",
+            post(routes::embedded_agents::connect_embedded_agent),
+        )
+        .route(
+            "/api/v1/agents/{id}/profiles",
+            get(routes::embedded_agents::list_profiles),
+        )
+        .route(
+            "/api/v1/agents/{id}/profiles/connect",
+            post(routes::embedded_agents::connect_embedded_profile),
+        )
+        .route(
+            "/api/v1/agents/{id}/profiles/{profile_id}/select",
+            post(routes::embedded_agents::select_profile),
+        )
+        .route(
+            "/api/v1/agents/{id}/sessions",
+            get(routes::embedded_agents::list_sessions)
+                .post(routes::embedded_agents::create_session),
+        )
+        .route(
+            "/api/v1/agents/{id}/effective-permissions",
+            post(routes::embedded_agents::effective_permissions),
+        )
+        .route(
+            "/api/v1/agent-sessions/{id}/rotate",
+            post(routes::embedded_agents::rotate_session),
+        )
+        .route(
+            "/api/v1/agent-sessions/{id}/suspend",
+            post(routes::embedded_agents::suspend_session),
+        )
+        .route(
+            "/api/v1/agent-sessions/{id}/resume",
+            post(routes::embedded_agents::resume_session),
+        )
+        .route(
+            "/api/v1/agent-sessions/{id}/cancel",
+            post(routes::embedded_agents::cancel_session_turn),
+        )
+        .route(
+            "/api/v1/agent-sessions/{id}/steer",
+            post(routes::embedded_agents::steer_session_turn),
+        )
+        .route(
+            "/api/v1/agent-sessions/{session_id}/interactions",
+            get(routes::embedded_agents::list_session_interactions),
+        )
+        .route(
+            "/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer",
+            post(routes::embedded_agents::answer_session_interaction),
+        )
+        .route(
+            "/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel",
+            post(routes::embedded_agents::cancel_session_interaction),
+        )
+        .route(
+            "/api/v1/commitments/{id}",
+            get(routes::coordination::get_commitment)
+                .patch(routes::coordination::update_commitment),
+        )
+        .route(
+            "/api/v1/commitments/{id}/complete",
+            post(routes::coordination::complete_commitment),
+        )
+        .route(
+            "/api/v1/commitments/{id}/transfer",
+            post(routes::coordination::transfer_commitment),
+        )
+        .route(
+            "/api/v1/commitments/{id}/cancel",
+            post(routes::coordination::cancel_commitment),
+        )
+        .route(
+            "/api/v1/commitments/{id}/evidence",
+            get(routes::coordination::list_commitment_evidence),
+        )
+        .route(
+            "/api/v1/inbox/{id}",
+            get(routes::coordination::get_inbox_item),
+        )
+        .route(
+            "/api/v1/inbox/{id}/status",
+            patch(routes::coordination::update_inbox_item),
+        )
+        .route(
+            "/api/v1/questions/{id}",
+            get(routes::coordination::get_question),
+        )
+        .route(
+            "/api/v1/questions/{id}/answer",
+            post(routes::coordination::answer_question),
+        )
+        .route(
+            "/api/v1/actions/{id}",
+            get(routes::coordination::get_action),
+        )
+        .route(
+            "/api/v1/actions/{id}/approve",
+            post(routes::coordination::approve_action),
+        )
+        .route(
+            "/api/v1/actions/{id}/execute",
+            post(routes::coordination::execute_action),
+        )
+        .route(
+            "/api/v1/actions/{id}/execute-task",
+            post(routes::coordination::execute_task_proposal),
+        )
+        .route(
+            "/api/v1/credentials",
+            get(routes::embedded_agents::list_credentials),
+        )
+        .route(
+            "/api/v1/credentials/{id}",
+            delete(routes::embedded_agents::revoke_credential),
         )
         .route(
             "/api/v1/executor-types",

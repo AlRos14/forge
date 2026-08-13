@@ -1,0 +1,1523 @@
+use std::{
+    collections::BTreeSet,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
+
+use db::{
+    new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, Agent, AgentChatRepo,
+    AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
+    AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo, AgentStatus, AssigneeKind,
+    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
+    CredentialHandle, ExecutionRepo, ExecutionStatus, PageRequest, ProjectAgentBindingRepo,
+    ProjectMemberRepo, ProjectRepo, RotateAgentSession, SelectAgentProfile, SortBy, SortOrder,
+    SqliteDb, TaskRepo, TaskRoleAssignmentRepo, UpdateAgentSession, UpsertAgentConnectionHealth,
+};
+use forge_agent_host::{
+    AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType,
+    InteractionBrokerHandle, NativeAgentRuntimeBackend, Secret, SqliteProtectedRuntimeStore,
+    WorkspaceAccess,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    agent_chat_policy::guard_runtime_content,
+    native_tools::CoordinationToolProvider,
+    workflow::{default_roles, effective_role, engine::WorkflowEngine},
+    Result, ServiceError,
+};
+
+const NATIVE_EXECUTOR_TYPE: &str = "embedded";
+const DEFAULT_CONTEXT_TOKENS: u32 = 128_000;
+const DEFAULT_MAX_INPUT_TOKENS: u32 = 96_000;
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_000;
+
+#[derive(Clone)]
+pub struct EmbeddedAgentService {
+    db: Arc<SqliteDb>,
+    protected_store: Arc<SqliteProtectedRuntimeStore>,
+    native_backend: Arc<NativeAgentRuntimeBackend>,
+}
+
+#[derive(Clone)]
+pub struct ConnectEmbeddedAgent {
+    pub owner_user_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub credential_label: String,
+    pub credential: Secret,
+    pub system_prompt: Option<String>,
+    pub account_permission_ceiling: Value,
+    pub tool_policy: Value,
+    pub context_tokens: Option<u32>,
+    pub max_input_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Clone)]
+pub struct ConnectEmbeddedProfile {
+    pub owner_user_id: String,
+    pub identity_id: String,
+    pub expected_identity_version: i64,
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub credential_label: String,
+    pub credential: Secret,
+    pub system_prompt: Option<String>,
+    pub permission_policy: Option<String>,
+    pub tool_policy: Value,
+    pub context_tokens: Option<u32>,
+    pub max_input_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedEmbeddedAgent {
+    pub agent: Agent,
+    pub credential_handle: CredentialHandle,
+    pub profile: AgentProfile,
+    pub health: AgentConnectionHealth,
+    pub session: AgentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RequestedCanonicalScope {
+    Account,
+    Project { project_id: String },
+    AgentChat { chat_id: String },
+    Task { task_id: String, role: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateScopedSession {
+    pub actor_user_id: String,
+    pub identity_id: String,
+    pub profile_id: Option<String>,
+    pub scope: RequestedCanonicalScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectivePermissions {
+    pub allowed: BTreeSet<String>,
+    pub denied: BTreeSet<String>,
+    pub requires_approval: BTreeSet<String>,
+}
+
+impl EmbeddedAgentService {
+    pub fn new(db: Arc<SqliteDb>, protected_key_material: &[u8]) -> Self {
+        let digest = Sha256::digest(protected_key_material);
+        let mut master_key = [0_u8; 32];
+        master_key.copy_from_slice(&digest);
+        let protected_store = Arc::new(SqliteProtectedRuntimeStore::new(
+            Arc::clone(&db),
+            master_key,
+            1,
+        ));
+        let native_backend = Arc::new(
+            NativeAgentRuntimeBackend::new(Arc::clone(&protected_store))
+                .with_forge_tool_provider(Arc::new(CoordinationToolProvider::new(Arc::clone(&db)))),
+        );
+        Self {
+            db,
+            protected_store,
+            native_backend,
+        }
+    }
+
+    pub fn native_backend(&self) -> Arc<NativeAgentRuntimeBackend> {
+        Arc::clone(&self.native_backend)
+    }
+
+    pub fn protected_store(&self) -> Arc<SqliteProtectedRuntimeStore> {
+        Arc::clone(&self.protected_store)
+    }
+
+    /// Return the broker composed by the native backend over the same
+    /// protected store used for provider credentials and runtime state.
+    pub fn interaction_broker(&self) -> InteractionBrokerHandle {
+        self.native_backend.interaction_broker()
+    }
+
+    pub async fn connect_new_agent(
+        &self,
+        input: ConnectEmbeddedAgent,
+    ) -> Result<ConnectedEmbeddedAgent> {
+        validate_native_connection(
+            &input.name,
+            &input.provider,
+            &input.base_url,
+            &input.model,
+            input.credential.expose(),
+        )
+        .await?;
+        let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
+        validate_public_runtime_json(&input.account_permission_ceiling)?;
+        validate_public_runtime_json(&input.tool_policy)?;
+        let now = now_rfc3339();
+        let identity_id = new_uuid_v4();
+        let profile_id = new_uuid_v4();
+        let credential_id = new_uuid_v4();
+        let credential_handle = self
+            .protected_store
+            .create_credential(
+                &credential_id,
+                &input.owner_user_id,
+                &input.provider,
+                &input.credential_label,
+                input.credential.clone(),
+                &now,
+            )
+            .await
+            .map_err(redacted_host_error)?;
+        let capabilities = native_capabilities();
+        let profile = CreateAgentProfile {
+            id: profile_id.clone(),
+            identity_id: identity_id.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
+            provider: Some(input.provider.clone()),
+            model: Some(input.model.clone()),
+            reasoning_effort: None,
+            permission_policy: Some("scoped_proposals".to_owned()),
+            prompt_template: system_prompt,
+            capabilities_json: serde_json::to_string(&capabilities).unwrap_or_else(|_| "{}".into()),
+            tool_policy_json: input.tool_policy.to_string(),
+            config_json: native_config_json(
+                &input.base_url,
+                input.context_tokens,
+                input.max_input_tokens,
+                input.max_output_tokens,
+            )
+            .to_string(),
+            credential_ref: Some(credential_id.clone()),
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let create_result = AgentRepo::create_identity_with_profile(
+            &*self.db,
+            CreateAgentIdentity {
+                id: identity_id.clone(),
+                name: input.name,
+                description: input.description,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some(input.owner_user_id.clone()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: input.account_permission_ceiling.to_string(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            profile,
+        )
+        .await;
+        let agent = match create_result {
+            Ok(agent) => agent,
+            Err(error) => {
+                let _ = self
+                    .protected_store
+                    .revoke_credential(&credential_id, &input.owner_user_id, &now)
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let profile = AgentProfileRepo::get_profile(&*self.db, &profile_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.clone()))?;
+        let health = self
+            .check_and_record_connection(&profile, &input.owner_user_id)
+            .await?;
+        let session = self
+            .create_or_resume_session(CreateScopedSession {
+                actor_user_id: input.owner_user_id,
+                identity_id,
+                profile_id: Some(profile_id),
+                scope: RequestedCanonicalScope::Account,
+            })
+            .await?;
+        Ok(ConnectedEmbeddedAgent {
+            agent,
+            credential_handle,
+            profile,
+            health,
+            session,
+        })
+    }
+
+    pub async fn connect_profile(
+        &self,
+        input: ConnectEmbeddedProfile,
+    ) -> Result<(Agent, CredentialHandle, AgentProfile, AgentConnectionHealth)> {
+        let identity = self
+            .require_owned_identity(&input.identity_id, &input.owner_user_id)
+            .await?;
+        if identity.version != input.expected_identity_version {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        validate_native_connection(
+            &identity.name,
+            &input.provider,
+            &input.base_url,
+            &input.model,
+            input.credential.expose(),
+        )
+        .await?;
+        let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
+        let account_permission_ceiling = sqlx::query_scalar::<_, String>(
+            "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
+        )
+        .bind(&identity.id)
+        .fetch_one(self.db.pool())
+        .await?;
+        let account_permission_ceiling =
+            serde_json::from_str(&account_permission_ceiling).unwrap_or(Value::Null);
+        validate_public_runtime_json(&account_permission_ceiling)?;
+        validate_public_runtime_json(&input.tool_policy)?;
+        let permission_policy = validate_public_runtime_text(input.permission_policy.as_deref())?;
+        let now = now_rfc3339();
+        let credential_id = new_uuid_v4();
+        let credential_handle = self
+            .protected_store
+            .create_credential(
+                &credential_id,
+                &input.owner_user_id,
+                &input.provider,
+                &input.credential_label,
+                input.credential.clone(),
+                &now,
+            )
+            .await
+            .map_err(redacted_host_error)?;
+        let profile_id = new_uuid_v4();
+        let profile = AgentProfileRepo::create_profile(
+            &*self.db,
+            CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: input.identity_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
+                provider: Some(input.provider),
+                model: Some(input.model),
+                reasoning_effort: None,
+                permission_policy: permission_policy
+                    .or_else(|| Some("scoped_proposals".to_owned())),
+                prompt_template: system_prompt,
+                capabilities_json: serde_json::to_string(&native_capabilities())
+                    .unwrap_or_else(|_| "{}".into()),
+                tool_policy_json: input.tool_policy.to_string(),
+                config_json: native_config_json(
+                    &input.base_url,
+                    input.context_tokens,
+                    input.max_input_tokens,
+                    input.max_output_tokens,
+                )
+                .to_string(),
+                credential_ref: Some(credential_id.clone()),
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await;
+        let profile = match profile {
+            Ok(profile) => profile,
+            Err(error) => {
+                let _ = self
+                    .protected_store
+                    .revoke_credential(&credential_id, &input.owner_user_id, &now)
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let agent = AgentProfileRepo::select_profile(
+            &*self.db,
+            SelectAgentProfile {
+                identity_id: input.identity_id,
+                profile_id: profile_id.clone(),
+                expected_version: input.expected_identity_version,
+                updated_at: now,
+            },
+        )
+        .await?;
+        let health = self
+            .check_and_record_connection(&profile, &input.owner_user_id)
+            .await?;
+        Ok((agent, credential_handle, profile, health))
+    }
+
+    pub async fn create_or_resume_session(
+        &self,
+        input: CreateScopedSession,
+    ) -> Result<AgentSession> {
+        let identity = self
+            .require_owned_identity(&input.identity_id, &input.actor_user_id)
+            .await?;
+        if identity.paused {
+            return Err(ServiceError::AgentPaused {
+                agent_id: identity.id,
+            });
+        }
+        let profile_id = input
+            .profile_id
+            .unwrap_or_else(|| identity.profile_id.clone());
+        let profile = AgentProfileRepo::get_profile(&*self.db, &profile_id)
+            .await?
+            .filter(|profile| profile.identity_id == identity.id)
+            .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.clone()))?;
+        let canonical = self
+            .authorize_scope(&input.actor_user_id, &identity, &input.scope)
+            .await?;
+        let project_id = self.scope_project_id(&input.scope).await?;
+        self.persist_authorized_session(
+            identity,
+            profile,
+            canonical,
+            project_id,
+            canonical_task_id(&input.scope),
+            canonical_task_role(&input.scope),
+            scope_authority_json(&input.actor_user_id, &input.scope),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_authorized_session(
+        &self,
+        identity: Agent,
+        profile: AgentProfile,
+        canonical: CanonicalScope,
+        project_id: Option<String>,
+        task_id: Option<String>,
+        task_role: Option<String>,
+        authority_json: Value,
+    ) -> Result<AgentSession> {
+        let now = now_rfc3339();
+        let scope = AgentContextScopeRepo::create_context_scope(
+            &*self.db,
+            CreateAgentContextScope {
+                id: new_uuid_v4(),
+                identity_id: identity.id.clone(),
+                scope_type: canonical_scope_name(canonical.scope_type).to_owned(),
+                scope_id: canonical.scope_id.clone(),
+                project_id,
+                task_id,
+                task_role,
+                workspace_access: workspace_access_name(canonical.workspace_access).to_owned(),
+                authority_json: authority_json.to_string(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await?;
+        if let Some(active) =
+            AgentSessionRepo::get_active_agent_session(&*self.db, &identity.id, &scope.id).await?
+        {
+            if active.profile_id == profile.id {
+                return Ok(active);
+            }
+            return self.rotate_authorized_session(&active, &profile).await;
+        }
+        let capabilities = capabilities_for_profile(&profile, &canonical);
+        let (status, connection_status) = self.initial_session_status(&profile).await?;
+        AgentSessionRepo::create_agent_session(
+            &*self.db,
+            CreateAgentSession {
+                id: new_uuid_v4(),
+                identity_id: identity.id,
+                profile_id: profile.id,
+                context_scope_id: scope.id,
+                backend_kind: profile.backend_kind.clone(),
+                runtime_session_id: (profile.backend_kind == "native").then(new_uuid_v4),
+                status,
+                capabilities_json: serde_json::to_string(&capabilities)
+                    .unwrap_or_else(|_| "{}".to_owned()),
+                connection_status,
+                predecessor_session_id: None,
+                last_activity_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn rotate_session(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        expected_version: i64,
+    ) -> Result<AgentSession> {
+        let previous = AgentSessionRepo::get_agent_session(&*self.db, session_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_session", session_id.to_owned()))?;
+        self.require_owned_identity(&previous.identity_id, actor_user_id)
+            .await?;
+        if previous.version != expected_version {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let profile = AgentProfileRepo::get_profile(&*self.db, &previous.profile_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_profile", previous.profile_id.clone()))?;
+        self.rotate_session_for_profile(actor_user_id, &previous, &profile)
+            .await
+    }
+
+    pub async fn set_session_status(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<AgentSession> {
+        if !matches!(status, "ready" | "suspended" | "cancelled") {
+            return Err(ServiceError::invalid_operation(
+                "session status must be ready, suspended, or cancelled",
+            ));
+        }
+        let session = AgentSessionRepo::get_agent_session(&*self.db, session_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_session", session_id.to_owned()))?;
+        self.require_owned_identity(&session.identity_id, actor_user_id)
+            .await?;
+        AgentSessionRepo::update_agent_session(
+            &*self.db,
+            UpdateAgentSession {
+                id: session.id,
+                expected_version,
+                runtime_session_id: None,
+                status: Some(status.to_owned()),
+                connection_status: None,
+                last_activity_at: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn cancel_session_turn(&self, actor_user_id: &str, session_id: &str) -> Result<()> {
+        let session = AgentSessionRepo::get_agent_session(&*self.db, session_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_session", session_id.to_owned()))?;
+        self.require_owned_identity(&session.identity_id, actor_user_id)
+            .await?;
+        if session.backend_kind != "native" {
+            return Err(ServiceError::invalid_operation(
+                "selected backend does not support native cancellation",
+            ));
+        }
+        let runtime_session_id = session.runtime_session_id.ok_or_else(|| {
+            ServiceError::invalid_operation("session has no native runtime identifier")
+        })?;
+        self.native_backend
+            .cancel(&runtime_session_id)
+            .await
+            .map_err(redacted_host_error)
+    }
+
+    pub async fn steer_session_turn(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        content: String,
+    ) -> Result<()> {
+        if content.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "steer content cannot be empty",
+            ));
+        }
+        let session = AgentSessionRepo::get_agent_session(&*self.db, session_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_session", session_id.to_owned()))?;
+        self.require_owned_identity(&session.identity_id, actor_user_id)
+            .await?;
+        if session.backend_kind != "native" {
+            return Err(ServiceError::invalid_operation(
+                "selected backend does not support steering",
+            ));
+        }
+        let runtime_session_id = session.runtime_session_id.ok_or_else(|| {
+            ServiceError::invalid_operation("session has no native runtime identifier")
+        })?;
+        self.native_backend
+            .steer(&runtime_session_id, content)
+            .await
+            .map_err(redacted_host_error)
+    }
+
+    pub async fn list_sessions(
+        &self,
+        actor_user_id: &str,
+        identity_id: &str,
+    ) -> Result<Vec<AgentSession>> {
+        self.require_owned_identity(identity_id, actor_user_id)
+            .await?;
+        AgentSessionRepo::list_agent_sessions(&*self.db, identity_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn effective_permissions(
+        &self,
+        actor_user_id: &str,
+        identity_id: &str,
+        scope_request: &RequestedCanonicalScope,
+    ) -> Result<EffectivePermissions> {
+        let identity = self
+            .require_owned_identity(identity_id, actor_user_id)
+            .await?;
+        let profile = AgentProfileRepo::get_profile(&*self.db, &identity.profile_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_profile", identity.profile_id.clone()))?;
+        let canonical = self
+            .authorize_scope(actor_user_id, &identity, scope_request)
+            .await?;
+        let account_json: String = sqlx::query_scalar(
+            "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        let mut layers = vec![
+            permission_set(&account_json),
+            permission_set(&profile.tool_policy_json),
+        ];
+        let project_id = self.scope_project_id(scope_request).await?;
+        if let Some(project_id) = project_id.as_deref() {
+            // Project/Agent Chat authorization above already requires the
+            // singular Project Agent binding. A Task assignment follows the
+            // existing Task role path and does not inherit Project binding
+            // authority.
+            match scope_request {
+                RequestedCanonicalScope::AgentChat { .. }
+                | RequestedCanonicalScope::Project { .. } => {
+                    let binding =
+                        ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
+                            .await?
+                            .filter(|binding| {
+                                binding.state == "active"
+                                    && binding.identity_id.as_deref() == Some(identity_id)
+                            })
+                            .ok_or_else(|| {
+                                ServiceError::not_found("project_agent_binding", identity_id)
+                            })?;
+                    layers.push(permission_set(&binding.permission_ceiling_json));
+                }
+                RequestedCanonicalScope::Task { .. } => {}
+                RequestedCanonicalScope::Account => unreachable!("Account has no Project id"),
+            }
+        }
+        let project_agent_chat = matches!(scope_request, RequestedCanonicalScope::AgentChat { .. })
+            && canonical.scope_type == CanonicalScopeType::AgentChat
+            && project_id.is_some();
+        layers.push(scope_permission_set(&canonical, project_agent_chat));
+        let allowed = intersect_non_empty_layers(&layers);
+        let known = known_permissions();
+        let denied = known.difference(&allowed).cloned().collect();
+        let requires_approval = allowed
+            .iter()
+            .filter(|permission| permission.starts_with("propose_") || *permission == "task_write")
+            .cloned()
+            .collect();
+        Ok(EffectivePermissions {
+            allowed,
+            denied,
+            requires_approval,
+        })
+    }
+
+    async fn rotate_session_for_profile(
+        &self,
+        actor_user_id: &str,
+        previous: &AgentSession,
+        profile: &AgentProfile,
+    ) -> Result<AgentSession> {
+        self.require_owned_identity(&previous.identity_id, actor_user_id)
+            .await?;
+        self.rotate_authorized_session(previous, profile).await
+    }
+
+    async fn rotate_authorized_session(
+        &self,
+        previous: &AgentSession,
+        profile: &AgentProfile,
+    ) -> Result<AgentSession> {
+        if profile.identity_id != previous.identity_id {
+            return Err(ServiceError::invalid_operation(
+                "replacement profile belongs to another identity",
+            ));
+        }
+        let now = now_rfc3339();
+        let replacement_id = new_uuid_v4();
+        let (status, connection_status) = self.initial_session_status(profile).await?;
+        let scope = AgentContextScopeRepo::get_context_scope(&*self.db, &previous.context_scope_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("agent_context_scope", previous.context_scope_id.clone())
+            })?;
+        let canonical = CanonicalScope {
+            scope_type: parse_canonical_scope_type(&scope.scope_type)?,
+            scope_id: scope.scope_id,
+            workspace_access: parse_workspace_access(&scope.workspace_access)?,
+        };
+        let capabilities = capabilities_for_profile(profile, &canonical);
+        AgentSessionRepo::rotate_agent_session(
+            &*self.db,
+            RotateAgentSession {
+                previous_session_id: previous.id.clone(),
+                expected_version: previous.version,
+                replacement: CreateAgentSession {
+                    id: replacement_id,
+                    identity_id: previous.identity_id.clone(),
+                    profile_id: profile.id.clone(),
+                    context_scope_id: previous.context_scope_id.clone(),
+                    backend_kind: profile.backend_kind.clone(),
+                    runtime_session_id: (profile.backend_kind == "native").then(new_uuid_v4),
+                    status,
+                    capabilities_json: serde_json::to_string(&capabilities)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                    connection_status,
+                    predecessor_session_id: Some(previous.id.clone()),
+                    last_activity_at: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn initial_session_status(&self, profile: &AgentProfile) -> Result<(String, String)> {
+        if profile.backend_kind != "native" {
+            return Ok(("ready".to_owned(), "unknown".to_owned()));
+        }
+        let connection_status =
+            AgentConnectionHealthRepo::get_connection_health(&*self.db, &profile.id)
+                .await?
+                .map(|health| health.status)
+                .unwrap_or_else(|| "unknown".to_owned());
+        let status = if connection_status == "healthy" {
+            "ready"
+        } else {
+            "degraded"
+        };
+        Ok((status.to_owned(), connection_status))
+    }
+
+    async fn require_owned_identity(&self, identity_id: &str, user_id: &str) -> Result<Agent> {
+        AgentRepo::get_by_id(&*self.db, identity_id)
+            .await?
+            .filter(|agent| agent.owner_id.as_deref() == Some(user_id))
+            .ok_or_else(|| ServiceError::not_found("agent", identity_id.to_owned()))
+    }
+
+    async fn authorize_scope(
+        &self,
+        actor_user_id: &str,
+        identity: &Agent,
+        requested: &RequestedCanonicalScope,
+    ) -> Result<CanonicalScope> {
+        match requested {
+            RequestedCanonicalScope::Account => Ok(CanonicalScope {
+                scope_type: CanonicalScopeType::Account,
+                scope_id: actor_user_id.to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            }),
+            RequestedCanonicalScope::Project { project_id } => {
+                require_project_authority(&self.db, actor_user_id, &identity.id, project_id)
+                    .await?;
+                Ok(CanonicalScope {
+                    scope_type: CanonicalScopeType::Project,
+                    scope_id: project_id.clone(),
+                    workspace_access: WorkspaceAccess::Deny,
+                })
+            }
+            RequestedCanonicalScope::AgentChat { chat_id } => {
+                let chat = AgentChatRepo::get_agent_chat(&*self.db, chat_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("agent_chat", chat_id.clone()))?;
+                match chat.kind.as_str() {
+                    "account_main" => {
+                        if chat.account_id.as_deref() != Some(actor_user_id) {
+                            return Err(ServiceError::not_found("agent_chat", chat_id.clone()));
+                        }
+                        AccountMainAgentBindingRepo::get_active_main_binding(
+                            &*self.db,
+                            actor_user_id,
+                        )
+                        .await?
+                        .filter(|binding| {
+                            binding.state == "active" && binding.identity_id == identity.id
+                        })
+                        .ok_or_else(|| {
+                            ServiceError::not_found("main_agent_binding", identity.id.clone())
+                        })?;
+                    }
+                    "project" => {
+                        let project_id = chat.project_id.as_deref().ok_or_else(|| {
+                            ServiceError::not_found("agent_chat", chat_id.clone())
+                        })?;
+                        ProjectMemberRepo::get_member(&*self.db, project_id, actor_user_id)
+                            .await?
+                            .ok_or_else(|| {
+                                ServiceError::not_found("project", project_id.to_owned())
+                            })?;
+                        ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
+                            .await?
+                            .filter(|binding| {
+                                binding.state == "active"
+                                    && binding.identity_id.as_deref() == Some(identity.id.as_str())
+                            })
+                            .ok_or_else(|| {
+                                ServiceError::not_found(
+                                    "project_agent_binding",
+                                    identity.id.clone(),
+                                )
+                            })?;
+                    }
+                    _ => {
+                        return Err(ServiceError::not_found("agent_chat", chat_id.clone()));
+                    }
+                }
+                Ok(CanonicalScope {
+                    scope_type: CanonicalScopeType::AgentChat,
+                    scope_id: chat_id.clone(),
+                    workspace_access: WorkspaceAccess::Deny,
+                })
+            }
+            RequestedCanonicalScope::Task { task_id, role } => {
+                if !matches!(role.as_str(), "worker" | "reviewer") {
+                    return Err(ServiceError::invalid_operation(
+                        "embedded Task sessions support only worker or reviewer roles",
+                    ));
+                }
+                let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+                ProjectMemberRepo::get_member(&*self.db, &task.project_id, actor_user_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+                let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+                let workflow = WorkflowEngine::resolve_workflow_for_task(
+                    &task,
+                    &project.workflow_definition,
+                    &api_types::Actor::system(api_types::SystemComponent::Executor),
+                );
+                let active_role = workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == task.status)
+                    .and_then(effective_role);
+                if !task_role_admitted_by_workflow(active_role, role) {
+                    return Err(ServiceError::invalid_operation(
+                        "embedded Task scope is not admitted by the current workflow state",
+                    ));
+                }
+                // The default Forge workflow calls its implementation role
+                // `coder`, while the embedded authority contract calls the
+                // same write-capable scope a `worker`. Resolve the durable
+                // assignment here without granting anything to an unassigned
+                // identity; reviewers remain an exact role match.
+                let _assignment = TaskRoleAssignmentRepo::list_by_task(&*self.db, task_id)
+                    .await?
+                    .into_iter()
+                    .find(|assignment| {
+                        assignment.assignee_type == Some(AssigneeKind::Agent)
+                            && assignment.assignee_id.as_deref() == Some(identity.id.as_str())
+                            && (assignment.role_name == role.as_str()
+                                || (role == "worker"
+                                    && matches!(assignment.role_name.as_str(), "worker" | "coder")))
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::not_found("task_role_assignment", task_id.clone())
+                    })?;
+                let access = if role == "reviewer" {
+                    WorkspaceAccess::TaskRead
+                } else {
+                    WorkspaceAccess::TaskWrite
+                };
+                // A role-table preassignment is not itself a workspace grant.
+                // The workflow must have admitted the task and a live
+                // execution must exist for this identity.  This prevents a
+                // caller from creating a durable write-capable Task session
+                // before the normal claim/dispatch transaction runs.
+                let active_execution = ExecutionRepo::list_by_task(
+                    &*self.db,
+                    task_id,
+                    PageRequest {
+                        cursor: None,
+                        limit: 100,
+                        include_total: false,
+                        sort_by: SortBy::CreatedAt,
+                        sort_order: SortOrder::Desc,
+                    },
+                )
+                .await?
+                .items
+                .into_iter()
+                .any(|execution| {
+                    execution.status == ExecutionStatus::Running
+                        && execution.agent_id.as_deref() == Some(identity.id.as_str())
+                        && if role == "reviewer" {
+                            execution.role == default_roles::REVIEWER
+                        } else {
+                            matches!(
+                                execution.role.as_str(),
+                                default_roles::WORKER | default_roles::CODER
+                            )
+                        }
+                });
+                let claim_admitted = role != "worker"
+                    || (task.assignee_type.as_deref() == Some("agent")
+                        && task.assignee_id.as_deref() == Some(identity.id.as_str()));
+                if !claim_admitted || !active_execution {
+                    return Err(ServiceError::not_found(
+                        "active_task_execution",
+                        task_id.clone(),
+                    ));
+                }
+                Ok(CanonicalScope {
+                    scope_type: CanonicalScopeType::Task,
+                    scope_id: task_id.clone(),
+                    workspace_access: access,
+                })
+            }
+        }
+    }
+
+    async fn scope_project_id(
+        &self,
+        requested: &RequestedCanonicalScope,
+    ) -> Result<Option<String>> {
+        match requested {
+            RequestedCanonicalScope::Account => Ok(None),
+            RequestedCanonicalScope::Project { project_id } => Ok(Some(project_id.clone())),
+            RequestedCanonicalScope::AgentChat { chat_id } => {
+                Ok(AgentChatRepo::get_agent_chat(&*self.db, chat_id)
+                    .await?
+                    .and_then(|chat| chat.project_id))
+            }
+            RequestedCanonicalScope::Task { task_id, .. } => Ok(Some(
+                TaskRepo::get_by_id(&*self.db, task_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?
+                    .project_id,
+            )),
+        }
+    }
+
+    async fn check_and_record_connection(
+        &self,
+        profile: &AgentProfile,
+        owner_user_id: &str,
+    ) -> Result<AgentConnectionHealth> {
+        let now = now_rfc3339();
+        let (status, error_code) = match self.probe_provider(profile, owner_user_id).await {
+            Ok(()) => ("healthy".to_owned(), None),
+            Err(code) => ("unavailable".to_owned(), Some(code)),
+        };
+        AgentConnectionHealthRepo::upsert_connection_health(
+            &*self.db,
+            UpsertAgentConnectionHealth {
+                profile_id: profile.id.clone(),
+                status,
+                capability_status_json: profile.capabilities_json.clone(),
+                checked_at: Some(now.clone()),
+                error_code,
+                updated_at: now,
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn probe_provider(
+        &self,
+        profile: &AgentProfile,
+        owner_user_id: &str,
+    ) -> std::result::Result<(), String> {
+        let handle = profile
+            .credential_ref
+            .as_deref()
+            .ok_or_else(|| "credential_missing".to_owned())?;
+        let credential = self
+            .protected_store
+            .load_credential(handle, owner_user_id)
+            .await
+            .map_err(|_| "credential_unavailable".to_owned())?;
+        let config: Value = serde_json::from_str(&profile.config_json)
+            .map_err(|_| "profile_config_invalid".to_owned())?;
+        let base_url = config
+            .get("base_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "base_url_missing".to_owned())?;
+        let (parsed, addresses) = provider_url_addresses(base_url)
+            .await
+            .map_err(|_| "provider_endpoint_invalid".to_owned())?;
+        let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "provider_endpoint_invalid".to_owned())?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| "provider_endpoint_invalid".to_owned())?;
+        let response = client
+            .get(endpoint)
+            .bearer_auth(credential.expose())
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    "provider_timeout".to_owned()
+                } else {
+                    "provider_unreachable".to_owned()
+                }
+            })?;
+        if response.status().is_success() {
+            Ok(())
+        } else if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+            Err("provider_authentication_failed".to_owned())
+        } else {
+            Err("provider_health_failed".to_owned())
+        }
+    }
+}
+
+async fn validate_native_connection(
+    name: &str,
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    credential: &str,
+) -> Result<()> {
+    if name.trim().is_empty()
+        || provider.trim().is_empty()
+        || model.trim().is_empty()
+        || credential.trim().is_empty()
+    {
+        return Err(ServiceError::invalid_operation(
+            "name, provider, model, and credential are required",
+        ));
+    }
+    if !matches!(provider, "openai" | "openai_compatible" | "openrouter") {
+        return Err(ServiceError::invalid_operation(
+            "provider is not supported by the embedded runtime",
+        ));
+    }
+    provider_url_addresses(base_url)
+        .await
+        .map_err(ServiceError::invalid_operation)?;
+    Ok(())
+}
+
+async fn provider_url_addresses(
+    base_url: &str,
+) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
+    let parsed = url::Url::parse(base_url).map_err(|_| "base_url must be an absolute URL")?;
+    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err("base_url must not contain userinfo or a fragment");
+    }
+    if parsed.scheme() != "https" {
+        return Err("base_url must use https");
+    }
+    let host = parsed.host().ok_or("base_url must include a host")?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or("base_url has no known port")?;
+    let addresses = match host {
+        url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
+        url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
+        url::Host::Domain(domain) => {
+            if restricted_provider_hostname(domain) {
+                return Err("base_url must not target a local or private hostname");
+            }
+            tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|_| "base_url hostname could not be resolved")?
+                .collect::<Vec<_>>()
+        }
+    };
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| restricted_provider_ip(address.ip()))
+    {
+        return Err("base_url must not target a private or local address");
+    }
+    Ok((parsed, addresses))
+}
+
+fn restricted_provider_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".home.arpa")
+}
+
+fn restricted_provider_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_loopback()
+                || address.is_unspecified()
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0] & 0xfe00) == 0xfc00
+                || segments[0] >= 0xff00
+                || address
+                    .to_ipv4()
+                    .is_some_and(|mapped| restricted_provider_ip(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+fn validate_public_runtime_text(value: Option<&str>) -> Result<Option<String>> {
+    value
+        .map(|text| guard_runtime_content(text).map(|guarded| guarded.content))
+        .transpose()
+}
+
+fn validate_public_runtime_json(value: &Value) -> Result<()> {
+    match value {
+        Value::String(text) => {
+            guard_runtime_content(text)?;
+        }
+        Value::Array(values) => {
+            for value in values {
+                validate_public_runtime_json(value)?;
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let key = key.to_ascii_lowercase();
+                if is_protected_runtime_field(&key) && !value.is_null() {
+                    return Err(ServiceError::invalid_operation(
+                        "protected values cannot be stored in ordinary runtime policy",
+                    ));
+                }
+                validate_public_runtime_json(value)?;
+            }
+        }
+        Value::Bool(_) | Value::Null | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn is_protected_runtime_field(key: &str) -> bool {
+    let compact: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    [
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "password",
+        "private_key",
+        "secret",
+    ]
+    .iter()
+    .any(|marker| {
+        key == *marker || key.contains(marker) || compact.contains(&marker.replace('_', ""))
+    }) || key == "token"
+        || key.ends_with("_token")
+        || compact == "token"
+        || compact.ends_with("token")
+}
+
+fn native_config_json(
+    base_url: &str,
+    context_tokens: Option<u32>,
+    max_input_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> Value {
+    json!({
+        "base_url": base_url.trim_end_matches('/'),
+        "context_tokens": context_tokens.unwrap_or(DEFAULT_CONTEXT_TOKENS),
+        "max_input_tokens": max_input_tokens.unwrap_or(DEFAULT_MAX_INPUT_TOKENS),
+        "max_output_tokens": max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+        "runtime_revision": forge_agent_host::AGENT_RUNTIME_REVISION,
+    })
+}
+
+fn native_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        native_runtime: true,
+        persistent_session: true,
+        protected_checkpoints: true,
+        lcm: true,
+        cancel: true,
+        steer: true,
+        workspace: WorkspaceAccess::Deny,
+    }
+}
+
+fn capabilities_for_profile(
+    profile: &AgentProfile,
+    canonical: &CanonicalScope,
+) -> BackendCapabilities {
+    if profile.backend_kind == "native" {
+        BackendCapabilities {
+            workspace: canonical.workspace_access,
+            ..native_capabilities()
+        }
+    } else {
+        BackendCapabilities {
+            native_runtime: false,
+            persistent_session: false,
+            protected_checkpoints: false,
+            lcm: false,
+            cancel: true,
+            steer: false,
+            workspace: canonical.workspace_access,
+        }
+    }
+}
+
+async fn require_project_authority(
+    db: &SqliteDb,
+    user_id: &str,
+    identity_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    ProjectMemberRepo::get_member(db, project_id, user_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+    ProjectAgentBindingRepo::get_active_project_binding(db, project_id)
+        .await?
+        .filter(|binding| {
+            binding.state == "active" && binding.identity_id.as_deref() == Some(identity_id)
+        })
+        .ok_or_else(|| ServiceError::not_found("project_agent_binding", identity_id.to_owned()))?;
+    Ok(())
+}
+
+fn canonical_scope_name(scope: CanonicalScopeType) -> &'static str {
+    match scope {
+        CanonicalScopeType::Account => "account",
+        CanonicalScopeType::Project => "project",
+        CanonicalScopeType::AgentChat => "agent_chat",
+        CanonicalScopeType::Task => "task",
+    }
+}
+
+fn parse_canonical_scope_type(value: &str) -> Result<CanonicalScopeType> {
+    match value {
+        "account" => Ok(CanonicalScopeType::Account),
+        "project" => Ok(CanonicalScopeType::Project),
+        "agent_chat" => Ok(CanonicalScopeType::AgentChat),
+        "task" => Ok(CanonicalScopeType::Task),
+        _ => Err(ServiceError::invalid_operation(
+            "stored canonical scope type is invalid",
+        )),
+    }
+}
+
+fn workspace_access_name(access: WorkspaceAccess) -> &'static str {
+    match access {
+        WorkspaceAccess::Deny => "deny",
+        WorkspaceAccess::TaskRead => "task_read",
+        WorkspaceAccess::TaskWrite => "task_write",
+    }
+}
+
+fn parse_workspace_access(value: &str) -> Result<WorkspaceAccess> {
+    match value {
+        "deny" => Ok(WorkspaceAccess::Deny),
+        "task_read" => Ok(WorkspaceAccess::TaskRead),
+        "task_write" => Ok(WorkspaceAccess::TaskWrite),
+        _ => Err(ServiceError::invalid_operation(
+            "stored workspace access is invalid",
+        )),
+    }
+}
+
+fn canonical_task_id(scope: &RequestedCanonicalScope) -> Option<String> {
+    match scope {
+        RequestedCanonicalScope::Task { task_id, .. } => Some(task_id.clone()),
+        _ => None,
+    }
+}
+
+fn canonical_task_role(scope: &RequestedCanonicalScope) -> Option<String> {
+    match scope {
+        RequestedCanonicalScope::Task { role, .. } => Some(role.clone()),
+        _ => None,
+    }
+}
+
+fn scope_authority_json(user_id: &str, scope: &RequestedCanonicalScope) -> Value {
+    json!({
+        "issued_to_user_id": user_id,
+        "scope": scope,
+        "revision": 1,
+    })
+}
+
+fn permission_set(value: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<Value>(value) else {
+        return BTreeSet::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        Value::Object(map) => map
+            .get("permissions")
+            .or_else(|| map.get("allowed"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn scope_permission_set(scope: &CanonicalScope, project_agent_chat: bool) -> BTreeSet<String> {
+    let mut values: Vec<&str> = match scope.scope_type {
+        CanonicalScopeType::Account => vec![
+            "read_account",
+            "propose_discovery",
+            "propose_project",
+            "propose_handoff",
+            "propose_message",
+            "propose_commitment",
+            "propose_memory",
+            "propose_session",
+        ],
+        CanonicalScopeType::Project => vec![
+            "read_project",
+            "read_memory",
+            "propose_task",
+            "propose_message",
+            "propose_commitment",
+            "propose_memory",
+            "propose_review",
+            "propose_decision",
+            "propose_session",
+        ],
+        CanonicalScopeType::AgentChat => vec![
+            "read_agent_chat",
+            "read_memory",
+            "propose_message",
+            "propose_commitment",
+            "propose_memory",
+            "propose_session",
+        ],
+        CanonicalScopeType::Task => match scope.workspace_access {
+            WorkspaceAccess::TaskRead => {
+                vec!["read_task", "read_memory", "task_read", "propose_review"]
+            }
+            WorkspaceAccess::TaskWrite => {
+                vec!["read_task", "read_memory", "task_read", "task_write"]
+            }
+            WorkspaceAccess::Deny => Vec::new(),
+        },
+    };
+    if scope.scope_type == CanonicalScopeType::AgentChat && project_agent_chat {
+        values.push("propose_task");
+    } else if scope.scope_type == CanonicalScopeType::AgentChat {
+        values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
+    }
+    values.into_iter().map(str::to_owned).collect()
+}
+
+fn known_permissions() -> BTreeSet<String> {
+    [
+        "read_account",
+        "read_project",
+        "read_agent_chat",
+        "read_task",
+        "read_memory",
+        "propose_task",
+        "propose_discovery",
+        "propose_project",
+        "propose_handoff",
+        "propose_message",
+        "propose_review",
+        "propose_commitment",
+        "propose_memory",
+        "propose_decision",
+        "propose_session",
+        "task_read",
+        "task_write",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn intersect_non_empty_layers(layers: &[BTreeSet<String>]) -> BTreeSet<String> {
+    let Some(first) = layers.first() else {
+        return BTreeSet::new();
+    };
+    // Every layer is a required ceiling.  Malformed JSON is represented by
+    // an empty set and must deny all permissions instead of disappearing
+    // from the intersection (which would be fail-open).
+    layers.iter().skip(1).fold(first.clone(), |allowed, layer| {
+        allowed.intersection(layer).cloned().collect()
+    })
+}
+
+fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError {
+    match error {
+        forge_agent_host::AgentHostError::CredentialNotFound
+        | forge_agent_host::AgentHostError::SessionNotFound => {
+            ServiceError::not_found("protected_runtime_resource", "unavailable")
+        }
+        forge_agent_host::AgentHostError::Authority(message)
+        | forge_agent_host::AgentHostError::Configuration(message)
+        | forge_agent_host::AgentHostError::Unsupported(message) => {
+            ServiceError::invalid_operation(message)
+        }
+        forge_agent_host::AgentHostError::Runtime(_) => {
+            ServiceError::Domain("embedded runtime failed".to_owned())
+        }
+        forge_agent_host::AgentHostError::ProtectedPersistence => {
+            ServiceError::Domain("protected runtime persistence failed".to_owned())
+        }
+    }
+}
+
+fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &str) -> bool {
+    match requested_role {
+        "reviewer" => active_role == Some(default_roles::REVIEWER),
+        "worker" => matches!(
+            active_role,
+            Some(default_roles::WORKER | default_roles::CODER)
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_intersection_never_expands_authority() {
+        let account = permission_set(r#"["read_project","read_memory","propose_task"]"#);
+        let profile = permission_set(r#"{"allowed":["read_project","propose_task"]}"#);
+        let scope: BTreeSet<String> = ["read_project", "read_memory"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let effective = intersect_non_empty_layers(&[account, profile, scope]);
+        assert_eq!(effective, BTreeSet::from(["read_project".to_owned()]));
+    }
+
+    #[test]
+    fn task_is_the_only_scope_that_can_admit_workspace_access() {
+        for scope_type in [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::AgentChat,
+        ] {
+            let scope = CanonicalScope {
+                scope_type,
+                scope_id: "scope".to_owned(),
+                workspace_access: WorkspaceAccess::TaskRead,
+            };
+            assert!(scope.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn non_task_scope_tool_permissions_never_include_task_workspace_authority() {
+        for scope_type in [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::AgentChat,
+        ] {
+            let permissions = scope_permission_set(
+                &CanonicalScope {
+                    scope_type,
+                    scope_id: "scope".to_owned(),
+                    workspace_access: WorkspaceAccess::Deny,
+                },
+                false,
+            );
+            assert!(!permissions.contains("task_read"));
+            assert!(!permissions.contains("task_write"));
+            assert_eq!(
+                permissions.contains("propose_review"),
+                scope_type == CanonicalScopeType::Project,
+                "a review request is a Project-scoped proposal, not Task workspace authority"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_empty_required_layer_denies_all_permissions() {
+        let account = permission_set(r#"["read_project","read_memory"]"#);
+        let malformed = permission_set("not-json");
+        let scope = BTreeSet::from(["read_project".to_owned()]);
+        assert!(intersect_non_empty_layers(&[account.clone(), malformed, scope]).is_empty());
+        assert!(intersect_non_empty_layers(&[account, BTreeSet::new()]).is_empty());
+    }
+
+    #[test]
+    fn task_role_requires_the_current_workflow_state() {
+        assert!(task_role_admitted_by_workflow(
+            Some(default_roles::CODER),
+            "worker"
+        ));
+        assert!(task_role_admitted_by_workflow(
+            Some(default_roles::WORKER),
+            "worker"
+        ));
+        assert!(task_role_admitted_by_workflow(
+            Some(default_roles::REVIEWER),
+            "reviewer"
+        ));
+        assert!(!task_role_admitted_by_workflow(None, "worker"));
+        assert!(!task_role_admitted_by_workflow(
+            Some(default_roles::PLANNER),
+            "worker"
+        ));
+        assert!(!task_role_admitted_by_workflow(
+            Some(default_roles::CODER),
+            "reviewer"
+        ));
+    }
+}

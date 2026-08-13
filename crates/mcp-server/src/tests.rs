@@ -1,14 +1,18 @@
 use std::{future::Future, sync::Arc};
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentRepo, AgentStatus,
-    AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentChatMessageListQuery,
+    AgentChatMessageRepo, AgentChatRepo, AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo,
+    AgentStatus, AssigneeKind, CreateAgent, CreateAgentIdentity, CreateAgentProfile,
+    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask,
     CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus,
-    ProjectRepo, RepoRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject,
-    UpsertDaemon,
+    PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, SortBy,
+    SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
+    UserRepo,
 };
 use events::EventBus;
 use serde_json::{json, Value};
+use services::{SetMainAgentBindingInput, SetProjectAgentBindingInput};
 
 use crate::{
     protocol::McpContext,
@@ -30,6 +34,139 @@ async fn sqlite_state() -> AppState {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     AppState::new(Arc::new(SqliteDb::new(pool)), Arc::new(EventBus::new(16)))
+}
+
+async fn seed_chat_account(state: &AppState) -> (String, String, String) {
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &*state.db,
+        &db::User {
+            id: "chat-user".to_owned(),
+            email: "chat-user@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat user creates");
+
+    let identity_id = new_uuid_v4();
+    let profile_id = new_uuid_v4();
+    AgentRepo::create_identity_with_profile(
+        &*state.db,
+        CreateAgentIdentity {
+            id: identity_id.clone(),
+            name: "MCP Chat Agent".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some("chat-user".to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        CreateAgentProfile {
+            id: profile_id.clone(),
+            identity_id: identity_id.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("test".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat identity creates");
+
+    state
+        .agent_chat_service
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: "chat-user".to_owned(),
+            account_id: "chat-user".to_owned(),
+            identity_id: identity_id.clone(),
+            profile_id: profile_id.clone(),
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "test".to_owned(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .expect("main binding creates");
+    (identity_id, profile_id, "chat-user".to_owned())
+}
+
+async fn seed_chat_project(state: &AppState, identity_id: &str, profile_id: &str) -> String {
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+    ProjectRepo::create(
+        &*state.db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "MCP Chat Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("chat-user".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat project creates");
+    ProjectMemberRepo::add_member(
+        &*state.db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: "chat-user".to_owned(),
+            role: "owner".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat project member creates");
+    let expected_version =
+        ProjectAgentBindingRepo::get_active_project_binding(&*state.db, &project_id)
+            .await
+            .expect("project binding lookup")
+            .map(|binding| binding.version);
+    state
+        .agent_chat_service
+        .set_project_binding(SetProjectAgentBindingInput {
+            actor_user_id: "chat-user".to_owned(),
+            project_id: project_id.clone(),
+            identity_id: Some(identity_id.to_owned()),
+            profile_id: Some(profile_id.to_owned()),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 1,
+            expected_version,
+            replacement_reason: None,
+        })
+        .await
+        .expect("project binding creates");
+    project_id
 }
 
 async fn seed_project_repo(state: &AppState) -> (String, String) {
@@ -333,6 +470,7 @@ fn tools_list_returns_descriptors() {
             "forge_add_task_dependency",
             "forge_assign_agent",
             "forge_cancel_task",
+            "forge_create_agent_handoff",
             "forge_create_project",
             "forge_create_sub_tasks",
             "forge_create_task",
@@ -340,8 +478,18 @@ fn tools_list_returns_descriptors() {
             "forge_memory_get",
             "forge_memory_search",
             "forge_get_project",
+            "forge_get_agent_session",
+            "forge_get_agent_chat",
+            "forge_get_agent_handoff",
+            "forge_get_main_agent",
+            "forge_get_project_agent",
             "forge_get_task",
             "forge_get_task_diff",
+            "forge_list_agent_profiles",
+            "forge_list_agent_chat_messages",
+            "forge_list_agent_chats",
+            "forge_list_agent_handoffs",
+            "forge_list_agent_sessions",
             "forge_list_agents",
             "forge_list_executions",
             "forge_list_projects",
@@ -350,6 +498,9 @@ fn tools_list_returns_descriptors() {
             "forge_preview_prompt",
             "forge_register_agent",
             "forge_remove_task_dependency",
+            "forge_send_agent_chat_message",
+            "forge_set_main_agent",
+            "forge_set_project_agent",
             "forge_transition_task",
             "forge_update_project",
             "forge_update_project_lifecycle_hooks",
@@ -362,6 +513,27 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+    });
+}
+
+#[test]
+fn revised_public_surface_does_not_advertise_retired_collaboration_tools() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let names = result["tools"]
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.iter().all(|name| !name.contains("room")));
+        assert!(names.iter().all(|name| !name.contains("membership")));
+        assert!(names.contains(&"forge_list_agent_chats"));
+        assert!(names.contains(&"forge_send_agent_chat_message"));
+        assert!(names.contains(&"forge_create_agent_handoff"));
     });
 }
 
@@ -414,6 +586,266 @@ fn unknown_method_returns_method_not_found() {
             .await
             .expect_err("unknown method errors");
         assert_eq!(error.code, -32601);
+    });
+}
+
+#[test]
+fn embedded_read_tools_require_authenticated_server_identity() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let error = dispatch(
+            &state,
+            "tools/call",
+            json!({
+                "name": "forge_list_agent_profiles",
+                "arguments": { "identity_id": "identity-1" }
+            }),
+        )
+        .await
+        .expect_err("profile reads must not accept an unbound caller identity");
+        assert_eq!(error.code, -32001);
+
+        let error = dispatch(
+            &state,
+            "tools/call",
+            json!({
+                "name": "forge_get_main_agent",
+                "arguments": {}
+            }),
+        )
+        .await
+        .expect_err("binding reads must bind to the authenticated account");
+        assert_eq!(error.code, -32001);
+    });
+}
+
+#[test]
+fn revised_chat_mutations_fail_closed_for_unknown_chat_without_room_fallback() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (_identity_id, _profile_id, user_id) = seed_chat_account(&state).await;
+        let context = McpContext {
+            project_id: None,
+            user_id: Some(user_id),
+        };
+        let error = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({
+                "name": "forge_send_agent_chat_message",
+                "arguments": { "chat_id": "chat-1", "content": "hello" }
+            }),
+        )
+        .await
+        .expect_err("chat send must not fall back to Room persistence");
+        assert_eq!(error.code, -32004);
+    });
+}
+
+#[test]
+fn mcp_chat_send_uses_atomic_admission_and_deduplicates() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (_identity_id, _profile_id, user_id) = seed_chat_account(&state).await;
+        let chat = state
+            .agent_chat_service
+            .ensure_main_chat(&user_id)
+            .await
+            .expect("main chat");
+        let context = McpContext {
+            project_id: None,
+            user_id: Some(user_id.clone()),
+        };
+
+        let rejected = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({
+                "name": "forge_send_agent_chat_message",
+                "arguments": {
+                    "chat_id": chat.id,
+                    "content": "Authorization: Bearer should-not-persist"
+                }
+            }),
+        )
+        .await
+        .expect_err("protected content is rejected before admission");
+        assert_eq!(rejected.code, -32602);
+
+        let messages = AgentChatMessageRepo::list_agent_chat_messages(
+            &*state.db,
+            AgentChatMessageListQuery {
+                chat_id: chat.id.clone(),
+                before_sequence: None,
+                page: PageRequest {
+                    cursor: None,
+                    limit: 100,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Asc,
+                },
+            },
+        )
+        .await
+        .expect("message count");
+        assert!(messages.items.is_empty());
+
+        let request = json!({
+            "name": "forge_send_agent_chat_message",
+            "arguments": {
+                "chat_id": chat.id.clone(),
+                "content": "Continue with the accepted brief",
+                "dedupe_key": "mcp-send-once"
+            }
+        });
+        let first = dispatch_with_context(&state, &context, "tools/call", request.clone())
+            .await
+            .expect("atomic MCP send");
+        let first_payload: Value = serde_json::from_str(
+            first["content"][0]["text"]
+                .as_str()
+                .expect("MCP text result"),
+        )
+        .expect("MCP JSON result");
+        let second = dispatch_with_context(&state, &context, "tools/call", request)
+            .await
+            .expect("idempotent MCP send replay");
+        let second_payload: Value = serde_json::from_str(
+            second["content"][0]["text"]
+                .as_str()
+                .expect("MCP text result"),
+        )
+        .expect("MCP JSON result");
+        assert_eq!(
+            first_payload["message"]["id"],
+            second_payload["message"]["id"]
+        );
+
+        let messages = AgentChatMessageRepo::list_agent_chat_messages(
+            &*state.db,
+            AgentChatMessageListQuery {
+                chat_id: chat.id.clone(),
+                before_sequence: None,
+                page: PageRequest {
+                    cursor: None,
+                    limit: 100,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Asc,
+                },
+            },
+        )
+        .await
+        .expect("message count");
+        let turns = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &chat.id)
+            .await
+            .expect("turn count");
+        assert_eq!(messages.items.len(), 1);
+        assert_eq!(turns.len(), 1);
+    });
+}
+
+#[test]
+fn mcp_handoff_admits_delivery_and_target_turn_atomically() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (identity_id, profile_id, user_id) = seed_chat_account(&state).await;
+        let project_id = seed_chat_project(&state, &identity_id, &profile_id).await;
+        let context = McpContext {
+            project_id: None,
+            user_id: Some(user_id.clone()),
+        };
+        let request = json!({
+            "name": "forge_create_agent_handoff",
+            "arguments": {
+                "project_id": project_id,
+                "content": "Approved brief for the Project Agent",
+                "dedupe_key": "mcp-handoff-once"
+            }
+        });
+
+        let first = dispatch_with_context(&state, &context, "tools/call", request.clone())
+            .await
+            .expect("atomic handoff");
+        let first_payload: Value = serde_json::from_str(
+            first["content"][0]["text"]
+                .as_str()
+                .expect("MCP text result"),
+        )
+        .expect("MCP JSON result");
+        assert_eq!(first_payload["status"], "delivered");
+        assert!(first_payload["target_message_id"].as_str().is_some());
+        assert!(first_payload["target_turn_job_id"].as_str().is_some());
+
+        let second = dispatch_with_context(&state, &context, "tools/call", request)
+            .await
+            .expect("idempotent handoff replay");
+        let second_payload: Value = serde_json::from_str(
+            second["content"][0]["text"]
+                .as_str()
+                .expect("MCP text result"),
+        )
+        .expect("MCP JSON result");
+        assert_eq!(
+            first_payload["id"], second_payload["id"],
+            "dedupe returns the original handoff"
+        );
+
+        let handoff_id = first_payload["id"].as_str().expect("handoff id");
+        let target_chat = AgentChatRepo::get_project_chat(&*state.db, &project_id)
+            .await
+            .expect("target chat lookup")
+            .expect("target chat exists");
+        let handoffs = AgentHandoffRepo::list_agent_handoffs(&*state.db, &target_chat.id)
+            .await
+            .expect("handoff count");
+        let target_messages = AgentChatMessageRepo::list_agent_chat_messages(
+            &*state.db,
+            AgentChatMessageListQuery {
+                chat_id: target_chat.id.clone(),
+                before_sequence: None,
+                page: PageRequest {
+                    cursor: None,
+                    limit: 100,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Asc,
+                },
+            },
+        )
+        .await
+        .expect("target message count");
+        let target_turns =
+            AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &target_chat.id)
+                .await
+                .expect("target turn count");
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].id, handoff_id);
+        assert_eq!(
+            handoffs[0].target_message_id.as_deref(),
+            first_payload["target_message_id"].as_str()
+        );
+        assert_eq!(
+            handoffs[0].target_turn_job_id.as_deref(),
+            first_payload["target_turn_job_id"].as_str()
+        );
+        assert_eq!(
+            target_messages
+                .items
+                .iter()
+                .filter(|message| message.handoff_id.as_deref() == Some(handoff_id))
+                .count(),
+            1
+        );
+        assert_eq!(
+            target_turns
+                .iter()
+                .filter(|turn| turn.causation_id.as_deref() == Some(handoff_id))
+                .count(),
+            1
+        );
     });
 }
 
@@ -473,6 +905,35 @@ fn scoped_mcp_injects_project_id_for_project_tools() {
 }
 
 #[test]
+fn forge_create_task_persists_validated_task_type() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        for (task_type, title) in [
+            ("discovery", "Discovery task"),
+            ("planning_task", "Planning task"),
+        ] {
+            let result = call_tool(
+                &state,
+                "forge_create_task",
+                json!({
+                    "project_id": project_id,
+                    "title": title,
+                    "type": task_type
+                }),
+            )
+            .await;
+            let task_id = result["id"].as_str().expect("task id");
+            let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+                .await
+                .expect("task lookup succeeds")
+                .expect("task persists");
+            assert_eq!(task.task_type, task_type);
+        }
+    });
+}
+
+#[test]
 fn forge_create_task_rejects_invalid_priority_with_field_error() {
     run_async(async {
         let state = sqlite_state().await;
@@ -516,7 +977,7 @@ fn forge_create_task_rejects_invalid_type_with_field_error() {
         assert_eq!(data["field"], "type");
         assert_eq!(
             data["accepted"]["enum"],
-            json!(["task", "planning_task", "sub_task"])
+            json!(["task", "planning_task", "sub_task", "discovery"])
         );
     });
 }

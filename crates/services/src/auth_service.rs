@@ -358,10 +358,14 @@ impl AuthService {
             .execute(&mut *tx)
             .await?;
 
-        sqlx::query("UPDATE agent SET owner_id = ?, visibility = 'account' WHERE owner_id IS NULL")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE agent_identity
+             SET owner_id = ?, visibility = 'account'
+             WHERE owner_id IS NULL",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             "UPDATE daemon SET owner_id = ?, visibility = 'account' WHERE owner_id IS NULL",
@@ -503,12 +507,45 @@ fn is_valid_email(email: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{create_sqlite_pool, run_migrations, SqliteDb};
+    use db::{create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, SqliteDb};
 
     async fn test_service() -> AuthService {
         let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
         run_migrations(&pool).await.unwrap();
         AuthService::new(Arc::new(SqliteDb::new(pool)), b"test-secret".to_vec(), 4)
+    }
+
+    async fn seed_orphan_agent(db: &SqliteDb, id: &str, name: &str, is_default: bool) {
+        let now = now_rfc3339();
+        AgentRepo::create(
+            db,
+            CreateAgent {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 60,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("orphan agent inserts");
     }
 
     #[tokio::test]
@@ -743,9 +780,7 @@ mod tests {
         let db = &svc.db;
         let now = now_rfc3339();
 
-        sqlx::query("INSERT INTO agent (id, name, executor_type, capabilities_json, config_json, max_concurrent_tasks, heartbeat_interval_seconds, max_missed_heartbeats, status, is_default, paused, visibility, version, created_at, updated_at) VALUES ('a1', 'agent1', 'shell', '[]', '{}', 1, 60, 3, 'idle', 1, 0, 'global', 1, ?, ?)")
-            .bind(&now).bind(&now)
-            .execute(db.pool()).await.unwrap();
+        seed_orphan_agent(db, "a1", "agent1", true).await;
 
         sqlx::query("INSERT INTO daemon (id, machine_id, hostname, os, arch, labels_json, status, detected_clis_json, visibility, version, created_at, updated_at) VALUES ('d1', 'm1', 'h1', 'linux', 'x86_64', '{}', 'online', '[]', 'global', 1, ?, ?)")
             .bind(&now).bind(&now)
@@ -761,7 +796,7 @@ mod tests {
             .expect("register succeeds");
 
         let (agent_owner, agent_visibility): (Option<String>, String) =
-            sqlx::query_as("SELECT owner_id, visibility FROM agent WHERE id = 'a1'")
+            sqlx::query_as("SELECT owner_id, visibility FROM agent_identity WHERE id = 'a1'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
@@ -797,16 +832,13 @@ mod tests {
     async fn bootstrap_second_user_does_not_claim() {
         let svc = test_service().await;
         let db = &svc.db;
-        let now = now_rfc3339();
 
         let _first = svc
             .register("first@test.com", "password123", None)
             .await
             .expect("first user");
 
-        sqlx::query("INSERT INTO agent (id, name, executor_type, capabilities_json, config_json, max_concurrent_tasks, heartbeat_interval_seconds, max_missed_heartbeats, status, is_default, paused, visibility, version, created_at, updated_at) VALUES ('a2', 'agent2', 'shell', '[]', '{}', 1, 60, 3, 'idle', 0, 0, 'global', 1, ?, ?)")
-            .bind(&now).bind(&now)
-            .execute(db.pool()).await.unwrap();
+        seed_orphan_agent(db, "a2", "agent2", false).await;
 
         let _second = svc
             .register("second@test.com", "password456", None)
@@ -814,7 +846,7 @@ mod tests {
             .expect("second user");
 
         let agent_owner: Option<String> =
-            sqlx::query_scalar("SELECT owner_id FROM agent WHERE id = 'a2'")
+            sqlx::query_scalar("SELECT owner_id FROM agent_identity WHERE id = 'a2'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();

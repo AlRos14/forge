@@ -4,41 +4,20 @@ use serde_json::Value;
 use crate::Result;
 
 pub(crate) async fn count_running_executions(db: &db::SqliteDb, agent_id: &str) -> Result<i64> {
-    count_running_executions_for_agent(db, agent_id, None).await
-}
-
-pub(crate) async fn count_running_executions_excluding_conversation(
-    db: &db::SqliteDb,
-    agent_id: &str,
-    conversation_id: &str,
-) -> Result<i64> {
-    count_running_executions_for_agent(db, agent_id, Some(conversation_id)).await
-}
-
-async fn count_running_executions_for_agent(
-    db: &db::SqliteDb,
-    agent_id: &str,
-    exclude_conversation_id: Option<&str>,
-) -> Result<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
         "SELECT
             (
                 SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'
             ) +
             (
-                SELECT COUNT(DISTINCT conversation.id)
-                FROM conversation
-                JOIN conversation_message ON conversation_message.conversation_id = conversation.id
-                WHERE conversation.agent_id = ?
-                  AND conversation_message.role = 'assistant'
-                  AND conversation_message.status = 'streaming'
-                  AND (? IS NULL OR conversation.id != ?)
+                SELECT COUNT(*)
+                FROM agent_chat_turn_job
+                WHERE responder_identity_id = ?
+                  AND status IN ('leased', 'running')
             )",
     )
     .bind(agent_id)
     .bind(agent_id)
-    .bind(exclude_conversation_id)
-    .bind(exclude_conversation_id)
     .fetch_one(db.pool())
     .await?)
 }
@@ -74,17 +53,15 @@ pub(crate) async fn count_running_executions_for_daemon(
             (
                 SELECT COUNT(*)
                 FROM execution
-                JOIN agent ON agent.id = execution.agent_id
+                JOIN agent_current AS agent ON agent.id = execution.agent_id
                 WHERE agent.daemon_id = ? AND execution.status = 'running'
             ) +
             (
-                SELECT COUNT(DISTINCT conversation.id)
-                FROM conversation
-                JOIN agent ON agent.id = conversation.agent_id
-                JOIN conversation_message ON conversation_message.conversation_id = conversation.id
+                SELECT COUNT(*)
+                FROM agent_chat_turn_job
+                JOIN agent_current AS agent ON agent.id = agent_chat_turn_job.responder_identity_id
                 WHERE agent.daemon_id = ?
-                  AND conversation_message.role = 'assistant'
-                  AND conversation_message.status = 'streaming'
+                  AND agent_chat_turn_job.status IN ('leased', 'running')
             )",
     )
     .bind(daemon_id)

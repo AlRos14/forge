@@ -7,7 +7,6 @@ import type {
   OperatorStatusResponse,
   PaginatedResponse,
   ProjectAnalyticsResponse,
-  ProjectAgentLinkResponse,
   ProjectMemberResponse,
   UpdateProfileRequest,
   UserResponse,
@@ -328,24 +327,6 @@ export function listMembers(projectId: string): Promise<ProjectMemberResponse[]>
 
 export function listProjectAgents(projectId: string): Promise<Agent[]> {
   return apiFetch<Agent[]>(`/projects/${projectId}/agents`)
-}
-
-export function listProjectAgentLinks(projectId: string): Promise<ProjectAgentLinkResponse[]> {
-  return apiFetch<ProjectAgentLinkResponse[]>(`/projects/${projectId}/agent-links`)
-}
-
-export function createProjectAgentLink(
-  projectId: string,
-  agentId: string,
-): Promise<ProjectAgentLinkResponse> {
-  return apiFetch<ProjectAgentLinkResponse>(`/projects/${projectId}/agent-links`, {
-    method: 'POST',
-    body: JSON.stringify({ agent_id: agentId }),
-  })
-}
-
-export function deleteProjectAgentLink(projectId: string, agentId: string): Promise<void> {
-  return apiFetch<void>(`/projects/${projectId}/agent-links/${agentId}`, { method: 'DELETE' })
 }
 
 export function addMember(

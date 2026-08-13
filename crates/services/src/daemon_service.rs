@@ -384,7 +384,7 @@ impl DaemonService {
         let exists = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
                 SELECT 1
-                FROM agent
+                FROM agent_current
                 WHERE daemon_id = ?
                   AND executor_type = ?
                   AND owner_id = ?

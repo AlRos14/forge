@@ -49,6 +49,20 @@ cargo run -p forge-cli         # plain start, data in ~/.forge/
 cargo run -p forge-cli -- --demo  # seed labelled demo data (idempotent)
 ```
 
+The embedded host pins Agent Runtime revision
+`a7075b1d2dd1cee05db63bc480ff46b0f97ec239` and requires Rust 1.86 or newer.
+Cargo fetches that revision normally. Contributors developing both repositories
+side by side may add this gitignored local override to `.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/ForgeAILab/agent-runtime.git"]
+agent-runtime = { path = "../agent-runtime/crates/agent-runtime" }
+agent-runtime-core = { path = "../agent-runtime/crates/agent-runtime-core" }
+agent-runtime-lcm = { path = "../agent-runtime/crates/agent-runtime-lcm" }
+```
+
+Do not commit the local patch or replace the immutable dependency revision.
+
 ### Docker
 
 ```bash
@@ -138,6 +152,78 @@ catalogs are provider- or installation-defined.
 
 The `shell` executor is always available and useful for scripted tests — see the
 walkthrough below.
+
+## Connecting a direct embedded agent
+
+An embedded agent is account-owned and does not need a Project. The connection
+endpoint stores the provider credential through a protected write-only boundary;
+responses contain an opaque credential handle, bounded health, and capabilities,
+never the credential value.
+
+```bash
+read -rsp 'Provider API key: ' PROVIDER_KEY; printf '\n'
+
+CONNECTED=$(curl -sS -X POST "$FORGE_URL/api/v1/embedded-agents/connect" \
+  -H 'content-type: application/json' \
+  -d "$(jq -n --arg key "$PROVIDER_KEY" '{
+    name: "my-forge-agent",
+    description: "A persistent account assistant",
+    provider: "openai",
+    base_url: "https://api.openai.com/v1",
+    model: "gpt-5.6-terra",
+    credential_label: "primary",
+    credential: $key
+  }')")
+unset PROVIDER_KEY
+
+AGENT_ID=$(jq -r .agent.id <<<"$CONNECTED")
+```
+
+The connection endpoint above is the implemented foundation: it creates a
+stable account-owned identity and immutable profile while keeping the provider
+credential behind a protected write-only boundary. It does not select a chat
+binding or grant Project/Task authority. Main and Project Agent Chat sessions
+remain filesystem-denied; only an identity admitted through the existing Task
+Worker/reviewer assignment and workflow can receive a Task Workspace.
+
+## Main Agent and Project Agent Chats
+
+The approved product model has one global Main Agent binding/chat per account
+and exactly one Project Agent binding/chat per operational Project. A connected
+but unbound identity stays available for later selection and does not appear as
+an extra chat-switcher entry. The revised binding and chat resources are:
+
+- Main binding: `/api/v1/account/main-agent`
+- Project binding: `/api/v1/projects/{project_id}/project-agent`
+- Chat switcher and messages: `/api/v1/agent-chats` and
+  `/api/v1/agent-chats/{chat_id}/messages`
+- Main-to-Project handoff: `/api/v1/projects/{project_id}/agent-handoffs`
+
+These resources are the public `V071+` replacement contract. Do not build new
+integrations against retired collaboration routes that may still exist as
+historical source data in an upgraded database.
+
+The Main Agent handles discovery, configured web search, Project lifecycle,
+bounded portfolio summaries, and explicit handoff. It cannot create, edit,
+assign, transition, review, merge, or deliver Tasks. The Project Agent manages
+Tasks only in its bound Project through `TaskService`; repository changes still
+happen only in admitted Task Worker/reviewer Workspaces. A handoff is an
+immutable, bounded, provenance-linked packet with at most one target turn, not
+shared hidden context or a second chat.
+
+## Existing-data migration
+
+The correction is forward-only. Migrations `V059`–`V070` remain unchanged; the
+replacement begins at `V071` or later. Legacy conversation/collaboration
+messages, IDs, ordering, ordinary bodies, provenance, runtime metadata,
+sessions, LCM/memory references, and turn-job history are preserved. Multiple
+source threads merge deterministically by timestamp, source ID, and source
+sequence. If no single safe Main/Project binding can be inferred, Forge marks
+the account or Project `agent_setup_required` instead of guessing or promoting
+a Task Worker. Expired/ambiguous leases become finite retry or terminal states,
+never silent success. V075 then quarantines the retired Room and membership
+tables as `legacy_*`, converts Room-scoped semantic memory to Agent Chat scope,
+and rejects any new Room authority record while retaining source provenance.
 
 ## End-to-end walkthrough
 

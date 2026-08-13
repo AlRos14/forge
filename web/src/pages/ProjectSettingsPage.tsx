@@ -12,7 +12,6 @@ import {
   Lightning,
   Pause,
   Plugs,
-  Robot,
   Users,
   WarningOctagon,
 } from '@phosphor-icons/react'
@@ -36,8 +35,8 @@ import { AnalyticsTab } from '@/components/settings/AnalyticsTab'
 import { DangerTab } from '@/components/settings/DangerTab'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
-import { LinkedAgentsTab } from '@/components/settings/LinkedAgentsTab'
 import { MembersTab } from '@/components/settings/MembersTab'
+import { ProjectAgentTab } from '@/components/settings/ProjectAgentTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
 import { ReposTab } from '@/components/settings/ReposTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
@@ -68,7 +67,7 @@ export type ProjectSettingsTab =
   | 'general'
   | 'repos'
   | 'members'
-  | 'linked-agents'
+  | 'project-agent'
   | 'mcp'
   | 'hooks'
   | 'analytics'
@@ -84,7 +83,7 @@ const SETTINGS_TABS: Array<{
   { id: 'general', label: 'General', icon: Gear },
   { id: 'repos', label: 'Repos', icon: GitBranch },
   { id: 'members', label: 'Members', icon: Users },
-  { id: 'linked-agents', label: 'Linked Agents', icon: Robot },
+  { id: 'project-agent', label: 'Project Agent', icon: Users },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
   { id: 'analytics', label: 'Analytics', icon: ChartBar },
@@ -254,9 +253,9 @@ export function ProjectSettingsPage({
   }
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
+    <div className="flex min-h-[calc(100dvh-7rem)] max-h-[calc(100dvh-7rem)] flex-col gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card lg:flex-row">
       {/* Settings sidebar */}
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-background">
+      <aside className="flex w-full shrink-0 flex-col border-b bg-background lg:w-56 lg:border-b-0 lg:border-r">
         <div className="border-b px-4 py-3">
           <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
             Settings
@@ -271,7 +270,7 @@ export function ProjectSettingsPage({
           </div>
           <p className="truncate font-mono text-[11px] text-muted-foreground">{projectId}</p>
         </div>
-        <nav className="flex flex-1 flex-col gap-0.5 p-2">
+        <nav className="flex flex-1 gap-0.5 overflow-x-auto p-2 lg:flex-col">
           {SETTINGS_TABS.map((tab) => {
             const TabIcon = tab.icon
             return (
@@ -284,7 +283,7 @@ export function ProjectSettingsPage({
                 }
                 params={{ projectId, tab: tab.id }}
                 className={cn(
-                  'relative flex w-full items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-[13px] leading-none font-medium text-left transition-colors',
+                  'relative flex w-auto shrink-0 items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-[13px] leading-none font-medium text-left transition-colors lg:w-full lg:shrink',
                   initialTab === tab.id
                     ? 'bg-[var(--ember-surface)] text-sidebar-active-foreground before:absolute before:left-0 before:top-1/2 before:-translate-y-1/2 before:h-4 before:w-[3px] before:rounded-r-full before:bg-primary'
                     : tab.danger
@@ -301,7 +300,7 @@ export function ProjectSettingsPage({
       </aside>
 
       {/* Content area */}
-      <div className="flex-1 overflow-y-auto px-8 py-6">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 lg:py-6">
         <div className="max-w-[760px]">
           {projectQuery.isError && (
             <ErrorBanner
@@ -343,7 +342,7 @@ export function ProjectSettingsPage({
 
           {initialTab === 'members' && <MembersTab projectId={projectId} />}
 
-          {initialTab === 'linked-agents' && <LinkedAgentsTab projectId={projectId} />}
+          {initialTab === 'project-agent' && <ProjectAgentTab projectId={projectId} />}
 
           {initialTab === 'mcp' && <ProjectMcpTab projectId={projectId} />}
 

@@ -544,7 +544,7 @@ export function ExecutionDetailPage({
             <div className="min-h-0 flex-1">
               <ExecutionViewer
                 logs={filteredLogs}
-                rawLogs={filteredLogs}
+                rawLogs={timelineLogs}
                 mode={viewerMode}
                 userPrompt={viewerUserPrompt}
                 errorMessage={execution?.error}

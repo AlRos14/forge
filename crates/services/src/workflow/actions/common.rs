@@ -14,6 +14,13 @@ use crate::workflow::{
     default_states, engine::WorkflowEngine, inherited_subtask_workflow, HookContext, HookResult,
 };
 
+pub(super) async fn publish_domain_event(ctx: &HookContext, dedupe_key: &str) {
+    let service = crate::DomainEventService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus));
+    if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
+        tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
+    }
+}
+
 pub(super) async fn get_role_assignment(
     ctx: &HookContext,
     role: &str,
@@ -192,7 +199,7 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
         Err(error) => {
             return Some(HookResult::Failed {
                 reason: error.to_string(),
-            })
+            });
         }
     };
     let count = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
@@ -200,7 +207,7 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
         Err(error) => {
             return Some(HookResult::Failed {
                 reason: error.to_string(),
-            })
+            });
         }
     };
     // This runs after `merging -> merge_failed` has been logged. The current
@@ -520,6 +527,11 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
     )
     .await
     .map_err(|error| error.to_string())?;
+    publish_domain_event(
+        ctx,
+        &format!("review-status:{}:{}:{}", review.id, review.status, now),
+    )
+    .await;
     let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
     if let Err(error) = memory_service
         .record_review_result_if_final(&ctx.project_id, &review)

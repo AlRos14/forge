@@ -32,9 +32,6 @@ const AgentsPage = lazy(() =>
 const BoardPage = lazy(() =>
   import('@/features/board/BoardPage').then((module) => ({ default: module.BoardPage })),
 )
-const ChatPage = lazy(() =>
-  import('@/pages/ChatPage').then((module) => ({ default: module.ChatPage })),
-)
 const DaemonsPage = lazy(() =>
   import('@/pages/DaemonsPage').then((module) => ({ default: module.DaemonsPage })),
 )
@@ -52,6 +49,15 @@ const OAuthAuthorizePage = lazy(() =>
 )
 const OperationsPage = lazy(() =>
   import('@/pages/OperationsPage').then((module) => ({ default: module.OperationsPage })),
+)
+const MissionControlPage = lazy(() =>
+  import('@/pages/MissionControlPage').then((module) => ({ default: module.MissionControlPage })),
+)
+const FederatedAgentsPage = lazy(() =>
+  import('@/pages/FederatedAgentsPage').then((module) => ({ default: module.FederatedAgentsPage })),
+)
+const ChatPage = lazy(() =>
+  import('@/pages/ChatPage').then((module) => ({ default: module.ChatPage })),
 )
 const ProjectSettingsPage = lazy(() =>
   import('@/pages/ProjectSettingsPage').then((module) => ({
@@ -74,7 +80,7 @@ const projectSettingsTabs = new Set<ProjectSettingsTab>([
   'general',
   'repos',
   'members',
-  'linked-agents',
+  'project-agent',
   'mcp',
   'hooks',
   'analytics',
@@ -435,6 +441,33 @@ const operationsRoute = createRoute({
   component: OperationsPage,
 })
 
+const missionControlRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/mission-control',
+  component: MissionControlPage,
+})
+
+const chatRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/chat',
+  component: ChatRouteComponent,
+})
+
+function ChatRouteComponent() {
+  return <ChatPage />
+}
+
+const projectChatRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/projects/$projectId/chat',
+  component: ProjectChatRouteComponent,
+})
+
+function ProjectChatRouteComponent() {
+  const { projectId } = projectChatRoute.useParams()
+  return <ChatPage projectId={projectId} />
+}
+
 const projectSettingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/projects/$projectId/settings',
@@ -476,28 +509,6 @@ function ProjectSettingsTabRouteComponent() {
   )
 }
 
-const projectChatRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/projects/$projectId/chat',
-  component: ProjectChatRouteComponent,
-})
-
-function ProjectChatRouteComponent() {
-  const { projectId } = projectChatRoute.useParams()
-  return <ChatPage projectId={projectId} />
-}
-
-const projectChatConversationRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/projects/$projectId/chat/$conversationId',
-  component: ProjectChatConversationRouteComponent,
-})
-
-function ProjectChatConversationRouteComponent() {
-  const { projectId, conversationId } = projectChatConversationRoute.useParams()
-  return <ChatPage projectId={projectId} conversationId={conversationId} />
-}
-
 const forgeSettingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
@@ -537,6 +548,12 @@ const accountTabRoute = createRoute({
     }
   },
   component: AccountTabRouteComponent,
+})
+
+const federatedAgentsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/agents/federated',
+  component: FederatedAgentsPage,
 })
 
 function AccountTabRouteComponent() {
@@ -585,18 +602,20 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   boardRoute,
   taskListRoute,
-  projectChatRoute,
-  projectChatConversationRoute,
   taskDetailRoute,
   taskDetailTabRoute,
   executionDetailRoute,
   agentsRoute,
+  federatedAgentsRoute,
   agentCreateRoute,
   agentEditRoute,
   agentDetailRoute,
   daemonsRoute,
   daemonDetailRoute,
   operationsRoute,
+  missionControlRoute,
+  chatRoute,
+  projectChatRoute,
   projectSettingsRoute,
   projectSettingsTabRoute,
   forgeSettingsRoute,

@@ -165,6 +165,8 @@ impl TaskDispatcher {
             | EffectiveStatus::Paused
             | EffectiveStatus::DaemonOffline
             | EffectiveStatus::DaemonUnavailable
+            | EffectiveStatus::ConnectionDegraded
+            | EffectiveStatus::ConnectionUnavailable
             | EffectiveStatus::Deactivated => return Ok(false),
             EffectiveStatus::Active | EffectiveStatus::Busy => {}
         }

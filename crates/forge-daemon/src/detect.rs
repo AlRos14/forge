@@ -40,6 +40,7 @@ fn availability_status(status: &AvailabilityStatus) -> &'static str {
 
 async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<String>) {
     match kind {
+        ExecutorKind::Embedded => (None, None),
         ExecutorKind::Shell => shell_path_and_version(),
         ExecutorKind::Codex => binary_path_and_version("codex").await,
         ExecutorKind::ClaudeCode => binary_path_and_version("claude").await,

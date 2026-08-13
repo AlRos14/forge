@@ -30,7 +30,8 @@ type SsePayload = {
   execution_id?: string
   kind?: string | null
   source?: string | null
-  conversation_id?: string
+  chat_id?: string
+  handoff_id?: string
   message_id?: string
   media_id?: string
   role?: string
@@ -68,6 +69,10 @@ function invalidateProjectTaskLists(queryClient: QueryClient, projectId?: string
   })
 }
 
+function invalidateMissionControl(queryClient: QueryClient): void {
+  void queryClient.invalidateQueries({ queryKey: ['mission-control'] })
+}
+
 export function routeSsePayload(
   payload: SsePayload,
   queryClient: QueryClient,
@@ -77,10 +82,7 @@ export function routeSsePayload(
 
   // Live stream events are consumed by dedicated UI listeners.
   if (eventType === 'execution.log') return
-  if (eventType === 'conversation.log') {
-    browserEvents.dispatch('forge:conversation-log', payload)
-    return
-  }
+  if (eventType === 'agent_chat.message_delta') return
 
   // Resync/reconciliation events.
   if (
@@ -131,11 +133,13 @@ export function routeSsePayload(
       void queryClient.invalidateQueries({ queryKey: qk.reviews(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.transitions(taskId) })
     }
+    invalidateMissionControl(queryClient)
   }
 
   if (eventType.startsWith('agent.')) {
     void queryClient.invalidateQueries({ queryKey: qk.agents })
     void queryClient.invalidateQueries({ queryKey: qk.agent(payload.entity_id) })
+    invalidateMissionControl(queryClient)
   }
 
   if (eventType.startsWith('daemon.')) {
@@ -163,37 +167,28 @@ export function routeSsePayload(
       invalidateProjectTaskLists(queryClient)
     }
     void queryClient.invalidateQueries({ queryKey: qk.execution(payload.entity_id) })
+    invalidateMissionControl(queryClient)
   }
 
-  if (eventType.startsWith('conversation.')) {
-    if (payload.conversation_id) {
-      void queryClient.invalidateQueries({ queryKey: qk.conversation(payload.conversation_id) })
-      void queryClient.invalidateQueries({
-        queryKey: qk.conversationMessages(payload.conversation_id),
-      })
-      if (eventType === 'conversation.message_completed') {
-        void queryClient.invalidateQueries({
-          queryKey: qk.conversationLogs(payload.conversation_id),
-        })
-      }
-    } else {
-      void queryClient.invalidateQueries({ queryKey: qk.conversation(payload.entity_id) })
-      void queryClient.invalidateQueries({
-        queryKey: qk.conversationMessages(payload.entity_id),
-      })
-      if (eventType === 'conversation.message_completed') {
-        void queryClient.invalidateQueries({
-          queryKey: qk.conversationLogs(payload.entity_id),
-        })
-      }
-    }
+  if (eventType.startsWith('agent_chat.')) {
+    const chatId = payload.chat_id ?? payload.entity_id
+    void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
+    void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId] })
+    void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId, 'messages'] })
+    void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId, 'turns'] })
     if (payload.project_id) {
-      void queryClient.invalidateQueries({
-        queryKey: qk.projectConversations(payload.project_id, 'active'),
-      })
-      void queryClient.invalidateQueries({
-        queryKey: qk.projectConversations(payload.project_id, 'archived'),
-      })
+      void queryClient.invalidateQueries({ queryKey: ['agent-handoffs', payload.project_id] })
+    }
+  }
+
+  if (eventType.startsWith('agent_handoff.')) {
+    void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
+    if (payload.project_id) {
+      void queryClient.invalidateQueries({ queryKey: ['agent-handoffs', payload.project_id] })
+    }
+    if (payload.chat_id) {
+      void queryClient.invalidateQueries({ queryKey: ['agent-chats', payload.chat_id, 'messages'] })
+      void queryClient.invalidateQueries({ queryKey: ['agent-chats', payload.chat_id, 'turns'] })
     }
   }
 
@@ -208,6 +203,7 @@ export function routeSsePayload(
     if (eventType.startsWith('review.')) {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(payload.task_id) })
     }
+    invalidateMissionControl(queryClient)
   }
   if (eventType === 'follow_up.dispatched' && payload.task_id) {
     void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
@@ -335,11 +331,15 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'comment.created',
         'notification.created',
         'follow_up.dispatched',
-        'conversation.message_created',
-        'conversation.message_delta',
-        'conversation.message_completed',
-        'conversation.log',
-        'conversation.updated',
+        'agent_chat.created',
+        'agent_chat.updated',
+        'agent_chat.message_created',
+        'agent_chat.message_delta',
+        'agent_chat.message_completed',
+        'agent_chat.turn_updated',
+        'agent_handoff.created',
+        'agent_handoff.delivered',
+        'agent_handoff.failed',
         'external_sync.completed',
         'external_sync.failed',
         'reconciliation.event',

@@ -14,6 +14,7 @@ config = { path = "../config" }
 db = { path = "../db" }
 events = { path = "../events" }
 executors = { path = "../executors" }
+forge-agent-host = { path = "../agent-host" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = "0.4"
 git = { path = "../git" }

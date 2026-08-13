@@ -2088,9 +2088,9 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
         .expect("execution loads")
         .expect("execution exists");
     assert_eq!(execution.status, ExecutionStatus::Running);
-    assert!(execution.summary.as_deref().is_some_and(
-        |summary| summary.contains("Workflow guard failed: require_plan_checklist_complete")
-    ));
+    assert!(execution.summary.as_deref().is_some_and(|summary| {
+        summary.contains("Workflow guard failed: require_plan_checklist_complete")
+    }));
     let task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")

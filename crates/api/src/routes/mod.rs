@@ -1,17 +1,15 @@
 use std::{collections::HashMap, str::FromStr};
 
 use api_types::{
-    parse_project_hooks_json, AgentResponse, ConversationMessageResponse, ConversationResponse,
-    DaemonResponse, ExecutionResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    ReviewDetails, ReviewResponse, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType,
-    WorkspaceResponse,
+    parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
+    ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, StateKind, StepResultEntry,
+    StepResultResponse, Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
+    TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
 };
 use db::{
-    Agent, Conversation, ConversationMessage, ConversationMessageRole, ConversationMessageStatus,
-    ConversationStatus, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review,
-    SortBy, SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo,
-    Workspace, WorkspaceRepo,
+    Agent, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review, SortBy,
+    SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, Workspace,
+    WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,11 +24,13 @@ use sqlx::Row;
 use crate::errors::{ApiError, ApiResult};
 
 pub mod admin;
+pub mod agent_chats;
 pub mod agents;
 pub mod auth;
 pub mod clis;
-pub mod conversations;
+pub mod coordination;
 pub mod daemons;
+pub mod embedded_agents;
 pub mod events;
 pub mod executions;
 pub mod executor_types;
@@ -40,13 +40,16 @@ pub mod integrations;
 pub mod mcp_config;
 pub mod members;
 pub mod memory;
+pub mod mission_control;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;
+pub mod product_genesis;
 pub mod project_agents;
 pub mod projects;
 pub mod repos;
 pub mod reviews;
+pub mod scoped_memory;
 pub mod settings;
 pub mod tasks;
 pub mod terminals;
@@ -501,6 +504,7 @@ fn parse_task_type(task_type: &str) -> TaskType {
     match task_type {
         "planning_task" => TaskType::PlanningTask,
         "sub_task" => TaskType::SubTask,
+        "discovery" => TaskType::Discovery,
         _ => TaskType::Task,
     }
 }
@@ -556,55 +560,6 @@ pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRole
     }
 }
 
-pub fn conversation_response(conversation: Conversation) -> ConversationResponse {
-    ConversationResponse {
-        id: conversation.id,
-        project_id: conversation.project_id,
-        agent_id: conversation.agent_id,
-        title: conversation.title,
-        status: match conversation.status {
-            ConversationStatus::Active => api_types::ConversationStatus::Active,
-            ConversationStatus::Archived => api_types::ConversationStatus::Archived,
-        },
-        system_prompt: conversation.system_prompt,
-        message_count: conversation.message_count,
-        last_message_at: conversation.last_message_at,
-        agent_session_id: conversation.agent_session_id,
-        version: conversation.version,
-        created_at: conversation.created_at,
-        updated_at: conversation.updated_at,
-    }
-}
-
-pub fn conversation_message_response(message: ConversationMessage) -> ConversationMessageResponse {
-    ConversationMessageResponse {
-        id: message.id,
-        conversation_id: message.conversation_id,
-        role: match message.role {
-            ConversationMessageRole::User => api_types::ConversationMessageRole::User,
-            ConversationMessageRole::Assistant => api_types::ConversationMessageRole::Assistant,
-            ConversationMessageRole::System => api_types::ConversationMessageRole::System,
-        },
-        content: message.content,
-        status: match message.status {
-            ConversationMessageStatus::Complete => api_types::ConversationMessageStatus::Complete,
-            ConversationMessageStatus::Streaming => api_types::ConversationMessageStatus::Streaming,
-            ConversationMessageStatus::Failed => api_types::ConversationMessageStatus::Failed,
-            ConversationMessageStatus::Cancelled => api_types::ConversationMessageStatus::Cancelled,
-        },
-        model: message.model,
-        token_usage_json: message
-            .token_usage_json
-            .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok()),
-        duration_ms: message.duration_ms,
-        error: message.error,
-        sequence: message.sequence,
-        created_at: message.created_at,
-        updated_at: message.updated_at,
-    }
-}
-
 pub fn agent_response(
     agent: Agent,
     active_task_count: Option<i64>,
@@ -615,13 +570,17 @@ pub fn agent_response(
         id: agent.id,
         name: agent.name,
         description: agent.description,
+        profile_id: agent.profile_id,
+        backend_kind: agent.backend_kind,
         executor_type: agent.executor_type,
+        provider: agent.provider,
         model: agent.model,
         reasoning_effort: agent.reasoning_effort,
         permission_policy: agent.permission_policy,
         prompt_template: agent.prompt_template,
         capabilities: serde_json::from_str(&agent.capabilities_json).unwrap_or_default(),
-        config_json: parse_json_value_or_empty_object(agent.config_json),
+        config_json: redact_sensitive_config(parse_json_value_or_empty_object(agent.config_json)),
+        credential_handle_id: agent.credential_ref,
         daemon_id: agent.daemon_id,
         max_concurrent_tasks: agent.max_concurrent_tasks,
         status: agent_status_response(agent.status),
@@ -875,6 +834,42 @@ fn parse_json_value(value: impl Into<String>) -> Value {
 
 fn parse_json_value_or_empty_object(value: String) -> Value {
     serde_json::from_str(&value).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+pub(crate) fn redact_sensitive_config(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase().replace('-', "_");
+                    let sensitive = [
+                        "api_key",
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "credential",
+                        "private_key",
+                    ]
+                    .iter()
+                    .any(|candidate| normalized.contains(candidate));
+                    (
+                        key,
+                        if sensitive {
+                            Value::String("[redacted]".to_owned())
+                        } else {
+                            redact_sensitive_config(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_sensitive_config).collect())
+        }
+        value => value,
+    }
 }
 
 fn parse_sort_by(value: Option<&str>) -> ApiResult<SortBy> {

@@ -100,6 +100,7 @@ async fn find_default_agent(db: &SqliteDb, executor_type: &str) -> db::Result<Op
 
 fn default_agent_name(kind: &ExecutorKind) -> String {
     let display_name = match kind {
+        ExecutorKind::Embedded => "Embedded",
         ExecutorKind::Shell => "Shell",
         ExecutorKind::Codex => "Codex",
         ExecutorKind::ClaudeCode => "Claude Code",

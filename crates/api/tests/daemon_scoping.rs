@@ -227,7 +227,7 @@ async fn daemon_report_provisions_owned_agents_for_authenticated_clis() {
         .await
         .expect("query user");
     let shell_agents: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, executor_type, owner_id, visibility FROM agent WHERE daemon_id = ? ORDER BY executor_type",
+        "SELECT id, executor_type, owner_id, visibility FROM agent_current WHERE daemon_id = ? ORDER BY executor_type",
     )
     .bind(&reg.daemon_id)
     .fetch_all(harness.state.db.pool())
@@ -496,11 +496,12 @@ async fn bootstrap_assigns_orphaned_resources_to_first_user() {
         "claimed daemon should become account-scoped"
     );
 
-    let (agent_owner, agent_visibility): (Option<String>, String) =
-        sqlx::query_as("SELECT owner_id, visibility FROM agent WHERE is_default = 1 LIMIT 1")
-            .fetch_one(harness.state.db.pool())
-            .await
-            .expect("query");
+    let (agent_owner, agent_visibility): (Option<String>, String) = sqlx::query_as(
+        "SELECT owner_id, visibility FROM agent_current WHERE is_default = 1 LIMIT 1",
+    )
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("query");
     assert!(
         agent_owner.is_some(),
         "default agents should be claimed by first user"

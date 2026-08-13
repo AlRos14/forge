@@ -13,15 +13,15 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CiStepStats, CreateProject, ModelTokenBreakdown, PageRequest,
-    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary,
-    ProjectTokenStats, SortBy, SortOrder, UpdateProject,
+    new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, CiStepStats, CreateProject,
+    ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
+    ProjectRepo, ProjectReviewSummary, ProjectTokenStats, SortBy, SortOrder, UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
 use services::{
     workflow::{engine::WorkflowEngine, validation::validate_workflow},
-    ServiceError,
+    ProductGenesisService, ServiceError,
 };
 
 use crate::{
@@ -44,13 +44,57 @@ pub async fn create_project(
     user: AuthenticatedUser,
     Json(request): Json<CreateProjectRequest>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
+    let genesis_session = if let Some(session_id) = request.product_genesis_session_id.as_deref() {
+        let session = genesis.get(session_id).await?;
+        if session.account_id != user.user_id {
+            return Err(ApiError::not_found("product_genesis_session", session_id));
+        }
+        if session.lifecycle != api_types::ProductGenesisLifecycle::ReadyForProject {
+            return Err(ApiError::bad_request(
+                "Product Genesis must be ready_for_project before Project creation",
+            ));
+        }
+        if let Some(existing_project_id) = session.project_id.as_deref() {
+            let existing = ProjectRepo::get_by_id(&*state.db, existing_project_id)
+                .await?
+                .filter(|project| project.owner_id.as_deref() == Some(user.user_id.as_str()))
+                .ok_or_else(|| ApiError::not_found("project", existing_project_id.to_owned()))?;
+            return Ok(Json(project_response(existing)?));
+        }
+        Some(session)
+    } else {
+        None
+    };
     let now = now_rfc3339();
     let mut settings = request.settings.unwrap_or_else(|| serde_json::json!({}));
     apply_default_review_config(&mut settings, request.default_review_config.as_ref())?;
     let workflow = WorkflowEngine::resolve_workflow("{}");
     validate_project_settings(&state.db, &settings, &workflow, None, None).await?;
     let settings = serialize_settings(&settings)?;
-    let project = ProjectRepo::create(
+    let (project_agent_identity_id, project_agent_profile_id) = match (
+        request.project_agent_identity_id,
+        request.project_agent_profile_id,
+    ) {
+        (Some(identity_id), Some(profile_id)) => {
+            let identity = AgentRepo::get_by_id(&*state.db, &identity_id)
+                .await?
+                .filter(|agent| agent.owner_id.as_deref() == Some(user.user_id.as_str()))
+                .ok_or_else(|| ApiError::not_found("agent", identity_id.clone()))?;
+            let profile = AgentProfileRepo::get_profile(&*state.db, &profile_id)
+                .await?
+                .filter(|profile| profile.identity_id == identity.id)
+                .ok_or_else(|| ApiError::not_found("agent_profile", profile_id.clone()))?;
+            (Some(identity.id), Some(profile.id))
+        }
+        (None, None) => (None, None),
+        _ => {
+            return Err(ApiError::bad_request(
+                "project_agent_identity_id and project_agent_profile_id must be provided together",
+            ));
+        }
+    };
+    let project = ProjectRepo::create_with_agent_binding(
         &*state.db,
         CreateProject {
             id: new_uuid_v4(),
@@ -62,8 +106,50 @@ pub async fn create_project(
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        project_agent_identity_id,
+        project_agent_profile_id,
     )
     .await?;
+
+    if let Some(session) = genesis_session {
+        // The Project/binding/chat transaction has committed. Link its stable
+        // result before returning so the normal handoff endpoint can retry
+        // after a delivery failure without creating a second Project.
+        let mut linked = false;
+        let mut expected_version = session.version;
+        for _ in 0..3 {
+            match genesis
+                .record_project(&session.id, expected_version, &project.id)
+                .await
+            {
+                Ok(_) => {
+                    linked = true;
+                    break;
+                }
+                Err(ServiceError::Db(db::DbError::VersionConflict)) => {
+                    let current = genesis.get(&session.id).await?;
+                    if current.project_id.as_deref() == Some(project.id.as_str()) {
+                        linked = true;
+                        break;
+                    }
+                    if current.project_id.is_some() {
+                        return Err(ApiError::conflict(
+                            "product_genesis",
+                            "Product Genesis is already linked to another Project",
+                        ));
+                    }
+                    expected_version = current.version;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !linked {
+            return Err(ApiError::conflict(
+                "product_genesis",
+                "Product Genesis changed while its Project was being linked",
+            ));
+        }
+    }
 
     // Auto-create owner membership (best-effort; may fail if user row doesn't exist yet)
     let _ = db::ProjectMemberRepo::add_member(

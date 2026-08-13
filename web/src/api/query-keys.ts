@@ -18,11 +18,6 @@ export const qk = {
   projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
   projectHookRunPages: (projectId: string, limit: number) =>
     ['projects', projectId, 'project-hook-runs', limit] as const,
-  projectConversations: (projectId: string, status: string = 'active') =>
-    ['projects', projectId, 'conversations', status] as const,
-  conversation: (id: string) => ['conversations', id] as const,
-  conversationMessages: (id: string) => ['conversations', id, 'messages'] as const,
-  conversationLogs: (id: string) => ['conversations', id, 'logs'] as const,
   repos: (projectId: string) => ['projects', projectId, 'repos'] as const,
   mcpConfig: (agent: string, scope: string, projectId?: string) =>
     ['config', 'mcp', agent, scope, projectId ?? 'global'] as const,
@@ -63,5 +58,4 @@ export const qk = {
   pats: () => ['pats'] as const,
   projectMembers: (projectId: string) => ['projects', projectId, 'members'] as const,
   projectAgents: (projectId: string) => ['projects', projectId, 'agents'] as const,
-  projectAgentLinks: (projectId: string) => ['projects', projectId, 'agent-links'] as const,
 }

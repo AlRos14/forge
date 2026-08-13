@@ -160,6 +160,39 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Copy:** stale moves say “Board changed while you were dragging; refreshed to the latest version.”
 - **Accessibility:** `role="status"` for reconciliation and `role="alert"` only when user action is required.
 
+### Agent chat switcher
+
+- **Structure:** one `Global · Main` entry followed by one entry per Project. Each Project entry opens that Project's single Agent Chat; unbound identities never appear here.
+- **States:** active, ready, setup required, loading, unavailable, and empty Project list. Setup status stays visible in the entry and in the chat surface.
+- **Accessibility:** entries are keyboard-operable buttons with `aria-current="page"` for the active scope, visible focus rings, and a named navigation region. There is no arbitrary identity roster or “new chat” action in this switcher.
+- **Responsive:** the switcher is a compact horizontal list below the chat header on narrow screens and a bounded left rail on larger screens; it must not create document-wide horizontal overflow.
+
+### Agent chat timeline and composer
+
+- **Structure:** server-authoritative Agent Chat messages, explicit handoffs, and one composer. Do not derive handoffs or target navigation from message text, task IDs, or retired Room/Conversation aliases.
+- **Turn states:** finite `sending`, `queued`, `leased`, `running`, `retry_wait`, `succeeded`, `failed`, and `cancelled` states are visible in the timeline and announced with `role="status"` or `role="alert"` as appropriate.
+- **Composer behavior:** Enter submits a non-composing message; Shift+Enter inserts a newline; IME composition is never interrupted. The send control is disabled while the current turn is live or the binding is not ready, with truthful copy explaining why.
+- **Handoffs:** a handoff's Continue action opens the target Project Agent Chat and never redirects to a board/task view. Context provenance remains inspectable from the explicit manifest identifier.
+- **States:** loading, recoverable error with retry, empty timeline, setup required, pending turn, and settled timeline all have explicit copy and keyboard-visible actions.
+- **Refresh:** server events may accelerate updates, but mounted timelines poll messages, turns, handoffs, and chat status at a bounded interval so a completed response never depends on an unavailable event channel.
+
+### Global chat launcher
+
+- **Structure:** a bottom-right launcher opens the same account-owned Main Agent timeline as `/chat`; it never creates a second chat or local fork.
+- **Accessibility:** the launcher has an accessible name, Escape closes the panel, focus moves into the panel on open, and focus returns to the launcher on close. The panel is responsive to viewport height and keeps the composer reachable above the safe area.
+
+### Binding setup controls
+
+- **Structure:** Agent settings can connect identities; Main settings select exactly one identity/profile through `/account/main-agent`; Project settings select exactly one identity/profile through `/projects/{id}/project-agent`.
+- **Truthfulness:** binding controls show server state and expected version, preserve optimistic-concurrency errors, and display the server-enforced permission ceiling as read-only metadata. Role, primary/steward, participant, archive-membership, and arbitrary capability-grant controls are not part of this surface.
+
+### Mission Control and Agent detail
+
+- **Hierarchy:** primary views lead with the singular Main binding, one Project binding per authorized Project, relevant Task Worker/reviewer activity, Attention, and outcomes. Connected profiles without a binding or active Task scope stay in secondary configuration inventory.
+- **Scope isolation:** a Project Agent view requests only its Project's handoff metadata; the Main timeline may show explicit handoff receipts but never imports Project-private history or memory.
+- **Recovery:** live chat turns expose a server-versioned “Cancel turn” action using an idempotency key; terminal turns expose only a bounded “Retry turn” action that re-admits the same request through normal server policy. Leased, queued, and retry-wait turns remain server-controlled and do not expose an unbounded client retry.
+- **Containment:** long message, identifier, and error content wraps inside the timeline; the timeline owns horizontal clipping and never creates page-level overflow.
+
 ## 6. Motion & Interaction
 
 | Token     |  Duration | Easing                          | Usage                                        |

@@ -7,6 +7,31 @@ fn test_dependency_gate_surfaces_as_409_variant() {
 }
 
 #[tokio::test]
+async fn create_task_rejects_unknown_task_type_before_persistence() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+
+    let error = service
+        .create_task(
+            project_id,
+            "Invalid type",
+            None,
+            None,
+            None,
+            Some("feature".to_owned()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("unknown task types must be rejected by the service boundary");
+
+    assert!(error.to_string().contains("task_type must be"));
+}
+
+#[tokio::test]
 async fn transition_allows_user_move_for_root_managed_subtask() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

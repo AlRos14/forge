@@ -120,6 +120,7 @@ pub(crate) fn task_type_to_string(task_type: TaskType) -> String {
         TaskType::Task => "task",
         TaskType::PlanningTask => "planning_task",
         TaskType::SubTask => "sub_task",
+        TaskType::Discovery => "discovery",
     }
     .to_owned()
 }

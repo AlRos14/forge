@@ -1,4 +1,4 @@
-use db::{AgentRepo, ProjectAgentLinkRepo, ProjectHookRunStatus};
+use db::{AgentRepo, ProjectAgentBindingRepo, ProjectHookRunStatus};
 use serde_json::Value;
 
 use crate::{
@@ -98,13 +98,12 @@ async fn agent_usable_in_project(context: &ActionContext<'_>, agent: &db::Agent)
     {
         return Ok(true);
     }
-    Ok(ProjectAgentLinkRepo::get_by_project_and_agent(
+    Ok(ProjectAgentBindingRepo::get_active_project_binding(
         &*context.service.db,
         &context.project.id,
-        &agent.id,
     )
     .await?
-    .is_some())
+    .is_some_and(|binding| binding.identity_id.as_deref() == Some(agent.id.as_str())))
 }
 
 fn automation_task_description(context: &ActionContext<'_>) -> String {

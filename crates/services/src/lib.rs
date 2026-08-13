@@ -1,9 +1,17 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod agent_capacity;
+pub mod agent_chat_memory_consumer;
+pub mod agent_chat_policy;
+pub mod agent_chat_service;
+pub mod agent_chat_turn_policy;
+pub mod agent_chat_turn_worker;
 pub mod agent_service;
+pub mod attention_service;
 pub mod auth_service;
-pub mod conversation_service;
+pub mod context_manifest;
+pub mod coordination_consumer;
+pub mod coordination_service;
 pub mod daemon_monitor;
 pub mod daemon_service;
 pub mod daemon_transport;
@@ -11,19 +19,25 @@ pub mod default_agents;
 pub(crate) mod deferred_dispatch;
 pub mod demo;
 pub mod diff;
+pub mod domain_event_service;
+pub mod embedded_agent_service;
 pub mod embedded_daemon;
+pub mod embedded_task_executor;
 pub mod external_api;
 pub mod external_sync;
 pub mod integration_service;
 pub mod lifecycle;
 pub mod memory;
+pub mod memory_source;
 pub mod merge_service;
+pub mod native_tools;
 pub mod notification_service;
 pub mod oauth_service;
 pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod plan_artifact;
 pub mod pr_service;
+pub mod product_genesis;
 pub mod project_hooks;
 pub mod project_member_service;
 pub mod prompt_preview;
@@ -38,9 +52,44 @@ pub mod workflow;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
 
+pub use agent_chat_memory_consumer::{
+    memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
+};
+pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
+pub use agent_chat_service::{
+    AdmittedAgentChatMessage, AgentChatHandoffOutcome, AgentChatService, CancelAgentChatTurnInput,
+    CommittedAgentChatResponse, CreateAgentHandoffInput, SendAgentChatMessageInput,
+    SetMainAgentBindingInput, SetProjectAgentBindingInput,
+};
+pub use agent_chat_turn_policy::{
+    bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
+    failure as fail_agent_chat_turn, failure_after_claim as fail_agent_chat_turn_after_claim,
+    recover_expired as recover_expired_agent_chat_turn,
+    FailureDecision as AgentChatFailureDecision, LeaseDecision as AgentChatLeaseDecision,
+};
+pub use agent_chat_turn_worker::{
+    AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend, CompletedAgentChatTurn,
+    FederatedAgentChatTurnRunner,
+};
 pub use agent_service::AgentService;
+pub use attention_service::{
+    AttentionProjectionRun, AttentionService, WakeAdmissionRequest, WakeAdmissionResult,
+    WakeSuppressionReason,
+};
 pub use auth_service::AuthService;
-pub use conversation_service::ConversationService;
+pub use context_manifest::{
+    fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
+};
+pub use coordination_consumer::{
+    coordination_consumer_lease_owner, coordination_consumer_name, CoordinationOutcomeConsumer,
+    CoordinationOutcomeRun,
+};
+pub use coordination_service::{
+    AgentActionService, AgentInboxService, ApproveActionInput, AskQuestionInput,
+    CommitmentEvidenceInput, CommitmentService, CompleteCommitmentInput, CreateCommitmentInput,
+    DeliverInboxInput, ExecuteActionInput, ExecuteTaskProposalInput, ExecutedTaskProposal,
+    ProposeActionInput, TaskProposalPayload, TransferCommitmentInput, UpdateCommitmentInput,
+};
 pub use daemon_monitor::DaemonMonitor;
 pub use daemon_service::{
     DaemonRegisterInput, DaemonRegistration, DaemonReportInput, DaemonService,
@@ -53,18 +102,33 @@ pub use daemon_transport::{
 pub use default_agents::ensure_default_agents;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
+pub use domain_event_service::DomainEventService;
+pub use embedded_agent_service::EmbeddedAgentService;
 pub use embedded_daemon::EmbeddedDaemon;
+pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
 pub use memory::{
-    BackfillSummary, BackfillTypeResult, MemoryCreator, MemoryItemInput, MemoryReferences,
-    MemorySearchResult, MemoryService,
+    BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
+    MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
+    MemoryService,
+};
+pub use memory_source::{
+    ForgeMemoryQuery, ForgeMemoryRecord, ForgeMemorySearch, ForgeMemorySource,
+    MemorySourceBindingInput,
 };
 pub use merge_service::{MergeOutcome, MergeService};
+pub use native_tools::CoordinationToolProvider;
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
 pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
+pub use product_genesis::{
+    render_product_genesis_prompt, validate_genesis_transition, GenesisLifecycleError,
+    GenesisPromptContext, NewProductGenesisSession, ProductGenesisService, ProductGenesisStart,
+    ProductGenesisStore, SqliteProductGenesisStore, TransitionProductGenesis,
+    PRODUCT_GENESIS_PROMPT_VERSION,
+};
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
 pub use prompt_preview::preview_effective_prompt;

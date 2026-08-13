@@ -4,6 +4,73 @@ All notable changes to Forge are documented in this file.
 
 Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
 
+## [Unreleased]
+
+### Breaking
+
+- Agents are stable account-owned identities with immutable, selectable
+  profiles. The legacy profile-shaped Agent representation and
+  `/api/v1/projects/{id}/agent-links` surface are removed. The approved
+  replacement has one active Main Agent binding per account and exactly one
+  active Project Agent binding per operational Project; Task Worker/reviewer
+  assignments remain separate and cannot satisfy a chat binding.
+- The general-purpose collaboration surface is replaced by one global Main
+  Agent Chat and one Project Agent Chat per Project. Participant lists,
+  addressing, responder policies, bounded rounds, arbitrary threads, and the
+  corresponding REST/MCP/CLI/types/event surfaces are removed without aliases.
+  The intended REST resources are `/api/v1/account/main-agent`,
+  `/api/v1/projects/{id}/project-agent`, `/api/v1/agent-chats`, and
+  `/api/v1/projects/{id}/agent-handoffs`.
+- New migrations begin at V071; V059–V070 are never edited. The forward-only
+  migration preserves legacy conversation/collaboration message IDs, ordering,
+  ordinary bodies, provenance, runtime metadata, sessions, LCM/memory links,
+  protected-content audit links, Task history, and turn-job state. Ambiguous
+  binding inference becomes explicit `agent_setup_required`; a primary Worker
+  is never promoted, and expired leases become finite retry/terminal states.
+  V075 quarantines the retired Room/membership tables under `legacy_*`, remaps
+  Room-scoped memory to Agent Chat scope, and rejects new Room authority rows.
+- Forge now builds its embedded host against Agent Runtime revision
+  `a7075b1d2dd1cee05db63bc480ff46b0f97ec239` and requires Rust 1.86 or newer for
+  that integration.
+
+### Added
+
+- Direct embedded-agent creation and protected provider connection in Forge,
+  including immutable native profile revisions, safe health/capability output,
+  explicit Main Agent Chat/Project Agent Chat/Task sessions, rotation
+  continuity, and deny-all filesystem access outside admitted Task
+  Worker/reviewer sessions.
+- Approved Main/Project Agent Chat replacement contract with immutable
+  messages, finite visible turn states, explicit provenance-linked handoffs,
+  bounded retry/lease recovery, and atomic Project-Agent binding/setup
+  behavior; implementation lands with the V071+ migration.
+- Forge-owned Agent Runtime hosting with per-identity/per-scope Lossless Context
+  Memory timelines, SQLite LCM persistence, protected checkpoints and
+  credentials, context manifests, and authorized provenance inspection.
+- Scoped semantic-memory ACLs and publication/supersession provenance,
+  persistent inbox items and evidence-backed commitments, typed action policy
+  envelopes, a durable domain-event ledger, Attention projections, and bounded
+  Mission Control/Agent-detail read APIs and web views.
+- REST, MCP, and `forge-ctl` operations for embedded connections, Main/Project
+  Agent bindings and chats, handoffs, sessions, commitments, context, and
+  Mission Control (the replacement surfaces land with the V071+ migration).
+
+### Changed
+
+- Agent Chat and Task outcomes commit to the durable event ledger; the
+  in-process event bus is a delivery and cache-invalidation projection, not
+  wake-up authority.
+- Existing CLI Task executors remain available, including Smith. Forge does not
+  add a Smith-native embedded backend or depend on the sibling TUI; the direct
+  backend composes Agent Runtime in the Forge-owned `forge-agent-host` crate.
+
+### Fixed
+
+- CLI-backed Agent Chat turns now pass the executor/config snapshot required by
+  the shared adapter, Product Genesis closes when the handoff cites the Main
+  Agent's response, and typed Task proposals reject unknown task types before
+  persistence instead of surfacing a SQLite constraint failure.
+
 ## [0.7.3] - 2026-08-09
 
 ### Fixed

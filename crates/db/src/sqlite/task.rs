@@ -566,18 +566,19 @@ impl TaskRepo for SqliteDb {
                             JOIN task_role_assignment ON task_role_assignment.task_id = task.id
                             WHERE task_role_assignment.assignee_type = 'agent'
                               AND task_role_assignment.assignee_id = ?
+                              AND task.id != ?
                               AND task.deleted_at IS NULL
                               AND task.status IN ({placeholders})
                         ) +
                         (
-                            SELECT COUNT(DISTINCT conversation.id) FROM conversation
-                            JOIN conversation_message ON conversation_message.conversation_id = conversation.id
-                            WHERE conversation.agent_id = ?
-                              AND conversation_message.role = 'assistant'
-                              AND conversation_message.status = 'streaming'
+                            SELECT COUNT(*) FROM agent_chat_turn_job
+                            WHERE responder_identity_id = ?
+                              AND status IN ('leased', 'running')
                         )"
                 );
-                let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(agent_id);
+                let mut query = sqlx::query_scalar::<_, i64>(&sql)
+                    .bind(agent_id)
+                    .bind(&input.task_id);
                 for status in &input.capacity_statuses {
                     query = query.bind(status);
                 }
@@ -613,14 +614,22 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task> {
-        let mut task = self.get_task_required(&input.id, true).await?;
+        let mut transaction = self.pool.begin().await?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let mut task = map_task(task_row)?;
         if task.deleted_at.is_some() {
             return Err(DbError::InvalidSoftDelete);
         }
         if task.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
-        task.status = input.status;
+        let previous_status = task.status.clone();
+        let target_status = input.status.clone();
+        task.status = target_status;
         if input.assignee_id.is_some() {
             task.assignee_type = None;
             task.assignee_id = None;
@@ -677,10 +686,35 @@ impl TaskRepo for SqliteDb {
             .push(" AND version = ")
             .push_bind(input.expected_version)
             .push(" AND deleted_at IS NULL");
-        let result = query.build().execute(&self.pool).await?;
+        let result = query.build().execute(&mut *transaction).await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+
+        let event_id = new_uuid_v4();
+        let event = CreateDomainEvent {
+            id: event_id.clone(),
+            event_type: "task.status_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task.id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("task-status-update:{}:{}", task.id, task.version)),
+            payload_json: serde_json::json!({
+                "from_status": previous_status,
+                "to_status": task.status,
+                "task_version": task.version,
+            })
+            .to_string(),
+            created_at: task.updated_at.clone(),
+        };
+        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
         Ok(task)
     }
 }

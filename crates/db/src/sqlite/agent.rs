@@ -1,48 +1,147 @@
 use super::*;
 use crate::now_rfc3339;
 
+// CLI identities still receive authority from the server-issued canonical
+// scope. This ceiling only makes the scope catalog usable; it cannot grant a
+// Chat filesystem access or let Main cross into Project/Task mutations.
+const DEFAULT_CLI_SCOPE_PERMISSIONS: &str = r#"{"permissions":["read_account","read_project","read_agent_chat","read_task","read_memory","propose_task","propose_discovery","propose_project","propose_handoff","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session","task_read","task_write"]}"#;
+
 #[async_trait]
 impl AgentRepo for SqliteDb {
     async fn create(&self, input: CreateAgent) -> Result<Agent> {
+        let profile_id = crate::new_uuid_v4();
+        let mut transaction = self.pool.begin().await?;
+
         if input.is_default {
-            sqlx::query("UPDATE agent SET is_default = 0 WHERE executor_type = ? AND id != ?")
-                .bind(&input.executor_type)
-                .bind(&input.id)
-                .execute(&self.pool)
+            clear_default_for_executor(&mut transaction, &input.executor_type, Some(&input.id))
                 .await?;
         }
-        sqlx::query("INSERT INTO agent (id, name, description, executor_type, model, reasoning_effort, permission_policy, prompt_template, capabilities_json, config_json, daemon_id, max_concurrent_tasks, heartbeat_interval_seconds, max_missed_heartbeats, status, last_heartbeat_at, is_default, paused, owner_id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&input.id)
-            .bind(&input.name)
-            .bind(input.description.as_deref())
-            .bind(&input.executor_type)
-            .bind(input.model.as_deref())
-            .bind(input.reasoning_effort.as_deref())
-            .bind(input.permission_policy.as_deref())
-            .bind(input.prompt_template.as_deref())
-            .bind(&input.capabilities_json)
-            .bind(&input.config_json)
-            .bind(input.daemon_id.as_deref())
-            .bind(input.max_concurrent_tasks)
-            .bind(input.heartbeat_interval_seconds)
-            .bind(input.max_missed_heartbeats)
-            .bind(input.status.to_string())
-            .bind(input.last_heartbeat_at.as_deref())
-            .bind(if input.is_default { 1 } else { 0 })
-            .bind(if input.paused { 1 } else { 0 })
-            .bind(input.owner_id.as_deref())
-            .bind(&input.visibility)
-            .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .execute(&self.pool)
-            .await?;
+
+        sqlx::query(
+            "INSERT INTO agent_identity (
+                id, name, description, selected_profile_id,
+                max_concurrent_tasks, heartbeat_interval_seconds,
+                max_missed_heartbeats, status, last_heartbeat_at,
+                is_default, paused, owner_id, visibility,
+                account_permission_ceiling, created_at, updated_at
+             ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.name)
+        .bind(input.description.as_deref())
+        .bind(input.max_concurrent_tasks)
+        .bind(input.heartbeat_interval_seconds)
+        .bind(input.max_missed_heartbeats)
+        .bind(input.status.to_string())
+        .bind(input.last_heartbeat_at.as_deref())
+        .bind(if input.is_default { 1 } else { 0 })
+        .bind(if input.paused { 1 } else { 0 })
+        .bind(input.owner_id.as_deref())
+        .bind(&input.visibility)
+        .bind(DEFAULT_CLI_SCOPE_PERMISSIONS)
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        insert_profile(
+            &mut transaction,
+            &CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: input.id.clone(),
+                backend_kind: "cli".to_string(),
+                executor_type: input.executor_type,
+                provider: None,
+                model: input.model,
+                reasoning_effort: input.reasoning_effort,
+                permission_policy: input.permission_policy,
+                prompt_template: input.prompt_template,
+                capabilities_json: input.capabilities_json,
+                tool_policy_json: DEFAULT_CLI_SCOPE_PERMISSIONS.to_string(),
+                config_json: input.config_json,
+                credential_ref: None,
+                daemon_id: input.daemon_id,
+                created_at: input.created_at,
+                updated_at: input.updated_at.clone(),
+            },
+        )
+        .await?;
+
+        sqlx::query(
+            "UPDATE agent_identity
+             SET selected_profile_id = ?
+             WHERE id = ?",
+        )
+        .bind(&profile_id)
+        .bind(&input.id)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
         AgentRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
     }
 
+    async fn create_identity_with_profile(
+        &self,
+        identity: CreateAgentIdentity,
+        profile: CreateAgentProfile,
+    ) -> Result<Agent> {
+        if profile.identity_id != identity.id {
+            return Err(DbError::Check(
+                "profile identity must match the new identity".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        if identity.is_default {
+            clear_default_for_executor(
+                &mut transaction,
+                &profile.executor_type,
+                Some(&identity.id),
+            )
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO agent_identity (
+                id, name, description, selected_profile_id,
+                max_concurrent_tasks, heartbeat_interval_seconds,
+                max_missed_heartbeats, status, last_heartbeat_at,
+                is_default, paused, owner_id, visibility,
+                account_permission_ceiling, created_at, updated_at
+             ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&identity.id)
+        .bind(&identity.name)
+        .bind(identity.description.as_deref())
+        .bind(identity.max_concurrent_tasks)
+        .bind(identity.heartbeat_interval_seconds)
+        .bind(identity.max_missed_heartbeats)
+        .bind(identity.status.to_string())
+        .bind(identity.last_heartbeat_at.as_deref())
+        .bind(if identity.is_default { 1 } else { 0 })
+        .bind(if identity.paused { 1 } else { 0 })
+        .bind(identity.owner_id.as_deref())
+        .bind(&identity.visibility)
+        .bind(&identity.account_permission_ceiling)
+        .bind(&identity.created_at)
+        .bind(&identity.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        insert_profile(&mut transaction, &profile).await?;
+        sqlx::query("UPDATE agent_identity SET selected_profile_id = ? WHERE id = ?")
+            .bind(&profile.id)
+            .bind(&identity.id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        AgentRepo::get_by_id(self, &identity.id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<Agent>> {
-        sqlx::query("SELECT * FROM agent WHERE id = ?")
+        sqlx::query("SELECT * FROM agent_current WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -91,7 +190,7 @@ impl AgentRepo for SqliteDb {
             }
         };
         let sql = format!(
-            "SELECT agent.* FROM agent{} ORDER BY {} LIMIT ? OFFSET ?",
+            "SELECT agent.* FROM agent_current AS agent{} ORDER BY {} LIMIT ? OFFSET ?",
             where_sql, order_sql
         );
         let mut q = sqlx::query(&sql);
@@ -114,7 +213,7 @@ impl AgentRepo for SqliteDb {
             .map(map_agent)
             .collect::<Result<Vec<_>>>()?;
         let total = if query.page.include_total {
-            let count_sql = format!("SELECT COUNT(*) FROM agent{}", where_sql);
+            let count_sql = format!("SELECT COUNT(*) FROM agent_current AS agent{}", where_sql);
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
             if let Some(status) = &query.status {
                 q = q.bind(status.to_string());
@@ -139,6 +238,15 @@ impl AgentRepo for SqliteDb {
         if agent.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
+
+        let profile_changed = input.model.is_some()
+            || input.reasoning_effort.is_some()
+            || input.permission_policy.is_some()
+            || input.prompt_template.is_some()
+            || input.capabilities_json.is_some()
+            || input.config_json.is_some()
+            || input.daemon_id.is_some();
+
         if let Some(name) = input.name {
             agent.name = name;
         }
@@ -187,50 +295,86 @@ impl AgentRepo for SqliteDb {
         if let Some(paused) = input.paused {
             agent.paused = paused;
         }
+
+        let mut transaction = self.pool.begin().await?;
         if agent.is_default {
-            sqlx::query("UPDATE agent SET is_default = 0 WHERE executor_type = ? AND id != ?")
-                .bind(&agent.executor_type)
-                .bind(&agent.id)
-                .execute(&self.pool)
+            clear_default_for_executor(&mut transaction, &agent.executor_type, Some(&agent.id))
                 .await?;
         }
-        agent.updated_at = input.updated_at;
-        agent.version += 1;
-        let result = sqlx::query("UPDATE agent SET name = ?, description = ?, model = ?, reasoning_effort = ?, permission_policy = ?, prompt_template = ?, capabilities_json = ?, config_json = ?, daemon_id = ?, max_concurrent_tasks = ?, heartbeat_interval_seconds = ?, max_missed_heartbeats = ?, status = ?, last_heartbeat_at = ?, is_default = ?, paused = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?")
-            .bind(&agent.name)
-            .bind(agent.description.as_deref())
-            .bind(agent.model.as_deref())
-            .bind(agent.reasoning_effort.as_deref())
-            .bind(agent.permission_policy.as_deref())
-            .bind(agent.prompt_template.as_deref())
-            .bind(&agent.capabilities_json)
-            .bind(&agent.config_json)
-            .bind(agent.daemon_id.as_deref())
-            .bind(agent.max_concurrent_tasks)
-            .bind(agent.heartbeat_interval_seconds)
-            .bind(agent.max_missed_heartbeats)
-            .bind(agent.status.to_string())
-            .bind(agent.last_heartbeat_at.as_deref())
-            .bind(if agent.is_default { 1 } else { 0 })
-            .bind(if agent.paused { 1 } else { 0 })
-            .bind(&agent.updated_at)
-            .bind(&agent.id)
-            .bind(input.expected_version)
-            .execute(&self.pool)
+
+        let selected_profile_id = if profile_changed {
+            let profile_id = crate::new_uuid_v4();
+            insert_profile(
+                &mut transaction,
+                &CreateAgentProfile {
+                    id: profile_id.clone(),
+                    identity_id: agent.id.clone(),
+                    backend_kind: agent.backend_kind.clone(),
+                    executor_type: agent.executor_type.clone(),
+                    provider: agent.provider.clone(),
+                    model: agent.model.clone(),
+                    reasoning_effort: agent.reasoning_effort.clone(),
+                    permission_policy: agent.permission_policy.clone(),
+                    prompt_template: agent.prompt_template.clone(),
+                    capabilities_json: agent.capabilities_json.clone(),
+                    tool_policy_json: agent.tool_policy_json.clone(),
+                    config_json: agent.config_json.clone(),
+                    credential_ref: agent.credential_ref.clone(),
+                    daemon_id: agent.daemon_id.clone(),
+                    created_at: input.updated_at.clone(),
+                    updated_at: input.updated_at.clone(),
+                },
+            )
             .await?;
+            profile_id
+        } else {
+            agent.profile_id.clone()
+        };
+
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET name = ?, description = ?, selected_profile_id = ?,
+                 max_concurrent_tasks = ?, heartbeat_interval_seconds = ?,
+                 max_missed_heartbeats = ?, status = ?, last_heartbeat_at = ?,
+                 is_default = ?, paused = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(&agent.name)
+        .bind(agent.description.as_deref())
+        .bind(&selected_profile_id)
+        .bind(agent.max_concurrent_tasks)
+        .bind(agent.heartbeat_interval_seconds)
+        .bind(agent.max_missed_heartbeats)
+        .bind(agent.status.to_string())
+        .bind(agent.last_heartbeat_at.as_deref())
+        .bind(if agent.is_default { 1 } else { 0 })
+        .bind(if agent.paused { 1 } else { 0 })
+        .bind(&input.updated_at)
+        .bind(&agent.id)
+        .bind(input.expected_version)
+        .execute(&mut *transaction)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
-        Ok(agent)
+
+        transaction.commit().await?;
+        AgentRepo::get_by_id(self, &agent.id)
+            .await?
+            .ok_or(DbError::NotFound)
     }
 
     async fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
-        let result = sqlx::query("UPDATE agent SET paused = ?, updated_at = ? WHERE id = ?")
-            .bind(if paused { 1 } else { 0 })
-            .bind(now_rfc3339())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET paused = ?, version = version + 1, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(if paused { 1 } else { 0 })
+        .bind(now_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
@@ -277,11 +421,18 @@ impl AgentRepo for SqliteDb {
         .await
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        let result = sqlx::query("DELETE FROM agent WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    async fn archive(&self, id: &str, archived_at: &str) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET archived_at = ?, paused = 1, is_default = 0, status = 'offline',
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND archived_at IS NULL",
+        )
+        .bind(archived_at)
+        .bind(archived_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
@@ -331,18 +482,87 @@ impl AgentRepo for SqliteDb {
                       )
                 ) +
                 (
-                    SELECT COUNT(DISTINCT conversation.id)
-                    FROM conversation
-                    JOIN conversation_message ON conversation_message.conversation_id = conversation.id
-                    WHERE conversation.agent_id = ?
-                      AND conversation_message.role = 'assistant'
-                      AND conversation_message.status = 'streaming'
+                    SELECT COUNT(*)
+                    FROM agent_chat_turn_job
+                    WHERE responder_identity_id = ?
+                      AND status IN ('leased', 'running')
                 )",
         )
         .bind(agent_id)
         .bind(agent_id)
         .fetch_one(&self.pool)
         .await?)
+    }
+}
+
+#[async_trait]
+impl AgentProfileRepo for SqliteDb {
+    async fn create_profile(&self, input: CreateAgentProfile) -> Result<AgentProfile> {
+        let mut transaction = self.pool.begin().await?;
+        insert_profile(&mut transaction, &input).await?;
+        transaction.commit().await?;
+        AgentProfileRepo::get_profile(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
+    async fn get_profile(&self, id: &str) -> Result<Option<AgentProfile>> {
+        sqlx::query("SELECT * FROM agent_profile WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_agent_profile)
+            .transpose()
+    }
+
+    async fn list_profiles(&self, identity_id: &str) -> Result<Vec<AgentProfile>> {
+        sqlx::query(
+            "SELECT * FROM agent_profile
+             WHERE identity_id = ?
+             ORDER BY version DESC, created_at DESC, id DESC",
+        )
+        .bind(identity_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_agent_profile)
+        .collect()
+    }
+
+    async fn select_profile(&self, input: SelectAgentProfile) -> Result<Agent> {
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET selected_profile_id = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?
+               AND EXISTS (
+                   SELECT 1 FROM agent_profile
+                   WHERE agent_profile.id = ?
+                     AND agent_profile.identity_id = agent_identity.id
+               )",
+        )
+        .bind(&input.profile_id)
+        .bind(&input.updated_at)
+        .bind(&input.identity_id)
+        .bind(input.expected_version)
+        .bind(&input.profile_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            let identity_exists =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_identity WHERE id = ?")
+                    .bind(&input.identity_id)
+                    .fetch_one(&self.pool)
+                    .await?
+                    > 0;
+            return Err(if identity_exists {
+                DbError::VersionConflict
+            } else {
+                DbError::NotFound
+            });
+        }
+        AgentRepo::get_by_id(self, &input.identity_id)
+            .await?
+            .ok_or(DbError::NotFound)
     }
 }
 
@@ -354,11 +574,13 @@ impl SqliteDb {
     ) -> Result<Vec<Agent>> {
         let rows = sqlx::query(
             "SELECT DISTINCT agent.*
-             FROM agent
-             LEFT JOIN project_agent_link ON project_agent_link.agent_id = agent.id
+             FROM agent_current AS agent
+             LEFT JOIN project_agent_binding AS binding
+               ON binding.identity_id = agent.id
+              AND binding.state = 'active'
              WHERE agent.visibility = 'global'
                 OR (agent.visibility = 'account' AND agent.owner_id = ?)
-                OR (project_agent_link.project_id = ? AND project_agent_link.agent_id = agent.id)
+                OR (binding.project_id = ?)
              ORDER BY agent.created_at ASC, agent.id ASC",
         )
         .bind(user_id)
@@ -368,4 +590,68 @@ impl SqliteDb {
 
         rows.into_iter().map(map_agent).collect()
     }
+}
+
+async fn insert_profile(
+    transaction: &mut Transaction<'_, Sqlite>,
+    input: &CreateAgentProfile,
+) -> Result<()> {
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(version), 0) + 1
+         FROM agent_profile
+         WHERE identity_id = ?",
+    )
+    .bind(&input.identity_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO agent_profile (
+            id, identity_id, backend_kind, executor_type, provider, model,
+            reasoning_effort, permission_policy, prompt_template,
+            capabilities_json, tool_policy_json, config_json, credential_ref,
+            daemon_id, version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.identity_id)
+    .bind(&input.backend_kind)
+    .bind(&input.executor_type)
+    .bind(input.provider.as_deref())
+    .bind(input.model.as_deref())
+    .bind(input.reasoning_effort.as_deref())
+    .bind(input.permission_policy.as_deref())
+    .bind(input.prompt_template.as_deref())
+    .bind(&input.capabilities_json)
+    .bind(&input.tool_policy_json)
+    .bind(&input.config_json)
+    .bind(input.credential_ref.as_deref())
+    .bind(input.daemon_id.as_deref())
+    .bind(revision)
+    .bind(&input.created_at)
+    .bind(&input.updated_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn clear_default_for_executor(
+    transaction: &mut Transaction<'_, Sqlite>,
+    executor_type: &str,
+    except_identity_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_identity
+         SET is_default = 0
+         WHERE selected_profile_id IN (
+             SELECT id FROM agent_profile WHERE executor_type = ?
+         )
+           AND (? IS NULL OR id != ?)",
+    )
+    .bind(executor_type)
+    .bind(except_identity_id)
+    .bind(except_identity_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }

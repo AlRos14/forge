@@ -29,7 +29,7 @@ import { logsToChatEntries } from '@/lib/logs-to-chat'
 import type { LogEntry } from '@/types/generated'
 import { productTerm } from '@/lib/i18n'
 
-type ConversationViewerProps = {
+type ChatLogViewerProps = {
   logs: LogEntry[]
   userPrompt?: string | null
   errorMessage?: string | null
@@ -92,7 +92,7 @@ const ChatEntryRenderer = memo(
     entryText(previous.entry) === entryText(next.entry),
 )
 
-export function ConversationViewer({
+export function ChatLogViewer({
   logs,
   userPrompt,
   errorMessage,
@@ -103,7 +103,7 @@ export function ConversationViewer({
   onNewLog,
   onLoadEarlier,
   onScrollBottomChange,
-}: ConversationViewerProps) {
+}: ChatLogViewerProps) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
   const pendingLogsRef = useRef<LogEntry[]>([])
   const notifiedLogsRef = useRef<LogEntry[]>([])

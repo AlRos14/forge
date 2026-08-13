@@ -101,7 +101,7 @@ impl OperatorStatusService {
                 e.executor_config_snapshot_json
              FROM execution e
              JOIN task t ON t.id = e.task_id
-             LEFT JOIN agent a ON a.id = e.agent_id
+             LEFT JOIN agent_current a ON a.id = e.agent_id
              LEFT JOIN workspace w ON w.id = e.workspace_id
              LEFT JOIN execution_usage eu ON eu.execution_id = e.id
              WHERE e.status = 'running'
@@ -253,18 +253,16 @@ impl OperatorStatusService {
                 (
                     SELECT COUNT(*)
                     FROM execution e
-                    JOIN agent a ON a.id = e.agent_id
+                    JOIN agent_current a ON a.id = e.agent_id
                     WHERE a.daemon_id = d.id AND e.status = 'running'
                 ) AS running_executions,
                 (
-                    SELECT COUNT(DISTINCT c.id)
-                    FROM conversation c
-                    JOIN agent a ON a.id = c.agent_id
-                    JOIN conversation_message cm ON cm.conversation_id = c.id
+                    SELECT COUNT(*)
+                    FROM agent_chat_turn_job turn_job
+                    JOIN agent_current a ON a.id = turn_job.responder_identity_id
                     WHERE a.daemon_id = d.id
-                      AND cm.role = 'assistant'
-                      AND cm.status = 'streaming'
-                ) AS streaming_conversations
+                      AND turn_job.status = 'leased'
+                ) AS active_agent_chat_turns
              FROM daemon d
              ORDER BY d.updated_at DESC, d.id ASC",
         )
@@ -274,9 +272,9 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let running_executions: i64 = row.try_get("running_executions")?;
-            let streaming_conversations: i64 = row.try_get("streaming_conversations")?;
+            let active_agent_chat_turns: i64 = row.try_get("active_agent_chat_turns")?;
             let active_sessions = running_executions
-                .saturating_add(streaming_conversations)
+                .saturating_add(active_agent_chat_turns)
                 .max(0) as u32;
             let labels_json: String = row.try_get("labels_json")?;
             let max_sessions = daemon_session_cap_from_labels(&labels_json)
@@ -309,14 +307,12 @@ impl OperatorStatusService {
                     WHERE e.agent_id = a.id AND e.status = 'running'
                 ) AS running_executions,
                 (
-                    SELECT COUNT(DISTINCT c.id)
-                    FROM conversation c
-                    JOIN conversation_message cm ON cm.conversation_id = c.id
-                    WHERE c.agent_id = a.id
-                      AND cm.role = 'assistant'
-                      AND cm.status = 'streaming'
-                ) AS streaming_conversations
-             FROM agent a
+                    SELECT COUNT(*)
+                    FROM agent_chat_turn_job turn_job
+                    WHERE turn_job.responder_identity_id = a.id
+                      AND turn_job.status = 'leased'
+                ) AS active_agent_chat_turns
+             FROM agent_current a
              ORDER BY a.name ASC, a.id ASC",
         )
         .fetch_all(self.db.pool())
@@ -325,9 +321,9 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let running_executions: i64 = row.try_get("running_executions")?;
-            let streaming_conversations: i64 = row.try_get("streaming_conversations")?;
+            let active_agent_chat_turns: i64 = row.try_get("active_agent_chat_turns")?;
             let active_sessions = running_executions
-                .saturating_add(streaming_conversations)
+                .saturating_add(active_agent_chat_turns)
                 .max(0) as u32;
             let max_sessions = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
             let at_capacity = max_sessions > 0 && active_sessions >= max_sessions;

@@ -236,7 +236,18 @@ pub(super) async fn build_executor_config_snapshot(
     agent: &Agent,
     overrides: Option<ExecutionOverrides>,
 ) -> Result<Option<String>> {
-    let resolved_daemon = crate::agent_service::resolve_daemon_for_agent(db, agent).await?;
+    // Native profiles are hosted by Forge itself and deliberately have no
+    // daemon authority.  CLI profiles retain the existing daemon resolution
+    // and snapshot provenance.
+    let resolved_daemon_id = if agent.backend_kind == "native" {
+        None
+    } else {
+        Some(
+            crate::agent_service::resolve_daemon_for_agent(db, agent)
+                .await?
+                .id,
+        )
+    };
     let mut base_config = parse_json_value("agent config_json", &agent.config_json)?;
     // Extract before normalization: the typed config round-trip drops
     // unknown fields, which would silently delete the chain.
@@ -255,13 +266,20 @@ pub(super) async fn build_executor_config_snapshot(
     let overrides_applied = overrides_applied.retain_config_keys(&normalized_config);
     let mut snapshot = json!({
         "agent_id": agent.id,
+        // Native execution consumes this immutable profile reference from the
+        // Task snapshot.  Provider credentials remain behind the protected
+        // profile/store boundary and are never copied into public execution
+        // snapshot JSON.
+        "profile_id": agent.profile_id,
+        "provider": agent.provider,
         "executor_type": agent.executor_type,
         "model": agent.model,
+        "prompt_template": agent.prompt_template,
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,
         "config": normalized_config,
         "capabilities": capabilities,
-        "resolved_daemon_id": resolved_daemon.id,
+        "resolved_daemon_id": resolved_daemon_id,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),
     });

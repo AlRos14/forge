@@ -205,6 +205,19 @@ impl TaskBoardRepo for SqliteDb {
             created_at: input.updated_at.clone(),
         };
         insert_transition_log(&mut tx, &transition_input).await?;
+        let transition_event = CreateDomainEvent::task_transition(
+            transition_input.id.clone(),
+            transition_input.task_id.clone(),
+            input.project_id.clone(),
+            &transition_input.from_state,
+            &transition_input.to_state,
+            transition_input.trigger_name.as_deref(),
+            &transition_input.triggered_by,
+            &transition_input.trigger_reason,
+            transition_input.rejection,
+            transition_input.created_at.clone(),
+        );
+        DomainEventRepo::append_event_in_tx(self, &mut tx, &transition_event).await?;
 
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)

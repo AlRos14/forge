@@ -1,4 +1,4 @@
-use db::{Agent, ClaimedTask, Execution, Page, Project, Task};
+use db::{Agent, AgentProfile, AgentSession, ClaimedTask, Execution, Page, Project, Task};
 use serde_json::{json, Value};
 
 pub(crate) fn task_page_value(page: Page<Task>) -> Value {
@@ -69,12 +69,17 @@ pub(crate) fn agent_value(agent: Agent) -> Value {
         "id": agent.id,
         "name": agent.name,
         "description": agent.description,
+        "profile_id": agent.profile_id,
+        "backend_kind": agent.backend_kind,
         "executor_type": agent.executor_type,
+        "provider": agent.provider,
         "model": agent.model,
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,
-        "capabilities": serde_json::from_str::<Value>(&agent.capabilities_json).unwrap_or(Value::Array(Vec::new())),
-        "config_json": serde_json::from_str::<Value>(&agent.config_json).unwrap_or(Value::Object(Default::default())),
+        "capabilities": safe_json(&agent.capabilities_json),
+        "config_json": safe_json(&agent.config_json),
+        // Opaque handle only; the protected credential is never serialized.
+        "credential_handle_id": agent.credential_ref,
         "daemon_id": agent.daemon_id,
         "max_concurrent_tasks": agent.max_concurrent_tasks,
         "heartbeat_interval_seconds": agent.heartbeat_interval_seconds,
@@ -99,6 +104,46 @@ pub(crate) fn project_value(project: Project) -> Value {
         "paused": paused,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
+    })
+}
+
+pub(crate) fn agent_profile_value(profile: AgentProfile) -> Value {
+    json!({
+        "id": profile.id,
+        "identity_id": profile.identity_id,
+        "backend_kind": profile.backend_kind,
+        "executor_type": profile.executor_type,
+        "provider": profile.provider,
+        "model": profile.model,
+        "reasoning_effort": profile.reasoning_effort,
+        "permission_policy": profile.permission_policy,
+        "system_prompt": profile.prompt_template,
+        "capabilities": safe_json(&profile.capabilities_json),
+        "tool_policy": safe_json(&profile.tool_policy_json),
+        "config": safe_json(&profile.config_json),
+        // This is an opaque database handle, never the protected credential.
+        "credential_handle_id": profile.credential_ref,
+        "version": profile.version,
+        "created_at": profile.created_at,
+    })
+}
+
+pub(crate) fn agent_session_value(session: AgentSession) -> Value {
+    json!({
+        "id": session.id,
+        "identity_id": session.identity_id,
+        "profile_id": session.profile_id,
+        "context_scope_id": session.context_scope_id,
+        "backend_kind": session.backend_kind,
+        "status": session.status,
+        "capabilities": json_string(Some(session.capabilities_json)),
+        "connection_status": session.connection_status,
+        "predecessor_session_id": session.predecessor_session_id,
+        "replaced_by_session_id": session.replaced_by_session_id,
+        "last_activity_at": session.last_activity_at,
+        "version": session.version,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
     })
 }
 
@@ -134,4 +179,34 @@ fn json_string(value: Option<String>) -> Value {
     value
         .map(|value| serde_json::from_str(&value).unwrap_or(Value::String(value)))
         .unwrap_or(Value::Null)
+}
+
+fn safe_json(value: &str) -> Value {
+    let parsed = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()));
+    redact_sensitive(parsed)
+}
+
+fn redact_sensitive(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase();
+                    if normalized.contains("credential")
+                        || normalized.contains("secret")
+                        || normalized.contains("password")
+                        || normalized == "token"
+                        || normalized.ends_with("_token")
+                        || normalized.contains("api_key")
+                    {
+                        return None;
+                    }
+                    Some((key, redact_sensitive(value)))
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_sensitive).collect()),
+        other => other,
+    }
 }

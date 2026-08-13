@@ -18,8 +18,8 @@ pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     account_key, build_ordered_fallback_routing, candidate_key, deserialize_config,
     merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig, CommandOverrides,
-    CursorConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig, NullConfig, OpencodeConfig,
-    PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig, SmithConfig,
+    CursorConfig, EmbeddedConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig, NullConfig,
+    OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig, SmithConfig,
     FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};

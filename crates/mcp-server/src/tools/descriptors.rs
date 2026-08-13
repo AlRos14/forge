@@ -10,7 +10,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
                 "title": { "type": "string" },
                 "description": { "type": "string" },
                 "parent_task_id": { "type": "string" },
-                "type": { "type": "string", "enum": ["task", "planning_task", "sub_task"] },
+                "type": { "type": "string", "enum": ["task", "planning_task", "sub_task", "discovery"] },
                 "priority": { "type": "integer" }
             }),
             required(scoped_project, &["project_id", "title"], &["title"]),
@@ -292,6 +292,133 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
                 }
             }),
             &["parent_task_id", "subtasks"],
+        ),
+        tool_descriptor(
+            "forge_list_agent_profiles",
+            "List immutable executable profiles for an account-owned agent identity. Protected credentials are never returned.",
+            json!({ "identity_id": { "type": "string" } }),
+            &["identity_id"],
+        ),
+        tool_descriptor(
+            "forge_list_agent_sessions",
+            "List scope-bound sessions for an account-owned agent identity without exposing protected session state.",
+            json!({ "identity_id": { "type": "string" } }),
+            &["identity_id"],
+        ),
+        tool_descriptor(
+            "forge_get_agent_session",
+            "Get one scope-bound agent session without exposing protected runtime state or credentials.",
+            json!({ "session_id": { "type": "string" } }),
+            &["session_id"],
+        ),
+        tool_descriptor(
+            "forge_get_main_agent",
+            "Inspect the account's singular Main Agent binding and setup state. The authenticated MCP account supplies authority.",
+            json!({}),
+            &[],
+        ),
+        tool_descriptor(
+            "forge_set_main_agent",
+            "Propose replacement of the account's singular Main Agent binding using optimistic concurrency.",
+            json!({
+                "identity_id": { "type": "string" },
+                "profile_id": { "type": "string" },
+                "expected_version": { "type": "integer" },
+                "autonomy_policy": { "type": "object" }
+            }),
+            &["identity_id", "profile_id", "expected_version"],
+        ),
+        tool_descriptor(
+            "forge_get_project_agent",
+            "Inspect the singular Project Agent binding for an authorized Project.",
+            json!({ "project_id": { "type": "string" } }),
+            required(scoped_project, &["project_id"], &[]),
+        ),
+        tool_descriptor(
+            "forge_set_project_agent",
+            "Propose replacement of a Project's singular Project Agent binding using optimistic concurrency.",
+            json!({
+                "project_id": { "type": "string" },
+                "identity_id": { "type": "string" },
+                "profile_id": { "type": "string" },
+                "expected_version": { "type": "integer" },
+                "permission_ceiling": { "type": "object" },
+                "autonomy_policy": { "type": "object" },
+                "subscriptions": { "type": "array", "items": { "type": "string" } },
+                "wake_budget": { "type": "integer" }
+            }),
+            required(
+                scoped_project,
+                &["project_id", "identity_id", "profile_id", "expected_version"],
+                &["identity_id", "profile_id", "expected_version"],
+            ),
+        ),
+        tool_descriptor(
+            "forge_list_agent_chats",
+            "List the authenticated account's Main chat and authorized Project Agent chats; no Room or arbitrary thread is exposed.",
+            json!({
+                "cursor": { "type": "string" },
+                "limit": { "type": "integer" }
+            }),
+            &[],
+        ),
+        tool_descriptor(
+            "forge_get_agent_chat",
+            "Inspect one authorized Agent Chat and redaction-safe turn state.",
+            json!({ "chat_id": { "type": "string" } }),
+            &["chat_id"],
+        ),
+        tool_descriptor(
+            "forge_list_agent_chat_messages",
+            "List immutable messages for one authorized Agent Chat, including bounded provenance and handoff references.",
+            json!({
+                "chat_id": { "type": "string" },
+                "before_sequence": { "type": "integer" },
+                "cursor": { "type": "string" },
+                "limit": { "type": "integer" }
+            }),
+            &["chat_id"],
+        ),
+        tool_descriptor(
+            "forge_send_agent_chat_message",
+            "Send one user message to an authorized singular Agent Chat. Forge admits the responder and turn from the bound scope.",
+            json!({
+                "chat_id": { "type": "string" },
+                "content": { "type": "string" },
+                "dedupe_key": { "type": "string" }
+            }),
+            &["chat_id", "content"],
+        ),
+        tool_descriptor(
+            "forge_list_agent_handoffs",
+            "List immutable Main-to-Project handoff records for an authorized Project.",
+            json!({
+                "project_id": { "type": "string" },
+                "cursor": { "type": "string" },
+                "limit": { "type": "integer" }
+            }),
+            required(scoped_project, &["project_id"], &[]),
+        ),
+        tool_descriptor(
+            "forge_get_agent_handoff",
+            "Inspect one authorized handoff's bounded content, provenance, and delivery outcome.",
+            json!({
+                "project_id": { "type": "string" },
+                "handoff_id": { "type": "string" }
+            }),
+            required(scoped_project, &["project_id", "handoff_id"], &["handoff_id"]),
+        ),
+        tool_descriptor(
+            "forge_create_agent_handoff",
+            "Publish a bounded, deduplicated Main-to-Project handoff. Forge guards content and derives target authority from the authenticated scope.",
+            json!({
+                "project_id": { "type": "string" },
+                "content": { "type": "string" },
+                "source_message_id": { "type": "string" },
+                "source_turn_job_id": { "type": "string" },
+                "dedupe_key": { "type": "string" }
+            }),
+            required(scoped_project, &["project_id", "content", "dedupe_key"], &["content", "dedupe_key"]),
         ),
     ])
 }

@@ -62,13 +62,24 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
         .expect("prerequisite completes");
     assert_eq!(done.task.status, "done".to_owned());
 
-    let status_event = rx.recv().await.expect("status event emits");
-    assert_eq!(status_event.event_type, "task.status_changed");
-    let dependency_event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("dependency event emits before timeout")
-        .expect("dependency event receives");
-    assert_eq!(dependency_event.event_type, "task.dependency_satisfied");
+    let mut status_event_seen = false;
+    let mut committed_event_seen = false;
+    let mut dependency_event = None;
+    for _ in 0..3 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("transition event emits before timeout")
+            .expect("transition event receives");
+        match event.event_type.as_str() {
+            "task.status_changed" => status_event_seen = true,
+            "domain_event.committed" => committed_event_seen = true,
+            "task.dependency_satisfied" => dependency_event = Some(event),
+            _ => {}
+        }
+    }
+    assert!(status_event_seen);
+    assert!(committed_event_seen);
+    let dependency_event = dependency_event.expect("dependency event receives");
     assert_eq!(dependency_event.entity_id, dependent.id);
     match dependency_event.context {
         EventContext::TaskDependencySatisfied {

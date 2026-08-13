@@ -1,5 +1,8 @@
 use super::*;
-use crate::workflow::engine::{BoardMoveOutcome, BoardMoveRequest};
+use crate::{
+    workflow::engine::{BoardMoveOutcome, BoardMoveRequest},
+    DomainEventService,
+};
 use api_types::{Actor, MoveTaskRequest, TaskMovedEventPayload, UserActionSource};
 use db::{
     CompareAndMoveTask, MoveTaskIdentity, MoveTaskPersistence, MoveTaskResult, TaskBoardRepo,
@@ -288,7 +291,16 @@ impl TaskService {
         .await?;
         match persistence {
             MoveTaskPersistence::Replayed(result) => Ok(*result),
-            MoveTaskPersistence::Committed { result, .. } => {
+            MoveTaskPersistence::Committed {
+                result,
+                transition_log,
+            } => {
+                if let Some(event) =
+                    db::DomainEventRepo::get_event(&*self.db, &transition_log.id).await?
+                {
+                    DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                        .publish_committed(&event);
+                }
                 self.publish_move_event(&result);
                 TaskBoardRepo::complete_move_operation(
                     &*self.db,

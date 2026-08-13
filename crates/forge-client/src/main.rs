@@ -2,7 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{data_dir_from_env, read_server_state, server_state_path};
 use forge_client::{
-    agent, auth, client::ForgeClient, daemon, mcp, memory, project, repo, run, task, OutputFormat,
+    agent, auth, client::ForgeClient, daemon, embedded, mcp, memory, project, repo, run, task,
+    OutputFormat,
 };
 
 #[derive(Parser)]
@@ -33,6 +34,7 @@ enum Commands {
     Repo(repo::RepoArgs),
     Run(run::RunArgs),
     Mcp(mcp::McpArgs),
+    Embedded(embedded::EmbeddedArgs),
 }
 
 #[tokio::main]
@@ -81,6 +83,10 @@ async fn main() -> Result<()> {
         Commands::Mcp(args) => {
             let server = resolve_server_url(cli.server.as_deref())?;
             args.run(&server).await
+        }
+        Commands::Embedded(args) => {
+            let client = client_for(cli.server.as_deref())?;
+            args.run(&client, &cli.output).await
         }
     }
 }

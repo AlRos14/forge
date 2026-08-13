@@ -86,6 +86,7 @@ fn resolve_isolation_posture(
     config_snapshot: &Value,
 ) -> String {
     match executor_kind {
+        ExecutorKind::Embedded => "task_workspace".to_owned(),
         ExecutorKind::Codex => config_string(config, config_snapshot, "sandbox")
             .unwrap_or_else(|| "not_applicable".to_owned()),
         ExecutorKind::ClaudeCode => {

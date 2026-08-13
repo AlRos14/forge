@@ -58,6 +58,11 @@ impl TaskService {
             &finished_at,
         )
         .await?;
+        self.publish_domain_event_by_dedupe(&format!(
+            "review-status:{}:{}:{}",
+            review.id, review.status, finished_at
+        ))
+        .await;
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -148,6 +153,11 @@ impl TaskService {
             &finished_at,
         )
         .await?;
+        self.publish_domain_event_by_dedupe(&format!(
+            "review-status:{}:{}:{}",
+            review.id, review.status, finished_at
+        ))
+        .await;
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)

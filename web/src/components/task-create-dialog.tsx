@@ -18,6 +18,7 @@ import type { Task, TaskType } from '@/types/generated'
 const taskTypes: { value: TaskType; label: string }[] = [
   { value: 'task', label: 'Task' },
   { value: 'planning_task', label: 'Planning Task' },
+  { value: 'discovery', label: 'Discovery' },
   { value: 'sub_task', label: 'Sub Task' },
 ]
 

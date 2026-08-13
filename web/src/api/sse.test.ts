@@ -74,32 +74,29 @@ describe('routeSsePayload', () => {
     )
   })
 
-  it('dispatches conversation.log browser event and skips query invalidation', () => {
+  it('ignores uncommitted Agent Chat streaming deltas until the ledger entry arrives', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(
       {
-        event_type: 'conversation.log',
-        entity_id: 'conv-1',
-        conversation_id: 'conv-1',
+        event_type: 'agent_chat.message_delta',
+        entity_id: 'chat-1',
+        chat_id: 'chat-1',
         timestamp: '2026-05-05T00:00:00Z',
       },
       queryClient,
       { dispatch },
     )
-    expect(dispatch).toHaveBeenCalledWith(
-      'forge:conversation-log',
-      expect.objectContaining({ event_type: 'conversation.log' }),
-    )
+    expect(dispatch).not.toHaveBeenCalled()
     expect(invalidateQueries).not.toHaveBeenCalled()
   })
 
-  it('invalidates conversation queries for conversation.message_delta', () => {
+  it('invalidates Agent Chat projections for committed ledger messages', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(
       {
-        event_type: 'conversation.message_delta',
+        event_type: 'agent_chat.message_created',
         entity_id: 'message-1',
-        conversation_id: 'conv-1',
+        chat_id: 'chat-1',
         project_id: 'proj-1',
         timestamp: '2026-05-05T00:00:00Z',
       },
@@ -109,9 +106,11 @@ describe('routeSsePayload', () => {
     expect(dispatch).not.toHaveBeenCalled()
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['conversations', 'conv-1'] }],
-        [{ queryKey: ['conversations', 'conv-1', 'messages'] }],
-        [{ queryKey: ['projects', 'proj-1', 'conversations', 'active'] }],
+        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats', 'chat-1'] }],
+        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
+        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
+        [{ queryKey: ['agent-handoffs', 'proj-1'] }],
       ]),
     )
   })

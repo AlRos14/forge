@@ -223,7 +223,7 @@ async fn run_execution_rechecks_cancelled_status_before_adapter_launch() {
         .with_workspace_exec_locks(Arc::clone(&locks));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    sqlx::query("UPDATE agent SET max_concurrent_tasks = 2 WHERE id = ?")
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 2 WHERE id = ?")
         .bind(&agent_id)
         .execute(db.pool())
         .await

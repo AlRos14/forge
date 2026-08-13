@@ -37,6 +37,9 @@ async fn forge_client_creates_and_gets_project() {
                 settings: None,
                 default_review_config: None,
                 paused: None,
+                project_agent_identity_id: None,
+                project_agent_profile_id: None,
+                product_genesis_session_id: None,
             },
         )
         .await
@@ -410,13 +413,17 @@ async fn create_agent_route(
         id: data.next_id("agent"),
         name: request.name,
         description: request.description,
+        profile_id: data.next_id("profile"),
+        backend_kind: "cli".to_owned(),
         executor_type: request.executor_type,
+        provider: None,
         model: request.model,
         reasoning_effort: request.reasoning_effort,
         permission_policy: request.permission_policy,
         prompt_template: request.prompt_template,
         capabilities: request.capabilities.unwrap_or_default(),
         config_json: request.config_json.unwrap_or_else(|| serde_json::json!({})),
+        credential_handle_id: None,
         daemon_id: request.daemon_id,
         max_concurrent_tasks: request.max_concurrent_tasks.unwrap_or(1),
         status: AgentStatus::Idle,
@@ -464,6 +471,9 @@ async fn create_project(client: &ForgeClient, name: &str) -> ProjectResponse {
                 settings: None,
                 default_review_config: None,
                 paused: None,
+                project_agent_identity_id: None,
+                project_agent_profile_id: None,
+                product_genesis_session_id: None,
             },
         )
         .await

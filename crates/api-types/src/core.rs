@@ -10,6 +10,7 @@ pub enum TaskType {
     Task,
     PlanningTask,
     SubTask,
+    Discovery,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -21,8 +22,9 @@ pub enum WorkMode {
     PullRequest,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum AgentStatus {
     Idle,
     Busy,
@@ -37,33 +39,6 @@ pub type ExecutionRole = String;
 pub enum ExecutionStatus {
     Running,
     Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ConversationStatus {
-    Active,
-    Archived,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ConversationMessageRole {
-    User,
-    Assistant,
-    System,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ConversationMessageStatus {
-    Complete,
-    Streaming,
     Failed,
     Cancelled,
 }
@@ -437,23 +412,6 @@ pub struct ReviewConfig {
     pub ci_steps: Vec<String>,
     #[serde(default)]
     pub review_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct ProjectAgentLinkResponse {
-    pub id: String,
-    pub project_id: String,
-    pub agent_id: String,
-    pub linked_by_user_id: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct CreateProjectAgentLinkRequest {
-    pub agent_id: String,
 }
 
 #[cfg(test)]

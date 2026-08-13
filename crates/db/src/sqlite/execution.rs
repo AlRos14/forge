@@ -289,7 +289,7 @@ impl ExecutionRepo for SqliteDb {
         let rows = if exclude_ids.is_empty() {
             sqlx::query(
                 "SELECT e.* FROM execution e
-                 INNER JOIN agent a ON a.id = e.agent_id
+                 INNER JOIN agent_current a ON a.id = e.agent_id
                  WHERE e.status = 'running'
                    AND a.daemon_id = ?
                    AND e.created_at < ?
@@ -307,7 +307,7 @@ impl ExecutionRepo for SqliteDb {
                 .join(", ");
             let query = format!(
                 "SELECT e.* FROM execution e
-                 INNER JOIN agent a ON a.id = e.agent_id
+                 INNER JOIN agent_current a ON a.id = e.agent_id
                  WHERE e.status = 'running'
                    AND a.daemon_id = ?
                    AND e.created_at < ?

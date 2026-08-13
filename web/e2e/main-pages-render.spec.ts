@@ -32,7 +32,9 @@ test('main pages and settings tabs render', async ({ page, request }) => {
   const routes: Array<{ path: string; visibleText: string | RegExp }> = [
     { path: `/projects/${project.id}/board`, visibleText: /^Todo$/ },
     { path: `/projects/${project.id}/tasks`, visibleText: /^Tasks$/ },
-    { path: `/projects/${project.id}/chat`, visibleText: /^Chat$/ },
+    { path: `/projects/${project.id}/chat`, visibleText: /^.* chat$/ },
+    { path: '/chat', visibleText: /^Global chat$/ },
+    { path: '/agents/federated', visibleText: /^Agent identities$/ },
     { path: '/agents', visibleText: /^Agents$/ },
     { path: '/daemons', visibleText: /^Daemons$/ },
     { path: '/operations', visibleText: /^Operations$/ },
@@ -50,6 +52,7 @@ test('main pages and settings tabs render', async ({ page, request }) => {
   for (const tab of [
     { nav: 'General', heading: 'General' },
     { nav: 'Repos', heading: 'Primary Repository' },
+    { nav: 'Project Agent', heading: 'One Project Agent binding' },
     { nav: 'MCP', heading: 'MCP' },
     { nav: 'Hooks', heading: 'Lifecycle Hooks' },
     { nav: 'Analytics', heading: 'Analytics' },

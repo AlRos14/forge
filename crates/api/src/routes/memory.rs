@@ -3,8 +3,8 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use db::{MemoryItem, MemoryRepository, ProjectMemberRepo, ProjectRepo};
-use services::MemorySearchResult;
+use db::{MemoryScopeGrant, ProjectMemberRepo, ProjectRepo};
+use services::{MemoryAccessContext, MemorySearchResult};
 use uuid::Uuid;
 
 use crate::{
@@ -27,29 +27,24 @@ pub async fn search_project_memory(
     require_project_visible(&state, &normalized_project_id, &user).await?;
     let layer = response_layer(params.layer, params.token_budget)?;
     let limit = params.limit.unwrap_or(20);
+    let access = MemoryAccessContext::for_scope(
+        None,
+        "project",
+        normalized_project_id.clone(),
+        vec!["project".to_owned()],
+    );
     let (results, has_more, next_cursor) = state
         .memory_service
-        .search(
-            project_uuid,
-            params.query,
-            params.layer,
-            params.token_budget,
-            limit,
-            params.cursor,
-        )
+        .search_scoped(&access, params.query, params.layer, limit, params.cursor)
         .await?;
 
     let mut items = Vec::with_capacity(results.len());
     for (index, result) in results.into_iter().enumerate() {
-        let raw = memory_item_for_result(&state, &result).await?;
-        if raw.project_id != normalized_project_id {
-            return Err(ApiError::not_found("memory_item", result.id.to_string()));
-        }
         items.push(memory_result_dto(
             result,
-            raw,
             layer,
             relevance_score(index),
+            Some(normalized_project_id.clone()),
         ));
     }
 
@@ -68,30 +63,54 @@ pub async fn get_memory_item(
 ) -> ApiResult<Json<MemorySearchResultDto>> {
     let item_uuid = parse_uuid(&id, "id")?;
     let layer = response_layer(params.layer, None)?;
-    let result = state.memory_service.get(item_uuid, params.layer).await?;
-    let raw = memory_item_for_result(&state, &result).await?;
-    require_project_visible(&state, &raw.project_id, &user).await?;
-    Ok(Json(memory_result_dto(result, raw, layer, 1.0)))
-}
-
-async fn memory_item_for_result(
-    state: &AppState,
-    result: &MemorySearchResult,
-) -> ApiResult<MemoryItem> {
-    let id = result.id.to_string();
-    MemoryRepository::get_memory_item(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("memory_item", id))
+    let grants = if let Some(project_id) = params.project_id.as_deref() {
+        let project_uuid = parse_uuid(project_id, "project_id")?;
+        let normalized_project_id = project_uuid.to_string();
+        require_project_visible(&state, &normalized_project_id, &user).await?;
+        vec![MemoryScopeGrant {
+            scope_type: "project".to_owned(),
+            scope_id: normalized_project_id,
+            visibility: vec!["project".to_owned()],
+            identity_id: None,
+        }]
+    } else {
+        visible_project_grants(&state, &user).await?
+    };
+    let access = MemoryAccessContext {
+        identity_id: None,
+        grants,
+    };
+    let result = state
+        .memory_service
+        .get_scoped(&access, item_uuid, params.layer)
+        .await
+        .map_err(|error| match error {
+            services::ServiceError::NotFound { .. } => {
+                ApiError::not_found("memory_item", id.clone())
+            }
+            other => ApiError::from(other),
+        })?;
+    Ok(Json(memory_result_dto(result, layer, 1.0, None)))
 }
 
 fn memory_result_dto(
     result: MemorySearchResult,
-    raw: MemoryItem,
     layer: u8,
     score: f32,
+    fallback_project_id: Option<String>,
 ) -> MemorySearchResultDto {
-    let source_id = source_ref_from_metadata(&raw.metadata_json).unwrap_or_else(|| raw.id.clone());
-    let creator = creator_from_item(&raw);
+    let source_id = result
+        .references
+        .as_ref()
+        .map(|references| references.source_ref.clone())
+        .unwrap_or_else(|| result.id.to_string());
+    let creator = result.creator.as_ref().and_then(|creator| {
+        creator
+            .creator_id
+            .clone()
+            .or_else(|| Some(creator.creator_type.clone()))
+    });
+    let references = result.references.as_ref();
     MemorySearchResultDto {
         id: result.id.to_string(),
         layer,
@@ -99,9 +118,12 @@ fn memory_result_dto(
         score,
         source_type: result.kind.to_string(),
         source_id,
-        project_id: raw.project_id,
-        task_id: raw.task_id,
-        created_at: raw.created_at,
+        project_id: references
+            .and_then(|references| references.project_id.clone())
+            .or(fallback_project_id)
+            .unwrap_or_default(),
+        task_id: references.and_then(|references| references.task_id.clone()),
+        created_at: result.created_at.unwrap_or_default(),
         creator,
     }
 }
@@ -124,26 +146,35 @@ fn relevance_score(index: usize) -> f32 {
     1.0 / (index as f32 + 1.0)
 }
 
-fn source_ref_from_metadata(metadata_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(metadata_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("source_ref")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-}
-
-fn creator_from_item(item: &MemoryItem) -> Option<String> {
-    item.created_by_id
-        .clone()
-        .or_else(|| item.created_by_type.clone())
-}
-
 fn parse_uuid(value: &str, field: &'static str) -> ApiResult<Uuid> {
     Uuid::parse_str(value)
         .map_err(|error| ApiError::bad_request(format!("invalid {field} UUID: {error}")))
+}
+
+async fn visible_project_grants(
+    state: &AppState,
+    user: &AuthenticatedUser,
+) -> ApiResult<Vec<MemoryScopeGrant>> {
+    let rows = sqlx::query(
+        "SELECT project.id FROM project WHERE project.owner_id IS NULL OR project.owner_id = ? OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ?)",
+    )
+    .bind(&user.user_id)
+    .bind(&user.user_id)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(db::DbError::from)?;
+    use sqlx::Row;
+    rows.into_iter()
+        .map(|row| {
+            Ok(MemoryScopeGrant {
+                scope_type: "project".to_owned(),
+                scope_id: row.try_get("id")?,
+                visibility: vec!["project".to_owned()],
+                identity_id: None,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(|error| ApiError::from(db::DbError::from(error)))
 }
 
 async fn require_project_visible(

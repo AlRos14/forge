@@ -1,5 +1,6 @@
 use std::{fmt, str::FromStr};
 
+use crate::pagination::PageRequest;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row};
 
@@ -229,13 +230,18 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub profile_id: String,
+    pub backend_kind: String,
     pub executor_type: String,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub permission_policy: Option<String>,
     pub prompt_template: Option<String>,
     pub capabilities_json: String,
+    pub tool_policy_json: String,
     pub config_json: String,
+    pub credential_ref: Option<String>,
     pub daemon_id: Option<String>,
     pub max_concurrent_tasks: i64,
     pub heartbeat_interval_seconds: i64,
@@ -248,6 +254,277 @@ pub struct Agent {
     pub visibility: String,
     pub version: i64,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub id: String,
+    pub identity_id: String,
+    pub backend_kind: String,
+    pub executor_type: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub permission_policy: Option<String>,
+    pub prompt_template: Option<String>,
+    pub capabilities_json: String,
+    pub tool_policy_json: String,
+    pub config_json: String,
+    pub credential_ref: Option<String>,
+    pub daemon_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialHandle {
+    pub id: String,
+    pub owner_user_id: String,
+    pub provider: String,
+    pub label: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextScope {
+    pub id: String,
+    pub identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub task_role: Option<String>,
+    pub workspace_access: String,
+    pub authority_json: String,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSession {
+    pub id: String,
+    pub identity_id: String,
+    pub profile_id: String,
+    pub context_scope_id: String,
+    pub backend_kind: String,
+    pub runtime_session_id: Option<String>,
+    pub status: String,
+    pub capabilities_json: String,
+    pub connection_status: String,
+    pub predecessor_session_id: Option<String>,
+    pub replaced_by_session_id: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConnectionHealth {
+    pub profile_id: String,
+    pub status: String,
+    pub capability_status_json: String,
+    pub checked_at: Option<String>,
+    pub error_code: Option<String>,
+    pub updated_at: String,
+}
+
+/// Durable identity/canonical-scope binding for one Agent Runtime LCM
+/// timeline.  The runtime-facing typed values remain in the host crate; the
+/// database stores their canonical JSON representation and immutable
+/// provenance fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLcmTimeline {
+    pub id: String,
+    pub identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub authorization_revision: String,
+    pub revision: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLcmEntryRecord {
+    pub timeline_id: String,
+    pub entry_id: String,
+    pub sequence: i64,
+    pub content_json: String,
+    pub content_fingerprint: String,
+    pub source_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLcmNodeRecord {
+    pub timeline_id: String,
+    pub node_id: String,
+    pub kind: String,
+    pub range_start: i64,
+    pub range_end: i64,
+    pub edges_json: String,
+    pub source_fingerprint: String,
+    pub summary_revision: String,
+    pub summary: String,
+    pub policy_revision: String,
+    pub algorithm_revision: String,
+    pub sizer_revision: String,
+    pub provenance_json: String,
+    pub token_count: i64,
+    pub source_token_count: i64,
+    pub classification_json: String,
+    pub revision: i64,
+    pub superseded_by: Option<String>,
+    pub operation_id: String,
+    pub operation_fingerprint: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLcmOperation {
+    pub timeline_id: String,
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub operation_fingerprint: String,
+    pub result_revision: i64,
+    pub result_entries: i64,
+    pub result_node_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainEvent {
+    pub sequence: i64,
+    pub id: String,
+    pub event_type: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub actor_type: String,
+    pub actor_id: Option<String>,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub dedupe_key: Option<String>,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+/// Rebuildable, durable Attention materialization.  The source event and
+/// dedupe key keep this row derived; the lifecycle columns are the only
+/// operator-owned state and use optimistic versions for concurrent clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionProjection {
+    pub id: String,
+    pub attention_type: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub identity_id: Option<String>,
+    pub source_event_id: String,
+    pub priority: i64,
+    pub status: String,
+    pub summary: String,
+    pub details_json: String,
+    pub dedupe_key: String,
+    pub occurred_at: String,
+    pub updated_at: String,
+    pub version: i64,
+    pub acknowledged_at: Option<String>,
+    pub snoozed_until: Option<String>,
+    pub resolved_at: Option<String>,
+    pub updated_by_user_id: Option<String>,
+    pub recommended_action: String,
+    pub source_sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateAttentionProjection {
+    pub id: String,
+    pub attention_type: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub identity_id: Option<String>,
+    pub source_event_id: String,
+    pub priority: i64,
+    pub status: String,
+    pub summary: String,
+    pub details_json: String,
+    pub dedupe_key: String,
+    pub occurred_at: String,
+    pub updated_at: String,
+    pub acknowledged_at: Option<String>,
+    pub snoozed_until: Option<String>,
+    pub resolved_at: Option<String>,
+    pub updated_by_user_id: Option<String>,
+    pub recommended_action: String,
+    pub source_sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAttentionLifecycle {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: String,
+    pub acknowledged_at: Option<Option<String>>,
+    pub snoozed_until: Option<Option<String>>,
+    pub resolved_at: Option<Option<String>>,
+    pub updated_by_user_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionListQuery {
+    pub account_id: Option<String>,
+    pub project_id: Option<String>,
+    pub scope_type: Option<String>,
+    pub status: Option<String>,
+    pub include_snoozed: bool,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionConsumerHealth {
+    pub consumer_name: String,
+    pub last_sequence: i64,
+    pub last_started_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_until: Option<String>,
+    pub processed_events: i64,
+    pub version: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertAttentionConsumerHealth {
+    pub consumer_name: String,
+    pub last_sequence: i64,
+    pub last_started_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_until: Option<String>,
+    pub processed_events_delta: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventConsumerCursor {
+    pub consumer_name: String,
+    pub last_sequence: i64,
+    pub version: i64,
     pub updated_at: String,
 }
 
@@ -490,57 +767,199 @@ pub struct Execution {
 
 pub type ExecutionRole = String;
 
+/// Versioned account-level binding for the singular Main Agent Chat.  Binding
+/// rows are retained when replaced so historical messages keep their original
+/// identity/profile attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Conversation {
+pub struct AccountMainAgentBinding {
+    pub id: String,
+    pub account_id: String,
+    pub identity_id: String,
+    pub profile_id: String,
+    pub state: String,
+    pub autonomy_policy_json: String,
+    pub tool_policy_revision: String,
+    pub version: i64,
+    pub replaced_by_binding_id: Option<String>,
+    pub replacement_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Versioned Project Agent binding.  A setup-required row intentionally has
+/// no identity/profile; this is an explicit state for migrated Projects and
+/// cannot be used to admit a model turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAgentBinding {
     pub id: String,
     pub project_id: String,
-    pub agent_id: Option<String>,
-    pub title: String,
-    pub status: ConversationStatus,
-    pub system_prompt: Option<String>,
+    pub identity_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub state: String,
+    pub autonomy_policy_json: String,
+    pub permission_ceiling_json: String,
+    pub subscriptions_json: String,
+    pub wake_budget: i64,
+    pub version: i64,
+    pub replaced_by_binding_id: Option<String>,
+    pub replacement_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChat {
+    pub id: String,
+    pub kind: String,
+    pub account_id: Option<String>,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub instruction_revision: i64,
     pub message_count: i64,
     pub last_message_at: Option<String>,
-    pub agent_session_id: Option<String>,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConversationStatus {
-    Active,
-    Archived,
+pub struct AgentChatSourceRef {
+    pub chat_id: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub source_scope_type: Option<String>,
+    pub source_scope_id: Option<String>,
+    pub source_revision: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConversationMessage {
+pub struct AgentChatInstructionRevision {
     pub id: String,
-    pub conversation_id: String,
-    pub role: ConversationMessageRole,
+    pub chat_id: String,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub revision: i64,
+    pub body: String,
+    pub content_guard_json: String,
+    pub sensitivity: String,
+    pub created_by_type: String,
+    pub created_by_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentChatMessageAuthorType {
+    User,
+    Agent,
+    System,
+    Handoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentChatMessageStatus {
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChatMessage {
+    pub id: String,
+    pub chat_id: String,
+    pub sequence: i64,
+    pub author_type: AgentChatMessageAuthorType,
+    pub author_id: Option<String>,
     pub content: String,
-    pub status: ConversationMessageStatus,
+    pub content_guard_json: String,
+    pub sensitivity: String,
+    pub status: AgentChatMessageStatus,
+    pub outcome: Option<String>,
     pub model: Option<String>,
+    pub profile_id: Option<String>,
+    pub session_id: Option<String>,
+    pub context_manifest_id: Option<String>,
     pub token_usage_json: Option<String>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
-    pub sequence: i64,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub handoff_id: Option<String>,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub source_message_id: Option<String>,
+    pub source_room_id: Option<String>,
+    pub source_conversation_id: Option<String>,
+    pub source_sequence: Option<i64>,
+    pub source_metadata_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentChatTurnState {
+    Queued,
+    Leased,
+    RetryWait,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChatTurnJob {
+    pub id: String,
+    pub chat_id: String,
+    pub triggering_message_id: String,
+    pub responder_identity_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub canonical_scope_type: String,
+    pub canonical_scope_id: String,
+    pub status: AgentChatTurnState,
+    pub dedupe_key: String,
+    pub lease_owner: Option<String>,
+    pub leased_until: Option<String>,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub next_attempt_at: Option<String>,
+    pub response_message_id: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConversationMessageRole {
-    User,
-    Assistant,
-    System,
+pub enum AgentHandoffStatus {
+    Pending,
+    Delivered,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConversationMessageStatus {
-    Complete,
-    Streaming,
-    Failed,
-    Cancelled,
+pub struct AgentHandoff {
+    pub id: String,
+    pub source_chat_id: String,
+    pub target_chat_id: String,
+    pub source_message_id: Option<String>,
+    pub source_turn_job_id: Option<String>,
+    pub target_message_id: Option<String>,
+    pub target_turn_job_id: Option<String>,
+    pub author_identity_id: Option<String>,
+    pub content: String,
+    pub content_guard_json: String,
+    pub source_revisions_json: String,
+    pub status: AgentHandoffStatus,
+    pub error_code: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub dedupe_key: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,7 +972,6 @@ pub enum MemoryKind {
     ExecutionSummary,
     Comment,
     Transition,
-    ConversationMessage,
     Artifact,
     Lesson,
     ContextPack,
@@ -565,7 +983,6 @@ pub enum MemorySourceType {
     Review,
     Comment,
     Transition,
-    Conversation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,10 +996,25 @@ pub enum MemoryConfidence {
 pub struct MemoryItem {
     pub row_id: i64,
     pub id: String,
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub task_id: Option<String>,
     pub execution_id: Option<String>,
-    pub conversation_id: Option<String>,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub visibility: String,
+    pub owner_identity_id: Option<String>,
+    pub authority: String,
+    pub sensitivity: String,
+    pub retention_priority: i64,
+    pub provenance_json: String,
+    pub publication_source_id: Option<String>,
+    pub supersedes_id: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub source_event_id: Option<String>,
+    pub source_scope_type: Option<String>,
+    pub source_scope_id: Option<String>,
+    pub source_revision: Option<String>,
     pub source_type: String,
     pub kind: String,
     pub title: String,
@@ -604,7 +1036,22 @@ impl MemoryItem {
             project_id: row.try_get("project_id")?,
             task_id: row.try_get("task_id")?,
             execution_id: row.try_get("execution_id")?,
-            conversation_id: row.try_get("conversation_id")?,
+            scope_type: row.try_get("scope_type")?,
+            scope_id: row.try_get("scope_id")?,
+            visibility: row.try_get("visibility")?,
+            owner_identity_id: row.try_get("owner_identity_id")?,
+            authority: row.try_get("authority")?,
+            sensitivity: row.try_get("sensitivity")?,
+            retention_priority: row.try_get("retention_priority")?,
+            provenance_json: row.try_get("provenance_json")?,
+            publication_source_id: row.try_get("publication_source_id")?,
+            supersedes_id: row.try_get("supersedes_id")?,
+            valid_from: row.try_get("valid_from")?,
+            valid_until: row.try_get("valid_until")?,
+            source_event_id: row.try_get("source_event_id")?,
+            source_scope_type: row.try_get("source_scope_type")?,
+            source_scope_id: row.try_get("source_scope_id")?,
+            source_revision: row.try_get("source_revision")?,
             source_type: row.try_get("source_type")?,
             kind: row.try_get("kind")?,
             title: row.try_get("title")?,
@@ -618,6 +1065,151 @@ impl MemoryItem {
             created_at: row.try_get("created_at")?,
         })
     }
+}
+
+/// One server-authorized canonical scope that a MemorySource may search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryScopeGrant {
+    pub scope_type: String,
+    pub scope_id: String,
+    pub visibility: Vec<String>,
+    pub identity_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAccessQuery {
+    pub identity_id: Option<String>,
+    pub grants: Vec<MemoryScopeGrant>,
+    pub query: String,
+    pub limit: i64,
+    pub cursor: Option<String>,
+    pub include_retracted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryGetQuery {
+    pub id: String,
+    pub identity_id: Option<String>,
+    pub grants: Vec<MemoryScopeGrant>,
+    pub include_retracted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMemoryLifecycleAssertion {
+    pub id: String,
+    pub memory_item_id: String,
+    pub assertion_type: String,
+    pub related_memory_id: Option<String>,
+    pub reason: Option<String>,
+    pub evidence_json: String,
+    pub asserted_by_type: String,
+    pub asserted_by_id: Option<String>,
+    pub source_event_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryLifecycleAssertion {
+    pub id: String,
+    pub memory_item_id: String,
+    pub assertion_type: String,
+    pub related_memory_id: Option<String>,
+    pub reason: Option<String>,
+    pub evidence_json: String,
+    pub asserted_by_type: String,
+    pub asserted_by_id: Option<String>,
+    pub source_event_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateForgeMemorySourceBinding {
+    pub id: String,
+    pub identity_id: String,
+    pub context_scope_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub account_id: Option<String>,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub policy_revision: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMemorySourceBinding {
+    pub id: String,
+    pub identity_id: String,
+    pub context_scope_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub account_id: Option<String>,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub policy_revision: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateContextManifest {
+    pub id: String,
+    pub identity_id: String,
+    pub agent_session_id: Option<String>,
+    pub context_scope_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub policy_revision: String,
+    pub domain_revision: String,
+    pub lcm_binding_revision: Option<String>,
+    pub runtime_manifest_id: Option<String>,
+    pub runtime_manifest_fingerprint: Option<String>,
+    pub combined_fingerprint: String,
+    pub request_fingerprint: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextManifest {
+    pub id: String,
+    pub identity_id: String,
+    pub agent_session_id: Option<String>,
+    pub context_scope_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub policy_revision: String,
+    pub domain_revision: String,
+    pub lcm_binding_revision: Option<String>,
+    pub runtime_manifest_id: Option<String>,
+    pub runtime_manifest_fingerprint: Option<String>,
+    pub combined_fingerprint: String,
+    pub request_fingerprint: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateContextManifestSource {
+    pub manifest_id: String,
+    pub ordinal: i64,
+    pub source_id: String,
+    pub source_type: String,
+    pub source_revision: String,
+    pub selection_reason: String,
+    pub disposition: String,
+    pub retention_priority: i64,
+    pub fragment_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextManifestSource {
+    pub manifest_id: String,
+    pub ordinal: i64,
+    pub source_id: String,
+    pub source_type: String,
+    pub source_revision: String,
+    pub selection_reason: String,
+    pub disposition: String,
+    pub retention_priority: i64,
+    pub fragment_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,20 +1436,31 @@ enum_strings!(ExecutionStatus {
     Cancelled => "cancelled",
 });
 
-enum_strings!(ConversationStatus {
-    Active => "active",
-    Archived => "archived",
-});
-
-enum_strings!(ConversationMessageRole {
+enum_strings!(AgentChatMessageAuthorType {
     User => "user",
-    Assistant => "assistant",
+    Agent => "agent",
     System => "system",
+    Handoff => "handoff",
 });
 
-enum_strings!(ConversationMessageStatus {
+enum_strings!(AgentChatMessageStatus {
     Complete => "complete",
-    Streaming => "streaming",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+enum_strings!(AgentChatTurnState {
+    Queued => "queued",
+    Leased => "leased",
+    RetryWait => "retry_wait",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+enum_strings!(AgentHandoffStatus {
+    Pending => "pending",
+    Delivered => "delivered",
     Failed => "failed",
     Cancelled => "cancelled",
 });
@@ -871,7 +1474,6 @@ enum_strings!(MemoryKind {
     ExecutionSummary => "execution_summary",
     Comment => "comment",
     Transition => "transition",
-    ConversationMessage => "conversation_message",
     Artifact => "artifact",
     Lesson => "lesson",
     ContextPack => "context_pack",
@@ -882,7 +1484,6 @@ enum_strings!(MemorySourceType {
     Review => "review",
     Comment => "comment",
     Transition => "transition",
-    Conversation => "conversation",
 });
 
 enum_strings!(MemoryConfidence {
@@ -1165,22 +1766,299 @@ pub struct CreateProjectMember {
     pub updated_at: String,
 }
 
+/// A durable obligation owned by an AgentIdentity rather than a runtime
+/// session.  Evidence, transfers, and lifecycle changes are append-only rows
+/// associated with this record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectAgentLink {
+pub struct AgentCommitment {
     pub id: String,
-    pub project_id: String,
-    pub agent_id: String,
-    pub linked_by_user_id: String,
+    pub owner_identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: AgentCommitmentStatus,
+    pub due_at: Option<String>,
+    pub correlation_id: String,
+    pub originating_action_id: Option<String>,
+    pub originating_task_id: Option<String>,
+    pub evidence_required: bool,
+    pub cancellation_reason: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub completed_at: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateProjectAgentLink {
+pub struct AgentCommitmentEvidence {
     pub id: String,
-    pub project_id: String,
-    pub agent_id: String,
-    pub linked_by_user_id: String,
+    pub commitment_id: String,
+    pub evidence_type: String,
+    pub evidence_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub description: Option<String>,
+    pub metadata_json: String,
+    pub authorized_by_type: String,
+    pub authorized_by_id: String,
+    pub dedupe_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCommitmentTransfer {
+    pub id: String,
+    pub commitment_id: String,
+    pub from_identity_id: String,
+    pub to_identity_id: String,
+    pub reason: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub dedupe_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCommitmentLifecycle {
+    pub id: String,
+    pub commitment_id: String,
+    pub from_status: Option<AgentCommitmentStatus>,
+    pub to_status: AgentCommitmentStatus,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub reason: Option<String>,
+    pub evidence_id: Option<String>,
+    pub dedupe_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentInboxItem {
+    pub id: String,
+    pub recipient_identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub kind: AgentInboxKind,
+    pub status: AgentInboxStatus,
+    pub title: String,
+    pub body: String,
+    pub payload_json: String,
+    pub source_type: Option<String>,
+    pub source_id: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub dedupe_key: String,
+    pub read_at: Option<String>,
+    pub acknowledged_at: Option<String>,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentQuestion {
+    pub id: String,
+    pub recipient_identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub status: AgentQuestionStatus,
+    pub question: String,
+    pub context_json: String,
+    pub answer: Option<String>,
+    pub asked_by_type: String,
+    pub asked_by_id: String,
+    pub answered_by_type: Option<String>,
+    pub answered_by_id: Option<String>,
+    pub inbox_item_id: Option<String>,
+    pub due_at: Option<String>,
+    pub correlation_id: String,
+    pub version: i64,
+    pub answered_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAction {
+    pub id: String,
+    pub actor_identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub operation: String,
+    pub payload_json: String,
+    pub payload_hash: String,
+    pub dedupe_key: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub requested_permission: String,
+    pub policy_result: AgentActionPolicyResult,
+    pub policy_reason: Option<String>,
+    pub status: AgentActionStatus,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    pub outcome_json: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentActionApproval {
+    pub id: String,
+    pub action_id: String,
+    pub approver_identity_id: String,
+    pub decision: AgentActionApprovalDecision,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentActionExecution {
+    pub id: String,
+    pub action_id: String,
+    pub attempt: i64,
+    pub status: AgentActionExecutionStatus,
+    pub result_json: Option<String>,
+    pub error: Option<String>,
+    pub executed_by_type: String,
+    pub executed_by_id: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCommitmentStatus {
+    Proposed,
+    Open,
+    Accepted,
+    InProgress,
+    Blocked,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentInboxKind {
+    Message,
+    Question,
+    Commitment,
+    TaskOutcome,
+    ActionResult,
+    ReviewRequest,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentInboxStatus {
+    Unread,
+    Read,
+    Acknowledged,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentQuestionStatus {
+    Open,
+    Answered,
+    Dismissed,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionPolicyResult {
+    Allowed,
+    ApprovalRequired,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionStatus {
+    Proposed,
+    PendingApproval,
+    Approved,
+    Denied,
+    Executing,
+    Executed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionApprovalDecision {
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionExecutionStatus {
+    Started,
+    Succeeded,
+    Failed,
+}
+
+enum_strings!(AgentCommitmentStatus {
+    Proposed => "proposed",
+    Open => "open",
+    Accepted => "accepted",
+    InProgress => "in_progress",
+    Blocked => "blocked",
+    Completed => "completed",
+    Cancelled => "cancelled",
+});
+
+enum_strings!(AgentInboxKind {
+    Message => "message",
+    Question => "question",
+    Commitment => "commitment",
+    TaskOutcome => "task_outcome",
+    ActionResult => "action_result",
+    ReviewRequest => "review_request",
+    System => "system",
+});
+
+enum_strings!(AgentInboxStatus {
+    Unread => "unread",
+    Read => "read",
+    Acknowledged => "acknowledged",
+    Dismissed => "dismissed",
+});
+
+enum_strings!(AgentQuestionStatus {
+    Open => "open",
+    Answered => "answered",
+    Dismissed => "dismissed",
+    Expired => "expired",
+});
+
+enum_strings!(AgentActionPolicyResult {
+    Allowed => "allowed",
+    ApprovalRequired => "approval_required",
+    Denied => "denied",
+});
+
+enum_strings!(AgentActionStatus {
+    Proposed => "proposed",
+    PendingApproval => "pending_approval",
+    Approved => "approved",
+    Denied => "denied",
+    Executing => "executing",
+    Executed => "executed",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+enum_strings!(AgentActionApprovalDecision {
+    Approved => "approved",
+    Denied => "denied",
+});
+
+enum_strings!(AgentActionExecutionStatus {
+    Started => "started",
+    Succeeded => "succeeded",
+    Failed => "failed",
+});

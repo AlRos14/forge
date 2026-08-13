@@ -3,8 +3,10 @@ use std::{str::FromStr, sync::Arc};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use db::{
-    now_rfc3339, CommentAuthorType, Execution, ExecutionStatus, MemoryConfidence, MemoryItem,
-    MemoryKind, MemoryRepository, MemorySourceType, Review, ReviewStatus, SqliteDb, TaskComment,
+    now_rfc3339, AgentChat, AgentChatMessage, AgentChatMessageAuthorType, CommentAuthorType,
+    CreateMemoryLifecycleAssertion, DomainEvent, Execution, ExecutionStatus, MemoryAccessQuery,
+    MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
+    MemorySourceType, Review, ReviewStatus, ScopedMemoryRepository, SqliteDb, TaskComment,
     TransitionLog,
 };
 use serde::{Deserialize, Serialize};
@@ -23,9 +25,9 @@ pub struct MemoryCreator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryReferences {
     pub source_ref: String,
+    pub project_id: Option<String>,
     pub task_id: Option<String>,
     pub execution_id: Option<String>,
-    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +50,6 @@ pub struct MemoryItemInput {
     pub project_id: Uuid,
     pub task_id: Option<String>,
     pub execution_id: Option<String>,
-    pub conversation_id: Option<String>,
     pub source_type: MemorySourceType,
     pub source_ref: String,
     pub kind: MemoryKind,
@@ -58,6 +59,57 @@ pub struct MemoryItemInput {
     pub confidence: Option<MemoryConfidence>,
     pub quality_score: Option<i64>,
     pub creator: Option<MemoryCreator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAccessContext {
+    pub identity_id: Option<String>,
+    pub grants: Vec<MemoryScopeGrant>,
+}
+
+impl MemoryAccessContext {
+    pub fn for_scope(
+        identity_id: Option<String>,
+        scope_type: impl Into<String>,
+        scope_id: impl Into<String>,
+        visibility: Vec<String>,
+    ) -> Self {
+        Self {
+            identity_id: identity_id.clone(),
+            grants: vec![MemoryScopeGrant {
+                scope_type: scope_type.into(),
+                scope_id: scope_id.into(),
+                visibility,
+                identity_id,
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPublicationInput {
+    pub source_id: Uuid,
+    pub source_scope_type: String,
+    pub source_scope_id: String,
+    pub target_scope_type: String,
+    pub target_scope_id: String,
+    pub target_project_id: Option<String>,
+    pub target_task_id: Option<String>,
+    pub target_visibility: String,
+    pub target_authority: String,
+    pub actor_identity_id: String,
+    pub reason: String,
+    pub evidence_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryLifecycleInput {
+    pub memory_id: Uuid,
+    pub assertion_type: String,
+    pub related_memory_id: Option<Uuid>,
+    pub reason: Option<String>,
+    pub evidence_json: String,
+    pub actor_identity_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +131,6 @@ pub struct MemoryBackfillSource {
     pub project_id: String,
     pub task_id: Option<String>,
     pub execution_id: Option<String>,
-    pub conversation_id: Option<String>,
     pub source_type: MemorySourceType,
     pub source_ref: String,
     pub kind: MemoryKind,
@@ -158,30 +209,425 @@ where
     }
 
     pub async fn record_from_source(&self, input: MemoryItemInput) -> Result<MemoryItem> {
+        let scope_type = if input.task_id.is_some() {
+            "task".to_owned()
+        } else {
+            "project".to_owned()
+        };
+        let scope_id = input
+            .task_id
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| input.project_id.to_string());
+        let item = build_memory_item(input, scope_type, scope_id, "project");
+        self.db.insert_memory_item(&item).await?;
+        Ok(item)
+    }
+}
+
+impl<R> MemoryService<R>
+where
+    R: MemoryRepository + ScopedMemoryRepository + Send + Sync,
+{
+    /// Search only through candidates admitted by the caller's immutable
+    /// canonical-scope grants. The repository performs ACL filtering before
+    /// FTS/body retrieval, so this service never turns an inaccessible id into
+    /// a distinguishable result.
+    pub async fn search_scoped(
+        &self,
+        access: &MemoryAccessContext,
+        query: String,
+        layer: Option<u8>,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<(Vec<MemorySearchResult>, bool, Option<String>)> {
+        let (items, has_more) = self
+            .db
+            .search_memory_items_scoped(MemoryAccessQuery {
+                identity_id: access.identity_id.clone(),
+                grants: access.grants.clone(),
+                query,
+                limit: i64::from(limit),
+                cursor,
+                include_retracted: false,
+            })
+            .await?;
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(scoped_memory_cursor_for_item)
+                .transpose()?
+        } else {
+            None
+        };
+        let layer = resolve_layer(layer, None)?;
+        let results = items
+            .into_iter()
+            .map(|item| shape_item(item, layer))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((results, has_more, next_cursor))
+    }
+
+    pub async fn get_scoped(
+        &self,
+        access: &MemoryAccessContext,
+        id: Uuid,
+        layer: Option<u8>,
+    ) -> Result<MemorySearchResult> {
+        let item = self
+            .db
+            .get_memory_item_scoped(MemoryGetQuery {
+                id: id.to_string(),
+                identity_id: access.identity_id.clone(),
+                grants: access.grants.clone(),
+                include_retracted: false,
+            })
+            .await?
+            .ok_or_else(|| ServiceError::not_found("memory_item", id.to_string()))?;
+        shape_item(item, resolve_layer(layer, None)?)
+    }
+
+    /// Publish or promote by creating a new immutable record. The original
+    /// private assertion is never widened or edited; the lifecycle assertion
+    /// links it to the newly-created shared record and records evidence.
+    pub async fn publish(
+        &self,
+        access: &MemoryAccessContext,
+        input: MemoryPublicationInput,
+    ) -> Result<MemoryItem> {
+        let evidence_json = guard_evidence_json(&input.evidence_json)?;
+        let reason = guard_memory_reason(&input.reason)?;
+        let source = self
+            .db
+            .get_memory_item_scoped(MemoryGetQuery {
+                id: input.source_id.to_string(),
+                identity_id: access.identity_id.clone(),
+                grants: access
+                    .grants
+                    .iter()
+                    .filter(|grant| {
+                        grant.scope_type == input.source_scope_type
+                            && grant.scope_id == input.source_scope_id
+                    })
+                    .cloned()
+                    .collect(),
+                include_retracted: false,
+            })
+            .await?
+            .ok_or_else(|| ServiceError::not_found("memory_item", input.source_id.to_string()))?;
+        if source.visibility != "private" {
+            return Err(ServiceError::invalid_operation(
+                "only private memory can be explicitly published",
+            ));
+        }
+        if source.owner_identity_id.as_deref() != Some(input.actor_identity_id.as_str()) {
+            return Err(ServiceError::not_found(
+                "memory_item",
+                input.source_id.to_string(),
+            ));
+        }
+        let target_visibility_allowed = match input.target_scope_type.as_str() {
+            "account" => input.target_visibility == "account",
+            "project" | "task" => input.target_visibility == "project",
+            "agent_chat" => input.target_visibility == "chat",
+            _ => false,
+        };
+        if !target_visibility_allowed {
+            return Err(ServiceError::invalid_operation(
+                "target visibility is not valid for the target scope",
+            ));
+        }
+        let target_grant = access
+            .grants
+            .iter()
+            .find(|grant| {
+                grant.scope_type == input.target_scope_type
+                    && grant.scope_id == input.target_scope_id
+                    && grant
+                        .visibility
+                        .iter()
+                        .any(|visibility| visibility == &input.target_visibility)
+            })
+            .ok_or_else(|| {
+                ServiceError::not_found("memory_scope", input.target_scope_id.clone())
+            })?;
+        if (target_grant.scope_type != source.scope_type
+            || target_grant.scope_id != source.scope_id)
+            && evidence_json.trim().is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "scope publication requires explicit evidence",
+            ));
+        }
+        if input.target_authority != "observation"
+            && input.target_authority != "hypothesis"
+            && input.target_authority != "proposal"
+            && input.target_authority != "decision"
+            && input.target_authority != "verified_fact"
+            && input.target_authority != "procedure"
+        {
+            return Err(ServiceError::invalid_operation(
+                "invalid memory authority for publication",
+            ));
+        }
+        if input.target_authority != source.authority && evidence_json.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "authority promotion requires explicit evidence",
+            ));
+        }
+        let now = now_rfc3339();
+        let published = MemoryItem {
+            row_id: 0,
+            id: Uuid::new_v4().to_string(),
+            project_id: input
+                .target_project_id
+                .clone()
+                .or_else(|| source.project_id.clone()),
+            task_id: input.target_task_id.clone(),
+            execution_id: source.execution_id.clone(),
+            scope_type: input.target_scope_type.clone(),
+            scope_id: input.target_scope_id.clone(),
+            visibility: input.target_visibility.clone(),
+            owner_identity_id: Some(input.actor_identity_id.clone()),
+            authority: input.target_authority.clone(),
+            sensitivity: source.sensitivity.clone(),
+            retention_priority: source.retention_priority.max(50),
+            provenance_json: json!({
+                "publication_source_id": source.id,
+                "reason": reason.clone(),
+                "evidence": serde_json::from_str::<Value>(&evidence_json).unwrap_or(Value::String(evidence_json.clone())),
+            })
+            .to_string(),
+            publication_source_id: Some(source.id.clone()),
+            supersedes_id: None,
+            valid_from: Some(now.clone()),
+            valid_until: None,
+            source_event_id: None,
+            source_scope_type: Some(input.target_scope_type.clone()),
+            source_scope_id: Some(input.target_scope_id.clone()),
+            source_revision: Some(source.created_at.clone()),
+            source_type: source.source_type.clone(),
+            kind: source.kind.clone(),
+            title: source.title.clone(),
+            summary: source.summary.clone(),
+            body: source.body.clone(),
+            metadata_json: source.metadata_json.clone(),
+            confidence: source.confidence.clone(),
+            quality_score: source.quality_score,
+            created_by_type: Some("agent".to_owned()),
+            created_by_id: Some(input.actor_identity_id.clone()),
+            created_at: now.clone(),
+        };
+        self.db.insert_memory_item(&published).await?;
+        self.db
+            .insert_memory_lifecycle_assertion(CreateMemoryLifecycleAssertion {
+                id: Uuid::new_v4().to_string(),
+                memory_item_id: source.id,
+                assertion_type: if input.target_authority != "observation" {
+                    "promoted".to_owned()
+                } else {
+                    "published".to_owned()
+                },
+                related_memory_id: Some(published.id.clone()),
+                reason: Some(reason),
+                evidence_json,
+                asserted_by_type: "agent".to_owned(),
+                asserted_by_id: Some(input.actor_identity_id),
+                source_event_id: None,
+                created_at: now,
+            })
+            .await?;
+        Ok(published)
+    }
+
+    pub async fn assert_lifecycle(
+        &self,
+        access: &MemoryAccessContext,
+        input: MemoryLifecycleInput,
+    ) -> Result<db::MemoryLifecycleAssertion> {
+        let evidence_json = guard_evidence_json(&input.evidence_json)?;
+        let reason = input
+            .reason
+            .as_deref()
+            .map(guard_memory_reason)
+            .transpose()?;
+        let source = self
+            .db
+            .get_memory_item_scoped(MemoryGetQuery {
+                id: input.memory_id.to_string(),
+                identity_id: access.identity_id.clone(),
+                grants: access.grants.clone(),
+                include_retracted: true,
+            })
+            .await?
+            .ok_or_else(|| ServiceError::not_found("memory_item", input.memory_id.to_string()))?;
+        let owner = source.owner_identity_id.as_deref() == Some(input.actor_identity_id.as_str());
+        let destructive = matches!(
+            input.assertion_type.as_str(),
+            "superseded" | "retracted" | "expired"
+        );
+        if (destructive || input.assertion_type == "published") && !owner {
+            return Err(ServiceError::not_found(
+                "memory_item",
+                input.memory_id.to_string(),
+            ));
+        }
+        let assertion_type = input.assertion_type.as_str();
+        if !matches!(
+            assertion_type,
+            "published"
+                | "promoted"
+                | "superseded"
+                | "retracted"
+                | "disputed"
+                | "expired"
+                | "evidence"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "invalid memory lifecycle assertion",
+            ));
+        }
+        if matches!(assertion_type, "published" | "promoted" | "superseded")
+            && input.related_memory_id.is_none()
+        {
+            return Err(ServiceError::invalid_operation(
+                "publication, promotion, and supersession assertions require a related memory",
+            ));
+        }
+        if input.assertion_type == "promoted" && evidence_json.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "promotion requires explicit evidence",
+            ));
+        }
+        if let Some(related_memory_id) = input.related_memory_id {
+            let related = self
+                .db
+                .get_memory_item_scoped(MemoryGetQuery {
+                    id: related_memory_id.to_string(),
+                    identity_id: access.identity_id.clone(),
+                    grants: access.grants.clone(),
+                    include_retracted: true,
+                })
+                .await?;
+            if related.is_none() {
+                return Err(ServiceError::not_found(
+                    "memory_item",
+                    related_memory_id.to_string(),
+                ));
+            }
+        }
+        Ok(self
+            .db
+            .insert_memory_lifecycle_assertion(CreateMemoryLifecycleAssertion {
+                id: Uuid::new_v4().to_string(),
+                memory_item_id: source.id,
+                assertion_type: input.assertion_type,
+                related_memory_id: input.related_memory_id.map(|id| id.to_string()),
+                reason,
+                evidence_json,
+                asserted_by_type: "agent".to_owned(),
+                asserted_by_id: Some(input.actor_identity_id),
+                source_event_id: None,
+                created_at: now_rfc3339(),
+            })
+            .await?)
+    }
+
+    /// Index one finalized Agent Chat message in the chat's canonical memory
+    /// scope. The singular-chat visibility label and chat id are the
+    /// canonical ACL/provenance boundary. The
+    /// source-receipt write is part of the repository transaction, so replay
+    /// after a lease expiry cannot create a duplicate memory item.
+    pub async fn record_agent_chat_message_event(
+        &self,
+        event: &DomainEvent,
+        chat: &AgentChat,
+        message: &AgentChatMessage,
+    ) -> Result<Option<MemoryItem>> {
+        if !matches!(
+            event.event_type.as_str(),
+            "agent_chat.message.admitted"
+                | "agent_chat.response.completed"
+                | "agent_chat.message.completed"
+        ) || message.status.to_string() != "complete"
+            || !matches!(
+                message.author_type,
+                AgentChatMessageAuthorType::User | AgentChatMessageAuthorType::Agent
+            )
+        {
+            return Ok(None);
+        }
+        if message.sensitivity == "secret"
+            || message.content.trim().is_empty()
+            || contains_protected_marker(&message.content)
+        {
+            return Ok(None);
+        }
+
+        let (scope_type, scope_id, visibility) =
+            ("agent_chat".to_owned(), chat.id.clone(), "chat".to_owned());
+        if chat.kind == "project" {
+            if chat.project_id.is_none() {
+                return Err(ServiceError::invalid_operation(
+                    "Project Agent Chat has no Project scope",
+                ));
+            }
+        } else {
+            if chat.account_id.is_none() {
+                return Err(ServiceError::invalid_operation(
+                    "Main Agent Chat has no account scope",
+                ));
+            }
+        }
+        let now = now_rfc3339();
         let item = MemoryItem {
             row_id: 0,
             id: Uuid::new_v4().to_string(),
-            project_id: input.project_id.to_string(),
-            task_id: input.task_id,
-            execution_id: input.execution_id,
-            conversation_id: input.conversation_id,
-            source_type: input.source_type.to_string(),
-            kind: input.kind.to_string(),
-            title: input.title,
-            summary: input.summary,
-            body: input.body,
-            metadata_json: source_metadata_json(&input.source_ref),
-            confidence: input.confidence.map(|value| value.to_string()),
-            quality_score: input.quality_score,
-            created_by_type: input
-                .creator
-                .as_ref()
-                .map(|creator| creator.creator_type.clone()),
-            created_by_id: input.creator.and_then(|creator| creator.creator_id),
-            created_at: now_rfc3339(),
+            project_id: chat.project_id.clone(),
+            task_id: None,
+            execution_id: None,
+            scope_type: scope_type.clone(),
+            scope_id: scope_id.clone(),
+            visibility,
+            owner_identity_id: match message.author_type {
+                AgentChatMessageAuthorType::Agent => message.author_id.clone(),
+                _ => None,
+            },
+            authority: "observation".to_owned(),
+            sensitivity: message.sensitivity.clone(),
+            retention_priority: 20,
+            provenance_json: json!({
+                "source_event_id": event.id,
+                "agent_chat_id": chat.id,
+                "message_id": message.id,
+                "sequence": message.sequence,
+            })
+            .to_string(),
+            publication_source_id: None,
+            supersedes_id: None,
+            valid_from: Some(message.created_at.clone()),
+            valid_until: None,
+            source_event_id: Some(event.id.clone()),
+            source_scope_type: Some(scope_type.clone()),
+            source_scope_id: Some(scope_id.clone()),
+            source_revision: Some(message.sequence.to_string()),
+            source_type: "agent_chat".to_owned(),
+            kind: "observation".to_owned(),
+            title: format!("Agent Chat {} message", message.author_type),
+            summary: snippet(&message.content),
+            body: message.content.clone(),
+            metadata_json: source_metadata_json(&message.id),
+            confidence: Some(MemoryConfidence::Confirmed.to_string()),
+            quality_score: None,
+            created_by_type: Some(message.author_type.to_string()),
+            created_by_id: message.author_id.clone(),
+            created_at: now,
         };
-        self.db.insert_memory_item(&item).await?;
-        Ok(item)
+        let (item, inserted) = self
+            .db
+            .insert_memory_item_if_source_absent(&item, "agent_chat", &message.id)
+            .await?;
+        Ok(inserted.then_some(item))
     }
 }
 
@@ -207,7 +653,6 @@ where
                 project_id: parse_uuid(&source.project_id, "project_id")?,
                 task_id: source.task_id,
                 execution_id: source.execution_id,
-                conversation_id: source.conversation_id,
                 source_type: source.source_type.clone(),
                 source_ref: source.source_ref,
                 kind: source.kind,
@@ -256,7 +701,6 @@ where
                 project_id: parse_uuid(project_id, "project_id")?,
                 task_id: Some(transition.task_id.clone()),
                 execution_id: None,
-                conversation_id: None,
                 source_type: MemorySourceType::Transition,
                 source_ref: transition.id.clone(),
                 kind: MemoryKind::Transition,
@@ -310,7 +754,6 @@ where
                 project_id: parse_uuid(project_id, "project_id")?,
                 task_id: Some(execution.task_id.clone()),
                 execution_id: Some(execution.id.clone()),
-                conversation_id: None,
                 source_type: MemorySourceType::Execution,
                 source_ref: execution.id.clone(),
                 kind: MemoryKind::ExecutionSummary,
@@ -353,7 +796,6 @@ where
                 project_id: parse_uuid(project_id, "project_id")?,
                 task_id: Some(review.task_id.clone()),
                 execution_id: Some(review.execution_id.clone()),
-                conversation_id: None,
                 source_type: MemorySourceType::Review,
                 source_ref: review.id.clone(),
                 kind: MemoryKind::ReviewResult,
@@ -386,7 +828,6 @@ where
             project_id: parse_uuid(project_id, "project_id")?,
             task_id: Some(comment.task_id.clone()),
             execution_id: None,
-            conversation_id: None,
             source_type: MemorySourceType::Comment,
             source_ref: comment.id.clone(),
             kind: MemoryKind::Comment,
@@ -399,63 +840,6 @@ where
         })
         .await
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn record_conversation_message(
-        &self,
-        project_id: &str,
-        conversation_agent_id: Option<&str>,
-        message_id: &str,
-        conversation_id: &str,
-        role: &str,
-        status: &str,
-        content: &str,
-        error: Option<&str>,
-    ) -> Result<Option<Uuid>> {
-        if role != "user" && role != "assistant" {
-            return Ok(None);
-        }
-        if status == "streaming" {
-            return Ok(None);
-        }
-        if self
-            .db
-            .memory_source_exists(
-                project_id,
-                &MemorySourceType::Conversation.to_string(),
-                message_id,
-            )
-            .await?
-        {
-            return Ok(None);
-        }
-        let body = conversation_message_body(role, status, content, error);
-        let item = self
-            .record_from_source(MemoryItemInput {
-                project_id: parse_uuid(project_id, "project_id")?,
-                task_id: None,
-                execution_id: None,
-                conversation_id: Some(conversation_id.to_owned()),
-                source_type: MemorySourceType::Conversation,
-                source_ref: message_id.to_owned(),
-                kind: MemoryKind::ConversationMessage,
-                title: format!("Conversation {role} message"),
-                summary: snippet(&body),
-                body,
-                confidence: Some(match status {
-                    "complete" => MemoryConfidence::Confirmed,
-                    _ => MemoryConfidence::Partial,
-                }),
-                quality_score: None,
-                creator: match role {
-                    "assistant" => conversation_agent_id.map(str::to_owned).map(agent_creator),
-                    "user" => Some(user_creator("conversation-user".to_owned())),
-                    _ => None,
-                },
-            })
-            .await?;
-        parse_uuid(&item.id, "memory_item.id").map(Some)
-    }
 }
 
 #[async_trait]
@@ -466,7 +850,6 @@ impl MemoryBackfillRepository for SqliteDb {
         sources.extend(list_review_sources(self).await?);
         sources.extend(list_comment_sources(self).await?);
         sources.extend(list_transition_sources(self).await?);
-        sources.extend(list_conversation_sources(self).await?);
         Ok(sources)
     }
 }
@@ -494,7 +877,6 @@ async fn list_execution_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSourc
                 project_id: row.try_get("project_id")?,
                 task_id: Some(row.try_get("task_id")?),
                 execution_id: Some(row.try_get("id")?),
-                conversation_id: None,
                 source_type: MemorySourceType::Execution,
                 source_ref: row.try_get("id")?,
                 kind: MemoryKind::ExecutionSummary,
@@ -531,7 +913,6 @@ async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>>
                 project_id: row.try_get("project_id")?,
                 task_id: Some(row.try_get("task_id")?),
                 execution_id: Some(row.try_get("execution_id")?),
-                conversation_id: None,
                 source_type: MemorySourceType::Review,
                 source_ref: row.try_get("id")?,
                 kind: MemoryKind::ReviewResult,
@@ -570,7 +951,6 @@ async fn list_comment_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>
                 project_id: row.try_get("project_id")?,
                 task_id: Some(row.try_get("task_id")?),
                 execution_id: None,
-                conversation_id: None,
                 source_type: MemorySourceType::Comment,
                 source_ref: row.try_get("id")?,
                 kind: MemoryKind::Comment,
@@ -626,7 +1006,6 @@ async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSour
             project_id: row.try_get("project_id")?,
             task_id: Some(transition.task_id.clone()),
             execution_id: None,
-            conversation_id: None,
             source_type: MemorySourceType::Transition,
             source_ref: transition.id.clone(),
             kind: MemoryKind::Transition,
@@ -641,49 +1020,6 @@ async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSour
         });
     }
     Ok(sources)
-}
-
-async fn list_conversation_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT c.project_id, cm.id, cm.conversation_id, c.agent_id, cm.role, cm.content, cm.status, cm.error \
-         FROM conversation_message cm JOIN conversation c ON c.id = cm.conversation_id \
-         WHERE cm.role IN ('user', 'assistant') AND cm.status != 'streaming' \
-         ORDER BY cm.created_at ASC, cm.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let role: String = row.try_get("role")?;
-            let status: String = row.try_get("status")?;
-            let content: String = row.try_get("content")?;
-            let error: Option<String> = row.try_get("error")?;
-            let body = conversation_message_body(&role, &status, &content, error.as_deref());
-            Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: None,
-                execution_id: None,
-                conversation_id: Some(row.try_get("conversation_id")?),
-                source_type: MemorySourceType::Conversation,
-                source_ref: row.try_get("id")?,
-                kind: MemoryKind::ConversationMessage,
-                title: format!("Conversation {role} message"),
-                summary: snippet(&body),
-                body,
-                confidence: Some(match status.as_str() {
-                    "complete" => MemoryConfidence::Confirmed,
-                    _ => MemoryConfidence::Partial,
-                }),
-                creator: match role.as_str() {
-                    "assistant" => row
-                        .try_get::<Option<String>, _>("agent_id")?
-                        .map(agent_creator),
-                    "user" => Some(user_creator("conversation-user".to_owned())),
-                    _ => None,
-                },
-            })
-        })
-        .collect()
 }
 
 fn resolve_layer(layer: Option<u8>, token_budget: Option<u32>) -> Result<MemoryLayer> {
@@ -710,9 +1046,9 @@ fn shape_item(item: MemoryItem, layer: MemoryLayer) -> Result<MemorySearchResult
     let references = MemoryReferences {
         source_ref: source_ref_from_metadata(&item.metadata_json)
             .unwrap_or_else(|| item.id.clone()),
+        project_id: item.project_id.clone(),
         task_id: item.task_id.clone(),
         execution_id: item.execution_id.clone(),
-        conversation_id: item.conversation_id.clone(),
     };
     let confidence = item
         .confidence
@@ -781,6 +1117,24 @@ fn memory_cursor_for_item(item: &MemoryItem) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn scoped_memory_cursor_for_item(item: &MemoryItem) -> Result<String> {
+    let rank = match item.authority.as_str() {
+        "decision" => 600,
+        "procedure" => 500,
+        "verified_fact" => 450,
+        "proposal" => 300,
+        "hypothesis" => 200,
+        _ => 100,
+    } + item.retention_priority;
+    let bytes = serde_json::to_vec(&json!({
+        "rank": rank,
+        "created_at": item.created_at,
+        "id": item.id,
+    }))
+    .map_err(|error| ServiceError::invalid_operation(format!("invalid memory cursor: {error}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 fn parse_uuid(value: &str, field: &str) -> Result<Uuid> {
     Uuid::parse_str(value).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid {field} UUID '{value}': {error}"))
@@ -789,6 +1143,137 @@ fn parse_uuid(value: &str, field: &str) -> Result<Uuid> {
 
 fn source_metadata_json(source_ref: &str) -> String {
     json!({ "source_ref": source_ref }).to_string()
+}
+
+fn build_memory_item(
+    input: MemoryItemInput,
+    scope_type: String,
+    scope_id: String,
+    visibility: &str,
+) -> MemoryItem {
+    let owner_identity_id = input.creator.as_ref().and_then(|creator| {
+        (creator.creator_type == "agent")
+            .then(|| creator.creator_id.clone())
+            .flatten()
+    });
+    let (body, sensitivity) = guard_memory_body(&input.body);
+    let (title, summary, body, sensitivity) =
+        guard_memory_fields(&input.title, input.summary.as_deref(), body, sensitivity);
+    let created_at = now_rfc3339();
+    MemoryItem {
+        row_id: 0,
+        id: Uuid::new_v4().to_string(),
+        project_id: Some(input.project_id.to_string()),
+        task_id: input.task_id,
+        execution_id: input.execution_id,
+        scope_type: scope_type.clone(),
+        scope_id: scope_id.clone(),
+        visibility: visibility.to_owned(),
+        owner_identity_id,
+        authority: "observation".to_owned(),
+        sensitivity,
+        retention_priority: 10,
+        provenance_json: json!({"source": "forge-memory-service"}).to_string(),
+        publication_source_id: None,
+        supersedes_id: None,
+        valid_from: Some(created_at.clone()),
+        valid_until: None,
+        source_event_id: None,
+        source_scope_type: Some(scope_type),
+        source_scope_id: Some(scope_id),
+        source_revision: None,
+        source_type: input.source_type.to_string(),
+        kind: input.kind.to_string(),
+        title,
+        summary,
+        body,
+        metadata_json: source_metadata_json(&input.source_ref),
+        confidence: input.confidence.map(|value| value.to_string()),
+        quality_score: input.quality_score,
+        created_by_type: input
+            .creator
+            .as_ref()
+            .map(|creator| creator.creator_type.clone()),
+        created_by_id: input.creator.and_then(|creator| creator.creator_id),
+        created_at,
+    }
+}
+
+fn guard_memory_body(body: &str) -> (String, String) {
+    if contains_protected_marker(body) {
+        (
+            "[protected value redacted before semantic-memory indexing]".to_owned(),
+            "restricted".to_owned(),
+        )
+    } else {
+        (body.to_owned(), "internal".to_owned())
+    }
+}
+
+fn guard_memory_fields(
+    title: &str,
+    summary: Option<&str>,
+    body: String,
+    sensitivity: String,
+) -> (String, Option<String>, String, String) {
+    if contains_protected_marker(title) || summary.is_some_and(contains_protected_marker) {
+        return (
+            "[protected memory redacted before semantic-memory indexing]".to_owned(),
+            None,
+            "[protected memory redacted before semantic-memory indexing]".to_owned(),
+            "restricted".to_owned(),
+        );
+    }
+    (
+        title.to_owned(),
+        summary.map(str::to_owned),
+        body,
+        sensitivity,
+    )
+}
+
+fn guard_evidence_json(evidence: &str) -> Result<String> {
+    let evidence = evidence.trim();
+    if evidence.is_empty() {
+        return Ok(String::new());
+    }
+    if evidence.len() > 64 * 1024 {
+        return Err(ServiceError::invalid_operation(
+            "memory evidence exceeds the 64 KiB limit",
+        ));
+    }
+    if contains_protected_marker(evidence) || evidence.to_ascii_lowercase().contains("-----begin") {
+        return Err(ServiceError::invalid_operation(
+            "protected values cannot be stored as memory evidence",
+        ));
+    }
+    serde_json::from_str::<Value>(evidence).map_err(|error| {
+        ServiceError::invalid_operation(format!("memory evidence must be valid JSON: {error}"))
+    })?;
+    Ok(evidence.to_owned())
+}
+
+fn guard_memory_reason(reason: &str) -> Result<String> {
+    let reason = reason.trim();
+    if reason.len() > 4 * 1024 {
+        return Err(ServiceError::invalid_operation(
+            "memory lifecycle reason exceeds the 4 KiB limit",
+        ));
+    }
+    if contains_protected_marker(reason) || reason.to_ascii_lowercase().contains("-----begin") {
+        return Err(ServiceError::invalid_operation(
+            "protected values cannot be stored as memory lifecycle reasons",
+        ));
+    }
+    Ok(reason.to_owned())
+}
+
+fn contains_protected_marker(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("authorization: bearer")
+        || body.contains("api_key")
+        || body.contains("sk-")
+        || body.contains("private key")
 }
 
 fn source_ref_from_metadata(metadata_json: &str) -> Option<String> {
@@ -967,21 +1452,6 @@ fn text_has_failure_signal(value: &str) -> bool {
         || lower.contains("hook_error")
 }
 
-fn conversation_message_body(
-    role: &str,
-    status: &str,
-    content: &str,
-    error: Option<&str>,
-) -> String {
-    let trimmed = content.trim();
-    if !trimmed.is_empty() {
-        return trimmed.to_owned();
-    }
-    error
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{role} message {status}"))
-}
-
 fn agent_creator(agent_id: String) -> MemoryCreator {
     MemoryCreator {
         creator_type: "agent".to_owned(),
@@ -1009,7 +1479,6 @@ fn backfill_results_by_type() -> Vec<BackfillTypeResult> {
         MemorySourceType::Review,
         MemorySourceType::Comment,
         MemorySourceType::Transition,
-        MemorySourceType::Conversation,
     ]
     .into_iter()
     .map(|source_type| BackfillTypeResult {
@@ -1044,15 +1513,14 @@ mod tests {
     use std::sync::Arc;
 
     use db::{
-        create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ConversationRepo,
-        ConversationStatus, CreateConversation, CreateExecution, CreateProject, CreateTask,
-        Execution, ExecutionRepo, ExecutionStatus, MemorySourceType, ProjectRepo, Review,
-        ReviewStatus, SqliteDb, TaskRepo,
+        create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateExecution,
+        CreateProject, CreateTask, Execution, ExecutionRepo, ExecutionStatus, MemorySourceType,
+        ProjectRepo, Review, ReviewStatus, SqliteDb, TaskRepo,
     };
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::MemoryService;
+    use super::{guard_evidence_json, guard_memory_reason, MemoryService};
 
     async fn sqlite_db() -> Arc<SqliteDb> {
         let pool = create_sqlite_pool("sqlite::memory:")
@@ -1136,46 +1604,6 @@ mod tests {
         .await
         .expect("execution creates");
         (project_id, task_id, execution)
-    }
-
-    async fn seed_project_conversation(db: &SqliteDb) -> (Uuid, String) {
-        let project_id = Uuid::new_v4();
-        let now = now_rfc3339();
-        ProjectRepo::create(
-            db,
-            CreateProject {
-                id: project_id.to_string(),
-                name: "Project".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project creates");
-        let conversation_id = new_uuid_v4();
-        ConversationRepo::create(
-            db,
-            CreateConversation {
-                id: conversation_id.clone(),
-                project_id: project_id.to_string(),
-                agent_id: None,
-                title: "Conversation".to_owned(),
-                status: ConversationStatus::Active,
-                system_prompt: None,
-                message_count: 0,
-                last_message_at: None,
-                agent_session_id: None,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .expect("conversation creates");
-        (project_id, conversation_id)
     }
 
     async fn memory_count(db: &SqliteDb, project_id: &Uuid, source_type: MemorySourceType) -> i64 {
@@ -1297,45 +1725,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn record_conversation_message_is_idempotent() {
-        let db = sqlite_db().await;
-        let (project_id, conversation_id) = seed_project_conversation(&db).await;
-        let service = MemoryService::new(Arc::clone(&db));
-        let message_id = new_uuid_v4();
-
-        let first = service
-            .record_conversation_message(
-                &project_id.to_string(),
-                None,
-                &message_id,
-                &conversation_id,
-                "user",
-                "complete",
-                "Please remember this.",
-                None,
-            )
-            .await
-            .expect("first conversation memory records");
-        let second = service
-            .record_conversation_message(
-                &project_id.to_string(),
-                None,
-                &message_id,
-                &conversation_id,
-                "user",
-                "complete",
-                "Please remember this.",
-                None,
-            )
-            .await
-            .expect("second conversation memory is skipped");
-
-        assert!(first.is_some());
-        assert!(second.is_none());
-        assert_eq!(
-            memory_count(&db, &project_id, MemorySourceType::Conversation).await,
-            1
-        );
+    #[test]
+    fn lifecycle_evidence_and_reason_reject_protected_values() {
+        assert!(guard_evidence_json(r#"{"note":"Authorization: Bearer sk-secret"}"#).is_err());
+        assert!(guard_memory_reason("private key material").is_err());
+        assert_eq!(guard_evidence_json("{}").expect("valid evidence"), "{}");
     }
 }

@@ -6,10 +6,7 @@ use crate::{
     project_hooks::{parse_project_hooks_json, ProjectHookRule},
     LifecycleEvent,
 };
-use crate::{
-    ConversationStatus, InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskStatus, TaskType,
-    WorkMode,
-};
+use crate::{InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskStatus, TaskType, WorkMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,31 +70,6 @@ pub type ExecutionOverridesRequest = ClaimOverrides;
 pub struct FollowUpRequest {
     pub message: String,
     pub agent_id: Option<String>,
-    pub overrides: Option<ExecutionOverridesRequest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct CreateConversationRequest {
-    pub agent_id: String,
-    pub title: Option<String>,
-    pub system_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct UpdateConversationRequest {
-    pub version: i64,
-    pub title: Option<String>,
-    pub agent_id: Option<String>,
-    pub system_prompt: Option<String>,
-    pub status: Option<ConversationStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct SendMessageRequest {
-    pub content: String,
     pub overrides: Option<ExecutionOverridesRequest>,
 }
 
@@ -166,6 +138,18 @@ pub struct CreateProjectRequest {
     pub settings: Option<Value>,
     pub default_review_config: Option<ReviewConfig>,
     pub paused: Option<bool>,
+    /// Optional initial Project Agent selection.  Omitting either value
+    /// leaves the new Project in explicit `agent_setup_required` state; the
+    /// server must never fabricate an identity or profile.
+    #[serde(default)]
+    pub project_agent_identity_id: Option<String>,
+    #[serde(default)]
+    pub project_agent_profile_id: Option<String>,
+    /// Optional authenticated Product Genesis session being materialized.
+    /// The server treats this as a lookup/reference and verifies ownership,
+    /// readiness, and optimistic version before linking the created Project.
+    #[serde(default)]
+    pub product_genesis_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

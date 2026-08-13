@@ -1,6 +1,6 @@
 use crate::{
     daemon_transport::DaemonConnectionRegistry, embedded_daemon::is_embedded_daemon_machine,
-    workflow::engine::WorkflowEngine, Result, ServiceError, TaskService,
+    workflow::engine::WorkflowEngine, DomainEventService, Result, ServiceError, TaskService,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
@@ -53,6 +53,7 @@ impl CrashRecovery {
             .await?;
 
             if outcome.annotated {
+                publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
                 self.publish(ForgeEvent {
                     event_type: "task.recovered".to_owned(),
                     entity_id: outcome.task.id,
@@ -66,7 +67,7 @@ impl CrashRecovery {
             }
         }
 
-        recovered += sweep_stale_recovery_annotations(&self.db).await?;
+        recovered += sweep_stale_recovery_annotations(&self.db, &self.event_bus).await?;
 
         for project in list_projects(&self.db).await? {
             let mut cursor = None;
@@ -318,6 +319,7 @@ impl HeartbeatMonitor {
                 .await?;
 
                 if outcome.annotated {
+                    publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
                     self.publish(ForgeEvent {
                         event_type: "task.recovered".to_owned(),
                         entity_id: outcome.task.id.clone(),
@@ -748,14 +750,17 @@ async fn recover_task(
     })
 }
 
-async fn sweep_stale_recovery_annotations(db: &SqliteDb) -> Result<u64> {
+async fn sweep_stale_recovery_annotations(
+    db: &Arc<SqliteDb>,
+    event_bus: &Arc<EventBus>,
+) -> Result<u64> {
     let mut cleared = 0_u64;
 
     for project in list_projects(db).await? {
         let mut cursor = None;
         loop {
             let page = TaskRepo::list(
-                db,
+                db.as_ref(),
                 TaskListQuery {
                     project_id: project.id.clone(),
                     q: None,
@@ -797,18 +802,20 @@ async fn sweep_stale_recovery_annotations(db: &SqliteDb) -> Result<u64> {
 
                 let should_clear = match blocked_execution_id {
                     None => true,
-                    Some(execution_id) => match ExecutionRepo::get_by_id(db, execution_id).await? {
-                        None => true,
-                        Some(execution) => !execution_awaits_recovery(&execution),
-                    },
+                    Some(execution_id) => {
+                        match ExecutionRepo::get_by_id(db.as_ref(), execution_id).await? {
+                            None => true,
+                            Some(execution) => !execution_awaits_recovery(&execution),
+                        }
+                    }
                 };
 
                 if !should_clear {
                     continue;
                 }
 
-                TaskRepo::update_status(
-                    db,
+                let updated = TaskRepo::update_status(
+                    db.as_ref(),
                     UpdateTaskStatus {
                         id: task.id.clone(),
                         expected_version: task.version,
@@ -821,6 +828,7 @@ async fn sweep_stale_recovery_annotations(db: &SqliteDb) -> Result<u64> {
                     },
                 )
                 .await?;
+                publish_task_status_event(db, event_bus, &updated).await;
                 cleared += 1;
             }
 
@@ -832,6 +840,14 @@ async fn sweep_stale_recovery_annotations(db: &SqliteDb) -> Result<u64> {
     }
 
     Ok(cleared)
+}
+
+async fn publish_task_status_event(db: &Arc<SqliteDb>, event_bus: &Arc<EventBus>, task: &Task) {
+    let service = DomainEventService::new(Arc::clone(db), Arc::clone(event_bus));
+    let dedupe_key = format!("task-status-update:{}:{}", task.id, task.version);
+    if let Err(error) = service.publish_by_dedupe(&dedupe_key).await {
+        tracing::warn!(task_id = %task.id, %error, "failed to mirror task status domain event");
+    }
 }
 
 fn execution_awaits_recovery(execution: &db::Execution) -> bool {
@@ -1596,11 +1612,21 @@ mod tests {
             json!(["reexecute", "reset_to_initial", "cancel_task"])
         );
 
-        let agent_event = rx.recv().await.expect("agent event receives");
-        assert_eq!(agent_event.event_type, "agent.timeout");
-        let task_event = rx.recv().await.expect("task event receives");
-        assert_eq!(task_event.event_type, "task.recovered");
-        assert_eq!(task_event.entity_id, task.id);
+        let mut event_types = Vec::new();
+        let mut recovered_event_id = None;
+        for _ in 0..3 {
+            let event = rx.recv().await.expect("recovery event receives");
+            if event.event_type == "task.recovered" {
+                recovered_event_id = Some(event.entity_id);
+            }
+            event_types.push(event.event_type);
+        }
+        assert!(event_types.iter().any(|event| event == "agent.timeout"));
+        assert!(event_types
+            .iter()
+            .any(|event| event == "domain_event.committed"));
+        assert!(event_types.iter().any(|event| event == "task.recovered"));
+        assert_eq!(recovered_event_id.as_deref(), Some(task.id.as_str()));
     }
 
     #[tokio::test]

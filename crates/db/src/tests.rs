@@ -1,19 +1,20 @@
 use crate::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4, AgentListQuery,
-    AgentRepo, AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimTask, CompareAndMoveTask,
-    ConversationListQuery, ConversationMessageListQuery, ConversationMessageRepo,
-    ConversationMessageRole, ConversationMessageStatus, ConversationRepo, ConversationStatus,
-    CreateAgent, CreateConversation, CreateConversationMessage, CreateExecution, CreateProject,
-    CreateProjectAgentLink, CreateProjectMember, CreateRepo, CreateReview, CreateSkill, CreateTask,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4,
+    AgentContextScopeRepo, AgentListQuery, AgentRepo, AgentSessionRepo, AgentStatus,
+    AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimTask, CompareAndMoveTask,
+    CompleteDomainEvent, CreateAgent, CreateAgentContextScope, CreateAgentSession,
+    CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
+    CreateProjectMember, CreateRepo, CreateReview, CreateSkill, CreateTask,
     CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace, DaemonRepo, DaemonStatus,
-    DbError, ExecutionRepo, ExecutionStatus, MemoryConfidence, MemoryItem, MemoryKind,
-    MemoryRepository, MemorySourceType, MoveTaskIdentity, MoveTaskPersistence,
-    NotificationListQuery, NotificationRepo, PageRequest, ProjectAgentLinkRepo, ProjectMemberRepo,
-    ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, SkillRepo, SortBy, SortOrder, SqliteDb, Task,
+    DbError, DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryAccessQuery, MemoryConfidence,
+    MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType,
+    MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery, NotificationRepo, PageRequest,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus,
+    RotateAgentSession, ScopedMemoryRepository, SkillRepo, SortBy, SortOrder, SqliteDb, Task,
     TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo,
-    TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateConversation, UpdateExecution,
-    UpdateProject, UpdateRepo, UpdateSkill, UpdateTask, UpdateTerminalSessionStatus, UpsertDaemon,
-    WorkMode, WorkspaceRepo, WorkspaceStatus,
+    TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution, UpdateProject,
+    UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
+    UpsertDaemon, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -34,6 +35,60 @@ async fn sqlite_db() -> SqliteDb {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     SqliteDb::new(pool)
+}
+
+#[tokio::test]
+async fn cli_agent_creation_gets_scope_bounded_permission_layers() {
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations(&pool).await.expect("migrations run");
+    let db = SqliteDb::new(pool.clone());
+    let now = now_rfc3339();
+    let agent = AgentRepo::create(
+        &db,
+        CreateAgent {
+            id: new_uuid_v4(),
+            name: "Smith chat agent".to_owned(),
+            description: None,
+            executor_type: "smith".to_owned(),
+            model: Some("gpt-5.6-luna".to_owned()),
+            reasoning_effort: Some("max".to_owned()),
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: r#"{"profile":"luna"}"#.to_owned(),
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: Some("account-1".to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("CLI agent creates");
+
+    let identity_ceiling: String =
+        sqlx::query_scalar("SELECT account_permission_ceiling FROM agent_identity WHERE id = ?")
+            .bind(&agent.id)
+            .fetch_one(&pool)
+            .await
+            .expect("identity permission ceiling reads");
+
+    for layer in [&identity_ceiling, &agent.tool_policy_json] {
+        let value: serde_json::Value = serde_json::from_str(layer).expect("permission JSON");
+        let permissions = value["permissions"].as_array().expect("permission array");
+        assert!(permissions.iter().any(|value| value == "propose_task"));
+        assert!(permissions.iter().any(|value| value == "task_write"));
+        assert!(!permissions.iter().any(|value| value == "approve_actions"));
+    }
 }
 
 async fn seed_daemon(db: &SqliteDb) -> String {
@@ -171,10 +226,25 @@ fn memory_item(project_id: &str, title: &str, body: &str) -> MemoryItem {
     MemoryItem {
         row_id: 0,
         id: new_uuid_v4(),
-        project_id: project_id.to_owned(),
+        project_id: Some(project_id.to_owned()),
         task_id: None,
         execution_id: None,
-        conversation_id: None,
+        scope_type: "project".to_owned(),
+        scope_id: project_id.to_owned(),
+        visibility: "project".to_owned(),
+        owner_identity_id: None,
+        authority: "observation".to_owned(),
+        sensitivity: "internal".to_owned(),
+        retention_priority: 10,
+        provenance_json: "{}".to_owned(),
+        publication_source_id: None,
+        supersedes_id: None,
+        valid_from: None,
+        valid_until: None,
+        source_event_id: None,
+        source_scope_type: Some("project".to_owned()),
+        source_scope_id: Some(project_id.to_owned()),
+        source_revision: None,
         source_type: MemorySourceType::Comment.to_string(),
         kind: MemoryKind::Observation.to_string(),
         title: title.to_owned(),
@@ -392,8 +462,182 @@ async fn test_memory_project_isolation() {
 
     assert!(!has_more);
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].project_id, project_a);
+    assert_eq!(items[0].project_id.as_deref(), Some(project_a.as_str()));
     assert_eq!(items[0].id, item_a.id);
+}
+
+#[tokio::test]
+async fn test_scoped_memory_search_is_acl_first_and_bounded() {
+    let db = sqlite_db().await;
+    let project_a = seed_project(&db, "Scoped memory A", None).await;
+    let project_b = seed_project(&db, "Scoped memory B", None).await;
+    let mut private = memory_item(&project_a, "Private marker", "private-sharedneedle");
+    private.visibility = "private".to_owned();
+    private.metadata_json = serde_json::json!({"source_ref": "private-1"}).to_string();
+    let project = memory_item(&project_a, "Project marker", "project-sharedneedle");
+    let other = memory_item(&project_b, "Other marker", "sharedneedle");
+    for item in [&private, &project, &other] {
+        MemoryRepository::insert_memory_item(&db, item)
+            .await
+            .expect("scoped memory inserts");
+    }
+
+    let grant = MemoryScopeGrant {
+        scope_type: "project".to_owned(),
+        scope_id: project_a.clone(),
+        visibility: vec!["project".to_owned()],
+        identity_id: Some("identity-b".to_owned()),
+    };
+    let (items, has_more) = ScopedMemoryRepository::search_memory_items_scoped(
+        &db,
+        MemoryAccessQuery {
+            identity_id: Some("identity-b".to_owned()),
+            grants: vec![grant.clone()],
+            query: "sharedneedle".to_owned(),
+            limit: 1,
+            cursor: None,
+            include_retracted: false,
+        },
+    )
+    .await
+    .expect("scoped search succeeds");
+    assert!(!has_more);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, project.id);
+    assert_ne!(items[0].id, private.id);
+    assert_ne!(items[0].id, other.id);
+
+    let private_grant = MemoryScopeGrant {
+        scope_type: "project".to_owned(),
+        scope_id: project_a,
+        visibility: vec!["project".to_owned()],
+        identity_id: Some("identity-b".to_owned()),
+    };
+    let hidden = ScopedMemoryRepository::get_memory_item_scoped(
+        &db,
+        MemoryGetQuery {
+            id: private.id,
+            identity_id: Some("identity-b".to_owned()),
+            grants: vec![private_grant],
+            include_retracted: false,
+        },
+    )
+    .await
+    .expect("scoped get succeeds");
+    assert!(hidden.is_none());
+}
+
+#[tokio::test]
+async fn test_scoped_memory_lifecycle_excludes_retracted_and_keeps_audit() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Scoped lifecycle", None).await;
+    let item = memory_item(&project_id, "Lifecycle marker", "lifecycle-sharedneedle");
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("lifecycle item inserts");
+    ScopedMemoryRepository::insert_memory_lifecycle_assertion(
+        &db,
+        crate::CreateMemoryLifecycleAssertion {
+            id: new_uuid_v4(),
+            memory_item_id: item.id.clone(),
+            assertion_type: "retracted".to_owned(),
+            related_memory_id: None,
+            reason: Some("invalidated by evidence".to_owned()),
+            evidence_json: "{\"ticket\":\"e-1\"}".to_owned(),
+            asserted_by_type: "user".to_owned(),
+            asserted_by_id: Some("user-1".to_owned()),
+            source_event_id: None,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("lifecycle assertion inserts");
+    let grant = MemoryScopeGrant {
+        scope_type: "project".to_owned(),
+        scope_id: project_id,
+        visibility: vec!["project".to_owned()],
+        identity_id: None,
+    };
+    let (items, _) = ScopedMemoryRepository::search_memory_items_scoped(
+        &db,
+        MemoryAccessQuery {
+            identity_id: None,
+            grants: vec![grant],
+            query: "sharedneedle".to_owned(),
+            limit: 10,
+            cursor: None,
+            include_retracted: false,
+        },
+    )
+    .await
+    .expect("lifecycle search succeeds");
+    assert!(items.is_empty());
+    let assertions = ScopedMemoryRepository::list_memory_lifecycle_assertions(&db, &item.id)
+        .await
+        .expect("lifecycle audit loads");
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(assertions[0].assertion_type, "retracted");
+}
+
+#[tokio::test]
+async fn test_scoped_memory_cursor_replays_ranked_pages() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Scoped pagination", None).await;
+    let mut first = memory_item(&project_id, "First ranked", "ranked-sharedneedle");
+    first.id = "00000000-0000-4000-8000-000000000011".to_owned();
+    first.created_at = "2026-08-12T00:00:01Z".to_owned();
+    let mut second = memory_item(&project_id, "Second ranked", "ranked-sharedneedle");
+    second.id = "00000000-0000-4000-8000-000000000012".to_owned();
+    second.created_at = "2026-08-12T00:00:02Z".to_owned();
+    for item in [&first, &second] {
+        MemoryRepository::insert_memory_item(&db, item)
+            .await
+            .expect("ranked memory inserts");
+    }
+    let grant = MemoryScopeGrant {
+        scope_type: "project".to_owned(),
+        scope_id: project_id,
+        visibility: vec!["project".to_owned()],
+        identity_id: None,
+    };
+    let (page_one, more) = ScopedMemoryRepository::search_memory_items_scoped(
+        &db,
+        MemoryAccessQuery {
+            identity_id: None,
+            grants: vec![grant.clone()],
+            query: "sharedneedle".to_owned(),
+            limit: 1,
+            cursor: None,
+            include_retracted: false,
+        },
+    )
+    .await
+    .expect("first scoped page succeeds");
+    assert!(more);
+    let cursor = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "rank": page_one[0].retention_priority + 100,
+            "created_at": page_one[0].created_at,
+            "id": page_one[0].id,
+        }))
+        .expect("scoped cursor serializes"),
+    );
+    let (page_two, more) = ScopedMemoryRepository::search_memory_items_scoped(
+        &db,
+        MemoryAccessQuery {
+            identity_id: None,
+            grants: vec![grant],
+            query: "sharedneedle".to_owned(),
+            limit: 1,
+            cursor: Some(cursor),
+            include_retracted: false,
+        },
+    )
+    .await
+    .expect("second scoped page succeeds");
+    assert!(!more);
+    assert_eq!(page_two.len(), 1);
+    assert_ne!(page_one[0].id, page_two[0].id);
 }
 
 #[tokio::test]
@@ -446,7 +690,6 @@ fn test_memory_enum_round_trips() {
         MemoryKind::ExecutionSummary,
         MemoryKind::Comment,
         MemoryKind::Transition,
-        MemoryKind::ConversationMessage,
         MemoryKind::Artifact,
         MemoryKind::Lesson,
         MemoryKind::ContextPack,
@@ -461,7 +704,6 @@ fn test_memory_enum_round_trips() {
         MemorySourceType::Review,
         MemorySourceType::Comment,
         MemorySourceType::Transition,
-        MemorySourceType::Conversation,
     ];
     for source_type in source_types {
         let value = source_type.to_string();
@@ -519,120 +761,93 @@ async fn seed_agent(
     agent_id
 }
 
-async fn seed_project_agent_link(
-    db: &SqliteDb,
-    project_id: &str,
-    agent_id: &str,
-    linked_by_user_id: &str,
-) -> String {
-    let now = now_rfc3339();
-    let link_id = new_uuid_v4();
-    ProjectAgentLinkRepo::create(
-        db,
-        CreateProjectAgentLink {
-            id: link_id.clone(),
-            project_id: project_id.to_owned(),
-            agent_id: agent_id.to_owned(),
-            linked_by_user_id: linked_by_user_id.to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("project agent link creates");
-    link_id
-}
-
 #[tokio::test]
-async fn test_project_agent_link_uniqueness() {
+async fn test_agent_session_rotation_is_atomic_and_preserves_lineage() {
     let db = sqlite_db().await;
+    let identity_id = seed_agent(&db, "rotating agent", "account", None).await;
+    let identity = AgentRepo::get_by_id(&db, &identity_id)
+        .await
+        .expect("identity lookup succeeds")
+        .expect("identity exists");
     let now = now_rfc3339();
-    let linked_by_user_id = new_uuid_v4();
-    let project_id = seed_project(&db, "Agent links", None).await;
-    let agent_id = seed_agent(&db, "linked agent", "global", None).await;
-
-    ProjectAgentLinkRepo::create(
+    let scope = AgentContextScopeRepo::create_context_scope(
         &db,
-        CreateProjectAgentLink {
+        CreateAgentContextScope {
             id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            agent_id: agent_id.clone(),
-            linked_by_user_id: linked_by_user_id.clone(),
+            identity_id: identity_id.clone(),
+            scope_type: "account".to_owned(),
+            scope_id: "account-owner".to_owned(),
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: "{}".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
-    .expect("first project agent link creates");
-
-    let duplicate = ProjectAgentLinkRepo::create(
+    .expect("account scope creates");
+    let original_id = new_uuid_v4();
+    let original = AgentSessionRepo::create_agent_session(
         &db,
-        CreateProjectAgentLink {
-            id: new_uuid_v4(),
-            project_id,
-            agent_id,
-            linked_by_user_id,
+        CreateAgentSession {
+            id: original_id.clone(),
+            identity_id: identity_id.clone(),
+            profile_id: identity.profile_id.clone(),
+            context_scope_id: scope.id.clone(),
+            backend_kind: "cli".to_owned(),
+            runtime_session_id: Some("runtime-original".to_owned()),
+            status: "ready".to_owned(),
+            capabilities_json: "{}".to_owned(),
+            connection_status: "healthy".to_owned(),
+            predecessor_session_id: None,
+            last_activity_at: None,
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
         },
     )
-    .await;
-    assert!(
-        matches!(duplicate, Err(DbError::Check(_))),
-        "duplicate link should fail with a uniqueness check error"
+    .await
+    .expect("original session creates");
+    let replacement_id = new_uuid_v4();
+    let replacement = AgentSessionRepo::rotate_agent_session(
+        &db,
+        RotateAgentSession {
+            previous_session_id: original.id.clone(),
+            expected_version: original.version,
+            replacement: CreateAgentSession {
+                id: replacement_id.clone(),
+                identity_id,
+                profile_id: identity.profile_id,
+                context_scope_id: scope.id,
+                backend_kind: "cli".to_owned(),
+                runtime_session_id: Some("runtime-replacement".to_owned()),
+                status: "ready".to_owned(),
+                capabilities_json: "{}".to_owned(),
+                connection_status: "healthy".to_owned(),
+                predecessor_session_id: Some(original_id.clone()),
+                last_activity_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        },
+    )
+    .await
+    .expect("session rotates");
+    assert_eq!(replacement.id, replacement_id);
+    assert_eq!(
+        replacement.predecessor_session_id.as_deref(),
+        Some(original_id.as_str())
     );
-}
-
-#[tokio::test]
-async fn test_project_agent_link_cascade_on_project_delete() {
-    let db = sqlite_db().await;
-    let linked_by_user_id = new_uuid_v4();
-    let project_id = seed_project(&db, "Project cascade link", None).await;
-    let agent_id = seed_agent(&db, "project cascade agent", "global", None).await;
-    seed_project_agent_link(&db, &project_id, &agent_id, &linked_by_user_id).await;
-
-    ProjectRepo::delete(&db, &project_id)
+    let replaced = AgentSessionRepo::get_agent_session(&db, &original_id)
         .await
-        .expect("project deletes");
-
-    let link = ProjectAgentLinkRepo::get_by_project_and_agent(&db, &project_id, &agent_id)
-        .await
-        .expect("project agent link lookup succeeds");
-    assert!(link.is_none());
-    let links = ProjectAgentLinkRepo::list_by_project(&db, &project_id)
-        .await
-        .expect("project agent links list");
-    assert!(links.is_empty());
-    let agent = AgentRepo::get_by_id(&db, &agent_id)
-        .await
-        .expect("agent lookup succeeds");
-    assert!(agent.is_some());
-}
-
-#[tokio::test]
-async fn test_project_agent_link_cascade_on_agent_delete() {
-    let db = sqlite_db().await;
-    let linked_by_user_id = new_uuid_v4();
-    let project_id = seed_project(&db, "Agent cascade link", None).await;
-    let agent_id = seed_agent(&db, "agent cascade agent", "global", None).await;
-    seed_project_agent_link(&db, &project_id, &agent_id, &linked_by_user_id).await;
-
-    AgentRepo::delete(&db, &agent_id)
-        .await
-        .expect("agent deletes");
-
-    let link = ProjectAgentLinkRepo::get_by_project_and_agent(&db, &project_id, &agent_id)
-        .await
-        .expect("project agent link lookup succeeds");
-    assert!(link.is_none());
-    let links = ProjectAgentLinkRepo::list_by_project(&db, &project_id)
-        .await
-        .expect("project agent links list");
-    assert!(links.is_empty());
-    let project = ProjectRepo::get_by_id(&db, &project_id)
-        .await
-        .expect("project lookup succeeds");
-    assert!(project.is_some());
+        .expect("original session loads")
+        .expect("original session remains");
+    assert_eq!(replaced.status, "replaced");
+    assert_eq!(
+        replaced.replaced_by_session_id.as_deref(),
+        Some(replacement_id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -686,19 +901,37 @@ async fn test_list_agents_usable_in_project() {
         .iter()
         .any(|agent| agent.id.as_str() == u2_agent_id.as_str()));
 
-    ProjectAgentLinkRepo::create(
+    let setup_binding = ProjectAgentBindingRepo::get_active_project_binding(&db, &project_id)
+        .await
+        .expect("project setup binding loads")
+        .expect("project setup binding exists");
+    let u2_agent = AgentRepo::get_by_id(&db, &u2_agent_id)
+        .await
+        .expect("u2 agent loads")
+        .expect("u2 agent exists");
+    ProjectAgentBindingRepo::replace_project_binding(
         &db,
-        CreateProjectAgentLink {
-            id: new_uuid_v4(),
+        crate::ReplaceProjectAgentBinding {
             project_id: project_id.clone(),
-            agent_id: u2_agent_id.clone(),
-            linked_by_user_id: u1_id.clone(),
-            created_at: now.clone(),
-            updated_at: now,
+            expected_version: setup_binding.version,
+            replacement: CreateProjectAgentBinding {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                identity_id: Some(u2_agent.id),
+                profile_id: Some(u2_agent.profile_id),
+                state: "active".to_owned(),
+                autonomy_policy_json: "{}".to_owned(),
+                permission_ceiling_json: "{}".to_owned(),
+                subscriptions_json: "[]".to_owned(),
+                wake_budget: 0,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            replacement_reason: Some("test project agent selection".to_owned()),
         },
     )
     .await
-    .expect("u2 account agent links to project");
+    .expect("project agent binding creates");
 
     let usable = SqliteDb::list_agents_usable_in_project(&db, &project_id, &u1_id)
         .await
@@ -1559,16 +1792,33 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
     .await
     .expect("repo inserts");
 
-    sqlx::query(
-        "INSERT INTO agent (id, name, executor_type, daemon_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    AgentRepo::create(
+        &db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: "shell".to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            daemon_id: Some(daemon_id),
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&agent_id)
-    .bind("shell")
-    .bind("shell")
-    .bind(&daemon_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(&pool)
     .await
     .expect("agent inserts");
 
@@ -2711,6 +2961,14 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     assert_eq!(review.status, ReviewStatus::Passed);
     assert_eq!(review.step_results_json, r#"[{"index":0,"exit_code":0}]"#);
     assert_eq!(review.finished_at, Some(now.clone()));
+    let review_events = DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .expect("review outcome event lists");
+    assert!(review_events.iter().any(|event| {
+        event.event_type == "review.status_changed"
+            && event.entity_id == review_id
+            && event.scope_id == task_id
+    }));
 
     let workspace_id = new_uuid_v4();
     let workspace = WorkspaceRepo::create(
@@ -3197,6 +3455,10 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
             capacity_statuses: vec![
+                // The task being claimed may already be role-assigned in a
+                // source state that participates in capacity accounting.
+                // It must not consume a slot before its own first claim.
+                "todo".to_owned(),
                 "in_progress".to_owned(),
                 "review".to_owned(),
                 "merging".to_owned(),
@@ -3714,159 +3976,6 @@ async fn test_unsatisfied_dependencies_empty_when_done() {
         .is_empty());
 }
 
-#[tokio::test]
-async fn conversation_crud_and_message_sequence() {
-    let db = sqlite_db().await;
-    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let now = now_rfc3339();
-
-    let conversation = ConversationRepo::create(
-        &db,
-        CreateConversation {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            agent_id: Some(agent_id.clone()),
-            title: "Planning Chat".to_owned(),
-            status: ConversationStatus::Active,
-            system_prompt: Some("You are a PM".to_owned()),
-            message_count: 0,
-            last_message_at: None,
-            agent_session_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("conversation creates");
-
-    let listed = ConversationRepo::list_by_project(
-        &db,
-        ConversationListQuery {
-            project_id: project_id.clone(),
-            status: Some(ConversationStatus::Active),
-            page: page(20),
-        },
-    )
-    .await
-    .expect("conversation lists");
-    assert_eq!(listed.items.len(), 1);
-    assert_eq!(listed.items[0].id, conversation.id);
-
-    let sequence_1 = ConversationMessageRepo::next_sequence(&db, &conversation.id)
-        .await
-        .expect("seq 1");
-    assert_eq!(sequence_1, 1);
-
-    let message_1 = ConversationMessageRepo::create(
-        &db,
-        CreateConversationMessage {
-            id: new_uuid_v4(),
-            conversation_id: conversation.id.clone(),
-            role: ConversationMessageRole::User,
-            content: "hello".to_owned(),
-            status: ConversationMessageStatus::Complete,
-            model: None,
-            token_usage_json: None,
-            duration_ms: None,
-            error: None,
-            sequence: sequence_1,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("first message creates");
-
-    let sequence_2 = ConversationMessageRepo::next_sequence(&db, &conversation.id)
-        .await
-        .expect("seq 2");
-    assert_eq!(sequence_2, 2);
-
-    let _message_2 = ConversationMessageRepo::create(
-        &db,
-        CreateConversationMessage {
-            id: new_uuid_v4(),
-            conversation_id: conversation.id.clone(),
-            role: ConversationMessageRole::Assistant,
-            content: "hi".to_owned(),
-            status: ConversationMessageStatus::Streaming,
-            model: Some("gpt-5".to_owned()),
-            token_usage_json: None,
-            duration_ms: None,
-            error: None,
-            sequence: sequence_2,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("second message creates");
-
-    let page_result = ConversationMessageRepo::list_by_conversation(
-        &db,
-        ConversationMessageListQuery {
-            conversation_id: conversation.id.clone(),
-            before_sequence: None,
-            page: PageRequest {
-                cursor: None,
-                limit: 50,
-                include_total: true,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        },
-    )
-    .await
-    .expect("messages list");
-    assert_eq!(page_result.items.len(), 2);
-    assert_eq!(page_result.items[0].sequence, 1);
-    assert_eq!(page_result.items[1].sequence, 2);
-
-    let active = ConversationMessageRepo::get_active_streaming_message(&db, &conversation.id)
-        .await
-        .expect("get active")
-        .expect("active exists");
-    assert_eq!(active.status, ConversationMessageStatus::Streaming);
-    assert_eq!(active.sequence, 2);
-
-    let updated = ConversationRepo::update(
-        &db,
-        UpdateConversation {
-            id: conversation.id.clone(),
-            expected_version: conversation.version,
-            agent_id: None,
-            title: Some("Renamed".to_owned()),
-            status: Some(ConversationStatus::Archived),
-            system_prompt: Some(Some("updated prompt".to_owned())),
-            message_count: Some(2),
-            last_message_at: Some(Some(now.clone())),
-            agent_session_id: Some(Some("sess-1".to_owned())),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("conversation updates");
-    assert_eq!(updated.status, ConversationStatus::Archived);
-    assert_eq!(updated.title, "Renamed");
-
-    let updated_message = ConversationMessageRepo::update(
-        &db,
-        crate::UpdateConversationMessage {
-            id: message_1.id.clone(),
-            content: Some("hello updated".to_owned()),
-            status: Some(ConversationMessageStatus::Complete),
-            model: None,
-            token_usage_json: None,
-            duration_ms: None,
-            error: None,
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("message updates");
-    assert_eq!(updated_message.content, "hello updated");
-}
-
 // ── User / RefreshToken tests ──────────────────────────────────────────────
 
 async fn seed_user(db: &SqliteDb) -> String {
@@ -4243,4 +4352,473 @@ async fn test_normalize_failure_kinds_migration_backfill() {
         serde_json::from_str::<serde_json::Value>(&blocked).unwrap()["kind"],
         "从未见过"
     );
+}
+
+#[tokio::test]
+async fn domain_event_claims_are_ordered_replay_safe_and_deduplicated() {
+    let db = sqlite_db().await;
+    let created_at = "2026-08-12T20:00:00Z".to_owned();
+    let first = CreateDomainEvent {
+        id: "event-first".to_owned(),
+        event_type: "task.transitioned".to_owned(),
+        entity_type: "task".to_owned(),
+        entity_id: "task-1".to_owned(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "task".to_owned(),
+        scope_id: "task-1".to_owned(),
+        correlation_id: "corr-1".to_owned(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some("task-transition:1".to_owned()),
+        payload_json: r#"{"to_state":"review"}"#.to_owned(),
+        created_at: created_at.clone(),
+    };
+    let first_row = DomainEventRepo::append_event(&db, first.clone())
+        .await
+        .expect("first event appends");
+    let duplicate = DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: "event-duplicate".to_owned(),
+            payload_json: r#"{"to_state":"review"}"#.to_owned(),
+            ..first
+        },
+    )
+    .await
+    .expect("dedupe returns the committed event");
+    assert_eq!(duplicate.id, first_row.id);
+    let conflicting_dedupe = DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: "event-conflicting-dedupe".to_owned(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task-other".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task-other".to_owned(),
+            correlation_id: "corr-other".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("task-transition:1".to_owned()),
+            payload_json: "{}".to_owned(),
+            created_at: "2026-08-12T20:00:01Z".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(conflicting_dedupe, Err(DbError::Check(_))));
+
+    let second = DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: "event-second".to_owned(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task-2".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task-2".to_owned(),
+            correlation_id: "corr-2".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("task-transition:2".to_owned()),
+            payload_json: "{}".to_owned(),
+            created_at,
+        },
+    )
+    .await
+    .expect("second event appends");
+
+    let claim_input = |owner: &str, now: &str, leased_until: &str| ClaimDomainEvents {
+        consumer_name: "projection".to_owned(),
+        lease_owner: owner.to_owned(),
+        now: now.to_owned(),
+        leased_until: leased_until.to_owned(),
+        limit: 10,
+    };
+    let claimed = DomainEventRepo::claim_event_batch(
+        &db,
+        claim_input("worker-a", "2026-08-12T20:01:00Z", "2026-08-12T20:02:00Z"),
+    )
+    .await
+    .expect("events claim");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        ["event-first", "event-second"]
+    );
+
+    let second_out_of_order = DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "projection".to_owned(),
+            lease_owner: "worker-a".to_owned(),
+            event_sequence: second.sequence,
+            event_id: second.id.clone(),
+            dedupe_key: second.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:01:01Z".to_owned(),
+        },
+    )
+    .await;
+    assert!(second_out_of_order.is_err(), "cursor must remain ordered");
+
+    assert!(DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "projection".to_owned(),
+            lease_owner: "worker-a".to_owned(),
+            event_sequence: first_row.sequence,
+            event_id: first_row.id.clone(),
+            dedupe_key: first_row.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:01:02Z".to_owned(),
+        },
+    )
+    .await
+    .expect("first event completes"));
+    assert!(DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "projection".to_owned(),
+            lease_owner: "worker-a".to_owned(),
+            event_sequence: second.sequence,
+            event_id: second.id.clone(),
+            dedupe_key: second.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:01:03Z".to_owned(),
+        },
+    )
+    .await
+    .expect("second event completes"));
+    assert_eq!(
+        DomainEventRepo::get_consumer_cursor(&db, "projection")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence,
+        second.sequence
+    );
+    assert!(!DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "projection".to_owned(),
+            lease_owner: "worker-a".to_owned(),
+            event_sequence: second.sequence,
+            event_id: second.id.clone(),
+            dedupe_key: "task-transition:2".to_owned(),
+            completed_at: "2026-08-12T20:01:04Z".to_owned(),
+        },
+    )
+    .await
+    .expect("duplicate completion is idempotent"));
+
+    // A live lease at the cursor head blocks later sequences from being
+    // claimed by another worker; otherwise that worker could never
+    // checkpoint its out-of-order receipt.
+    let third = DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: "event-third".to_owned(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task-3".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task-3".to_owned(),
+            correlation_id: "corr-3".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("task-transition:3".to_owned()),
+            payload_json: "{}".to_owned(),
+            created_at: "2026-08-12T20:01:05Z".to_owned(),
+        },
+    )
+    .await
+    .expect("third event appends");
+    let fourth = DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: "event-fourth".to_owned(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task-4".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task-4".to_owned(),
+            correlation_id: "corr-4".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("task-transition:4".to_owned()),
+            payload_json: "{}".to_owned(),
+            created_at: "2026-08-12T20:01:06Z".to_owned(),
+        },
+    )
+    .await
+    .expect("fourth event appends");
+    let head_claim = DomainEventRepo::claim_event_batch(
+        &db,
+        claim_input(
+            "worker-head",
+            "2026-08-12T20:01:07Z",
+            "2026-08-12T20:02:07Z",
+        ),
+    )
+    .await
+    .expect("head events claim");
+    assert_eq!(head_claim.len(), 2);
+    assert_eq!(head_claim[0].id, third.id);
+    assert_eq!(head_claim[1].id, fourth.id);
+    // The same consumer cannot be claimed concurrently by another owner.
+    let blocked_claim = DomainEventRepo::claim_event_batch(
+        &db,
+        claim_input(
+            "worker-other",
+            "2026-08-12T20:01:08Z",
+            "2026-08-12T20:02:08Z",
+        ),
+    )
+    .await
+    .expect("blocked claim succeeds");
+    assert!(blocked_claim.is_empty());
+    assert!(DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "projection".to_owned(),
+            lease_owner: "worker-head".to_owned(),
+            event_sequence: third.sequence,
+            event_id: third.id.clone(),
+            dedupe_key: third.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:01:09Z".to_owned(),
+        },
+    )
+    .await
+    .expect("third event completes"));
+    assert!(DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "projection".to_owned(),
+            lease_owner: "worker-head".to_owned(),
+            event_sequence: fourth.sequence,
+            event_id: fourth.id.clone(),
+            dedupe_key: fourth.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:01:10Z".to_owned(),
+        },
+    )
+    .await
+    .expect("fourth event completes"));
+
+    // Simulate a legacy crash after writing a projection receipt but before
+    // checkpointing the cursor. Claiming the next batch must repair the
+    // contiguous receipt prefix instead of getting stuck behind event-first.
+    sqlx::query(
+        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, version, updated_at)
+         VALUES ('repair', 0, 1, ?)",
+    )
+    .bind("2026-08-12T20:02:00Z")
+    .execute(db.pool())
+    .await
+    .expect("repair cursor inserts");
+    sqlx::query(
+        "INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at)
+         VALUES ('repair', ?, ?, ?)",
+    )
+    .bind(&first_row.id)
+    .bind(first_row.dedupe_key.as_deref().unwrap())
+    .bind("2026-08-12T20:02:00Z")
+    .execute(db.pool())
+    .await
+    .expect("orphan receipt inserts");
+    let repaired = DomainEventRepo::claim_event_batch(
+        &db,
+        ClaimDomainEvents {
+            consumer_name: "repair".to_owned(),
+            lease_owner: "repair-worker".to_owned(),
+            now: "2026-08-12T20:02:01Z".to_owned(),
+            leased_until: "2026-08-12T20:03:00Z".to_owned(),
+            limit: 1,
+        },
+    )
+    .await
+    .expect("repair claim succeeds");
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0].id, second.id);
+    assert_eq!(
+        DomainEventRepo::get_consumer_cursor(&db, "repair")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence,
+        first_row.sequence
+    );
+    assert!(DomainEventRepo::complete_claimed_event(
+        &db,
+        CompleteDomainEvent {
+            consumer_name: "repair".to_owned(),
+            lease_owner: "repair-worker".to_owned(),
+            event_sequence: second.sequence,
+            event_id: second.id.clone(),
+            dedupe_key: second.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:02:02Z".to_owned(),
+        },
+    )
+    .await
+    .expect("repaired cursor completes next event"));
+
+    let recovery_db = sqlite_db().await;
+    let stale_event = DomainEventRepo::append_event(
+        &recovery_db,
+        CreateDomainEvent {
+            id: "event-stale".to_owned(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task-3".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task-3".to_owned(),
+            correlation_id: "corr-3".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("task-transition:3".to_owned()),
+            payload_json: "{}".to_owned(),
+            created_at: "2026-08-12T20:03:00Z".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let first_claim = DomainEventRepo::claim_event_batch(
+        &recovery_db,
+        ClaimDomainEvents {
+            consumer_name: "recovery".to_owned(),
+            lease_owner: "worker-a".to_owned(),
+            now: "2026-08-12T20:03:01Z".to_owned(),
+            leased_until: "2026-08-12T20:03:02Z".to_owned(),
+            limit: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_claim[0].id, stale_event.id);
+    let second_claim = DomainEventRepo::claim_event_batch(
+        &recovery_db,
+        ClaimDomainEvents {
+            consumer_name: "recovery".to_owned(),
+            lease_owner: "worker-b".to_owned(),
+            now: "2026-08-12T20:03:03Z".to_owned(),
+            leased_until: "2026-08-12T20:03:04Z".to_owned(),
+            limit: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_claim[0].id, stale_event.id);
+    let stale_completion = DomainEventRepo::complete_claimed_event(
+        &recovery_db,
+        CompleteDomainEvent {
+            consumer_name: "recovery".to_owned(),
+            lease_owner: "worker-a".to_owned(),
+            event_sequence: stale_event.sequence,
+            event_id: stale_event.id.clone(),
+            dedupe_key: stale_event.dedupe_key.clone().unwrap(),
+            completed_at: "2026-08-12T20:03:03Z".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(stale_completion, Err(DbError::VersionConflict)));
+    assert!(DomainEventRepo::complete_claimed_event(
+        &recovery_db,
+        CompleteDomainEvent {
+            consumer_name: "recovery".to_owned(),
+            lease_owner: "worker-b".to_owned(),
+            event_sequence: stale_event.sequence,
+            event_id: stale_event.id,
+            dedupe_key: "task-transition:3".to_owned(),
+            completed_at: "2026-08-12T20:03:04Z".to_owned(),
+        },
+    )
+    .await
+    .expect("replacement worker completes after lease expiry"));
+}
+
+#[tokio::test]
+async fn domain_event_append_in_tx_rolls_back_with_the_mutation() {
+    let db = sqlite_db().await;
+    let event = CreateDomainEvent {
+        id: "rolled-back-event".to_owned(),
+        event_type: "task.transitioned".to_owned(),
+        entity_type: "task".to_owned(),
+        entity_id: "task-rollback".to_owned(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "task".to_owned(),
+        scope_id: "task-rollback".to_owned(),
+        correlation_id: "corr-rollback".to_owned(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some("rollback-event".to_owned()),
+        payload_json: "{}".to_owned(),
+        created_at: "2026-08-12T20:00:00Z".to_owned(),
+    };
+    let mut transaction = db.pool().begin().await.expect("transaction begins");
+    DomainEventRepo::append_event_in_tx(&db, &mut transaction, &event)
+        .await
+        .expect("event appends inside transaction");
+    transaction
+        .rollback()
+        .await
+        .expect("transaction rolls back");
+    assert!(DomainEventRepo::get_event(&db, &event.id)
+        .await
+        .expect("event lookup succeeds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn direct_task_status_updates_emit_a_ledger_event_atomically() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "todo".to_owned(),
+        "ledger task",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task lookup succeeds")
+        .expect("task exists");
+    let updated = TaskRepo::update_status(
+        &db,
+        UpdateTaskStatus {
+            id: task_id.clone(),
+            expected_version: task.version,
+            status: "in_progress".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: "2026-08-12T20:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("task status updates");
+    assert_eq!(updated.status, "in_progress");
+    let events = DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .expect("task event lists");
+    let event = events
+        .iter()
+        .find(|event| event.event_type == "task.status_changed" && event.entity_id == task_id)
+        .expect("task status event exists");
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+    assert_eq!(payload["from_status"], "todo");
+    assert_eq!(payload["to_status"], "in_progress");
 }

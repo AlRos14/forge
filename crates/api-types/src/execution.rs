@@ -3,11 +3,10 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, CanonicalPhase, ConversationMessageRole, ConversationMessageStatus,
-    ConversationStatus, ExecutionAction, ExecutionBehavior, ExecutionRole, ExecutionStatus,
-    InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason,
-    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
-    WorkflowHealthSummary, WorkspaceResponse,
+    AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionRole,
+    ExecutionStatus, InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy,
+    StopReason, TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType,
+    WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -98,18 +97,24 @@ pub struct TaskExecutionObservability {
     pub total_cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct AgentResponse {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub profile_id: String,
+    pub backend_kind: String,
     pub executor_type: String,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub permission_policy: Option<String>,
     pub prompt_template: Option<String>,
     pub capabilities: Vec<String>,
+    #[ts(type = "Record<string, unknown>")]
     pub config_json: Value,
+    pub credential_handle_id: Option<String>,
     pub daemon_id: Option<String>,
     pub max_concurrent_tasks: i64,
     pub status: AgentStatus,
@@ -286,45 +291,4 @@ pub struct PromptPreviewResponse {
     pub system: String,
     pub user: String,
     pub tools: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct ConversationResponse {
-    pub id: String,
-    pub project_id: String,
-    pub agent_id: Option<String>,
-    pub title: String,
-    pub status: ConversationStatus,
-    pub system_prompt: Option<String>,
-    pub message_count: i64,
-    pub last_message_at: Option<String>,
-    pub agent_session_id: Option<String>,
-    pub version: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct ConversationMessageResponse {
-    pub id: String,
-    pub conversation_id: String,
-    pub role: ConversationMessageRole,
-    pub content: String,
-    pub status: ConversationMessageStatus,
-    pub model: Option<String>,
-    #[ts(type = "Record<string, unknown> | null")]
-    pub token_usage_json: Option<Value>,
-    pub duration_ms: Option<i64>,
-    pub error: Option<String>,
-    pub sequence: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SendMessageResponse {
-    pub user_message: ConversationMessageResponse,
-    pub assistant_message: ConversationMessageResponse,
 }

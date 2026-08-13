@@ -99,6 +99,7 @@ export function ComboSelect({
   const handleSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Escape') { setOpen(false); return }
     if (e.key === 'Enter') {
+      if (e.nativeEvent.isComposing) return
       if (filtered.length === 1) { selectValue(filtered[0].value); return }
       if (showCustomOption) { selectValue(query.trim()); return }
       if (filtered.length === 0 && !allowCustom) return

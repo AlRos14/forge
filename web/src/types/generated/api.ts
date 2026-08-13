@@ -6,7 +6,7 @@ import type { ProjectHookRule } from './bindings/ProjectHookRule'
 
 export type TaskStatus = string
 
-export type TaskType = 'task' | 'planning_task' | 'sub_task'
+export type TaskType = 'task' | 'planning_task' | 'sub_task' | 'discovery'
 
 export type ExecutionRole = string
 export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'cancelled'
@@ -68,9 +68,6 @@ export type AgentStatus = 'idle' | 'busy' | 'error' | 'offline'
 export type ReviewStatus = 'running' | 'awaiting_human' | 'passed' | 'failed' | 'cancelled'
 export type DaemonStatus = 'online' | 'offline'
 export type WorkMode = 'direct_merge' | 'pull_request'
-export type ConversationStatus = 'active' | 'archived'
-export type ConversationMessageRole = 'user' | 'assistant' | 'system'
-export type ConversationMessageStatus = 'complete' | 'streaming' | 'failed' | 'cancelled'
 export type TerminalSessionStatus =
   | 'starting'
   | 'running'
@@ -393,6 +390,7 @@ export interface MemorySearchQuery {
 
 export interface MemoryGetQuery {
   layer?: number | null
+  project_id?: string | null
 }
 
 export interface MemorySearchResultDto {
@@ -412,6 +410,120 @@ export interface MemorySearchResponse {
   items: MemorySearchResultDto[]
   has_more: boolean
   next_cursor: string | null
+}
+
+export interface MemoryPublicationRequest {
+  source_scope_type: string
+  source_scope_id: string
+  target_scope_type: string
+  target_scope_id: string
+  target_project_id: string | null
+  target_task_id: string | null
+  target_chat_id: string | null
+  target_visibility: string
+  target_authority: string
+  actor_identity_id: string
+  reason: string
+  evidence_json: string
+}
+
+export interface MemoryLifecycleRequest {
+  scope_type: string
+  scope_id: string
+  assertion_type: string
+  related_memory_id: string | null
+  reason: string | null
+  evidence_json: string
+  actor_identity_id: string
+}
+
+export interface MemoryLifecycleResponse {
+  id: string
+  memory_item_id: string
+  assertion_type: string
+  related_memory_id: string | null
+  reason: string | null
+  evidence_present: boolean
+  asserted_by_type: string
+  asserted_by_id: string | null
+  source_event_id: string | null
+  created_at: string
+}
+
+export interface MemoryProvenanceResponse {
+  id: string
+  scope_type: string
+  scope_id: string
+  visibility: string
+  owner_identity_id: string | null
+  authority: string
+  sensitivity: string
+  retention_priority: number
+  source_type: string
+  source_ref: string | null
+  source_event_id: string | null
+  source_scope_type: string | null
+  source_scope_id: string | null
+  source_revision: string | null
+  source_chat_sequence: number | null
+  publication_source_id: string | null
+  supersedes_id: string | null
+  valid_from: string | null
+  valid_until: string | null
+  created_by_type: string | null
+  created_by_id: string | null
+  created_at: string
+  lifecycle: MemoryLifecycleResponse[]
+}
+
+export interface ContextManifestQuery {
+  identity_id: string
+  context_scope_id: string
+}
+
+export interface ContextManifestListQuery {
+  context_scope_id: string | null
+  limit: number | null
+}
+
+export interface MemoryProvenanceQuery {
+  scope_type: string
+  scope_id: string
+  identity_id: string
+}
+
+export interface ContextManifestSourceResponse {
+  ordinal: number
+  source_id: string
+  source_type: string
+  source_revision: string
+  selection_reason: string
+  disposition: string
+  retention_priority: number
+  fragment_fingerprint: string
+}
+
+export interface ContextManifestResponse {
+  id: string
+  identity_id: string
+  agent_session_id: string | null
+  context_scope_id: string
+  scope_type: string
+  scope_id: string
+  policy_revision: string
+  domain_revision: string
+  lcm_binding_revision: string | null
+  runtime_manifest_id: string | null
+  runtime_manifest_fingerprint: string | null
+  combined_fingerprint: string
+  request_fingerprint: string
+  created_at: string
+  sources: ContextManifestSourceResponse[]
+}
+
+export interface ContextManifestListResponse {
+  items: ContextManifestResponse[]
+  has_more: boolean
 }
 
 // --- Paginated wrapper (matches api_types::PaginatedResponse<T>) ---
@@ -465,36 +577,6 @@ export interface Task {
 
 export type TaskResponse = Task
 
-export interface Conversation {
-  id: string
-  project_id: string
-  agent_id: string | null
-  title: string
-  status: ConversationStatus
-  system_prompt: string | null
-  message_count: number
-  last_message_at: string | null
-  agent_session_id: string | null
-  version: number
-  created_at: string
-  updated_at: string
-}
-
-export interface ConversationMessage {
-  id: string
-  conversation_id: string
-  role: ConversationMessageRole
-  content: string
-  status: ConversationMessageStatus
-  model: string | null
-  token_usage_json: Record<string, unknown> | null
-  duration_ms: number | null
-  error: string | null
-  sequence: number
-  created_at: string
-  updated_at: string
-}
-
 // --- Execution (matches api_types::ExecutionResponse) ---
 
 export interface Execution {
@@ -537,13 +619,17 @@ export interface Agent {
   id: string
   name: string
   description: string | null
+  profile_id: string
+  backend_kind: string
   executor_type: string
+  provider: string | null
   model: string | null
   reasoning_effort: string | null
   permission_policy: string | null
   prompt_template: string | null
   capabilities: string[]
   config_json: Record<string, unknown>
+  credential_handle_id?: string | null
   daemon_id: string | null
   daemon?: Daemon
   max_concurrent_tasks: number
@@ -824,33 +910,6 @@ export interface FollowUpRequest {
   }
 }
 
-export interface CreateConversationRequest {
-  agent_id: string
-  title?: string | null
-  system_prompt?: string | null
-}
-
-export interface UpdateConversationRequest {
-  version: number
-  title?: string | null
-  agent_id?: string | null
-  system_prompt?: string | null
-  status?: ConversationStatus | null
-}
-
-export interface SendMessageRequest {
-  content: string
-  overrides?: {
-    model_id?: string
-    reasoning_effort?: string
-  } | null
-}
-
-export interface SendMessageResponse {
-  user_message: ConversationMessage
-  assistant_message: ConversationMessage
-}
-
 export interface LaunchExecutionResponse {
   data: {
     task: Task
@@ -893,6 +952,10 @@ export interface CreateProjectRequest {
   name: string
   settings?: Record<string, unknown> | null
   default_review_config?: ReviewConfig | null
+  paused?: boolean | null
+  project_agent_identity_id?: string | null
+  project_agent_profile_id?: string | null
+  product_genesis_session_id?: string | null
 }
 
 export interface UpdateProjectRequest {

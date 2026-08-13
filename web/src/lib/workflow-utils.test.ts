@@ -6,6 +6,7 @@ import {
   getStaleBlockingAnnotation,
   getTaskWorkflowWarning,
   outgoingWorkflowEdges,
+  taskTypes,
   taskHasError,
   workflowTriggerTargets,
 } from './workflow-utils'
@@ -18,6 +19,12 @@ const emptyHooks = {
   on_enter: [],
   after_enter: [],
 }
+
+describe('project task types', () => {
+  it('keeps Discovery available to Project-scoped task surfaces', () => {
+    expect(taskTypes).toContain('discovery')
+  })
+})
 
 function state(
   name: string,
@@ -57,11 +64,7 @@ describe('deriveColumns', () => {
 
     const columns = deriveColumns(workflow)
 
-    expect(columns.map((column) => column.primaryState)).toEqual([
-      'todo',
-      'in_progress',
-      'review',
-    ])
+    expect(columns.map((column) => column.primaryState)).toEqual(['todo', 'in_progress', 'review'])
     expect(columns[1].states).toEqual(['planning', 'in_progress'])
   })
 })

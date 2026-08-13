@@ -1,0 +1,605 @@
+use std::{
+    collections::HashMap,
+    fmt,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use agent_runtime::{
+    core::{
+        cancel::CancelReason,
+        catalog::{ModelLimits, ResolvedModelProfile},
+        content::{ContentPart, Role, UserInput},
+        event::{RuntimeEvent, TurnFinish},
+        ids::SessionId,
+        provider::{ModelId, Provider},
+        security::SecuritySubject,
+        usage::CounterKind,
+        workspace::DenyAllWorkspace,
+    },
+    harness::{LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver},
+    provider::openai::{OpenAiConfig, OpenAiProvider},
+    runtime::{RuntimeBuilder, SessionHandle, StartSession},
+};
+use async_trait::async_trait;
+use futures_util::StreamExt;
+
+use crate::{
+    AgentHostError, AgentSessionBackend, AgentTurnOutput, AgentTurnRequest, BackendCapabilities,
+    CanonicalScope, CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION,
+    ForgeToolProvider, InteractionBrokerHandle, RuntimeContextManifestLink, ScopeToolComposition,
+    TurnEventSink, protected_store::SqliteProtectedRuntimeStore, transport::ReqwestTransport,
+};
+
+#[derive(Clone)]
+pub struct NativeAgentRuntimeBackend {
+    protected_store: Arc<SqliteProtectedRuntimeStore>,
+    interaction_broker: InteractionBrokerHandle,
+    active: Arc<Mutex<HashMap<String, SessionHandle>>>,
+    forge_tool_provider: Option<Arc<dyn ForgeToolProvider>>,
+}
+
+impl NativeAgentRuntimeBackend {
+    pub fn new(protected_store: Arc<SqliteProtectedRuntimeStore>) -> Self {
+        Self {
+            interaction_broker: InteractionBrokerHandle::new(Arc::clone(&protected_store)),
+            protected_store,
+            active: Arc::new(Mutex::new(HashMap::new())),
+            forge_tool_provider: None,
+        }
+    }
+
+    /// Installs the Forge domain provider used by scope-derived read/proposal
+    /// tools.  The provider receives identity/scope values resolved from the
+    /// persisted session, never from model arguments.
+    pub fn with_forge_tool_provider(mut self, provider: Arc<dyn ForgeToolProvider>) -> Self {
+        self.forge_tool_provider = Some(provider);
+        self
+    }
+
+    /// Returns the shared protected broker used by native turns.  API
+    /// handlers may answer through another clone; the durable row is the
+    /// synchronization boundary rather than an in-process channel.
+    pub fn interaction_broker(&self) -> InteractionBrokerHandle {
+        self.interaction_broker.clone()
+    }
+
+    fn provider(request: &AgentTurnRequest) -> Result<Arc<dyn Provider>, AgentHostError> {
+        match request.provider.provider.as_str() {
+            "openai" | "openai_compatible" | "openrouter" => {
+                let config = OpenAiConfig::new(
+                    request.provider.base_url.clone(),
+                    request.provider.model.clone(),
+                )
+                .with_api_key(request.provider.credential.clone());
+                Ok(Arc::new(OpenAiProvider::new(
+                    ReqwestTransport::new()
+                        .map_err(|error| AgentHostError::Configuration(error.message))?,
+                    config,
+                )))
+            }
+            provider => Err(AgentHostError::Unsupported(format!(
+                "native provider `{provider}` is not configured"
+            ))),
+        }
+    }
+}
+
+impl fmt::Debug for NativeAgentRuntimeBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeAgentRuntimeBackend")
+            .field(
+                "active_sessions",
+                &self.active.lock().map(|map| map.len()).unwrap_or(0),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl AgentSessionBackend for NativeAgentRuntimeBackend {
+    fn capabilities(&self, scope: &CanonicalScope) -> BackendCapabilities {
+        BackendCapabilities {
+            native_runtime: true,
+            persistent_session: true,
+            protected_checkpoints: true,
+            lcm: true,
+            cancel: true,
+            steer: true,
+            workspace: scope.workspace_access,
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        request: AgentTurnRequest,
+        sink: Arc<dyn TurnEventSink>,
+    ) -> Result<AgentTurnOutput, AgentHostError> {
+        request.scope.validate()?;
+        let binding = self
+            .protected_store
+            .runtime_scope_binding(
+                &request.forge_session_id,
+                &request.runtime_session_id,
+                request.workspace_path.as_deref(),
+            )
+            .await?;
+        if binding.scope != request.scope {
+            return Err(AgentHostError::Authority(
+                "native turn scope does not match the server-issued session binding".to_owned(),
+            ));
+        }
+        if binding.workspace_path.as_deref() != request.workspace_path.as_deref() {
+            return Err(AgentHostError::Authority(
+                "native turn workspace does not match the server-issued Task workspace".to_owned(),
+            ));
+        }
+        let workspace = workspace_for_scope(&binding.scope, binding.workspace_path.as_deref())?;
+        let composed_workspace_root = match binding.scope.scope_type {
+            CanonicalScopeType::Task => Some(workspace.root().to_owned()),
+            CanonicalScopeType::Account
+            | CanonicalScopeType::Project
+            | CanonicalScopeType::AgentChat => None,
+        };
+        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            binding.identity_id.clone(),
+            binding.scope.clone(),
+            binding.task_role.as_deref(),
+            composed_workspace_root.as_deref(),
+            &binding.allowed_permissions,
+            binding.agent_chat_project_id.is_some(),
+            self.forge_tool_provider.clone(),
+        )?;
+        let provider = Self::provider(&request)?;
+        let model_id = ModelId::new(&request.provider.model);
+        let lcm_store = self
+            .protected_store
+            .lcm_store_for_runtime_session(
+                &request.runtime_session_id,
+                scope_type_name(request.scope.scope_type),
+                &request.scope.scope_id,
+            )
+            .await?;
+        let lcm_timeline_id = lcm_store.timeline_id().to_owned();
+        let lcm_binding_revision = lcm_store.authorization_revision().to_owned();
+        let lcm_binding = lcm_store.runtime_binding(SessionId::new(&request.runtime_session_id))?;
+        let lcm = LcmCoordinator::new(
+            Arc::new(lcm_store),
+            Arc::new(DeterministicLcmSummaryModel::default()),
+            Arc::new(StaticLcmTimelineResolver::new(lcm_binding)),
+            LcmCoordinatorPolicy {
+                input_budget_tokens: u64::from(request.provider.max_input_tokens),
+                ..LcmCoordinatorPolicy::default()
+            },
+        )
+        .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+        let mut builder = RuntimeBuilder::new(model_id.clone())
+            .provider_name(request.provider.provider.clone())
+            .provider(provider)
+            .model_profile(ResolvedModelProfile::explicit(
+                request.provider.provider.clone(),
+                model_id,
+                ModelLimits::new(
+                    request.provider.context_tokens,
+                    request.provider.max_input_tokens,
+                    request.provider.max_output_tokens,
+                ),
+            ))
+            .workspace(workspace)
+            .session_store(self.protected_store.clone())
+            .checkpoint_store(self.protected_store.clone())
+            .interaction_broker(Arc::new(self.interaction_broker.clone()))
+            .security_subject(SecuritySubject::new(binding.identity_id))
+            .lcm(Arc::new(lcm));
+        builder = composition.apply(builder);
+        if let Some(prompt) = request.system_prompt.as_deref() {
+            builder = builder.system_prompt(prompt);
+        }
+        let runtime = builder
+            .build()
+            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+        let session = runtime
+            .start_session(
+                StartSession::new()
+                    .with_id(SessionId::new(&request.runtime_session_id))
+                    .with_history(request.history),
+            )
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let mut events = session.subscribe();
+        let turn = session
+            .send(UserInput::text(request.input))
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        self.active
+            .lock()
+            .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
+            .insert(request.runtime_session_id.clone(), session.clone());
+        let turn_id = turn.id().clone();
+        let finish_result = loop {
+            tokio::select! {
+                _ = request.cancellation.cancelled() => {
+                    turn.interrupt(CancelReason::UserRequested);
+                    break Ok(TurnFinish::Cancelled { reason: CancelReason::UserRequested });
+                }
+                event = events.next() => {
+                    let Some(event) = event else {
+                        break Err(AgentHostError::Runtime(
+                            "runtime event stream ended before completion".to_owned(),
+                        ));
+                    };
+                    if event.turn.as_ref() != Some(&turn_id) {
+                        continue;
+                    }
+                    match &event.payload {
+                        RuntimeEvent::TextDelta { text, .. } => sink.text_delta(text).await,
+                        RuntimeEvent::TurnCompleted { finish, .. } => break Ok(finish.clone()),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let persist_result = session
+            .persist()
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()));
+        self.active
+            .lock()
+            .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
+            .remove(&request.runtime_session_id);
+        let finish = finish_result?;
+        persist_result?;
+
+        match finish {
+            TurnFinish::Completed => {}
+            TurnFinish::Cancelled { .. } => {
+                return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
+            }
+            TurnFinish::LimitReached { .. } => {
+                return Err(AgentHostError::Runtime("turn limit reached".to_owned()));
+            }
+            TurnFinish::Failed => return Err(AgentHostError::Runtime("turn failed".to_owned())),
+            TurnFinish::NeedsInput { .. } => {
+                return Err(AgentHostError::Runtime(
+                    "turn requires protected host interaction".to_owned(),
+                ));
+            }
+        }
+        let history = session.history();
+        let text = history
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(ContentPart::as_text)
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        let snapshot = session.snapshot();
+        let context_manifest =
+            RuntimeContextManifestLink::from_snapshot(&snapshot).map(|manifest| {
+                manifest.with_lcm_binding(
+                    lcm_timeline_id,
+                    lcm_binding_revision,
+                    FORGE_LCM_STORE_REVISION,
+                )
+            });
+        let usage = snapshot.usage.total();
+        Ok(AgentTurnOutput {
+            runtime_session_id: request.runtime_session_id,
+            text,
+            input_tokens: usage.input_tokens(),
+            output_tokens: usage
+                .get(CounterKind::Output)
+                .saturating_add(usage.get(CounterKind::Reasoning)),
+            context_manifest,
+        })
+    }
+
+    async fn cancel(&self, runtime_session_id: &str) -> Result<(), AgentHostError> {
+        let session = self
+            .active
+            .lock()
+            .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
+            .get(runtime_session_id)
+            .cloned()
+            .ok_or(AgentHostError::SessionNotFound)?;
+        session
+            .interrupt_current_turn(CancelReason::UserRequested)
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn steer(&self, runtime_session_id: &str, content: String) -> Result<(), AgentHostError> {
+        let session = self
+            .active
+            .lock()
+            .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
+            .get(runtime_session_id)
+            .cloned()
+            .ok_or(AgentHostError::SessionNotFound)?;
+        session
+            .steer_current_turn(None, UserInput::text(content))
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        Ok(())
+    }
+}
+
+fn scope_type_name(scope: CanonicalScopeType) -> &'static str {
+    match scope {
+        CanonicalScopeType::Account => "account",
+        CanonicalScopeType::Project => "project",
+        CanonicalScopeType::AgentChat => "agent_chat",
+        CanonicalScopeType::Task => "task",
+    }
+}
+
+/// Build the fail-closed workspace boundary for one server-authorized scope.
+///
+/// The runtime's workspace contract deliberately answers only whether a path
+/// is inside a boundary.  Forge keeps the higher-level read/write distinction
+/// in the canonical scope/tool policy and in the existing Task reviewer
+/// worktree restoration path; this adapter makes sure only Task scopes receive
+/// a repository root at all.
+fn workspace_for_scope(
+    scope: &CanonicalScope,
+    workspace_path: Option<&str>,
+) -> Result<Arc<dyn agent_runtime::core::workspace::Workspace>, AgentHostError> {
+    match scope.scope_type {
+        CanonicalScopeType::Task => {
+            let path = workspace_path
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AgentHostError::Authority(
+                        "Task scope requires a host-issued workspace path".to_owned(),
+                    )
+                })?;
+            let canonical = std::fs::canonicalize(path).map_err(|_| {
+                AgentHostError::Authority(
+                    "Task scope workspace path is not an existing directory".to_owned(),
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(AgentHostError::Authority(
+                    "Task scope workspace path is not a directory".to_owned(),
+                ));
+            }
+            Ok(Arc::new(TaskWorkspace::new(canonical)))
+        }
+        CanonicalScopeType::Account
+        | CanonicalScopeType::Project
+        | CanonicalScopeType::AgentChat => {
+            if workspace_path.is_some() {
+                return Err(AgentHostError::Authority(
+                    "non-Task scope cannot receive a workspace path".to_owned(),
+                ));
+            }
+            Ok(Arc::new(DenyAllWorkspace))
+        }
+    }
+}
+
+/// A filesystem-aware, fail-closed Task workspace boundary.
+///
+/// Existing paths are canonicalized before the component-aware boundary check.
+/// For a not-yet-created path, the nearest existing ancestor is canonicalized;
+/// this prevents a symlinked directory from redirecting a later write outside
+/// the admitted root while still allowing tools to create new files.
+#[derive(Debug, Clone)]
+struct TaskWorkspace {
+    root: PathBuf,
+}
+
+impl TaskWorkspace {
+    fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        Self {
+            root: std::fs::canonicalize(&root).unwrap_or(root),
+        }
+    }
+}
+
+impl agent_runtime::core::workspace::Workspace for TaskWorkspace {
+    fn root(&self) -> &str {
+        self.root.to_str().unwrap_or("<invalid-task-workspace>")
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        if path.is_empty()
+            || Path::new(path)
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return false;
+        }
+        let root = &self.root;
+        let candidate = Path::new(path);
+        let candidate = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root.join(candidate)
+        };
+        let Ok(relative) = candidate.strip_prefix(root) else {
+            return false;
+        };
+        let mut current = root.clone();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    // Do not follow symlinks even when their current target is
+                    // inside the root.  This closes both existing escapes and
+                    // broken-link write escapes where `Path::exists()` would
+                    // otherwise skip the link and accept its parent.
+                    return false;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // New descendants are allowed after the last existing,
+                    // non-symlink parent.  The typed write tool rechecks after
+                    // creating parents to close the create-then-follow race.
+                    return true;
+                }
+                Err(_) => return false,
+            }
+        }
+        std::fs::canonicalize(&candidate)
+            .map(|canonical| canonical.as_path() == root.as_path() || canonical.starts_with(root))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use crate::WorkspaceAccess;
+    use agent_runtime::core::workspace::Workspace;
+
+    #[test]
+    fn task_workspace_is_component_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("forge-task-workspace-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("workspace creates");
+        let workspace = TaskWorkspace::new(&root);
+        let canonical_root = PathBuf::from(workspace.root());
+        assert!(workspace.contains(workspace.root()));
+        assert!(workspace.contains(canonical_root.join("src/main.rs").to_str().unwrap()));
+        assert!(
+            !workspace.contains(
+                canonical_root
+                    .parent()
+                    .unwrap()
+                    .join("forge-task-workspace-sibling/src/main.rs")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert!(
+            !workspace.contains(
+                canonical_root
+                    .join("../forge-task-workspace-sibling")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        std::fs::remove_dir_all(root).expect("workspace cleans");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_workspace_rejects_symlinked_read_and_write_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "forge-task-workspace-symlink-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "forge-task-workspace-outside-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace creates");
+        std::fs::create_dir_all(&outside).expect("outside creates");
+        std::fs::write(outside.join("secret.txt"), "outside").expect("outside file writes");
+        symlink(&outside, root.join("linked")).expect("symlink creates");
+        symlink(outside.join("does-not-exist"), root.join("broken-link"))
+            .expect("broken symlink creates");
+
+        let workspace = TaskWorkspace::new(&root);
+        assert!(!workspace.contains(root.join("linked/secret.txt").to_str().unwrap()));
+        assert!(!workspace.contains(root.join("linked/new.txt").to_str().unwrap()));
+        assert!(!workspace.contains(root.join("broken-link/new.txt").to_str().unwrap()));
+
+        std::fs::remove_dir_all(root).expect("workspace cleans");
+        std::fs::remove_dir_all(outside).expect("outside cleans");
+    }
+
+    #[test]
+    fn non_task_scopes_cannot_supply_workspace() {
+        for scope_type in [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::AgentChat,
+        ] {
+            let scope = CanonicalScope {
+                scope_type,
+                scope_id: "scope-1".to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            };
+            let error = workspace_for_scope(&scope, Some("/tmp/repo")).unwrap_err();
+            assert!(matches!(error, AgentHostError::Authority(_)));
+            let deny_all = workspace_for_scope(&scope, None).expect("deny-all workspace");
+            assert!(!deny_all.contains("/tmp/repo/file.rs"));
+        }
+    }
+
+    #[test]
+    fn task_scope_requires_a_host_issued_workspace() {
+        for access in [WorkspaceAccess::TaskRead, WorkspaceAccess::TaskWrite] {
+            let scope = CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: "task-1".to_owned(),
+                workspace_access: access,
+            };
+            let error = workspace_for_scope(&scope, None).unwrap_err();
+            assert!(matches!(error, AgentHostError::Authority(_)));
+        }
+    }
+
+    #[test]
+    fn canonical_scope_only_grants_task_read_or_write() {
+        for scope_type in [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::AgentChat,
+        ] {
+            assert!(
+                CanonicalScope {
+                    scope_type,
+                    scope_id: "scope-1".to_owned(),
+                    workspace_access: WorkspaceAccess::Deny,
+                }
+                .validate()
+                .is_ok()
+            );
+            for access in [WorkspaceAccess::TaskRead, WorkspaceAccess::TaskWrite] {
+                assert!(
+                    CanonicalScope {
+                        scope_type,
+                        scope_id: "scope-1".to_owned(),
+                        workspace_access: access,
+                    }
+                    .validate()
+                    .is_err()
+                );
+            }
+        }
+        for access in [WorkspaceAccess::TaskRead, WorkspaceAccess::TaskWrite] {
+            assert!(
+                CanonicalScope {
+                    scope_type: CanonicalScopeType::Task,
+                    scope_id: "task-1".to_owned(),
+                    workspace_access: access,
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        assert!(
+            CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: "task-1".to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

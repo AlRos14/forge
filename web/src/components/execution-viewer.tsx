@@ -1,6 +1,6 @@
 import { ChatCircle, Terminal } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
-import { ConversationViewer } from '@/components/conversation-viewer'
+import { ChatLogViewer } from '@/components/conversation-viewer'
 import { RawLogViewer } from '@/components/raw-log-viewer'
 import type { LogEntry } from '@/types/generated'
 
@@ -76,7 +76,7 @@ export function ExecutionViewer({
       <div className="relative min-h-0 flex-1">
         <div className="absolute inset-0">
           {mode === 'chat' ? (
-            <ConversationViewer
+            <ChatLogViewer
               logs={logs}
               userPrompt={userPrompt}
               errorMessage={errorMessage}

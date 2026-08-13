@@ -227,6 +227,9 @@ pub fn is_embedded_daemon_machine(machine_id: &str) -> bool {
 
 async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<String>) {
     match kind {
+        // Forge-hosted native profiles do not have a CLI binary or daemon
+        // detection record. They are dispatched by the Task executor router.
+        ExecutorKind::Embedded => (None, None),
         ExecutorKind::Shell => (Some("/bin/sh".to_owned()), None),
         ExecutorKind::Codex => binary_path_and_version("codex").await,
         ExecutorKind::ClaudeCode => binary_path_and_version("claude").await,

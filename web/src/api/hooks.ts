@@ -12,10 +12,8 @@ import {
   addMember,
   searchUsers,
   createPat,
-  createProjectAgentLink,
   deleteNotification,
   deletePat,
-  deleteProjectAgentLink,
   getProjectAnalytics,
   getOperationsStatus,
   getSettings,
@@ -28,7 +26,6 @@ import {
   listNotifications,
   listPats,
   listProjectHookRuns,
-  listProjectAgentLinks,
   listProjectAgents,
   listWorkflowTemplates,
   markAllNotificationsRead,
@@ -52,10 +49,7 @@ import type {
   AssignRoleRequest,
   ClaimTaskRequest,
   Comment,
-  Conversation,
-  ConversationMessage,
   CreateCommentRequest,
-  CreateConversationRequest,
   DiffEnvelope,
   CreateAgentRequest,
   CreateProjectRequest,
@@ -97,10 +91,7 @@ import type {
   TaskUsageSummary,
   TestLifecycleHookRequest,
   LifecycleHookTestResponse,
-  SendMessageRequest,
-  SendMessageResponse,
   SettingsResponse,
-  UpdateConversationRequest,
   UpdateSettingsRequest,
   WorkflowDefinition,
   Workspace,
@@ -253,6 +244,8 @@ export function useCreateProject() {
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.projects })
+      void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
+      void queryClient.invalidateQueries({ queryKey: ['product-genesis', 'active'] })
     },
   })
 }
@@ -318,139 +311,6 @@ export function useTestProjectLifecycleHook(projectId: string) {
         method: 'POST',
         body: JSON.stringify(body),
       }),
-  })
-}
-
-// --- Conversations ---
-
-export function useConversationsQuery(projectId: string, status: 'active' | 'archived' = 'active') {
-  return useInfiniteQuery({
-    queryKey: qk.projectConversations(projectId, status),
-    queryFn: ({ pageParam }) =>
-      apiFetch<PaginatedResponse<Conversation>>(`/projects/${projectId}/conversations`, {
-        search: { status, cursor: pageParam as string | undefined, limit: 50 },
-      }),
-    initialPageParam: undefined as string | undefined,
-    getNextPageParam: (last) => last.next_cursor ?? undefined,
-  })
-}
-
-export function useConversationQuery(conversationId: string) {
-  return useQuery({
-    queryKey: qk.conversation(conversationId),
-    queryFn: () => apiFetch<Conversation>(`/conversations/${conversationId}`),
-    enabled: Boolean(conversationId),
-  })
-}
-
-export function useCreateConversation(projectId: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (body: CreateConversationRequest) =>
-      apiFetch<Conversation>(`/projects/${projectId}/conversations`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (conversation) => {
-      void queryClient.invalidateQueries({ queryKey: qk.projectConversations(projectId, 'active') })
-      void queryClient.invalidateQueries({ queryKey: qk.conversation(conversation.id) })
-    },
-  })
-}
-
-export function useUpdateConversation() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      conversationId,
-      body,
-    }: {
-      conversationId: string
-      body: UpdateConversationRequest
-    }) =>
-      apiFetch<Conversation>(`/conversations/${conversationId}`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (conversation) => {
-      void queryClient.invalidateQueries({ queryKey: qk.conversation(conversation.id) })
-      void queryClient.invalidateQueries({
-        queryKey: qk.projectConversations(conversation.project_id, conversation.status),
-      })
-    },
-  })
-}
-
-export function useArchiveConversation() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (conversationId: string) =>
-      apiFetch<void>(`/conversations/${conversationId}`, { method: 'DELETE' }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({
-        predicate: (query) => query.queryKey[2] === 'conversations',
-      })
-    },
-  })
-}
-
-export function useConversationMessagesQuery(conversationId: string) {
-  return useInfiniteQuery({
-    queryKey: qk.conversationMessages(conversationId),
-    queryFn: ({ pageParam }) =>
-      apiFetch<PaginatedResponse<ConversationMessage>>(
-        `/conversations/${conversationId}/messages`,
-        {
-          search: { cursor: pageParam as string | undefined, limit: 50 },
-        },
-      ),
-    initialPageParam: undefined as string | undefined,
-    getNextPageParam: (last) => last.next_cursor ?? undefined,
-    enabled: Boolean(conversationId),
-  })
-}
-
-export function useConversationLogsQuery(conversationId: string, isRunning?: boolean) {
-  return useQuery({
-    queryKey: qk.conversationLogs(conversationId),
-    enabled: Boolean(conversationId),
-    refetchInterval: isRunning ? 3000 : false,
-    queryFn: async (): Promise<{ items: LogEntry[]; has_more: boolean }> => {
-      return apiFetch<{ items: LogEntry[]; has_more: boolean }>(
-        `/conversations/${conversationId}/logs`,
-      )
-    },
-  })
-}
-
-export function useSendConversationMessage() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ conversationId, body }: { conversationId: string; body: SendMessageRequest }) =>
-      apiFetch<SendMessageResponse>(`/conversations/${conversationId}/messages`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (_response, variables) => {
-      void queryClient.invalidateQueries({
-        queryKey: qk.conversationMessages(variables.conversationId),
-      })
-      void queryClient.invalidateQueries({ queryKey: qk.conversation(variables.conversationId) })
-      void queryClient.invalidateQueries({
-        predicate: (query) => query.queryKey[2] === 'conversations',
-      })
-    },
-  })
-}
-
-export function useCancelConversationResponse() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (conversationId: string) =>
-      apiFetch<void>(`/conversations/${conversationId}/cancel`, { method: 'POST' }),
-    onSuccess: (_response, conversationId) => {
-      void queryClient.invalidateQueries({ queryKey: qk.conversationMessages(conversationId) })
-    },
   })
 }
 
@@ -1842,36 +1702,6 @@ export function useProjectAgentsQuery(projectId: string) {
     queryKey: qk.projectAgents(projectId),
     queryFn: () => listProjectAgents(projectId),
     enabled: Boolean(projectId),
-  })
-}
-
-export function useProjectAgentLinksQuery(projectId: string) {
-  return useQuery({
-    queryKey: qk.projectAgentLinks(projectId),
-    queryFn: () => listProjectAgentLinks(projectId),
-    enabled: Boolean(projectId),
-  })
-}
-
-export function useCreateProjectAgentLink(projectId: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (agentId: string) => createProjectAgentLink(projectId, agentId),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: qk.projectAgents(projectId) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectAgentLinks(projectId) })
-    },
-  })
-}
-
-export function useDeleteProjectAgentLink(projectId: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (agentId: string) => deleteProjectAgentLink(projectId, agentId),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: qk.projectAgents(projectId) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectAgentLinks(projectId) })
-    },
   })
 }
 

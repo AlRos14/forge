@@ -24,7 +24,7 @@ export interface ColumnGroup extends BoardColumn {
   taskCount: number
 }
 
-export const taskTypes: TaskType[] = ['task', 'planning_task', 'sub_task']
+export const taskTypes: TaskType[] = ['task', 'planning_task', 'discovery', 'sub_task']
 
 export type BoardSearchTypes = string[] | string | undefined
 
@@ -47,7 +47,9 @@ export function taskHasError(task: Task): boolean {
   return !isStaleBlockingAnnotation(task)
 }
 
-export function getTaskWorkflowWarning(task: TaskResponse): { title: string; message: string } | null {
+export function getTaskWorkflowWarning(
+  task: TaskResponse,
+): { title: string; message: string } | null {
   const remaining = task.plan_progress?.remaining ?? 0
   const latest = task.execution_observability
   if (
@@ -170,7 +172,9 @@ export function deriveColumns(workflow: WorkflowDefinition, tasks: Task[] = []):
       }),
     )
     const kind = primaryDef?.kind ?? null
-    const kindColors = kind ? KIND_COLORS[kind] : { dot: 'bg-purple-500', accent: 'border-l-purple-500' }
+    const kindColors = kind
+      ? KIND_COLORS[kind]
+      : { dot: 'bg-purple-500', accent: 'border-l-purple-500' }
     const dot = NAME_DOT_OVERRIDES[primaryState] ?? kindColors.dot
     const isTerminal = states.every(
       (s) => workflow.states.find((sd) => sd.name === s)?.kind === 'terminal',
@@ -212,9 +216,7 @@ function normalizeWorkflowLabel(value: string): string {
 }
 
 export function formatStateLabel(value: string): string {
-  return value
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (char) => char.toUpperCase())
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
 }
 
 export type WorkflowEdge = {
@@ -223,19 +225,26 @@ export type WorkflowEdge = {
   trigger: WorkflowTrigger
 }
 
-export function outgoingWorkflowEdges(workflow: WorkflowDefinition, fromState: string): WorkflowEdge[] {
+export function outgoingWorkflowEdges(
+  workflow: WorkflowDefinition,
+  fromState: string,
+): WorkflowEdge[] {
   const state = workflow.states.find((candidate) => candidate.name === fromState)
   if (!state) return []
   const edges = Object.entries(state.triggers ?? {})
-    .filter((entry): entry is [WorkflowTrigger, NonNullable<(typeof state.triggers)[WorkflowTrigger]>] =>
-      typeof entry[1]?.to === 'string',
+    .filter(
+      (entry): entry is [WorkflowTrigger, NonNullable<(typeof state.triggers)[WorkflowTrigger]>] =>
+        typeof entry[1]?.to === 'string',
     )
     .map(([trigger, definition]) => ({
       from: fromState,
       to: definition.to,
       trigger,
     }))
-  if (!Object.prototype.hasOwnProperty.call(state.triggers ?? {}, 'accept') && state.kind !== 'terminal') {
+  if (
+    !Object.prototype.hasOwnProperty.call(state.triggers ?? {}, 'accept') &&
+    state.kind !== 'terminal'
+  ) {
     const stateIndex = workflow.states.findIndex((candidate) => candidate.name === fromState)
     const nextState = stateIndex >= 0 ? workflow.states[stateIndex + 1] : undefined
     if (nextState) {

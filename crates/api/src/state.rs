@@ -5,7 +5,8 @@ use db::SqliteDb;
 use events::EventBus;
 use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
 use services::{
-    AgentService, AuthService, ConversationService, DaemonService, MemoryService, MergeService,
+    AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
+    CommitmentService, DaemonService, EmbeddedAgentService, MemoryService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
     TaskService, TerminalActivityTracker, TerminalService, WorkspaceCleanupScheduler,
     WorkspaceExecutionLockManager,
@@ -63,9 +64,14 @@ pub struct AppState {
     pub db: Arc<SqliteDb>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
+    pub embedded_agent_service: Arc<EmbeddedAgentService>,
+    pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
+    pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
+    pub commitment_service: Arc<CommitmentService>,
+    pub agent_inbox_service: Arc<AgentInboxService>,
+    pub agent_action_service: Arc<AgentActionService>,
     pub daemon_service: Arc<DaemonService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
-    pub conversation_service: Arc<ConversationService>,
     pub workflow_template_service:
         Arc<services::workflow::template_service::WorkflowTemplateService>,
     pub memory_service: Arc<MemoryService>,
@@ -166,8 +172,22 @@ impl AppState {
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
-        let task_executor: Arc<dyn TaskExecutor> =
+        let embedded_agent_service =
+            Arc::new(EmbeddedAgentService::new(Arc::clone(&db), &jwt_secret));
+        let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&db)));
+        let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
+        let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
+        let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
+        let cli_task_executor: Arc<dyn TaskExecutor> =
             Arc::new(FallbackExecutor::new(Arc::clone(&adapter_registry)));
+        let embedded_task_executor = Arc::new(services::EmbeddedTaskExecutor::new(
+            Arc::clone(&db),
+            Arc::clone(&embedded_agent_service),
+        ));
+        let task_executor: Arc<dyn TaskExecutor> = Arc::new(services::TaskExecutorRouter::new(
+            cli_task_executor,
+            embedded_task_executor,
+        ));
         let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
@@ -243,10 +263,11 @@ impl AppState {
         let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
-        let conversation_service = Arc::new(
-            ConversationService::new(Arc::clone(&db), Arc::clone(&event_bus))
-                .with_memory_service(Arc::clone(&memory_service)),
-        );
+        let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
+            Arc::clone(&db),
+            Arc::clone(&embedded_agent_service),
+            Arc::clone(&task_executor),
+        ));
         let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
         let oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&db),
@@ -258,9 +279,14 @@ impl AppState {
             db,
             task_service,
             agent_service,
+            embedded_agent_service,
+            agent_chat_service,
+            agent_chat_turn_worker,
+            commitment_service,
+            agent_inbox_service,
+            agent_action_service,
             daemon_service,
             daemon_connections,
-            conversation_service,
             workflow_template_service,
             memory_service,
             merge_service,

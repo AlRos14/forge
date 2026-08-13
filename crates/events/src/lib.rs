@@ -158,7 +158,7 @@ pub enum EventContext {
     AgentCreated {
         name: String,
     },
-    AgentDeleted {},
+    AgentArchived {},
     AgentPaused {},
     AgentResumed {},
     ProfileCreated {
@@ -349,34 +349,29 @@ pub enum EventContext {
         agent_id: Option<String>,
         reason: Option<String>,
     },
-    ConversationMessageCreated {
-        project_id: String,
-        conversation_id: String,
-        message_id: String,
-        role: String,
-        status: String,
+    DomainEventCommitted {
+        sequence: i64,
+        entity_type: String,
+        scope_type: String,
+        scope_id: String,
     },
-    ConversationMessageDelta {
-        project_id: String,
-        conversation_id: String,
+    AgentChatMessageAdmitted {
+        chat_id: String,
         message_id: String,
+        author_type: String,
+    },
+    AgentChatTurnProgress {
+        chat_id: String,
+        turn_job_id: String,
         delta: String,
     },
-    ConversationMessageCompleted {
-        project_id: String,
-        conversation_id: String,
+    AgentChatResponseCompleted {
+        chat_id: String,
+        turn_job_id: String,
         message_id: String,
-        status: String,
-        error: Option<String>,
     },
-    ConversationLog {
-        project_id: String,
-        conversation_id: String,
-        log: serde_json::Value,
-    },
-    ConversationUpdated {
-        project_id: String,
-        conversation_id: String,
+    AgentChatUpdated {
+        chat_id: String,
         status: String,
     },
     ExternalSyncCompleted {

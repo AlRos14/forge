@@ -16,16 +16,26 @@ proxy in front of it.
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).
 
+This reference describes the singular Main/Project Agent Chat surface shipped
+by the forward-only `V071+` migrations. Retired collaboration routes are not a
+supported integration point even when their source rows remain in an upgraded
+database for historical provenance.
+
 ## REST endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST   | `/api/v1/projects` | Create project |
+| POST   | `/api/v1/projects` | Create project; when `product_genesis_session_id` references the authenticated account's `ready_for_project` session, the atomic Project/binding/chat result is linked for normal handoff retry |
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
 | GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |
 | GET    | `/api/v1/memory/{id}` | Get memory item |
+| POST   | `/api/v1/memory/{id}/publish` | Explicitly publish an owned private assertion into an authorized scope |
+| POST   | `/api/v1/memory/{id}/lifecycle` | Append an authorized immutable lifecycle assertion |
+| GET    | `/api/v1/memory/{id}/provenance` | Inspect metadata-only memory provenance |
+| GET    | `/api/v1/context-manifests/{id}` | Inspect an authorized immutable context manifest and source decisions |
+| GET    | `/api/v1/agents/{id}/context-manifests` | List recent authorized context manifests for an owned identity |
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
@@ -66,11 +76,69 @@ For the conceptual model behind these endpoints see
 | POST   | `/api/v1/terminals/{id}/resize` | Resize task terminal session |
 | POST   | `/api/v1/terminals/{id}/terminate` | Terminate task terminal session |
 | GET    | `/api/v1/terminals/{id}/ws?attach_token=TOKEN` | Terminal WebSocket upgrade |
-| POST   | `/api/v1/agents` | Register agent |
-| GET    | `/api/v1/agents` | List agents |
-| GET    | `/api/v1/agents/{id}` | Get agent |
+| POST   | `/api/v1/agents` | Create an account-owned stable agent identity with its initial CLI profile |
+| GET    | `/api/v1/agents` | List visible agent identities with selected-profile fields |
+| GET    | `/api/v1/agents/{id}` | Get an agent identity with selected-profile fields |
+| DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
+| POST   | `/api/v1/embedded-agents/connect` | Create an account identity plus protected native-provider connection, profile, health, and initial account session |
+| GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
+| POST   | `/api/v1/agents/{id}/profiles/connect` | Ingest a protected credential and create/select a new native profile revision |
+| POST   | `/api/v1/agents/{id}/profiles/{profile_id}/select` | Select an immutable profile using the identity version |
+| GET    | `/api/v1/agents/{id}/sessions` | List safe scope-bound session status/capability snapshots |
+| POST   | `/api/v1/agents/{id}/sessions` | Create or resume an explicitly scoped session |
+| POST   | `/api/v1/agents/{id}/effective-permissions` | Inspect the fail-closed permission intersection for one canonical scope |
+| POST   | `/api/v1/agent-sessions/{id}/rotate` | Replace a session while retaining identity/scope continuity |
+| POST   | `/api/v1/agent-sessions/{id}/suspend` | Suspend a session using its optimistic version |
+| POST   | `/api/v1/agent-sessions/{id}/resume` | Resume a session using its optimistic version |
+| POST   | `/api/v1/agent-sessions/{id}/cancel` | Explicitly cancel the active native turn when supported |
+| POST   | `/api/v1/agent-sessions/{id}/steer` | Explicitly steer the active native turn when supported |
+| GET    | `/api/v1/agent-sessions/{session_id}/interactions` | List redaction-safe pending protected interactions for an owned session |
+| POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer` | Answer a protected interaction with an optimistic version |
+| POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel` | Cancel a protected interaction with an optimistic version |
+| GET    | `/api/v1/credentials` | List safe opaque credential handles owned by the account |
+| DELETE | `/api/v1/credentials/{id}` | Revoke an owned protected credential handle |
+| GET    | `/api/v1/account/main-agent` | `V071+` — Get the account's single Main Agent binding |
+| PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency |
+| POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat and admit its first finite turn |
+| GET    | `/api/v1/account/main-agent/product-genesis/active` | `V072+` — Return the authenticated account's active Genesis session, if any |
+| GET    | `/api/v1/account/main-agent/product-genesis/{session_id}` | `V072+` — Read one Genesis session owned by the authenticated account, including lifecycle, source references, and optimistic version |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/ready` | `V072+` — Record the typed Main discovery-ready decision with `expected_version`; Project creation remains the normal atomic Project path |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/cancel` | `V072+` — Cancel an active Genesis session with `expected_version` and an optional reason |
+| GET    | `/api/v1/projects/{id}/project-agent` | `V071+` — Get the Project's single Project Agent binding |
+| PUT    | `/api/v1/projects/{id}/project-agent` | `V071+` — Create or replace the Project Agent binding with optimistic concurrency |
+| GET    | `/api/v1/agent-chats` | `V071+` — List the authorized global Main chat and bound Project chats for the switcher |
+| GET    | `/api/v1/agent-chats/{chat_id}` | `V071+` — Get chat metadata, binding state, and visible turn status |
+| GET    | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — List immutable authorized Agent Chat messages |
+| POST   | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — Admit one guarded user message and exactly one queued turn |
+| GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
+| POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
+| GET    | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — List immutable Main-to-Project handoff records |
+| POST   | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — Publish one bounded, provenance-linked handoff and at most one target turn |
+| GET    | `/api/v1/projects/{id}/agent-handoffs/{handoff_id}` | `V071+` — Inspect an authorized handoff and delivery receipt |
+| GET    | `/api/v1/agents/{id}/commitments` | List commitments owned by an authenticated identity |
+| POST   | `/api/v1/agents/{id}/commitments` | Create a commitment; owner identity and actor are bound by the route/authenticated user |
+| GET    | `/api/v1/commitments/{id}` | Get an authorized commitment |
+| PATCH  | `/api/v1/commitments/{id}` | Versioned commitment lifecycle/metadata update |
+| POST   | `/api/v1/commitments/{id}/complete` | Complete only with an authorized evidence reference |
+| POST   | `/api/v1/commitments/{id}/transfer` | Transfer ownership with a required reason |
+| POST   | `/api/v1/commitments/{id}/cancel` | Cancel with a required reason |
+| GET    | `/api/v1/commitments/{id}/evidence` | List append-only commitment evidence |
+| GET    | `/api/v1/agents/{id}/inbox` | List durable inbox items for an owned identity |
+| GET    | `/api/v1/inbox/{id}` | Get an authorized inbox item |
+| PATCH  | `/api/v1/inbox/{id}/status` | Versioned inbox acknowledgement/status update |
+| GET    | `/api/v1/agents/{id}/questions` | List questions addressed to an owned identity |
+| POST   | `/api/v1/agents/{id}/questions` | Ask a question with atomic inbox delivery |
+| GET    | `/api/v1/questions/{id}` | Get an authorized question |
+| POST   | `/api/v1/questions/{id}/answer` | Answer an authorized question |
+| GET    | `/api/v1/agents/{id}/actions` | List auditable proposals for an owned identity |
+| POST   | `/api/v1/agents/{id}/actions` | Create a typed proposal; Forge derives permission and policy server-side |
+| POST   | `/api/v1/agents/{id}/task-proposals` | Create a typed Task proposal in an admitted Project scope |
+| GET    | `/api/v1/actions/{id}` | Get an authorized proposal and its server policy result |
+| POST   | `/api/v1/actions/{id}/approve` | Record an independent, scope-authorized approval/denial |
+| POST   | `/api/v1/actions/{id}/execute` | Record an admitted action execution idempotently |
+| POST   | `/api/v1/actions/{id}/execute-task` | Create the authoritative Task through TaskService and audit the outcome |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
@@ -82,9 +150,56 @@ For the conceptual model behind these endpoints see
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
 
-## Agents
+## Agent identities, bindings, and chats
 
-An agent's `config_json` may include an ordered `fallbacks` array of
+An Agent response represents a stable identity plus its currently selected
+immutable profile. Connection/profile APIs accept provider credentials only in
+request bodies and immediately move them behind a protected write-only store;
+responses, events, errors, and logs contain only opaque credential handles and
+bounded health. Profile `config` fields are recursively redacted.
+
+Creating or connecting an identity grants no Main or Project binding. The
+account may explicitly select one active Main Agent binding, and each
+operational Project may explicitly select one active Project Agent binding.
+Unbound identities remain available for later binding or Task assignment but do
+not create chat-switcher entries. Every session request carries exactly one
+canonical scope: Main Agent Chat, Project Agent Chat, or Task. Main/Project Chat
+scopes are filesystem-denied; a Task session is admitted only through existing
+assignment and workflow authority and derives only that Task Workspace.
+
+`cancel` and `steer` are explicit operations whose availability follows the
+session capability snapshot. Sending an ordinary Agent Chat message does not
+imply either action. Mutable identity/profile-pointer, binding, and session
+operations use optimistic versions and return HTTP 409 on a stale version.
+
+Native sessions may also pause on a protected questionnaire. The interaction
+routes are scoped by the session path and derive account ownership solely from
+the authenticated user; request bodies never provide an owner or identity
+authority. Listing returns only redaction-safe lifecycle metadata. Answers are
+write-only protected values, accepted with `expected_version`, and never enter
+ordinary API responses, logs, Agent Chats, memory, manifests, or domain events.
+
+### Product Genesis
+
+Product Genesis is a durable typed discovery lifecycle over the existing
+account Main Agent Chat. Starting it never creates a Conversation, Room, thread,
+or chat-switcher entry. The server derives the Main Chat from the authenticated
+account's active binding, stores the prompt revision/maturity/source references
+with optimistic `version`, and admits the first discovery turn through the
+ordinary Agent Chat message service. The rendered prompt is also stored as an
+immutable `agent_chat_instruction_revision` linked to the Genesis session; the
+turn runner overlays it only while the session is discovering or ready for a
+Project. Cancellation/handoff stops the overlay without deleting its history.
+Without a Main binding the start request
+returns setup-required and creates neither a session nor a turn. Only the
+session owner may mark discovery ready or cancel it; both mutations use the
+session's optimistic version and stale versions return HTTP 409. Project creation
+and Main-to-Project handoff continue through the normal atomic Project Agent
+binding/chat and Agent Chat handoff resources—Genesis does not accept raw
+Project or chat IDs as authority.
+Stale, already-completed, cancelled, or expired interactions return HTTP 409.
+
+A CLI profile's `config_json` may include an ordered `fallbacks` array of
 `{"executor_type": "...", "config": {...}}` candidates. When the primary
 executor reports quota exhaustion or is unavailable, execution falls back to
 the next candidate (same CLI with a different account profile, or a
@@ -94,7 +209,126 @@ execution retry budget. Duplicate candidates and unknown executor types are
 rejected at dispatch time; an empty `{}` candidate config is valid. See
 [architecture.md](architecture.md#executor-fallback-chains).
 
+## Main and Project Agent bindings
+
+Bindings are authority, not identity ownership. An account has at most one
+active Main Agent binding and an operational Project has exactly one active
+Project Agent binding. Only an authorized account or Project administrator may
+create or replace a binding. The invariant is unconditional: Task Worker and
+reviewer assignments never satisfy it, and there is no role/`is_primary`
+combination or primary-agent election.
+
+Binding replacement uses optimistic concurrency and preserves the identity,
+profile revisions, sessions, Agent Chat messages, handoffs, commitments, Task
+attribution, and memory provenance. A migrated Project for which no single safe
+binding can be inferred is marked `agent_setup_required`; Project and Task data
+remain readable and usable, but Project Agent turns are unavailable until the
+user selects an identity. A primary Worker is never inferred as the binding.
+
+## Commitments, inbox, and typed actions
+
+Coordination endpoints are authenticated and least-authority scoped. An
+`/agents/{id}/...` route first verifies that the identity is owned by the
+authenticated account. Project Agent actions additionally require the active
+Project Agent binding and Project policy; Agent Chat reads/writes require the
+corresponding Main/Project Chat binding and history authorization; Task scopes
+require the identity's current Task role assignment. Direct item reads also
+accept an authorized Project Agent Chat/Task scope, without exposing another
+account's identity-owned records.
+
+Commitment lifecycle writes require `expected_version` and a dedupe key.
+Transitions follow the durable state machine; blocked and cancelled states
+require a reason, transfer requires a reason, and completion requires a
+non-empty evidence type/id authorized by the authenticated actor. Request
+delivery or an inbox item is never completion evidence. Evidence and transfer
+history remain append-only.
+
+Questions are admitted as one transaction with their inbox item. Replaying the
+same inbox dedupe key returns the original question only when the request
+payload matches; a mismatched replay is rejected. Answering a question binds
+the answer actor to the authenticated user and uses optimistic versioning.
+
+Action proposal requests contain an operation and payload, but never a policy
+result or actor identity. Forge derives the canonical requested permission,
+binds the actor from the identity path, verifies the concrete account,
+Project, Agent Chat, or Task authority, intersects account/profile/tool/binding
+ceilings and workflow/assignment gates, and persists `allowed`,
+`approval_required`, or `denied`. Public action responses expose the policy
+result, reason, target, and payload hash; they do not expose the persisted
+payload body. Protected approvals require an independently authorized active
+identity in the same scope and reject self-approval. Executions are
+idempotent by action/idempotency key.
+
+`task.propose` is available through the typed Task proposal endpoint. Its
+execution validates the Project Agent binding and proposal contract, then calls
+the existing `TaskService`; the resulting Task/workspace/workflow authority
+is not replaced by the action envelope. A denied or invalid proposal is never
+listed as a Task. `task_type`, when present, is the same closed enum as normal
+Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
+values are rejected before an action is admitted. Terminal Task delivery,
+blocked, failed, and cancelled
+events are reconciled by the durable `agent-coordination-outcomes` consumer:
+the originating proposal inbox is acknowledged, one task-outcome inbox item
+is delivered, and successful delivery adds evidence and completes the linked
+commitment exactly once. Cursor replay after restart uses event-derived
+dedupe keys and cannot duplicate those projections.
+
+## Agent Chats
+
+The account's Main Agent has one global Agent Chat. Each operational Project has
+one Project Agent Chat, created atomically with its Project Agent binding. The
+chat remains stable when the bound identity or selected profile is replaced;
+messages, handoffs, memory references, and session provenance remain attached
+to the canonical chat scope. Connected but unbound identities do not create
+additional chats.
+
+Message admission authorizes the chat and current binding, applies content
+guards, appends one immutable user message, creates exactly one queued turn job,
+and records matching domain events in one short transaction. The turn then
+executes outside that transaction and exposes only the finite states `queued`,
+`leased`, `retry_wait`, `succeeded`, `failed`, and `cancelled`. Expiring leases,
+finite attempt budgets, optimistic versions, and idempotency keys make retries
+observable and prevent duplicate assistant messages. A missing assistant
+message with a non-success turn is never rendered as a completed exchange.
+Cancellation is allowed only for an authorized non-terminal turn and requires
+its current optimistic version plus an idempotency key; stale or terminal
+requests return a conflict instead of rewriting the durable outcome.
+
+Main Agent tools are limited to discovery, configured web search, Project
+lifecycle/organization, bounded portfolio summaries, and explicit handoff. A
+Project Agent may create and manage Tasks only in its bound Project through
+`TaskService`; neither Main nor Project Agent Chat receives repository access.
+Task Workers and reviewers continue through the existing Task assignment,
+workflow, Workspace, validation, review, and delivery path.
+
+### Main-to-Project handoff
+
+`POST /api/v1/projects/{id}/agent-handoffs` publishes an immutable, bounded,
+provenance-linked packet from the Main Chat into the target Project Chat. The
+packet may contain approved discovery content and typed references/revisions,
+but never credentials, protected values, private memory bodies, hidden global
+history, or Main Agent authority. Admission creates one visible delivery
+receipt and at most one target turn; replay with the same idempotency key is
+safe. A Project Agent response is not recursively fed back into the Main Agent;
+any later handoff is another explicit publication.
+
+The V071+ request/response types and nested message/turn resources are the live
+contract. Clients should use the singular routes and types listed above; no
+compatibility aliases are provided.
+
 ## Projects
+
+With the V071+ replacement, creating an operational Project also creates its
+single Project Agent binding and Project Agent Chat in one transaction. The
+selected identity/profile is validated before either record becomes visible;
+Genesis callers may include `product_genesis_session_id`; ownership and
+`ready_for_project` state are checked server-side, and replay returns the
+already-linked Project rather than creating another one. Handoff remains a
+separate normal Agent Chat operation, so a failed delivery leaves the session
+ready with its Project ID and can be retried safely.
+there is no later primary-agent election. Imported Projects that cannot yield
+one safe binding remain in `agent_setup_required` until the user resolves them.
+The exact binding fields are finalized with the replacement request types.
 
 `ProjectResponse` includes `project_hooks`, an array of project-wide hook
 rules stored separately from workflow settings. Projects with no configured
@@ -315,7 +549,30 @@ roles and triggers unavailable from the current state return `400`.
 ## Memory
 
 Forge exposes a read-only memory retrieval layer over indexed execution
-summaries, reviews, comments, failure transitions, and conversations.
+summaries, reviews, comments, failure transitions, and finalized Agent Chat
+messages.
+
+Scoped memory is ACL-first: Main Agent Chat, Project Agent Chat, Project, and
+Task grants are resolved server-side before full-text search or body retrieval.
+Secret rows are never searchable. A private assertion is not implicitly
+promoted; callers must use `POST /api/v1/memory/{id}/publish` with an owned
+identity, an exact target scope/visibility, and explicit evidence. Lifecycle
+changes append audit records rather than mutating the original assertion. The
+publication, lifecycle, and provenance responses omit memory bodies and
+submitted evidence. Main Chat memory does not imply Project Chat memory, and a
+handoff publishes only its bounded, authorized packet with source provenance.
+
+`GET /api/v1/memory/{id}/provenance` requires `scope_type`, `scope_id`, and an
+owned `identity_id` query parameter. It returns source ids/revisions,
+sensitivity, authority, lifecycle metadata, and retention fields only.
+`GET /api/v1/context-manifests/{id}` requires `identity_id` and
+`context_scope_id`; it returns immutable policy/runtime fingerprints and a
+bounded list of source ids, revisions, selection reasons, dispositions, and
+fragment fingerprints, never source fragments.
+`GET /api/v1/agents/{id}/context-manifests` is the discoverability/listing
+counterpart; it accepts optional `context_scope_id` and bounded `limit` (max
+50) query parameters and filters out manifests whose current scope is no
+longer authorized.
 
 ### `GET /api/v1/projects/{id}/memory/search`
 
@@ -803,27 +1060,70 @@ and can publish their own status events.
 ## MCP tools
 
 Forge exposes tools at `POST /mcp` (JSON-RPC 2.0). The MCP server has its own
-`McpState` and does not depend on the `api` crate.
+`AppState` and does not depend on the `api` crate.
 
 MCP requests require authentication. Clients can send `Authorization: Bearer
 <token>` or include `token=<token>` in the MCP URL query string; `forge-ctl mcp
 install` writes the query-string form because the supported client config files
 store only the server URL.
 
+When a user is authenticated, Forge binds the MCP call to that server-issued
+user identity. A project-scoped MCP connection may also use the `project_id`
+query parameter or `x-forge-project-id` header; project membership is checked
+before project-scoped reads and the supplied project id cannot override that
+binding. The embedded-agent inspection surfaces never accept a caller-supplied
+authority identity, return raw credentials, protected session state, or
+checkpoint bodies. Binding, message-send, and handoff mutations derive actor
+and scope from the authenticated MCP context; identity, Project, chat, and
+Task IDs are only references that Forge authorizes.
+
 | Tool | Purpose |
 |------|---------|
 | `forge_create_task` | Create a new task |
+| `forge_create_sub_tasks` | Create ordered subtasks under a root task |
+| `forge_add_task_dependency` | Add a prerequisite task dependency |
+| `forge_remove_task_dependency` | Remove a task dependency |
+| `forge_list_task_dependencies` | List a task's prerequisite dependencies |
 | `forge_list_tasks` | List tasks with pagination |
 | `forge_get_task` | Get task detail |
 | `forge_preview_prompt` | Preview effective prompt without dispatching |
+| `forge_update_task` | Update mutable task fields |
+| `forge_transition_task` | Transition a task to another status |
 | `forge_memory_search` | Search project memory with an injection-guard wrapper |
 | `forge_memory_get` | Get one memory item with an injection-guard wrapper |
 | `forge_assign_agent` | Atomic claim |
 | `forge_cancel_task` | Cancel task |
 | `forge_get_task_diff` | Get code diff |
 | `forge_list_executions` | List executions |
+| `forge_follow_up_execution` | Resume a completed or failed execution with a child execution |
+| `forge_list_projects` | List projects |
+| `forge_create_project` | Create a project |
+| `forge_get_project` | Get project details |
+| `forge_update_project` | Update mutable project fields |
+| `forge_update_project_lifecycle_hooks` | Replace project lifecycle hooks |
+| `forge_register_agent` | Register an agent executor |
+| `forge_list_agents` | List registered agents |
+| `forge_list_agent_profiles` | List immutable executable profiles for an owned agent identity |
+| `forge_list_agent_sessions` | List safe status/capability snapshots for an owned identity's sessions |
+| `forge_get_agent_session` | Inspect one owned scope-bound session without protected runtime state |
+| `forge_get_main_agent` | Inspect the singular account Main Agent binding and setup state |
+| `forge_set_main_agent` | Replace the singular Main Agent binding with optimistic concurrency |
+| `forge_get_project_agent` | Inspect the singular Project Agent binding |
+| `forge_set_project_agent` | Replace a Project Agent binding with optimistic concurrency |
+| `forge_list_agent_chats` | List the authenticated Main Chat and authorized Project Agent Chats |
+| `forge_get_agent_chat` | Inspect one authorized Agent Chat and finite turn state |
+| `forge_list_agent_chat_messages` | List immutable Agent Chat messages and bounded provenance |
+| `forge_send_agent_chat_message` | Send one message to a bound Agent Chat |
+| `forge_list_agent_handoffs` | List immutable Main-to-Project handoffs |
+| `forge_get_agent_handoff` | Inspect one handoff and its delivery outcome |
+| `forge_create_agent_handoff` | Publish a bounded, deduplicated Main-to-Project handoff |
 
 Disable the endpoint with `forge --no-mcp` if you don't want it.
+
+`forge_create_task` accepts the optional `type` field (`task`, `planning_task`,
+`sub_task`, or `discovery`) and passes it through to the authoritative Task service. A
+project-scoped MCP connection may omit `project_id`; Forge injects the bound
+Project and rejects a conflicting reference.
 
 ### Memory MCP tools
 

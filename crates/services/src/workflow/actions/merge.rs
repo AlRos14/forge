@@ -201,7 +201,7 @@ async fn merge_failure_result(ctx: &HookContext, task: &db::Task, reason: String
         Err(error) => {
             return HookResult::Failed {
                 reason: error.to_string(),
-            }
+            };
         }
     };
     let existing_follow_ups = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
@@ -209,7 +209,7 @@ async fn merge_failure_result(ctx: &HookContext, task: &db::Task, reason: String
         Err(error) => {
             return HookResult::Failed {
                 reason: error.to_string(),
-            }
+            };
         }
     };
 

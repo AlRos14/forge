@@ -1,7 +1,8 @@
 use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, Daemon,
-    DaemonRepo, DaemonStatus, PageRequest, SortBy, SortOrder, SqliteDb, UpdateAgent,
+    new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
+    AgentStatus, CreateAgent, Daemon, DaemonRepo, DaemonStatus, PageRequest, SortBy, SortOrder,
+    SqliteDb, UpdateAgent,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde_json::Value;
@@ -13,6 +14,8 @@ pub enum EffectiveStatus {
     Deactivated,
     DaemonOffline,
     DaemonUnavailable,
+    ConnectionDegraded,
+    ConnectionUnavailable,
     Busy,
     Error,
     Paused,
@@ -25,6 +28,8 @@ impl EffectiveStatus {
             Self::Deactivated => "deactivated",
             Self::DaemonOffline => "daemon_offline",
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::ConnectionDegraded => "connection_degraded",
+            Self::ConnectionUnavailable => "connection_unavailable",
             Self::Busy => "busy",
             Self::Error => "error",
             Self::Paused => "paused",
@@ -46,6 +51,20 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
 
     if agent.paused {
         return Ok(EffectiveStatus::Paused);
+    }
+
+    if agent.backend_kind == "native" {
+        let health =
+            AgentConnectionHealthRepo::get_connection_health(db, &agent.profile_id).await?;
+        match health.as_ref().map(|health| health.status.as_str()) {
+            Some("healthy") => {}
+            Some("degraded") => return Ok(EffectiveStatus::ConnectionDegraded),
+            _ => return Ok(EffectiveStatus::ConnectionUnavailable),
+        }
+        if !has_running_execution_capacity(db, agent).await? {
+            return Ok(EffectiveStatus::Busy);
+        }
+        return Ok(EffectiveStatus::Active);
     }
 
     if let Some(daemon_id) = &agent.daemon_id {
@@ -175,6 +194,11 @@ impl AgentService {
     ) -> Result<Agent> {
         let name = name.into();
         tracing::Span::current().record("agent_name", tracing::field::display(&name));
+        if executor_type.trim().eq_ignore_ascii_case("embedded") {
+            return Err(ServiceError::invalid_operation(
+                "embedded identities must be created through the protected embedded-agent connection",
+            ));
+        }
         validate_positive("max_concurrent", max_concurrent.unwrap_or(1))?;
         validate_positive("heartbeat_interval", heartbeat_interval.unwrap_or(30))?;
         validate_positive("max_missed", max_missed.unwrap_or(3))?;
@@ -348,7 +372,7 @@ impl AgentService {
     }
 
     #[tracing::instrument(skip(self, agent_id), fields(agent_id = tracing::field::Empty))]
-    pub async fn delete(&self, agent_id: impl Into<String>) -> Result<()> {
+    pub async fn archive(&self, agent_id: impl Into<String>) -> Result<()> {
         let agent_id = agent_id.into();
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
@@ -357,20 +381,28 @@ impl AgentService {
         let role_events = task_service
             .on_agent_deleted_in_tx(&mut transaction, &agent_id)
             .await?;
-        let result = sqlx::query("DELETE FROM agent WHERE id = ?")
-            .bind(&agent_id)
-            .execute(&mut *transaction)
-            .await?;
+        let now = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET archived_at = ?, paused = 1, is_default = 0, status = 'offline',
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND archived_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&agent_id)
+        .execute(&mut *transaction)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ServiceError::not_found("agent", agent_id));
         }
         transaction.commit().await?;
         task_service.publish_role_sweep_events(role_events);
         self.publish(ForgeEvent {
-            event_type: "agent.deleted".to_owned(),
+            event_type: "agent.archived".to_owned(),
             entity_id: agent_id,
             timestamp: event_timestamp(),
-            context: EventContext::AgentDeleted {},
+            context: EventContext::AgentArchived {},
         });
         Ok(())
     }
@@ -501,12 +533,17 @@ mod tests {
             id: new_uuid_v4(),
             name: "detached".to_owned(),
             description: None,
+            profile_id: new_uuid_v4(),
+            backend_kind: "cli".to_owned(),
             executor_type: "shell".to_owned(),
+            provider: None,
             model: None,
             reasoning_effort: None,
             permission_policy: None,
             capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some("missing-daemon".to_owned()),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,
@@ -643,7 +680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_update_heartbeat_list_and_delete_agent() {
+    async fn register_update_heartbeat_list_and_archive_agent() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let service = AgentService::new(Arc::clone(&db), Arc::clone(&event_bus));
@@ -708,9 +745,9 @@ mod tests {
             .expect("available agents list");
         assert_eq!(available, vec![idle.clone()]);
 
-        service.delete(idle.id).await.expect("agent deletes");
+        service.archive(idle.id).await.expect("agent archives");
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.status_changed");
-        assert_eq!(rx.recv().await.unwrap().event_type, "agent.deleted");
+        assert_eq!(rx.recv().await.unwrap().event_type, "agent.archived");
     }
 
     #[tokio::test]

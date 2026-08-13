@@ -1,10 +1,11 @@
-use crate::{Result, ServiceError};
+use crate::{DomainEventService, Result, ServiceError};
 use async_trait::async_trait;
 use db::{
     new_uuid_v4, now_rfc3339, CreatePrMetadata, PrMetadata, PrMetadataRepo, PrProviderConfig,
     PrProviderConfigRepo, Repo, RepoRepo, SqliteDb, Task, TaskMetadata, TaskRepo, UpdatePrMetadata,
     UpdateTaskStatus,
 };
+use events::EventBus;
 use serde_json::json;
 use sqlx::Row;
 use std::{sync::Arc, time::Duration};
@@ -261,13 +262,15 @@ impl PrService {
 
 pub struct PrReconciler {
     db: Arc<SqliteDb>,
+    event_bus: Arc<EventBus>,
     interval: Duration,
 }
 
 impl PrReconciler {
-    pub fn new(db: Arc<SqliteDb>, interval: Option<Duration>) -> Self {
+    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, interval: Option<Duration>) -> Self {
         Self {
             db,
+            event_bus,
             interval: interval.unwrap_or(Duration::from_secs(60)),
         }
     }
@@ -348,7 +351,7 @@ impl PrReconciler {
                 )
                 .await?;
                 set_task_awaiting_human(&self.db, &task, false).await?;
-                TaskRepo::update_status(
+                let updated = TaskRepo::update_status(
                     &*self.db,
                     UpdateTaskStatus {
                         id: task.id,
@@ -362,6 +365,7 @@ impl PrReconciler {
                     },
                 )
                 .await?;
+                self.publish_task_status_event(&updated).await;
             }
             RemotePrStatus::Closed => {
                 PrMetadataRepo::update(
@@ -389,7 +393,7 @@ impl PrReconciler {
                     "recovery_actions": ["return_to_implementation", "retry_pr_publication", "cancel_task"],
                     "blocked_at": now,
                 });
-                TaskRepo::update_status(
+                let updated = TaskRepo::update_status(
                     &*self.db,
                     UpdateTaskStatus {
                         id: task.id,
@@ -403,9 +407,18 @@ impl PrReconciler {
                     },
                 )
                 .await?;
+                self.publish_task_status_event(&updated).await;
             }
         }
         Ok(())
+    }
+
+    async fn publish_task_status_event(&self, task: &Task) {
+        let service = DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let dedupe_key = format!("task-status-update:{}:{}", task.id, task.version);
+        if let Err(error) = service.publish_by_dedupe(&dedupe_key).await {
+            tracing::warn!(task_id = %task.id, %error, "failed to mirror PR task status domain event");
+        }
     }
 }
 

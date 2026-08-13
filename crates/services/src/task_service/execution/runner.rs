@@ -97,6 +97,9 @@ impl TaskService {
         if execution.role == crate::workflow::default_roles::REVIEWER {
             executors::mark_worktree_read_only(&mut agent_config);
         }
+        if agent_config.get("executor_type").and_then(Value::as_str) == Some("embedded") {
+            crate::embedded_task_executor::set_task_role_marker(&mut agent_config, &execution.role);
+        }
         let max_turns = self.resolve_max_turns(&task).await?;
         let logs_path = self
             .resolve_execution_logs_path(&execution, &task, &workspace, &execution_id)
@@ -779,6 +782,11 @@ impl TaskService {
             },
         )
         .await?;
+        self.publish_domain_event_by_dedupe(&format!(
+            "task-status-update:{}:{}",
+            updated.id, updated.version
+        ))
+        .await;
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id,

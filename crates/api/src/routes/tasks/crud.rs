@@ -18,6 +18,7 @@ pub async fn create_task(
             api_types::TaskType::Task => "task",
             api_types::TaskType::PlanningTask => "planning_task",
             api_types::TaskType::SubTask => "sub_task",
+            api_types::TaskType::Discovery => "discovery",
         }
         .to_owned()
     });

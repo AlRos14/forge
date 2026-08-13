@@ -1,4 +1,4 @@
-use db::{ExecutionRepo, MemoryRepository, ProjectMemberRepo, ProjectRepo, TaskRepo};
+use db::{ExecutionRepo, ProjectMemberRepo, ProjectRepo, TaskRepo};
 use serde_json::{json, Value};
 
 use crate::{
@@ -35,7 +35,7 @@ pub(crate) async fn dispatch_with_context(
                 arguments => arguments,
             };
             let arguments = apply_project_scope(state, &params.name, arguments, context).await?;
-            let result = dispatch_tool(state, &params.name, arguments).await?;
+            let result = dispatch_tool(state, &params.name, arguments, context).await?;
             Ok(tool_call_result(result))
         }
         _ => Err(McpToolError::new(-32601, "method not found")),
@@ -91,11 +91,6 @@ async fn apply_project_scope(
         assert_execution_in_scope(state, project_id, execution_id).await?;
     }
 
-    if tool_name == "forge_memory_get" {
-        let memory_id = required_string_arg(object, "id")?;
-        assert_memory_in_scope(state, project_id, memory_id).await?;
-    }
-
     Ok(arguments)
 }
 
@@ -108,6 +103,11 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
             | "forge_update_project"
             | "forge_update_project_lifecycle_hooks"
             | "forge_memory_search"
+            | "forge_get_project_agent"
+            | "forge_set_project_agent"
+            | "forge_list_agent_handoffs"
+            | "forge_get_agent_handoff"
+            | "forge_create_agent_handoff"
     )
 }
 
@@ -169,26 +169,6 @@ async fn assert_execution_in_scope(
     assert_task_in_scope(state, project_id, &execution.task_id).await
 }
 
-async fn assert_memory_in_scope(
-    state: &AppState,
-    project_id: &str,
-    memory_id: &str,
-) -> Result<(), McpToolError> {
-    let item = MemoryRepository::get_memory_item(&*state.db, memory_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("memory_item", memory_id.to_owned()))?;
-    if item.project_id != project_id {
-        return Err(
-            McpToolError::new(-32602, "memory item does not belong to scoped MCP project")
-                .with_data(json!({
-                    "project_id": project_id,
-                    "id": memory_id,
-                })),
-        );
-    }
-    Ok(())
-}
-
 async fn assert_project_membership(
     state: &AppState,
     project_id: &str,
@@ -198,7 +178,7 @@ async fn assert_project_membership(
         .await?
         .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
 
-    if project.owner_id.is_none() {
+    if project.owner_id.as_deref() == Some(user_id) {
         return Ok(());
     }
 

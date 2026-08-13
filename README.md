@@ -13,11 +13,12 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status: public beta](https://img.shields.io/badge/status-public%20beta-orange.svg)](#status)
 
-Forge gives every task its own isolated git worktree, then runs your CI gate and
-review step before changes touch `main`. Drive Claude Code, Codex, Cursor,
-Gemini, opencode, and your own shell agents through one local-first task
-lifecycle — REST API, MCP endpoint, CLI, and web UI in a single binary.
-Self-hosted, MIT, no cloud.
+Forge hosts durable embedded assistants and task-scoped coding agents in one
+local control plane. Talk to one global Main Agent, hand approved context to
+one Project Agent per Project, and keep each chat's continuity without granting
+repository access outside an admitted Task. Every coding Task still gets an
+isolated git worktree, CI gate, and review before changes touch `main`. REST,
+MCP, CLI, and web UI ship in one self-hosted binary.
 
 [Quickstart](#5-minute-quickstart) · [Why Forge](#why-forge) · [Docs](docs/) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
@@ -32,6 +33,9 @@ that: every task runs in its own git worktree, hits your CI gate, and waits for
 review before it merges. **Agents collaborate; they don't collide.**
 
 - **One isolated git worktree per task** — Claude Code, Codex, Cursor, Gemini, and Smith can each work in parallel without overwriting each other or polluting your main checkout.
+- **Main and Project Agent Chats** — keep one global discovery chat, one durable Project chat per Project, and make Main-to-Project handoffs explicit and provenance-linked.
+- **Persistent embedded identities** — connect a provider profile once, bind it explicitly as Main or Project Agent when needed, and keep Task Worker/reviewer authority separate from chat bindings.
+- **Mission Control** — inspect attention, commitments, current scope, health, and recent outcomes without opening a wall of runtime logs.
 - **Review gate with your CI** — define `ci_steps` per task; the review runner blocks merge until they pass. Human approval is an explicit transition, not an afterthought.
 - **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with an audit log and explicit cancellation paths so handoffs between agents (and humans) are legible.
 - **BYO agent** — first-class adapters for Claude Code, Codex, Cursor, Gemini, opencode, Smith, and a generic shell executor. Add your own with a small adapter.
@@ -44,7 +48,9 @@ review before it merges. **Agents collaborate; they don't collide.**
 - **Small engineering teams** piloting agent workflows who need worktree isolation, audit trails, and a review gate before code lands on `main`.
 - **Builders** who want a local, hackable control plane for AI coding work — not another hosted dashboard.
 
-If you only want a chat UI bolted onto your editor, Forge is not for you. Try Continue or Cline instead.
+If you only want an unscoped chat UI bolted onto your editor, Forge is not for
+you. Forge is built around durable identity, explicit authority, delivery
+evidence, and gated repository work.
 
 ## 5-minute quickstart
 
@@ -79,10 +85,13 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 
 | Concept | What it is |
 |---|---|
-| **Project** | A workspace grouping repos, tasks, agents, and a workflow definition. |
+| **Agent identity** | A durable account-owned agent with immutable selectable provider/CLI profiles. |
+| **Main Agent** | The account's single global assistant for discovery, Project lifecycle, bounded summaries, and explicit handoff. |
+| **Project** | A workspace grouping repos, Tasks, one Project Agent Chat, and a workflow definition. |
+| **Project Agent** | The single persistent manager for a Project; it manages Tasks only through the Project workflow. |
+| **Agent Chat** | The immutable, scope-isolated timeline for the Main Agent or one Project Agent. |
 | **Repo** | A pointer to a local git checkout that tasks operate on. |
 | **Task** | A unit of agent work with a state, optional CI steps, and an audit log. |
-| **Agent** | A registered AI executor (Claude Code, Codex, Cursor, shell, …) bound to a daemon. |
 | **Daemon** | The local process that reports installed CLIs and runs executions. |
 | **Worktree** | An isolated git checkout created per task, cleaned up on `done`/`cancelled`. |
 | **Review gate** | The CI steps + optional human approval that block `review → merging`. |
@@ -115,6 +124,10 @@ Deeper dive → [docs/architecture.md](docs/architecture.md).
 
 Forge is in **public beta** (`0.1.x`). The local-first single-user product is usable
 end-to-end, but APIs, schemas, and CLI flags can change without deprecation cycles.
+The Main/Project Agent Chat model described above is the approved replacement
+surface currently being implemented; its data-preserving migration starts at
+`V071+`. Check [CHANGELOG.md](CHANGELOG.md) for the visible breaking transition
+before building against collaboration APIs.
 Track breaking changes in [CHANGELOG.md](CHANGELOG.md). A stable `1.0` will land
 once the workflow engine, multi-user story, and release artifacts (signing, SBOMs,
 Homebrew, Windows builds) are finalized.

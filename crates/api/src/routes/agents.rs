@@ -213,7 +213,7 @@ pub async fn update_agent(
     ))
 }
 
-pub async fn delete_agent(
+pub async fn archive_agent(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(id): Path<String>,
@@ -222,7 +222,7 @@ pub async fn delete_agent(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_manageable(&agent, &user, &id)?;
-    state.agent_service.delete(id).await?;
+    state.agent_service.archive(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -342,6 +342,8 @@ pub async fn agent_availability(
             ),
             "daemon_offline" => "Pinned daemon is offline".to_owned(),
             "deactivated" => "Pinned daemon does not have this executor authenticated".to_owned(),
+            "connection_degraded" => "Embedded provider connection is degraded".to_owned(),
+            "connection_unavailable" => "Embedded provider connection is unavailable".to_owned(),
             status => format!("Agent is not available: {status}"),
         })
     };

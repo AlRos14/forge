@@ -51,7 +51,7 @@ impl LifecyclePlugin for KnowledgeCapturePlugin {
             _ => {
                 return Ok(PluginResult::Skipped {
                     reason: "no_log_dir".into(),
-                })
+                });
             }
         };
 
@@ -63,7 +63,7 @@ impl LifecyclePlugin for KnowledgeCapturePlugin {
             _ => {
                 return Ok(PluginResult::Skipped {
                     reason: "no_repo_path".into(),
-                })
+                });
             }
         };
 
@@ -98,7 +98,12 @@ impl LifecyclePlugin for KnowledgeCapturePlugin {
                 "---\ntitle: \"{}\"\ncategory: {}\ntags:\n{}\ncreated_by: knowledge-capture\ntask_id: \"{}\"\ncreated_at: \"{}\"\nupdated_at: \"{}\"\n---\n\n{}\n",
                 snippet.title,
                 snippet.category,
-                snippet.tags.iter().map(|t| format!("  - {t}")).collect::<Vec<_>>().join("\n"),
+                snippet
+                    .tags
+                    .iter()
+                    .map(|t| format!("  - {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 ctx.task_id,
                 now,
                 now,

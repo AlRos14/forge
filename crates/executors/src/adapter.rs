@@ -10,6 +10,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
+    /// Forge-hosted Agent Runtime profile.  This is intentionally not a CLI
+    /// adapter; services route it to the Forge-owned native task backend.
+    Embedded,
     Shell,
     Codex,
     ClaudeCode,
@@ -23,6 +26,7 @@ pub enum ExecutorKind {
 impl std::fmt::Display for ExecutorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Embedded => write!(f, "embedded"),
             Self::Shell => write!(f, "shell"),
             Self::Codex => write!(f, "codex"),
             Self::ClaudeCode => write!(f, "claude_code"),
@@ -39,6 +43,7 @@ impl std::str::FromStr for ExecutorKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "embedded" => Ok(Self::Embedded),
             "shell" => Ok(Self::Shell),
             "codex" => Ok(Self::Codex),
             "claude_code" => Ok(Self::ClaudeCode),

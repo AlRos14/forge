@@ -69,6 +69,14 @@ impl TaskService {
                 "task".to_owned()
             }
         });
+        if !matches!(
+            effective_task_type.as_str(),
+            "task" | "planning_task" | "sub_task" | "discovery"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "task_type must be task, planning_task, sub_task, or discovery",
+            ));
+        }
         let validated_assignments = if let Some(ref assignments) = role_assignments {
             let workflow_roles: std::collections::HashSet<&str> =
                 workflow.roles.iter().map(|r| r.name.as_str()).collect();

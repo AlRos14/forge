@@ -77,7 +77,8 @@ impl DaemonRepo for SqliteDb {
                     "SELECT * FROM daemon WHERE visibility = 'global' OR owner_id IS NULL OR owner_id = ? ORDER BY {} LIMIT ? OFFSET ?",
                     order_clause_without_priority(&page)
                 ),
-                "SELECT COUNT(*) FROM daemon WHERE visibility = 'global' OR owner_id IS NULL OR owner_id = ?" as &str,
+                "SELECT COUNT(*) FROM daemon WHERE visibility = 'global' OR owner_id IS NULL OR owner_id = ?"
+                    as &str,
                 true,
             ),
             None => (
@@ -85,7 +86,8 @@ impl DaemonRepo for SqliteDb {
                     "SELECT * FROM daemon WHERE visibility = 'global' OR owner_id IS NULL ORDER BY {} LIMIT ? OFFSET ?",
                     order_clause_without_priority(&page)
                 ),
-                "SELECT COUNT(*) FROM daemon WHERE visibility = 'global' OR owner_id IS NULL" as &str,
+                "SELECT COUNT(*) FROM daemon WHERE visibility = 'global' OR owner_id IS NULL"
+                    as &str,
                 false,
             ),
         };
