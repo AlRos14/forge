@@ -94,6 +94,19 @@ impl TaskMediaRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
+        // V076's legacy trigger marks the additive asset as a candidate, but
+        // it cannot see Project evidence attachments.  Reconcile through the
+        // shared-media repository so a Task delete never clears bytes still
+        // referenced by evidence or an immutable release pin.
+        if let Some(asset_id) =
+            sqlx::query_scalar::<_, String>("SELECT asset_id FROM task_media WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?
+        {
+            SharedMediaRepo::reconcile_media_asset(self, &asset_id, deleted_at).await?;
+        }
+
         Self::get_media_by_id(self, id, true)
             .await?
             .ok_or(DbError::NotFound)

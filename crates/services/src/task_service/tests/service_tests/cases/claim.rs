@@ -1,6 +1,125 @@
 use super::super::*;
 
 #[tokio::test]
+async fn orchestration_identity_claim_fails_before_workspace_or_branch_creation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    let setup = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
+        .await
+        .expect("setup binding loads")
+        .expect("setup binding exists");
+    ProjectAgentBindingRepo::replace_project_binding(
+        &*db,
+        ReplaceProjectAgentBinding {
+            project_id: project_id.clone(),
+            expected_version: setup.version,
+            replacement: CreateProjectAgentBinding {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                identity_id: Some(agent_id.clone()),
+                profile_id: Some(agent.profile_id.clone()),
+                state: "active".to_owned(),
+                autonomy_policy_json: "{}".to_owned(),
+                permission_ceiling_json: r#"{"permissions":["propose_task"]}"#.to_owned(),
+                subscriptions_json: "[]".to_owned(),
+                wake_budget: 0,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            replacement_reason: Some("test orchestration boundary".to_owned()),
+        },
+    )
+    .await
+    .expect("Project Agent binding activates");
+    let task = service
+        .create_task(
+            project_id,
+            "Orchestration identity must not claim",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+
+    let result = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidOperation { message })
+            if message.contains("Main and Project Agent identities")
+    ));
+    assert!(
+        WorkspaceRepo::get_by_task_id(&*db, &task.id)
+            .await
+            .expect("workspace lookup")
+            .is_none(),
+        "rejected orchestration identity must not create a workspace row"
+    );
+    assert!(
+        !git::branch_exists(repo_dir.path(), &::workspace::task_branch_name(&task.id))
+            .await
+            .expect("branch lookup"),
+        "rejected orchestration identity must not create a task branch"
+    );
+}
+
+#[tokio::test]
+async fn claim_recovers_task_branch_left_by_a_rejected_workspace_attempt() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Recover orphan task branch",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let branch = ::workspace::task_branch_name(&task.id);
+    run_git(repo_dir.path(), &["branch", &branch]);
+
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("claim recovers existing task branch");
+
+    let workspace = WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .expect("workspace lookup")
+        .expect("workspace exists");
+    assert_eq!(workspace.branch, branch);
+    assert!(std::path::Path::new(&workspace.worktree_path).exists());
+    assert_eq!(claimed.task.status, "in_progress");
+}
+
+#[tokio::test]
 async fn create_claim_and_transition_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

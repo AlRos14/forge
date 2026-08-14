@@ -24,6 +24,15 @@ impl TaskService {
             &project.workflow_definition,
             &options.triggered_by,
         );
+        if task.repo_id.is_some()
+            && workflow.state_kind(&new_status) == Some(api_types::StateKind::Active)
+        {
+            // Direct transitions must obey the same admission boundary as
+            // claim/launch for every repository-capable task type.  Task
+            // labels such as discovery/planning only select a read-only
+            // executor profile; they do not bypass the baseline/lease gate.
+            self.ensure_task_runnable(&task).await?;
+        }
         self.ensure_planning_plan_ready_before_leaving(
             &task,
             &new_status,

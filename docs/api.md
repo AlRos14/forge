@@ -25,10 +25,63 @@ database for historical provenance.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST   | `/api/v1/projects` | Create project; when `product_genesis_session_id` references the authenticated account's `ready_for_project` session, the atomic Project/binding/chat result is linked for normal handoff retry |
+| POST   | `/api/v1/projects` | Create a normal Project through an authorized human/API setup path; Genesis creation uses the exact `CreateProjectFromCharterApproval` receipt contract below |
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
+| GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve` | Create the exact principal-bound, single-use Charter approval receipt |
+| GET    | `/api/v1/projects/{id}/charter` | Read the Project's current Charter and revision history |
+| POST   | `/api/v1/projects/{id}/charter/revisions` | Append a Project Charter revision or adoption draft |
+| POST   | `/api/v1/projects/{id}/charter/revisions/{revision_id}/approve` | Approve an exact Project Charter revision or adoption Charter |
+| GET    | `/api/v1/projects/{id}/documents` | List Project Documents with opaque keyset pagination |
+| POST   | `/api/v1/projects/{id}/documents` | Create a typed Project Document |
+| GET    | `/api/v1/projects/{id}/documents/{document_id}` | Read a Project Document and current revision pointers |
+| GET    | `/api/v1/projects/{id}/documents/{document_id}/revisions` | List immutable Document revisions with opaque keyset pagination |
+| POST   | `/api/v1/projects/{id}/documents/{document_id}/revisions` | Append an immutable Document revision |
+| GET    | `/api/v1/projects/{id}/documents/{document_id}/revisions/{revision_id}` | Read one exact Document revision |
+| GET    | `/api/v1/projects/{id}/documents/{document_id}/revisions/{revision_id}/diff` | Read the deterministic diff for one exact Document revision |
+| POST   | `/api/v1/projects/{id}/documents/{document_id}/approve` | Approve an exact Document revision where policy requires it |
+| GET    | `/api/v1/projects/{id}/decisions` | List effective Project Decision Log records |
+| GET    | `/api/v1/projects/{id}/decisions/candidates` | List scoped Decision Log candidates with opaque keyset pagination |
+| POST   | `/api/v1/projects/{id}/decisions/candidates` | Propose a scoped Decision Log candidate |
+| GET    | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}` | Read one Decision Log candidate |
+| POST   | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}/approve` | Approve one exact Decision Log candidate |
+| POST   | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}/reject` | Reject one exact Decision Log candidate |
+| GET    | `/api/v1/projects/{id}/decisions/{decision_id}` | Read one effective Decision Log record |
+| GET    | `/api/v1/projects/{id}/milestones` | List milestone definitions/instances and active projections |
+| POST   | `/api/v1/projects/{id}/milestones` | Create a milestone definition revision |
+| POST   | `/api/v1/projects/{id}/milestones/primary` | Set the explicit primary milestone pointer with CAS |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}` | Read milestone state, checks, readiness, and evidence references |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/transition` | Transition the mutable milestone instance lifecycle with CAS |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions` | Append an immutable milestone definition revision |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions` | List immutable milestone definition revisions |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}` | Read one exact milestone definition revision |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}/transition` | Transition a definition revision lifecycle with CAS |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness` | Persist one principal-bound immutable `ReadinessSnapshot` candidate |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/history` | List immutable readiness candidates with opaque keyset pagination |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/{snapshot_id}` | Read one exact readiness candidate |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Record a user-bound manual acceptance result |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive` | Record a user-bound immutable acceptance waiver |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/release` | User-only release of an exact readiness candidate into immutable `Mxxx-rN` |
+| GET    | `/api/v1/projects/{id}/releases/{release_id}` | Inspect an immutable release manifest and evidence pins |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/releases` | List immutable milestone release history with opaque keyset pagination |
+| GET    | `/api/v1/projects/{id}/media` | List Project-authorized media assets/attachments |
+| POST   | `/api/v1/projects/{id}/media` | Upload a Project media asset |
+| GET    | `/api/v1/projects/{id}/media/{asset_id}` | Stream or download a Project-authorized media asset |
+| POST   | `/api/v1/projects/{id}/media/{asset_id}/redact` | User-authorized Project owner/admin redaction with an immutable audit tombstone |
+| POST   | `/api/v1/projects/{id}/media/{asset_id}/purge` | User-authorized Project owner/admin purge; removes bytes and overlays pinned release evidence as unavailable |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence` | List milestone evidence attachments with opaque keyset pagination |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence` | Attach/reuse Project media as milestone evidence |
+| GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Read one exact active evidence attachment |
+| DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
+| GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection |
+| GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection |
+| POST   | `/api/v1/projects/{id}/execution-baseline` | Propose one Project execution-baseline shell |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Append an exact, digest-bound execution-baseline revision |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline and promote matching preplanned Tasks |
 | GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |
 | GET    | `/api/v1/memory/{id}` | Get memory item |
 | POST   | `/api/v1/memory/{id}/publish` | Explicitly publish an owned private assertion into an authorized scope |
@@ -104,7 +157,6 @@ database for historical provenance.
 | POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat and admit its first finite turn |
 | GET    | `/api/v1/account/main-agent/product-genesis/active` | `V072+` — Return the authenticated account's active Genesis session, if any |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}` | `V072+` — Read one Genesis session owned by the authenticated account, including lifecycle, source references, and optimistic version |
-| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/ready` | `V072+` — Record the typed Main discovery-ready decision with `expected_version`; Project creation remains the normal atomic Project path |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/cancel` | `V072+` — Cancel an active Genesis session with `expected_version` and an optional reason |
 | GET    | `/api/v1/projects/{id}/project-agent` | `V071+` — Get the Project's single Project Agent binding |
 | PUT    | `/api/v1/projects/{id}/project-agent` | `V071+` — Create or replace the Project Agent binding with optimistic concurrency |
@@ -138,6 +190,7 @@ database for historical provenance.
 | GET    | `/api/v1/actions/{id}` | Get an authorized proposal and its server policy result |
 | POST   | `/api/v1/actions/{id}/approve` | Record an independent, scope-authorized approval/denial |
 | POST   | `/api/v1/actions/{id}/execute` | Record an admitted action execution idempotently |
+| POST   | `/api/v1/actions/{id}/execute-orchestration` | Materialize a Main Charter/Project orchestration proposal through its typed domain executor; generic execution rejects these operations |
 | POST   | `/api/v1/actions/{id}/execute-task` | Create the authoritative Task through TaskService and audit the outcome |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
@@ -188,16 +241,134 @@ account's active binding, stores the prompt revision/maturity/source references
 with optimistic `version`, and admits the first discovery turn through the
 ordinary Agent Chat message service. The rendered prompt is also stored as an
 immutable `agent_chat_instruction_revision` linked to the Genesis session; the
-turn runner overlays it only while the session is discovering or ready for a
-Project. Cancellation/handoff stops the overlay without deleting its history.
-Without a Main binding the start request
-returns setup-required and creates neither a session nor a turn. Only the
-session owner may mark discovery ready or cancel it; both mutations use the
-session's optimistic version and stale versions return HTTP 409. Project creation
-and Main-to-Project handoff continue through the normal atomic Project Agent
-binding/chat and Agent Chat handoff resources—Genesis does not accept raw
-Project or chat IDs as authority.
-Stale, already-completed, cancelled, or expired interactions return HTTP 409.
+turn runner overlays it only while the session is `discovering` or
+`ready_for_project`. The active skill is the server-owned
+`forge.main.project-discovery/v2`: it asks at most two consequential questions
+per turn, maintains a typed revisioned Charter, and keeps facts, decisions,
+research, assumptions, and hypotheses distinct. Cancellation or handoff stops
+the overlay without deleting history. Without a Main binding the start request
+returns setup-required and creates neither a session nor a turn. The session
+owner may cancel discovery with the session's optimistic version; stale
+versions return HTTP 409. `ready_for_project` is reached only by the exact
+Charter approval/create flow below; there is no standalone discovery-ready
+endpoint.
+
+Genesis Project creation is the typed `CreateProjectFromCharterApproval`
+operation on `POST /api/v1/projects`. It accepts one active single-use
+`charter_approval_id` receipt and an idempotency key; the receipt itself binds
+the exact Charter revision, canonical content digest, rendered-view digest,
+selected Project Agent identity/profile/operating-skill/policy revisions, user
+principal, expected version, and explicit approval event. A ready Genesis brief
+or `product_genesis_session_id` alone is not sufficient, and the superseded
+Genesis request field is not accepted. The operation must not substitute a
+newer draft, name, profile, or digest.
+
+Genesis Charter approval omits `expected_project_version` because no Project
+exists yet. Project adoption/amendment approval must provide that field as a
+positive current Project version; zero is not a compatibility sentinel.
+
+On success, one transaction creates the Project, Project Agent binding, Project
+Chat, Charter attachment, bounded immutable handoff, target message/turn job,
+domain events, Genesis `handed_off` state, and consumed receipt. There is no
+`handoff_pending` state. Any failure rolls back every record, leaves Genesis
+`ready_for_project` and the receipt `active`, and can be retried with the same
+receipt/idempotency key. A replay after a committed response loss returns the
+original Project and handoff identities without creating a duplicate.
+
+After attachment, Charter ownership is Project-scoped: later revisions or
+adoption proposals use the Project Charter routes, not Main Genesis routes.
+Genesis does not accept raw Project or chat IDs as authority. A normal
+authorized human/API `POST /api/v1/projects` may still create an explicit
+`legacy_unverified`/`charter_setup_required` Project, but it cannot invent a
+user approval; release remains blocked until the user approves an exact
+adoption Charter revision.
+
+### Project Charters, Documents, Decisions, and effective state
+
+The Project Charter route exposes immutable revisions, exact content/render
+digests, approval/supersession history, and the current-approved pointer. The
+Document routes expose only the typed kinds `research`, `delivery_brief`,
+`product_spec`, `design`, `architecture`, and `execution_plan`; they are
+Forge-owned artifacts with revision/diff/export views, not repository files.
+Decision records are append-only and their effective state is exactly
+`active`, `superseded`, or `invalidated`. Draft/proposal/approval/rejection
+records are candidate workflow records and are not effective DecisionRecord
+states.
+
+Responses that summarize current Project state are derived by authority domain:
+the approved Charter governs identity/scope, the approved baseline and
+Documents govern execution intent, effective Decisions govern recorded choices,
+Task/validation services govern work/check truth, and immutable releases govern
+historic claims. Chat, memory, status cards, and dashboards are retrieval or
+navigation aids only. A cross-domain conflict returns a typed reconciliation
+reason rather than a global recency merge.
+
+### Milestones, readiness, releases, and evidence
+
+Milestone definition revisions use `draft`, `proposed`, `approved`, or
+`superseded`; milestone instances use `planned`, `active`, `ready_for_release`,
+`released`, or `cancelled`. Multiple milestones may be active and the
+`primary_milestone_id` pointer is explicit. `ReadinessSnapshot` is an immutable
+candidate, not a release: standalone readiness creates no evidence pins. A
+ready snapshot moves an unreleased active milestone to `ready_for_release`;
+non-ready or stale results leave it active with typed reasons.
+
+Only an authorized user may call the milestone release route with the exact
+candidate snapshot ID and readiness digest. Forge re-authorizes every covered
+source and recomputes the digest inside the release transaction. A match creates
+one immutable `Mxxx-rN` manifest, evidence pins, lifecycle transition, and
+events atomically; it creates no second readiness snapshot. Releases are frozen
+internal evidence records, not deploy/tag/merge operations, and corrections
+append a later revision without mutating history.
+
+Project media routes provide Project-owned assets and can reuse the same
+underlying asset as Task media. Existing asset IDs, Task media IDs, Task URLs,
+storage keys, metadata, and file bytes are preserved in place; no bytes move or
+duplicate and this change makes no on-disk layout-break claim. Existing
+`/api/v1/tasks/{task_id}/media` and
+`/api/v1/media/{media_id}` behavior remains valid while the Task attachment is
+active. Milestone evidence adds a same-Project attachment and stable authorized
+Project URL without changing the Task list. Deleting a Task makes its Task URL
+unavailable under existing policy, while a release pin keeps the bytes retained
+for the Project evidence URL while the shared asset remains available.
+
+Evidence attachment metadata uses `available`, `quarantined`, `redacted`, or
+`purged`. The public remove route marks an attachment `purged`; readiness does
+not count unavailable evidence. The Project media route serves bytes only when
+the shared asset is still `available` and authorized. Ordinary cleanup deletes
+bytes only after checking that no active Task/Project attachment or immutable
+release pin references them, under a scheduler lease. Release pins remain
+immutable. V076 and the internal shared-media repository persist audited
+redaction/purge tombstones and project pinned release evidence as
+`evidence_unavailable` without rewriting a release manifest. The authorized
+Project disposition routes are `POST
+/api/v1/projects/{id}/media/{asset_id}/redact` and `POST
+/api/v1/projects/{id}/media/{asset_id}/purge`. Both require Project owner/admin
+access, an explicit user authorization action (`project.media.redact` or
+`project.media.purge`), the asset `expected_version`, an idempotency key, and a
+non-empty reason no longer than 4096 bytes. Each returns the resulting
+`MediaAsset` metadata; the route never accepts a storage key or bytes.
+The JSON body is `ProjectMediaTombstoneRequest`:
+
+```json
+{
+  "mutation": {
+    "expected_version": 3,
+    "idempotency_key": "media-disposition-1",
+    "authorization": {
+      "principal": { "kind": "user", "id": "user-123" },
+      "authorization_basis": "privacy request PR-123",
+      "action": "project.media.purge",
+      "event_id": "user-event-123",
+      "occurred_at": "2026-08-13T12:00:00Z"
+    }
+  },
+  "reason": "approved privacy/security/legal removal"
+}
+```
+
+Use `project.media.redact` with the redaction route. `expected_digest` and
+`deduplication_key` remain optional mutation-envelope fields.
 
 A CLI profile's `config_json` may include an ordered `fallbacks` array of
 `{"executor_type": "...", "config": {...}}` candidates. When the primary
@@ -254,8 +425,11 @@ binds the actor from the identity path, verifies the concrete account,
 Project, Agent Chat, or Task authority, intersects account/profile/tool/binding
 ceilings and workflow/assignment gates, and persists `allowed`,
 `approval_required`, or `denied`. Public action responses expose the policy
-result, reason, target, and payload hash; they do not expose the persisted
-payload body. Protected approvals require an independently authorized active
+result, reason, target, payload hash, and a derived `materialized` boolean; they
+do not expose the persisted payload body. `materialized` is `false` for a
+proposal and becomes `true` only after the typed Task/orchestration executor
+has persisted an `executed` status, a server-derived target, and its typed
+outcome. Protected approvals require an independently authorized active
 identity in the same scope and reject self-approval. Executions are
 idempotent by action/idempotency key.
 
@@ -272,6 +446,20 @@ the originating proposal inbox is acknowledged, one task-outcome inbox item
 is delivered, and successful delivery adds evidence and completes the linked
 commitment exactly once. Cursor replay after restart uses event-derived
 dedupe keys and cannot duplicate those projections.
+
+Main orchestration proposals use the dedicated
+`POST /api/v1/actions/{id}/execute-orchestration` route. The service resolves
+account and Main-Chat scope from the action's bound identity, then performs the
+canonical Charter repository operation for `charter.draft`,
+`charter.readiness`, `charter.diff`, and `charter.approval_target`. A
+`project.create` proposal is user-only: Forge rechecks the exact active Charter
+approval receipt, selected identity/profile/operating-skill/policy revisions,
+canonical digests, and authenticated approving principal before invoking the
+atomic `CreateProjectFromCharterApproval` transaction. The generic
+`/execute` endpoint rejects these five operation names, so an arbitrary result
+cannot masquerade as a persisted Charter revision or Project handoff. Both
+typed execution and the underlying Charter/Project mutation require the action
+version and idempotency key; replays return the committed execution/result.
 
 ## Agent Chats
 
@@ -301,6 +489,16 @@ Project Agent may create and manage Tasks only in its bound Project through
 Task Workers and reviewers continue through the existing Task assignment,
 workflow, Workspace, validation, review, and delivery path.
 
+When configured, both Main and Project Agent native Chat sessions receive the
+read-only `forge_public_web_search` tool. It is scope-derived (Main account or
+the authenticated Project binding), accepts only a bounded query and result
+limit, and returns at most ten `{url,title,snippet,retrieved_at}` records plus
+untrusted-content metadata. The endpoint is public HTTPS and unauthenticated;
+Forge sends no cookies or credentials. Search results do not create an
+`AgentAction`, persist a decision, or imply user approval. The tool is absent
+when `public_search.endpoint` is not configured, and `web.search` is rejected
+as a proposal operation.
+
 ### Main-to-Project handoff
 
 `POST /api/v1/projects/{id}/agent-handoffs` publishes an immutable, bounded,
@@ -318,17 +516,23 @@ compatibility aliases are provided.
 
 ## Projects
 
-With the V071+ replacement, creating an operational Project also creates its
-single Project Agent binding and Project Agent Chat in one transaction. The
-selected identity/profile is validated before either record becomes visible;
-Genesis callers may include `product_genesis_session_id`; ownership and
-`ready_for_project` state are checked server-side, and replay returns the
-already-linked Project rather than creating another one. Handoff remains a
-separate normal Agent Chat operation, so a failed delivery leaves the session
-ready with its Project ID and can be retried safely.
-there is no later primary-agent election. Imported Projects that cannot yield
-one safe binding remain in `agent_setup_required` until the user resolves them.
-The exact binding fields are finalized with the replacement request types.
+With the V071+ replacement, a normal authorized human/API Project creation
+creates its single Project Agent binding and Project Agent Chat atomically. A
+Genesis caller must use `CreateProjectFromCharterApproval` with an active
+single-use Charter approval receipt; `product_genesis_session_id` is not a
+Genesis creation bypass or compatibility field. The selected
+identity/profile/operating-skill revision, exact Charter revision/digests,
+expected versions, authenticated principal, and idempotency key are verified
+before any record becomes visible. The transaction creates the Project,
+binding, Chat, Charter attachment, handoff, target message/turn, events, and
+Genesis transition together. Replay returns the original result, while a
+failure leaves no Project or handoff and keeps Genesis ready for retry.
+
+There is no later primary-agent election. Projects imported from before the
+Charter model that cannot yield one safe binding remain `agent_setup_required`
+and are also `legacy_unverified` until an explicit adoption Charter is
+approved. Their Project Chat, Tasks, evidence capture, and Document maintenance
+remain usable; only release is blocked by the missing approved Charter.
 
 `ProjectResponse` includes `project_hooks`, an array of project-wide hook
 rules stored separately from workflow settings. Projects with no configured
@@ -568,7 +772,11 @@ sensitivity, authority, lifecycle metadata, and retention fields only.
 `GET /api/v1/context-manifests/{id}` requires `identity_id` and
 `context_scope_id`; it returns immutable policy/runtime fingerprints and a
 bounded list of source ids, revisions, selection reasons, dispositions, and
-fragment fingerprints, never source fragments.
+fragment fingerprints, never source fragments. Pointer-backed Project sources
+also expose `is_stale` and `current_revision`; these are read-time comparisons
+against the current Charter, approved Document, active execution baseline,
+active milestone definition, Project identity, or Project Agent binding. The
+stored source revision, disposition, and manifest fingerprint remain immutable.
 `GET /api/v1/agents/{id}/context-manifests` is the discoverability/listing
 counterpart; it accepts optional `context_scope_id` and bounded `limit` (max
 50) query parameters and filters out manifests whose current scope is no
@@ -663,9 +871,12 @@ notified.
 
 ## Pagination
 
-All list endpoints use opaque keyset cursors: base64-encoded JSON
-`{sort_by, sort_order, last_value, last_id}`. The `db` layer queries `limit + 1`
-rows to determine `has_more`. The response field is `items` (not `data`).
+All list endpoints use opaque keyset cursors and return `items` (not `data`).
+The existing task-board lists use base64-encoded JSON
+`{sort_by, sort_order, last_value, last_id}`; orchestration artifact lists use
+an equivalent server-opaque cursor and do not expose their sort tuple. The
+`db` layer (or route projection) reads one extra keyset row to determine
+`has_more`.
 
 ### Query parameters
 
@@ -872,6 +1083,26 @@ Terminal configuration lives under the `terminal` config section:
 `terminal.max_sessions_per_user`; invalid terminal configuration is rejected
 when Forge loads config.
 
+Public search configuration lives under `public_search`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `public_search.endpoint` | unset | Public HTTPS JSON endpoint; unset disables the native tool |
+| `public_search.timeout_ms` | `5000` | Request/response deadline, bounded to 100–30000 ms |
+| `public_search.max_response_bytes` | `262144` | Maximum response body, bounded to 1 KiB–4 MiB |
+
+The same values may be supplied with `FORGE_PUBLIC_SEARCH_ENDPOINT`,
+`FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, and `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`;
+environment values take precedence over the config file.
+
+The endpoint contract is `{"results":[{"url","title","snippet"}]}`. Forge
+adds its retrieval timestamp, validates public HTTP(S) source URLs, caps the
+query at 512 characters and results at 10, and labels all returned text as
+untrusted data. Forge disables redirects and ambient proxy/cookie/auth state,
+resolves the configured host at connect time, and rejects private, special-use,
+and IPv4-mapped IPv6 addresses. An unset endpoint omits the tool; invalid
+configuration is rejected before a runtime can expose it.
+
 ### Access model
 
 Only authenticated project members with access to the owning task can create,
@@ -973,21 +1204,116 @@ Task media is stored under `<data_dir>/media/<task_id>/...`, not inside the
 task worktree. Workspace cleanup for done tasks does not touch task media, so
 media links remain valid for archived, done, and cancelled tasks.
 
-Deleting an individual media item soft-deletes the row by setting `deleted_at`,
-removes the stored bytes, and returns `204`. Soft-deleting a task tombstones its
-active media rows and removes their stored files. A future hard task delete
-cascades remaining media rows through the database foreign key.
+Deleting an individual media item soft-deletes the Task attachment by setting
+`deleted_at` and makes its Task URL/list entry unavailable, then returns `204`.
+Soft-deleting a task tombstones its active Task attachments. The existing
+physical bytes are removed only when no active Task media, Project attachment,
+or immutable release pin references the asset; a leased cleanup worker
+re-checks all three reference classes before deletion. A future hard task
+delete cascades remaining attachment rows through the database foreign key.
+This preserves the existing Task API while allowing release evidence to survive
+Task cleanup.
+
+### Project evidence and release pins
+
+Project media listing returns `{ "items": [...], "next_cursor": null,
+"has_more": false }` and accepts an opaque `cursor` plus `limit` (1-100).
+Project uploads use `multipart/form-data` with one `file` part and a `mutation`
+JSON part containing the standard `MutationEnvelope`; the envelope's expected
+version is the Project version. Uploads are replay-safe by idempotency key and
+record a bounded authenticated-user provenance event. Bytes are staged through
+a durable pending-upload record and remain unavailable until the staged file
+and metadata finalize together. Declared MIME types must match bounded magic
+signature and the filename extension; misleading extensions and executable
+extensions are rejected.
+
+Evidence list responses use the same `{items,next_cursor,has_more}` envelope.
+Attach and remove requests require an explicit user authorization, an exact
+milestone/attachment `expected_version`, and an idempotency key. The database
+validates every Task, execution, validation, and acceptance-check reference in
+the same Project and current milestone-definition revision before committing
+the evidence row and its domain event. A same-key request with different
+content returns `409 idempotency_conflict`; a stale version returns
+`409 version_conflict`.
+
+Project media is an authorized projection over the shared `media_asset` layer.
+Project uploads create Project-owned assets, while evidence can reuse a
+same-Project Task asset. Migration adds Project ownership, attachment, evidence,
+and release-pin metadata without
+changing the existing asset ID, Task media ID, Task URL, storage key, metadata,
+or file bytes. It does not move or duplicate bytes and makes no on-disk
+layout-break claim. A same-Project milestone may reuse a Task asset without
+making it appear in another Task's list. The Project media route is separately
+authorized through Project membership and provides the stable evidence URL;
+the Task URL remains governed by the Task attachment and is not revived by a
+Project attachment or release pin.
+
+`MediaAsset` responses intentionally omit the internal `storage_key`; clients
+and agents receive only the stable authenticated Project URL. The bytes are
+served only after the recorded size, SHA-256 digest, and content signature are
+validated. Safe image/video types use `Content-Disposition: inline`; all other
+types use an attachment disposition, and every response sets
+`X-Content-Type-Options: nosniff`.
+
+Evidence records include caption, kind (`screenshot`, `walkthrough_video`,
+`log`, `report`, or `other`), source Task/run/validation when present,
+acceptance-check links, uploader, checksum, timestamp, and availability:
+`available`, `quarantined`, `redacted`, or `purged`. The Project media route
+serves only an authorized shared asset whose availability is `available`;
+unavailable assets return `404` while safe metadata may remain visible.
+Standalone readiness records exact evidence attachment IDs/digests but creates
+no release pins. A successful user-approved release creates the immutable
+release-scoped pin, which prevents ordinary garbage collection. The former Task
+URL remains unavailable after Task deletion, while the Project evidence URL
+serves bytes only while availability and authorization permit it. The
+`POST .../redact` route changes the shared asset and its Project attachments to
+`redacted` and records the authorized reason/audit provenance; the Project media
+route blocks serving the original bytes, and affected release pins receive an
+`evidence_unavailable` projection. The legacy Task media route retains its
+existing authorization/serving behavior while its Task attachment remains
+active. The `POST .../purge` route records the same immutable audit data, changes
+the asset/attachments to `purged`, removes the stored bytes, and applies the
+same projection to every affected release pin, so neither former URL can serve
+the bytes. Both routes use the asset version and idempotency key for CAS and
+replay; a mismatched replay or stale version returns the standard typed
+conflict. Neither route rewrites an immutable release manifest.
 
 ### SSE events
 
-`GET /api/v1/events` subscribers receive media lifecycle events through the
-existing SSE stream. Event context fields are flattened onto the standard
-`ForgeEvent` envelope with `event_type`, `entity_id`, and `timestamp`.
+`GET /api/v1/events` streams typed `EventBus` events. Orchestration and media
+mutations also append replayable events to the durable `domain_event` ledger in
+the same transaction as their authoritative rows. The current route
+implementation does not yet define a typed `EventContext` mirror for every new
+orchestration/media event, so live SSE delivery remains a verification/task
+gate; clients must not treat an SSE notification as the durable source of
+truth. Event context fields are flattened onto the standard `ForgeEvent`
+envelope when mirrored, with `event_type`, `entity_id`, and `timestamp`.
 
 | Event | Context payload |
 |-------|-----------------|
+| `project_charter.revision_created` | `{ "charter_id": "...", "revision_id": "...", "revision": 2, "content_digest": "...", "rendered_digest": "..." }` |
+| `project_charter.approved` | `{ "charter_id": "...", "revision_id": "...", "approval_id": "...", "content_digest": "...", "rendered_digest": "..." }` |
+| `project.charter.approved` | `{ "charter_id": "...", "revision_id": "...", "approval_id": "...", "content_digest": "...", "rendered_digest": "..." }` |
+| `project.created_from_charter_approval` | `{ "project_id": "...", "charter_id": "...", "revision_id": "...", "approval_id": "..." }` |
+| `project.document.created` | `{ "project_id": "...", "document_id": "...", "kind": "...", "approval_policy": "..." }` |
+| `project.document.revision_created` | `{ "project_id": "...", "document_id": "...", "revision_id": "...", "content_digest": "...", "render_digest": "..." }` |
+| `project.document.approved` | `{ "project_id": "...", "document_id": "...", "revision_id": "...", "approval_id": "...", "content_digest": "...", "render_digest": "..." }` |
+| `project.decision.candidate_created` | `{ "project_id": "...", "candidate_id": "...", "lifecycle": "proposed" }` |
+| `project.decision.approved` | `{ "project_id": "...", "candidate_id": "...", "decision_id": "..." }` |
+| `project.decision.candidate_rejected` | `{ "project_id": "...", "candidate_id": "...", "reason": "..." }` |
+| `project.decision.created` | `{ "project_id": "...", "decision_id": "...", "state": "active", "decision_class": "..." }` |
+| `project.execution_baseline.proposed` | `{ "project_id": "...", "baseline_id": "..." }` |
+| `project.execution_baseline.revised` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "...", "content_digest": "...", "render_digest": "..." }` |
+| `project.execution_baseline.approved` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "...", "approval_id": "..." }` |
+| `project.execution_baseline.activated` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "..." }` |
 | `task.media.uploaded` | `{ "task_id": "...", "media_id": "...", "content_type": "...", "byte_size": 12345, "filename": "evidence.png" }` |
 | `task.media.deleted` | `{ "task_id": "...", "media_id": "..." }` |
+| `project.media.uploaded` | `{ "project_id": "...", "asset_id": "...", "content_type": "...", "byte_size": 12345, "filename": "evidence.png", "checksum": "..." }` |
+| `project.media.redacted` | `{ "project_id": "...", "asset_id": "...", "target_availability": "redacted", "expected_version": 3, "mutation_fingerprint": "...", "authorization_event_id": "..." }` |
+| `project.media.purged` | `{ "project_id": "...", "asset_id": "...", "target_availability": "purged", "expected_version": 3, "mutation_fingerprint": "...", "authorization_event_id": "..." }` |
+| `project.evidence.attached` | `{ "project_id": "...", "milestone_id": "...", "asset_id": "...", "evidence_id": "..." }` |
+| `project.evidence.removed` | `{ "project_id": "...", "milestone_id": "...", "evidence_id": "..." }` |
+| `milestone.released` | `{ "release_id": "...", "release_identity": "M001-r1", "readiness_snapshot_id": "...", "readiness_digest": "...", "snapshot_digest": "..." }` |
 
 ### Markdown evidence patterns
 

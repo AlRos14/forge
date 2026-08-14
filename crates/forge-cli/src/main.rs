@@ -131,6 +131,10 @@ async fn main() {
         Arc::clone(&event_bus),
         workspace_root.clone(),
     ));
+    let shared_media_cleanup_scheduler = Arc::new(services::SharedMediaCleanupScheduler::new(
+        Arc::clone(&db),
+        media_storage_root(&effective_config.forge.data_dir),
+    ));
     let review_runner = Arc::new(review::ReviewRunner::new(
         Arc::clone(&db),
         Arc::clone(&event_bus),
@@ -235,6 +239,8 @@ async fn main() {
     }
     let project_hook_service_handle = Arc::clone(&state.project_hook_service).start();
     let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    let shared_media_cleanup_handle =
+        Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
     let task_dispatcher = Arc::new(services::TaskDispatcher::new(
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),
@@ -376,6 +382,7 @@ async fn main() {
 
     let _ = shutdown_handle.await;
     let _ = cleanup_handle.await;
+    let _ = shared_media_cleanup_handle.await;
     match tokio::time::timeout(Duration::from_secs(5), monitor_handle).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(%error, "heartbeat monitor task failed during shutdown"),
@@ -461,6 +468,10 @@ fn absolute_path(path: PathBuf) -> std::io::Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+fn media_storage_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("media")
 }
 
 fn bind_server_listener(config: &ForgeConfig, configured_addr: SocketAddr) -> TcpListener {
@@ -557,8 +568,11 @@ fn local_url(port: u16, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute_path, server_url_for_addr, web_dist_dir};
-    use std::{net::SocketAddr, path::PathBuf};
+    use super::{absolute_path, media_storage_root, server_url_for_addr, web_dist_dir};
+    use std::{
+        net::SocketAddr,
+        path::{Path, PathBuf},
+    };
 
     #[test]
     fn absolute_path_preserves_absolute_paths() {
@@ -577,6 +591,13 @@ mod tests {
 
         assert!(path.is_absolute());
         assert!(path.ends_with("test/workspaces"));
+    }
+
+    #[test]
+    fn media_storage_root_matches_task_media_layout() {
+        let data_dir = Path::new("/tmp/forge-data");
+
+        assert_eq!(media_storage_root(data_dir), data_dir.join("media"));
     }
 
     #[test]

@@ -3,9 +3,10 @@
 mod common;
 
 use api_types::{
-    AgentChatMessageListResponse, AgentHandoffResponse, ConnectedEmbeddedAgentResponse,
-    ErrorResponse, ProductGenesisActiveResponse, ProductGenesisSession,
-    ProductGenesisStartResponse, ProjectResponse,
+    AgentChatMessageListResponse, ConnectedEmbeddedAgentResponse, ErrorResponse,
+    ProductGenesisActiveResponse, ProductGenesisCharterResponse, ProductGenesisLifecycle,
+    ProductGenesisSession, ProductGenesisStartResponse, ProjectCharterApproval,
+    ProjectCharterRevision, ProjectResponse,
 };
 use axum::{http::Method, http::StatusCode, Router};
 use serde_json::json;
@@ -81,7 +82,7 @@ async fn product_genesis_uses_existing_main_chat_and_is_cancelable() {
     );
     assert!(instruction
         .get::<String, _>("body")
-        .contains("Product Genesis protocol v1"));
+        .contains("Forge Main Agent — Project Discovery and Portfolio Protocol v2"));
 
     let active: ProductGenesisActiveResponse = common::empty_request_with_bearer(
         app,
@@ -223,13 +224,13 @@ async fn product_genesis_requires_main_binding_and_hides_cross_account_sessions(
 }
 
 #[tokio::test]
-async fn ready_genesis_uses_normal_project_chat_handoff_and_completes() {
-    let workspace = common::TestDir::new("product-genesis-handoff");
-    let harness = common::test_app(workspace.path(), "product-genesis-handoff").await;
+async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
+    let workspace = common::TestDir::new("product-genesis-charter-create");
+    let harness = common::test_app(workspace.path(), "product-genesis-charter-create").await;
     let app = &harness.app;
     let token = common::test_jwt();
 
-    let connected = connect_genesis_agent(app, &token, "genesis-handoff").await;
+    let connected = connect_genesis_agent(app, &token, "genesis-charter-create").await;
     let binding: api_types::MainAgentBindingResponse = common::json_request_with_bearer(
         app,
         Method::PUT,
@@ -249,138 +250,449 @@ async fn ready_genesis_uses_normal_project_chat_handoff_and_completes() {
         Method::POST,
         "/api/v1/account/main-agent/product-genesis",
         &token,
-        json!({ "initial_idea": "A product that needs a Project handoff" }),
+        json!({
+            "maturity": "mvp",
+            "initial_idea": "A small, durable project that needs an exact Charter handoff",
+            "preferred_project_agent_identity_id": connected.agent.id
+        }),
         StatusCode::CREATED,
     )
     .await;
 
-    let genesis = services::ProductGenesisService::for_sqlite(harness.state.db.clone());
-    // The Main Agent's typed readiness action is persisted before the normal
-    // Project API path records its atomic Project/chat/binding result.
-    let ready: ProductGenesisSession = common::json_request_with_bearer(
+    let initial_projection: ProductGenesisCharterResponse = common::empty_request_with_bearer(
         app,
-        Method::POST,
+        Method::GET,
         &format!(
-            "/api/v1/account/main-agent/product-genesis/{}/ready",
+            "/api/v1/account/main-agent/product-genesis/{}/charter",
             started.session.id
         ),
         &token,
-        json!({ "expected_version": started.session.version }),
         StatusCode::OK,
     )
     .await;
-    assert!(matches!(
-        ready.lifecycle,
-        api_types::ProductGenesisLifecycle::ReadyForProject
-    ));
-
-    let project: ProjectResponse = common::json_request_with_bearer(
-        app,
-        Method::POST,
-        "/api/v1/projects",
-        &token,
-        json!({
-            "name": "Genesis handoff project",
-            "project_agent_identity_id": connected.agent.id,
-            "project_agent_profile_id": connected.profile.id,
-            "product_genesis_session_id": started.session.id
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    let project_linked = genesis
-        .get(&started.session.id)
-        .await
-        .expect("Genesis project link remains readable");
+    assert!(initial_projection.charter.is_none());
+    let selected_agent = initial_projection
+        .selected_project_agent
+        .expect("Genesis must project the selected Project Agent");
+    assert_eq!(selected_agent.identity_id, connected.agent.id);
+    assert_eq!(selected_agent.profile_revision_id, connected.profile.id);
     assert_eq!(
-        project_linked.project_id.as_deref(),
-        Some(project.id.as_str())
+        selected_agent.operating_skill_revision,
+        "forge.project.orchestration/v1@1"
     );
-    assert!(matches!(
-        project_linked.lifecycle,
-        api_types::ProductGenesisLifecycle::ReadyForProject
-    ));
 
-    let replayed_project: ProjectResponse = common::json_request_with_bearer(
+    let content = exact_charter_content();
+    let rendered = services::render_and_digest_charter(&content);
+    let charter_id = "charter-genesis-exact";
+    let save: ProjectCharterRevision = common::json_request_with_bearer(
         app,
         Method::POST,
-        "/api/v1/projects",
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter/revisions",
+            started.session.id
+        ),
         &token,
         json!({
-            "name": "A replay must not fork Genesis",
-            "project_agent_identity_id": connected.agent.id,
-            "project_agent_profile_id": connected.profile.id,
-            "product_genesis_session_id": started.session.id
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(replayed_project.id, project.id);
-
-    let failed_handoff: ErrorResponse = common::json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/agent-handoffs", project.id),
-        &token,
-        json!({
-            "source_message_id": ready.source_message_ids[0],
-            "content": "x".repeat(20_000),
-            "dedupe_key": "genesis-handoff-failed-before-persist"
-        }),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    assert!(failed_handoff.message.contains("bounded"));
-    let after_failed_handoff = genesis
-        .get(&started.session.id)
-        .await
-        .expect("failed handoff keeps Genesis durable");
-    assert_eq!(
-        after_failed_handoff.project_id.as_deref(),
-        Some(project.id.as_str())
-    );
-    assert!(matches!(
-        after_failed_handoff.lifecycle,
-        api_types::ProductGenesisLifecycle::ReadyForProject
-    ));
-    assert!(after_failed_handoff
-        .failure_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("bounded publication limit")));
-
-    let handoff: AgentHandoffResponse = common::json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/agent-handoffs", project.id),
-        &token,
-        json!({
-            // A Genesis handoff may cite the Main turn/response rather than
-            // one of the user discovery inputs recorded on the session.
-            "source_turn_job_id": started.admitted_turn_id,
-            "content": "Approved bounded brief for the Project Agent.",
-            "dedupe_key": "genesis-handoff-1"
+            "mutation": {
+                "expected_version": 1,
+                "idempotency_key": "charter-revision-save-1",
+                "authorization": user_authorization(
+                    "project_charter.revision.save",
+                    "charter-save-event"
+                )
+            },
+            "charter_id": charter_id,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": content,
+            "rendered_view": rendered.rendered_view,
+            "render_version": rendered.render_version,
+            "provenance": {
+                "author": { "kind": "user", "id": "test-user-id" },
+                "operating_skill_revision": "forge.main.project-discovery/v2@1",
+                "source_refs": [{
+                    "source_kind": "main_chat",
+                    "source_id": binding.chat_id,
+                    "label": "Main Chat discovery"
+                }],
+                "change_summary": "Initial approved Project Charter"
+            }
         }),
         StatusCode::CREATED,
     )
     .await;
-    assert_eq!(handoff.source_chat_id, binding.chat_id);
-    assert_eq!(handoff.target_project_id, project.id);
+    assert_eq!(save.charter_id, charter_id);
+    assert_eq!(save.revision_number, 1);
+    assert_eq!(save.content_digest, rendered.content_digest);
+    assert_eq!(save.render_digest, rendered.render_digest);
     assert!(matches!(
-        handoff.status,
-        api_types::AgentHandoffStatus::Pending | api_types::AgentHandoffStatus::Delivered
+        save.lifecycle,
+        api_types::CharterRevisionLifecycle::Proposed
+    ));
+    assert_eq!(
+        save.readiness
+            .as_ref()
+            .expect("save evaluates Charter readiness")
+            .status,
+        api_types::CharterReadinessStatus::Ready
+    );
+
+    let projection: ProductGenesisCharterResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter",
+            started.session.id
+        ),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let charter = projection.charter.expect("saved Charter is projected");
+    assert_eq!(charter.id, charter_id);
+    assert_eq!(charter.version, 2);
+    assert_eq!(
+        charter.current_draft_revision_id.as_deref(),
+        Some(save.id.as_str())
+    );
+    assert_eq!(projection.revisions.len(), 1);
+    assert_eq!(
+        projection
+            .current_draft_revision
+            .as_ref()
+            .expect("draft pointer is projected")
+            .content_digest,
+        rendered.content_digest
+    );
+    assert!(projection.approval.is_none());
+
+    let approval_body = |content_digest: &str, approval_key: &str| {
+        json!({
+            "mutation": {
+                "expected_version": charter.version,
+                "expected_digest": rendered.content_digest,
+                "idempotency_key": approval_key,
+                "authorization": user_authorization(
+                    "product_genesis.charter_approval",
+                    format!("approval-event-{approval_key}")
+                )
+            },
+            "charter_id": charter_id,
+            "revision_id": save.id,
+            "content_digest": content_digest,
+            "render_digest": rendered.render_digest,
+            "expected_charter_version": charter.version,
+            "approved_project_name": content.identity.working_name,
+            "approved_project_slug": "exact-charter-project",
+            "project_mode": "compact",
+            "selected_project_agent_identity_id": selected_agent.identity_id,
+            "selected_project_agent_profile_revision_id": selected_agent.profile_revision_id,
+            "selected_project_agent_operating_skill_revision": selected_agent.operating_skill_revision,
+            "selected_project_agent_policy_digest": selected_agent.policy_digest
+        })
+    };
+
+    let stale_digest: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter/revisions/{}/approve",
+            started.session.id, save.id
+        ),
+        &token,
+        approval_body("stale-content-digest", "approval-stale"),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(stale_digest.message.contains("digest"));
+
+    let other_user_token = jwt_for("other-user-id", "other@example.com");
+    let mut cross_user_approval_body =
+        approval_body(&rendered.content_digest, "approval-cross-user");
+    cross_user_approval_body["mutation"]["authorization"]["principal"]["id"] =
+        json!("other-user-id");
+    let cross_user: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter/revisions/{}/approve",
+            started.session.id, save.id
+        ),
+        &other_user_token,
+        cross_user_approval_body,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(cross_user.message.contains("product_genesis_session"));
+
+    let approval: ProjectCharterApproval = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter/revisions/{}/approve",
+            started.session.id, save.id
+        ),
+        &token,
+        approval_body(&rendered.content_digest, "approval-exact"),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(approval.charter_id, charter_id);
+    assert_eq!(approval.charter_revision_id, save.id);
+    assert_eq!(approval.charter_content_digest, rendered.content_digest);
+    assert_eq!(approval.charter_render_digest, rendered.render_digest);
+    assert_eq!(approval.expected_charter_version, charter.version);
+    assert_eq!(
+        approval.approved_project_name,
+        content.identity.working_name
+    );
+    assert_eq!(
+        approval.selected_project_agent_identity_id,
+        connected.agent.id
+    );
+    assert_eq!(
+        approval.selected_project_agent_profile_revision_id,
+        connected.profile.id
+    );
+    assert!(matches!(
+        approval.state,
+        api_types::CharterApprovalState::Active
     ));
 
+    let mut cross_user_create_body =
+        create_from_approval_body(&approval.id, "create-cross-user", "other-user-event");
+    cross_user_create_body["authorization"]["principal"]["id"] = json!("other-user-id");
+    let cross_user_create: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/projects",
+        &other_user_token,
+        cross_user_create_body,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(cross_user_create
+        .message
+        .contains("project_charter_approval"));
+
+    let created: api_types::CreateProjectFromCharterApprovalResponse =
+        common::json_request_with_bearer(
+            app,
+            Method::POST,
+            "/api/v1/projects",
+            &token,
+            create_from_approval_body(&approval.id, "create-exact", "create-event-exact"),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(created.charter_id, charter_id);
+    assert_eq!(created.charter_revision_id, save.id);
+    assert!(!created.project_id.is_empty());
+    assert!(!created.project_agent_binding_id.is_empty());
+    assert!(!created.project_chat_id.is_empty());
+    assert!(!created.handoff_id.is_empty());
+    assert!(!created.target_message_id.is_empty());
+    assert!(!created.target_turn_id.is_empty());
+
+    let genesis = services::ProductGenesisService::for_sqlite(harness.state.db.clone());
     let completed = genesis
         .get(&started.session.id)
         .await
         .expect("Genesis history remains readable");
     assert!(matches!(
         completed.lifecycle,
-        api_types::ProductGenesisLifecycle::HandedOff
+        ProductGenesisLifecycle::HandedOff
     ));
-    assert_eq!(completed.project_id.as_deref(), Some(project.id.as_str()));
-    assert_eq!(completed.handoff_id.as_deref(), Some(handoff.id.as_str()));
+    assert_eq!(
+        completed.project_id.as_deref(),
+        Some(created.project_id.as_str())
+    );
+    assert_eq!(completed.charter_id.as_deref(), Some(charter_id));
+    assert_eq!(
+        completed.charter_revision_id.as_deref(),
+        Some(save.id.as_str())
+    );
+    assert_eq!(
+        completed.charter_approval_id.as_deref(),
+        Some(approval.id.as_str())
+    );
+    assert_eq!(
+        completed.handoff_id.as_deref(),
+        Some(created.handoff_id.as_str())
+    );
+
+    let project: ProjectResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", created.project_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(project.id, created.project_id);
+    assert_eq!(project.name, content.identity.working_name);
+    assert_eq!(project.charter_status, "charter_backed");
+    assert!(!project.charter_setup_required);
+    assert_eq!(project.current_charter_id.as_deref(), Some(charter_id));
+    assert_eq!(
+        project.current_charter_revision_id.as_deref(),
+        Some(save.id.as_str())
+    );
+    assert_eq!(project.current_charter_version, charter.version + 1);
+    assert!(project.primary_milestone_id.is_some());
+
+    let approval_projection: ProductGenesisCharterResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter",
+            started.session.id
+        ),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let consumed = approval_projection
+        .approval
+        .expect("consumed receipt remains visible");
+    assert_eq!(consumed.id, approval.id);
+    assert_eq!(
+        consumed.consumed_by_project_id.as_deref(),
+        Some(created.project_id.as_str())
+    );
+    assert!(matches!(
+        consumed.state,
+        api_types::CharterApprovalState::Consumed
+    ));
+
+    let handoff = sqlx::query(
+        "SELECT source_chat_id, target_chat_id, target_message_id, target_turn_job_id,
+                status, content, source_revisions_json
+         FROM agent_handoff WHERE id = ?",
+    )
+    .bind(&created.handoff_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("atomic Charter handoff exists");
+    assert_eq!(handoff.get::<String, _>("source_chat_id"), binding.chat_id);
+    assert_eq!(
+        handoff.get::<String, _>("target_chat_id"),
+        created.project_chat_id
+    );
+    assert_eq!(
+        handoff.get::<String, _>("target_message_id"),
+        created.target_message_id
+    );
+    assert_eq!(
+        handoff.get::<String, _>("target_turn_job_id"),
+        created.target_turn_id
+    );
+    assert_eq!(handoff.get::<String, _>("status"), "delivered");
+    let handoff_content = handoff.get::<String, _>("content");
+    assert!(handoff_content.contains(&save.id));
+    assert!(!handoff_content.contains("No other material constraints are known at approval time."));
+    let provenance: serde_json::Value =
+        serde_json::from_str(&handoff.get::<String, _>("source_revisions_json"))
+            .expect("handoff provenance is JSON");
+    assert_eq!(provenance["charter"]["id"], charter_id);
+    assert_eq!(provenance["charter"]["revision_id"], save.id);
+    assert_eq!(
+        provenance["charter"]["content_digest"],
+        rendered.content_digest
+    );
+    assert_eq!(
+        provenance["charter"]["render_digest"],
+        rendered.render_digest
+    );
+    assert_eq!(provenance["approval"]["id"], approval.id);
+    assert_eq!(
+        provenance["redaction_manifest"]["excluded_knowledge_item_ids"],
+        json!(["known-constraints"])
+    );
+    assert_eq!(provenance["target"]["chat_id"], created.project_chat_id);
+    assert_eq!(
+        provenance["target"]["binding_id"],
+        created.project_agent_binding_id
+    );
+
+    let message_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_message WHERE chat_id = ? AND id = ?")
+            .bind(&created.project_chat_id)
+            .bind(&created.target_message_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("target handoff message exists");
+    assert_eq!(message_count, 1);
+    let turn_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_turn_job WHERE chat_id = ? AND id = ?")
+            .bind(&created.project_chat_id)
+            .bind(&created.target_turn_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("target turn job exists");
+    assert_eq!(turn_count, 1);
+    let chat_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_chat WHERE project_id = ? AND kind = 'project'",
+    )
+    .bind(&created.project_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("one Project Chat exists");
+    assert_eq!(chat_count, 1);
+    let active_binding_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_agent_binding WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(&created.project_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("one active Project Agent binding exists");
+    assert_eq!(active_binding_count, 1);
+    let project_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE id = ?")
+        .bind(&created.project_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("one Project exists");
+    assert_eq!(project_count, 1);
+
+    let replayed: api_types::CreateProjectFromCharterApprovalResponse =
+        common::json_request_with_bearer(
+            app,
+            Method::POST,
+            "/api/v1/projects",
+            &token,
+            create_from_approval_body(&approval.id, "create-exact", "create-event-exact"),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(replayed, created);
+
+    let changed_authorization: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/projects",
+        &token,
+        create_from_approval_body(&approval.id, "create-exact", "create-event-replay"),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(changed_authorization.message.contains("idempotency"));
+
+    let mismatched_key: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/projects",
+        &token,
+        create_from_approval_body(&approval.id, "create-different", "create-event-fork"),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(mismatched_key.message.contains("idempotency"));
+
+    let project_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project")
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("project count remains queryable");
+    assert_eq!(project_count_after, 1);
 }
 
 async fn connect_genesis_agent(
@@ -411,4 +723,138 @@ async fn connect_genesis_agent(
         StatusCode::OK,
     )
     .await
+}
+
+fn user_authorization(action: &str, event_id: impl Into<String>) -> serde_json::Value {
+    json!({
+        "principal": { "kind": "user", "id": "test-user-id" },
+        "authorization_basis": "explicit_user_authorization",
+        "action": action,
+        "event_id": event_id.into(),
+        "occurred_at": "2026-08-13T00:00:00Z"
+    })
+}
+
+fn create_from_approval_body(
+    approval_id: &str,
+    idempotency_key: &str,
+    event_id: &str,
+) -> serde_json::Value {
+    json!({
+        "approval_id": approval_id,
+        "idempotency_key": idempotency_key,
+        "authorization": user_authorization(
+            "product_genesis.create_project_from_approval",
+            event_id
+        )
+    })
+}
+
+fn exact_charter_content() -> api_types::ProjectCharterContent {
+    api_types::ProjectCharterContent {
+        identity: api_types::CharterIdentity {
+            working_name: "Exact Charter Project".to_owned(),
+            slug_proposal: Some("exact-charter-project".to_owned()),
+            one_line_vision: "A focused project with an auditable handoff.".to_owned(),
+            maturity: api_types::ProductMaturity::Mvp,
+            lifecycle_intent: Some("validate the smallest useful workflow".to_owned()),
+            project_type: Some("product".to_owned()),
+            value_proposition: Some("Keep approved intent durable and traceable.".to_owned()),
+        },
+        problem_and_people: api_types::CharterProblemAndPeople {
+            problem_or_opportunity:
+                "Project intent is otherwise lost between discovery and execution.".to_owned(),
+            target_users: vec!["Forge builders".to_owned()],
+            beneficiaries: vec!["Project collaborators".to_owned()],
+            jobs_pains_opportunity: vec!["Turn a rough idea into an executable brief.".to_owned()],
+            current_alternatives: vec!["Unversioned chat notes".to_owned()],
+            stakeholders: vec!["Project owner".to_owned()],
+            excluded_audiences: vec!["Unrelated projects".to_owned()],
+        },
+        core_experience: api_types::CharterCoreExperience {
+            primary_outcome: "A Project Agent starts from one approved, bounded Charter."
+                .to_owned(),
+            core_loop: Some("discover, approve, hand off, validate".to_owned()),
+            principal_journeys: Vec::new(),
+        },
+        scope: api_types::CharterScope {
+            must_have_outcomes: vec!["Persist the approved Charter and handoff.".to_owned()],
+            required_deliverables: vec!["One Project Chat with one queued turn.".to_owned()],
+            later_possibilities: vec![
+                "Expand the Charter through Project-local revisions.".to_owned()
+            ],
+            explicit_non_goals: vec!["Managing unrelated Projects".to_owned()],
+        },
+        success: api_types::CharterSuccessBoundary {
+            qualitative_outcome: Some(
+                "The Project Agent can continue without restating intent.".to_owned(),
+            ),
+            success_signals: vec!["The handoff preserves exact Charter digests.".to_owned()],
+            acceptance_statements: vec!["A replay does not create a second Project.".to_owned()],
+            required_evidence: vec!["Database assertions and API integration test.".to_owned()],
+            non_claims: vec!["This does not prove repository implementation quality.".to_owned()],
+        },
+        constraints_and_risks: api_types::CharterConstraintsAndRisks {
+            product: vec!["Single-user local-first operation.".to_owned()],
+            time_and_budget: Vec::new(),
+            technology: vec!["SQLite and the existing Forge API.".to_owned()],
+            data: vec!["Do not copy hidden Main Chat history.".to_owned()],
+            integrations: Vec::new(),
+            security_privacy_compliance: vec!["Require explicit user approval.".to_owned()],
+            accessibility: Vec::new(),
+            operations: Vec::new(),
+            migration: Vec::new(),
+            launch: Vec::new(),
+            agent_authority: vec!["Project Agent remains Project-scoped.".to_owned()],
+            risks: Vec::new(),
+        },
+        knowledge_ledger: api_types::CharterKnowledgeLedger {
+            items: vec![api_types::CharterKnowledgeItem {
+                id: "known-constraints".to_owned(),
+                statement: "No other material constraints are known at approval time.".to_owned(),
+                kind: api_types::CharterKnowledgeKind::UserDecision,
+                normative: false,
+                transfer_approved: false,
+                provenance: Vec::new(),
+                confidence: Some(api_types::CharterConfidence::NotApplicable),
+                observed_at: None,
+                freshness_expires_at: None,
+                impact: None,
+                owner: None,
+                default_value: None,
+                revisit_trigger: None,
+                falsification_evidence: None,
+                blocking: false,
+            }],
+        },
+        handoff_note: Some(api_types::CharterHandoffNote {
+            recommended_first_action: Some(
+                "Create the first Project-local execution plan.".to_owned(),
+            ),
+            bounded_summary: Some(
+                "Start by validating the approved problem and outcome.".to_owned(),
+            ),
+            unresolved_item_ids: Vec::new(),
+        }),
+    }
+}
+
+fn jwt_for(subject: &str, email: &str) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after epoch")
+        .as_secs();
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": subject,
+            "email": email,
+            "is_admin": false,
+            "iat": now,
+            "exp": now + 900,
+        }),
+        &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
+    )
+    .expect("encode alternate test jwt")
 }

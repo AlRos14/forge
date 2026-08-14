@@ -4,17 +4,18 @@ use crate::{
     AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimTask, CompareAndMoveTask,
     CompleteDomainEvent, CreateAgent, CreateAgentContextScope, CreateAgentSession,
     CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
+    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
     CreateProjectMember, CreateRepo, CreateReview, CreateSkill, CreateTask,
     CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace, DaemonRepo, DaemonStatus,
     DbError, DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryAccessQuery, MemoryConfidence,
     MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType,
     MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery, NotificationRepo, PageRequest,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus,
-    RotateAgentSession, ScopedMemoryRepository, SkillRepo, SortBy, SortOrder, SqliteDb, Task,
-    TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo,
-    TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution, UpdateProject,
-    UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
-    UpsertDaemon, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo, RepoRepo,
+    ReviewRepo, ReviewStatus, RotateAgentSession, ScopedMemoryRepository, SkillRepo, SortBy,
+    SortOrder, SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    UpdateExecution, UpdateProject, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -35,6 +36,81 @@ async fn sqlite_db() -> SqliteDb {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     SqliteDb::new(pool)
+}
+
+#[tokio::test]
+async fn atomic_first_charter_revision_rolls_back_new_ownership_on_failure() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, created_at, updated_at)
+         VALUES (?, ?, '{}', ?, ?)",
+    )
+    .bind("charter-rollback-project")
+    .bind("Charter rollback project")
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("project fixture inserts");
+
+    let result = ProjectOrchestrationRepo::create_project_charter_revision_atomically(
+        &db,
+        CreateProjectCharterRevisionAtomically {
+            project_id: Some("charter-rollback-project".to_owned()),
+            genesis_session_id: None,
+            account_id: "test-user-id".to_owned(),
+            charter: CreateProjectCharter {
+                id: "charter-rollback".to_owned(),
+                account_id: "test-user-id".to_owned(),
+                genesis_session_id: None,
+                project_mode: "compact".to_owned(),
+                maturity: "mvp".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            revision: CreateProjectCharterRevision {
+                id: "charter-rollback-revision".to_owned(),
+                charter_id: "charter-rollback".to_owned(),
+                expected_charter_version: 1,
+                project_mode: "compact".to_owned(),
+                maturity: "mvp".to_owned(),
+                base_revision: 0,
+                base_revision_id: None,
+                lifecycle: "proposed".to_owned(),
+                schema_version: "forge.project-charter/v1".to_owned(),
+                render_version: "forge.project-charter-render/v1".to_owned(),
+                content_json: "not-json".to_owned(),
+                rendered_view: "invalid".to_owned(),
+                change_summary: "rollback fixture".to_owned(),
+                author_type: "user".to_owned(),
+                author_id: Some("test-user-id".to_owned()),
+                source_message_id: None,
+                source_turn_job_id: None,
+                source_refs_json: "[]".to_owned(),
+                content_digest: "content-digest".to_owned(),
+                rendered_digest: "rendered-digest".to_owned(),
+                created_at: now,
+            },
+        },
+    )
+    .await;
+    assert!(result.is_err());
+
+    let charter_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM project_charter WHERE id = 'charter-rollback'")
+            .fetch_one(db.pool())
+            .await
+            .expect("charter count queries");
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_charter_revision
+         WHERE charter_id = 'charter-rollback'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("revision count queries");
+    assert_eq!(charter_count, 0);
+    assert_eq!(revision_count, 0);
 }
 
 #[tokio::test]
@@ -4821,4 +4897,295 @@ async fn direct_task_status_updates_emit_a_ledger_event_atomically() {
     let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
     assert_eq!(payload["from_status"], "todo");
     assert_eq!(payload["to_status"], "in_progress");
+}
+
+#[tokio::test]
+async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gate() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "todo".to_owned(),
+        "baseline race task",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = now_rfc3339();
+    let charter_id = new_uuid_v4();
+    let charter_revision_id = new_uuid_v4();
+    let baseline_id = new_uuid_v4();
+    let baseline_revision_id = new_uuid_v4();
+    let approval_id = new_uuid_v4();
+    let user_id = new_uuid_v4();
+
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES (?, ?, 'test', 'Baseline Race User', ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(format!("{user_id}@example.test"))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("user creates");
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&user_id)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("Project owner updates");
+    sqlx::query(
+        "INSERT INTO project_charter
+         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
+         VALUES (?, ?, ?, 'standard', 'mvp', 'attached', ?, ?)",
+    )
+    .bind(&charter_id)
+    .bind(&user_id)
+    .bind(&project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("Charter creates");
+    sqlx::query(
+        "INSERT INTO project_charter_revision
+         (id, charter_id, revision, base_revision, lifecycle, schema_version,
+          render_version, content_json, rendered_view, author_type, author_id,
+          content_digest, rendered_digest, created_at)
+         VALUES (?, ?, 1, 0, 'approved', 'test-schema', 'test-render', '{}',
+                 'approved Charter', 'user', ?, 'charter-content-digest',
+                 'charter-render-digest', ?)",
+    )
+    .bind(&charter_revision_id)
+    .bind(&charter_id)
+    .bind(&user_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("Charter revision creates");
+    sqlx::query(
+        "UPDATE project_charter
+         SET current_approved_revision_id = ?, version = 2, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&charter_revision_id)
+    .bind(&now)
+    .bind(&charter_id)
+    .execute(db.pool())
+    .await
+    .expect("Charter approval pointer updates");
+    sqlx::query(
+        "UPDATE project
+         SET charter_status = 'charter_backed', charter_setup_required = 0,
+             current_charter_id = ?, current_charter_revision_id = ?,
+             current_charter_version = 2, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&charter_id)
+    .bind(&charter_revision_id)
+    .bind(&now)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .expect("Project becomes Charter-backed");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline
+         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
+         VALUES (?, ?, ?, 'active', 1, ?, ?)",
+    )
+    .bind(&baseline_id)
+    .bind(&project_id)
+    .bind(&baseline_revision_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("active baseline creates");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline_revision
+         (id, baseline_id, revision, base_revision, lifecycle, charter_revision_id,
+          release_policy_revision, release_policy_digest, schema_version, render_version,
+          rendered_view, content_digest, rendered_digest, created_at)
+         VALUES (?, ?, 1, 0, 'approved', ?, 'policy-1', 'policy-digest',
+                 'schema-1', 'render-1', 'approved baseline', 'content-digest',
+                 'render-digest', ?)",
+    )
+    .bind(&baseline_revision_id)
+    .bind(&baseline_id)
+    .bind(&charter_revision_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("approved baseline revision creates");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline_approval
+         (id, baseline_id, revision_id, expected_project_version, principal_type,
+          principal_id, authorization_basis, authorization_action,
+          authorization_occurred_at, explicit_event, content_digest,
+          rendered_digest, lifecycle, idempotency_key, created_at, updated_at)
+         VALUES (?, ?, ?, 1, 'user', ?, 'test',
+                 'project.execution_baseline.approve', '2026-08-13T00:00:00Z',
+                 'approve exact baseline',
+                 'content-digest', 'render-digest', 'consumed', ?, ?, ?)",
+    )
+    .bind(&approval_id)
+    .bind(&baseline_id)
+    .bind(&baseline_revision_id)
+    .bind(&user_id)
+    .bind(format!("approval-{approval_id}"))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline approval creates");
+    sqlx::query(
+        "INSERT INTO project_task_governance
+         (task_id, project_id, charter_revision_id, baseline_id, baseline_revision_id,
+          runnable, provenance_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, '{}', ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&project_id)
+    .bind(&charter_revision_id)
+    .bind(&baseline_id)
+    .bind(&baseline_revision_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("runnable governance creates");
+
+    // This represents the race after the service's read-only admission gate:
+    // the exact baseline is superseded before the authoritative execution
+    // INSERT transaction starts.
+    sqlx::query(
+        "UPDATE project_execution_baseline
+         SET lifecycle = 'superseded', version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&baseline_id)
+    .execute(db.pool())
+    .await
+    .expect("baseline supersedes");
+    sqlx::query(
+        "UPDATE project_task_governance
+         SET runnable = 0, version = version + 1, updated_at = ?
+         WHERE task_id = ?",
+    )
+    .bind(&now)
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("governance is revoked");
+
+    let task_before = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task reads")
+        .expect("task exists");
+    let mut claim_transaction = db.pool().begin().await.expect("claim transaction begins");
+    let claim = TaskRepo::claim(
+        &db,
+        &mut claim_transaction,
+        ClaimTask {
+            task_id: task_id.clone(),
+            assignee_type: "agent".to_owned(),
+            assignee_id: Some(agent_id.clone()),
+            expected_version: task_before.version,
+            source_status: "todo".to_owned(),
+            target_status: "in_progress".to_owned(),
+            capacity_statuses: vec!["in_progress".to_owned()],
+            execution: CreateExecution {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                agent_id: Some(agent_id.clone()),
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            max_concurrent_tasks: 1,
+            claimed_at: now.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(claim, Err(DbError::InvalidTransition)));
+    claim_transaction
+        .rollback()
+        .await
+        .expect("claim transaction rolls back");
+    let task_after = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task rereads")
+        .expect("task remains");
+    assert_eq!(task_after.version, task_before.version);
+    assert_eq!(task_after.status, "todo");
+    assert!(task_after.assignee_id.is_none());
+
+    let execution = ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(execution, Err(DbError::InvalidTransition)));
+    let execution_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("execution count reads");
+    assert_eq!(execution_count, 0, "stale baseline must not mint execution");
+    let workspace_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("workspace count reads");
+    assert_eq!(
+        workspace_count, 1,
+        "race guard does not duplicate a workspace"
+    );
 }

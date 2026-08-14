@@ -27,8 +27,9 @@ use futures_util::StreamExt;
 use crate::{
     AgentHostError, AgentSessionBackend, AgentTurnOutput, AgentTurnRequest, BackendCapabilities,
     CanonicalScope, CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION,
-    ForgeToolProvider, InteractionBrokerHandle, RuntimeContextManifestLink, ScopeToolComposition,
-    TurnEventSink, protected_store::SqliteProtectedRuntimeStore, transport::ReqwestTransport,
+    ForgeToolProvider, InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
+    ScopeToolComposition, TurnEventSink, protected_store::SqliteProtectedRuntimeStore,
+    transport::ReqwestTransport,
 };
 
 #[derive(Clone)]
@@ -142,13 +143,16 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             | CanonicalScopeType::Project
             | CanonicalScopeType::AgentChat => None,
         };
-        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
             binding.identity_id.clone(),
             binding.scope.clone(),
             binding.task_role.as_deref(),
             composed_workspace_root.as_deref(),
             &binding.allowed_permissions,
-            binding.agent_chat_project_id.is_some(),
+            ProjectChatToolContext {
+                is_project_agent_chat: binding.agent_chat_project_id.is_some(),
+                charter_setup_required: binding.project_charter_setup_required,
+            },
             self.forge_tool_provider.clone(),
         )?;
         let provider = Self::provider(&request)?;

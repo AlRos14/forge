@@ -105,7 +105,39 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 ```
 
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
-`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
+`FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
+`FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+
+### Optional bounded public web search
+
+Main and Project Agent Chats can use a direct `forge_public_web_search` tool
+for quick public facts when a non-authenticated HTTPS endpoint is configured.
+The endpoint is opt-in and receives only `q` and `limit` query parameters;
+Forge sends no cookies, browser state, credentials, or filesystem data.
+Configure it in `forge.yaml`:
+
+```yaml
+public_search:
+  endpoint: https://search.example.test/forge
+  timeout_ms: 5000
+  max_response_bytes: 262144
+```
+
+The endpoint must return bounded JSON in the form
+`{"results":[{"url":"https://…","title":"…","snippet":"…"}]}`.
+Forge caps queries at 512 characters, results at 10, title/snippet lengths,
+the response body, and the request deadline. Result text is marked as
+untrusted external data and is never persisted as a user decision. Forge
+disables redirects and ambient proxy/cookie/auth state, revalidates DNS
+addresses at connect time, and rejects private, special-use, and
+IPv4-mapped IPv6 targets. The tool is omitted when
+`public_search.endpoint` is unset; invalid configuration is rejected before
+startup. Direct `web.search` proposals are not persisted as `AgentAction`
+rows.
+
+The equivalent environment variables are `FORGE_PUBLIC_SEARCH_ENDPOINT`,
+`FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, and `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`.
 
 JWT signing uses `server.jwt_secret` in the config file or `FORGE_JWT_SECRET`
 when set. Otherwise Forge reads or creates `<data_dir>/jwt_secret.bin` on first
@@ -211,6 +243,69 @@ happen only in admitted Task Worker/reviewer Workspaces. A handoff is an
 immutable, bounded, provenance-linked packet with at most one target turn, not
 shared hidden context or a second chat.
 
+## Starting a Project from Main Chat
+
+Use the global Main Chat for Product Genesis. The server-owned
+`forge.main.project-discovery/v2` skill keeps the discovery turn bounded (at
+most two consequential questions), separates facts from user decisions,
+research, assumptions, and hypotheses, and maintains a revisioned Project
+Charter. It recommends the Project name, mode (`compact` or `standard`), scope,
+non-goals, success signal, constraints, and selected Project Agent; only the
+user approves the exact Charter revision.
+
+The Main Chat shows the exact Charter content/render digests and approval target.
+Approval creates a single-use receipt. Project creation then uses the typed
+`CreateProjectFromCharterApproval` operation with that receipt and an
+idempotency key. A ready Genesis brief or a generic
+`product_genesis_session_id` is not enough. The atomic operation creates the
+Project, Project Agent binding and Chat, Charter attachment, handoff, target
+message/turn, events, and `handed_off` Genesis state together. If it fails,
+Forge leaves Genesis `ready_for_project`, keeps the receipt active, and creates
+no partial Project or handoff; retrying with the same key returns the original
+result after a committed response loss.
+
+Use the “Continue with Project Agent” action to enter the Project Chat. The
+Project Agent acknowledges the approved Charter, avoids re-asking settled
+questions, and creates only the typed Documents needed by the Project:
+`research`, `delivery_brief`, `product_spec`, `design`, `architecture`, or
+`execution_plan`. Before a repository-capable Task can run, the user approves
+one exact execution baseline digest covering the governing artifacts,
+acceptance/evidence matrix, risk/capability classes, release policy, and
+adaptive envelope. The Project Agent can then manage Tasks inside that envelope;
+repository access remains limited to scheduler-issued Task Workspaces.
+
+Milestones are outcome contracts, not editable percentages. Their definition
+revisions and live lifecycle are distinct. The Project Agent may request a
+standalone readiness evaluation; Forge stores an immutable `ReadinessSnapshot`
+and moves a successful unreleased milestone to `ready_for_release`. Readiness
+creates no release pins. The user releases by naming the exact snapshot ID and
+digest; Forge recomputes it inside the release transaction and creates one
+immutable `Mxxx-rN` manifest plus evidence pins. A release is a frozen Forge
+evidence record, not a deploy or merge. Corrections append a later revision.
+
+For screenshots, videos, and reports, reuse existing Task media from the same
+Project whenever possible. When it is reused, the Project evidence attachment
+keeps the existing asset ID, Task media ID, Task URL, storage key, and file
+bytes in place; it does not copy bytes or change the on-disk layout. Deleting
+the Task makes its Task URL unavailable, but a release pin keeps the asset
+referenced through the authorized Project evidence URL while the shared asset
+remains available.
+Evidence attachment metadata is `available`, `quarantined`, `redacted`, or
+`purged`; removing an attachment marks it purged, and the Project media route
+serves bytes only while the shared asset is available and authorized. Ordinary
+garbage collection re-checks active attachments and immutable release pins
+under a scheduler lease. The schema defines audited mandatory-purge tombstone
+and `evidence_unavailable` semantics, and V076's internal repository persists
+those audited projections. A Project owner/admin may use
+`POST /api/v1/projects/{id}/media/{asset_id}/redact` or
+`POST /api/v1/projects/{id}/media/{asset_id}/purge` with explicit user
+authorization, the current asset version, an idempotency key, and a reason.
+Redaction blocks serving through the Project media URL and renders pinned
+release evidence unavailable; the legacy Task media URL keeps its existing
+behavior while its Task attachment remains active. Purge also removes the
+shared bytes, so neither former URL serves them. Neither disposition rewrites
+the release manifest.
+
 ## Existing-data migration
 
 The correction is forward-only. Migrations `V059`–`V070` remain unchanged; the
@@ -224,6 +319,24 @@ a Task Worker. Expired/ambiguous leases become finite retry or terminal states,
 never silent success. V075 then quarantines the retired Room and membership
 tables as `legacy_*`, converts Room-scoped semantic memory to Agent Chat scope,
 and rejects any new Room authority record while retaining source provenance.
+
+The Charter, Project artifact, milestone, release, and shared-media metadata
+for this change are added by the forward-only
+`V076__project_charter_milestones_media.sql` migration. V001–V075 remain
+immutable; existing media IDs, URLs, storage keys, metadata, and file bytes are
+preserved in place, with no file move/duplication or on-disk layout break.
+
+Projects that predate the Charter model are explicitly
+`legacy_unverified`/`charter_setup_required`; migration never fabricates an
+approved Charter from old chat, Tasks, memory, or inferred names. The Project
+Chat, Tasks, evidence capture, and Document maintenance remain usable. The
+Project Agent may draft an adoption Charter from authorized current state, but
+only explicit user approval of its exact revision establishes Project truth and
+unblocks release. Existing task media IDs, URLs, storage keys, and file bytes
+remain in place; migration does not move or duplicate files or claim an on-disk
+layout break. If a migration or server restart fails, old media references and
+bytes remain usable and physical cleanup is retried separately after checking
+attachments and release pins.
 
 ## End-to-end walkthrough
 

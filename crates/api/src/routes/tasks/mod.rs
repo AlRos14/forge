@@ -16,8 +16,8 @@ use axum::{
 };
 use db::{
     now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskBoardRepo,
-    TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
+    PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SharedMediaRepo, SortBy, SortOrder,
+    TaskBoardRepo, TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
     TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;

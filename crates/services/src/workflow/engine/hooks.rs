@@ -322,6 +322,13 @@ mod tests {
             owner_id: None,
             project_hooks_json: "[]".to_owned(),
             project_work_epoch: 0,
+            charter_status: "legacy_unverified".to_owned(),
+            charter_setup_required: true,
+            current_charter_id: None,
+            current_charter_revision_id: None,
+            current_charter_version: 0,
+            primary_milestone_id: None,
+            version: 1,
             created_at: "now".to_owned(),
             updated_at: "now".to_owned(),
         }

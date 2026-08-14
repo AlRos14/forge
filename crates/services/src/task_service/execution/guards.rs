@@ -117,6 +117,40 @@ impl TaskService {
         Ok(())
     }
 
+    /// Repository Tasks have one active WorkspaceLease per Task, so any
+    /// running repository execution excludes every other role—not only a
+    /// second interactive session. This preflight prevents a losing launch
+    /// from creating a failed execution and annotating the Task while the
+    /// scheduler's legitimate execution is still running.
+    pub(super) async fn ensure_no_running_repository_execution(&self, task: &Task) -> Result<()> {
+        if task.repo_id.is_none() {
+            return Ok(());
+        }
+        let page = ExecutionRepo::list_by_task(
+            &*self.db,
+            &task.id,
+            PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?;
+        if let Some(running) = page
+            .items
+            .into_iter()
+            .find(|execution| execution.status == ExecutionStatus::Running)
+        {
+            return Err(ServiceError::invalid_operation(format!(
+                "repository execution already running: {}",
+                running.id
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) async fn check_dependency_gate(&self, task: &Task, agent_id: &str) -> Result<()> {
         let unsatisfied_dependencies =
             TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &task.id).await?;
@@ -178,6 +212,8 @@ impl TaskService {
         )
         .await
         .map_err(ServiceError::from)?;
+        self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
+            .await;
         super::publish_terminal_execution_event(self, &execution);
         if should_block_task_for_failed_execution(&execution) {
             if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {

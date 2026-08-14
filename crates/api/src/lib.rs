@@ -9,7 +9,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{any, delete, get, patch, post, put};
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -33,6 +33,12 @@ pub fn build_router(state: AppState, web_dist_dir: impl Into<PathBuf>) -> Router
 
     Router::new()
         .route("/healthz", get(healthz))
+        // Keep unknown API paths inside the API surface.  Otherwise the
+        // outer SPA fallback turns an unknown API mutation into a static-file
+        // method response (typically 405), which makes a missing API route
+        // look like a valid browser route.
+        .route("/api/v1", any(api_not_found))
+        .route("/api/v1/{*path}", any(api_not_found))
         // OAuth 2.1 endpoints for MCP client authentication.
         .route(
             "/.well-known/oauth-protected-resource",
@@ -116,8 +122,16 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::product_genesis::get_product_genesis),
         )
         .route(
-            "/api/v1/account/main-agent/product-genesis/{session_id}/ready",
-            post(routes::product_genesis::ready_product_genesis),
+            "/api/v1/account/main-agent/product-genesis/{session_id}/charter",
+            get(routes::project_orchestration::get_genesis_charter),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions",
+            post(routes::project_orchestration::save_genesis_charter_revision),
+        )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve",
+            post(routes::project_orchestration::approve_genesis_charter_revision),
         )
         .route(
             "/api/v1/account/main-agent/product-genesis/{session_id}/cancel",
@@ -179,6 +193,177 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/analytics",
             get(routes::projects::get_project_analytics),
+        )
+        .route(
+            "/api/v1/projects/{id}/overview",
+            get(routes::project_overview::get_project_overview),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-baseline",
+            get(routes::execution_baseline::get_execution_baseline)
+                .post(routes::execution_baseline::create_execution_baseline),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions",
+            post(routes::execution_baseline::save_execution_baseline_revision),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve",
+            post(routes::execution_baseline::approve_execution_baseline),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate",
+            post(routes::execution_baseline::activate_execution_baseline),
+        )
+        .route(
+            "/api/v1/projects/{id}/charter",
+            get(routes::project_charters::get_project_charter),
+        )
+        .route(
+            "/api/v1/projects/{id}/charter/revisions",
+            post(routes::project_charters::save_project_charter_revision),
+        )
+        .route(
+            "/api/v1/projects/{id}/charter/revisions/{revision_id}/approve",
+            post(routes::project_charters::approve_project_charter_revision),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/documents",
+            get(routes::project_documents::list_project_documents)
+                .post(routes::project_documents::create_project_document),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/documents/{document_id}",
+            get(routes::project_documents::get_project_document),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/documents/{document_id}/revisions",
+            get(routes::project_documents::list_project_document_revisions)
+                .post(routes::project_documents::save_project_document_revision),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/documents/{document_id}/revisions/{revision_id}",
+            get(routes::project_documents::get_project_document_revision),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/documents/{document_id}/revisions/{revision_id}/diff",
+            get(routes::project_documents::get_project_document_revision_diff),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/documents/{document_id}/approve",
+            post(routes::project_documents::approve_project_document),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/decisions",
+            get(routes::project_documents::list_decisions),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/decisions/candidates",
+            get(routes::project_documents::list_decision_candidates)
+                .post(routes::project_documents::create_decision_candidate),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/decisions/candidates/{candidate_id}",
+            get(routes::project_documents::get_decision_candidate),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/decisions/candidates/{candidate_id}/approve",
+            post(routes::project_documents::approve_decision_candidate),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/decisions/candidates/{candidate_id}/reject",
+            post(routes::project_documents::reject_decision_candidate),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/decisions/{decision_id}",
+            get(routes::project_documents::get_decision),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones",
+            get(routes::milestones::list_milestones_with_query)
+                .post(routes::milestones::create_milestone),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}",
+            get(routes::milestones::get_milestone),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/readiness",
+            post(routes::milestones::evaluate_readiness),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/readiness/history",
+            get(routes::milestones::list_readiness_snapshots),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/readiness/{snapshot_id}",
+            get(routes::milestones::get_readiness_snapshot),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/transition",
+            post(routes::milestones::transition_milestone),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result",
+            post(routes::milestones::record_milestone_check),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive",
+            post(routes::milestones::waive_milestone_check),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/revisions",
+            get(routes::milestones::list_milestone_revisions_with_query)
+                .post(routes::milestones::save_milestone_revision),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}",
+            get(routes::milestones::get_milestone_revision),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}/transition",
+            post(routes::milestones::transition_milestone_revision),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/release",
+            post(routes::milestones::release_milestone),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/primary",
+            post(routes::milestones::set_primary_milestone),
+        )
+        .route(
+            "/api/v1/projects/{id}/media",
+            get(routes::project_media::list_media).post(routes::project_media::upload_media),
+        )
+        .route(
+            "/api/v1/projects/{id}/media/{asset_id}",
+            get(routes::project_media::serve_media),
+        )
+        .route(
+            "/api/v1/projects/{id}/media/{asset_id}/redact",
+            post(routes::project_media::redact_media),
+        )
+        .route(
+            "/api/v1/projects/{id}/media/{asset_id}/purge",
+            post(routes::project_media::purge_media),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/evidence",
+            get(routes::project_media::list_evidence).post(routes::project_media::attach_evidence),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}",
+            get(routes::project_media::get_evidence)
+                .delete(routes::project_media::remove_evidence),
+        )
+        .route(
+            "/api/v1/projects/{id}/releases/{release_id}",
+            get(routes::milestones::get_release),
+        )
+        .route(
+            "/api/v1/projects/{id}/milestones/{milestone_id}/releases",
+            get(routes::milestones::list_releases),
         )
         .route(
             "/api/v1/projects/{id}/memory/search",
@@ -684,6 +869,10 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::coordination::execute_action),
         )
         .route(
+            "/api/v1/actions/{id}/execute-orchestration",
+            post(routes::coordination::execute_orchestration_action),
+        )
+        .route(
             "/api/v1/actions/{id}/execute-task",
             post(routes::coordination::execute_task_proposal),
         )
@@ -798,7 +987,7 @@ pub fn api_router(state: AppState) -> Router {
                     "http.trace",
                     request_id = %request_id,
                     method = %request.method(),
-                    uri = %request.uri(),
+                    path = %middleware::request_log_path(request.uri()),
                 )
             })
             .on_response(DefaultOnResponse::new().level(Level::INFO)),
@@ -844,6 +1033,10 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+async fn api_not_found(uri: Uri) -> impl IntoResponse {
+    errors::ApiError::not_found("route", uri.path())
+}
+
 async fn cache_control_middleware(req: Request, next: Next) -> Response {
     let uri = req.uri().clone();
     let mut response = next.run(req).await;
@@ -886,6 +1079,39 @@ async fn router_serves_spa_fallback() {
     let response = router
         .oneshot(
             Request::builder()
+                .uri("/projects/default/board")
+                .body(axum::body::Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_api_paths_do_not_fall_through_to_spa() {
+    use tower::util::ServiceExt;
+
+    let router = build_router(test_state().await, temp_web_dist());
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ready")
+                .body(axum::body::Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
                 .uri("/projects/default/board")
                 .body(axum::body::Body::empty())
                 .expect("build request"),
@@ -1062,4 +1288,17 @@ fn backoff_cap_is_stable() {
         backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
     }
     assert_eq!(backoff, std::time::Duration::from_secs(30));
+}
+
+#[test]
+fn request_trace_path_omits_sensitive_query_parameters() {
+    let request = Request::builder()
+        .uri("/api/v1/events?token=never-log-this")
+        .body(axum::body::Body::empty())
+        .expect("build request");
+
+    assert_eq!(
+        middleware::request_log_path(request.uri()),
+        "/api/v1/events"
+    );
 }

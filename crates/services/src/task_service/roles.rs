@@ -433,6 +433,8 @@ impl TaskService {
         )
         .await
         .map_err(|error| ServiceError::invalid_operation(format!("cancel failed: {error}")))?;
+        self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
+            .await;
         self.publish(ForgeEvent {
             event_type: "task.execution_cancelled".to_owned(),
             entity_id: execution.task_id.clone(),

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Forge Project Agent"
+  short_description: "Plan and orchestrate one Forge Project"
+  default_prompt: "Use $forge-project-agent to continue this approved Project through planning, Tasks, evidence, and release."

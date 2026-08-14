@@ -18,6 +18,26 @@ impl TaskService {
                 "only running executions can be started",
             ));
         }
+        // Remote and local adapters both require the scheduler-issued lease;
+        // checking at this boundary closes the gap between execution-row
+        // creation and adapter launch/recovery.
+        if let Err(error) = self.verify_execution_workspace_authority(&execution).await {
+            // Authority can be revoked or superseded between execution-row
+            // creation and this dispatch attempt.  Stop the attempt and
+            // revoke any remaining grant before surfacing the denial.
+            let failure_message = error.to_string();
+            if let Err(mark_error) = self
+                .fail_execution_before_dispatch(&execution.id, failure_message)
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %mark_error,
+                    "failed to terminalize execution after initial WorkspaceLease verification failure"
+                );
+            }
+            return Err(error);
+        }
 
         let result = async {
             let agent = match execution.agent_id.as_deref() {
@@ -87,6 +107,14 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        self.verify_active_workspace_lease(
+            &task,
+            &workspace,
+            &execution.role,
+            execution.agent_id.as_deref(),
+            &execution.id,
+        )
+        .await?;
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -94,7 +122,9 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER {
+        if execution.role == crate::workflow::default_roles::REVIEWER
+            || matches!(task.task_type.as_str(), "planning_task" | "discovery")
+        {
             executors::mark_worktree_read_only(&mut agent_config);
         }
         if agent_config.get("executor_type").and_then(Value::as_str) == Some("embedded") {
@@ -194,6 +224,28 @@ impl TaskService {
                 "execution dispatch stopped before adapter launch"
             );
             return Ok(execution_before_launch);
+        }
+
+        // Workspace lock acquisition and pre-launch preparation can outlive
+        // a lease or a baseline supersession.  Re-read the execution/task
+        // bindings and acknowledge the lease immediately before handing
+        // control to an executor.
+        if let Err(error) = self
+            .verify_execution_workspace_authority(&execution_before_launch)
+            .await
+        {
+            let failure_message = error.to_string();
+            if let Err(mark_error) = self
+                .fail_execution_before_dispatch(&execution_before_launch.id, failure_message)
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %execution_before_launch.id,
+                    %mark_error,
+                    "failed to terminalize execution after final WorkspaceLease verification failure"
+                );
+            }
+            return Err(error);
         }
 
         let description = execution_description(&execution, &task, &agent_config);
@@ -464,6 +516,9 @@ impl TaskService {
         )
         .await?;
 
+        self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)
+            .await;
+
         if let Some(token_usage) = result.usage {
             let model = token_usage
                 .model
@@ -666,7 +721,9 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER {
+        if execution.role == crate::workflow::default_roles::REVIEWER
+            || matches!(task.task_type.as_str(), "planning_task" | "discovery")
+        {
             executors::mark_worktree_read_only(&mut executor_config);
         }
         let executor_type = executor_config

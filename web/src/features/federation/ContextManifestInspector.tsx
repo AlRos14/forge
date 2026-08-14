@@ -135,11 +135,21 @@ function SourceDecision({ source }: { source: ContextManifestSource }) {
             {source.source_type}
           </span>
         </div>
-        <StateBadge status={source.disposition} />
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <StateBadge status={source.disposition} />
+          {source.is_stale ? <StateBadge status="stale" label="Stale pointer" /> : null}
+        </div>
       </header>
       <dl className="mt-4 grid gap-3 text-xs sm:grid-cols-2">
         <MetadataValue label="Source ID" value={source.source_id} copyable />
         <MetadataValue label="Source revision" value={source.source_revision} copyable />
+        {source.current_revision || source.is_stale ? (
+          <MetadataValue
+            label="Current canonical revision"
+            value={source.current_revision ?? "No current pointer"}
+            copyable={Boolean(source.current_revision)}
+          />
+        ) : null}
         <div>
           <dt className="text-muted-foreground">Selection reason</dt>
           <dd className="mt-1 text-foreground">{source.selection_reason}</dd>

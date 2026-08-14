@@ -32,6 +32,14 @@ function isBindingReady(entry: AgentChatEntry | undefined): boolean {
   return Boolean(entry && entry.binding_state === 'active' && entry.chat_status === 'ready')
 }
 
+function switcherState(entry: AgentChatEntry): 'ready' | 'setup_required' | 'unavailable' {
+  if (isBindingReady(entry)) return 'ready'
+  if (entry.binding_state === 'setup_required' || entry.chat_status === 'setup_required') {
+    return 'setup_required'
+  }
+  return 'unavailable'
+}
+
 function count(value: bigint | number): number {
   return typeof value === 'bigint' ? Number(value) : value
 }
@@ -41,15 +49,16 @@ function toSwitcherEntry(
   projectName: string,
   active: boolean,
 ): ChatSwitcherEntry {
-  const setupRequired = !isBindingReady(entry)
+  const state = switcherState(entry)
   return {
     id: entry.chat_id,
     label: entry.kind === 'main' ? 'Global · Main' : projectName,
     description:
       entry.kind === 'main' ? 'Account-owned Main Agent timeline' : 'Project-owned Agent timeline',
     agentName: entry.identity_name,
-    agentStatus: setupRequired ? null : 'ready',
-    setupRequired,
+    agentStatus: state === 'ready' ? 'ready' : state === 'unavailable' ? 'unavailable' : null,
+    state,
+    setupRequired: state === 'setup_required',
     pendingTurnCount: count(entry.pending_turn_count),
     active,
   }
@@ -62,6 +71,7 @@ function emptyGlobalEntry(active: boolean): ChatSwitcherEntry {
     description: 'Account-owned Main Agent timeline',
     agentName: null,
     agentStatus: null,
+    state: 'setup_required',
     setupRequired: true,
     active,
   }
@@ -102,14 +112,49 @@ function ScopeAffordances({ projectId, ready }: { projectId?: string; ready?: bo
   )
 }
 
+const PROJECT_RECORD_LINKS = [
+  { label: 'Milestones', section: 'milestones' },
+  { label: 'Documents', section: 'documents' },
+  { label: 'Decisions', section: 'decisions' },
+  { label: 'Evidence', section: 'evidence' },
+  { label: 'Readiness', section: 'readiness' },
+  { label: 'Releases', section: 'releases' },
+] as const
+
+export function ProjectRecordNavigation({ projectId }: { projectId: string }) {
+  const projectPath = `/projects/${encodeURIComponent(projectId)}`
+
+  return (
+    <nav
+      aria-label="Project records"
+      className="flex min-w-0 flex-wrap items-center justify-end gap-1.5"
+    >
+      <span className="mr-1 font-mono text-micro font-semibold uppercase tracking-[0.1em] text-muted-foreground">
+        Project records
+      </span>
+      <a
+        href={`${projectPath}/tasks?sort_by=updated_at&sort_order=desc`}
+        className="rounded-full border border-border-subtle bg-muted/30 px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:border-primary/40 hover:bg-ember-surface hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Tasks
+      </a>
+      {PROJECT_RECORD_LINKS.map(({ label, section }) => (
+        <a
+          key={section}
+          href={`${projectPath}/overview#${section}`}
+          className="rounded-full border border-border-subtle bg-muted/30 px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:border-primary/40 hover:bg-ember-surface hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {label}
+        </a>
+      ))}
+    </nav>
+  )
+}
+
 export function ChatPage({ projectId }: { projectId?: string }) {
   const navigate = useNavigate()
   const chatsQuery = useAgentChatsQuery()
   const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
-  const selectedGlobalChatId = useChatSelection((state) => state.globalChatId)
-  const selectedProjectChatId = useChatSelection((state) =>
-    projectId ? state.projectChatIds[projectId] : undefined,
-  )
   const setGlobalChat = useChatSelection((state) => state.setGlobalChat)
   const setProjectChat = useChatSelection((state) => state.setProjectChat)
   const entries = chatsQuery.data?.items ?? []
@@ -135,6 +180,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
         description: 'Project-owned Agent timeline',
         agentName: null,
         agentStatus: null,
+        state: 'setup_required' as const,
         setupRequired: true,
         active: project.id === projectId,
       }
@@ -154,14 +200,27 @@ export function ChatPage({ projectId }: { projectId?: string }) {
     ]
   }, [projectId, projectSources, projects])
 
-  const globalEntry = globalSource
-    ? toSwitcherEntry(globalSource, 'Global', !projectId)
-    : emptyGlobalEntry(!projectId)
+  const globalEntry = chatsQuery.isLoading
+    ? {
+        ...emptyGlobalEntry(!projectId),
+        state: 'loading' as const,
+        setupRequired: false,
+        description: 'Loading account-owned Main Agent timeline',
+      }
+    : chatsQuery.isError
+      ? {
+          ...emptyGlobalEntry(!projectId),
+          state: 'unavailable' as const,
+          setupRequired: false,
+          description: 'Main Agent chat unavailable',
+        }
+      : globalSource
+        ? toSwitcherEntry(globalSource, 'Global', !projectId)
+        : emptyGlobalEntry(!projectId)
   const activeSource = projectId
     ? projectSources.find((entry) => entry.project_id === projectId)
     : globalSource
-  const storedChatId = projectId ? selectedProjectChatId : selectedGlobalChatId
-  const activeChatId = activeSource?.chat_id ?? (entries.length === 0 ? storedChatId : undefined)
+  const activeChatId = activeSource?.chat_id
   const chatQuery = useAgentChatQuery(activeChatId)
   const sendMutation = useSendAgentChatMessageMutation(chatQuery.data?.id)
   const cancelMutation = useCancelAgentChatTurnMutation(chatQuery.data?.id)
@@ -177,6 +236,15 @@ export function ChatPage({ projectId }: { projectId?: string }) {
   const chatNeedsSetup = Boolean(
     activeSource?.binding_state === 'setup_required' || chatQuery.data?.status === 'setup_required',
   )
+  const chatUnavailable = Boolean(activeSource && !chatNeedsSetup && !isBindingReady(activeSource))
+  const activeState =
+    chatsQuery.isLoading || (activeChatId !== undefined && chatQuery.isLoading)
+      ? 'loading'
+      : chatsQuery.isError || chatQuery.isError || chatUnavailable
+        ? 'unavailable'
+        : chatNeedsSetup || !activeSource
+          ? 'setup_required'
+          : 'ready'
 
   useEffect(() => {
     if (!chatQuery.data) return
@@ -235,6 +303,13 @@ export function ChatPage({ projectId }: { projectId?: string }) {
         <AgentChatSwitcher
           globalEntry={globalEntry}
           projectEntries={projectEntries}
+          projectListState={
+            chatsQuery.isError || projectsQuery.isError
+              ? 'error'
+              : chatsQuery.isLoading || projectsQuery.isLoading
+                ? 'loading'
+                : 'ready'
+          }
           onSelectGlobal={() => void navigate({ to: '/chat' })}
           onSelectProject={(entry) => {
             const source = projectSources.find((candidate) => candidate.chat_id === entry.id)
@@ -245,7 +320,10 @@ export function ChatPage({ projectId }: { projectId?: string }) {
             })
           }}
         />
-        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <section
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+          aria-label={`${pageTitle} timeline`}
+        >
           <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border-subtle px-4 py-3 sm:px-5">
             <div className="flex min-w-0 items-center gap-3">
               <Avatar
@@ -258,27 +336,21 @@ export function ChatPage({ projectId }: { projectId?: string }) {
                   {activeAgentName ?? (projectId ? 'Project Agent' : 'Main Agent')}
                 </p>
                 <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <StatusDot
-                    status={chatQuery.data?.status === 'ready' ? 'ready' : 'setup_required'}
-                  />
-                  {chatQuery.data?.status === 'ready'
+                  <StatusDot status={activeState} />
+                  {activeState === 'ready'
                     ? 'Ready for one finite turn'
-                    : 'Setup required'}
+                    : activeState === 'loading'
+                      ? 'Loading authorized chat'
+                      : activeState === 'unavailable'
+                        ? 'Unavailable'
+                        : 'Setup required'}
                 </p>
               </div>
             </div>
-            <div className="flex flex-wrap items-center justify-end gap-3">
+            <div className="flex min-w-0 flex-wrap items-center justify-end gap-3">
               {projectId ? (
                 <>
-                  <Link
-                    to="/projects/$projectId/tasks"
-                    params={{ projectId }}
-                    search={{ sort_by: 'updated_at', sort_order: 'desc' }}
-                    className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    Open Project Tasks
-                    <ArrowUpRight size={13} aria-hidden />
-                  </Link>
+                  <ProjectRecordNavigation projectId={projectId} />
                   <Link
                     to="/projects/$projectId/settings/$tab"
                     params={{ projectId, tab: 'project-agent' }}
@@ -305,6 +377,42 @@ export function ChatPage({ projectId }: { projectId?: string }) {
               description="Forge could not load this existing Agent Chat. Try again before admitting a turn."
               onRetry={() => void chatQuery.refetch()}
             />
+          ) : chatUnavailable ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
+              <section
+                className="mx-auto flex w-full max-w-xl flex-col items-start rounded-xl border border-destructive/30 bg-destructive/5 p-5 sm:p-6"
+                role="alert"
+                aria-labelledby="chat-unavailable-heading"
+              >
+                <h2
+                  id="chat-unavailable-heading"
+                  className="text-base font-semibold text-foreground"
+                >
+                  Agent Chat unavailable
+                </h2>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  This durable chat exists, but its owning Agent binding is currently paused,
+                  replaced, revoked, or archived. Forge will not admit a turn until the authorized
+                  binding is restored.
+                </p>
+                {projectId ? (
+                  <Link
+                    to="/projects/$projectId/settings/$tab"
+                    params={{ projectId, tab: 'project-agent' }}
+                    className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Open Agent settings <ArrowUpRight size={13} aria-hidden />
+                  </Link>
+                ) : (
+                  <Link
+                    to="/agents/federated"
+                    className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Open Agent settings <ArrowUpRight size={13} aria-hidden />
+                  </Link>
+                )}
+              </section>
+            </div>
           ) : chatNeedsSetup ? (
             <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
               <ChatSetupRequired projectId={projectId} />
@@ -324,7 +432,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
               <ChatSetupRequired projectId={projectId} />
             </div>
           )}
-        </main>
+        </section>
       </div>
     </div>
   )

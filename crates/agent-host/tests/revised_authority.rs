@@ -9,8 +9,8 @@ use agent_runtime::core::{
 };
 use async_trait::async_trait;
 use forge_agent_host::{
-    AgentHostError, CanonicalScope, CanonicalScopeType, ForgeToolProvider, ScopeToolComposition,
-    WorkspaceAccess,
+    AgentHostError, CanonicalScope, CanonicalScopeType, FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
+    ForgeToolProvider, ScopeToolComposition, WorkspaceAccess,
 };
 use serde_json::Value;
 
@@ -155,8 +155,17 @@ fn main_agent_chat_catalog_has_global_actions_but_no_task_or_workspace() {
     for operation in ["discovery.read", "portfolio.read", "project.summary"] {
         assert!(reads.iter().any(|candidate| candidate == operation));
     }
-    for operation in ["web.search", "project.lifecycle", "handoff.publish"] {
-        assert!(proposals.iter().any(|candidate| candidate == operation));
+    assert!(!proposals.iter().any(|candidate| candidate == "web.search"));
+    for operation in [
+        "project.lifecycle",
+        "handoff.publish",
+        "message.send",
+        "commitment.update",
+        "memory.publish",
+        "memory.supersede",
+        "session.action",
+    ] {
+        assert!(!proposals.iter().any(|candidate| candidate == operation));
     }
     assert!(
         !proposals
@@ -200,11 +209,18 @@ async fn main_agent_denies_every_task_and_repository_intent_even_with_forged_ref
         Some(Arc::new(NoopProvider)),
     )
     .expect("Main Agent Chat composition is valid");
+    assert!(
+        !composition
+            .tool_names()
+            .iter()
+            .any(|name| name == "forge_scope_propose"),
+        "Main Chat must use its closed orchestration surface, not the generic proposal tool"
+    );
     let propose = composition
         .tools()
         .into_iter()
-        .find(|tool| tool.spec().name == "forge_scope_propose")
-        .expect("Main Chat has bounded proposal tool");
+        .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL)
+        .expect("Main Chat has bounded orchestration proposal tool");
     let context = PreparationContext {
         session: SessionId::new("main-session"),
         turn: None,

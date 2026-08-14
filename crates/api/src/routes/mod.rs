@@ -32,6 +32,7 @@ pub mod coordination;
 pub mod daemons;
 pub mod embedded_agents;
 pub mod events;
+pub mod execution_baseline;
 pub mod executions;
 pub mod executor_types;
 pub mod external_links;
@@ -40,12 +41,18 @@ pub mod integrations;
 pub mod mcp_config;
 pub mod members;
 pub mod memory;
+pub mod milestones;
 pub mod mission_control;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;
 pub mod product_genesis;
 pub mod project_agents;
+pub mod project_charters;
+pub mod project_documents;
+pub mod project_media;
+pub mod project_orchestration;
+pub mod project_overview;
 pub mod projects;
 pub mod repos;
 pub mod reviews;
@@ -144,6 +151,13 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         workflow_template_name: project.workflow_template_name,
         paused_at: project.paused_at.clone(),
         paused: project.paused_at.is_some(),
+        charter_status: project.charter_status,
+        charter_setup_required: project.charter_setup_required,
+        current_charter_id: project.current_charter_id,
+        current_charter_revision_id: project.current_charter_revision_id,
+        current_charter_version: project.current_charter_version,
+        primary_milestone_id: project.primary_milestone_id,
+        version: project.version,
     })
 }
 

@@ -280,6 +280,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 status: ExecutionOutcome::Cancelled,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
+                assistant_output: stream.assistant_output,
                 summary: stream.summary,
                 error: None,
                 usage: stream.usage,
@@ -296,6 +297,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 status: ExecutionOutcome::Failed,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
+                assistant_output: stream.assistant_output,
                 summary: stream.summary,
                 error: Some(error),
                 usage: stream.usage,
@@ -308,6 +310,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 status: ExecutionOutcome::Failed,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
+                assistant_output: stream.assistant_output,
                 summary: stream.summary,
                 error: Some(smith_run_error(status, &stream.stderr_tail)),
                 usage: stream.usage,
@@ -332,6 +335,7 @@ impl CodingExecutorAdapter for SmithAdapter {
             status: ExecutionOutcome::Completed,
             after_sha,
             agent_session_id: stream.agent_session_id,
+            assistant_output: stream.assistant_output,
             summary: stream.summary,
             error: None,
             usage: stream.usage,
@@ -368,6 +372,7 @@ struct LimitSignal {
 #[derive(Default)]
 struct StreamResult {
     agent_session_id: Option<String>,
+    assistant_output: Option<String>,
     summary: Option<String>,
     error: Option<String>,
     stderr_tail: String,
@@ -506,9 +511,14 @@ async fn stream_run_output(
         stderr_lines.push(line);
     }
 
-    if result.summary.is_none() && !assistant_chunks.is_empty() {
+    if !assistant_chunks.is_empty() {
         let full = assistant_chunks.join("");
-        result.summary = Some(full.chars().take(MAX_SUMMARY_CHARS).collect());
+        if result.assistant_output.is_none() {
+            result.assistant_output = Some(full.clone());
+        }
+        if result.summary.is_none() {
+            result.summary = Some(full.chars().take(MAX_SUMMARY_CHARS).collect());
+        }
     }
 
     result.stderr_tail = stderr_lines.join("\n");
@@ -614,6 +624,7 @@ async fn process_smith_stdout_line(
             }
 
             if let Some(output) = parsed.get("output").and_then(|v| v.as_str()) {
+                result.assistant_output = Some(output.to_owned());
                 result.summary = Some(output.chars().take(MAX_SUMMARY_CHARS).collect());
             }
 
@@ -926,6 +937,23 @@ mod tests {
 
         // Even though the run ended badly, prose is not a signal.
         assert!(availability_error(&stream, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn result_preserves_full_assistant_output_beside_bounded_task_summary() {
+        let output = "x".repeat(MAX_SUMMARY_CHARS + 300);
+        let stream = stream_fixture(&[serde_json::json!({
+            "type": "result",
+            "status": "ok",
+            "output": output,
+        })])
+        .await;
+
+        assert_eq!(
+            stream.summary.as_deref().map(str::len),
+            Some(MAX_SUMMARY_CHARS)
+        );
+        assert_eq!(stream.assistant_output.as_deref(), Some(output.as_str()));
     }
 
     #[tokio::test]

@@ -6,14 +6,21 @@
 //! atomic Agent Chat service composite.  A failed adapter call is persisted on
 //! the job with a bounded error and a finite retry budget.
 
-use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery,
-    AgentChatMessageRepo, AgentChatMessageStatus, AgentChatTurnJob, AgentChatTurnJobRepo,
-    AgentProfile, AgentProfileRepo, AgentRepo, AgentSession, PageRequest, SqliteDb,
+    AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo, AgentChatTurnJob,
+    AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession, PageRequest,
+    ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
 use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
 use forge_agent_host::RuntimeContextManifestLink;
@@ -21,7 +28,7 @@ use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
     Message, NativeProviderConfig, Role, TurnEventSink, WorkspaceAccess,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -36,6 +43,17 @@ use crate::{
     agent_chat_turn_policy::failure_after_claim,
     context_manifest::{ContextManifestInput, ContextManifestService, ContextSourceInput},
     embedded_agent_service::{CreateScopedSession, RequestedCanonicalScope},
+    operating_skills::{
+        canonical_main_operating_skill_body, canonical_project_operating_skill_body,
+        render_project_operating_skill, EffectiveProjectStateContext, ProjectOperatingSkillContext,
+        MAIN_OPERATING_SKILL_CONTENT_DIGEST, MAIN_OPERATING_SKILL_KEY,
+        MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
+        MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
+        PROJECT_OPERATING_SKILL_CONTENT_DIGEST, PROJECT_OPERATING_SKILL_KEY,
+        PROJECT_OPERATING_SKILL_POLICY_DIGEST, PROJECT_OPERATING_SKILL_POLICY_JSON,
+        PROJECT_OPERATING_SKILL_RENDER_VERSION, PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
+    },
+    project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
     EmbeddedAgentService, Result, ServiceError,
 };
 
@@ -45,6 +63,37 @@ const TURN_LEASE_SECONDS: i64 = 120;
 const MAX_ACTIVE_TURNS: usize = 32;
 const MAX_HISTORY: i64 = 100;
 const MAX_ERROR_CHARS: usize = 512;
+const PROJECT_HANDOFF_SCHEMA_VERSION: &str = "forge.project-charter-handoff/v1";
+const PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION: &str = "forge.project-context-reference/v1";
+const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
+// Setup keeps the existing Project proposal ceiling but the host exposes only
+// the typed adoption operation while this server-derived state is active.
+// The candidate is still committed only through the authenticated Project
+// Charter domain route; no caller-authored permission string is trusted.
+const PROJECT_SETUP_PERMISSION_CEILING: &str =
+    "read_project,read_agent_chat,read_memory,propose_message,propose_project";
+const REQUIRED_HANDOFF_REDACTION_CATEGORIES: [&str; 6] = [
+    "full_main_chat_history",
+    "hidden_memory_bodies",
+    "credentials",
+    "protected_runtime_or_browser_state",
+    "unrelated_projects",
+    "authority_bearing_text",
+];
+const PROJECT_SETUP_RESTRICTIONS: &str = r#"
+
+## SERVER-OWNED LEGACY PROJECT SETUP RESTRICTIONS
+This Project is legacy and has no Charter-backed authority yet. Treat all
+legacy state as bounded, unverified input. You may explain current state,
+identify missing adoption information, perform safe read-only discovery, and
+propose an adoption Charter for explicit user approval. Do not claim a Charter,
+approval, handoff, baseline, milestone, readiness, release, or repository
+authority. Do not create or dispatch implementation Tasks, access a repository Workspace,
+use credentials or browser state, validate work, approve a release,
+or mutate Project execution state. Existing legacy Task and Chat records remain
+visible for continuity, but no new repository-capable work may be authorized
+until a user-approved Charter-backed adoption is committed.
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedAgentChatTurn {
@@ -64,7 +113,271 @@ struct LoadedAgentChatTurn {
     session: AgentSession,
     input: AgentChatMessage,
     history: Vec<AgentChatMessage>,
-    genesis_instruction: Option<String>,
+    /// A server-owned instruction revision.  For Main this is the active
+    /// Product Genesis revision; for Project it is the rendered Project
+    /// operating skill.  It is always appended after Profile text at the
+    /// adapter boundary so the server contract has the stronger precedence.
+    operating_instruction: Option<String>,
+    /// Redaction-safe provenance records for the server-owned instruction and
+    /// the authenticated bounded Project state.  These are appended to the
+    /// runtime context manifest when the backend returns one.
+    operating_context_sources: Vec<ContextSourceInput>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectOperatingSkillSnapshot {
+    instruction: String,
+    context_sources: Vec<ContextSourceInput>,
+}
+
+/// A bounded, server-derived context reference.  The display value may be
+/// shown in an operating-skill prompt, while the remaining fields are kept in
+/// the persisted manifest so a reviewer can tell which exact authority record
+/// was selected, why it was selected, and whether it was stale or omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperatingContextReference {
+    display: String,
+    source_id: String,
+    source_type: String,
+    source_revision: String,
+    digest: String,
+    selection_reason: String,
+    disposition: String,
+    sensitivity: String,
+}
+
+impl OperatingContextReference {
+    fn included(
+        display: impl Into<String>,
+        source_id: impl Into<String>,
+        source_type: impl Into<String>,
+        source_revision: impl Into<String>,
+        digest: impl Into<String>,
+        selection_reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            display: display.into(),
+            source_id: source_id.into(),
+            source_type: source_type.into(),
+            source_revision: source_revision.into(),
+            digest: digest.into(),
+            selection_reason: selection_reason.into(),
+            disposition: "included".to_owned(),
+            sensitivity: "internal".to_owned(),
+        }
+    }
+
+    fn omitted(
+        display: impl Into<String>,
+        source_id: impl Into<String>,
+        source_type: impl Into<String>,
+        source_revision: impl Into<String>,
+        digest: impl Into<String>,
+        selection_reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            disposition: "omitted".to_owned(),
+            ..Self::included(
+                display,
+                source_id,
+                source_type,
+                source_revision,
+                digest,
+                selection_reason,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffPacket {
+    schema_version: String,
+    handoff_id: String,
+    deduplication_key: String,
+    correlation_id: String,
+    causation_id: String,
+    /// The approval receipt and request envelope are populated by the atomic
+    /// Project-creation transaction. They are required parts of the v1 packet;
+    /// accepting their absence would make an incomplete packet look like a
+    /// valid handoff.
+    approval_id: String,
+    request: ProjectCharterHandoffRequest,
+    source: ProjectCharterHandoffSource,
+    project: ProjectCharterHandoffProject,
+    target: ProjectCharterHandoffTarget,
+    charter: ProjectCharterHandoffCharter,
+    approval: ProjectCharterHandoffApproval,
+    project_agent: ProjectCharterHandoffAgent,
+    bounded_summary: String,
+    settled_decision_ids: Vec<String>,
+    unresolved_items: Vec<Value>,
+    research_references: Vec<Value>,
+    content_classification: String,
+    redaction_manifest: ProjectCharterHandoffRedactionManifest,
+    created_at: String,
+    delivery: ProjectCharterHandoffDelivery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffSource {
+    chat_id: String,
+    message_ids: Vec<String>,
+    message_id: String,
+    turn_id: Option<String>,
+    identity_id: String,
+    profile_revision_id: String,
+    instruction_revision_id: String,
+    instruction_revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffRequest {
+    policy_revision: String,
+    policy_digest: String,
+    source_revisions_digest: String,
+    source_revisions_json: String,
+    authorization: ProjectCharterHandoffAuthorization,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffAuthorization {
+    principal_type: String,
+    principal_id: String,
+    authorization_basis: String,
+    action: String,
+    event_id: String,
+    occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffProject {
+    id: String,
+    name: String,
+    lifecycle: String,
+    mode: String,
+    approved_slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffTarget {
+    chat_id: String,
+    binding_id: String,
+    identity_id: String,
+    profile_revision_id: String,
+    message_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffCharter {
+    id: String,
+    revision_id: String,
+    revision_number: i64,
+    schema_version: String,
+    content_digest: String,
+    render_version: String,
+    render_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffApproval {
+    id: String,
+    event_id: String,
+    authorization_basis: String,
+    authorization_action: String,
+    authorization_event_id: String,
+    authorization_occurred_at: String,
+    approved_by: ProjectCharterHandoffPrincipal,
+    approved_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffAgent {
+    identity_id: String,
+    profile_revision_id: String,
+    operating_skill_revision: String,
+    policy_revision: String,
+    policy_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffPrincipal {
+    kind: String,
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffRedactionManifest {
+    excluded_knowledge_item_ids: Vec<String>,
+    excluded_categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCharterHandoffDelivery {
+    delivered_at: String,
+}
+
+struct ProjectHandoffExpectation<'a> {
+    handoff_id: &'a str,
+    deduplication_key: &'a str,
+    correlation_id: &'a str,
+    causation_id: &'a str,
+    source_chat_id: &'a str,
+    source_identity_id: &'a str,
+    source_profile_revision_id: &'a str,
+    source_instruction_revision_id: &'a str,
+    source_instruction_revision: i64,
+    source_message_ids: Vec<String>,
+    source_turn_id: Option<&'a str>,
+    project_id: &'a str,
+    project_name: &'a str,
+    project_mode: &'a str,
+    approved_slug: Option<&'a str>,
+    target_chat_id: &'a str,
+    target_binding_id: &'a str,
+    target_message_id: &'a str,
+    target_turn_id: &'a str,
+    charter_id: &'a str,
+    charter_revision_id: &'a str,
+    charter_revision_number: i64,
+    charter_schema_version: &'a str,
+    charter_content_digest: &'a str,
+    charter_render_version: &'a str,
+    charter_render_digest: &'a str,
+    approval_id: &'a str,
+    approval_event_id: &'a str,
+    approval_authorization_basis: &'a str,
+    approval_authorization_action: &'a str,
+    approval_authorization_event_id: &'a str,
+    approval_authorization_occurred_at: &'a str,
+    approval_principal_kind: &'a str,
+    approval_principal_id: &'a str,
+    approval_created_at: &'a str,
+    create_authorization_principal_type: &'a str,
+    create_authorization_principal_id: &'a str,
+    create_authorization_basis: &'a str,
+    create_authorization_action: &'a str,
+    create_authorization_event_id: &'a str,
+    create_authorization_occurred_at: &'a str,
+    identity_id: &'a str,
+    profile_revision_id: &'a str,
+    operating_skill_revision: &'a str,
+    policy_revision: &'a str,
+    policy_digest: &'a str,
+    created_at: &'a str,
+    delivered_at: &'a str,
 }
 
 #[async_trait]
@@ -210,6 +523,11 @@ impl FederatedAgentChatTurnRunner {
     }
 
     async fn load_turn(&self, job: &AgentChatTurnJob) -> Result<LoadedAgentChatTurn> {
+        if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn has a mismatched canonical scope",
+            ));
+        }
         let input =
             AgentChatMessageRepo::get_agent_chat_message(&*self.db, &job.triggering_message_id)
                 .await?
@@ -217,6 +535,9 @@ impl FederatedAgentChatTurnRunner {
                 .ok_or_else(|| {
                     ServiceError::not_found("agent_chat_message", job.triggering_message_id.clone())
                 })?;
+        let chat = AgentChatRepo::get_agent_chat(&*self.db, &job.chat_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_chat", job.chat_id.clone()))?;
         let identity_id = job
             .responder_identity_id
             .as_deref()
@@ -232,6 +553,216 @@ impl FederatedAgentChatTurnRunner {
             .await?
             .filter(|profile| profile.identity_id == agent.id)
             .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
+
+        // The Project operating skill is admitted before session creation or
+        // any model call.  A Project Chat is never allowed to fall back to a
+        // profile-only prompt, an old handoff overlay, or a legacy Project
+        // binding when its Charter pointers cannot be proven current.
+        let (operating_instruction, operating_context_sources) = match chat.kind.as_str() {
+            "account_main" => {
+                if chat.project_id.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Main Agent Chat unexpectedly has a Project scope",
+                    ));
+                }
+                // Genesis instructions are immutable history rows, but only
+                // the currently active session is admitted as model context.
+                // Joining the lifecycle table here prevents a cancelled/
+                // handed-off protocol from remaining an authority-bearing
+                // overlay after restart.
+                let instruction_row = sqlx::query(
+                    "SELECT instruction.id AS instruction_id, instruction.revision,
+                            instruction.body,
+                            genesis.id AS genesis_id, genesis.version AS genesis_version,
+                            genesis.lifecycle AS genesis_lifecycle,
+                            genesis.charter_id, genesis.charter_revision_id,
+                            revision.content_digest AS charter_content_digest,
+                            revision.rendered_digest AS charter_render_digest
+                     FROM agent_chat_instruction_revision AS instruction
+                     JOIN product_genesis_session AS genesis
+                       ON genesis.id = instruction.source_id
+                      AND genesis.main_chat_id = instruction.chat_id
+                     LEFT JOIN project_charter_revision AS revision
+                       ON revision.id = genesis.charter_revision_id
+                     WHERE instruction.chat_id = ?
+                       AND instruction.source_type = 'native'
+                       AND genesis.lifecycle IN ('discovering', 'ready_for_project')
+                     ORDER BY instruction.revision DESC, instruction.id DESC
+                     LIMIT 1",
+                )
+                .bind(&job.chat_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+                if let Some(instruction_row) = instruction_row {
+                    let instruction_id: String = instruction_row.try_get("instruction_id")?;
+                    let instruction_revision: i64 = instruction_row.try_get("revision")?;
+                    let instruction_body: String = instruction_row.try_get("body")?;
+                    let genesis_id: String = instruction_row.try_get("genesis_id")?;
+                    let genesis_version: i64 = instruction_row.try_get("genesis_version")?;
+                    let genesis_lifecycle: String = instruction_row.try_get("genesis_lifecycle")?;
+                    let main_skill_row = sqlx::query(
+                        "SELECT os.current_revision_id,
+                                sr.id, sr.skill_key, sr.revision,
+                                sr.schema_version, sr.render_version,
+                                sr.canonical_body, sr.policy_json,
+                                sr.policy_digest, sr.content_digest
+                         FROM operating_skill AS os
+                         JOIN operating_skill_revision AS sr
+                           ON sr.id = os.current_revision_id
+                         WHERE os.id = ? AND os.lifecycle = 'active'",
+                    )
+                    .bind(MAIN_OPERATING_SKILL_KEY)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Main Agent Genesis has no active server operating-skill revision",
+                        )
+                    })?;
+                    let main_skill_revision: String =
+                        main_skill_row.try_get("current_revision_id")?;
+                    let main_skill_key: String = main_skill_row.try_get("skill_key")?;
+                    let main_skill_revision_number: i64 = main_skill_row.try_get("revision")?;
+                    let main_skill_schema_version: String =
+                        main_skill_row.try_get("schema_version")?;
+                    let main_skill_render_version: String =
+                        main_skill_row.try_get("render_version")?;
+                    let main_skill_canonical_body: String =
+                        main_skill_row.try_get("canonical_body")?;
+                    let main_skill_policy_json: String = main_skill_row.try_get("policy_json")?;
+                    let main_skill_policy_digest: String =
+                        main_skill_row.try_get("policy_digest")?;
+                    let main_skill_content_digest: String =
+                        main_skill_row.try_get("content_digest")?;
+                    if main_skill_key != MAIN_OPERATING_SKILL_KEY
+                        || main_skill_revision_number < 1
+                        || main_skill_revision
+                            != format!("{MAIN_OPERATING_SKILL_KEY}@{main_skill_revision_number}")
+                        || main_skill_schema_version != MAIN_OPERATING_SKILL_SCHEMA_VERSION
+                        || main_skill_render_version != MAIN_OPERATING_SKILL_RENDER_VERSION
+                        || main_skill_canonical_body != canonical_main_operating_skill_body()
+                        || main_skill_policy_json != MAIN_OPERATING_SKILL_POLICY_JSON
+                        || main_skill_policy_digest != MAIN_OPERATING_SKILL_POLICY_DIGEST
+                        || main_skill_content_digest != MAIN_OPERATING_SKILL_CONTENT_DIGEST
+                    {
+                        return Err(ServiceError::invalid_operation(
+                            "Main Agent Genesis operating skill is not the canonical server contract",
+                        ));
+                    }
+                    let charter_id: Option<String> = instruction_row.try_get("charter_id")?;
+                    let charter_revision_id: Option<String> =
+                        instruction_row.try_get("charter_revision_id")?;
+                    let charter_content_digest: Option<String> =
+                        instruction_row.try_get("charter_content_digest")?;
+                    let charter_render_digest: Option<String> =
+                        instruction_row.try_get("charter_render_digest")?;
+                    let mut references = vec![
+                        OperatingContextReference::included(
+                            format!("genesis:{genesis_id}@v{genesis_version}"),
+                            &genesis_id,
+                            "main_genesis",
+                            format!("v{genesis_version}:{genesis_lifecycle}"),
+                            fingerprint_id(&format!(
+                                "genesis:{genesis_id}:v{genesis_version}:lifecycle:{genesis_lifecycle}"
+                            )),
+                            "active_product_genesis",
+                        ),
+                        OperatingContextReference::included(
+                            format!("main_profile:{}@v{}", profile.id, profile.version),
+                            &profile.id,
+                            "main_profile",
+                            format!("v{}", profile.version),
+                            fingerprint_id(&format!(
+                                "profile:{}:v{}:policy:{}",
+                                profile.id, profile.version, profile.tool_policy_json
+                            )),
+                            "authenticated_main_profile",
+                        ),
+                        OperatingContextReference::included(
+                            format!("main_instruction:{instruction_id}@{instruction_revision}"),
+                            &instruction_id,
+                            "main_genesis_instruction",
+                            instruction_revision.to_string(),
+                            fingerprint_id(&instruction_body),
+                            "active_genesis_instruction",
+                        ),
+                    ];
+                    let account_id = chat.account_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Main Agent Chat has no authenticated account for portfolio context",
+                        )
+                    })?;
+                    if agent.owner_id.as_deref() != Some(account_id) {
+                        return Err(ServiceError::invalid_operation(
+                            "Main Agent identity is not owned by the Chat account",
+                        ));
+                    }
+                    references.extend(self.load_main_portfolio_context(account_id).await?);
+                    if let (Some(charter_id), Some(charter_revision_id)) =
+                        (charter_id.as_deref(), charter_revision_id.as_deref())
+                    {
+                        if let (Some(content_digest), Some(render_digest)) = (
+                            charter_content_digest.as_deref(),
+                            charter_render_digest.as_deref(),
+                        ) {
+                            references.push(OperatingContextReference::included(
+                                format!(
+                                    "charter:{charter_id}@{charter_revision_id}:content:{content_digest}:render:{render_digest}"
+                                ),
+                                charter_id,
+                                "main_charter",
+                                charter_revision_id,
+                                content_digest,
+                                "active_genesis_charter",
+                            ));
+                        }
+                    }
+                    (
+                        Some(instruction_body),
+                        main_operating_context_sources(
+                            &main_skill_revision,
+                            &main_skill_content_digest,
+                            &references,
+                        ),
+                    )
+                } else {
+                    let active_genesis_id = sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT id
+                         FROM product_genesis_session
+                         WHERE main_chat_id = ?
+                           AND lifecycle IN ('discovering', 'ready_for_project')
+                         ORDER BY version DESC, id DESC
+                         LIMIT 1",
+                    )
+                    .bind(&job.chat_id)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                    .flatten();
+                    if active_genesis_id.is_some() {
+                        return Err(ServiceError::invalid_operation(
+                            "Active Product Genesis has no immutable Main instruction revision",
+                        ));
+                    }
+                    (None, Vec::new())
+                }
+            }
+            "project" => {
+                let project_id = chat.project_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project Agent Chat has no authenticated Project scope",
+                    )
+                })?;
+                let snapshot = self
+                    .load_project_operating_skill(project_id, &agent, &profile, &chat.id, job)
+                    .await?;
+                (Some(snapshot.instruction), snapshot.context_sources)
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat has an unsupported canonical kind",
+                ));
+            }
+        };
         let owner_user_id = agent
             .owner_id
             .clone()
@@ -268,32 +799,1417 @@ impl FederatedAgentChatTurnRunner {
             message.sequence < input.sequence && message.status == AgentChatMessageStatus::Complete
         })
         .collect();
-        // Genesis instructions are immutable history rows, but only the
-        // currently active session is admitted as model context.  Joining the
-        // lifecycle table here prevents a cancelled/handed-off protocol from
-        // remaining an authority-bearing overlay after restart.
-        let active_genesis_instruction = sqlx::query_scalar::<_, String>(
-            "SELECT instruction.body
-             FROM agent_chat_instruction_revision AS instruction
-             JOIN product_genesis_session AS genesis
-               ON genesis.id = instruction.source_id
-              AND genesis.main_chat_id = instruction.chat_id
-             WHERE instruction.chat_id = ?
-               AND instruction.source_type = 'native'
-               AND genesis.lifecycle IN ('discovering', 'ready_for_project')
-             ORDER BY instruction.revision DESC, instruction.id DESC
-             LIMIT 1",
-        )
-        .bind(&job.chat_id)
-        .fetch_optional(self.db.pool())
-        .await?;
         Ok(LoadedAgentChatTurn {
             agent,
             profile,
             session,
             input,
             history,
-            genesis_instruction: active_genesis_instruction,
+            operating_instruction,
+            operating_context_sources,
+        })
+    }
+
+    /// Load only the account owner's bounded portfolio projection for Main
+    /// context. Project rows are represented by stable identifiers, current
+    /// versions, and safe lifecycle pointers; names and other mutable detail
+    /// remain behind the typed `portfolio.read` projection. No Project Chat,
+    /// Task, repository, memory, or credential data enters Main context.
+    async fn load_main_portfolio_context(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<OperatingContextReference>> {
+        let rows = sqlx::query(
+            "SELECT id, version, updated_at, paused_at, charter_status,
+                    current_charter_revision_id
+             FROM project
+             WHERE owner_id = ?
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 20",
+        )
+        .bind(account_id)
+        .fetch_all(self.db.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let project_id: String = row.try_get("id")?;
+                let version: i64 = row.try_get("version")?;
+                let updated_at: String = row.try_get("updated_at")?;
+                let paused = row.try_get::<Option<String>, _>("paused_at")?.is_some();
+                let charter_status: String = row.try_get("charter_status")?;
+                let charter_revision_id: Option<String> =
+                    row.try_get("current_charter_revision_id")?;
+                let digest = canonical_context_digest(&serde_json::json!({
+                    "project_id": &project_id,
+                    "version": version,
+                    "updated_at": &updated_at,
+                    "paused": paused,
+                    "charter_status": &charter_status,
+                    "current_charter_revision_id": &charter_revision_id,
+                }))?;
+                Ok(OperatingContextReference::included(
+                    format!("portfolio:{project_id}@v{version}"),
+                    project_id,
+                    "main_portfolio_projection",
+                    format!("v{version}:{updated_at}"),
+                    digest,
+                    "bounded_account_portfolio_projection",
+                ))
+            })
+            .collect()
+    }
+
+    /// Load and authenticate the complete Project operating-skill boundary.
+    ///
+    /// The worker intentionally does not trust the chat row, handoff prose, or
+    /// Profile as an authority source.  The active binding, Project pointers,
+    /// approved Charter revision, approval receipt, and selected server skill
+    /// are joined and compared here before a session is admitted to a model
+    /// backend.  A missing or stale pointer is an error rather than a degraded
+    /// prompt: a Project Agent must not make a mutating proposal against an
+    /// unproven Project state.
+    async fn load_project_operating_skill(
+        &self,
+        project_id: &str,
+        agent: &Agent,
+        profile: &AgentProfile,
+        project_chat_id: &str,
+        job: &AgentChatTurnJob,
+    ) -> Result<ProjectOperatingSkillSnapshot> {
+        // Authenticate the Project Agent binding before retrieving any
+        // Project row.  The chat's project_id is a routing hint, not an ACL
+        // grant, so cross-scope rows must never become a lookup oracle.
+        let binding = ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
+            .await?
+            .filter(|binding| {
+                binding.state == "active"
+                    && binding.identity_id.as_deref() == Some(agent.id.as_str())
+                    && binding.profile_id.as_deref() == Some(profile.id.as_str())
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project Agent turn has no authenticated active Project binding",
+                )
+            })?;
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        if binding.permission_ceiling_json.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent binding has no permission ceiling",
+            ));
+        }
+
+        // These columns were added by V076 and are intentionally read as a
+        // narrow row here until the orchestration repositories expose their
+        // full typed binding record.  Reading the exact row also ensures a
+        // stale Rust model cannot accidentally turn a missing column into a
+        // permissive default.
+        let binding_row = sqlx::query(
+            "SELECT id, project_id, state, identity_id, profile_id,
+                    operating_skill_revision_id, policy_revision, policy_digest,
+                    charter_id, charter_revision_id, charter_setup_required
+             FROM project_agent_binding
+             WHERE id = ? AND project_id = ?",
+        )
+        .bind(&binding.id)
+        .bind(project_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent binding disappeared while admitting the turn",
+            )
+        })?;
+        let binding_state: String = binding_row.try_get("state")?;
+        let binding_project_id: String = binding_row.try_get("project_id")?;
+        let binding_identity_id: Option<String> = binding_row.try_get("identity_id")?;
+        let binding_profile_id: Option<String> = binding_row.try_get("profile_id")?;
+        let binding_skill_revision_id: Option<String> =
+            binding_row.try_get("operating_skill_revision_id")?;
+        let binding_policy_revision: String = binding_row.try_get("policy_revision")?;
+        let binding_policy_digest: String = binding_row.try_get("policy_digest")?;
+        let binding_charter_id: Option<String> = binding_row.try_get("charter_id")?;
+        let binding_charter_revision_id: Option<String> =
+            binding_row.try_get("charter_revision_id")?;
+        let binding_charter_setup_required: i64 = binding_row.try_get("charter_setup_required")?;
+
+        // Existing Projects intentionally remain usable while they are being
+        // adopted into the Charter model.  Their Project Agent may only read
+        // the bounded legacy state and propose the adoption Charter; this
+        // branch never claims Charter/handoff authority and never enables
+        // repository-capable work or release operations.
+        if project.charter_status == "legacy_unverified" && project.charter_setup_required {
+            if binding_state != "active"
+                || binding_project_id != project_id
+                || binding_identity_id.as_deref() != Some(agent.id.as_str())
+                || binding_profile_id.as_deref() != Some(profile.id.as_str())
+                || binding_charter_setup_required != 1
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Legacy Project Agent setup binding is not authenticated",
+                ));
+            }
+            let skill_row = sqlx::query(
+                "SELECT sr.id, sr.skill_key, sr.revision,
+                        sr.schema_version, sr.render_version, sr.canonical_body,
+                        sr.policy_json, sr.policy_digest, sr.content_digest,
+                        os.current_revision_id
+                 FROM operating_skill_revision AS sr
+                 JOIN operating_skill AS os ON os.id = sr.operating_skill_id
+                  AND os.current_revision_id = sr.id
+                 WHERE os.lifecycle = 'active' AND sr.skill_key = ?
+                 ORDER BY sr.revision DESC, sr.id DESC LIMIT 1",
+            )
+            .bind(PROJECT_OPERATING_SKILL_KEY)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project setup cannot load the server-owned operating skill",
+                )
+            })?;
+            let setup_skill_revision_id: String = skill_row.try_get("id")?;
+            let setup_skill_key: String = skill_row.try_get("skill_key")?;
+            let setup_skill_revision: i64 = skill_row.try_get("revision")?;
+            let setup_skill_schema_version: String = skill_row.try_get("schema_version")?;
+            let setup_skill_render_version: String = skill_row.try_get("render_version")?;
+            let setup_skill_canonical_body: String = skill_row.try_get("canonical_body")?;
+            let setup_skill_policy_json: String = skill_row.try_get("policy_json")?;
+            let setup_skill_policy_digest: String = skill_row.try_get("policy_digest")?;
+            let setup_skill_content_digest: String = skill_row.try_get("content_digest")?;
+            let setup_skill_current_revision: Option<String> =
+                skill_row.try_get("current_revision_id")?;
+            if setup_skill_key != PROJECT_OPERATING_SKILL_KEY
+                || setup_skill_revision < 1
+                || setup_skill_schema_version != PROJECT_OPERATING_SKILL_SCHEMA_VERSION
+                || setup_skill_render_version != PROJECT_OPERATING_SKILL_RENDER_VERSION
+                || setup_skill_canonical_body != canonical_project_operating_skill_body()
+                || setup_skill_policy_json != PROJECT_OPERATING_SKILL_POLICY_JSON
+                || setup_skill_policy_digest != PROJECT_OPERATING_SKILL_POLICY_DIGEST
+                || setup_skill_content_digest != PROJECT_OPERATING_SKILL_CONTENT_DIGEST
+                || setup_skill_current_revision.as_deref() != Some(setup_skill_revision_id.as_str())
+                || setup_skill_revision_id
+                    != format!("{PROJECT_OPERATING_SKILL_KEY}@{setup_skill_revision}")
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Project setup operating skill is not the selected server contract",
+                ));
+            }
+            let project_identity_digest = canonical_context_digest(&serde_json::json!({
+                "id": &project.id,
+                "name": &project.name,
+                "paused": project.paused_at.is_some(),
+                "charter_status": &project.charter_status,
+                "charter_setup_required": project.charter_setup_required,
+                "version": project.version,
+                "updated_at": &project.updated_at,
+            }))?;
+            let context_references = vec![
+                OperatingContextReference::included(
+                    format!("project:{project_id}@v{}", project.version),
+                    project_id,
+                    "project_identity",
+                    format!("v{}", project.version),
+                    project_identity_digest,
+                    "authenticated_project_identity",
+                ),
+                OperatingContextReference::included(
+                    "project_authority:legacy_unverified",
+                    project_id,
+                    "project_authority",
+                    "legacy_unverified",
+                    canonical_context_digest(&serde_json::json!({
+                        "authority": "legacy_unverified",
+                        "project_id": project_id,
+                    }))?,
+                    "legacy_setup_restriction",
+                ),
+                OperatingContextReference::included(
+                    "project_setup:charter_adoption_required",
+                    project_id,
+                    "project_setup",
+                    "charter_adoption_required",
+                    canonical_context_digest(&serde_json::json!({
+                        "setup": "charter_adoption_required",
+                        "project_id": project_id,
+                    }))?,
+                    "legacy_setup_restriction",
+                ),
+            ];
+            let context_reference_displays = context_references
+                .iter()
+                .map(|reference| reference.display.clone())
+                .collect::<Vec<_>>();
+            let context = ProjectOperatingSkillContext {
+                project_id: project_id.to_owned(),
+                binding_id: binding.id.clone(),
+                permission_ceiling: PROJECT_SETUP_PERMISSION_CEILING.to_owned(),
+                policy_revision: None,
+                handoff_payload_hash: None,
+                charter_id: None,
+                charter_revision: None,
+                charter_content_digest: None,
+                charter_render_digest: None,
+                approval_receipt_id: None,
+                project_mode: api_types::ProjectMode::Compact,
+                effective_state: EffectiveProjectStateContext::default(),
+                context_manifest_references: context_reference_displays,
+                profile_text: profile.prompt_template.clone().unwrap_or_default(),
+            };
+            let mut instruction = render_project_operating_skill(&context);
+            instruction.push_str(PROJECT_SETUP_RESTRICTIONS);
+            let context_sources = project_operating_context_sources(
+                &setup_skill_revision_id,
+                &setup_skill_content_digest,
+                &context_references,
+            );
+            return Ok(ProjectOperatingSkillSnapshot {
+                instruction,
+                context_sources,
+            });
+        }
+
+        if project.charter_status != "charter_backed"
+            || project.charter_setup_required
+            || project.current_charter_id.is_none()
+            || project.current_charter_revision_id.is_none()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent turn is blocked until the Project has an approved Charter",
+            ));
+        }
+        if binding_state != "active"
+            || binding_project_id != project_id
+            || binding_identity_id.as_deref() != Some(agent.id.as_str())
+            || binding_profile_id.as_deref() != Some(profile.id.as_str())
+            || binding_charter_setup_required != 0
+            || binding_policy_revision.trim().is_empty()
+            || binding_policy_digest.trim().is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent binding is not an active Charter-backed authority",
+            ));
+        }
+        let binding_skill_revision_id = binding_skill_revision_id.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent binding has no server-owned operating-skill revision",
+            )
+        })?;
+        let binding_charter_id = binding_charter_id.ok_or_else(|| {
+            ServiceError::invalid_operation("Project Agent binding has no Charter pointer")
+        })?;
+        let binding_charter_revision_id = binding_charter_revision_id.ok_or_else(|| {
+            ServiceError::invalid_operation("Project Agent binding has no Charter revision pointer")
+        })?;
+
+        let project_charter_id = project.current_charter_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("Project has no current Charter pointer")
+        })?;
+        let project_charter_revision_id = project
+            .current_charter_revision_id
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Project has no current Charter revision pointer")
+            })?;
+        if binding_charter_id != project_charter_id
+            || binding_charter_revision_id != project_charter_revision_id
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent binding Charter pointers do not match the Project",
+            ));
+        }
+
+        let charter_row = sqlx::query(
+            "SELECT c.id AS charter_id, c.account_id AS charter_account_id,
+                    c.genesis_session_id,
+                    c.current_approved_revision_id,
+                    c.project_mode, c.version AS charter_version,
+                    r.id AS charter_revision_id, r.lifecycle AS charter_revision_lifecycle,
+                    r.revision AS charter_revision_number,
+                    r.schema_version AS charter_schema_version,
+                    r.render_version AS charter_render_version,
+                    r.content_digest AS charter_content_digest,
+                    r.rendered_digest AS charter_render_digest,
+                    a.id AS approval_id, a.lifecycle AS approval_lifecycle,
+                    a.approval_type,
+                    a.content_digest AS approval_content_digest,
+                    a.rendered_digest AS approval_render_digest,
+                    a.expected_charter_version,
+                    a.approved_project_mode,
+                    a.approved_name,
+                    a.selected_identity_id, a.selected_profile_id,
+                    a.selected_operating_skill_revision_id,
+                    a.selected_policy_revision, a.selected_policy_digest,
+                    a.approval_event_id,
+                    a.consumed_project_id,
+                    a.approved_slug,
+                    a.approving_principal_type,
+                    a.approving_principal_id,
+                    a.authorization_basis AS approval_authorization_basis,
+                    a.authorization_action AS approval_authorization_action,
+                    a.explicit_event AS approval_authorization_event_id,
+                    a.authorization_occurred_at AS approval_authorization_occurred_at,
+                    a.created_at AS approval_created_at
+             FROM project_charter AS c
+             JOIN project_charter_revision AS r
+               ON r.id = c.current_approved_revision_id
+              AND r.lifecycle = 'approved'
+             JOIN project_charter_approval AS a
+               ON a.charter_id = c.id AND a.revision_id = r.id
+              AND a.lifecycle IN ('active', 'consumed')
+             WHERE c.project_id = ? AND c.id = ? AND r.id = ?
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(project_charter_id)
+        .bind(project_charter_revision_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent turn has no current approved Charter approval receipt",
+            )
+        })?;
+        let charter_id: String = charter_row.try_get("charter_id")?;
+        let charter_account_id: String = charter_row.try_get("charter_account_id")?;
+        let charter_revision_id: String = charter_row.try_get("charter_revision_id")?;
+        let current_approved_revision_id: Option<String> =
+            charter_row.try_get("current_approved_revision_id")?;
+        let charter_revision_lifecycle: String =
+            charter_row.try_get("charter_revision_lifecycle")?;
+        let charter_revision_number: i64 = charter_row.try_get("charter_revision_number")?;
+        let charter_schema_version: String = charter_row.try_get("charter_schema_version")?;
+        let charter_render_version: String = charter_row.try_get("charter_render_version")?;
+        let charter_version: i64 = charter_row.try_get("charter_version")?;
+        let expected_charter_version: i64 = charter_row.try_get("expected_charter_version")?;
+        let approval_lifecycle: String = charter_row.try_get("approval_lifecycle")?;
+        let approval_id: String = charter_row.try_get("approval_id")?;
+        let approval_type: String = charter_row.try_get("approval_type")?;
+        let approval_content_digest: String = charter_row.try_get("approval_content_digest")?;
+        let approval_render_digest: String = charter_row.try_get("approval_render_digest")?;
+        let approved_project_mode: String = charter_row.try_get("approved_project_mode")?;
+        let approved_name: Option<String> = charter_row.try_get("approved_name")?;
+        let charter_content_digest: String = charter_row.try_get("charter_content_digest")?;
+        let charter_render_digest: String = charter_row.try_get("charter_render_digest")?;
+        let consumed_project_id: Option<String> = charter_row.try_get("consumed_project_id")?;
+        let selected_identity_id: Option<String> = charter_row.try_get("selected_identity_id")?;
+        let selected_profile_id: Option<String> = charter_row.try_get("selected_profile_id")?;
+        let selected_skill_revision_id: Option<String> =
+            charter_row.try_get("selected_operating_skill_revision_id")?;
+        let selected_policy_revision: Option<String> =
+            charter_row.try_get("selected_policy_revision")?;
+        let selected_policy_digest: Option<String> =
+            charter_row.try_get("selected_policy_digest")?;
+        let approval_event_id: Option<String> = charter_row.try_get("approval_event_id")?;
+        let approval_approved_slug: Option<String> = charter_row.try_get("approved_slug")?;
+        let approval_principal_kind: String = charter_row.try_get("approving_principal_type")?;
+        let approval_principal_id: String = charter_row.try_get("approving_principal_id")?;
+        let approval_authorization_basis: String =
+            charter_row.try_get("approval_authorization_basis")?;
+        let approval_authorization_action: String =
+            charter_row.try_get("approval_authorization_action")?;
+        let approval_authorization_event_id: String =
+            charter_row.try_get("approval_authorization_event_id")?;
+        let approval_authorization_occurred_at: String =
+            charter_row.try_get("approval_authorization_occurred_at")?;
+        let approval_created_at: String = charter_row.try_get("approval_created_at")?;
+        let genesis_session_id: Option<String> = charter_row.try_get("genesis_session_id")?;
+        let expected_approval_event_id = approval_event_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent Charter approval has no immutable authorization event",
+            )
+        })?;
+        let expected_identity_id = selected_identity_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent Charter approval has no selected identity",
+            )
+        })?;
+        let expected_profile_revision_id = selected_profile_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent Charter approval has no selected profile revision",
+            )
+        })?;
+        let expected_skill_revision_id =
+            selected_skill_revision_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project Agent Charter approval has no selected operating skill revision",
+                )
+            })?;
+        let expected_policy_revision = selected_policy_revision.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent Charter approval has no selected policy revision",
+            )
+        })?;
+        let expected_policy_digest = selected_policy_digest.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent Charter approval has no selected policy digest",
+            )
+        })?;
+        let recomputed_policy_digest = project_agent_policy_digest(&profile.tool_policy_json);
+        if charter_id != project_charter_id
+            || charter_revision_id != project_charter_revision_id
+            || current_approved_revision_id.as_deref() != Some(project_charter_revision_id)
+            || charter_revision_lifecycle != "approved"
+            || approval_lifecycle != "consumed"
+            || project.current_charter_version != charter_version
+            || expected_charter_version + 1 != project.current_charter_version
+            || approval_content_digest != charter_content_digest
+            || approval_render_digest != charter_render_digest
+            || charter_content_digest.trim().is_empty()
+            || charter_render_digest.trim().is_empty()
+            || selected_identity_id.as_deref() != Some(agent.id.as_str())
+            || selected_profile_id.as_deref() != Some(profile.id.as_str())
+            || selected_skill_revision_id.as_deref() != Some(binding_skill_revision_id.as_str())
+            || selected_policy_revision.as_deref() != Some(binding_policy_revision.as_str())
+            || selected_policy_digest.as_deref() != Some(binding_policy_digest.as_str())
+            || expected_identity_id != agent.id
+            || expected_profile_revision_id != profile.id
+            || expected_skill_revision_id != binding_skill_revision_id
+            || expected_policy_revision != binding_policy_revision
+            || expected_policy_digest != binding_policy_digest
+            || expected_policy_digest != recomputed_policy_digest
+            || consumed_project_id.as_deref() != Some(project_id)
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent Charter, approval, binding, or selected policy is stale or mismatched",
+            ));
+        }
+
+        let skill_row = sqlx::query(
+            "SELECT sr.id, sr.skill_key, sr.revision,
+                    sr.schema_version, sr.render_version, sr.canonical_body,
+                    sr.policy_json, sr.policy_digest, sr.content_digest,
+                    os.current_revision_id
+             FROM operating_skill_revision AS sr
+             JOIN operating_skill AS os ON os.id = sr.operating_skill_id
+             WHERE sr.id = ?",
+        )
+        .bind(&binding_skill_revision_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("Project Agent operating-skill revision is not present")
+        })?;
+        let skill_id: String = skill_row.try_get("id")?;
+        let skill_key: String = skill_row.try_get("skill_key")?;
+        let skill_revision: i64 = skill_row.try_get("revision")?;
+        let skill_schema_version: String = skill_row.try_get("schema_version")?;
+        let skill_render_version: String = skill_row.try_get("render_version")?;
+        let skill_canonical_body: String = skill_row.try_get("canonical_body")?;
+        let skill_policy_json: String = skill_row.try_get("policy_json")?;
+        let skill_policy_digest: String = skill_row.try_get("policy_digest")?;
+        let skill_content_digest: String = skill_row.try_get("content_digest")?;
+        if skill_id != binding_skill_revision_id
+            || skill_key != PROJECT_OPERATING_SKILL_KEY
+            || skill_revision < 1
+            || skill_schema_version != PROJECT_OPERATING_SKILL_SCHEMA_VERSION
+            || skill_render_version != PROJECT_OPERATING_SKILL_RENDER_VERSION
+            || skill_canonical_body != canonical_project_operating_skill_body()
+            || skill_policy_json != PROJECT_OPERATING_SKILL_POLICY_JSON
+            || skill_policy_digest != PROJECT_OPERATING_SKILL_POLICY_DIGEST
+            || skill_content_digest != PROJECT_OPERATING_SKILL_CONTENT_DIGEST
+            || binding_skill_revision_id
+                != format!("{PROJECT_OPERATING_SKILL_KEY}@{skill_revision}")
+            || skill_row
+                .try_get::<Option<String>, _>("current_revision_id")?
+                .as_deref()
+                != Some(binding_skill_revision_id.as_str())
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent operating-skill revision is not the selected server contract",
+            ));
+        }
+
+        let project_owner_id = project.owner_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Charter-backed Project has no owner for Main-to-Project authentication",
+            )
+        })?;
+        if charter_account_id != project_owner_id {
+            return Err(ServiceError::invalid_operation(
+                "Project Charter account does not match the Project owner",
+            ));
+        }
+        if agent.owner_id.as_deref() != Some(project_owner_id) {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent identity is not owned by the Project account",
+            ));
+        }
+        if approval_principal_kind != "user" || approval_principal_id != project_owner_id {
+            return Err(ServiceError::invalid_operation(
+                "Project Charter approval is not an authenticated user authorization",
+            ));
+        }
+        let approval_event = sqlx::query(
+            "SELECT principal_type, principal_id, authorization_basis, action,
+                    explicit_event, occurred_at
+             FROM project_charter_approval_event
+             WHERE approval_id = ? AND id = ? AND principal_type = 'user'
+               AND principal_id = ? LIMIT 1",
+        )
+        .bind(&approval_id)
+        .bind(expected_approval_event_id)
+        .bind(project_owner_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let approval_event = approval_event.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Charter approval event is not an exact user authorization",
+            )
+        })?;
+        if approval_event.try_get::<String, _>("authorization_basis")?
+            != approval_authorization_basis
+            || approval_event.try_get::<String, _>("action")? != approval_authorization_action
+            || approval_event.try_get::<String, _>("explicit_event")?
+                != approval_authorization_event_id
+            || approval_event.try_get::<String, _>("occurred_at")?
+                != approval_authorization_occurred_at
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project Charter approval event is not an exact user authorization",
+            ));
+        }
+        let (handoff_id, handoff_payload_hash) = if genesis_session_id.is_none()
+            && matches!(approval_type.as_str(), "adoption" | "charter_amendment")
+        {
+            let is_adoption = approval_type == "adoption";
+            if project.charter_status != "charter_backed"
+                || project.charter_setup_required
+                || approval_principal_kind != "user"
+                || approval_principal_id != project_owner_id
+                || approved_name.as_deref() != Some(project.name.as_str())
+                || approval_lifecycle != "consumed"
+                || consumed_project_id.as_deref() != Some(project_id)
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Project adoption approval is stale or not authenticated",
+                ));
+            }
+            let charter_revision_for_hash = project_charter_revision_id.to_owned();
+            let adoption_hash = hash_parts(
+                if is_adoption {
+                    b"forge-project-adoption-bootstrap-v1\0"
+                } else {
+                    b"forge-project-charter-amendment-bootstrap-v1\0"
+                },
+                [&approval_id, &charter_revision_for_hash, &binding.id],
+            );
+            (None, adoption_hash)
+        } else {
+            let genesis_session_id = genesis_session_id.ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project Charter has no Product Genesis source for Main provenance",
+                )
+            })?;
+            let genesis_row = sqlx::query(
+                "SELECT account_id, main_chat_id, lifecycle, source_message_ids_json
+                 FROM product_genesis_session
+                 WHERE id = ?",
+            )
+            .bind(&genesis_session_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project handoff has no Product Genesis source record",
+                )
+            })?;
+            let genesis_account_id: String = genesis_row.try_get("account_id")?;
+            let genesis_main_chat_id: String = genesis_row.try_get("main_chat_id")?;
+            let genesis_lifecycle: String = genesis_row.try_get("lifecycle")?;
+            let genesis_source_message_ids_json: String =
+                genesis_row.try_get("source_message_ids_json")?;
+            let genesis_source_message_ids: Vec<String> =
+                serde_json::from_str(&genesis_source_message_ids_json).map_err(|_| {
+                    ServiceError::invalid_operation(
+                        "Project handoff Product Genesis source references are invalid",
+                    )
+                })?;
+            if genesis_account_id != project_owner_id
+                || genesis_lifecycle != "handed_off"
+                || genesis_main_chat_id.trim().is_empty()
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Project handoff Product Genesis/Main provenance is stale or mismatched",
+                ));
+            }
+            let source_turn_id = match genesis_source_message_ids.last() {
+                Some(source_message_id) => {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT id FROM agent_chat_turn_job
+                     WHERE chat_id = ? AND triggering_message_id = ?
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    )
+                    .bind(&genesis_main_chat_id)
+                    .bind(source_message_id)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                }
+                None => None,
+            };
+            let handoff_rows = sqlx::query(
+                "SELECT handoff.id, handoff.source_chat_id, handoff.target_chat_id,
+                        handoff.author_identity_id, handoff.content,
+                        handoff.source_revisions_json, handoff.status,
+                        handoff.correlation_id, handoff.causation_id,
+                        handoff.dedupe_key, handoff.created_at, handoff.updated_at,
+                        handoff.target_message_id, handoff.target_turn_job_id,
+                        source_chat.kind AS source_kind,
+                        source_chat.account_id AS source_account_id,
+                        target_chat.kind AS target_kind,
+                        target_chat.project_id AS target_project_id
+                 FROM agent_handoff AS handoff
+                 JOIN agent_chat AS source_chat ON source_chat.id = handoff.source_chat_id
+                  AND source_chat.kind = 'account_main'
+                  AND source_chat.account_id = ?
+                 JOIN agent_chat AS target_chat ON target_chat.id = handoff.target_chat_id
+                  AND target_chat.kind = 'project'
+                  AND target_chat.project_id = ?
+                 JOIN agent_identity AS author ON author.id = handoff.author_identity_id
+                  AND author.owner_id = source_chat.account_id
+                 WHERE handoff.target_chat_id = ?
+                   AND handoff.status = 'delivered'
+                   AND json_valid(handoff.source_revisions_json) = 1
+                   AND json_extract(handoff.source_revisions_json, '$.schema_version') = ?
+                   AND json_extract(handoff.source_revisions_json, '$.approval.id') = ?
+                 ORDER BY handoff.created_at DESC, handoff.id DESC",
+            )
+            .bind(project_owner_id)
+            .bind(project_id)
+            .bind(project_chat_id)
+            .bind(PROJECT_HANDOFF_SCHEMA_VERSION)
+            .bind(&approval_id)
+            .fetch_all(self.db.pool())
+            .await?;
+            let mut matching_handoff: Option<(String, String, String)> = None;
+            for handoff_row in handoff_rows {
+                let source_chat_id: String = handoff_row.try_get("source_chat_id")?;
+                let target_chat_id: String = handoff_row.try_get("target_chat_id")?;
+                let author_identity_id: Option<String> =
+                    handoff_row.try_get("author_identity_id")?;
+                let source_kind: String = handoff_row.try_get("source_kind")?;
+                let source_account_id: Option<String> = handoff_row.try_get("source_account_id")?;
+                let target_kind: String = handoff_row.try_get("target_kind")?;
+                let target_project_id: Option<String> = handoff_row.try_get("target_project_id")?;
+                let status: String = handoff_row.try_get("status")?;
+                if source_kind != "account_main"
+                    || source_account_id.as_deref() != Some(project_owner_id)
+                    || target_kind != "project"
+                    || target_project_id.as_deref() != Some(project_id)
+                    || target_chat_id != project_chat_id
+                    || source_chat_id == project_chat_id
+                    || source_chat_id != genesis_main_chat_id
+                    || status != "delivered"
+                {
+                    continue;
+                }
+                let handoff_id: String = handoff_row.try_get("id")?;
+                let handoff_content: String = handoff_row.try_get("content")?;
+                let handoff_source_revisions: String =
+                    handoff_row.try_get("source_revisions_json")?;
+                let Some(author_identity_id) = author_identity_id.as_deref() else {
+                    continue;
+                };
+                let packet = match parse_project_handoff_packet(&handoff_source_revisions) {
+                    Ok(packet) => packet,
+                    Err(_) => continue,
+                };
+                let source_profile_exists: Option<String> = sqlx::query_scalar(
+                    "SELECT profile.id
+                     FROM agent_profile AS profile
+                     JOIN agent_identity AS identity ON identity.id = profile.identity_id
+                     WHERE profile.id = ? AND profile.identity_id = ?
+                       AND identity.owner_id = ?
+                     LIMIT 1",
+                )
+                .bind(&packet.source.profile_revision_id)
+                .bind(author_identity_id)
+                .bind(project_owner_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+                if source_profile_exists.is_none() {
+                    continue;
+                }
+                let source_instruction_revision: Option<i64> = sqlx::query_scalar(
+                    "SELECT revision FROM agent_chat_instruction_revision
+                     WHERE id = ? AND chat_id = ? AND source_type = 'native' AND source_id = ?
+                     LIMIT 1",
+                )
+                .bind(&packet.source.instruction_revision_id)
+                .bind(&genesis_main_chat_id)
+                .bind(&genesis_session_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+                if source_instruction_revision != Some(packet.source.instruction_revision) {
+                    continue;
+                }
+                if let Some(source_turn_id) = packet.source.turn_id.as_deref() {
+                    let source_turn: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                        "SELECT responder_identity_id, profile_id
+                             FROM agent_chat_turn_job
+                             WHERE id = ? AND chat_id = ? LIMIT 1",
+                    )
+                    .bind(source_turn_id)
+                    .bind(&genesis_main_chat_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+                    if source_turn.as_ref().and_then(|turn| turn.0.as_deref())
+                        != Some(author_identity_id)
+                        || source_turn.as_ref().and_then(|turn| turn.1.as_deref())
+                            != Some(packet.source.profile_revision_id.as_str())
+                    {
+                        continue;
+                    }
+                }
+                let handoff_correlation_id: String = handoff_row.try_get("correlation_id")?;
+                let handoff_causation_id: Option<String> = handoff_row.try_get("causation_id")?;
+                let handoff_deduplication_key: String = handoff_row.try_get("dedupe_key")?;
+                let handoff_created_at: String = handoff_row.try_get("created_at")?;
+                let handoff_updated_at: String = handoff_row.try_get("updated_at")?;
+                let create_event_payload: String = sqlx::query_scalar(
+                    "SELECT payload_json
+                     FROM domain_event
+                     WHERE dedupe_key = ?
+                       AND event_type = 'project.created_from_charter_approval'
+                       AND entity_type = 'project'
+                       AND entity_id = ?
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                )
+                .bind(format!(
+                    "project-charter-create:{handoff_deduplication_key}"
+                ))
+                .bind(project_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project handoff has no durable Project-creation authorization event",
+                    )
+                })?;
+                let create_event: Value =
+                    serde_json::from_str(&create_event_payload).map_err(|_| {
+                        ServiceError::invalid_operation(
+                            "Project handoff creation authorization event is invalid",
+                        )
+                    })?;
+                let create_authorization = create_event
+                    .get("authorization")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Project handoff creation authorization event is incomplete",
+                        )
+                    })?;
+                let create_authorization_field = |field: &str| -> Result<String> {
+                    create_authorization
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(format!(
+                                "Project handoff creation authorization is missing {field}"
+                            ))
+                        })
+                };
+                let create_authorization_principal_type =
+                    create_authorization_field("principal_type")?;
+                let create_authorization_principal_id = create_authorization_field("principal_id")?;
+                let create_authorization_basis = create_authorization_field("authorization_basis")?;
+                let create_authorization_action = create_authorization_field("action")?;
+                let create_authorization_event_id = create_authorization_field("event_id")?;
+                let create_authorization_occurred_at = create_authorization_field("occurred_at")?;
+                let handoff_target_message_id: Option<String> =
+                    handoff_row.try_get("target_message_id")?;
+                let handoff_target_turn_id: Option<String> =
+                    handoff_row.try_get("target_turn_job_id")?;
+                let handoff_causation_id = handoff_causation_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project handoff has no immutable causation event",
+                    )
+                })?;
+                let handoff_target_message_id =
+                    handoff_target_message_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Project handoff has no target message provenance",
+                        )
+                    })?;
+                let handoff_target_turn_id =
+                    handoff_target_turn_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Project handoff has no target turn provenance",
+                        )
+                    })?;
+                if handoff_target_message_id != job.triggering_message_id.as_str()
+                    || handoff_target_turn_id != job.id.as_str()
+                {
+                    continue;
+                }
+                let handoff_expectation = ProjectHandoffExpectation {
+                    handoff_id: &handoff_id,
+                    deduplication_key: &handoff_deduplication_key,
+                    correlation_id: &handoff_correlation_id,
+                    causation_id: handoff_causation_id,
+                    source_chat_id: &genesis_main_chat_id,
+                    source_identity_id: author_identity_id,
+                    source_profile_revision_id: &packet.source.profile_revision_id,
+                    source_instruction_revision_id: &packet.source.instruction_revision_id,
+                    source_instruction_revision: packet.source.instruction_revision,
+                    source_message_ids: genesis_source_message_ids.clone(),
+                    source_turn_id: source_turn_id.as_deref(),
+                    project_id,
+                    project_name: &project.name,
+                    project_mode: &approved_project_mode,
+                    approved_slug: approval_approved_slug.as_deref(),
+                    target_chat_id: project_chat_id,
+                    target_binding_id: &binding.id,
+                    target_message_id: &job.triggering_message_id,
+                    target_turn_id: &job.id,
+                    charter_id: project_charter_id,
+                    charter_revision_id: project_charter_revision_id,
+                    charter_revision_number,
+                    charter_schema_version: &charter_schema_version,
+                    charter_content_digest: &charter_content_digest,
+                    charter_render_version: &charter_render_version,
+                    charter_render_digest: &charter_render_digest,
+                    approval_id: &approval_id,
+                    approval_event_id: expected_approval_event_id,
+                    approval_authorization_basis: &approval_authorization_basis,
+                    approval_authorization_action: &approval_authorization_action,
+                    approval_authorization_event_id: &approval_authorization_event_id,
+                    approval_authorization_occurred_at: &approval_authorization_occurred_at,
+                    approval_principal_kind: &approval_principal_kind,
+                    approval_principal_id: project_owner_id,
+                    approval_created_at: &approval_created_at,
+                    create_authorization_principal_type: &create_authorization_principal_type,
+                    create_authorization_principal_id: &create_authorization_principal_id,
+                    create_authorization_basis: &create_authorization_basis,
+                    create_authorization_action: &create_authorization_action,
+                    create_authorization_event_id: &create_authorization_event_id,
+                    create_authorization_occurred_at: &create_authorization_occurred_at,
+                    identity_id: &agent.id,
+                    profile_revision_id: &profile.id,
+                    operating_skill_revision: &binding_skill_revision_id,
+                    policy_revision: &binding_policy_revision,
+                    policy_digest: &recomputed_policy_digest,
+                    created_at: &handoff_created_at,
+                    delivered_at: &handoff_updated_at,
+                };
+                if validate_project_handoff_packet(
+                    &handoff_source_revisions,
+                    &handoff_expectation,
+                    &approval_lifecycle,
+                    consumed_project_id.as_deref(),
+                    project_id,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                if matching_handoff.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Project Agent turn has multiple handoffs for the exact Charter approval",
+                    ));
+                }
+                matching_handoff = Some((handoff_id, handoff_content, handoff_source_revisions));
+            }
+            let (handoff_id, handoff_content, handoff_source_revisions) = matching_handoff
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project Agent turn has no exact consumed Charter handoff",
+                    )
+                })?;
+            let handoff_payload_hash = hash_parts(
+                b"forge-project-handoff-payload-v1\0",
+                [&handoff_id, &handoff_content, &handoff_source_revisions],
+            );
+            (Some(handoff_id), handoff_payload_hash)
+        };
+
+        let project_mode = match charter_row.try_get::<String, _>("project_mode")?.as_str() {
+            "compact" => api_types::ProjectMode::Compact,
+            "standard" => api_types::ProjectMode::Standard,
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Project Charter has an unsupported Project mode",
+                ));
+            }
+        };
+
+        let project_identity_digest = canonical_context_digest(&serde_json::json!({
+            "id": &project.id,
+            "name": &project.name,
+            "paused": project.paused_at.is_some(),
+            "charter_status": &project.charter_status,
+            "charter_setup_required": project.charter_setup_required,
+            "version": project.version,
+            "updated_at": &project.updated_at,
+            "charter_id": &charter_id,
+            "charter_revision_id": &charter_revision_id,
+            "charter_content_digest": &charter_content_digest,
+            "charter_render_digest": &charter_render_digest,
+        }))?;
+        let approval_receipt_digest = canonical_context_digest(&serde_json::json!({
+            "id": &approval_id,
+            "event_id": expected_approval_event_id,
+            "principal_type": &approval_principal_kind,
+            "principal_id": &approval_principal_id,
+            "authorization_basis": &approval_authorization_basis,
+            "authorization_action": &approval_authorization_action,
+            "authorization_occurred_at": &approval_authorization_occurred_at,
+            "created_at": &approval_created_at,
+            "charter_id": &charter_id,
+            "revision_id": &charter_revision_id,
+            "content_digest": &charter_content_digest,
+            "render_digest": &charter_render_digest,
+        }))?;
+
+        let mut context_references = vec![
+            OperatingContextReference::included(
+                format!("project:{project_id}@v{}", project.version),
+                project_id,
+                "project_identity",
+                format!("v{}", project.version),
+                project_identity_digest,
+                "authenticated_project_identity",
+            ),
+            OperatingContextReference::included(
+                format!(
+                    "binding:{}@policy:{}:digest:{}",
+                    binding.id, binding_policy_revision, binding_policy_digest
+                ),
+                &binding.id,
+                "project_agent_binding",
+                binding_policy_revision.clone(),
+                &binding_policy_digest,
+                "authenticated_project_binding_policy",
+            ),
+            OperatingContextReference::included(
+                format!(
+                    "operating_skill:{}:content:{}",
+                    binding_skill_revision_id, skill_content_digest
+                ),
+                &binding_skill_revision_id,
+                "server_operating_skill",
+                binding_skill_revision_id.clone(),
+                &skill_content_digest,
+                "canonical_project_operating_skill",
+            ),
+            OperatingContextReference::included(
+                format!(
+                    "charter:{charter_id}@{charter_revision_id}:content:{charter_content_digest}:render:{charter_render_digest}"
+                ),
+                &charter_id,
+                "project_charter",
+                charter_revision_id.clone(),
+                &charter_content_digest,
+                "current_approved_project_charter",
+            ),
+            OperatingContextReference::included(
+                format!(
+                    "approval:{approval_id}@event:{}",
+                    expected_approval_event_id
+                ),
+                &approval_id,
+                "charter_approval_receipt",
+                expected_approval_event_id.to_owned(),
+                approval_receipt_digest,
+                "consumed_project_charter_approval",
+            ),
+        ];
+        if let Some(handoff_id) = handoff_id.as_deref() {
+            context_references.push(OperatingContextReference::included(
+                format!("handoff:{handoff_id}:receipt:{handoff_payload_hash}"),
+                handoff_id,
+                "main_to_project_handoff_receipt",
+                "forge.project-charter-handoff/v1",
+                &handoff_payload_hash,
+                "opaque_handoff_provenance_only",
+            ));
+        } else if approval_type == "adoption" {
+            context_references.push(OperatingContextReference::included(
+                format!("adoption_bootstrap:{approval_id}:receipt:{handoff_payload_hash}"),
+                &approval_id,
+                "project_adoption_bootstrap",
+                charter_revision_id.clone(),
+                &handoff_payload_hash,
+                "consumed_user_adoption_approval",
+            ));
+        } else {
+            context_references.push(OperatingContextReference::included(
+                format!("charter_amendment_bootstrap:{approval_id}:receipt:{handoff_payload_hash}"),
+                &approval_id,
+                "charter_amendment_bootstrap",
+                charter_revision_id.clone(),
+                &handoff_payload_hash,
+                "consumed_user_charter_amendment_approval",
+            ));
+        }
+
+        let projection = load_effective_project_state(&self.db, project_id, Some(32)).await?;
+        if projection
+            .governing_charter
+            .as_ref()
+            .map(|charter| format!("{}@{}", charter.id, charter.revision_id))
+            .as_deref()
+            != Some(&format!("{charter_id}@{charter_revision_id}"))
+        {
+            return Err(ServiceError::invalid_operation(
+                "Project effective-state projection does not match the authenticated Charter",
+            ));
+        }
+        let effective_state = effective_state_context(&projection)?;
+
+        if let Some(baseline) = projection.active_execution_baseline.as_ref() {
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "baseline:{}@{}:content:{}:render:{}:policy:{}@{}",
+                    baseline.id,
+                    baseline.revision_id,
+                    baseline.content_digest,
+                    baseline.render_digest,
+                    baseline.release_policy_revision,
+                    baseline.release_policy_digest
+                ),
+                &baseline.id,
+                "execution_baseline",
+                &baseline.revision_id,
+                &baseline.content_digest,
+                "active_approved_execution_baseline",
+            ));
+        } else {
+            context_references.push(OperatingContextReference::omitted(
+                "baseline:unresolved",
+                project_id,
+                "execution_baseline",
+                "unresolved",
+                canonical_context_digest(&serde_json::json!({
+                    "project_id": project_id,
+                    "source_event_watermark": &projection.source_event_watermark,
+                    "execution_baseline": Value::Null,
+                }))?,
+                "no_active_approved_execution_baseline",
+            ));
+        }
+
+        for document in &projection.approved_documents {
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "document:{}:{}@{}:content:{}:render:{}",
+                    document.kind,
+                    document.id,
+                    document.revision_id,
+                    document.content_digest,
+                    document.render_digest
+                ),
+                &document.id,
+                "project_document",
+                &document.revision_id,
+                &document.content_digest,
+                "current_approved_document",
+            ));
+        }
+
+        for decision in &projection.active_decisions {
+            let digest = canonical_context_digest(decision)?;
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "decision:{}@{}:digest:{}",
+                    decision.id, decision.created_at, digest
+                ),
+                &decision.id,
+                "project_decision",
+                &decision.created_at,
+                digest,
+                "active_effective_decision",
+            ));
+        }
+        for decision in &projection.invalidated_decisions {
+            let digest = canonical_context_digest(decision)?;
+            context_references.push(OperatingContextReference::omitted(
+                format!("decision:{}@stale:digest:{}", decision.id, digest),
+                &decision.id,
+                "project_decision",
+                &decision.created_at,
+                digest,
+                "invalidated_decision",
+            ));
+        }
+
+        for reconciliation in &projection.reconciliation_required {
+            context_references.push(OperatingContextReference::omitted(
+                format!(
+                    "reconciliation:{}:{}:{}@{}:digest:{}",
+                    reconciliation.id,
+                    reconciliation.record_type,
+                    reconciliation.record_id,
+                    reconciliation.record_revision,
+                    reconciliation.record_digest
+                ),
+                &reconciliation.record_id,
+                "project_reconciliation",
+                &reconciliation.record_revision,
+                &reconciliation.record_digest,
+                "reconciliation_required",
+            ));
+        }
+        for conflict in &projection.canonical_conflicts {
+            context_references.push(OperatingContextReference::omitted(
+                format!(
+                    "conflict:{}:{}:{}@{}:{}@{}",
+                    conflict.id,
+                    conflict.domain,
+                    conflict.governing_record_id,
+                    conflict.governing_record_revision,
+                    conflict.conflicting_record_id,
+                    conflict.conflicting_record_revision
+                ),
+                &conflict.id,
+                "canonical_project_conflict",
+                &conflict.created_at,
+                &conflict.governing_record_digest,
+                "canonical_conflict_blocks_affected_work",
+            ));
+        }
+
+        let task_summary = projection
+            .task_summary
+            .by_status
+            .iter()
+            .map(|count| format!("{}={}", count.key, count.count))
+            .collect::<Vec<_>>()
+            .join(",");
+        let task_summary_digest = canonical_context_digest(&projection.task_summary)?;
+        context_references.push(OperatingContextReference::included(
+            format!(
+                "tasks:summary:{}:total={}@{}",
+                task_summary, projection.task_summary.total, task_summary_digest
+            ),
+            project_id,
+            "project_task_projection",
+            &projection.source_event_watermark,
+            task_summary_digest,
+            "latest_server_accepted_task_versions",
+        ));
+
+        let validation_summary = projection
+            .validation_summary
+            .by_outcome
+            .iter()
+            .map(|count| format!("{}={}", count.key, count.count))
+            .collect::<Vec<_>>()
+            .join(",");
+        let validation_summary_digest = canonical_context_digest(&projection.validation_summary)?;
+        context_references.push(OperatingContextReference::included(
+            format!(
+                "validation:summary:{}:total={}@{}",
+                validation_summary, projection.validation_summary.total, validation_summary_digest
+            ),
+            project_id,
+            "project_validation_projection",
+            &projection.source_event_watermark,
+            validation_summary_digest,
+            "latest_validation_summary",
+        ));
+
+        // Coordination state is a bounded reconciliation projection.  Only
+        // server-derived ids, lifecycle/version metadata, and evidence counts
+        // enter the Project prompt; inbox bodies and commitment descriptions
+        // remain behind explicit scoped read tools and cannot inject prompt
+        // instructions.
+        for commitment in &projection.commitments {
+            let digest = canonical_context_digest(commitment)?;
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "commitment:{}:{}@v{}:evidence:{}",
+                    commitment.id, commitment.status, commitment.version, commitment.evidence_count
+                ),
+                &commitment.id,
+                "project_commitment",
+                format!("v{}", commitment.version),
+                digest,
+                "project_commitment_reconciliation",
+            ));
+        }
+        for item in &projection.inbox {
+            let digest = canonical_context_digest(item)?;
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "inbox:{}:{}:{}@v{}",
+                    item.id, item.kind, item.status, item.version
+                ),
+                &item.id,
+                "project_inbox_reconciliation",
+                format!("v{}", item.version),
+                digest,
+                "project_inbox_reconciliation",
+            ));
+        }
+
+        for milestone in &projection.active_milestones {
+            context_references.push(
+                match (
+                    milestone.definition_revision_id.as_deref(),
+                    milestone.definition_digest.as_deref(),
+                ) {
+                    (Some(definition_revision), Some(definition_digest))
+                        if !definition_revision.trim().is_empty()
+                            && !definition_digest.trim().is_empty() =>
+                    {
+                        OperatingContextReference::included(
+                            format!(
+                                "milestone:{}@{}:content:{}",
+                                milestone.id, definition_revision, definition_digest
+                            ),
+                            &milestone.id,
+                            "project_milestone_definition",
+                            definition_revision,
+                            definition_digest,
+                            "current_project_milestone_definition",
+                        )
+                    }
+                    _ => OperatingContextReference::omitted(
+                        format!("milestone:{}@stale:missing_definition", milestone.id),
+                        &milestone.id,
+                        "project_milestone_definition",
+                        "unresolved",
+                        canonical_context_digest(milestone)?,
+                        "missing_milestone_definition",
+                    ),
+                },
+            );
+        }
+
+        if let Some(readiness) = projection.readiness.latest.as_ref() {
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "readiness:{}@{}:{}:digest:{}",
+                    readiness.id,
+                    readiness.event_watermark,
+                    readiness.outcome,
+                    readiness.readiness_digest
+                ),
+                &readiness.id,
+                "project_readiness_snapshot",
+                &readiness.id,
+                &readiness.readiness_digest,
+                "latest_readiness_snapshot",
+            ));
+        } else {
+            context_references.push(OperatingContextReference::omitted(
+                "readiness:unresolved",
+                project_id,
+                "project_readiness_snapshot",
+                &projection.source_event_watermark,
+                canonical_context_digest(&serde_json::json!({
+                    "project_id": project_id,
+                    "source_event_watermark": &projection.source_event_watermark,
+                    "readiness": Value::Null,
+                }))?,
+                "no_readiness_snapshot",
+            ));
+        }
+
+        for release in &projection.releases {
+            let release_revision = release.release_revision.to_string();
+            context_references.push(OperatingContextReference::included(
+                format!(
+                    "release:{}:{}@{}:readiness:{}:snapshot:{}:baseline:{}@{}",
+                    release.id,
+                    release.release_identifier,
+                    release.release_revision,
+                    release.readiness_digest,
+                    release.snapshot_digest,
+                    release.baseline_id,
+                    release.baseline_revision_id
+                ),
+                &release.id,
+                "immutable_project_release",
+                &release_revision,
+                &release.snapshot_digest,
+                "immutable_release_history",
+            ));
+        }
+
+        let unreleased = &projection.unreleased_changes;
+        for (source_type, ids, reason) in [
+            (
+                "unreleased_document_change",
+                &unreleased.document_ids,
+                "current_document_draft_differs_from_approved",
+            ),
+            (
+                "unreleased_decision_candidate",
+                &unreleased.decision_candidate_ids,
+                "decision_candidate_not_effective",
+            ),
+            (
+                "unreleased_baseline_revision",
+                &unreleased.baseline_revision_ids,
+                "baseline_revision_not_active",
+            ),
+            (
+                "unreleased_active_milestone",
+                &unreleased.active_milestone_ids,
+                "active_milestone_has_no_release",
+            ),
+            (
+                "unreleased_reconciliation",
+                &unreleased.reconciliation_ids,
+                "reconciliation_record_remains_required",
+            ),
+        ] {
+            for id in ids {
+                let digest = canonical_context_digest(&serde_json::json!({
+                    "source_type": source_type,
+                    "source_id": id,
+                    "source_event_watermark": &projection.source_event_watermark,
+                }))?;
+                context_references.push(OperatingContextReference::omitted(
+                    format!("{source_type}:{id}:digest:{digest}"),
+                    id,
+                    source_type,
+                    &projection.source_event_watermark,
+                    digest,
+                    reason,
+                ));
+            }
+        }
+
+        // The prompt and manifest use the same canonical projection.  Raw
+        // handoff packet JSON, Main chat IDs, and Main transcript bodies never
+        // enter these references.
+
+        let context = ProjectOperatingSkillContext {
+            project_id: project_id.to_owned(),
+            binding_id: binding.id,
+            permission_ceiling: binding.permission_ceiling_json,
+            policy_revision: Some(binding_policy_revision.clone()),
+            handoff_payload_hash: handoff_id.as_ref().map(|_| handoff_payload_hash),
+            charter_id: Some(charter_id),
+            charter_revision: Some(charter_revision_id),
+            charter_content_digest: Some(charter_content_digest),
+            charter_render_digest: Some(charter_render_digest),
+            approval_receipt_id: Some(approval_id),
+            project_mode,
+            effective_state,
+            context_manifest_references: context_references
+                .iter()
+                .map(|reference| reference.display.clone())
+                .collect(),
+            profile_text: profile.prompt_template.clone().unwrap_or_default(),
+        };
+        let instruction = render_project_operating_skill(&context);
+        let context_sources = project_operating_context_sources(
+            &binding_skill_revision_id,
+            &skill_content_digest,
+            &context_references,
+        );
+        Ok(ProjectOperatingSkillSnapshot {
+            instruction,
+            context_sources,
         })
     }
 
@@ -309,7 +2225,8 @@ impl FederatedAgentChatTurnRunner {
             session,
             input,
             history,
-            genesis_instruction,
+            operating_instruction,
+            operating_context_sources,
         } = turn;
         let owner_user_id = agent
             .owner_id
@@ -364,7 +2281,7 @@ impl FederatedAgentChatTurnRunner {
                     },
                     system_prompt: compose_system_prompt(
                         profile.prompt_template.as_deref(),
-                        genesis_instruction.as_deref(),
+                        operating_instruction.as_deref(),
                     ),
                     history: runtime_history(&history),
                     input: input.content,
@@ -378,8 +2295,28 @@ impl FederatedAgentChatTurnRunner {
         guard_agent_chat_content(&content)?;
         let context_manifest_id = if let Some(manifest) = output.context_manifest.as_ref() {
             Some(
-                self.persist_runtime_context_manifest(job, &agent, &session, manifest)
-                    .await?,
+                self.persist_runtime_context_manifest(
+                    job,
+                    &agent,
+                    &profile,
+                    &session,
+                    Some(&model),
+                    manifest,
+                    &operating_context_sources,
+                )
+                .await?,
+            )
+        } else if !operating_context_sources.is_empty() {
+            Some(
+                self.persist_server_context_manifest(
+                    job,
+                    &agent,
+                    &profile,
+                    &session,
+                    Some(&model),
+                    &operating_context_sources,
+                )
+                .await?,
             )
         } else {
             None
@@ -406,12 +2343,16 @@ impl FederatedAgentChatTurnRunner {
     /// runtime remains the owner of context ordering and bodies; Forge stores
     /// identifiers, revisions, counts and fingerprints and links the result
     /// to the canonical Agent Chat session before the response is admitted.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_runtime_context_manifest(
         &self,
         job: &AgentChatTurnJob,
         agent: &Agent,
+        profile: &AgentProfile,
         session: &AgentSession,
+        model: Option<&str>,
         runtime_manifest: &RuntimeContextManifestLink,
+        operating_context_sources: &[ContextSourceInput],
     ) -> Result<String> {
         let identity_id = uuid::Uuid::parse_str(&agent.id)
             .map_err(|_| ServiceError::invalid_operation("Agent identity id is invalid"))?;
@@ -419,8 +2360,21 @@ impl FederatedAgentChatTurnRunner {
             ServiceError::invalid_operation("Agent Chat context scope id is invalid")
         })?;
         let manifest_id = agent_chat_manifest_id(&agent.id, &session.id, runtime_manifest);
-        let request_fingerprint = agent_chat_request_fingerprint(job, session, runtime_manifest);
-        let sources = runtime_manifest_sources(runtime_manifest);
+        let request_fingerprint = agent_chat_request_fingerprint(
+            job,
+            profile,
+            session,
+            model,
+            runtime_manifest,
+            operating_context_sources,
+        )?;
+        let runtime_sources = runtime_manifest_sources(runtime_manifest);
+        let mut sources = operating_context_sources.to_vec();
+        let source_offset = sources.len() as i64;
+        for (offset, mut source) in runtime_sources.into_iter().enumerate() {
+            source.ordinal = source_offset + offset as i64;
+            sources.push(source);
+        }
         let service = ContextManifestService::new(Arc::clone(&self.db));
 
         if let Some(existing) = service
@@ -435,7 +2389,9 @@ impl FederatedAgentChatTurnRunner {
                     "Agent Chat runtime context manifest idempotency conflict",
                 ));
             }
-            let existing_sources = service.sources(manifest_id).await?;
+            let existing_sources = service
+                .sources(manifest_id, identity_id, context_scope_id)
+                .await?;
             for source in &sources {
                 if existing_sources.iter().any(|stored| {
                     stored.ordinal == source.ordinal
@@ -444,7 +2400,9 @@ impl FederatedAgentChatTurnRunner {
                 }) {
                     continue;
                 }
-                service.append_source(manifest_id, source.clone()).await?;
+                service
+                    .append_source(manifest_id, identity_id, context_scope_id, source.clone())
+                    .await?;
             }
             return Ok(manifest_id.to_string());
         }
@@ -476,7 +2434,101 @@ impl FederatedAgentChatTurnRunner {
             ServiceError::invalid_operation("persisted context manifest id is invalid")
         })?;
         for source in sources {
-            service.append_source(created_id, source).await?;
+            service
+                .append_source(created_id, identity_id, context_scope_id, source)
+                .await?;
+        }
+        Ok(created.id)
+    }
+
+    /// Persist the server-owned context even when the selected backend does
+    /// not expose an Agent Runtime manifest (for example, the CLI backend).
+    ///
+    /// Main/Project operating sources are already bounded, redaction-safe
+    /// references produced by `load_turn`.  They must not disappear merely
+    /// because the provider adapter has no runtime manifest to attach.  The
+    /// durable turn job is the idempotency boundary here: a retry of the same
+    /// job reuses the same immutable manifest, while a changed source/profile
+    /// set is rejected as an idempotency conflict.
+    async fn persist_server_context_manifest(
+        &self,
+        job: &AgentChatTurnJob,
+        agent: &Agent,
+        profile: &AgentProfile,
+        session: &AgentSession,
+        model: Option<&str>,
+        operating_context_sources: &[ContextSourceInput],
+    ) -> Result<String> {
+        let identity_id = uuid::Uuid::parse_str(&agent.id)
+            .map_err(|_| ServiceError::invalid_operation("Agent identity id is invalid"))?;
+        let session_id = uuid::Uuid::parse_str(&session.id)
+            .map_err(|_| ServiceError::invalid_operation("Agent Chat session id is invalid"))?;
+        let context_scope_id = uuid::Uuid::parse_str(&session.context_scope_id).map_err(|_| {
+            ServiceError::invalid_operation("Agent Chat context scope id is invalid")
+        })?;
+        let manifest_id = agent_chat_server_manifest_id(&agent.id, &session.id, &job.id);
+        let request_fingerprint = agent_chat_server_request_fingerprint(
+            job,
+            profile,
+            session,
+            model,
+            operating_context_sources,
+        )?;
+        let service = ContextManifestService::new(Arc::clone(&self.db));
+
+        if let Some(existing) = service
+            .get_authorized(manifest_id, identity_id, context_scope_id)
+            .await?
+        {
+            if existing.request_fingerprint != request_fingerprint {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat server context manifest idempotency conflict",
+                ));
+            }
+            let existing_sources = service
+                .sources(manifest_id, identity_id, context_scope_id)
+                .await?;
+            for source in operating_context_sources {
+                if existing_sources.iter().any(|stored| {
+                    stored.ordinal == source.ordinal
+                        && stored.source_id == source.source_id
+                        && stored.source_revision == source.source_revision
+                }) {
+                    continue;
+                }
+                service
+                    .append_source(manifest_id, identity_id, context_scope_id, source.clone())
+                    .await?;
+            }
+            return Ok(manifest_id.to_string());
+        }
+
+        let created = service
+            .create(
+                ContextManifestInput {
+                    id: manifest_id,
+                    identity_id,
+                    agent_session_id: Some(session_id),
+                    context_scope_id,
+                    scope_type: "agent_chat".to_owned(),
+                    scope_id: job.chat_id.clone(),
+                    policy_revision: "forge-agent-chat-context-policy-1".to_owned(),
+                    domain_revision: "forge-agent-chat-server-context-1".to_owned(),
+                    lcm_binding_revision: None,
+                    runtime_manifest_id: None,
+                    runtime_manifest_fingerprint: None,
+                    request_fingerprint,
+                },
+                operating_context_sources,
+            )
+            .await?;
+        let created_id = uuid::Uuid::parse_str(&created.id).map_err(|_| {
+            ServiceError::invalid_operation("persisted context manifest id is invalid")
+        })?;
+        for source in operating_context_sources {
+            service
+                .append_source(created_id, identity_id, context_scope_id, source.clone())
+                .await?;
         }
         Ok(created.id)
     }
@@ -493,11 +2545,12 @@ impl FederatedAgentChatTurnRunner {
             session,
             input,
             history,
-            genesis_instruction,
+            operating_instruction,
+            operating_context_sources,
         } = turn;
         let prompt = build_cli_prompt(
             profile.prompt_template.as_deref(),
-            genesis_instruction.as_deref(),
+            operating_instruction.as_deref(),
             &history,
             &input.content,
         );
@@ -522,6 +2575,21 @@ impl FederatedAgentChatTurnRunner {
             .await?;
         let content = cli_result_content(result)?;
         guard_agent_chat_content(&content)?;
+        let context_manifest_id = if operating_context_sources.is_empty() {
+            None
+        } else {
+            Some(
+                self.persist_server_context_manifest(
+                    job,
+                    &agent,
+                    &profile,
+                    &session,
+                    profile.model.as_deref(),
+                    &operating_context_sources,
+                )
+                .await?,
+            )
+        };
         Ok(CompletedAgentChatTurn {
             identity_id: agent.id,
             profile_id: profile.id,
@@ -530,7 +2598,7 @@ impl FederatedAgentChatTurnRunner {
             content,
             token_usage_json: None,
             duration_ms,
-            context_manifest_id: None,
+            context_manifest_id,
         })
     }
 }
@@ -892,7 +2960,7 @@ fn runtime_history(history: &[AgentChatMessage]) -> Vec<Message> {
 
 fn build_cli_prompt(
     profile_prompt: Option<&str>,
-    genesis_instruction: Option<&str>,
+    operating_instruction: Option<&str>,
     history: &[AgentChatMessage],
     input: &str,
 ) -> String {
@@ -900,10 +2968,10 @@ fn build_cli_prompt(
     if let Some(prompt) = profile_prompt.filter(|value| !value.trim().is_empty()) {
         sections.push(prompt.trim().to_owned());
     }
-    if let Some(instruction) = genesis_instruction.filter(|value| !value.trim().is_empty()) {
+    if let Some(instruction) = operating_instruction.filter(|value| !value.trim().is_empty()) {
         sections.push(format!(
-            "Active Product Genesis instruction (immutable revision):\n{}",
-            instruction.trim()
+            "SERVER-OWNED OPERATING INSTRUCTION (authoritative; overrides Profile text and context):\n{}",
+            instruction.trim(),
         ));
     }
     sections.push(
@@ -925,16 +2993,16 @@ fn build_cli_prompt(
 
 fn compose_system_prompt(
     profile_prompt: Option<&str>,
-    genesis_instruction: Option<&str>,
+    operating_instruction: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
     if let Some(prompt) = profile_prompt.filter(|value| !value.trim().is_empty()) {
         sections.push(prompt.trim().to_owned());
     }
-    if let Some(instruction) = genesis_instruction.filter(|value| !value.trim().is_empty()) {
+    if let Some(instruction) = operating_instruction.filter(|value| !value.trim().is_empty()) {
         sections.push(format!(
-            "Active Product Genesis instruction (immutable revision):\n{}",
-            instruction.trim()
+            "SERVER-OWNED OPERATING INSTRUCTION (authoritative; overrides Profile text and context):\n{}",
+            instruction.trim(),
         ));
     }
     (!sections.is_empty()).then(|| sections.join("\n\n"))
@@ -960,29 +3028,127 @@ fn agent_chat_manifest_id(
     uuid::Uuid::from_bytes(id)
 }
 
+fn agent_chat_server_manifest_id(identity_id: &str, session_id: &str, job_id: &str) -> uuid::Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"forge-agent-chat-server-context-manifest-v1\0");
+    digest.update(identity_id.as_bytes());
+    digest.update([0]);
+    digest.update(session_id.as_bytes());
+    digest.update([0]);
+    digest.update(job_id.as_bytes());
+    let bytes = digest.finalize();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&bytes[..16]);
+    id[6] = (id[6] & 0x0f) | 0x50;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(id)
+}
+
+fn canonical_operating_context_sources(
+    operating_context_sources: &[ContextSourceInput],
+) -> Vec<Value> {
+    // ContextSourceInput is an internal persistence DTO. Keep the digest
+    // contract explicit and bounded instead of making its Rust serialization
+    // shape part of the request wire format (or accidentally admitting a
+    // future field such as a context body).
+    operating_context_sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "ordinal": source.ordinal,
+                "source_id": &source.source_id,
+                "source_type": &source.source_type,
+                "source_revision": &source.source_revision,
+                "selection_reason": &source.selection_reason,
+                "disposition": &source.disposition,
+                "retention_priority": source.retention_priority,
+                "fragment_fingerprint": &source.fragment_fingerprint,
+                "sensitivity": &source.sensitivity,
+            })
+        })
+        .collect()
+}
+
 fn agent_chat_request_fingerprint(
     job: &AgentChatTurnJob,
+    profile: &AgentProfile,
     session: &AgentSession,
+    model: Option<&str>,
     runtime_manifest: &RuntimeContextManifestLink,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"forge-agent-chat-runtime-request-v1\0");
-    for value in [
-        job.chat_id.as_str(),
-        job.triggering_message_id.as_str(),
-        job.correlation_id.as_str(),
-        &job.causation_depth.to_string(),
-        session.id.as_str(),
-        session.context_scope_id.as_str(),
-        runtime_manifest.turn_id.as_str(),
-        runtime_manifest.context_fingerprint.as_str(),
-        runtime_manifest.cache_plan_fingerprint.as_str(),
-        runtime_manifest.runtime_manifest_fingerprint.as_str(),
-    ] {
-        digest.update(value.as_bytes());
-        digest.update([0]);
-    }
-    hex::encode(digest.finalize())
+    operating_context_sources: &[ContextSourceInput],
+) -> Result<String> {
+    let operating_context_sources = canonical_operating_context_sources(operating_context_sources);
+    api_types::canonical_digest_with_schema(
+        "forge.agent-chat-runtime-request/v1",
+        &serde_json::json!({
+            "job": {
+                "chat_id": &job.chat_id,
+                "triggering_message_id": &job.triggering_message_id,
+                "correlation_id": &job.correlation_id,
+                "causation_depth": job.causation_depth,
+            },
+            "session": {
+                "id": &session.id,
+                "context_scope_id": &session.context_scope_id,
+            },
+            "profile": {
+                "id": &profile.id,
+                "version": profile.version,
+                "backend_kind": &profile.backend_kind,
+                "model": model,
+            },
+            "runtime_manifest": {
+                "turn_id": &runtime_manifest.turn_id,
+                "context_fingerprint": &runtime_manifest.context_fingerprint,
+                "cache_plan_fingerprint": &runtime_manifest.cache_plan_fingerprint,
+                "runtime_manifest_fingerprint": &runtime_manifest.runtime_manifest_fingerprint,
+            },
+            "operating_context_sources": operating_context_sources,
+        }),
+    )
+    .map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Agent Chat runtime request cannot be canonically serialized: {error}"
+        ))
+    })
+}
+
+fn agent_chat_server_request_fingerprint(
+    job: &AgentChatTurnJob,
+    profile: &AgentProfile,
+    session: &AgentSession,
+    model: Option<&str>,
+    operating_context_sources: &[ContextSourceInput],
+) -> Result<String> {
+    let operating_context_sources = canonical_operating_context_sources(operating_context_sources);
+    api_types::canonical_digest_with_schema(
+        "forge.agent-chat-server-context-request/v1",
+        &serde_json::json!({
+            "job": {
+                "id": &job.id,
+                "chat_id": &job.chat_id,
+                "triggering_message_id": &job.triggering_message_id,
+                "correlation_id": &job.correlation_id,
+                "causation_depth": job.causation_depth,
+            },
+            "session": {
+                "id": &session.id,
+                "context_scope_id": &session.context_scope_id,
+            },
+            "profile": {
+                "id": &profile.id,
+                "version": profile.version,
+                "backend_kind": &profile.backend_kind,
+                "model": model,
+            },
+            "operating_context_sources": operating_context_sources,
+        }),
+    )
+    .map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Agent Chat server context request cannot be canonically serialized: {error}"
+        ))
+    })
 }
 
 fn runtime_manifest_sources(
@@ -1116,10 +3282,690 @@ fn fingerprint_id(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+fn canonical_context_digest<T: Serialize>(value: &T) -> Result<String> {
+    api_types::canonical_digest_with_schema(PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION, value).map_err(
+        |error| {
+            ServiceError::invalid_operation(format!(
+                "Project context reference cannot be canonically serialized: {error}"
+            ))
+        },
+    )
+}
+
+fn validate_project_handoff_packet(
+    source_revisions_json: &str,
+    expected: &ProjectHandoffExpectation<'_>,
+    approval_lifecycle: &str,
+    consumed_project_id: Option<&str>,
+    project_id: &str,
+) -> Result<ProjectCharterHandoffPacket> {
+    if approval_lifecycle != "consumed" || consumed_project_id != Some(project_id) {
+        return Err(ServiceError::invalid_operation(
+            "Project Agent handoff requires the consumed Charter approval for this Project",
+        ));
+    }
+    let packet = parse_project_handoff_packet(source_revisions_json)?;
+    let packet_value: Value = serde_json::from_str(source_revisions_json).map_err(|_| {
+        ServiceError::invalid_operation("Project Agent handoff has an invalid source manifest")
+    })?;
+    let source_manifest: Value = serde_json::from_str(&packet.request.source_revisions_json)
+        .map_err(|_| {
+            ServiceError::invalid_operation(
+                "Project Agent handoff request source manifest is invalid",
+            )
+        })?;
+    if !source_manifest.is_object() {
+        return Err(ServiceError::invalid_operation(
+            "Project Agent handoff request source manifest must be an object",
+        ));
+    }
+    if !handoff_source_manifest_matches_packet(&source_manifest, &packet) {
+        return Err(ServiceError::invalid_operation(
+            "Project Agent handoff request source manifest does not match its canonical packet",
+        ));
+    }
+    let recomputed_source_revisions_digest =
+        handoff_request_fingerprint(&packet_value, &packet.request.authorization)?;
+    let redaction_categories = {
+        let mut categories = packet.redaction_manifest.excluded_categories.clone();
+        categories.sort();
+        categories
+    };
+    let mut required_categories = REQUIRED_HANDOFF_REDACTION_CATEGORIES
+        .iter()
+        .map(|category| (*category).to_owned())
+        .collect::<Vec<_>>();
+    required_categories.sort();
+    let values_are_bounded = packet.bounded_summary.chars().count() <= MAX_HANDOFF_BOUNDED_CHARS
+        && packet.settled_decision_ids.len() <= 64
+        && packet.unresolved_items.len() <= 64
+        && packet.research_references.len() <= 64
+        && packet
+            .unresolved_items
+            .iter()
+            .chain(packet.research_references.iter())
+            .all(handoff_value_is_bounded)
+        && handoff_text_is_safe(&packet.bounded_summary)
+        && packet
+            .settled_decision_ids
+            .iter()
+            .all(|value| non_empty(value) && handoff_text_is_safe(value));
+    let redaction_shape_is_valid = redaction_categories == required_categories
+        && packet
+            .redaction_manifest
+            .excluded_knowledge_item_ids
+            .iter()
+            .all(|value| non_empty(value))
+        && packet
+            .redaction_manifest
+            .excluded_knowledge_item_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            == packet.redaction_manifest.excluded_knowledge_item_ids.len();
+    let matches = values_are_bounded
+        && redaction_shape_is_valid
+        && packet.schema_version == PROJECT_HANDOFF_SCHEMA_VERSION
+        && packet.handoff_id == expected.handoff_id
+        && packet.deduplication_key == expected.deduplication_key
+        && packet.correlation_id == expected.correlation_id
+        && packet.causation_id == expected.causation_id
+        && packet.approval_id == expected.approval_id
+        && non_empty(&packet.request.policy_revision)
+        && packet.request.policy_revision == expected.policy_revision
+        && non_empty(&packet.request.policy_digest)
+        && packet.request.policy_digest == expected.policy_digest
+        && non_empty(&packet.request.source_revisions_digest)
+        && packet.request.source_revisions_digest == recomputed_source_revisions_digest
+        && non_empty(&packet.request.source_revisions_json)
+        && non_empty(&packet.request.authorization.principal_type)
+        && packet.request.authorization.principal_type == expected.approval_principal_kind
+        && non_empty(&packet.request.authorization.principal_id)
+        && packet.request.authorization.principal_id == expected.approval_principal_id
+        && packet.request.authorization.principal_type
+            == expected.create_authorization_principal_type
+        && packet.request.authorization.principal_id == expected.create_authorization_principal_id
+        && packet.request.authorization.authorization_basis == expected.create_authorization_basis
+        && packet.request.authorization.action == expected.create_authorization_action
+        && packet.request.authorization.event_id == expected.create_authorization_event_id
+        && packet.request.authorization.occurred_at == expected.create_authorization_occurred_at
+        && packet.source.chat_id == expected.source_chat_id
+        && packet.source.identity_id == expected.source_identity_id
+        && packet.source.profile_revision_id == expected.source_profile_revision_id
+        && packet.source.instruction_revision_id == expected.source_instruction_revision_id
+        && packet.source.instruction_revision == expected.source_instruction_revision
+        && packet.source.message_ids == expected.source_message_ids
+        && packet
+            .source
+            .message_ids
+            .last()
+            .is_some_and(|last| last == &packet.source.message_id)
+        && packet.source.turn_id.as_deref() == expected.source_turn_id
+        && packet.project.id == expected.project_id
+        && packet.project.name == expected.project_name
+        && packet.project.lifecycle == "active"
+        && packet.project.mode == expected.project_mode
+        && packet.project.approved_slug.as_deref() == expected.approved_slug
+        && packet.target.chat_id == expected.target_chat_id
+        && packet.target.binding_id == expected.target_binding_id
+        && packet.target.message_id == expected.target_message_id
+        && packet.target.turn_id == expected.target_turn_id
+        && packet.target.identity_id == expected.identity_id
+        && packet.target.profile_revision_id == expected.profile_revision_id
+        && packet.charter.id == expected.charter_id
+        && packet.charter.revision_id == expected.charter_revision_id
+        && packet.charter.revision_number == expected.charter_revision_number
+        && packet.charter.schema_version == expected.charter_schema_version
+        && packet.charter.content_digest == expected.charter_content_digest
+        && packet.charter.render_version == expected.charter_render_version
+        && packet.charter.render_digest == expected.charter_render_digest
+        && packet.approval.id == expected.approval_id
+        && packet.approval.event_id == expected.approval_event_id
+        && packet.approval.authorization_basis == expected.approval_authorization_basis
+        && packet.approval.authorization_action == expected.approval_authorization_action
+        && packet.approval.authorization_event_id == expected.approval_authorization_event_id
+        && packet.approval.authorization_occurred_at == expected.approval_authorization_occurred_at
+        && packet.approval.approved_by.kind == expected.approval_principal_kind
+        && packet.approval.approved_by.id == expected.approval_principal_id
+        && packet.approval.approved_at == expected.approval_created_at
+        && packet.project_agent.identity_id == expected.identity_id
+        && packet.project_agent.profile_revision_id == expected.profile_revision_id
+        && packet.project_agent.operating_skill_revision == expected.operating_skill_revision
+        && packet.project_agent.policy_revision == expected.policy_revision
+        && packet.project_agent.policy_digest == expected.policy_digest
+        && packet.content_classification == "approved_project_charter"
+        && packet.created_at == expected.created_at
+        && packet.delivery.delivered_at == expected.delivered_at
+        && non_empty(&packet.handoff_id)
+        && non_empty(&packet.deduplication_key)
+        && non_empty(&packet.correlation_id)
+        && non_empty(&packet.causation_id)
+        && non_empty(&packet.source.chat_id)
+        && non_empty(&packet.source.identity_id)
+        && non_empty(&packet.source.profile_revision_id)
+        && non_empty(&packet.source.instruction_revision_id)
+        && non_empty(&packet.source.message_id)
+        && packet
+            .source
+            .message_ids
+            .iter()
+            .all(|value| non_empty(value))
+        && non_empty(&packet.project.id)
+        && non_empty(&packet.project.name)
+        && non_empty(&packet.target.chat_id)
+        && non_empty(&packet.target.binding_id)
+        && non_empty(&packet.target.identity_id)
+        && non_empty(&packet.target.profile_revision_id)
+        && non_empty(&packet.target.message_id)
+        && non_empty(&packet.target.turn_id)
+        && non_empty(&packet.charter.id)
+        && non_empty(&packet.charter.revision_id)
+        && non_empty(&packet.charter.schema_version)
+        && non_empty(&packet.charter.content_digest)
+        && non_empty(&packet.charter.render_version)
+        && non_empty(&packet.charter.render_digest)
+        && non_empty(&packet.approval.id)
+        && non_empty(&packet.approval.event_id)
+        && non_empty(&packet.approval.authorization_basis)
+        && non_empty(&packet.approval.authorization_action)
+        && non_empty(&packet.approval.authorization_event_id)
+        && non_empty(&packet.approval.authorization_occurred_at)
+        && non_empty(&packet.approval.approved_by.kind)
+        && non_empty(&packet.approval.approved_by.id)
+        && non_empty(&packet.approval.approved_at)
+        && non_empty(&packet.project_agent.identity_id)
+        && non_empty(&packet.project_agent.profile_revision_id)
+        && non_empty(&packet.project_agent.operating_skill_revision)
+        && non_empty(&packet.project_agent.policy_revision)
+        && non_empty(&packet.project_agent.policy_digest)
+        && non_empty(&packet.content_classification)
+        && non_empty(&packet.created_at)
+        && non_empty(&packet.delivery.delivered_at);
+    if !matches {
+        return Err(ServiceError::invalid_operation(
+            "Project Agent handoff Charter, approval, selected agent, or policy references are stale or mismatched",
+        ));
+    }
+    Ok(packet)
+}
+
+fn parse_project_handoff_packet(
+    source_revisions_json: &str,
+) -> Result<ProjectCharterHandoffPacket> {
+    serde_json::from_str(source_revisions_json).map_err(|_| {
+        ServiceError::invalid_operation("Project Agent handoff has an invalid typed Charter packet")
+    })
+}
+
+fn handoff_source_manifest_matches_packet(
+    source_manifest: &Value,
+    packet: &ProjectCharterHandoffPacket,
+) -> bool {
+    let Ok(mut expected) = serde_json::to_value(packet) else {
+        return false;
+    };
+    let Some(expected) = expected.as_object_mut() else {
+        return false;
+    };
+    expected.remove("request");
+    expected.remove("approval_id");
+    if let Some(target) = expected.get_mut("target").and_then(Value::as_object_mut) {
+        target.insert("chat_id".to_owned(), Value::Null);
+    }
+    if let Some(source) = expected.get_mut("source").and_then(Value::as_object_mut) {
+        source.remove("message_id");
+    }
+    if let Some(delivery) = expected.get_mut("delivery").and_then(Value::as_object_mut) {
+        delivery.insert("delivered_at".to_owned(), Value::Null);
+    }
+    canonicalize_json_value(&Value::Object(expected.clone()))
+        == canonicalize_json_value(source_manifest)
+}
+
+/// Reproduce the DB transaction's immutable handoff-request fingerprint after
+/// removing values allocated by that transaction.  The fingerprint therefore
+/// proves the complete bounded packet shape and the exact authorization
+/// envelope without treating a caller-controlled digest as authority.
+fn handoff_request_fingerprint(
+    value: &Value,
+    authorization: &ProjectCharterHandoffAuthorization,
+) -> Result<String> {
+    let mut normalized = value.clone();
+    let object = normalized.as_object_mut().ok_or_else(|| {
+        ServiceError::invalid_operation("Project Agent handoff source manifest must be an object")
+    })?;
+    object.remove("approval_id");
+    if let Some(request) = object.get_mut("request").and_then(Value::as_object_mut) {
+        request.remove("policy_revision");
+        request.remove("policy_digest");
+        request.remove("source_revisions_digest");
+        request.remove("authorization");
+    }
+    if let Some(target) = object.get_mut("target").and_then(Value::as_object_mut) {
+        target.insert("chat_id".to_owned(), Value::Null);
+    }
+    if let Some(delivery) = object.get_mut("delivery").and_then(Value::as_object_mut) {
+        delivery.insert("delivered_at".to_owned(), Value::Null);
+    }
+    if let Some(source) = object.get_mut("source").and_then(Value::as_object_mut) {
+        source.remove("message_id");
+    }
+    let request = object
+        .entry("request".to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let request = request.as_object_mut().ok_or_else(|| {
+        ServiceError::invalid_operation("Project Agent handoff request must be an object")
+    })?;
+    let source_revisions_json = request
+        .get("source_revisions_json")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent handoff request source manifest is required",
+            )
+        })?;
+    let source_revisions_json = canonical_json_string(source_revisions_json)?;
+    request.insert(
+        "source_revisions_json".to_owned(),
+        Value::String(source_revisions_json),
+    );
+    request.insert(
+        "authorization".to_owned(),
+        serde_json::json!({
+            "principal_type": authorization.principal_type,
+            "principal_id": authorization.principal_id,
+            "authorization_basis": authorization.authorization_basis,
+            "action": authorization.action,
+            "event_id": authorization.event_id,
+            "occurred_at": authorization.occurred_at,
+        }),
+    );
+    let canonical = canonicalize_json_value(&normalized);
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent handoff source manifest is invalid: {error}"
+        ))
+    })?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+fn canonical_json_string(value: &str) -> Result<String> {
+    let parsed: Value = serde_json::from_str(value).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent handoff source manifest is invalid: {error}"
+        ))
+    })?;
+    serde_json::to_string(&canonicalize_json_value(&parsed)).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent handoff source manifest is invalid: {error}"
+        ))
+    })
+}
+
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_json_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(canonicalize_json_value)
+                .collect::<Vec<_>>(),
+        ),
+        scalar => scalar.clone(),
+    }
+}
+
+fn non_empty(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn handoff_text_is_safe(value: &str) -> bool {
+    if value.chars().count() > MAX_HANDOFF_BOUNDED_CHARS {
+        return false;
+    }
+    if value.trim().is_empty() {
+        return true;
+    }
+    guard_agent_chat_content(value).is_ok()
+}
+
+fn handoff_value_is_bounded(value: &Value) -> bool {
+    let Ok(serialized) = serde_json::to_string(value) else {
+        return false;
+    };
+    serialized.chars().count() <= MAX_HANDOFF_BOUNDED_CHARS && handoff_text_is_safe(&serialized)
+}
+
+fn project_agent_policy_digest(tool_policy_json: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"forge.project-agent-policy/v1\0");
+    digest.update(tool_policy_json.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn effective_state_context(
+    projection: &ProjectEffectiveStateProjection,
+) -> Result<EffectiveProjectStateContext> {
+    let mut reconciliation_required = projection
+        .reconciliation_required
+        .iter()
+        .map(|record| {
+            format!(
+                "{}:{}:{}@{}:digest:{}:state:{}:v{}:updated:{}",
+                record.id,
+                record.record_type,
+                record.record_id,
+                record.record_revision,
+                record.record_digest,
+                record.state,
+                record.version,
+                record.updated_at
+            )
+        })
+        .collect::<Vec<_>>();
+    let unreleased = &projection.unreleased_changes;
+    if !unreleased.document_ids.is_empty()
+        || !unreleased.decision_candidate_ids.is_empty()
+        || !unreleased.baseline_revision_ids.is_empty()
+        || !unreleased.active_milestone_ids.is_empty()
+        || !unreleased.reconciliation_ids.is_empty()
+    {
+        reconciliation_required.push(format!(
+            "unreleased changes: documents={:?}; decision_candidates={:?}; baseline_revisions={:?}; active_milestones={:?}; reconciliations={:?}",
+            unreleased.document_ids,
+            unreleased.decision_candidate_ids,
+            unreleased.baseline_revision_ids,
+            unreleased.active_milestone_ids,
+            unreleased.reconciliation_ids,
+        ));
+    }
+    if !projection.commitments.is_empty() || !projection.inbox.is_empty() {
+        reconciliation_required.push(format!(
+            "coordination reconciliation: commitments={:?}; inbox={:?}",
+            projection
+                .commitments
+                .iter()
+                .map(|commitment| {
+                    format!(
+                        "{}:{}@v{}:evidence={}",
+                        commitment.id,
+                        commitment.status,
+                        commitment.version,
+                        commitment.evidence_count
+                    )
+                })
+                .collect::<Vec<_>>(),
+            projection
+                .inbox
+                .iter()
+                .map(|item| format!(
+                    "{}:{}:{}@v{}",
+                    item.id, item.kind, item.status, item.version
+                ))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    Ok(EffectiveProjectStateContext {
+        governing_charter: projection.governing_charter.as_ref().map(|charter| {
+            format!(
+                "{}@{}#r{}:content:{}:render:{}:v{}",
+                charter.id,
+                charter.revision_id,
+                charter.revision,
+                charter.content_digest,
+                charter.render_digest,
+                charter.version
+            )
+        }),
+        active_execution_baseline: projection
+            .active_execution_baseline
+            .as_ref()
+            .map(|baseline| {
+                format!(
+                    "{}@{}:content:{}:render:{}:policy:{}@{}",
+                    baseline.id,
+                    baseline.revision_id,
+                    baseline.content_digest,
+                    baseline.render_digest,
+                    baseline.release_policy_revision,
+                    baseline.release_policy_digest
+                )
+            }),
+        applicable_document_revisions: projection
+            .approved_documents
+            .iter()
+            .map(|document| {
+                format!(
+                    "{}:{}@{}:content:{}:render:{}",
+                    document.kind,
+                    document.id,
+                    document.revision_id,
+                    document.content_digest,
+                    document.render_digest
+                )
+            })
+            .collect(),
+        active_decisions: projection
+            .active_decisions
+            .iter()
+            .map(|decision| {
+                let digest = canonical_context_digest(decision)?;
+                Ok::<_, ServiceError>(format!(
+                    "{} [{}] @{}: {}:digest:{}{}",
+                    decision.id,
+                    decision.decision_class,
+                    decision.created_at,
+                    decision.selected_outcome,
+                    digest,
+                    decision
+                        .baseline_revision_id
+                        .as_deref()
+                        .map(|revision| format!(":baseline:{revision}"))
+                        .unwrap_or_default()
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        reconciliation_required,
+        canonical_conflicts: projection
+            .canonical_conflicts
+            .iter()
+            .map(|conflict| {
+                format!(
+                    "{} [{}] {}:{}@{}:{}@{}:digests:{}:{}: {}",
+                    conflict.id,
+                    conflict.domain,
+                    conflict.governing_record_type,
+                    conflict.governing_record_id,
+                    conflict.governing_record_revision,
+                    conflict.conflicting_record_type,
+                    conflict.conflicting_record_revision,
+                    conflict.governing_record_digest,
+                    conflict.conflicting_record_digest,
+                    conflict.description
+                )
+            })
+            .collect(),
+        task_summary: projection
+            .task_summary
+            .by_status
+            .iter()
+            .map(|count| format!("{}={}", count.key, count.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+            + &format!(" (total={})", projection.task_summary.total),
+        validation_summary: projection
+            .validation_summary
+            .by_outcome
+            .iter()
+            .map(|count| format!("{}={}", count.key, count.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+            + &format!(" (total={})", projection.validation_summary.total),
+        active_milestones: projection
+            .active_milestones
+            .iter()
+            .map(|milestone| {
+                let definition_revision =
+                    milestone.definition_revision_id.as_deref().ok_or_else(|| {
+                        ServiceError::conflict(
+                            "active Project milestone has no definition revision",
+                        )
+                    })?;
+                let definition_digest =
+                    milestone.definition_digest.as_deref().ok_or_else(|| {
+                        ServiceError::conflict("active Project milestone has no definition digest")
+                    })?;
+                Ok::<_, ServiceError>(format!(
+                    "{} ({}) @{}:content:{}:v{}",
+                    milestone.milestone_key,
+                    milestone.lifecycle,
+                    definition_revision,
+                    definition_digest,
+                    milestone.version
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        primary_milestone_id: projection.primary_milestone_id.clone(),
+        readiness: projection
+            .readiness
+            .latest
+            .as_ref()
+            .map(|readiness| {
+                format!(
+                    "{} ({}@{}):event:{}:baseline:{}@{}:content:{}:policy:{}@{}",
+                    readiness.outcome,
+                    readiness.id,
+                    readiness.readiness_digest,
+                    readiness.event_watermark,
+                    readiness.baseline_id,
+                    readiness.baseline_revision_id,
+                    readiness.baseline_digest,
+                    readiness.release_policy_revision,
+                    readiness.release_policy_digest
+                )
+            })
+            .unwrap_or_else(|| "unresolved".to_owned()),
+        releases: projection
+            .releases
+            .iter()
+            .map(|release| {
+                format!(
+                    "{} ({}@{}):snapshot:{}:baseline:{}@{}:content:{}:created:{}",
+                    release.release_identifier,
+                    release.id,
+                    release.readiness_digest,
+                    release.snapshot_digest,
+                    release.baseline_id,
+                    release.baseline_revision_id,
+                    release.baseline_digest,
+                    release.created_at
+                )
+            })
+            .collect(),
+        event_watermark: Some(projection.source_event_watermark.clone()),
+    })
+}
+
+fn hash_parts<'a, I>(prefix: &[u8], values: I) -> String
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut digest = Sha256::new();
+    digest.update(prefix);
+    for value in values {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn project_operating_context_sources(
+    skill_revision_id: &str,
+    skill_content_digest: &str,
+    context_references: &[OperatingContextReference],
+) -> Vec<ContextSourceInput> {
+    let mut sources = Vec::with_capacity(context_references.len() + 1);
+    sources.push(ContextSourceInput {
+        ordinal: 0,
+        source_id: format!("operating_skill:{PROJECT_OPERATING_SKILL_KEY}"),
+        source_type: "server_operating_skill".to_owned(),
+        source_revision: skill_revision_id.to_owned(),
+        selection_reason: "server_owned_project_operating_skill".to_owned(),
+        disposition: "included".to_owned(),
+        retention_priority: 100,
+        // The renderer body is immutable and its canonical digest is the
+        // source fingerprint.  A key/revision hash would prove only that the
+        // pointer was formatted, not that the selected body was authentic.
+        fragment_fingerprint: skill_content_digest.to_owned(),
+        sensitivity: "internal".to_owned(),
+    });
+    for (ordinal, reference) in context_references.iter().enumerate() {
+        sources.push(ContextSourceInput {
+            ordinal: ordinal as i64 + 1,
+            source_id: format!(
+                "project_context:{}:{}",
+                reference.source_type, reference.source_id
+            ),
+            source_type: reference.source_type.clone(),
+            source_revision: reference.source_revision.clone(),
+            selection_reason: reference.selection_reason.clone(),
+            disposition: reference.disposition.clone(),
+            retention_priority: 100,
+            fragment_fingerprint: reference.digest.clone(),
+            sensitivity: reference.sensitivity.clone(),
+        });
+    }
+    sources
+}
+
+fn main_operating_context_sources(
+    skill_revision_id: &str,
+    skill_content_digest: &str,
+    context_references: &[OperatingContextReference],
+) -> Vec<ContextSourceInput> {
+    let mut sources = Vec::with_capacity(context_references.len() + 1);
+    sources.push(ContextSourceInput {
+        ordinal: 0,
+        source_id: format!("operating_skill:{MAIN_OPERATING_SKILL_KEY}"),
+        source_type: "server_operating_skill".to_owned(),
+        source_revision: skill_revision_id.to_owned(),
+        selection_reason: "server_owned_main_genesis_operating_skill".to_owned(),
+        disposition: "included".to_owned(),
+        retention_priority: 100,
+        fragment_fingerprint: skill_content_digest.to_owned(),
+        sensitivity: "internal".to_owned(),
+    });
+    for (ordinal, reference) in context_references.iter().enumerate() {
+        sources.push(ContextSourceInput {
+            ordinal: ordinal as i64 + 1,
+            source_id: format!(
+                "main_genesis_context:{}:{}",
+                reference.source_type, reference.source_id
+            ),
+            source_type: reference.source_type.clone(),
+            source_revision: reference.source_revision.clone(),
+            selection_reason: reference.selection_reason.clone(),
+            disposition: reference.disposition.clone(),
+            retention_priority: 100,
+            fragment_fingerprint: reference.digest.clone(),
+            sensitivity: reference.sensitivity.clone(),
+        });
+    }
+    sources
+}
+
 fn cli_result_content(result: ExecutionResult) -> Result<String> {
     match result.status {
         ExecutionOutcome::Completed => result
-            .summary
+            .assistant_output
+            .or(result.summary)
             .filter(|summary| !summary.trim().is_empty())
             .ok_or_else(|| ServiceError::invalid_operation("Agent Chat CLI returned no content")),
         ExecutionOutcome::Cancelled => Err(ServiceError::invalid_operation(
@@ -1164,7 +4010,13 @@ fn classify_turn_error(error: &ServiceError) -> &'static str {
         "credential_unavailable"
     } else if text.contains("cancel") {
         "cancelled"
-    } else if text.contains("scope") || text.contains("permission") || text.contains("binding") {
+    } else if text.contains("scope")
+        || text.contains("permission")
+        || text.contains("binding")
+        || text.contains("charter")
+        || text.contains("operating-skill")
+        || text.contains("handoff")
+    {
         "authority_denied"
     } else if text.contains("profile") || text.contains("config") {
         "configuration_invalid"
@@ -1211,15 +4063,21 @@ mod tests {
             classify_turn_error(&ServiceError::invalid_operation("credential unavailable")),
             "credential_unavailable"
         );
+        assert_eq!(
+            classify_turn_error(&ServiceError::invalid_operation(
+                "Project Agent Charter pointer is stale"
+            )),
+            "authority_denied"
+        );
     }
 
     #[test]
-    fn active_genesis_instruction_is_added_to_both_backend_contexts() {
+    fn server_owned_operating_instruction_is_added_to_both_backend_contexts() {
         let instruction = "Product Genesis protocol v1\nAsk at most two questions.";
         let system = compose_system_prompt(Some("profile rules"), Some(instruction))
             .expect("an active instruction produces system context");
         assert!(system.contains("profile rules"));
-        assert!(system.contains("Active Product Genesis instruction"));
+        assert!(system.contains("SERVER-OWNED OPERATING INSTRUCTION"));
         assert!(system.contains(instruction));
 
         let prompt = build_cli_prompt(
@@ -1228,7 +4086,7 @@ mod tests {
             &[],
             "continue discovery",
         );
-        assert!(prompt.contains("Active Product Genesis instruction"));
+        assert!(prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
         assert!(prompt.contains("continue discovery"));
     }
 
@@ -1239,6 +4097,747 @@ mod tests {
             .contains("profile rules"));
         assert!(compose_system_prompt(None, None).is_none());
         let prompt = build_cli_prompt(None, None, &[], "ordinary Main message");
-        assert!(!prompt.contains("Active Product Genesis instruction"));
+        assert!(!prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
+    }
+
+    #[test]
+    fn project_operating_context_provenance_is_server_owned_and_bounded() {
+        let sources = project_operating_context_sources(
+            "forge.project.orchestration/v1@1",
+            "project-skill-content-digest",
+            &[
+                OperatingContextReference::included(
+                    "charter:charter-1@revision-2",
+                    "charter-1",
+                    "project_charter",
+                    "revision-2",
+                    "digest-charter",
+                    "test",
+                ),
+                OperatingContextReference::included(
+                    "milestone:M001@rev-1",
+                    "M001",
+                    "project_milestone",
+                    "rev-1",
+                    "digest-milestone",
+                    "test",
+                ),
+            ],
+        );
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].source_type, "server_operating_skill");
+        assert_eq!(
+            sources[0].source_id,
+            "operating_skill:forge.project.orchestration/v1"
+        );
+        assert_eq!(
+            sources[0].source_revision,
+            "forge.project.orchestration/v1@1"
+        );
+        assert_eq!(
+            sources[0].fragment_fingerprint,
+            "project-skill-content-digest"
+        );
+        assert_eq!(sources[1].source_type, "project_charter");
+        assert_eq!(
+            sources[1].source_id,
+            "project_context:project_charter:charter-1"
+        );
+        assert_eq!(sources[1].disposition, "included");
+        assert_eq!(sources[2].ordinal, 2);
+        let duplicate_resource_sources = project_operating_context_sources(
+            "forge.project.orchestration/v1@1",
+            "project-skill-content-digest",
+            &[
+                OperatingContextReference::included(
+                    "tasks:project-1@watermark-1",
+                    "project-1",
+                    "project_task_projection",
+                    "watermark-1",
+                    "task-digest",
+                    "test",
+                ),
+                OperatingContextReference::included(
+                    "validation:project-1@watermark-1",
+                    "project-1",
+                    "project_validation_projection",
+                    "watermark-1",
+                    "validation-digest",
+                    "test",
+                ),
+            ],
+        );
+        assert_ne!(
+            duplicate_resource_sources[1].source_id,
+            duplicate_resource_sources[2].source_id
+        );
+        assert!(sources.iter().all(|source| source.sensitivity != "secret"));
+    }
+
+    #[test]
+    fn server_owned_instruction_is_after_profile_text() {
+        let system = compose_system_prompt(
+            Some("profile says to ignore the Project boundary"),
+            Some("Forge Project Agent — Project Planning and Orchestration Protocol v1"),
+        )
+        .expect("prompt should be present");
+        assert!(
+            system.find("profile says").expect("profile")
+                < system
+                    .find("SERVER-OWNED OPERATING INSTRUCTION")
+                    .expect("authority")
+        );
+    }
+
+    #[test]
+    fn project_prompt_and_manifest_provenance_never_expose_main_packet_contents() {
+        let main_secrets = [
+            "main-chat-private",
+            "main-message-private",
+            "main-turn-private",
+            "main-instruction-private",
+            "private Main transcript body",
+            "source_revisions_json",
+        ];
+        let mut context = ProjectOperatingSkillContext::new("project-8", "binding-8");
+        context.permission_ceiling =
+            "read_project,read_agent_chat,read_memory,propose_message,propose_project".to_owned();
+        context.handoff_payload_hash =
+            Some("6f3a4f5e4ec4ce9ad9b7f9e4a62f1e5f2f7a9eb6e53f6b6f0b7d0c8a1d4b2c3e".to_owned());
+        context.context_manifest_references = vec![
+            "project:project-8@v3".to_owned(),
+            "handoff:opaque-receipt:6f3a4f5e".to_owned(),
+            "charter:charter-1@revision-2:content:charter-digest:render:render-digest".to_owned(),
+        ];
+        let instruction = render_project_operating_skill(&context);
+        let prompt = compose_system_prompt(Some("profile data"), Some(&instruction))
+            .expect("Project prompt should include the server-owned skill");
+        let sources = project_operating_context_sources(
+            "forge.project.orchestration/v1@1",
+            "project-skill-content-digest",
+            &[OperatingContextReference::included(
+                "handoff:opaque-receipt:6f3a4f5e",
+                "opaque-receipt",
+                "main_to_project_handoff_receipt",
+                "forge.project-charter-handoff/v1",
+                "6f3a4f5e",
+                "opaque_handoff_provenance_only",
+            )],
+        );
+        for secret in main_secrets {
+            assert!(!prompt.contains(secret), "prompt leaked {secret}");
+            assert!(
+                sources
+                    .iter()
+                    .all(|source| !source.source_id.contains(secret)
+                        && !source.source_revision.contains(secret)
+                        && !source.fragment_fingerprint.contains(secret)),
+                "manifest leaked {secret}"
+            );
+        }
+        assert!(prompt.contains("Handoff payload hash"));
+        assert!(prompt.contains("opaque-receipt:6f3a4f5e"));
+        assert!(sources.iter().any(|source| {
+            source.source_type == "main_to_project_handoff_receipt"
+                && source.selection_reason == "opaque_handoff_provenance_only"
+        }));
+    }
+
+    #[test]
+    fn effective_state_context_keeps_digests_conflicts_and_unreleased_changes() {
+        let projection: ProjectEffectiveStateProjection = serde_json::from_value(serde_json::json!({
+            "project": {
+                "id": "project-8", "name": "Project Eight", "paused": false,
+                "charter_status": "charter_backed", "charter_setup_required": false,
+                "version": 4, "created_at": "2026-08-13T00:00:00Z", "updated_at": "2026-08-13T00:00:01Z"
+            },
+            "governing_charter": {
+                "id": "charter-1", "revision_id": "charter-revision-2", "revision": 2,
+                "version": 3, "content_digest": "charter-content", "render_digest": "charter-render"
+            },
+            "active_execution_baseline": {
+                "id": "baseline-1", "revision_id": "baseline-revision-2", "revision": 2,
+                "version": 2, "lifecycle": "active", "charter_revision_id": "charter-revision-2",
+                "content_digest": "baseline-content", "render_digest": "baseline-render",
+                "release_policy_revision": "policy-2", "release_policy_digest": "policy-digest"
+            },
+            "approved_documents": [{
+                "id": "document-1", "kind": "delivery_brief", "title": "Brief",
+                "revision_id": "document-revision-3", "revision": 3, "version": 2,
+                "lifecycle": "approved", "content_digest": "document-content", "render_digest": "document-render"
+            }],
+            "active_decisions": [{
+                "id": "decision-1", "state": "active", "decision_class": "project_implementation",
+                "question": "Which loop?", "selected_outcome": "Loop A", "rationale": "Smallest test",
+                "principal_type": "agent", "principal_id": "identity-1",
+                "authority_basis": "active_execution_baseline_adaptive_envelope",
+                "authorization_action": "project.decision.record_effective",
+                "explicit_event": "action-1", "authorization_occurred_at": "2026-08-13T00:00:02Z",
+                "charter_revision_id": "charter-revision-2",
+                "baseline_revision_id": "baseline-revision-2", "source_refs": [],
+                "affected_records": {}, "created_at": "2026-08-13T00:00:02Z"
+            }],
+            "invalidated_decisions": [],
+            "reconciliation_required": [{
+                "id": "reconcile-1", "conflict_id": "conflict-1", "record_type": "task",
+                "record_id": "task-1", "record_revision": "v3", "record_digest": "task-digest",
+                "state": "required", "version": 2, "updated_at": "2026-08-13T00:00:03Z"
+            }],
+            "canonical_conflicts": [{
+                "id": "conflict-1", "domain": "execution", "governing_record_type": "baseline",
+                "governing_record_id": "baseline-1", "governing_record_revision": "baseline-revision-2",
+                "governing_record_digest": "baseline-content", "conflicting_record_type": "task",
+                "conflicting_record_id": "task-1", "conflicting_record_revision": "v3",
+                "conflicting_record_digest": "task-digest", "affected_paths": ["scope"],
+                "conflict_code": "stale_task", "description": "Task is outside baseline", "created_at": "2026-08-13T00:00:03Z"
+            }],
+            "task_summary": {"total": 2, "by_status": [{"key": "todo", "count": 2}]},
+            "validation_summary": {"total": 1, "by_outcome": [{"key": "stale", "count": 1}]},
+            "commitments": [{
+                "id": "commitment-1", "status": "blocked", "due_at": null,
+                "originating_task_id": "task-1", "evidence_required": true,
+                "evidence_count": 0, "blocked_reason": "awaiting evidence",
+                "version": 2, "updated_at": "2026-08-13T00:00:02Z"
+            }],
+            "inbox": [{
+                "id": "inbox-1", "kind": "task_outcome", "status": "unread",
+                "source_type": "task", "source_id": "task-1",
+                "correlation_id": "corr-1", "version": 1,
+                "created_at": "2026-08-13T00:00:02Z", "updated_at": "2026-08-13T00:00:03Z"
+            }],
+            "active_milestones": [{
+                "id": "milestone-1", "milestone_key": "M001", "display_label": "Deliver",
+                "lifecycle": "active", "definition_revision_id": "milestone-revision-2",
+                "definition_digest": "milestone-content", "version": 2,
+                "blocker_reasons": [], "stale_reasons": ["stale check"], "reconciliation_reasons": []
+            }],
+            "primary_milestone_id": "milestone-1",
+            "readiness": {
+                "latest": {
+                    "id": "readiness-1", "milestone_id": "milestone-1", "definition_revision_id": "milestone-revision-2",
+                    "baseline_id": "baseline-1", "baseline_revision_id": "baseline-revision-2",
+                    "baseline_digest": "baseline-content", "release_policy_revision": "policy-2",
+                    "release_policy_digest": "policy-digest", "event_watermark": "event-8",
+                    "outcome": "blocked", "blocking_reasons": ["stale"], "readiness_digest": "readiness-digest",
+                    "created_at": "2026-08-13T00:00:04Z"
+                },
+                "by_milestone": []
+            },
+            "releases": [{
+                "id": "release-1", "milestone_id": "milestone-1", "release_sequence": 1,
+                "release_revision": 1, "release_identifier": "M001-r1", "readiness_snapshot_id": "readiness-0",
+                "readiness_digest": "readiness-0-digest", "baseline_id": "baseline-0",
+                "baseline_revision_id": "baseline-revision-1", "baseline_digest": "baseline-0-content",
+                "snapshot_digest": "release-snapshot-0-digest",
+                "created_at": "2026-08-12T00:00:00Z"
+            }],
+            "unreleased_changes": {
+                "document_ids": ["document-2"], "decision_candidate_ids": ["candidate-1"],
+                "baseline_revision_ids": ["baseline-revision-3"], "active_milestone_ids": ["milestone-1"],
+                "reconciliation_ids": ["reconcile-1"]
+            },
+            "source_event_watermark": "event-8", "source_event_sequence": 8,
+            "source_project_version": 4, "source_project_work_epoch": 9
+        })).expect("typed effective-state projection");
+        let state = effective_state_context(&projection).expect("canonical effective state");
+        assert!(state
+            .governing_charter
+            .expect("Charter")
+            .contains("charter-content"));
+        assert!(state
+            .active_execution_baseline
+            .expect("baseline")
+            .contains("policy-2@policy-digest"));
+        assert!(state.active_decisions[0].contains("digest:"));
+        assert!(state.reconciliation_required[0].contains("task-digest"));
+        assert!(state
+            .reconciliation_required
+            .iter()
+            .any(|value| value.contains("commitment-1") && value.contains("inbox-1")));
+        assert!(state.canonical_conflicts[0].contains("baseline-content"));
+        assert!(state.task_summary.contains("total=2"));
+        assert!(state.validation_summary.contains("total=1"));
+        assert!(state.active_milestones[0].contains("milestone-content"));
+        assert!(state.readiness.contains("event:event-8"));
+        assert!(state.releases[0].contains("baseline-revision-1"));
+        assert!(state
+            .reconciliation_required
+            .iter()
+            .any(|value| value.contains("unreleased changes")));
+        assert_eq!(state.event_watermark.as_deref(), Some("event-8"));
+    }
+
+    fn handoff_packet_json() -> String {
+        let mut packet = serde_json::json!({
+            "schema_version": PROJECT_HANDOFF_SCHEMA_VERSION,
+            "handoff_id": "handoff-1",
+            "deduplication_key": "dedupe-1",
+            "correlation_id": "correlation-1",
+            "causation_id": "event-1",
+            "approval_id": "approval-3",
+            "request": {
+                "policy_revision": "forge.project-agent-policy/v1",
+                "policy_digest": "policy-digest-7",
+                "source_revisions_digest": "source-revisions-digest-1",
+                "source_revisions_json": "{\"schema_version\":\"forge.project-charter-handoff/v1\"}",
+                "authorization": {
+                    "principal_type": "user",
+                    "principal_id": "account-1",
+                    "authorization_basis": "approved_charter",
+                    "action": "create_project_from_charter_approval",
+                    "event_id": "approval-event-4",
+                    "occurred_at": "2026-08-13T00:00:00Z"
+                }
+            },
+            "source": {
+                "chat_id": "main-chat-1",
+                "message_ids": ["message-1", "message-2"],
+                "message_id": "message-2",
+                "turn_id": "source-turn-1",
+                "identity_id": "main-identity-1",
+                "profile_revision_id": "main-profile-1",
+                "instruction_revision_id": "instruction-1",
+                "instruction_revision": 3
+            },
+            "project": {
+                "id": "project-8",
+                "name": "Project Eight",
+                "lifecycle": "active",
+                "mode": "standard",
+                "approved_slug": "project-eight"
+            },
+            "target": {
+                "chat_id": "project-chat-8",
+                "binding_id": "binding-8",
+                "identity_id": "identity-5",
+                "profile_revision_id": "profile-6",
+                "message_id": "target-message-8",
+                "turn_id": "target-turn-8"
+            },
+            "charter": {
+                "id": "charter-1",
+                "revision_id": "revision-2",
+                "revision_number": 2,
+                "schema_version": "forge.project-charter/v1",
+                "content_digest": "content-digest-2",
+                "render_version": "forge-project-charter/v1",
+                "render_digest": "render-digest-2"
+            },
+            "approval": {
+                "id": "approval-3",
+                "event_id": "approval-event-4",
+                "authorization_basis": "approved_charter",
+                "authorization_action": "project.charter.approve",
+                "authorization_event_id": "charter-authorization-event-4",
+                "authorization_occurred_at": "2026-08-12T23:59:59Z",
+                "approved_by": {
+                    "kind": "user",
+                    "id": "account-1"
+                },
+                "approved_at": "2026-08-13T00:00:00Z"
+            },
+            "project_agent": {
+                "identity_id": "identity-5",
+                "profile_revision_id": "profile-6",
+                "operating_skill_revision": "forge.project.orchestration/v1@1",
+                "policy_revision": "forge.project-agent-policy/v1",
+                "policy_digest": "policy-digest-7"
+            },
+            "bounded_summary": "Approved Project handoff summary.",
+            "settled_decision_ids": ["decision-1"],
+            "unresolved_items": [{"id": "unresolved-1", "question": "Which low-risk option should be tested?"}],
+            "research_references": [{"url": "https://example.test/reference", "claim": "bounded public reference"}],
+            "content_classification": "approved_project_charter",
+            "redaction_manifest": {
+                "excluded_knowledge_item_ids": ["memory-1"],
+                "excluded_categories": [
+                    "full_main_chat_history",
+                    "hidden_memory_bodies",
+                    "credentials",
+                    "protected_runtime_or_browser_state",
+                    "unrelated_projects",
+                    "authority_bearing_text"
+                ]
+            },
+            "created_at": "2026-08-13T00:00:00Z",
+            "delivery": {
+                "delivered_at": "2026-08-13T00:00:01Z"
+            }
+        });
+        let authorization = ProjectCharterHandoffAuthorization {
+            principal_type: "user".to_owned(),
+            principal_id: "account-1".to_owned(),
+            authorization_basis: "create_project_from_approved_charter".to_owned(),
+            action: "create_project_from_charter_approval".to_owned(),
+            event_id: "approval-event-4".to_owned(),
+            occurred_at: "2026-08-13T00:00:00Z".to_owned(),
+        };
+        packet["request"]["authorization"] = serde_json::to_value(&authorization).expect("auth");
+        let mut source_manifest = packet.clone();
+        source_manifest
+            .as_object_mut()
+            .expect("source manifest object")
+            .remove("request");
+        source_manifest
+            .as_object_mut()
+            .expect("source manifest object")
+            .remove("approval_id");
+        source_manifest["target"]["chat_id"] = Value::Null;
+        source_manifest["source"]
+            .as_object_mut()
+            .expect("source object")
+            .remove("message_id");
+        source_manifest["delivery"]["delivered_at"] = Value::Null;
+        packet["request"]["source_revisions_json"] = Value::String(source_manifest.to_string());
+        packet["request"]["source_revisions_digest"] =
+            Value::String(handoff_request_fingerprint(&packet, &authorization).expect("digest"));
+        packet.to_string()
+    }
+
+    fn handoff_expectation<'a>() -> ProjectHandoffExpectation<'a> {
+        ProjectHandoffExpectation {
+            handoff_id: "handoff-1",
+            deduplication_key: "dedupe-1",
+            correlation_id: "correlation-1",
+            causation_id: "event-1",
+            source_chat_id: "main-chat-1",
+            source_identity_id: "main-identity-1",
+            source_profile_revision_id: "main-profile-1",
+            source_instruction_revision_id: "instruction-1",
+            source_instruction_revision: 3,
+            source_message_ids: vec!["message-1".to_owned(), "message-2".to_owned()],
+            source_turn_id: Some("source-turn-1"),
+            project_id: "project-8",
+            project_name: "Project Eight",
+            project_mode: "standard",
+            approved_slug: Some("project-eight"),
+            target_chat_id: "project-chat-8",
+            target_binding_id: "binding-8",
+            target_message_id: "target-message-8",
+            target_turn_id: "target-turn-8",
+            charter_id: "charter-1",
+            charter_revision_id: "revision-2",
+            charter_revision_number: 2,
+            charter_schema_version: "forge.project-charter/v1",
+            charter_content_digest: "content-digest-2",
+            charter_render_version: "forge-project-charter/v1",
+            charter_render_digest: "render-digest-2",
+            approval_id: "approval-3",
+            approval_event_id: "approval-event-4",
+            approval_authorization_basis: "approved_charter",
+            approval_authorization_action: "project.charter.approve",
+            approval_authorization_event_id: "charter-authorization-event-4",
+            approval_authorization_occurred_at: "2026-08-12T23:59:59Z",
+            approval_principal_kind: "user",
+            approval_principal_id: "account-1",
+            approval_created_at: "2026-08-13T00:00:00Z",
+            create_authorization_principal_type: "user",
+            create_authorization_principal_id: "account-1",
+            create_authorization_basis: "create_project_from_approved_charter",
+            create_authorization_action: "create_project_from_charter_approval",
+            create_authorization_event_id: "approval-event-4",
+            create_authorization_occurred_at: "2026-08-13T00:00:00Z",
+            identity_id: "identity-5",
+            profile_revision_id: "profile-6",
+            operating_skill_revision: "forge.project.orchestration/v1@1",
+            policy_revision: "forge.project-agent-policy/v1",
+            policy_digest: "policy-digest-7",
+            created_at: "2026-08-13T00:00:00Z",
+            delivered_at: "2026-08-13T00:00:01Z",
+        }
+    }
+
+    #[test]
+    fn project_handoff_accepts_the_full_approved_packet_shape() {
+        let packet = validate_project_handoff_packet(
+            &handoff_packet_json(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect("the full server-owned packet should parse and authenticate");
+        assert_eq!(packet.handoff_id, "handoff-1");
+        assert_eq!(packet.target.chat_id, "project-chat-8");
+        assert_eq!(packet.redaction_manifest.excluded_categories.len(), 6);
+    }
+
+    #[test]
+    fn project_handoff_rejects_mismatched_charter_revision() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["charter"]["revision_id"] = Value::String("revision-stale".to_owned());
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("stale Charter revision must fail closed");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_mismatched_policy_digest() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["project_agent"]["policy_digest"] = Value::String("policy-stale".to_owned());
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("stale policy digest must fail closed");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_tampered_source_manifest_digest() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["request"]["source_revisions_json"] =
+            Value::String("{\"schema_version\":\"tampered\"}".to_owned());
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("a source-manifest mutation must invalidate its digest");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_semantically_tampered_source_manifest_even_with_new_digest() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        let mut source_manifest: Value = serde_json::from_str(
+            packet["request"]["source_revisions_json"]
+                .as_str()
+                .expect("source manifest"),
+        )
+        .expect("source manifest JSON");
+        source_manifest["bounded_summary"] = Value::String("tampered summary".to_owned());
+        packet["request"]["source_revisions_json"] = Value::String(source_manifest.to_string());
+        let authorization: ProjectCharterHandoffAuthorization =
+            serde_json::from_value(packet["request"]["authorization"].clone())
+                .expect("authorization");
+        packet["request"]["source_revisions_digest"] =
+            Value::String(handoff_request_fingerprint(&packet, &authorization).expect("digest"));
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("a semantically altered source manifest must fail closed");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_tampered_approval_authorization() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["approval"]["authorization_action"] =
+            Value::String("project.charter.revoke".to_owned());
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("approval authorization changes must fail closed");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_tampered_create_authorization_even_with_new_digest() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["request"]["authorization"]["action"] =
+            Value::String("project.handoff.replay".to_owned());
+        let authorization: ProjectCharterHandoffAuthorization =
+            serde_json::from_value(packet["request"]["authorization"].clone())
+                .expect("authorization");
+        packet["request"]["source_revisions_digest"] =
+            Value::String(handoff_request_fingerprint(&packet, &authorization).expect("digest"));
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("create authorization changes must fail closed");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_tampered_delivery_and_redaction_shape() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["delivery"]["delivered_at"] = Value::String("delivery-stale".to_owned());
+        packet["redaction_manifest"]["excluded_categories"] =
+            serde_json::json!(["full_main_chat_history"]);
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("delivery and redaction provenance must fail closed");
+        assert!(error.to_string().contains("Project Agent handoff"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_unknown_fields_without_discarding_them() {
+        let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        packet["source"]["untrusted_extra"] = Value::String("must reject".to_owned());
+        let error = validate_project_handoff_packet(
+            &packet.to_string(),
+            &handoff_expectation(),
+            "consumed",
+            Some("project-8"),
+            "project-8",
+        )
+        .expect_err("unknown packet fields must not be discarded");
+        assert!(error.to_string().contains("invalid typed Charter packet"));
+    }
+
+    #[test]
+    fn project_handoff_requires_the_v076_approval_and_request_envelope() {
+        for field in ["approval_id", "request"] {
+            let mut packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+            packet.as_object_mut().expect("object").remove(field);
+            let error = validate_project_handoff_packet(
+                &packet.to_string(),
+                &handoff_expectation(),
+                "consumed",
+                Some("project-8"),
+                "project-8",
+            )
+            .expect_err("required V076 handoff fields must not be optional");
+            assert!(error.to_string().contains("invalid typed Charter packet"));
+        }
+    }
+
+    #[test]
+    fn legacy_setup_instruction_only_allows_read_and_adoption_proposals() {
+        assert!(PROJECT_SETUP_RESTRICTIONS.contains("propose an adoption Charter"));
+        assert!(
+            PROJECT_SETUP_RESTRICTIONS.contains("Do not create or dispatch implementation Tasks")
+        );
+        assert!(PROJECT_SETUP_RESTRICTIONS.contains("repository Workspace"));
+        assert_eq!(
+            PROJECT_SETUP_PERMISSION_CEILING,
+            "read_project,read_agent_chat,read_memory,propose_message,propose_project"
+        );
+        assert!(!PROJECT_SETUP_PERMISSION_CEILING.contains("propose_task"));
+    }
+
+    #[test]
+    fn main_genesis_context_provenance_names_skill_instruction_and_charter() {
+        let sources = main_operating_context_sources(
+            "forge.main.project-discovery/v2@1",
+            "main-skill-content-digest",
+            &[
+                OperatingContextReference::included(
+                    "genesis:genesis-1@v2",
+                    "genesis-1",
+                    "main_genesis",
+                    "v2",
+                    "genesis-digest",
+                    "test",
+                ),
+                OperatingContextReference::included(
+                    "main_instruction:instruction-1@3",
+                    "instruction-1",
+                    "main_genesis_instruction",
+                    "3",
+                    "instruction-digest",
+                    "test",
+                ),
+                OperatingContextReference::included(
+                    "charter:charter-1@revision-2",
+                    "charter-1",
+                    "main_charter",
+                    "revision-2",
+                    "charter-digest",
+                    "test",
+                ),
+                OperatingContextReference::included(
+                    "portfolio:project-1@v4",
+                    "project-1",
+                    "main_portfolio_projection",
+                    "v4:2026-08-13T00:00:00Z",
+                    "portfolio-digest",
+                    "bounded_account_portfolio_projection",
+                ),
+            ],
+        );
+        assert_eq!(
+            sources[0].source_id,
+            "operating_skill:forge.main.project-discovery/v2"
+        );
+        assert_eq!(
+            sources[0].source_revision,
+            "forge.main.project-discovery/v2@1"
+        );
+        assert_eq!(sources[0].fragment_fingerprint, "main-skill-content-digest");
+        assert!(sources
+            .iter()
+            .any(|source| source.source_type == "main_genesis_instruction"));
+        assert!(sources.iter().any(|source| {
+            source.source_type == "main_portfolio_projection"
+                && source.disposition == "included"
+                && source.sensitivity != "secret"
+        }));
+    }
+
+    #[test]
+    fn server_context_manifest_identity_is_stable_per_turn_job() {
+        let first = agent_chat_server_manifest_id("identity-1", "session-1", "job-1");
+        let replay = agent_chat_server_manifest_id("identity-1", "session-1", "job-1");
+        let next_job = agent_chat_server_manifest_id("identity-1", "session-1", "job-2");
+        let other_session = agent_chat_server_manifest_id("identity-1", "session-2", "job-1");
+
+        assert_eq!(first, replay);
+        assert_ne!(first, next_job);
+        assert_ne!(first, other_session);
+    }
+
+    #[test]
+    fn server_context_manifest_fingerprint_shape_excludes_context_bodies() {
+        let source = ContextSourceInput {
+            ordinal: 0,
+            source_id: "main_genesis_context:main_genesis:genesis-1@v2".to_owned(),
+            source_type: "main_genesis".to_owned(),
+            source_revision: "v2:discovering".to_owned(),
+            selection_reason: "active_product_genesis".to_owned(),
+            disposition: "included".to_owned(),
+            retention_priority: 100,
+            fragment_fingerprint: "digest-1".to_owned(),
+            sensitivity: "internal".to_owned(),
+        };
+        let encoded = serde_json::to_string(&canonical_operating_context_sources(&[source]))
+            .expect("canonical source metadata serializes");
+
+        assert!(encoded.contains("main_genesis_context:main_genesis:genesis-1@v2"));
+        assert!(encoded.contains("digest-1"));
+        assert!(!encoded.contains("body"));
+        assert!(!encoded.contains("private transcript"));
+    }
+
+    #[test]
+    fn project_handoff_rejects_active_approval() {
+        let error = validate_project_handoff_packet(
+            &handoff_packet_json(),
+            &handoff_expectation(),
+            "active",
+            None,
+            "project-8",
+        )
+        .expect_err("an active approval must not admit a Project turn");
+        assert!(error.to_string().contains("consumed Charter approval"));
     }
 }

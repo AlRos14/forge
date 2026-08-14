@@ -9,8 +9,9 @@ use api_types::{
 };
 use async_trait::async_trait;
 use db::{
-    create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, CreateTask,
-    DaemonRepo, DaemonStatus, UpdateProject, UpsertDaemon,
+    create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent,
+    CreateProjectAgentBinding, CreateTask, DaemonRepo, DaemonStatus, ProjectAgentBindingRepo,
+    ReplaceProjectAgentBinding, UpdateProject, UpsertDaemon,
 };
 use executors::{ExecutionResult, ExecutorError};
 use sqlx::Row;

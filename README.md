@@ -89,9 +89,12 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 | **Main Agent** | The account's single global assistant for discovery, Project lifecycle, bounded summaries, and explicit handoff. |
 | **Project** | A workspace grouping repos, Tasks, one Project Agent Chat, and a workflow definition. |
 | **Project Agent** | The single persistent manager for a Project; it manages Tasks only through the Project workflow. |
+| **Project Charter** | The user-approved, revisioned source of Project identity, scope, constraints, success, and unresolved knowledge. |
 | **Agent Chat** | The immutable, scope-isolated timeline for the Main Agent or one Project Agent. |
 | **Repo** | A pointer to a local git checkout that tasks operate on. |
 | **Task** | A unit of agent work with a state, optional CI steps, and an audit log. |
+| **Milestone / release** | An outcome contract with evidence-backed readiness and an immutable `Mxxx-rN` Forge snapshot. |
+| **Evidence** | Project-authorized image, video, or report metadata that can reuse Task media and survive release pinning. |
 | **Daemon** | The local process that reports installed CLIs and runs executions. |
 | **Worktree** | An isolated git checkout created per task, cleaned up on `done`/`cancelled`. |
 | **Review gate** | The CI steps + optional human approval that block `review → merging`. |
@@ -114,8 +117,8 @@ Deeper dive → [docs/architecture.md](docs/architecture.md).
 | Doc | What's in it |
 |---|---|
 | [Getting started](docs/getting-started.md) | Install, first project, agents, end-to-end task walkthrough. |
-| [Architecture](docs/architecture.md) | Crate graph, task state machine, database, event bus. |
-| [API reference](docs/api.md) | REST endpoints, query params, pagination, MCP tools, SSE. |
+| [Architecture](docs/architecture.md) | Authority model, Project truth, milestones/evidence, crate graph, task state machine, database, event bus. |
+| [API reference](docs/api.md) | Charter/Project/Document/Milestone/Release REST endpoints, media retention, pagination, MCP tools, SSE. |
 | [forge-ctl CLI](docs/cli.md) | Subcommands, daemon link, scripted runs. |
 | [Execution logs](docs/execution-logs.md) | JSONL log schema and chat-history reconstruction. |
 | [Changelog](CHANGELOG.md) | Per-release changes and breaking notes. |

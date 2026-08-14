@@ -31,6 +31,7 @@ impl RunArgs {
                     review_config: None,
                     merge_config: None,
                     role_assignments: None,
+                    governance: None,
                 },
             )
             .await?;

@@ -90,6 +90,67 @@ async fn identity(db: &SqliteDb) -> (String, String) {
     (identity_id, profile_id)
 }
 
+async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
+    let now = now_rfc3339();
+    let charter_id = format!("{project_id}-charter");
+    let revision_id = format!("{charter_id}-revision-1");
+    sqlx::query(
+        "INSERT INTO project_charter (
+             id, account_id, project_id, project_mode, maturity, lifecycle,
+             version, created_at, updated_at
+         ) VALUES (?, 'user-1', ?, 'compact', 'prototype', 'attached', 1, ?, ?)",
+    )
+    .bind(&charter_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("charter creates");
+    sqlx::query(
+        "INSERT INTO project_charter_revision (
+             id, charter_id, revision, base_revision, lifecycle, schema_version,
+             render_version, content_json, rendered_view, change_summary,
+             author_type, author_id, source_refs_json, content_digest,
+             rendered_digest, created_at
+         ) VALUES (?, ?, 1, 0, 'approved', 'forge.project-charter/v1',
+                   'forge.project-charter-render/v1', '{}', '# Project A',
+                   'test fixture approval', 'user', 'user-1', '[]',
+                   'charter-content-digest', 'charter-render-digest', ?)",
+    )
+    .bind(&revision_id)
+    .bind(&charter_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("charter revision creates");
+    sqlx::query(
+        "UPDATE project_charter
+         SET current_approved_revision_id = ?, current_draft_revision_id = ?, version = 2
+         WHERE id = ?",
+    )
+    .bind(&revision_id)
+    .bind(&revision_id)
+    .bind(&charter_id)
+    .execute(db.pool())
+    .await
+    .expect("charter approval attaches");
+    sqlx::query(
+        "UPDATE project
+         SET current_charter_id = ?, current_charter_revision_id = ?,
+             current_charter_version = 1, charter_status = 'charter_backed',
+             charter_setup_required = 0, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&charter_id)
+    .bind(&revision_id)
+    .bind(&now)
+    .bind(project_id)
+    .execute(db.pool())
+    .await
+    .expect("approved Charter attaches to Project");
+}
+
 #[tokio::test]
 async fn main_chat_is_not_task_capable_even_with_broad_identity_policy() {
     let db = sqlite_db().await;
@@ -128,7 +189,7 @@ async fn main_chat_is_not_task_capable_even_with_broad_identity_policy() {
 }
 
 #[tokio::test]
-async fn project_chat_gets_task_management_only_for_its_owning_project() {
+async fn project_chat_gets_task_management_only_after_charter_setup_for_its_owning_project() {
     let db = sqlite_db().await;
     let (identity_id, profile_id) = identity(&db).await;
     let now = now_rfc3339();
@@ -191,7 +252,7 @@ async fn project_chat_gets_task_management_only_for_its_owning_project() {
         .expect("Project chat lookup")
         .expect("Project chat");
     let service = EmbeddedAgentService::new(Arc::clone(&db), b"test-protected-key");
-    let own = service
+    let setup_required = service
         .effective_permissions(
             "user-1",
             &identity_id,
@@ -201,6 +262,20 @@ async fn project_chat_gets_task_management_only_for_its_owning_project() {
         )
         .await
         .expect("Project permissions");
+    assert!(!setup_required.allowed.contains("propose_task"));
+    assert!(setup_required.denied.contains("propose_task"));
+
+    attach_approved_charter(&db, "project-a").await;
+    let own = service
+        .effective_permissions(
+            "user-1",
+            &identity_id,
+            &RequestedCanonicalScope::AgentChat {
+                chat_id: chat.id.clone(),
+            },
+        )
+        .await
+        .expect("charter-backed Project permissions");
     assert!(own.allowed.contains("propose_task"));
     assert!(!own.allowed.contains("task_write"));
     assert!(!own.allowed.contains("propose_session"));

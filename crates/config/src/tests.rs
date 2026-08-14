@@ -1,8 +1,8 @@
 use crate::{
     data_dir_from_env, default_data_dir, default_workspace_root, read_server_state,
-    server_state_path, write_server_state, ConfigError, ConfigOverrides, ForgeConfig, ServerState,
-    TerminalConfig, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND,
-    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    server_state_path, write_server_state, ConfigError, ConfigOverrides, ForgeConfig,
+    PublicSearchConfig, ServerState, TerminalConfig, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
+    DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use std::{
     env, fs,
@@ -103,6 +103,87 @@ fn terminal_config_rejects_task_limit_above_user_limit() {
         ConfigError::InvalidConfig { message }
             if message.contains("terminal.max_sessions_per_task")
     ));
+}
+
+#[test]
+fn public_search_defaults_to_disabled_and_bounded_limits() {
+    let config = PublicSearchConfig::default();
+
+    assert_eq!(config.endpoint, None);
+    assert_eq!(config.timeout_ms, 5_000);
+    assert_eq!(config.max_response_bytes, 256 * 1024);
+    config.validate().expect("default search config is valid");
+}
+
+#[test]
+fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
+    for endpoint in [
+        "http://search.example.test",
+        "https://localhost/search",
+        "https://127.0.0.1/search",
+        "https://[::ffff:127.0.0.1]/search",
+        "https://[::ffff:8.8.8.8]/search",
+        "https://[::8.8.8.8]/search",
+        "https://[64:ff9b::192.0.2.1]/search",
+        "https://[fe80::1%25en0]/search",
+        "https://[2001:2::1]/search",
+        "https://192.0.2.1/search",
+        "https://[2001:db8::1]/search",
+        "https://search.example.test/?token=secret",
+        "https://user:password@search.example.test/search",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(endpoint.to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "endpoint must be rejected: {endpoint}"
+        );
+    }
+
+    for (timeout_ms, max_response_bytes) in [
+        (99, 256 * 1024),
+        (30_001, 256 * 1024),
+        (5_000, 1023),
+        (5_000, 4 * 1024 * 1024 + 1),
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some("https://search.example.test".to_owned()),
+            timeout_ms,
+            max_response_bytes,
+        };
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
+fn public_search_file_and_environment_settings_are_loaded() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+public_search:
+  endpoint: https://search.example.test/api
+  timeout_ms: 2500
+  max_response_bytes: 65536
+"#,
+    )
+    .expect("write config");
+    env::set_var("FORGE_PUBLIC_SEARCH_TIMEOUT_MS", "3000");
+
+    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+        .expect("search config loads");
+    assert_eq!(
+        config.public_search.endpoint.as_deref(),
+        Some("https://search.example.test/api")
+    );
+    assert_eq!(config.public_search.timeout_ms, 3000);
+    assert_eq!(config.public_search.max_response_bytes, 65536);
 }
 
 #[test]
@@ -439,6 +520,9 @@ fn clear_forge_env() {
     for key in [
         "FORGE_SERVER_BIND",
         "FORGE_PUBLIC_BASE_URL",
+        "FORGE_PUBLIC_SEARCH_ENDPOINT",
+        "FORGE_PUBLIC_SEARCH_TIMEOUT_MS",
+        "FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES",
         "FORGE_DATA_DIR",
         "FORGE_WORKSPACE_ROOT",
         "FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS",

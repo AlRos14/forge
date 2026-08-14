@@ -318,6 +318,8 @@ impl AppState {
     }
 
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.embedded_agent_service
+            .set_public_search_config(Some(config.public_search.clone()));
         self.oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.auth_service),

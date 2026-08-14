@@ -5,7 +5,11 @@ use crate::{
     DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv6Addr},
+    path::PathBuf,
+};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,8 +19,26 @@ pub struct ForgeConfig {
     pub workspace: WorkspaceConfig,
     pub agent: AgentDefaults,
     #[serde(default)]
+    pub public_search: PublicSearchConfig,
+    #[serde(default)]
     pub terminal: TerminalConfig,
     pub project: ProjectSettings,
+}
+
+/// Optional least-privilege endpoint used by Main and Project Agent Chat
+/// web-search tools.  The endpoint is intentionally unauthenticated: Forge
+/// never sends cookies, browser state, credentials, or agent/profile secrets
+/// to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PublicSearchConfig {
+    /// A public HTTPS endpoint implementing Forge's bounded JSON search
+    /// contract.  `None` leaves the native tool out of the catalog.
+    pub endpoint: Option<String>,
+    /// Whole request/response deadline in milliseconds.
+    pub timeout_ms: u64,
+    /// Maximum response body size in bytes.
+    pub max_response_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,7 +151,8 @@ impl ForgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.terminal.validate()
+        self.terminal.validate()?;
+        self.public_search.validate()
     }
 
     #[must_use]
@@ -162,10 +185,134 @@ impl Default for ForgeConfig {
                 heartbeat_interval_seconds: DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS,
                 max_missed_heartbeats: DEFAULT_AGENT_MAX_MISSED_HEARTBEATS,
             },
+            public_search: PublicSearchConfig::default(),
             terminal: TerminalConfig::default(),
             project: ProjectSettings::default(),
         }
     }
+}
+
+impl Default for PublicSearchConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            timeout_ms: 5_000,
+            max_response_bytes: 256 * 1024,
+        }
+    }
+}
+
+impl PublicSearchConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(100..=30_000).contains(&self.timeout_ms) {
+            return Err(ConfigError::InvalidConfig {
+                message: "public_search.timeout_ms must be between 100 and 30000".to_owned(),
+            });
+        }
+        if !(1024..=4 * 1024 * 1024).contains(&self.max_response_bytes) {
+            return Err(ConfigError::InvalidConfig {
+                message: "public_search.max_response_bytes must be between 1024 and 4194304"
+                    .to_owned(),
+            });
+        }
+        let Some(endpoint) = self.endpoint.as_deref() else {
+            return Ok(());
+        };
+        if endpoint.chars().count() > 2048 {
+            return Err(ConfigError::InvalidConfig {
+                message: "public_search.endpoint is too long".to_owned(),
+            });
+        }
+        let parsed = Url::parse(endpoint).map_err(|_| ConfigError::InvalidConfig {
+            message: "public_search.endpoint must be an absolute HTTPS URL".to_owned(),
+        })?;
+        if parsed.scheme() != "https"
+            || parsed.host().is_none()
+            || parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.query().is_some()
+        {
+            return Err(ConfigError::InvalidConfig {
+                message: "public_search.endpoint must be an absolute HTTPS URL without credentials, query, or fragment".to_owned(),
+            });
+        }
+        if parsed.host_str().is_some_and(is_private_or_local_host) {
+            return Err(ConfigError::InvalidConfig {
+                message: "public_search.endpoint must not target a local or private host"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    let normalized = host
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if normalized.contains('%') {
+        return true;
+    }
+    if matches!(normalized.as_str(), "localhost" | "localhost.localdomain")
+        || normalized.ends_with(".localhost")
+        || normalized.ends_with(".local")
+    {
+        return true;
+    }
+    let Ok(address) = normalized.parse::<IpAddr>() else {
+        return false;
+    };
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224
+        }
+        IpAddr::V6(address) => is_blocked_public_ipv6(address),
+    }
+}
+
+fn is_blocked_public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    let first = segments[0];
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_unique_local()
+        || address.is_unicast_link_local()
+        // Reject every IPv4-compatible/mapped representation, including a
+        // mapped public address.  Allowing one would make endpoint policy
+        // differ depending on the resolver's address-family choice.
+        || address.to_ipv4().is_some()
+        || (first & 0xffc0 == 0xfec0)
+        || (first & 0xff00 == 0xff00)
+        || (first == 0x2001 && segments[1] == 0x0db8)
+        || (first == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+        || (first == 0x2001 && (0..=5).contains(&segments[1]))
+        || (0x3ff0..=0x3fff).contains(&first)
+        || (first == 0x2001 && segments[1] == 0)
+        || (first == 0x2001 && (0x0010..=0x001f).contains(&segments[1]))
+        || (first == 0x2001 && (0x0020..=0x002f).contains(&segments[1]))
+        || first == 0x2002
+        || (first == 0x0100
+            && segments[1] == 0
+            && segments[2] == 0
+            && segments[3] == 0)
+        || (first == 0x0064 && segments[1] == 0xff9b && segments[2] == 0)
+        || (first == 0x0064 && segments[1] == 0xff9b && segments[2] == 1)
 }
 
 impl Default for TerminalConfig {

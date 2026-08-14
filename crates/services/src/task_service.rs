@@ -16,11 +16,12 @@ use cli_adapters::codex::protocol::RESUME_THREAD_ID_CONFIG_KEY;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
     CommentAuthorType, CreateExecution, CreateTask, CreateTaskComment, CreateTaskRoleAssignment,
-    CreateWorkspace, DbError, Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo,
-    PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy,
-    SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata,
-    TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
-    UpsertExecutionUsage, Workspace, WorkspaceRepo, WorkspaceStatus,
+    CreateWorkspace, CreateWorkspaceLease, DbError, Execution, ExecutionRepo, ExecutionStatus,
+    ExecutionUsageRepo, PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus,
+    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo,
+    TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
+    TaskStatus, TransitionLogRepo, UpsertExecutionUsage, Workspace, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -46,6 +47,7 @@ pub(crate) mod config;
 mod create;
 mod create_subtasks;
 mod execution;
+mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
 mod move_task;
@@ -266,6 +268,139 @@ impl TaskService {
         self.event_bus.publish(event);
     }
 
+    /// Create a running execution and remove a freshly prepared workspace if
+    /// the authoritative in-transaction admission guard rejects it. Existing
+    /// workspaces are intentionally retained for retries/recovery; only a
+    /// workspace created by this attempt is rolled back.
+    pub(crate) async fn create_running_execution(
+        &self,
+        input: CreateExecution,
+        workspace_created_by_attempt: bool,
+    ) -> Result<Execution> {
+        let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
+            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            Some((task, workspace))
+        } else {
+            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
+            if task.repo_id.is_some() {
+                return Err(ServiceError::invalid_operation(
+                    "repository execution requires a scheduler WorkspaceLease-backed workspace",
+                ));
+            }
+            None
+        };
+
+        // The lease is FK-bound to the concrete execution attempt.  Create
+        // that attempt first, then issue the authority; a rejected lease is
+        // immediately terminalized so no running execution can exist without
+        // an active scheduler grant.
+        let execution = match ExecutionRepo::create(&*self.db, input.clone()).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                if workspace_created_by_attempt {
+                    self.cleanup_fresh_execution_workspace_by_id(
+                        &input.task_id,
+                        input.workspace_id.as_deref(),
+                    )
+                    .await;
+                }
+                return Err(error.into());
+            }
+        };
+        if let Some((task, workspace)) = repository_context.as_ref() {
+            if let Err(error) = self
+                .issue_workspace_lease(
+                    task,
+                    workspace,
+                    &input.role,
+                    input.agent_id.as_deref(),
+                    &input.id,
+                )
+                .await
+            {
+                if let Err(mark_error) = self
+                    .fail_execution_before_dispatch(&execution.id, error.to_string())
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %mark_error,
+                        "failed to terminalize execution after WorkspaceLease rejection"
+                    );
+                }
+                if workspace_created_by_attempt {
+                    self.cleanup_fresh_execution_workspace(task, workspace)
+                        .await;
+                }
+                return Err(error);
+            }
+        }
+        Ok(execution)
+    }
+
+    pub(crate) async fn cleanup_fresh_execution_workspace(
+        &self,
+        task: &Task,
+        workspace: &Workspace,
+    ) {
+        self.cleanup_fresh_execution_workspace_by_id(&task.id, Some(&workspace.id))
+            .await;
+    }
+
+    async fn cleanup_fresh_execution_workspace_by_id(
+        &self,
+        task_id: &str,
+        workspace_id: Option<&str>,
+    ) {
+        let mut removed_workspace = false;
+        if let Some(workspace_id) = workspace_id {
+            // Delete only our workspace row and only while no execution has
+            // acquired it. This protects a concurrent launch which reused
+            // the same Task workspace after this attempt lost admission.
+            match sqlx::query(
+                "DELETE FROM workspace
+                 WHERE id = ? AND task_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM execution
+                       WHERE execution.workspace_id = workspace.id
+                   )",
+            )
+            .bind(workspace_id)
+            .bind(task_id)
+            .execute(self.db.pool())
+            .await
+            {
+                Ok(result) => removed_workspace = result.rows_affected() == 1,
+                Err(cleanup_error) => tracing::warn!(
+                    task_id,
+                    workspace_id,
+                    %cleanup_error,
+                    "failed to remove workspace row after rejected execution"
+                ),
+            }
+        }
+        let mut manager = WorkspaceManager::new(self.workspace_root.clone());
+        if let Some(locks) = self.repo_cache_locks.clone() {
+            manager = manager.with_repo_cache_locks(locks);
+        }
+        if removed_workspace {
+            if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
+                tracing::warn!(
+                    task_id,
+                    %cleanup_error,
+                    "failed to remove fresh worktree after rejected execution"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn complete_remote_execution(
         &self,
         notification: api_types::ExecutionTerminalNotification,
@@ -385,6 +520,11 @@ impl TaskService {
             },
         )
         .await?;
+
+        if updated.status != ExecutionStatus::Running {
+            self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)
+                .await;
+        }
 
         if let Some(usage) = notification.usage {
             let provider = execution::usage_provider_from_snapshot(

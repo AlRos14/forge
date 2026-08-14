@@ -33,7 +33,7 @@ pub fn current_request_id() -> Option<String> {
 pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     let request_id = request_id_from_headers(req.headers());
     let method = req.method().clone();
-    let uri = req.uri().clone();
+    let path = request_log_path(req.uri()).to_owned();
     req.extensions_mut()
         .insert(RequestId::new(request_id.clone()));
 
@@ -41,7 +41,7 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
         "http.request",
         request_id = %request_id,
         method = %method,
-        uri = %uri,
+        path = %path,
     );
 
     let mut response = CURRENT_REQUEST_ID
@@ -56,6 +56,10 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     }
 
     response
+}
+
+pub(crate) fn request_log_path(uri: &axum::http::Uri) -> &str {
+    uri.path()
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {

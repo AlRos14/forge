@@ -165,6 +165,14 @@ pub struct ContextManifestSourceResponse {
     pub source_revision: String,
     pub selection_reason: String,
     pub disposition: String,
+    /// True when this immutable source revision no longer matches the
+    /// Project's current canonical pointer. The historical selection decision
+    /// and manifest fingerprint remain unchanged.
+    pub is_stale: bool,
+    /// The current canonical revision when this source type is pointer-backed.
+    /// `None` means either the source is not pointer-backed or its canonical
+    /// artifact is no longer present in the current Project projection.
+    pub current_revision: Option<String>,
     pub retention_priority: i64,
     pub fragment_fingerprint: String,
 }

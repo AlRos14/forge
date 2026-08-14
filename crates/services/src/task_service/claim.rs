@@ -1,6 +1,8 @@
+use super::workspace::prepare_workspace_owned;
 use super::*;
 use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
 use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
+use sqlx::Row;
 
 impl TaskService {
     pub async fn claim_task(
@@ -24,6 +26,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        // Do this before workspace preparation so a blocked Charter-backed
+        // implementation Task can never receive a workspace/lease as a side
+        // effect of an attempted claim.
+        self.ensure_task_runnable(&task).await?;
         if matches!(&assignee, Assignee::Agent(_)) && project.paused_at.is_some() {
             return Err(ServiceError::ProjectPaused {
                 project_id: project.id,
@@ -75,6 +81,10 @@ impl TaskService {
                     )
                 }
             };
+        if let Some(claiming_agent) = agent.as_ref() {
+            self.ensure_repository_worker_identity(&task.project_id, &claiming_agent.id)
+                .await?;
+        }
         if let Some(claiming_agent_id) = agent.as_ref().map(|agent| agent.id.as_str()) {
             if let Some(role_name) = target_role.as_deref() {
                 self.ensure_claim_role_available(&task.id, role_name, claiming_agent_id)
@@ -82,7 +92,7 @@ impl TaskService {
             }
         }
         let previous_status = task.status.clone();
-        let workspace = prepare_workspace(
+        let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
             &self.db,
             &self.workspace_root,
             &task,
@@ -113,7 +123,6 @@ impl TaskService {
             None => None,
         };
         let agent_id = agent.as_ref().map(|agent| agent.id.clone());
-
         let mut transaction = self.db.pool().begin().await.map_err(DbError::from)?;
         let claimed = TaskRepo::claim(
             &*self.db,
@@ -154,12 +163,101 @@ impl TaskService {
                 claimed_at: now,
             },
         )
-        .await?;
-        transaction.commit().await.map_err(DbError::from)?;
-
-        if let Some(claiming_agent_id) = agent_id.as_deref() {
-            self.assign_claim_state_role(&claimed.task, claiming_agent_id)
-                .await?;
+        .await;
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                drop(transaction);
+                if workspace_created_by_attempt {
+                    self.cleanup_fresh_execution_workspace(&task, &workspace)
+                        .await;
+                }
+                return Err(error.into());
+            }
+        };
+        if let (Some(role_name), Some(claiming_agent_id)) =
+            (target_role.as_deref(), agent_id.as_deref())
+        {
+            let role_now = now_rfc3339();
+            sqlx::query(
+                "INSERT INTO task_role_assignment
+                    (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+                 VALUES (?, ?, ?, 'agent', ?, ?, ?)
+                 ON CONFLICT(task_id, role_name) DO NOTHING",
+            )
+            .bind(new_uuid_v4())
+            .bind(&claimed.task.id)
+            .bind(role_name)
+            .bind(claiming_agent_id)
+            .bind(&role_now)
+            .bind(&role_now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::from)?;
+            let assignment = sqlx::query(
+                "SELECT assignee_type, assignee_id
+                 FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+            )
+            .bind(&claimed.task.id)
+            .bind(role_name)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::from)?;
+            if assignment
+                .get::<Option<String>, _>("assignee_type")
+                .as_deref()
+                != Some("agent")
+                || assignment
+                    .get::<Option<String>, _>("assignee_id")
+                    .as_deref()
+                    != Some(claiming_agent_id)
+            {
+                return Err(ServiceError::conflict(format!(
+                    "role '{}' is assigned to a different agent",
+                    role_name
+                )));
+            }
+        }
+        // Human claims remain user-managed work and do not mint repository
+        // authority. Only a scheduler-dispatched Agent Worker/reviewer gets
+        // an execution-scoped WorkspaceLease.
+        let lease = if agent_id.is_some() {
+            match self
+                .issue_workspace_lease_in_tx(
+                    &mut transaction,
+                    &claimed.task,
+                    &workspace,
+                    target_role.as_deref().unwrap_or("executor"),
+                    agent_id.as_deref(),
+                    &execution_id,
+                )
+                .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    drop(transaction);
+                    if workspace_created_by_attempt {
+                        self.cleanup_fresh_execution_workspace(&task, &workspace)
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = transaction.commit().await.map_err(DbError::from) {
+            // The commit may have succeeded at SQLite despite a transport
+            // error; revoke the lease idempotently so a crashed claimant can
+            // never retain repository authority.
+            if let Some(lease) = lease.as_ref() {
+                self.revoke_workspace_lease(lease).await;
+            }
+            if workspace_created_by_attempt {
+                self.cleanup_fresh_execution_workspace(&task, &workspace)
+                    .await;
+            }
+            return Err(error.into());
         }
 
         self.publish(ForgeEvent {
@@ -274,36 +372,6 @@ impl TaskService {
             state_config,
         };
         let _ = DispatchRoleAgent.execute(&ctx).await;
-    }
-
-    async fn assign_claim_state_role(&self, task: &Task, claiming_agent_id: &str) -> Result<()> {
-        let Some(role_name) = self.role_for_state(task, &task.status).await? else {
-            return Ok(());
-        };
-        self.ensure_claim_role_available(&task.id, &role_name, claiming_agent_id)
-            .await?;
-
-        let existing =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &role_name).await?;
-        if existing.is_some() {
-            return Ok(());
-        }
-
-        let now = now_rfc3339();
-        TaskRoleAssignmentRepo::assign(
-            &*self.db,
-            CreateTaskRoleAssignment {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                role_name,
-                assignee_type: Some(AssigneeKind::Agent),
-                assignee_id: Some(claiming_agent_id.to_owned()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
-        Ok(())
     }
 
     pub(super) async fn role_for_state(

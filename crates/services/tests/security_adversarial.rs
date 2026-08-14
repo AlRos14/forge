@@ -7,8 +7,9 @@ use db::{
 };
 use serde_json::json;
 use services::{
-    ForgeMemoryQuery, ForgeMemorySource, MemoryAccessContext, MemoryLifecycleInput,
-    MemoryPublicationInput, MemoryService, MemorySourceBindingInput,
+    ContextManifestInput, ContextManifestService, ContextSourceInput, ForgeMemoryQuery,
+    ForgeMemorySource, MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput,
+    MemoryService, MemorySourceBindingInput,
 };
 use uuid::Uuid;
 
@@ -340,6 +341,93 @@ async fn context_manifest_rejects_secret_source_even_when_text_claims_public_sco
 }
 
 #[tokio::test]
+async fn context_manifest_sources_require_the_manifest_scope_before_retrieval() {
+    let db = Arc::new(sqlite_db().await);
+    let owner_id = seed_identity(db.as_ref(), "manifest-owner").await;
+    let outsider_id = seed_identity(db.as_ref(), "manifest-outsider").await;
+    let context_scope_id = Uuid::new_v4();
+    let now = now_rfc3339();
+    AgentContextScopeRepo::create_context_scope(
+        db.as_ref(),
+        CreateAgentContextScope {
+            id: context_scope_id.to_string(),
+            identity_id: owner_id.clone(),
+            scope_type: "project".to_owned(),
+            scope_id: "project-boundary".to_owned(),
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("context scope creates");
+
+    let service = ContextManifestService::new(Arc::clone(&db));
+    let manifest_id = Uuid::new_v4();
+    let manifest = service
+        .create(
+            ContextManifestInput {
+                id: manifest_id,
+                identity_id: Uuid::parse_str(&owner_id).expect("owner UUID"),
+                agent_session_id: None,
+                context_scope_id,
+                scope_type: "project".to_owned(),
+                scope_id: "project-boundary".to_owned(),
+                policy_revision: "policy".to_owned(),
+                domain_revision: "domain".to_owned(),
+                lcm_binding_revision: None,
+                runtime_manifest_id: None,
+                runtime_manifest_fingerprint: None,
+                request_fingerprint: "request".to_owned(),
+            },
+            &[],
+        )
+        .await
+        .expect("manifest creates");
+    let owner_uuid = Uuid::parse_str(&owner_id).expect("owner UUID");
+    let outsider_uuid = Uuid::parse_str(&outsider_id).expect("outsider UUID");
+    let source = ContextSourceInput {
+        ordinal: 0,
+        source_id: "project-document-1".to_owned(),
+        source_type: "project_document".to_owned(),
+        source_revision: "revision-1".to_owned(),
+        selection_reason: "approved".to_owned(),
+        disposition: "included".to_owned(),
+        retention_priority: 100,
+        fragment_fingerprint: "digest".to_owned(),
+        sensitivity: "internal".to_owned(),
+    };
+    let denied = service
+        .append_source(manifest_id, outsider_uuid, context_scope_id, source.clone())
+        .await;
+    assert!(denied.is_err(), "foreign identity cannot append a source");
+    assert!(
+        service
+            .sources(manifest_id, outsider_uuid, context_scope_id)
+            .await
+            .is_err(),
+        "foreign identity cannot observe source existence"
+    );
+    service
+        .append_source(manifest_id, owner_uuid, context_scope_id, source)
+        .await
+        .expect("owner appends source");
+    assert_eq!(
+        service
+            .sources(manifest_id, owner_uuid, context_scope_id)
+            .await
+            .expect("owner reads sources")
+            .len(),
+        1
+    );
+    assert_eq!(manifest.id, manifest_id.to_string());
+}
+
+#[tokio::test]
 async fn publication_is_immutable_and_destructive_lifecycle_is_owner_only() {
     let db = Arc::new(sqlite_db().await);
     let now = now_rfc3339();
@@ -401,6 +489,45 @@ async fn publication_is_immutable_and_destructive_lifecycle_is_owner_only() {
         .expect("publication succeeds");
     assert_ne!(published.id, source.id);
     assert_eq!(published.visibility, "project");
+    assert_eq!(published.source_scope_type.as_deref(), Some("project"));
+    assert_eq!(
+        published.source_scope_id.as_deref(),
+        Some(project_id.as_str())
+    );
+    assert_eq!(
+        published.source_revision.as_deref(),
+        source.source_revision.as_deref(),
+        "publication must retain the canonical source revision"
+    );
+    let mut missing_revision = source.clone();
+    missing_revision.id = new_uuid_v4();
+    missing_revision.source_revision = None;
+    MemoryRepository::insert_memory_item(db.as_ref(), &missing_revision)
+        .await
+        .expect("missing-revision source inserts for rejection test");
+    let missing_revision_publication = service
+        .publish(
+            &access,
+            MemoryPublicationInput {
+                source_id: Uuid::parse_str(&missing_revision.id).expect("source id is UUID"),
+                source_scope_type: "project".to_owned(),
+                source_scope_id: project_id.clone(),
+                target_scope_type: "project".to_owned(),
+                target_scope_id: project_id.clone(),
+                target_project_id: Some(project_id.clone()),
+                target_task_id: None,
+                target_visibility: "project".to_owned(),
+                target_authority: "observation".to_owned(),
+                actor_identity_id: identity_id.clone(),
+                reason: "missing revision must fail closed".to_owned(),
+                evidence_json: "{}".to_owned(),
+            },
+        )
+        .await;
+    assert!(
+        missing_revision_publication.is_err(),
+        "memory without a canonical source revision cannot be published"
+    );
     let source_after = MemoryRepository::get_memory_item(db.as_ref(), &source.id)
         .await
         .expect("source loads")

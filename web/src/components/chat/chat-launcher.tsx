@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ChatCircleDots, X } from '@phosphor-icons/react'
 import { AgentChatTimeline } from '@/components/chat/agent-chat-timeline'
@@ -32,26 +32,26 @@ export function ChatLauncher() {
   const cancelMutation = useCancelAgentChatTurnMutation(globalChatQuery.data?.id)
   const setGlobalChat = useChatSelection((state) => state.setGlobalChat)
 
+  const close = useCallback(() => {
+    setOpen(false)
+    requestAnimationFrame(() => launcherRef.current?.focus())
+  }, [])
+
   useEffect(() => {
     if (!open) return
     panelHeadingRef.current?.focus()
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key === 'Escape') close()
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [open])
+  }, [close, open])
 
   useEffect(() => {
     if (globalChatQuery.data) {
       setGlobalChat(globalChatQuery.data)
     }
   }, [globalChatQuery.data, setGlobalChat])
-
-  function close() {
-    setOpen(false)
-    requestAnimationFrame(() => launcherRef.current?.focus())
-  }
 
   async function sendMessage(content: string) {
     if (!globalChatQuery.data) throw new Error('The global Main Agent Chat is not ready yet.')

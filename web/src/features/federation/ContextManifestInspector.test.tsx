@@ -55,6 +55,8 @@ const manifest: ContextManifest = {
       source_revision: 'revision-4',
       selection_reason: 'Matched the active Agent Chat scope.',
       disposition: 'included',
+      is_stale: true,
+      current_revision: 'revision-5',
       retention_priority: 9n,
       fragment_fingerprint: 'fragment-fingerprint',
     },
@@ -76,6 +78,8 @@ describe('ContextManifestInspector', () => {
 
     expect(screen.getByRole('region', { name: 'Context manifest metadata' })).toBeTruthy()
     expect(screen.getByText('Matched the active Agent Chat scope.')).toBeTruthy()
+    expect(screen.getByText('Stale pointer')).toBeTruthy()
+    expect(screen.getByText('revision-5')).toBeTruthy()
     expect(screen.getByText('combined-fingerprint')).toBeTruthy()
     expect(screen.queryByText(/source body|secret body/i)).toBeNull()
   })

@@ -631,10 +631,12 @@ async fn response_and_handoff_replays_are_single_ledger_outcomes() {
             lease_owner: Some(Some("test-owner".to_owned())),
             leased_until: Some(Some("2026-08-13T00:02:04.000Z".to_owned())),
             attempt_count: Some(1),
-            next_attempt_at: Some(None),
+            // A retry lease may still carry diagnostics from an earlier
+            // failed attempt. Successful completion must clear them.
+            next_attempt_at: Some(Some("2026-08-13T00:00:05.000Z".to_owned())),
             response_message_id: None,
-            error_code: None,
-            error_message: None,
+            error_code: Some(Some("provider_unavailable".to_owned())),
+            error_message: Some(Some("first attempt failed".to_owned())),
             updated_at: now.to_owned(),
         },
     )
@@ -694,6 +696,9 @@ async fn response_and_handoff_replays_are_single_ledger_outcomes() {
     )
     .await
     .expect("complete response");
+    assert!(completed.turn.next_attempt_at.is_none());
+    assert!(completed.turn.error_code.is_none());
+    assert!(completed.turn.error_message.is_none());
     let replay = AgentChatTransactionRepo::complete_agent_chat_turn(
         &db,
         db::CompleteAgentChatTurn {

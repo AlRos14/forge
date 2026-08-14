@@ -237,6 +237,9 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::invalid_operation(message),
+            ServiceError::AuthorizationDenied { message } => {
+                Self::forbidden_with_code("authorization.invalid", message)
+            }
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,
@@ -432,6 +435,12 @@ impl From<DbError> for ApiError {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",
                 message: "resource version conflict".to_owned(),
+                details: None,
+            },
+            DbError::IdempotencyConflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "idempotency_conflict",
+                message: "idempotency key was already used for a different mutation".to_owned(),
                 details: None,
             },
             DbError::TaskVersionConflict { expected, actual } => Self {

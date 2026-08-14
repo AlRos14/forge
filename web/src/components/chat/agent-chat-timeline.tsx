@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   ArrowDown,
   ArrowUpRight,
@@ -328,6 +328,10 @@ export function ChatComposer({
   const [content, setContent] = useState('')
   const [error, setError] = useState<string | null>(null)
   const formRef = useRef<HTMLFormElement>(null)
+  const statusId = useId()
+  const describedBy = [disabledReason ? `${statusId}-reason` : null, error ? `${statusId}-error` : null]
+    .filter(Boolean)
+    .join(' ')
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -345,12 +349,12 @@ export function ChatComposer({
   return (
     <form ref={formRef} onSubmit={submit} className="border-t border-border-subtle bg-muted/20 p-4">
       {disabledReason ? (
-        <p className="mb-3 text-xs text-muted-foreground" role="status">
+        <p id={`${statusId}-reason`} className="mb-3 text-xs text-muted-foreground" role="status">
           {disabledReason}
         </p>
       ) : null}
       {error ? (
-        <p className="mb-3 text-xs text-destructive" role="alert">
+        <p id={`${statusId}-error`} className="mb-3 text-xs text-destructive" role="alert">
           {error}
         </p>
       ) : null}
@@ -367,6 +371,8 @@ export function ChatComposer({
           rows={2}
           disabled={disabled || isSending}
           aria-label="Chat message"
+          aria-describedby={describedBy || undefined}
+          className="min-w-0 flex-1"
         />
         <Button
           type="submit"

@@ -7,6 +7,7 @@ pub(crate) struct FileConfig {
     pub server: Option<FileServerConfig>,
     pub workspace: Option<FileWorkspaceConfig>,
     pub agent: Option<FileAgentDefaults>,
+    pub public_search: Option<FilePublicSearchConfig>,
     pub terminal: Option<FileTerminalConfig>,
     pub project: Option<BTreeMap<String, String>>,
 }
@@ -38,6 +39,13 @@ pub(crate) struct FileAgentDefaults {
     pub max_concurrent_tasks: Option<u32>,
     pub heartbeat_interval_seconds: Option<u64>,
     pub max_missed_heartbeats: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FilePublicSearchConfig {
+    pub endpoint: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_response_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

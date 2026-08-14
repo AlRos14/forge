@@ -326,6 +326,15 @@ where
                 input.source_id.to_string(),
             ));
         }
+        let source_revision = source
+            .source_revision
+            .clone()
+            .filter(|revision| !revision.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "memory publication requires an exact canonical source revision",
+                )
+            })?;
         let target_visibility_allowed = match input.target_scope_type.as_str() {
             "account" => input.target_visibility == "account",
             "project" | "task" => input.target_visibility == "project",
@@ -403,9 +412,19 @@ where
             valid_from: Some(now.clone()),
             valid_until: None,
             source_event_id: None,
-            source_scope_type: Some(input.target_scope_type.clone()),
-            source_scope_id: Some(input.target_scope_id.clone()),
-            source_revision: Some(source.created_at.clone()),
+            // Publication changes the ACL scope, not the canonical source.
+            // Preserve the source artifact's scope and exact revision so the
+            // shared projection cannot become a separately editable copy or
+            // silently drift to a publication timestamp.
+            source_scope_type: source
+                .source_scope_type
+                .clone()
+                .or_else(|| Some(source.scope_type.clone())),
+            source_scope_id: source
+                .source_scope_id
+                .clone()
+                .or_else(|| Some(source.scope_id.clone())),
+            source_revision: Some(source_revision),
             source_type: source.source_type.clone(),
             kind: source.kind.clone(),
             title: source.title.clone(),
@@ -601,6 +620,11 @@ where
                 "agent_chat_id": chat.id,
                 "message_id": message.id,
                 "sequence": message.sequence,
+                // Agent turns carry the immutable server/runtime context
+                // manifest used for admission. Keep only its canonical ID in
+                // memory provenance; the manifest sources remain the source
+                // of truth for exact artifact revisions and stale pointers.
+                "context_manifest_id": message.context_manifest_id,
             })
             .to_string(),
             publication_source_id: None,

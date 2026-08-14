@@ -410,7 +410,7 @@ async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() 
         json!({ "before_id": first.id, "after_id": second.id }),
     )
     .await;
-    assert_eq!(removed_endpoint.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(removed_endpoint.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

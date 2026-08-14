@@ -142,6 +142,181 @@ bounded, provenance-linked publication from the Main Chat to the target Project
 Chat and schedules at most one target turn; it never copies credentials,
 private memory, hidden global history, or Main Agent authority.
 
+### Project truth, authority, and release evidence
+
+The singular chats are interaction surfaces, not a mutable source of truth.
+Forge stores consequential Project state as immutable, addressable revisions and
+derives read models from those records. Authority is scoped by domain:
+
+| Domain | Authoritative record | Owner / final authority |
+| --- | --- | --- |
+| Project identity and scope | approved `ProjectCharterRevision` | User approves; Main Agent recommends before handoff; Project Agent proposes amendments afterward |
+| Execution intent | approved Project Documents and one active execution baseline | Project Agent proposes; user approves the baseline and material changes |
+| Consequential choices | effective `DecisionRecord` (`active`, `superseded`, or `invalidated`) | Authorized principal recorded on the decision; candidate/editor records are not effective decisions |
+| Work state | Task, validation, review, and event records | Task/workflow services, assigned workers, reviewers, and authorized users under existing policy |
+| Outcome and release | milestone definition, `ReadinessSnapshot`, and immutable `Mxxx-rN` release manifest | Project Agent proposes; Forge evaluates; user alone releases |
+| Context and continuity | authorized `ContextManifest`, LCM timeline, and scoped memory references | Forge authorizes sources; Runtime stores continuity; neither chat nor memory can promote authority |
+
+The Main Agent owns global discovery and portfolio routing only. It can draft a
+Genesis Charter and publish one bounded handoff, but it cannot manage a Project
+or revise its Charter after attachment. The Project Agent owns planning and
+orchestration for exactly one Project, but cannot edit a repository, self-review,
+self-attest, self-waive, or release. Only a scheduler-issued Task
+`WorkspaceLease` grants repository authority to an assigned worker or reviewer.
+Model output, Agent Profile text, chat prose, web pages, repository text, and
+memory are data; none can widen a permission ceiling or satisfy an approval.
+
+`WorkspaceLease` is an internal scheduler record, not a public API or chat
+capability. The V076 `workspace_lease` table persists the Project/Task plus
+exact Task version and execution attempt, logical repository binding, resolved
+base ref, role, capability JSON, assigned principal, capability-profile
+revision/digest, issuing principal, issue/expiry timestamps, status, and
+optimistic version. Its database guards require the same Project, Task version,
+repository binding, assigned principal, running execution, approved-baseline
+gate (or the explicit pre-baseline read-only discovery/planning predicate), and
+profile revision/digest; one active lease is allowed per Task and identity
+fields are immutable. Active Main Agent and Project Agent identities are
+ineligible for leases even if a caller tries to assign them a Task role.
+Custom workflow execution-role names are retained for assignment matching and
+canonicalized to `worker`; only the dedicated `reviewer` role receives the
+reviewer lease class. Its operation idempotency key is the exact execution
+attempt ID: claim inserts the execution and lease in one transaction, and each
+retry/follow-up creates a fresh child execution with its own lease. A matching
+role assignment is authoritative for that execution role (for example, an
+independent reviewer may differ from the Task's primary worker). On a
+`legacy_unverified` Project only, an explicit manual execution selection is the
+assignment boundary when neither the role nor Task has an assignee; an existing
+applicable assignment still must match. Charter-backed Projects always require
+the exact Task Worker/reviewer role or Task assignment.
+`WorkspaceLeaseRepo` provides CAS revoke and bounded expiry operations.
+
+The scheduler delivers authority through the internal execution channel by
+creating the running execution and lease together; the executor acknowledges
+that delivery by verifying the exact active lease immediately before provider
+start and before execution work. A missing, expired, revoked, reassigned, or
+superseded lease fails closed. Heartbeat/recovery expiry cancels and terminalizes
+the running attempt and records reconciliation, and all terminal, failed,
+cancelled, daemon-disconnected, and stalled paths revoke the grant. A retry
+gets a new execution identity and lease. The claim path canonicalizes executor,
+worker, and task-worker aliases to persisted `worker`, while reviewers remain
+`reviewer`. No route, MCP tool, chat context, filesystem path, handle, or bearer
+token exposes the row.
+
+#### Charter, Documents, Decisions, and effective state
+
+Product Genesis uses the server-owned `forge.main.project-discovery/v2` skill
+only while its Genesis session is `discovering` or `ready_for_project`. It asks
+no more than two consequential questions per turn and keeps facts, explicit
+user decisions, research findings, assumptions, hypotheses, and open decisions
+distinct. A Charter is append-only: each revision records typed content,
+rendered approval view, base revision, provenance, canonical content digest, and
+rendered-view digest. An approval receipt is principal-bound, single-use, and
+has only `active`, `consumed`, or `revoked` lifecycle. `CreateProjectFromCharterApproval`
+consumes that exact receipt and atomically attaches the Charter to one Project.
+
+Project Documents are Forge-owned, revisioned artifacts rather than arbitrary
+repository files. Their kinds are exactly `research`, `delivery_brief`,
+`product_spec`, `design`, `architecture`, and `execution_plan`. They can be
+rendered, diffed, and exported; a repository copy is a derived Task deliverable
+and never becomes implicit Project truth. The Project Agent operating contract
+is `forge.project.orchestration/v1`; profile instructions may shape tone or
+expertise but cannot override it.
+
+The Decision Log is append-only. An effective `DecisionRecord` is only
+`active`, `superseded`, or `invalidated`; draft, proposal, approval, and
+rejection are editor workflow records outside that effective state set. Forge
+does not use a global “latest record wins” hierarchy. It computes a typed
+`EffectiveProjectState` by domain, names the governing Charter/baseline/
+Documents/Decisions/Tasks/checks/milestones/releases, and records a visible
+canonical conflict plus `reconciliation_required` reason when authoritative
+records disagree. It blocks only the affected execution or readiness path.
+
+#### Milestones, readiness, and immutable releases
+
+Milestone definition revisions use only `draft`, `proposed`, `approved`, and
+`superseded`. The milestone instance lifecycle uses only `planned`, `active`,
+`ready_for_release`, `released`, and `cancelled`; blockers, stale results, and
+`reconciliation_required` remain typed projections while an unreleased
+milestone is `active`. Multiple milestones may be active, and the Project keeps
+an explicit `primary_milestone_id`; it is never inferred from recency or Task
+counts. Compact Project creation supplies `M001` (shown as `M1 — Deliver
+outcome`) when no other definition is present.
+
+Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
+It records the exact input manifest, source versions, evidence attachment
+IDs/digests, policy references, result (`ready`, `blocked`, `failed`, or
+`stale`), and readiness digest. A ready snapshot moves an unreleased active
+milestone to `ready_for_release`; non-ready results leave it active with typed
+reasons. Readiness creates no release pins. A user release request must name
+the exact snapshot ID and digest; Forge re-authorizes and recomputes that
+digest inside one transaction before creating the immutable `Mxxx-rN` manifest,
+release-scoped evidence pins, lifecycle transition, and events. `released` is
+terminal; later corrections append the next release revision and never mutate
+history. Forge release is an internal frozen evidence snapshot, not a merge,
+tag, deployment, or external publication.
+
+#### Shared media and evidence lifecycle
+
+Task media and Project evidence can share one Project-authorized binary asset.
+The forward migration adds ownership, attachment, evidence, and release-pin
+metadata around existing rows; it preserves every existing asset ID, Task
+media ID, Task URL, storage key, metadata, and file byte in place. It neither
+moves nor duplicates bytes and makes no on-disk layout-break claim. The existing
+Task media routes continue to authorize through the active Task attachment.
+Attaching the same asset to a milestone creates metadata only and does not add
+it to another Task's list. Deleting a Task or Task attachment makes its Task
+URL unavailable under the existing policy; a release pin keeps the same bytes
+retained for the stable authorized Project evidence URL while the asset remains
+available.
+
+Evidence attachment metadata uses exactly `available`, `quarantined`,
+`redacted`, or `purged`. The public remove operation marks an attachment
+`purged`; readiness excludes unavailable evidence, and the Project media route
+serves bytes only while the shared asset is `available` and authorized. A
+cleanup worker re-checks active Task/Project attachments and immutable release
+pins under a lease immediately before deleting bytes, so restart and Task-delete
+races cannot remove still-referenced evidence. Release pins remain immutable.
+V076 and the internal shared-media repository persist an audited redaction or
+purge tombstone, retain the permitted checksum/audit metadata, and project a
+pinned release's evidence as `evidence_unavailable` without rewriting its
+manifest. Authorized Project owners/admins invoke `POST
+/api/v1/projects/{id}/media/{asset_id}/redact` or `POST
+/api/v1/projects/{id}/media/{asset_id}/purge` with a
+`ProjectMediaTombstoneRequest` carrying the asset version, idempotency key,
+explicit user authorization (`project.media.redact` or `project.media.purge`),
+and a bounded reason. Redaction blocks serving through the Project media route
+while retaining bytes; the legacy Task media route keeps its existing behavior
+while the Task attachment remains active. Purge records the same immutable
+audit data, removes bytes, and both dispositions overlay every affected release
+pin as `evidence_unavailable`; after purge neither former URL serves the bytes.
+Neither route rewrites the immutable release manifest, and neither accepts a
+storage key or raw bytes.
+
+#### Context, memory, and recovery invariants
+
+Main context contains only the active Genesis Charter state and bounded
+portfolio projections. Project Agent context contains the current approved
+Charter, the active approved baseline, relevant approved Document revisions,
+compatible effective Decisions, authoritative Task/validation projections,
+active milestone/readiness state, and immutable release history. Every source
+is revision-addressed in a `ContextManifest` with authorization, digest,
+inclusion reason, and token disposition. Semantic memory and LCM summaries may
+point to canonical artifact IDs/revisions and identify stale references, but
+never contain a separately editable copy of Project truth. A newer approved
+artifact or server state always outranks chat, summaries, memory, or model
+output; cross-Project sources are rejected before retrieval and counting.
+
+Genesis Project creation, binding, Project Chat, Charter attachment, handoff
+message/turn, events, `handed_off` transition, and receipt consumption are one
+database transaction. A failure leaves Genesis `ready_for_project`, the exact
+approval receipt `active`, and no partial Project or handoff; retry with the
+same idempotency key returns the original committed result if one exists. A
+release or media-pin failure leaves the milestone `ready_for_release` with no
+partial manifest or pin. Migration failures leave legacy media references and
+bytes usable; physical cleanup is a separate guarded operation. These recovery
+rules make replay safe without inventing approval or silently substituting a
+name, Charter revision, artifact, or evidence asset.
+
 ### Direct Agent Runtime host and LCM
 
 `forge-agent-host` composes Agent Runtime directly at immutable revision
@@ -166,7 +341,11 @@ Forge selects and authorizes domain context; Agent Runtime alone budgets and
 serializes final model context. `context_manifest` records the offered source
 IDs/revisions and selection reasons, links the runtime run-manifest fingerprint,
 and records included/summarized/omitted dispositions without duplicating token
-planning. Protected bodies never enter either manifest.
+planning. Protected bodies never enter either manifest. Authorized manifest
+inspection compares pointer-backed Project references with the current
+canonical Charter, Document, baseline, milestone, Project, and binding
+revisions and reports stale references as a read-time overlay; it never rewrites
+the immutable manifest or LCM history.
 
 ### HTTP shell and web assets
 
@@ -498,6 +677,15 @@ the role-bounded Workspace/tools and Task LCM timeline. Other simultaneous
 sessions for that identity retain their own denied Main/Project Agent Chat
 workspaces.
 
+Repository claims preflight the selected identity before creating a Task
+branch or worktree: an active Main or Project Agent identity is rejected even
+if it also has a Task assignment. Forge admits at most one running
+repository-capable execution for a Task, including retries and interactive
+follow-ups, and rejects a second attempt before changing Task state. If a
+process stops after creating the deterministic Task branch but before the
+worktree record is committed, the next valid claim recovers that branch into a
+new worktree instead of failing or creating an alternate branch.
+
 `assignee` is an engine-reserved role name. Active states without explicit
 `state.role` implicitly bind `assignee`. This fallback applies only to Active
 states; Gate, Initial, Backlog, Terminal, and Custom states without roles bind
@@ -630,6 +818,13 @@ Project-agent-membership tables under `legacy_*`, remaps Room-scoped semantic
 memory to the owning Agent Chat, and adds database guards that reject new Room
 context, LCM, memory-binding, or manifest authority. Historical source IDs and
 sequences remain available only as provenance.
+
+The Charter, Project artifact, milestone, release, and shared-media metadata
+for this change are added by the forward-only
+`V076__project_charter_milestones_media.sql` migration. It leaves V001–V075
+immutable, preserves existing media identifiers/storage keys/file bytes, and
+does not move or duplicate files. Any later migration must be independently
+numbered and is outside this change's contract.
 
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.

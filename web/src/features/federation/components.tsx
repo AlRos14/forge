@@ -27,7 +27,8 @@ export function StatusDot({ status, className }: { status: string | null | undef
         : normalized.includes('attention') ||
             normalized.includes('degraded') ||
             normalized.includes('paused') ||
-            normalized.includes('stalled')
+            normalized.includes('stalled') ||
+            normalized.includes('stale')
           ? 'bg-warning'
           : 'bg-muted-foreground'
 
@@ -51,7 +52,8 @@ export function StateBadge({ status, label }: { status: string | null | undefine
         : normalized.includes('attention') ||
             normalized.includes('degraded') ||
             normalized.includes('paused') ||
-            normalized.includes('stalled')
+            normalized.includes('stalled') ||
+            normalized.includes('stale')
           ? 'border-warning/40 bg-warning/10 text-warning'
           : 'border-border bg-muted text-muted-foreground'
 

@@ -52,6 +52,7 @@
     "toggleTheme": "Toggle theme",
     "navigation": {
       "agents": "Agents",
+      "overview": "Overview",
       "board": "Board",
       "chat": "Agent Chat",
       "daemons": "Runtimes",

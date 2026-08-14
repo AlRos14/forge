@@ -231,28 +231,48 @@ impl TaskService {
                 })?;
             let updated_snapshot =
                 executor_snapshot_with_resume_thread(snapshot_json, &agent_session_id)?;
-            let resumed = ExecutionRepo::update(
-                &*self.db,
-                db::UpdateExecution {
-                    id: execution.id.clone(),
-                    status: Some(ExecutionStatus::Running),
-                    stop_reason: Some(None),
-                    stopped_by: Some(None),
-                    resume_policy: Some(None),
-                    stopped_at: Some(None),
-                    agent_session_id: None,
-                    agent_message_id: Some(None),
-                    last_activity_at: None,
-                    summary: Some(Some(prompt)),
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: Some(None),
-                    error: Some(None),
-                    executor_config_snapshot_json: Some(Some(updated_snapshot)),
-                    updated_at: now_rfc3339(),
-                },
-            )
-            .await?;
+            let agent_id = execution.agent_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "execution {} missing agent_id",
+                    execution.id
+                ))
+            })?;
+            let execution_id = new_uuid_v4();
+            let now = now_rfc3339();
+            let resumed = self
+                .create_running_execution(
+                    CreateExecution {
+                        id: execution_id.clone(),
+                        task_id: task.id.clone(),
+                        agent_id: Some(agent_id),
+                        role: execution.role.clone(),
+                        status: ExecutionStatus::Running,
+                        stop_reason: None,
+                        stopped_by: None,
+                        resume_policy: None,
+                        stopped_at: None,
+                        parent_execution_id: Some(execution.id.clone()),
+                        agent_session_id: None,
+                        agent_message_id: None,
+                        last_activity_at: None,
+                        summary: Some(prompt),
+                        logs_path: Some(execution_logs_path(
+                            &self.workspace_root,
+                            &task.project_id,
+                            &task.id,
+                            &execution_id,
+                        )),
+                        before_sha: execution.before_sha.clone(),
+                        after_sha: None,
+                        error: None,
+                        executor_config_snapshot_json: Some(updated_snapshot),
+                        workspace_id: execution.workspace_id.clone(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                    false,
+                )
+                .await?;
 
             self.publish(ForgeEvent {
                 event_type: "follow_up.dispatched".to_owned(),

@@ -42,8 +42,16 @@ pub use manifest::{
 pub use native::NativeAgentRuntimeBackend;
 pub use protected_store::SqliteProtectedRuntimeStore;
 pub use typed_tools::{
-    FORGE_SCOPE_PROPOSE_PERMISSION, FORGE_SCOPE_READ_PERMISSION, ForgeToolProvider,
-    ScopeToolComposition, TaskToolRole,
+    FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
+    FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+    FORGE_PUBLIC_WEB_SEARCH_TOOL, FORGE_SCOPE_PROPOSE_PERMISSION, FORGE_SCOPE_READ_PERMISSION,
+    ForgeToolProvider, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
+    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
+    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
+    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, ProjectChatToolContext,
+    PublicSearchScope, ScopeToolComposition, TaskToolRole,
 };
 
 /// The immutable revision Forge is built and tested against.
@@ -82,6 +90,10 @@ pub struct RuntimeScopeBinding {
     /// malformed/legacy chat scopes remain `None`; this is intentionally not
     /// inferred from the opaque canonical scope id or turn input.
     pub agent_chat_project_id: Option<String>,
+    /// Server-derived Project Charter setup state. Native composition uses
+    /// this to expose only the legacy adoption surface until user approval
+    /// commits a Charter; it is never supplied by model input.
+    pub project_charter_setup_required: bool,
     /// Effective Forge permission names after intersecting the persisted
     /// identity, profile, membership, and canonical-scope ceilings.  Native
     /// tool registration must use this set as a second boundary; it is never

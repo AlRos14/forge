@@ -31,7 +31,6 @@ use serde_json::{json, Value};
 use services::{
     CancelAgentChatTurnInput, CreateAgentHandoffInput, ProductGenesisService,
     SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
-    TransitionProductGenesis,
 };
 
 use crate::{
@@ -326,24 +325,10 @@ pub async fn create_agent_handoff(
         .agent_chat_service
         .ensure_main_chat(&user.user_id)
         .await?;
-    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
-    // Genesis owns the Main timeline and the atomically-created Project, not
-    // one particular input message. A real handoff normally cites the Main
-    // Agent's completed brief response, while `source_message_ids` records the
-    // user's discovery inputs. Matching the owning chat + linked Project keeps
-    // those valid response-based handoffs on the normal lifecycle path.
-    let genesis_handoff = genesis
-        .active(&user.user_id)
-        .await?
-        .filter(|session| {
-            matches!(
-                session.lifecycle,
-                api_types::ProductGenesisLifecycle::ReadyForProject
-            ) && session.main_chat_id == source.id
-                && session.project_id.as_deref() == Some(project_id.as_str())
-        })
-        .map(|session| (session.id, session.version, project_id.clone()));
-    let outcome = match state
+    // Genesis creation performs its first handoff inside
+    // CreateProjectFromCharterApproval. This endpoint remains available for
+    // later explicit, bounded Main-to-Project publications only.
+    let outcome = state
         .agent_chat_service
         .create_handoff(CreateAgentHandoffInput {
             actor_user_id: user.user_id.clone(),
@@ -355,47 +340,7 @@ pub async fn create_agent_handoff(
             source_revisions_json: "[]".to_owned(),
             dedupe_key: request.dedupe_key,
         })
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            if let Some((session_id, expected_version, genesis_project_id)) = &genesis_handoff {
-                let reason = error.to_string().chars().take(512).collect::<String>();
-                if let Err(record_error) = genesis
-                    .record_project_failure(
-                        session_id,
-                        *expected_version,
-                        genesis_project_id,
-                        &reason,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %record_error,
-                        "failed to persist Product Genesis handoff failure"
-                    );
-                }
-            }
-            return Err(error.into());
-        }
-    };
-    if let Some((session_id, expected_version, _genesis_project_id)) = genesis_handoff {
-        // The normal AgentChatService transaction has committed the immutable
-        // publication, target message, and one target turn before Genesis is
-        // advanced.  If this optimistic transition loses a race, the handoff
-        // remains durable and the same dedupe key safely resumes it.
-        genesis
-            .transition(TransitionProductGenesis {
-                id: session_id,
-                expected_version,
-                lifecycle: api_types::ProductGenesisLifecycle::HandedOff,
-                project_id: Some(project_id.clone()),
-                handoff_id: Some(outcome.handoff.id.clone()),
-                failure_reason: None,
-            })
-            .await?;
-    }
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(handoff_response(&state, outcome.handoff).await?),

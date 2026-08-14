@@ -64,6 +64,16 @@ const ProjectSettingsPage = lazy(() =>
     default: module.ProjectSettingsPage,
   })),
 )
+const ProjectOverviewPage = lazy(() =>
+  import('@/pages/ProjectOverviewPage').then((module) => ({
+    default: module.ProjectOverviewPage,
+  })),
+)
+const ProjectReleasePage = lazy(() =>
+  import('@/pages/ProjectReleasePage').then((module) => ({
+    default: module.ProjectReleasePage,
+  })),
+)
 const RegisterPage = lazy(() =>
   import('@/pages/RegisterPage').then((module) => ({ default: module.RegisterPage })),
 )
@@ -463,6 +473,28 @@ const projectChatRoute = createRoute({
   component: ProjectChatRouteComponent,
 })
 
+const projectOverviewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/projects/$projectId/overview',
+  component: ProjectOverviewRouteComponent,
+})
+
+const projectReleaseRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/projects/$projectId/releases/$releaseId',
+  component: ProjectReleaseRouteComponent,
+})
+
+function ProjectOverviewRouteComponent() {
+  const { projectId } = projectOverviewRoute.useParams()
+  return <ProjectOverviewPage projectId={projectId} />
+}
+
+function ProjectReleaseRouteComponent() {
+  const { projectId, releaseId } = projectReleaseRoute.useParams()
+  return <ProjectReleasePage projectId={projectId} releaseId={releaseId} />
+}
+
 function ProjectChatRouteComponent() {
   const { projectId } = projectChatRoute.useParams()
   return <ChatPage projectId={projectId} />
@@ -616,6 +648,8 @@ const routeTree = rootRoute.addChildren([
   missionControlRoute,
   chatRoute,
   projectChatRoute,
+  projectOverviewRoute,
+  projectReleaseRoute,
   projectSettingsRoute,
   projectSettingsTabRoute,
   forgeSettingsRoute,

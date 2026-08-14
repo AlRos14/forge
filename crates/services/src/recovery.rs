@@ -7,7 +7,7 @@ use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, Daemon, DaemonRepo, Execution,
     ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo, ResumePolicy, SortBy,
     SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, UpdateAgent, UpdateExecution,
-    UpdateTaskStatus,
+    UpdateTaskStatus, WorkspaceLeaseRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -40,6 +40,10 @@ impl CrashRecovery {
 
     #[tracing::instrument(skip(self))]
     pub async fn run_recovery(&self) -> Result<u64> {
+        // Expire stale grants before recovering active Tasks. The recovery
+        // pass below then sees the still-running attempt and requeues/blocks
+        // it through the normal crash-recovery state machine.
+        expire_workspace_leases(&self.db, &self.event_bus, None, None, false).await?;
         let tasks = self.list_in_progress_tasks(None).await?;
         let mut recovered = 0;
 
@@ -299,7 +303,6 @@ impl HeartbeatMonitor {
                 },
             )
             .await?;
-
             self.publish(ForgeEvent {
                 event_type: "agent.timeout".to_owned(),
                 entity_id: agent.id.clone(),
@@ -341,9 +344,17 @@ impl HeartbeatMonitor {
                 "heartbeat monitor detected timed out agents"
             );
         }
+        let expired = expire_workspace_leases(
+            &self.db,
+            &self.event_bus,
+            self.task_executor.as_deref(),
+            self.task_service.as_deref(),
+            true,
+        )
+        .await?;
         let stalled = self.check_stalled_executions().await?;
         let disconnected = self.check_disconnected_daemon_executions().await?;
-        Ok(timed_out + stalled + disconnected)
+        Ok(timed_out + stalled + disconnected + expired)
     }
 
     #[tracing::instrument(skip(self))]
@@ -430,6 +441,8 @@ impl HeartbeatMonitor {
                 },
             )
             .await?;
+
+            revoke_active_workspace_lease(&self.db, &updated.task_id).await;
 
             self.publish(ForgeEvent {
                 event_type: "execution.stalled".to_owned(),
@@ -566,6 +579,140 @@ impl HeartbeatMonitor {
     }
 }
 
+/// Expire scheduler grants and, during the live heartbeat pass, stop any
+/// execution that lost its authority.  Startup recovery deliberately leaves
+/// the execution running long enough for `recover_task` to apply its normal
+/// requeue/block policy; the heartbeat path terminalizes it immediately.
+async fn expire_workspace_leases(
+    db: &SqliteDb,
+    event_bus: &EventBus,
+    task_executor: Option<&dyn TaskExecutor>,
+    task_service: Option<&TaskService>,
+    terminalize_running: bool,
+) -> Result<u64> {
+    let expired = WorkspaceLeaseRepo::expire(db, &now_rfc3339(), 500).await?;
+    let expired_count = expired.len() as u64;
+    if !terminalize_running {
+        return Ok(expired_count);
+    }
+
+    for lease in expired {
+        let Some(execution) = ExecutionRepo::get_by_id(db, &lease.execution_id).await? else {
+            continue;
+        };
+        if execution.status != ExecutionStatus::Running {
+            continue;
+        }
+
+        if let Some(task_executor) = task_executor {
+            if !execution_is_remote_owned(db, &execution)
+                .await
+                .unwrap_or(false)
+            {
+                if let Err(error) = task_executor.cancel(&execution.id).await {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %error,
+                        "failed to cancel execution after WorkspaceLease expiry"
+                    );
+                }
+            }
+        }
+
+        let now = now_rfc3339();
+        let updated = match ExecutionRepo::update(
+            db,
+            UpdateExecution {
+                id: execution.id.clone(),
+                status: Some(ExecutionStatus::Failed),
+                stop_reason: Some(Some(StopReason::ExecutionStalled)),
+                stopped_by: Some(Some(
+                    api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor)
+                        .display(),
+                )),
+                resume_policy: Some(Some(ResumePolicy::Manual)),
+                stopped_at: Some(Some(now.clone())),
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: Some(Some(now.clone())),
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: Some(Some("scheduler WorkspaceLease expired".to_owned())),
+                executor_config_snapshot_json: None,
+                updated_at: now,
+            },
+        )
+        .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %error,
+                    "failed to stop execution after WorkspaceLease expiry"
+                );
+                continue;
+            }
+        };
+
+        event_bus.publish(ForgeEvent {
+            event_type: "execution.stalled".to_owned(),
+            entity_id: updated.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::ExecutionStalled {
+                task_id: updated.task_id.clone(),
+                execution_id: updated.id.clone(),
+                stale_before: lease.expires_at.clone(),
+            },
+        });
+        event_bus.publish(ForgeEvent {
+            event_type: "reconciliation.event".to_owned(),
+            entity_id: updated.task_id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::ReconciliationEvent {
+                task_id: Some(updated.task_id.clone()),
+                execution_id: Some(updated.id.clone()),
+                reason: "workspace_lease_expired".to_owned(),
+            },
+        });
+        if let Some(task_service) = task_service {
+            if let Err(error) = task_service.annotate_executor_failure_block(&updated).await {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    task_id = %updated.task_id,
+                    %error,
+                    "failed to cascade expired WorkspaceLease execution"
+                );
+            }
+        }
+    }
+
+    Ok(expired_count)
+}
+
+async fn revoke_active_workspace_lease(db: &SqliteDb, task_id: &str) {
+    match WorkspaceLeaseRepo::get_active_for_task(db, task_id).await {
+        Ok(Some(lease)) => {
+            if let Err(error) =
+                WorkspaceLeaseRepo::revoke(db, &lease.id, lease.version, &now_rfc3339()).await
+            {
+                tracing::warn!(
+                    task_id,
+                    lease_id = %lease.id,
+                    %error,
+                    "failed to revoke WorkspaceLease at recovery terminal boundary"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(task_id, %error, "failed to load WorkspaceLease at recovery terminal boundary")
+        }
+    }
+}
+
 pub(crate) struct CancelledExecution {
     pub execution_id: String,
     pub agent_session_id: Option<String>,
@@ -651,6 +798,11 @@ async fn recover_task(
         ResumePolicy::Manual,
     )
     .await?;
+
+    // A cancelled attempt must never retain its repository authority. If the
+    // recovery policy later schedules a retry, it receives a fresh execution
+    // identity and lease through TaskService admission.
+    revoke_active_workspace_lease(db, &task.id).await;
 
     if cancelled.is_empty() {
         return Ok(RecoverTaskOutcome {
@@ -1017,6 +1169,8 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         },
     )
     .await?;
+
+    revoke_active_workspace_lease(db, &updated.task_id).await;
 
     event_bus.publish(ForgeEvent {
         event_type: "execution.daemon_disconnected".to_owned(),

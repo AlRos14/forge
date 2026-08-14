@@ -61,6 +61,31 @@ impl TaskService {
                 .bind(&now)
                 .execute(&mut *transaction)
                 .await?;
+            // Subtasks inherit the parent's immutable governance provenance.
+            // The replacement link records the adaptive split without making
+            // the child a new source of authority.
+            sqlx::query(
+                "INSERT INTO project_task_governance
+                 (task_id, project_id, charter_revision_id, baseline_id,
+                  baseline_revision_id, plan_item_id, milestone_id,
+                  document_revisions_json, capability_class, risk_class,
+                  runnable, replacement_of_task_id, provenance_json,
+                  version, created_at, updated_at)
+                 SELECT ?, project_id, charter_revision_id, baseline_id,
+                        baseline_revision_id, plan_item_id, milestone_id,
+                        document_revisions_json, capability_class, risk_class,
+                        runnable, ?, provenance_json,
+                        1, ?, ?
+                 FROM project_task_governance
+                 WHERE task_id = ?",
+            )
+            .bind(&task_id)
+            .bind(&parent_task_id)
+            .bind(&now)
+            .bind(&now)
+            .bind(&parent_task_id)
+            .execute(&mut *transaction)
+            .await?;
             task_ids.push(task_id);
         }
         transaction.commit().await?;

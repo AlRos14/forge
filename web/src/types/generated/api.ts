@@ -499,6 +499,8 @@ export interface ContextManifestSourceResponse {
   source_revision: string
   selection_reason: string
   disposition: string
+  is_stale: boolean
+  current_revision: string | null
   retention_priority: number
   fragment_fingerprint: string
 }
@@ -660,6 +662,13 @@ export interface Project {
   workflow_template_name?: string | null
   paused_at: string | null
   paused: boolean
+  charter_status: string
+  charter_setup_required: boolean
+  current_charter_id: string | null
+  current_charter_revision_id: string | null
+  current_charter_version: number
+  primary_milestone_id: string | null
+  version: number
   created_at: string
   updated_at: string
 }

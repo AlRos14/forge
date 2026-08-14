@@ -27,51 +27,55 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        self.ensure_task_runnable(&task).await?;
+        self.ensure_no_running_repository_execution(&task).await?;
         self.check_dependency_gate(&task, agent_id).await?;
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        let workspace = prepare_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task.id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task.id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
         let executor_config_snapshot_json = with_dispatch_metadata(
             build_executor_config_snapshot(&self.db, &task, &agent, None).await?,
             dispatch_metadata,
         )?;
         let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*self.db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent.id.clone()),
-                role: role.to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(prompt),
-                logs_path: None,
-                before_sha: workspace.before_sha.clone(),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json,
-                workspace_id: Some(workspace.id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
+        let execution = self
+            .create_running_execution(
+                CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    agent_id: Some(agent.id.clone()),
+                    role: role.to_owned(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: Some(prompt),
+                    logs_path: None,
+                    before_sha: workspace.before_sha.clone(),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                workspace_created_by_attempt,
+            )
+            .await?;
 
         tracing::info!(
             task_id = %task.id,
@@ -126,6 +130,20 @@ impl TaskService {
                 task.id, task.status
             )));
         }
+        self.ensure_no_running_repository_execution(&task).await?;
+        let task = match workflow.state_kind(&task.status) {
+            Some(api_types::StateKind::Initial | api_types::StateKind::Custom) => {
+                if let Some(target) = first_launch_target(&workflow, &task.status) {
+                    self.transition(task.id.clone(), target, task.version)
+                        .await?
+                        .task
+                } else {
+                    task
+                }
+            }
+            _ => task,
+        };
+        self.ensure_task_runnable(&task).await?;
         self.check_dependency_gate(&task, &agent_id).await?;
         self.ensure_no_running_interactive_execution(&task.id)
             .await?;
@@ -133,47 +151,49 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        let workspace = prepare_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task_id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task_id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
         self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(&agent_id), None)
             .await?;
         let executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
         let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*self.db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent.id.clone()),
-                role: "interactive".to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary,
-                logs_path: None,
-                before_sha: workspace.before_sha.clone(),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json,
-                workspace_id: Some(workspace.id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
+        let execution = self
+            .create_running_execution(
+                CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    agent_id: Some(agent.id.clone()),
+                    role: "interactive".to_owned(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary,
+                    logs_path: None,
+                    before_sha: workspace.before_sha.clone(),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                workspace_created_by_attempt,
+            )
+            .await?;
 
         tracing::info!(
             task_id = %task.id,
@@ -182,25 +202,6 @@ impl TaskService {
             role = "interactive",
             "execution launched"
         );
-
-        let task = {
-            let kind = workflow.state_kind(&task.status);
-            if matches!(
-                kind,
-                Some(api_types::StateKind::Initial | api_types::StateKind::Custom)
-            ) {
-                let target = first_launch_target(&workflow, &task.status);
-                if let Some(target) = target {
-                    self.transition(task.id.clone(), target, task.version)
-                        .await?
-                        .task
-                } else {
-                    task
-                }
-            } else {
-                task
-            }
-        };
 
         self.publish(ForgeEvent {
             event_type: "task.execution_launched".to_owned(),
@@ -266,6 +267,19 @@ impl TaskService {
                 task.status
             )));
         }
+        self.ensure_no_running_repository_execution(&task).await?;
+        let task = match workflow.state_kind(&task.status) {
+            Some(api_types::StateKind::Initial | api_types::StateKind::Custom) => {
+                if let Some(target) = first_launch_target(&workflow, &task.status) {
+                    self.transition(task.id.clone(), target, task.version)
+                        .await?
+                        .task
+                } else {
+                    task
+                }
+            }
+            _ => task,
+        };
 
         let resolved_agent_id = agent_id
             .or_else(|| parent_execution.agent_id.clone())
@@ -321,14 +335,16 @@ impl TaskService {
 
         self.ensure_no_running_interactive_execution(&task.id)
             .await?;
-        let workspace = prepare_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task.id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        self.ensure_task_runnable(&task).await?;
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task.id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
         let mut executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
         if let (Some(snapshot_json), Some(parent_snapshot_json)) = (
@@ -349,34 +365,35 @@ impl TaskService {
         }
 
         let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*self.db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(resolved_agent_id.clone()),
-                role: "interactive".to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: Some(parent_execution_id),
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(message),
-                logs_path: None,
-                before_sha: workspace.before_sha.clone(),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json,
-                workspace_id: Some(workspace.id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
+        let execution = self
+            .create_running_execution(
+                CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    agent_id: Some(resolved_agent_id.clone()),
+                    role: "interactive".to_owned(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: Some(parent_execution_id),
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: Some(message),
+                    logs_path: None,
+                    before_sha: workspace.before_sha.clone(),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                workspace_created_by_attempt,
+            )
+            .await?;
 
         tracing::info!(
             task_id = %task.id,
@@ -386,25 +403,6 @@ impl TaskService {
             role = "interactive",
             "follow-up execution launched"
         );
-
-        let task = {
-            let kind = workflow.state_kind(&task.status);
-            if matches!(
-                kind,
-                Some(api_types::StateKind::Initial | api_types::StateKind::Custom)
-            ) {
-                let target = first_launch_target(&workflow, &task.status);
-                if let Some(target) = target {
-                    self.transition(task.id.clone(), target, task.version)
-                        .await?
-                        .task
-                } else {
-                    task
-                }
-            } else {
-                task
-            }
-        };
 
         self.publish(ForgeEvent {
             event_type: "task.execution_launched".to_owned(),
@@ -436,6 +434,25 @@ impl TaskService {
         &self,
         parent_execution_id: impl Into<String>,
         context: Option<String>,
+    ) -> Result<LaunchExecutionResult> {
+        self.re_execute_execution_with_context_inner(parent_execution_id, context, false)
+            .await
+    }
+
+    pub(super) async fn re_execute_execution_for_recovery(
+        &self,
+        parent_execution_id: impl Into<String>,
+        context: Option<String>,
+    ) -> Result<LaunchExecutionResult> {
+        self.re_execute_execution_with_context_inner(parent_execution_id, context, true)
+            .await
+    }
+
+    async fn re_execute_execution_with_context_inner(
+        &self,
+        parent_execution_id: impl Into<String>,
+        context: Option<String>,
+        clear_recovery_metadata: bool,
     ) -> Result<LaunchExecutionResult> {
         let parent_execution_id = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
@@ -469,7 +486,8 @@ impl TaskService {
         )
         .await?;
         if page.items.into_iter().any(|execution| {
-            execution.status == ExecutionStatus::Running && execution.role == parent_execution.role
+            execution.status == ExecutionStatus::Running
+                && (task.repo_id.is_some() || execution.role == parent_execution.role)
         }) {
             return Err(ServiceError::invalid_operation(format!(
                 "execution already running for role {}",
@@ -523,14 +541,29 @@ impl TaskService {
             )));
         }
 
-        let workspace = prepare_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task.id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        let task = match workflow.state_kind(&task.status) {
+            Some(api_types::StateKind::Initial | api_types::StateKind::Custom) => {
+                if let Some(target) = first_launch_target(&workflow, &task.status) {
+                    self.transition(task.id.clone(), target, task.version)
+                        .await?
+                        .task
+                } else {
+                    task
+                }
+            }
+            _ => task,
+        };
+        self.ensure_task_runnable(&task).await?;
+
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task.id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
         let executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
         let role_name = &parent_execution.role;
@@ -560,35 +593,44 @@ impl TaskService {
             Some(ctx) => format!("[User context: {ctx}]\n\n{}", prompt.user),
             None => prompt.user,
         };
+        // A WorkspaceLease is pinned to the exact Task version. Recovery
+        // metadata must therefore be cleared before the execution and lease
+        // are created, never after authority has already been minted.
+        let task = if clear_recovery_metadata {
+            self.clear_blocking_metadata(&task.id).await?
+        } else {
+            task
+        };
         let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*self.db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent.id.clone()),
-                role: parent_execution.role.clone(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(summary),
-                logs_path: None,
-                before_sha: workspace.before_sha.clone(),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json,
-                workspace_id: Some(workspace.id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
+        let execution = self
+            .create_running_execution(
+                CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    agent_id: Some(agent.id.clone()),
+                    role: parent_execution.role.clone(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: Some(summary),
+                    logs_path: None,
+                    before_sha: workspace.before_sha.clone(),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                workspace_created_by_attempt,
+            )
+            .await?;
 
         tracing::info!(
             task_id = %task.id,
@@ -598,25 +640,6 @@ impl TaskService {
             role = %execution.role,
             "re-execute execution launched"
         );
-
-        let task = {
-            let kind = workflow.state_kind(&task.status);
-            if matches!(
-                kind,
-                Some(api_types::StateKind::Initial | api_types::StateKind::Custom)
-            ) {
-                let target = first_launch_target(&workflow, &task.status);
-                if let Some(target) = target {
-                    self.transition(task.id.clone(), target, task.version)
-                        .await?
-                        .task
-                } else {
-                    task
-                }
-            } else {
-                task
-            }
-        };
 
         self.publish(ForgeEvent {
             event_type: "task.execution_launched".to_owned(),

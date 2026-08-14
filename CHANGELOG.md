@@ -8,6 +8,37 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Coordination mutation and typed execution envelopes now reject unknown JSON
+  fields instead of silently discarding them; callers must use the exact closed
+  request shape.
+- Product Genesis Project creation now requires an explicit user approval
+  receipt bound to the exact Charter revision, canonical content/render
+  digests, selected Project Agent revisions, and idempotency key. The typed
+  `CreateProjectFromCharterApproval` operation consumes that single-use receipt
+  atomically with Project/binding/Chat/Charter/handoff creation; a ready Genesis
+  brief or the removed `product_genesis_session_id` field cannot bypass it.
+  Existing Projects adopt through an explicit `legacy_unverified` Charter
+  approval, and no `handoff_pending` state or compatibility alias is provided.
+- Release-pinned evidence now has explicit shared-media retention semantics.
+  Task media IDs, URLs, storage keys, metadata, and file bytes remain in place
+  without moving or duplicating bytes or claiming an on-disk layout break.
+  Deleting a Task removes its Task attachment/URL under existing policy, while
+  a successful user-approved `Mxxx-rN` release pins the same asset through an
+  authorized Project evidence URL. Evidence attachment availability is
+  `available`/`quarantined`/`redacted`/`purged`; removing an attachment marks it
+  purged, while ordinary garbage collection preserves assets referenced by
+  active attachments or immutable release pins. V076 and the internal
+  shared-media repository persist audited redaction/purge tombstones and the
+  `evidence_unavailable` release overlay without rewriting an immutable release
+  manifest. Project owners/admins may now use the explicit, audited
+  `POST /api/v1/projects/{id}/media/{asset_id}/redact` or
+  `POST /api/v1/projects/{id}/media/{asset_id}/purge` mutation with the current
+  asset version, idempotency key, authorization action, and bounded reason;
+  redaction blocks serving through the Project media URL and marks pinned
+  release evidence unavailable, while the legacy Task media URL keeps its
+  existing behavior while its Task attachment remains active. Purge also
+  removes bytes, so neither former URL serves them; neither disposition rewrites
+  the release manifest.
 - Agents are stable account-owned identities with immutable, selectable
   profiles. The legacy profile-shaped Agent representation and
   `/api/v1/projects/{id}/agent-links` surface are removed. The approved
@@ -29,12 +60,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   is never promoted, and expired leases become finite retry/terminal states.
   V075 quarantines the retired Room/membership tables under `legacy_*`, remaps
   Room-scoped memory to Agent Chat scope, and rejects new Room authority rows.
+  The Charter, Project artifact, milestone, release, and shared-media metadata
+  for this change are in the forward-only `V076` migration; V001–V075 remain
+  immutable and existing media bytes stay in place.
 - Forge now builds its embedded host against Agent Runtime revision
   `a7075b1d2dd1cee05db63bc480ff46b0f97ec239` and requires Rust 1.86 or newer for
   that integration.
 
 ### Added
 
+- Configurable, least-privilege `forge_public_web_search` support for Main and
+  Project Agent Chat. The tool is omitted when unconfigured, performs only
+  bounded unauthenticated HTTPS requests with redirect/proxy/DNS-private-host
+  protections, labels result text as untrusted, and never materializes or
+  persists search output as a user decision.
 - Direct embedded-agent creation and protected provider connection in Forge,
   including immutable native profile revisions, safe health/capability output,
   explicit Main Agent Chat/Project Agent Chat/Task sessions, rotation
@@ -57,6 +96,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Context-manifest source projections now report whether pointer-backed Project
+  references are stale and, when present, the current canonical revision. This
+  is a read-time overlay; immutable manifest selection decisions and
+  fingerprints are unchanged.
+
 - Agent Chat and Task outcomes commit to the durable event ledger; the
   in-process event bus is a delivery and cache-invalidation projection, not
   wake-up authority.
@@ -66,6 +110,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Successful Agent Chat retries now clear stale retry diagnostics, and typed
+  Project Agent Task proposals inherit the Project's default review policy when
+  they do not supply a per-Task override.
+- Repository-capable claims reject Main and Project Agent identities before
+  creating a worktree or branch, recover a Task branch left by an interrupted
+  pre-worktree attempt, and reject a second running repository execution or
+  follow-up before mutating Task state.
+- HTTP request tracing records only the request path, preventing access tokens
+  and other sensitive query parameters from being written to server logs.
+- Smith-backed Agent Chat preserves the complete assistant response while Task
+  projections retain their existing bounded 500-character summary.
 - CLI-backed Agent Chat turns now pass the executor/config snapshot required by
   the shared adapter, Product Genesis closes when the handoff cites the Main
   Agent's response, and typed Task proposals reject unknown task types before

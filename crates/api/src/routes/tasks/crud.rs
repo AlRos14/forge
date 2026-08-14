@@ -24,7 +24,7 @@ pub async fn create_task(
     });
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_governance(
             project_id,
             request.title,
             request.description,
@@ -34,6 +34,7 @@ pub async fn create_task(
             review_config,
             request.merge_config,
             request.role_assignments,
+            request.governance,
         )
         .await?;
     Ok(Json(task_response(&state.db, task).await?))

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AgentChatTimeline } from './agent-chat-timeline'
+import { AgentChatTimeline, ChatComposer } from './agent-chat-timeline'
 import type { AgentChat, AgentChatMessage, AgentChatTurn } from '@/features/agent-chat/types'
 
 const mocks = vi.hoisted(() => ({
@@ -311,6 +311,25 @@ describe('AgentChatTimeline polling', () => {
     expect(screen.getByText(longContent).className).toContain('break-words')
     expect(view.container.querySelector('[aria-label="Chat timeline"]')?.className).toContain(
       'overflow-x-hidden',
+    )
+  })
+})
+
+describe('ChatComposer accessibility', () => {
+  it('associates a disabled reason with the message field', () => {
+    render(
+      <ChatComposer
+        disabled
+        disabledReason="A finite turn is already in progress."
+        onSend={vi.fn(async () => undefined)}
+      />,
+    )
+
+    const textbox = screen.getByRole('textbox', { name: 'Chat message' })
+    const describedBy = textbox.getAttribute('aria-describedby')
+    expect(describedBy).toBeTruthy()
+    expect(document.getElementById(describedBy ?? '')?.textContent).toContain(
+      'A finite turn is already in progress.',
     )
   })
 })

@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use config::PublicSearchConfig;
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, Agent, AgentChatRepo,
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
@@ -40,6 +41,7 @@ pub struct EmbeddedAgentService {
     db: Arc<SqliteDb>,
     protected_store: Arc<SqliteProtectedRuntimeStore>,
     native_backend: Arc<NativeAgentRuntimeBackend>,
+    tool_provider: Arc<CoordinationToolProvider>,
 }
 
 #[derive(Clone)]
@@ -121,15 +123,23 @@ impl EmbeddedAgentService {
             master_key,
             1,
         ));
+        let tool_provider = Arc::new(CoordinationToolProvider::new(Arc::clone(&db)));
         let native_backend = Arc::new(
             NativeAgentRuntimeBackend::new(Arc::clone(&protected_store))
-                .with_forge_tool_provider(Arc::new(CoordinationToolProvider::new(Arc::clone(&db)))),
+                .with_forge_tool_provider(tool_provider.clone()),
         );
         Self {
             db,
             protected_store,
             native_backend,
+            tool_provider,
         }
+    }
+
+    /// Apply the server's optional public-search configuration to the shared
+    /// provider used by all subsequently composed native sessions.
+    pub fn set_public_search_config(&self, config: Option<PublicSearchConfig>) {
+        self.tool_provider.set_public_search_config(config);
     }
 
     pub fn native_backend(&self) -> Arc<NativeAgentRuntimeBackend> {
@@ -597,6 +607,17 @@ impl EmbeddedAgentService {
             permission_set(&profile.tool_policy_json),
         ];
         let project_id = self.scope_project_id(scope_request).await?;
+        let project_charter_setup_required = if let Some(project_id) = project_id.as_deref() {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT charter_setup_required FROM project WHERE id = ? LIMIT 1",
+            )
+            .bind(project_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .is_some_and(|value| value != 0)
+        } else {
+            false
+        };
         if let Some(project_id) = project_id.as_deref() {
             // Project/Agent Chat authorization above already requires the
             // singular Project Agent binding. A Task assignment follows the
@@ -624,7 +645,11 @@ impl EmbeddedAgentService {
         let project_agent_chat = matches!(scope_request, RequestedCanonicalScope::AgentChat { .. })
             && canonical.scope_type == CanonicalScopeType::AgentChat
             && project_id.is_some();
-        layers.push(scope_permission_set(&canonical, project_agent_chat));
+        layers.push(scope_permission_set(
+            &canonical,
+            project_agent_chat,
+            project_charter_setup_required,
+        ));
         let allowed = intersect_non_empty_layers(&layers);
         let known = known_permissions();
         let denied = known.difference(&allowed).cloned().collect();
@@ -1313,37 +1338,44 @@ fn permission_set(value: &str) -> BTreeSet<String> {
     }
 }
 
-fn scope_permission_set(scope: &CanonicalScope, project_agent_chat: bool) -> BTreeSet<String> {
+fn scope_permission_set(
+    scope: &CanonicalScope,
+    project_agent_chat: bool,
+    project_charter_setup_required: bool,
+) -> BTreeSet<String> {
     let mut values: Vec<&str> = match scope.scope_type {
         CanonicalScopeType::Account => vec![
             "read_account",
             "propose_discovery",
             "propose_project",
             "propose_handoff",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_session",
         ],
-        CanonicalScopeType::Project => vec![
-            "read_project",
-            "read_memory",
-            "propose_task",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_review",
-            "propose_decision",
-            "propose_session",
-        ],
-        CanonicalScopeType::AgentChat => vec![
-            "read_agent_chat",
-            "read_memory",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_session",
-        ],
+        CanonicalScopeType::Project => {
+            let mut project = vec![
+                "read_project",
+                "read_memory",
+                "propose_project",
+                "propose_message",
+            ];
+            if !project_charter_setup_required {
+                project.extend([
+                    "propose_task",
+                    "propose_commitment",
+                    "propose_memory",
+                    "propose_review",
+                    "propose_decision",
+                    "propose_session",
+                ]);
+            }
+            project
+        }
+        CanonicalScopeType::AgentChat => {
+            let mut chat = vec!["read_agent_chat", "read_memory", "propose_message"];
+            if project_agent_chat && !project_charter_setup_required {
+                chat.extend(["propose_commitment", "propose_memory", "propose_session"]);
+            }
+            chat
+        }
         CanonicalScopeType::Task => match scope.workspace_access {
             WorkspaceAccess::TaskRead => {
                 vec!["read_task", "read_memory", "task_read", "propose_review"]
@@ -1355,7 +1387,10 @@ fn scope_permission_set(scope: &CanonicalScope, project_agent_chat: bool) -> BTr
         },
     };
     if scope.scope_type == CanonicalScopeType::AgentChat && project_agent_chat {
-        values.push("propose_task");
+        values.push("propose_project");
+        if !project_charter_setup_required {
+            values.push("propose_task");
+        }
     } else if scope.scope_type == CanonicalScopeType::AgentChat {
         values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
     }
@@ -1475,6 +1510,7 @@ mod tests {
                     scope_id: "scope".to_owned(),
                     workspace_access: WorkspaceAccess::Deny,
                 },
+                false,
                 false,
             );
             assert!(!permissions.contains("task_read"));

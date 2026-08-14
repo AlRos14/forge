@@ -1,7 +1,7 @@
 use super::*;
 use crate::{new_uuid_v4, now_rfc3339};
 
-const DEFAULT_PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
+const DEFAULT_PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 
 #[async_trait]
 impl ProjectRepo for SqliteDb {

@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use api_types::{
     ContextManifestListQuery, ContextManifestListResponse, ContextManifestQuery,
@@ -18,6 +21,7 @@ use db::{
 use services::{
     ContextManifestService, MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput,
 };
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -240,11 +244,18 @@ pub async fn get_context_manifest(
         .await?
         .ok_or_else(|| ApiError::not_found("context_manifest", manifest_id.to_string()))?;
     let sources = service
-        .sources(manifest_id)
+        .sources(manifest_id, identity_id, context_scope_id)
         .await?
         .into_iter()
         .take(MAX_MANIFEST_SOURCES)
-        .map(context_source_response)
+        .collect::<Vec<_>>();
+    let project_pointers = match context_scope.project_id.as_deref() {
+        Some(project_id) => Some(load_project_context_pointers(&state, project_id).await?),
+        None => None,
+    };
+    let sources = sources
+        .into_iter()
+        .map(|source| context_source_response(source, project_pointers.as_ref()))
         .collect();
     Ok(Json(context_manifest_response(manifest, sources)))
 }
@@ -266,13 +277,13 @@ pub async fn list_context_manifests(
         .as_deref()
         .map(|value| parse_uuid(value, "context_scope_id"))
         .transpose()?;
+    let context_scopes =
+        AgentContextScopeRepo::list_context_scopes(&*state.db, &identity_id).await?;
     if let Some(scope_id) = requested_scope {
-        let scope = AgentContextScopeRepo::get_context_scope(&*state.db, &scope_id.to_string())
-            .await?
+        let scope = context_scopes
+            .iter()
+            .find(|scope| scope.id == scope_id.to_string())
             .ok_or_else(|| ApiError::not_found("context_scope", scope_id.to_string()))?;
-        if scope.identity_id != identity_id {
-            return Err(ApiError::not_found("context_scope", scope_id.to_string()));
-        }
         authorized_scope_grant(&state, &user, &scope.scope_type, &scope.scope_id).await?;
     }
     let service = ContextManifestService::new(Arc::clone(&state.db));
@@ -285,18 +296,23 @@ pub async fn list_context_manifests(
         .await?;
     let allowed_scope_ids = if requested_scope.is_none() {
         let mut allowed = HashSet::new();
-        for scope in AgentContextScopeRepo::list_context_scopes(&*state.db, &identity_id).await? {
+        for scope in &context_scopes {
             if authorized_scope_grant(&state, &user, &scope.scope_type, &scope.scope_id)
                 .await
                 .is_ok()
             {
-                allowed.insert(scope.id);
+                allowed.insert(scope.id.clone());
             }
         }
         Some(allowed)
     } else {
         None
     };
+    let context_scopes = context_scopes
+        .into_iter()
+        .map(|scope| (scope.id.clone(), scope))
+        .collect::<HashMap<_, _>>();
+    let mut project_pointer_cache = HashMap::new();
     let mut items = Vec::with_capacity(manifests.len());
     for manifest in manifests {
         if allowed_scope_ids
@@ -306,11 +322,28 @@ pub async fn list_context_manifests(
             continue;
         }
         let sources = service
-            .sources(parse_uuid(&manifest.id, "manifest_id")?)
+            .sources(
+                parse_uuid(&manifest.id, "manifest_id")?,
+                identity,
+                parse_uuid(&manifest.context_scope_id, "context_scope_id")?,
+            )
             .await?
             .into_iter()
             .take(MAX_MANIFEST_SOURCES)
-            .map(context_source_response)
+            .collect::<Vec<_>>();
+        let project_id = context_scopes
+            .get(&manifest.context_scope_id)
+            .and_then(|scope| scope.project_id.as_deref());
+        if let Some(project_id) = project_id {
+            if !project_pointer_cache.contains_key(project_id) {
+                let pointers = load_project_context_pointers(&state, project_id).await?;
+                project_pointer_cache.insert(project_id.to_owned(), pointers);
+            }
+        }
+        let project_pointers = project_id.and_then(|id| project_pointer_cache.get(id));
+        let sources = sources
+            .into_iter()
+            .map(|source| context_source_response(source, project_pointers))
             .collect();
         items.push(context_manifest_response(manifest, sources));
     }
@@ -557,7 +590,147 @@ fn lifecycle_response(assertion: MemoryLifecycleAssertion) -> MemoryLifecycleRes
     }
 }
 
-fn context_source_response(source: db::ContextManifestSource) -> ContextManifestSourceResponse {
+#[derive(Debug, Default)]
+struct ProjectContextPointers {
+    revisions: HashMap<(String, String), String>,
+}
+
+impl ProjectContextPointers {
+    fn insert(&mut self, source_type: &str, source_id: &str, revision: &str) {
+        if !source_id.trim().is_empty() && !revision.trim().is_empty() {
+            self.revisions.insert(
+                (source_type.to_owned(), source_id.to_owned()),
+                revision.to_owned(),
+            );
+        }
+    }
+
+    fn current_revision(&self, source_type: &str, source_id: &str) -> Option<&str> {
+        self.revisions
+            .get(&(source_type.to_owned(), source_id.to_owned()))
+            .map(String::as_str)
+    }
+}
+
+async fn load_project_context_pointers(
+    state: &AppState,
+    project_id: &str,
+) -> ApiResult<ProjectContextPointers> {
+    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
+    let mut pointers = ProjectContextPointers::default();
+    pointers.insert(
+        "project_identity",
+        &project.id,
+        &format!("v{}", project.version),
+    );
+    if let (Some(charter_id), Some(revision_id)) = (
+        project.current_charter_id.as_deref(),
+        project.current_charter_revision_id.as_deref(),
+    ) {
+        pointers.insert("project_charter", charter_id, revision_id);
+    }
+
+    for row in sqlx::query(
+        "SELECT id, current_approved_revision_id
+         FROM project_document
+         WHERE project_id = ? AND current_approved_revision_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(state.db.pool())
+    .await?
+    {
+        pointers.insert(
+            "project_document",
+            row.try_get::<String, _>("id")?.as_str(),
+            row.try_get::<String, _>("current_approved_revision_id")?
+                .as_str(),
+        );
+    }
+
+    for row in sqlx::query(
+        "SELECT id, current_revision_id
+         FROM project_execution_baseline
+         WHERE project_id = ? AND lifecycle = 'active'
+           AND current_revision_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(state.db.pool())
+    .await?
+    {
+        pointers.insert(
+            "execution_baseline",
+            row.try_get::<String, _>("id")?.as_str(),
+            row.try_get::<String, _>("current_revision_id")?.as_str(),
+        );
+    }
+
+    for row in sqlx::query(
+        "SELECT id, current_definition_revision_id
+         FROM project_milestone
+         WHERE project_id = ?
+           AND lifecycle IN ('planned', 'active', 'ready_for_release')
+           AND current_definition_revision_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(state.db.pool())
+    .await?
+    {
+        pointers.insert(
+            "project_milestone_definition",
+            row.try_get::<String, _>("id")?.as_str(),
+            row.try_get::<String, _>("current_definition_revision_id")?
+                .as_str(),
+        );
+    }
+
+    for row in sqlx::query(
+        "SELECT id, policy_revision
+         FROM project_agent_binding
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(project_id)
+    .fetch_all(state.db.pool())
+    .await?
+    {
+        pointers.insert(
+            "project_agent_binding",
+            row.try_get::<String, _>("id")?.as_str(),
+            row.try_get::<String, _>("policy_revision")?.as_str(),
+        );
+    }
+
+    Ok(pointers)
+}
+
+fn context_source_response(
+    source: db::ContextManifestSource,
+    project_pointers: Option<&ProjectContextPointers>,
+) -> ContextManifestSourceResponse {
+    let pointer_backed = matches!(
+        source.source_type.as_str(),
+        "project_identity"
+            | "project_agent_binding"
+            | "project_charter"
+            | "project_document"
+            | "execution_baseline"
+            | "project_milestone_definition"
+    ) && matches!(source.disposition.as_str(), "included" | "summarized")
+        && source.source_id.starts_with("project_context:");
+    let current_revision = if pointer_backed {
+        let source_id = source
+            .source_id
+            .strip_prefix("project_context:")
+            .expect("pointer-backed Project context source has canonical prefix");
+        project_pointers
+            .and_then(|pointers| pointers.current_revision(&source.source_type, source_id))
+            .map(safe_metadata_value)
+    } else {
+        None
+    };
+    let is_stale =
+        pointer_backed && current_revision.as_deref() != Some(source.source_revision.as_str());
     ContextManifestSourceResponse {
         ordinal: source.ordinal,
         source_id: safe_metadata_value(&source.source_id),
@@ -565,6 +738,8 @@ fn context_source_response(source: db::ContextManifestSource) -> ContextManifest
         source_revision: safe_metadata_value(&source.source_revision),
         selection_reason: safe_metadata_value(&source.selection_reason),
         disposition: safe_metadata_value(&source.disposition),
+        is_stale,
+        current_revision,
         retention_priority: source.retention_priority,
         fragment_fingerprint: safe_metadata_value(&source.fragment_fingerprint),
     }
@@ -662,6 +837,37 @@ mod tests {
         assert!(validate_target_visibility("agent_chat", "participants").is_err());
         assert!(validate_target_visibility("agent_chat", "chat").is_ok());
         assert!(validate_target_visibility("room", "participants").is_err());
+    }
+
+    #[test]
+    fn project_context_sources_report_live_and_missing_canonical_pointers() {
+        let source = db::ContextManifestSource {
+            manifest_id: "manifest".to_owned(),
+            ordinal: 1,
+            source_id: "project_context:document-1".to_owned(),
+            source_type: "project_document".to_owned(),
+            source_revision: "revision-1".to_owned(),
+            selection_reason: "current_approved_document".to_owned(),
+            disposition: "included".to_owned(),
+            retention_priority: 100,
+            fragment_fingerprint: "digest".to_owned(),
+        };
+        let mut pointers = ProjectContextPointers::default();
+        pointers.insert("project_document", "document-1", "revision-1");
+        let current = context_source_response(source.clone(), Some(&pointers));
+        assert!(!current.is_stale);
+        assert_eq!(current.current_revision.as_deref(), Some("revision-1"));
+
+        pointers.insert("project_document", "document-1", "revision-2");
+        let advanced = context_source_response(source.clone(), Some(&pointers));
+        assert!(advanced.is_stale);
+        assert_eq!(advanced.current_revision.as_deref(), Some("revision-2"));
+        assert_eq!(advanced.source_revision, "revision-1");
+        assert_eq!(advanced.disposition, "included");
+
+        let removed = context_source_response(source, Some(&ProjectContextPointers::default()));
+        assert!(removed.is_stale);
+        assert!(removed.current_revision.is_none());
     }
 
     #[test]

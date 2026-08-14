@@ -133,6 +133,10 @@ pub struct ExecutionResult {
     pub status: ExecutionOutcome,
     pub after_sha: Option<String>,
     pub agent_session_id: Option<String>,
+    /// Complete assistant response when an interactive executor exposes one.
+    /// Task projections continue to use the bounded `summary`; Agent Chat may
+    /// consume this field after applying its own message admission limits.
+    pub assistant_output: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage: Option<TokenUsage>,

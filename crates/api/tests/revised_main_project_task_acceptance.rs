@@ -11,9 +11,27 @@ use axum::{
 };
 use db::AgentContextScopeRepo;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const PROVIDER_SECRET: &str = "revised-acceptance-provider-secret";
+
+struct ProjectAuthorityFixture {
+    project_id: String,
+    charter_id: String,
+    charter_revision_id: String,
+    charter_content_digest: String,
+    charter_render_digest: String,
+    milestone_id: String,
+    milestone_definition_revision_id: String,
+}
+
+struct TaskGovernanceFixture {
+    charter_revision_id: String,
+    baseline_id: String,
+    baseline_revision_id: String,
+    milestone_id: String,
+}
 
 #[tokio::test]
 async fn main_project_handoff_project_task_worker_and_main_denial() {
@@ -82,22 +100,150 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     .await;
     let main_chat_id = required_string(&main_binding, &["chat_id"]);
 
-    // Project creation carries the selected identity/profile so the Project,
-    // binding, and Project Chat are one transaction in the replacement API.
-    let project = request_json(
+    // Product Genesis binds approved intent, the selected Project Agent, the
+    // Project, and its Project Chat in one replay-safe transaction.
+    let genesis = request_json(
+        app,
+        Method::POST,
+        "/api/v1/account/main-agent/product-genesis",
+        &token,
+        json!({
+            "maturity": "mvp",
+            "initial_idea": "A bounded Todo list with auditable Task delegation.",
+            "preferred_project_agent_identity_id": project_identity
+        }),
+        &[StatusCode::CREATED],
+    )
+    .await;
+    let genesis_id = required_string(&genesis, &["session", "id"]);
+    let charter_id = "revised-acceptance-charter";
+    let charter_content = todo_charter_content();
+    let rendered_charter = services::render_and_digest_charter(&charter_content);
+    let saved_charter = request_json(
+        app,
+        Method::POST,
+        &format!("/api/v1/account/main-agent/product-genesis/{genesis_id}/charter/revisions"),
+        &token,
+        json!({
+            "mutation": {
+                "expected_version": 1,
+                "idempotency_key": "revised-acceptance-charter-save",
+                "authorization": user_authorization(
+                    "project_charter.revision.save",
+                    "revised-acceptance-charter-save-event"
+                )
+            },
+            "charter_id": charter_id,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": charter_content,
+            "rendered_view": rendered_charter.rendered_view,
+            "render_version": rendered_charter.render_version,
+            "provenance": user_provenance("Approved Todo Charter")
+        }),
+        &[StatusCode::CREATED],
+    )
+    .await;
+    let charter_revision_id = required_string(&saved_charter, &["id"]);
+    let charter_projection = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/account/main-agent/product-genesis/{genesis_id}/charter"),
+        &token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let charter_version = charter_projection["charter"]["version"]
+        .as_i64()
+        .expect("Charter version");
+    let charter_approval = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{genesis_id}/charter/revisions/{charter_revision_id}/approve"
+        ),
+        &token,
+        json!({
+            "mutation": {
+                "expected_version": charter_version,
+                "expected_digest": rendered_charter.content_digest,
+                "idempotency_key": "revised-acceptance-charter-approve",
+                "authorization": user_authorization(
+                    "product_genesis.charter_approval",
+                    "revised-acceptance-charter-approve-event"
+                )
+            },
+            "charter_id": charter_id,
+            "revision_id": charter_revision_id,
+            "content_digest": rendered_charter.content_digest,
+            "render_digest": rendered_charter.render_digest,
+            "expected_charter_version": charter_version,
+            "approved_project_name": "Todo acceptance project",
+            "approved_project_slug": "todo-acceptance-project",
+            "project_mode": "compact",
+            "selected_project_agent_identity_id": project_identity,
+            "selected_project_agent_profile_revision_id": project_profile,
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@1",
+            "selected_project_agent_policy_digest": project_policy_digest(
+                &project_agent["profile"]["tool_policy"]
+            )
+        }),
+        &[StatusCode::CREATED],
+    )
+    .await;
+    let approval_id = required_string(&charter_approval, &["id"]);
+    let created_project = request_json(
         app,
         Method::POST,
         "/api/v1/projects",
         &token,
         json!({
-            "name": "Todo acceptance project",
-            "project_agent_identity_id": project_identity,
-            "project_agent_profile_id": project_profile
+            "approval_id": approval_id,
+            "idempotency_key": "revised-acceptance-project-create",
+            "authorization": user_authorization(
+                "product_genesis.create_project_from_approval",
+                "revised-acceptance-project-create-event"
+            )
         }),
-        &[StatusCode::OK, StatusCode::CREATED],
+        &[StatusCode::CREATED],
     )
     .await;
-    let project_id = required_string(&project, &["id"]);
+    let project_id = required_string(&created_project, &["project_id"]);
+    request_json(
+        app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        &token,
+        json!({
+            "default_review_config": {
+                "ci_steps": ["python3 -m unittest -v"],
+                "review_prompt": "Independently verify the Todo CLI."
+            }
+        }),
+        &[StatusCode::OK],
+    )
+    .await;
+    let project = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        &token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let milestone_id = required_string(&project, &["primary_milestone_id"]);
+    let milestone = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/milestones/{milestone_id}"),
+        &token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let milestone_definition_revision_id = required_string(&milestone, &["definition_revision_id"]);
 
     let project_binding = request_json(
         app,
@@ -178,6 +324,20 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         &[StatusCode::OK],
     )
     .await;
+    let task_governance = create_active_execution_baseline(
+        app,
+        &token,
+        ProjectAuthorityFixture {
+            project_id: project_id.clone(),
+            charter_id: charter_id.to_owned(),
+            charter_revision_id: charter_revision_id.clone(),
+            charter_content_digest: rendered_charter.content_digest.clone(),
+            charter_render_digest: rendered_charter.render_digest.clone(),
+            milestone_id: milestone_id.clone(),
+            milestone_definition_revision_id,
+        },
+    )
+    .await;
 
     let chats = request_json(
         app,
@@ -253,6 +413,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "Main must not create this Task",
             "revised-acceptance-main-task-denial",
             &worker_identity,
+            &task_governance,
         ),
         &[StatusCode::FORBIDDEN, StatusCode::NOT_FOUND],
     )
@@ -274,6 +435,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "Implement Todo item",
             "revised-acceptance-project-task",
             &worker_identity,
+            &task_governance,
         ),
         &[StatusCode::OK, StatusCode::CREATED],
     )
@@ -319,6 +481,11 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     )
     .await;
     let task_id = required_string(&executed, &["task", "id"]);
+    assert_eq!(
+        executed["task"]["task_state_config"]["review"]["ci_steps"][0],
+        "python3 -m unittest -v",
+        "typed Task proposals must inherit the Project review policy just like direct Task creation"
+    );
     assert_eq!(
         required_string(&executed, &["task", "project_id"]),
         project_id
@@ -382,6 +549,206 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     );
 }
 
+async fn create_active_execution_baseline(
+    app: &Router,
+    token: &str,
+    authority: ProjectAuthorityFixture,
+) -> TaskGovernanceFixture {
+    let project = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", authority.project_id),
+        token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let project_version = project["version"]
+        .as_i64()
+        .expect("baseline Project version");
+    let baseline_id = "revised-acceptance-baseline";
+    let proposed = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/execution-baseline",
+            authority.project_id
+        ),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": project_version,
+                "idempotency_key": "revised-acceptance-baseline-propose",
+                "authorization": user_authorization(
+                    "project.execution_baseline.propose",
+                    "revised-acceptance-baseline-propose-event"
+                )
+            },
+            "baseline_id": baseline_id
+        }),
+        &[StatusCode::CREATED, StatusCode::OK],
+    )
+    .await;
+    let baseline_version = proposed["baseline"]["version"]
+        .as_i64()
+        .expect("proposed baseline version");
+
+    let release_policy: api_types::ExecutionBaselineReleasePolicy = serde_json::from_value(json!({
+        "schema_version": services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
+        "revision": "revised-acceptance-policy-r1",
+        "required_check_definition_revisions": [
+            authority.milestone_definition_revision_id
+        ],
+        "reviewer_independence_rules": ["independent-reviewer"],
+        "manual_attestation_rules": ["manual-attestation"],
+        "waiver_rules": ["user-waiver"],
+        "evidence_kinds": ["ci-log", "media"],
+        "evidence_contexts": ["milestone"],
+        "evidence_freshness_rules": ["current-milestone"],
+        "dependency_rules": ["dependencies-green"],
+        "stale_input_rules": ["stale-baseline-blocks"],
+        "forbidden_side_effects": ["cross-project-write"],
+        "known_issue_rules": ["known-issue-blocks"],
+        "correction_rules": ["correction-required"],
+        "purge_rules": ["purge-stale-evidence"]
+    }))
+    .expect("closed release policy parses");
+    let release_policy_digest = api_types::canonical_digest_with_schema(
+        services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
+        &release_policy,
+    )
+    .expect("release policy digest");
+    let content = json!({
+        "charter_revision": {
+            "artifact_id": authority.charter_id,
+            "revision_id": authority.charter_revision_id,
+            "content_digest": authority.charter_content_digest,
+            "render_version": "forge.project-charter/v1",
+            "render_digest": authority.charter_render_digest
+        },
+        "document_revisions": [],
+        "plan_item_ids": ["revised-acceptance-plan-item-1"],
+        "milestone_ids": [authority.milestone_id],
+        "milestone_definition_revision_ids": [
+            authority.milestone_definition_revision_id
+        ],
+        "primary_milestone_id": authority.milestone_id,
+        "release_policy_revision": "revised-acceptance-policy-r1",
+        "release_policy_digest": release_policy_digest,
+        "release_policy": release_policy,
+        "acceptance_evidence_matrix": [],
+        "capability_classes": ["repository_write"],
+        "risk_classes": ["low"],
+        "reviewer_independence_rules": ["independent-reviewer"],
+        "elevated_operations": [],
+        "adaptive_envelope": {
+            "allowed_task_operations": ["split"],
+            "fixed_outcomes": [],
+            "fixed_acceptance": [],
+            "fixed_risk_classes": ["low"],
+            "forbidden_side_effects": [],
+            "elevated_operations": []
+        },
+        "rollback_and_recovery": ["retry"],
+        "exclusions": []
+    });
+    let typed_content: api_types::ExecutionBaselineContent =
+        serde_json::from_value(content.clone()).expect("baseline content parses");
+    let rendered =
+        services::render_execution_baseline(&typed_content).expect("execution baseline renders");
+    let saved = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/execution-baseline/{baseline_id}/revisions",
+            authority.project_id
+        ),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": baseline_version,
+                "idempotency_key": "revised-acceptance-baseline-revision",
+                "authorization": user_authorization(
+                    "project.execution_baseline.revise",
+                    "revised-acceptance-baseline-revision-event"
+                )
+            },
+            "base_revision_id": null,
+            "content": content,
+            "rendered_view": rendered.rendered_view,
+            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
+            "content_digest": rendered.content_digest,
+            "render_digest": rendered.render_digest,
+            "provenance": user_provenance("Todo execution baseline")
+        }),
+        &[StatusCode::CREATED, StatusCode::OK],
+    )
+    .await;
+    let baseline_revision_id = required_string(&saved, &["current_revision", "id"]);
+    let revised_version = saved["baseline"]["version"]
+        .as_i64()
+        .expect("revised baseline version");
+    let approved = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/execution-baseline/{baseline_id}/revisions/{baseline_revision_id}/approve",
+            authority.project_id
+        ),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": revised_version,
+                "idempotency_key": "revised-acceptance-baseline-approve",
+                "authorization": user_authorization(
+                    "project.execution_baseline.approve",
+                    "revised-acceptance-baseline-approve-event"
+                )
+            },
+            "revision_id": baseline_revision_id,
+            "content_digest": rendered.content_digest,
+            "render_digest": rendered.render_digest,
+            "expected_project_version": project_version + 1
+        }),
+        &[StatusCode::CREATED, StatusCode::OK],
+    )
+    .await;
+    let approval_id = required_string(&approved, &["approval", "id"]);
+    let activated = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/execution-baseline/{baseline_id}/activate",
+            authority.project_id
+        ),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": project_version + 1,
+                "idempotency_key": "revised-acceptance-baseline-activate",
+                "authorization": user_authorization(
+                    "project.execution_baseline.activate",
+                    "revised-acceptance-baseline-activate-event"
+                )
+            },
+            "baseline_id": baseline_id,
+            "revision_id": baseline_revision_id,
+            "approval_id": approval_id,
+            "content_digest": rendered.content_digest,
+            "render_digest": rendered.render_digest
+        }),
+        &[StatusCode::OK],
+    )
+    .await;
+    assert_eq!(activated["baseline"]["lifecycle"], json!("active"));
+    TaskGovernanceFixture {
+        charter_revision_id: authority.charter_revision_id,
+        baseline_id: baseline_id.to_owned(),
+        baseline_revision_id,
+        milestone_id: authority.milestone_id,
+    }
+}
+
 async fn connect_embedded(app: &Router, token: &str, name: &str, permissions: &[&str]) -> Value {
     request_json(
         app,
@@ -404,7 +771,13 @@ async fn connect_embedded(app: &Router, token: &str, name: &str, permissions: &[
     .await
 }
 
-fn task_proposal_body(project_id: &str, title: &str, dedupe_key: &str, worker_id: &str) -> Value {
+fn task_proposal_body(
+    project_id: &str,
+    title: &str,
+    dedupe_key: &str,
+    worker_id: &str,
+    governance: &TaskGovernanceFixture,
+) -> Value {
     json!({
         "project_id": project_id,
         "title": title,
@@ -414,9 +787,80 @@ fn task_proposal_body(project_id: &str, title: &str, dedupe_key: &str, worker_id
             "assignee_type": "agent",
             "assignee_id": worker_id
         }],
+        "governance": {
+            "charter_revision_id": governance.charter_revision_id,
+            "baseline_id": governance.baseline_id,
+            "baseline_revision_id": governance.baseline_revision_id,
+            "plan_item_id": "revised-acceptance-plan-item-1",
+            "milestone_id": governance.milestone_id,
+            "document_revision_ids": [],
+            "capability_class": "repository_write",
+            "risk_class": "low",
+            "provenance": {"source": "revised-main-project-task-acceptance"}
+        },
         "dedupe_key": dedupe_key,
         "correlation_id": format!("{dedupe_key}-correlation")
     })
+}
+
+fn todo_charter_content() -> api_types::ProjectCharterContent {
+    serde_json::from_value(json!({
+        "identity": {
+            "working_name": "Todo acceptance project",
+            "slug_proposal": "todo-acceptance-project",
+            "one_line_vision": "A bounded Todo workflow delegated through Forge.",
+            "maturity": "mvp"
+        },
+        "problem_and_people": {
+            "problem_or_opportunity": "Todo work needs a durable, auditable agent handoff.",
+            "target_users": ["Forge users"],
+            "beneficiaries": ["Project collaborators"]
+        },
+        "core_experience": {
+            "primary_outcome": "A Project Agent creates and delegates one bounded Todo Task."
+        },
+        "scope": {
+            "must_have_outcomes": ["Create, execute, and validate one Todo Task."],
+            "explicit_non_goals": ["Cross-Project mutation"]
+        },
+        "success": {
+            "success_signals": ["The Worker receives only a Task-scoped WorkspaceLease."],
+            "acceptance_statements": ["Main cannot manage Project Tasks."]
+        },
+        "constraints_and_risks": {
+            "product": ["Single-user local-first operation."],
+            "technology": ["Use the existing Forge workflow and repository runtime."],
+            "security_privacy_compliance": ["Explicit user approval is required."]
+        },
+        "knowledge_ledger": {"items": []}
+    }))
+    .expect("Todo Charter content parses")
+}
+
+fn user_authorization(action: &str, event_id: &str) -> Value {
+    json!({
+        "principal": {"kind": "user", "id": "test-user-id"},
+        "authorization_basis": "explicit_user_authorization",
+        "action": action,
+        "event_id": event_id,
+        "occurred_at": db::now_rfc3339()
+    })
+}
+
+fn user_provenance(summary: &str) -> Value {
+    json!({
+        "author": {"kind": "user", "id": "test-user-id"},
+        "operating_skill_revision": "forge.project.orchestration/v1@1",
+        "source_refs": [],
+        "change_summary": summary
+    })
+}
+
+fn project_policy_digest(policy: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge.project-agent-policy/v1\0");
+    hasher.update(policy.to_string().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 async fn request_json(

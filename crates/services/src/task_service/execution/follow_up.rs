@@ -196,55 +196,17 @@ fn dispatch_role_follow_up_impl(
             &task_id,
             &execution_id,
         );
-        let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*service.db,
-            CreateExecution {
-                id: execution_id.clone(),
-                task_id: task_id.clone(),
-                agent_id: Some(agent_id),
-                role: role.clone(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: Some(lineage_parent.id.clone()),
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(prompt),
-                logs_path: Some(logs_path),
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json,
-                workspace_id: lineage_parent.workspace_id.clone(),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
-
-        tracing::info!(
-            task_id = %task_id,
-            role = %role,
-            execution_id = %execution.id,
-            parent_execution_id = %lineage_parent.id,
-            trigger = %trigger,
-            "role follow-up dispatched"
-        );
-
-        let task = TaskRepo::get_by_id(&*service.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        // Establish the final Task state/version before minting the
+        // execution-scoped WorkspaceLease. A transition after issuance would
+        // immediately make the exact-version authority stale.
         let active_state = service.active_state_for_role(&task, &role).await?;
-        if task.status != active_state {
+        let task = if task.status != active_state {
             service
                 .transition(task_id.clone(), active_state, task.version)
-                .await?;
+                .await?
+                .task
         } else if task.error_annotation.is_some() {
-            if let Err(error) = TaskRepo::update(
+            match TaskRepo::update(
                 &*service.db,
                 UpdateTask {
                     id: task.id.clone(),
@@ -264,9 +226,57 @@ fn dispatch_role_follow_up_impl(
             )
             .await
             {
-                tracing::warn!(%error, task_id = %task_id, "failed to clear error annotation on follow-up dispatch");
+                Ok(updated) => updated,
+                Err(error) => {
+                    tracing::warn!(%error, task_id = %task_id, "failed to clear error annotation before follow-up dispatch");
+                    TaskRepo::get_by_id(&*service.db, &task_id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?
+                }
             }
-        }
+        } else {
+            task
+        };
+        service.ensure_task_runnable(&task).await?;
+        let now = now_rfc3339();
+        let execution = service
+            .create_running_execution(
+                CreateExecution {
+                    id: execution_id.clone(),
+                    task_id: task_id.clone(),
+                    agent_id: Some(agent_id),
+                    role: role.clone(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: Some(lineage_parent.id.clone()),
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: Some(prompt),
+                    logs_path: Some(logs_path),
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: lineage_parent.workspace_id.clone(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                false,
+            )
+            .await?;
+
+        tracing::info!(
+            task_id = %task_id,
+            role = %role,
+            execution_id = %execution.id,
+            parent_execution_id = %lineage_parent.id,
+            trigger = %trigger,
+            "role follow-up dispatched"
+        );
 
         service.publish(ForgeEvent {
             event_type: "follow_up.dispatched".to_owned(),

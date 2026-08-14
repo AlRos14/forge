@@ -15,6 +15,7 @@ import {
   ChatCircleDots,
   Robot,
   Kanban,
+  ChartLineUp,
   Gear,
   Key,
   Sliders,
@@ -56,7 +57,6 @@ import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/cn'
 import { useLayoutStore } from '@/stores/layout'
 import { useAuthStore } from '@/stores/auth'
-import { useProductGenesisActiveQuery } from '@/features/product-genesis/hooks'
 import type { Agent } from '@/types/generated/api'
 
 const CommandPalette = lazy(() =>
@@ -68,6 +68,7 @@ const CommandPalette = lazy(() =>
 type NavItem = {
   to: string
   key:
+    | 'overview'
     | 'board'
     | 'tasks'
     | 'chat'
@@ -82,6 +83,7 @@ type NavItem = {
 }
 
 const navItems: NavItem[] = [
+  { to: '/projects/$projectId/overview', key: 'overview', icon: ChartLineUp, section: 'project' },
   { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'project' },
   { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
   { to: '/projects/$projectId/chat', key: 'chat', icon: ChatCircleDots, section: 'project' },
@@ -108,7 +110,6 @@ function ProjectSwitcher({
   const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
   const createProject = useCreateProject()
   const agentsQuery = useAgentsQuery()
-  const productGenesisQuery = useProductGenesisActiveQuery()
   const [createOpen, setCreateOpen] = useState(false)
   const [newName, setNewName] = useState('')
   const [selectedAgentId, setSelectedAgentId] = useState('')
@@ -117,22 +118,6 @@ function ProjectSwitcher({
   const projects = projectsQuery.data?.pages.flatMap((page) => page.items) ?? []
   const currentProject = projects.find((p) => p.id === projectId)
   const availableAgents = (agentsQuery.data?.items ?? []).filter((agent) => !agent.paused)
-  const activeGenesis = productGenesisQuery.data?.session ?? null
-  const readyGenesis =
-    activeGenesis?.lifecycle === 'ready_for_project' && !activeGenesis.project_id
-      ? activeGenesis
-      : null
-
-  useEffect(() => {
-    if (!createOpen || selectedAgentId || !readyGenesis?.preferred_project_agent_identity_id) return
-    if (
-      availableAgents.some(
-        (agent) => agent.id === readyGenesis.preferred_project_agent_identity_id,
-      )
-    ) {
-      setSelectedAgentId(readyGenesis.preferred_project_agent_identity_id)
-    }
-  }, [availableAgents, createOpen, readyGenesis, selectedAgentId])
 
   const fetchNextProjectsPage = () => {
     if (projectsQuery.hasNextPage && !projectsQuery.isFetchingNextPage) {
@@ -187,16 +172,11 @@ function ProjectSwitcher({
       return
     }
     const selectedAgent = availableAgents.find((agent) => agent.id === selectedAgentId)
-    if (readyGenesis && !selectedAgent) {
-      setError(t('projectSwitcher.projectAgentRequired'))
-      return
-    }
     try {
       const created = await createProject.mutateAsync({
         name,
         project_agent_identity_id: selectedAgent?.id ?? null,
         project_agent_profile_id: selectedAgent?.profile_id ?? null,
-        product_genesis_session_id: readyGenesis?.id ?? null,
       })
       setCreateOpen(false)
       setNewName('')
@@ -245,7 +225,6 @@ function ProjectSwitcher({
           agentsLoading={agentsQuery.isLoading}
           selectedAgentId={selectedAgentId}
           onAgentChange={setSelectedAgentId}
-          genesisReady={Boolean(readyGenesis)}
           error={error}
           loading={createProject.isPending}
           onSubmit={handleCreate}
@@ -301,7 +280,6 @@ function ProjectSwitcher({
         agentsLoading={agentsQuery.isLoading}
         selectedAgentId={selectedAgentId}
         onAgentChange={setSelectedAgentId}
-        genesisReady={Boolean(readyGenesis)}
         error={error}
         loading={createProject.isPending}
         onSubmit={handleCreate}
@@ -319,7 +297,6 @@ function CreateProjectDialog({
   agentsLoading,
   selectedAgentId,
   onAgentChange,
-  genesisReady,
   error,
   loading,
   onSubmit,
@@ -332,7 +309,6 @@ function CreateProjectDialog({
   agentsLoading: boolean
   selectedAgentId: string
   onAgentChange: (v: string) => void
-  genesisReady: boolean
   error: string
   loading: boolean
   onSubmit: (e: React.FormEvent) => void
@@ -346,11 +322,11 @@ function CreateProjectDialog({
             <DialogTitle>{t('projectSwitcher.createProject')}</DialogTitle>
           </DialogHeader>
           <div className="my-4 space-y-4">
-            {genesisReady ? (
-              <p className="rounded-md border border-ember-border bg-ember-surface px-3 py-2 text-xs text-foreground">
-                {t('projectSwitcher.genesisReady')}
-              </p>
-            ) : null}
+            <p className="rounded-md border border-border-subtle bg-muted/20 px-3 py-2 text-xs leading-5 text-muted-foreground">
+              Generic Project creation is available for human/API setup and starts in{' '}
+              <span className="font-mono text-micro">charter_setup_required</span>. Use Product
+              Genesis in the Main Chat when this Project needs a Charter-backed handoff.
+            </p>
             <div className="space-y-2">
               <Label htmlFor="project-name">{t('projectSwitcher.projectName')}</Label>
               <Input
@@ -364,24 +340,19 @@ function CreateProjectDialog({
             <div className="space-y-2">
               <Label htmlFor="project-agent">
                 {t('projectSwitcher.projectAgent')}
-                {!genesisReady ? (
-                  <span className="ml-1 font-normal text-muted-foreground">
-                    {t('projectSwitcher.optional')}
-                  </span>
-                ) : null}
+                <span className="ml-1 font-normal text-muted-foreground">
+                  {t('projectSwitcher.optional')}
+                </span>
               </Label>
               <select
                 id="project-agent"
                 value={selectedAgentId}
                 onChange={(event) => onAgentChange(event.target.value)}
-                required={genesisReady}
                 disabled={agentsLoading}
                 className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
               >
                 <option value="">
-                  {agentsLoading
-                    ? t('common.loading')
-                    : t('projectSwitcher.selectProjectAgent')}
+                  {agentsLoading ? t('common.loading') : t('projectSwitcher.selectProjectAgent')}
                 </option>
                 {agents.map((agent) => (
                   <option key={agent.id} value={agent.id}>
@@ -390,11 +361,7 @@ function CreateProjectDialog({
                   </option>
                 ))}
               </select>
-              <p className="text-xs text-muted-foreground">
-                {genesisReady
-                  ? t('projectSwitcher.genesisAgentHint')
-                  : t('projectSwitcher.agentHint')}
-              </p>
+              <p className="text-xs text-muted-foreground">{t('projectSwitcher.agentHint')}</p>
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
           </div>

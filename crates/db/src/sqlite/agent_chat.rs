@@ -873,6 +873,8 @@ impl AgentChatTransactionRepo for SqliteDb {
                 "UPDATE agent_chat_turn_job
                  SET status = 'succeeded', response_message_id = ?,
                      lease_owner = NULL, leased_until = NULL,
+                     next_attempt_at = NULL, error_code = NULL,
+                     error_message = NULL,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ?
                    AND status = 'leased' AND lease_owner = ?",
@@ -910,6 +912,8 @@ impl AgentChatTransactionRepo for SqliteDb {
             "UPDATE agent_chat_turn_job
              SET status = 'succeeded', response_message_id = ?,
                  lease_owner = NULL, leased_until = NULL,
+                 next_attempt_at = NULL, error_code = NULL,
+                 error_message = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?
                AND status = 'leased' AND lease_owner = ?",

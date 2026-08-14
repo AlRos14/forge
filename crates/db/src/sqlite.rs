@@ -18,27 +18,31 @@ use crate::{
     CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem, CreateAgentProfile,
     CreateAgentQuestion, CreateAttentionProjection, CreateDomainEvent, CreateExecution,
     CreateNotification, CreatePrMetadata, CreatePrProviderConfig, CreateProject,
-    CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration, CreateRepo,
-    CreateReview, CreateRuntime, CreateSkill, CreateTask, CreateTaskComment,
-    CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession, CreateWorkspace, Daemon,
-    DaemonRepo, DbError, DomainEvent, DomainEventRepo, EventConsumerCursor, Execution,
-    ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
-    FailAgentChatTurn, IntegrationRepo, ModelTokenBreakdown, Notification, NotificationListQuery,
-    NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
-    PrProviderConfigRepo, Project, ProjectAgentBinding, ProjectAgentBindingRepo,
-    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
-    ProjectIntegration, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
-    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo, Result, Review,
-    ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, SelectAgentProfile, Skill,
-    SkillRepo, SortBy, SortOrder, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo,
-    TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary,
-    TerminalSession, TerminalSessionRepo, TerminalSessionStatus, TransferAgentCommitment,
-    UpdateAgent, UpdateAgentAction, UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment,
-    UpdateAgentInboxItem, UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution,
-    UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
-    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
-    UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth, UpsertDaemon, UpsertExecutionUsage,
-    Workspace, WorkspaceRepo, WorkspaceStatus,
+    CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
+    CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
+    CreateProjectReleaseMediaPin, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
+    CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession,
+    CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent,
+    DomainEventRepo, EventConsumerCursor, Execution, ExecutionRepo, ExecutionStatus,
+    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, FailAgentChatTurn, IntegrationRepo,
+    MediaAsset, ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page,
+    PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project,
+    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectHookRun,
+    ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment,
+    ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary,
+    ProjectTokenStats, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo,
+    Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo,
+    SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo,
+    SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task, TaskComment,
+    TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo,
+    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
+    TransferAgentCommitment, UpdateAgent, UpdateAgentAction, UpdateAgentChat,
+    UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
+    UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
+    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
+    UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth, UpsertDaemon,
+    UpsertExecutionUsage, Workspace, WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -66,6 +70,7 @@ mod notification;
 mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
+mod orchestration;
 mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;
@@ -75,6 +80,7 @@ mod project_member;
 mod repo;
 mod review;
 mod runtime;
+mod shared_media;
 mod skill;
 mod system_setting;
 mod task;
@@ -86,6 +92,7 @@ mod task_terminal_session;
 mod user_auth;
 mod workflow;
 mod workspace;
+mod workspace_lease;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
@@ -164,7 +171,7 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
 }
 
 const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
-const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
     page.limit.clamp(1, 500)
@@ -222,6 +229,13 @@ fn map_project(row: SqliteRow) -> Result<Project> {
         owner_id: row.try_get("owner_id")?,
         project_hooks_json: row.try_get("project_hooks_json")?,
         project_work_epoch: row.try_get("project_work_epoch")?,
+        charter_status: row.try_get("charter_status")?,
+        charter_setup_required: row.try_get::<i64, _>("charter_setup_required")? != 0,
+        current_charter_id: row.try_get("current_charter_id")?,
+        current_charter_revision_id: row.try_get("current_charter_revision_id")?,
+        current_charter_version: row.try_get("current_charter_version")?,
+        primary_milestone_id: row.try_get("primary_milestone_id")?,
+        version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -575,6 +589,16 @@ impl SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
     ) -> Result<Execution> {
+        // The service performs a read-only admission check before preparing a
+        // workspace.  Recheck the authoritative Charter/baseline receipt in
+        // the same transaction as the execution INSERT so a baseline
+        // supersession racing that read cannot mint a stale Running execution.
+        // The service removes a newly prepared workspace when this guard
+        // rejects the execution, so no fresh lease remains behind.
+        // Legacy/unverified Projects intentionally bypass this guard.
+        if input.status == ExecutionStatus::Running && input.workspace_id.is_some() {
+            Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
+        }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
@@ -612,6 +636,56 @@ impl SqliteDb {
             .fetch_one(&mut **transaction)
             .await?;
         map_execution(row)
+    }
+
+    /// Re-check the exact active baseline receipt in the transaction that
+    /// mutates Task/Execution state. The service-level admission query is
+    /// intentionally only an early side-effect filter; it cannot be the
+    /// authority because a baseline may be superseded between that query and
+    /// claim/launch.
+    async fn ensure_execution_admission_in_tx(
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<()> {
+        let blocked: Option<i64> = sqlx::query_scalar(
+            "SELECT CASE WHEN p.charter_status = 'charter_backed'
+                                  AND p.charter_setup_required = 0
+                                  AND t.repo_id IS NOT NULL
+                                  AND NOT (
+                                      COALESCE(g.runnable, 0) = 1
+                                      AND g.charter_revision_id = p.current_charter_revision_id
+                                      AND g.baseline_id IS NOT NULL
+                                      AND g.baseline_revision_id IS NOT NULL
+                                      AND b.lifecycle = 'active'
+                                      AND b.current_revision_id = g.baseline_revision_id
+                                      AND r.lifecycle = 'approved'
+                                      AND r.charter_revision_id = p.current_charter_revision_id
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM project_execution_baseline_approval a
+                                          WHERE a.baseline_id = g.baseline_id
+                                            AND a.revision_id = g.baseline_revision_id
+                                            AND a.content_digest = r.content_digest
+                                            AND a.rendered_digest = r.rendered_digest
+                                            AND a.lifecycle IN ('active', 'consumed')
+                                      )
+                                  )
+                             THEN 1 ELSE 0 END
+             FROM task t
+             JOIN project p ON p.id = t.project_id
+             LEFT JOIN project_task_governance g ON g.task_id = t.id
+             LEFT JOIN project_execution_baseline b ON b.id = g.baseline_id
+             LEFT JOIN project_execution_baseline_revision r
+               ON r.id = g.baseline_revision_id
+             WHERE t.id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if blocked == Some(1) {
+            return Err(DbError::InvalidTransition);
+        }
+        Ok(())
     }
 
     async fn unsatisfied_dependencies_in_tx(

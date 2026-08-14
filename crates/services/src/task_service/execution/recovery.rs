@@ -214,7 +214,7 @@ impl TaskService {
         }
     }
 
-    async fn clear_blocking_metadata(&self, task_id: &str) -> Result<Task> {
+    pub(super) async fn clear_blocking_metadata(&self, task_id: &str) -> Result<Task> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
@@ -454,14 +454,16 @@ impl TaskService {
         } else {
             updated_snapshot
         };
-        let workspace = prepare_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task.id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        self.ensure_task_runnable(&task).await?;
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task.id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -472,48 +474,50 @@ impl TaskService {
                 api_types::RecoveryAction::ResumeSession,
             )),
         );
-        let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*self.db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent_id),
-                role: blocked_execution.role.clone(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: Some(blocked_execution.id.clone()),
-                agent_session_id: Some(agent_session_id),
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: match (
-                    context.as_deref(),
-                    blocked_execution
-                        .prompt
-                        .as_ref()
-                        .or(blocked_execution.summary.as_ref()),
-                ) {
-                    (Some(ctx), Some(orig)) => Some(format!("[User context: {ctx}]\n\n{orig}")),
-                    (Some(ctx), None) => Some(format!("[User context: {ctx}]")),
-                    (None, s) => s.cloned(),
-                },
-                logs_path: None,
-                before_sha: workspace.before_sha.clone(),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: Some(updated_snapshot),
-                workspace_id: Some(workspace.id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
-
         let updated_task = self
             .recover_task_transition_to_work_state(task, &workflow)
+            .await?;
+        let updated_task = self.clear_blocking_metadata(&updated_task.id).await?;
+        self.ensure_task_runnable(&updated_task).await?;
+        let now = now_rfc3339();
+        let execution = self
+            .create_running_execution(
+                CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: updated_task.id.clone(),
+                    agent_id: Some(agent_id),
+                    role: blocked_execution.role.clone(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: Some(blocked_execution.id.clone()),
+                    agent_session_id: Some(agent_session_id),
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: match (
+                        context.as_deref(),
+                        blocked_execution
+                            .prompt
+                            .as_ref()
+                            .or(blocked_execution.summary.as_ref()),
+                    ) {
+                        (Some(ctx), Some(orig)) => Some(format!("[User context: {ctx}]\n\n{orig}")),
+                        (Some(ctx), None) => Some(format!("[User context: {ctx}]")),
+                        (None, s) => s.cloned(),
+                    },
+                    logs_path: None,
+                    before_sha: workspace.before_sha.clone(),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: Some(updated_snapshot),
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                workspace_created_by_attempt,
+            )
             .await?;
         self.publish(ForgeEvent {
             event_type: "task.execution_resumed".to_owned(),
@@ -524,7 +528,6 @@ impl TaskService {
                 reason: reason.unwrap_or_else(|| "resume_session".to_owned()),
             },
         });
-        let updated_task = self.clear_blocking_metadata(&updated_task.id).await?;
         self.spawn_recovery_execution(
             updated_task.id.clone(),
             execution.id.clone(),
@@ -544,16 +547,15 @@ impl TaskService {
         let recovered =
             if let Some(blocked_execution_id) = annotation.blocked_execution_id.as_deref() {
                 let result = self
-                    .re_execute_execution_with_context(blocked_execution_id, context)
+                    .re_execute_execution_for_recovery(blocked_execution_id, context)
                     .await?;
-                let recovered = self.clear_blocking_metadata(&result.task.id).await?;
                 self.spawn_recovery_execution(
-                    recovered.id.clone(),
+                    result.task.id.clone(),
                     result.execution.id.clone(),
                     "reexecute",
                 )
                 .await?;
-                recovered
+                result.task
             } else {
                 self.recover_reexecute_current_state(task, context).await?
             };
@@ -664,46 +666,50 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        let workspace = prepare_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task.id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        self.ensure_task_runnable(&task).await?;
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task.id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
         let executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
-        let now = now_rfc3339();
-        let execution = ExecutionRepo::create(
-            &*self.db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent.id.clone()),
-                role: role_name.to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(summary),
-                logs_path: None,
-                before_sha: workspace.before_sha.clone(),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json,
-                workspace_id: Some(workspace.id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
+        // Clear recovery state before issuing an exact-version WorkspaceLease.
         let recovered = self.clear_blocking_metadata(&task.id).await?;
+        let now = now_rfc3339();
+        let execution = self
+            .create_running_execution(
+                CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: recovered.id.clone(),
+                    agent_id: Some(agent.id.clone()),
+                    role: role_name.to_owned(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: Some(summary),
+                    logs_path: None,
+                    before_sha: workspace.before_sha.clone(),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json,
+                    workspace_id: Some(workspace.id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                workspace_created_by_attempt,
+            )
+            .await?;
         self.spawn_recovery_execution(
             recovered.id.clone(),
             execution.id.clone(),

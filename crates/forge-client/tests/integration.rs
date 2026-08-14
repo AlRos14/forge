@@ -39,7 +39,6 @@ async fn forge_client_creates_and_gets_project() {
                 paused: None,
                 project_agent_identity_id: None,
                 project_agent_profile_id: None,
-                product_genesis_session_id: None,
             },
         )
         .await
@@ -127,6 +126,7 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
                 review_config: None,
                 merge_config: None,
                 role_assignments: None,
+                governance: None,
             },
         )
         .await
@@ -278,6 +278,13 @@ async fn create_project_route(
         paused_at: None,
         paused: request.paused.unwrap_or(false),
         project_hooks: vec![],
+        charter_status: "legacy_unverified".to_owned(),
+        charter_setup_required: true,
+        current_charter_id: None,
+        current_charter_revision_id: None,
+        current_charter_version: 0,
+        primary_milestone_id: None,
+        version: 1,
     };
     data.projects.insert(project.id.clone(), project.clone());
     Json(project)
@@ -473,7 +480,6 @@ async fn create_project(client: &ForgeClient, name: &str) -> ProjectResponse {
                 paused: None,
                 project_agent_identity_id: None,
                 project_agent_profile_id: None,
-                product_genesis_session_id: None,
             },
         )
         .await

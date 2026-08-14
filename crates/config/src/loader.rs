@@ -83,6 +83,18 @@ impl ForgeConfig {
             }
         }
 
+        if let Some(public_search) = file.public_search {
+            if let Some(endpoint) = public_search.endpoint {
+                self.public_search.endpoint = Some(endpoint);
+            }
+            if let Some(timeout_ms) = public_search.timeout_ms {
+                self.public_search.timeout_ms = timeout_ms;
+            }
+            if let Some(max_response_bytes) = public_search.max_response_bytes {
+                self.public_search.max_response_bytes = max_response_bytes;
+            }
+        }
+
         if let Some(terminal) = file.terminal {
             if let Some(enabled) = terminal.enabled {
                 self.terminal.enabled = enabled;
@@ -118,6 +130,17 @@ impl ForgeConfig {
         }
         if let Some(value) = env_value("FORGE_PUBLIC_BASE_URL") {
             self.server.public_base_url = Some(value);
+        }
+        if let Some(value) = env_value("FORGE_PUBLIC_SEARCH_ENDPOINT") {
+            self.public_search.endpoint = Some(value);
+        }
+        if let Some(value) = env_value("FORGE_PUBLIC_SEARCH_TIMEOUT_MS") {
+            self.public_search.timeout_ms =
+                parse_env_u64("FORGE_PUBLIC_SEARCH_TIMEOUT_MS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES") {
+            self.public_search.max_response_bytes =
+                parse_env_u64("FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES", &value)?;
         }
         if let Some(value) = env_value("FORGE_DATA_DIR") {
             self.forge.data_dir = expand_path(&value);

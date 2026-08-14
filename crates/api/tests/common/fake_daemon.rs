@@ -16,13 +16,15 @@ use axum::{
 };
 use db::{
     AgentRepo, AgentStatus, AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo,
-    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, Execution,
-    ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
-    UpsertDaemon, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DaemonRepo,
+    DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo,
+    TaskRoleAssignmentRepo, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     connect_async,
@@ -453,7 +455,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
         &*state.db,
         CreateTask {
             id: task_id.clone(),
-            project_id,
+            project_id: project_id.clone(),
             repo_id: None,
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
@@ -589,11 +591,11 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("repo creates");
-    TaskRepo::create(
+    let task = TaskRepo::create(
         &*state.db,
         CreateTask {
             id: task_id.clone(),
-            project_id,
+            project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
@@ -648,7 +650,7 @@ pub async fn seed_startable_execution_for_daemon(
         CreateWorkspace {
             id: workspace_id.clone(),
             task_id: task_id.clone(),
-            repo_id,
+            repo_id: repo_id.clone(),
             worktree_path: workspace_path.to_string_lossy().into_owned(),
             branch: "forge/task/start".to_owned(),
             status: WorkspaceStatus::Ready,
@@ -664,7 +666,7 @@ pub async fn seed_startable_execution_for_daemon(
         CreateExecution {
             id: uuid::Uuid::new_v4().to_string(),
             task_id: task_id.clone(),
-            agent_id: Some(agent_id),
+            agent_id: Some(agent_id.clone()),
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -685,11 +687,48 @@ pub async fn seed_startable_execution_for_daemon(
             ),
             workspace_id: Some(workspace_id),
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
         },
     )
     .await
     .expect("execution creates");
+    let capability_profile_revision = "forge.capability-profile/v1";
+    let capability_class = "repository_write";
+    let mut capability_digest = Sha256::new();
+    capability_digest.update(capability_profile_revision.as_bytes());
+    capability_digest.update([0]);
+    capability_digest.update(capability_class.as_bytes());
+    WorkspaceLeaseRepo::issue(
+        &*state.db,
+        CreateWorkspaceLease {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id,
+            task_id: task_id.clone(),
+            task_version: task.version,
+            execution_id: execution.id.clone(),
+            operation_idempotency_key: execution.id.clone(),
+            repository_binding_id: repo_id,
+            base_ref: "main".to_owned(),
+            role: "worker".to_owned(),
+            capabilities_json: serde_json::to_string(&[capability_class])
+                .expect("lease capabilities serialize"),
+            assigned_principal_type: "agent".to_owned(),
+            assigned_principal_id: agent_id,
+            capability_profile_revision: capability_profile_revision.to_owned(),
+            capability_profile_digest: format!(
+                "sha256:{}",
+                hex::encode(capability_digest.finalize())
+            ),
+            issuing_principal_type: "system".to_owned(),
+            issuing_principal_id: "task-service-scheduler".to_owned(),
+            issued_at: now.clone(),
+            expires_at: "2099-01-01T00:00:00+00:00".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("workspace lease creates");
 
     StartableExecutionFixture {
         task_id,

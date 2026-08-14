@@ -4,9 +4,9 @@ use api_types::{
     ActionExecutionResponse, AgentActionResponse, AnswerQuestionRequest, ApproveActionRequest,
     AskQuestionRequest, CommitmentEvidenceResponse, CommitmentResponse, CompleteCommitmentRequest,
     CoordinationListQuery, CreateCommitmentRequest, ExecuteActionRequest,
-    ExecuteTaskProposalRequest, InboxItemResponse, ProposeActionRequest, QuestionResponse,
-    TaskProposalExecutionResponse, TaskProposalRequest, TransferCommitmentRequest,
-    UpdateCommitmentRequest, UpdateInboxItemRequest,
+    ExecuteOrchestrationActionRequest, ExecuteTaskProposalRequest, InboxItemResponse,
+    ProposeActionRequest, QuestionResponse, TaskProposalExecutionResponse, TaskProposalRequest,
+    TransferCommitmentRequest, UpdateCommitmentRequest, UpdateInboxItemRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -22,8 +22,11 @@ use db::{
 };
 use serde_json::Value;
 use services::{
-    ApproveActionInput, AskQuestionInput, CommitmentEvidenceInput, CompleteCommitmentInput,
-    CreateCommitmentInput, ExecuteActionInput, ExecuteTaskProposalInput, ProposeActionInput,
+    is_main_orchestration_operation, is_project_orchestration_operation, ApproveActionInput,
+    AskQuestionInput, CommitmentEvidenceInput, CompleteCommitmentInput, CreateCommitmentInput,
+    ExecuteActionInput, ExecuteMainOrchestrationActionInput,
+    ExecuteProjectOrchestrationActionInput, ExecuteTaskProposalInput,
+    MainOrchestrationActionService, ProjectOrchestrationActionService, ProposeActionInput,
     TransferCommitmentInput, UpdateCommitmentInput,
 };
 
@@ -537,6 +540,7 @@ pub async fn propose_task(
         "task_state_config": request.task_state_config,
         "merge_config": request.merge_config,
         "role_assignments": request.role_assignments,
+        "governance": request.governance,
     });
     let action = state
         .agent_action_service
@@ -617,6 +621,45 @@ pub async fn execute_action(
             idempotency_key: request.idempotency_key,
         })
         .await?;
+    Ok(Json(execution_response(execution)))
+}
+
+/// Execute a Main Agent Charter/Project proposal through its typed domain
+/// materializer. The generic `/execute` endpoint intentionally refuses these
+/// operations so a caller cannot manufacture a successful result envelope.
+pub async fn execute_orchestration_action(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Json(request): Json<ExecuteOrchestrationActionRequest>,
+) -> ApiResult<Json<ActionExecutionResponse>> {
+    let action = state.agent_action_service.get(&id).await?;
+    authorize_action_mutation(&state, &action, &user.user_id).await?;
+    let execution = if is_main_orchestration_operation(&action.operation) {
+        MainOrchestrationActionService::new(state.db.clone())
+            .execute(ExecuteMainOrchestrationActionInput {
+                action_id: id,
+                expected_version: request.expected_version,
+                executed_by_type: "user".to_owned(),
+                executed_by_id: user.user_id,
+                idempotency_key: request.idempotency_key,
+            })
+            .await?
+    } else if is_project_orchestration_operation(&action.operation) {
+        ProjectOrchestrationActionService::new(state.db.clone())
+            .execute(ExecuteProjectOrchestrationActionInput {
+                action_id: id,
+                expected_version: request.expected_version,
+                executed_by_type: "user".to_owned(),
+                executed_by_id: user.user_id,
+                idempotency_key: request.idempotency_key,
+            })
+            .await?
+    } else {
+        return Err(ApiError::bad_request(
+            "action is not a typed orchestration proposal",
+        ));
+    };
     Ok(Json(execution_response(execution)))
 }
 
@@ -1138,6 +1181,13 @@ fn question_response(value: AgentQuestion) -> QuestionResponse {
 }
 
 fn action_response(value: AgentAction) -> AgentActionResponse {
+    let materialized = action_materialized(
+        &value.operation,
+        &value.status,
+        value.target_type.as_deref(),
+        value.target_id.as_deref(),
+        value.outcome_json.as_deref(),
+    );
     AgentActionResponse {
         id: value.id,
         actor_identity_id: value.actor_identity_id,
@@ -1156,10 +1206,50 @@ fn action_response(value: AgentAction) -> AgentActionResponse {
         target_type: value.target_type,
         target_id: value.target_id,
         outcome: value.outcome_json.as_deref().map(parse_json),
+        materialized,
         version: value.version,
         created_at: value.created_at,
         updated_at: value.updated_at,
     }
+}
+
+/// Materialization is a derived public projection, not a second authority
+/// flag. It becomes true only after a typed executor has transitioned the
+/// action to `executed`, retained its server-derived target, and persisted the
+/// typed outcome that proves which domain operation completed.
+fn action_materialized(
+    operation: &str,
+    status: &AgentActionStatus,
+    target_type: Option<&str>,
+    target_id: Option<&str>,
+    outcome_json: Option<&str>,
+) -> bool {
+    if *status != AgentActionStatus::Executed
+        || target_type.is_none_or(str::is_empty)
+        || target_id.is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let Some(outcome) = outcome_json
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return false;
+    };
+
+    if operation == "task.propose" {
+        return outcome
+            .get("task_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+    }
+    if is_main_orchestration_operation(operation) || is_project_orchestration_operation(operation) {
+        return outcome
+            .get("operation")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == operation);
+    }
+    false
 }
 
 fn execution_response(value: AgentActionExecution) -> ActionExecutionResponse {
@@ -1180,4 +1270,69 @@ fn execution_response(value: AgentActionExecution) -> ActionExecutionResponse {
 
 fn parse_json(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_materialized_is_false_until_typed_outcome_is_persisted() {
+        assert!(!action_materialized(
+            "task.propose",
+            &AgentActionStatus::Proposed,
+            Some("project"),
+            Some("project-1"),
+            None,
+        ));
+        assert!(!action_materialized(
+            "task.propose",
+            &AgentActionStatus::Executed,
+            Some("project"),
+            Some("project-1"),
+            None,
+        ));
+        assert!(!action_materialized(
+            "task.propose",
+            &AgentActionStatus::Executed,
+            None,
+            Some("project-1"),
+            Some(r#"{"task_id":"task-1"}"#),
+        ));
+        assert!(!action_materialized(
+            "task.propose",
+            &AgentActionStatus::Executed,
+            Some("project"),
+            Some("project-1"),
+            Some(r#"{"task_id":""}"#),
+        ));
+        assert!(action_materialized(
+            "task.propose",
+            &AgentActionStatus::Executed,
+            Some("project"),
+            Some("project-1"),
+            Some(r#"{"task_id":"task-1"}"#),
+        ));
+        assert!(action_materialized(
+            forge_agent_host::PROJECT_DOCUMENT_OPERATION,
+            &AgentActionStatus::Executed,
+            Some("project"),
+            Some("project-1"),
+            Some(r#"{"operation":"project.document","domain_committed":true}"#),
+        ));
+        assert!(!action_materialized(
+            forge_agent_host::PROJECT_DOCUMENT_OPERATION,
+            &AgentActionStatus::Executed,
+            Some("project"),
+            Some("project-1"),
+            Some(r#"{"operation":"project.decision","domain_committed":true}"#),
+        ));
+        assert!(!action_materialized(
+            "ordinary.action",
+            &AgentActionStatus::Executed,
+            Some("project"),
+            Some("project-1"),
+            Some(r#"{"task_id":"task-1"}"#),
+        ));
+    }
 }

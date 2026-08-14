@@ -1293,6 +1293,110 @@ async fn follow_up_execution_creates_interactive_child() {
 }
 
 #[tokio::test]
+async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let now = now_rfc3339();
+    let parent = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: Some("failed-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("failed".to_owned()),
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("failed parent creates");
+    let running = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("running execution creates");
+
+    let result = service
+        .follow_up_execution(parent.id, "continue".to_owned(), None, None)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidOperation { message })
+            if message.contains("repository execution already running")
+                && message.contains(&running.id)
+    ));
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("executions list");
+    assert_eq!(executions.items.len(), 2);
+    let unchanged = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(unchanged.version, task.version);
+    assert!(unchanged.error_annotation.is_none());
+}
+
+#[tokio::test]
 async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -2083,7 +2187,29 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
         .await
         .expect("guard rejection dispatches follow-up");
 
-    let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 20,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("executions load");
+    let resumed = executions
+        .items
+        .iter()
+        .find(|candidate| candidate.status == ExecutionStatus::Running)
+        .expect("lease-backed follow-up exists");
+    assert_eq!(
+        resumed.parent_execution_id.as_deref(),
+        Some(execution.id.as_str())
+    );
+    let execution = ExecutionRepo::get_by_id(&*db, &resumed.id)
         .await
         .expect("execution loads")
         .expect("execution exists");
@@ -2119,7 +2245,29 @@ async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_fol
         .await
         .expect("handoff succeeds");
 
-    let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 20,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("executions load");
+    let resumed = executions
+        .items
+        .iter()
+        .find(|candidate| candidate.status == ExecutionStatus::Running)
+        .expect("lease-backed subtask follow-up exists");
+    assert_eq!(
+        resumed.parent_execution_id.as_deref(),
+        Some(execution.id.as_str())
+    );
+    let execution = ExecutionRepo::get_by_id(&*db, &resumed.id)
         .await
         .expect("execution loads")
         .expect("execution exists");

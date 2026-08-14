@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use api_types::{
-    parse_project_hooks_json, CiStepAnalytics, CreateProjectRequest,
+    parse_project_hooks_json, CiStepAnalytics, CreateProjectFromCharterApprovalRequest,
+    CreateProjectFromCharterApprovalResponse, CreateProjectRequest,
     ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse, ProjectAnalyticsResponse,
     ProjectHookRunResponse, ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
     ProjectSettings, ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
@@ -10,6 +11,7 @@ use api_types::{
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use db::{
@@ -20,8 +22,11 @@ use db::{
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
 use services::{
-    workflow::{engine::WorkflowEngine, validation::validate_workflow},
-    ProductGenesisService, ServiceError,
+    create_project_from_charter_approval as materialize_project_from_charter_approval,
+    workflow::{
+        default_workflow::default_workflow, engine::WorkflowEngine, validation::validate_workflow,
+    },
+    CreateProjectAuthorization, CreateProjectFromCharterApprovalInput, ServiceError,
 };
 
 use crate::{
@@ -34,6 +39,13 @@ use crate::{
 const DEFAULT_REVIEW_CONFIG_KEY: &str = "default_review_config";
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CreateProjectBody {
+    FromCharterApproval(CreateProjectFromCharterApprovalRequest),
+    Direct(CreateProjectRequest),
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AnalyticsQuery {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -42,34 +54,27 @@ pub struct AnalyticsQuery {
 pub async fn create_project(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Json(request): Json<CreateProjectRequest>,
-) -> ApiResult<Json<ProjectResponse>> {
-    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
-    let genesis_session = if let Some(session_id) = request.product_genesis_session_id.as_deref() {
-        let session = genesis.get(session_id).await?;
-        if session.account_id != user.user_id {
-            return Err(ApiError::not_found("product_genesis_session", session_id));
+    Json(request): Json<CreateProjectBody>,
+) -> ApiResult<Response> {
+    match request {
+        CreateProjectBody::FromCharterApproval(request) => {
+            create_project_from_charter_approval(state, user, request).await
         }
-        if session.lifecycle != api_types::ProductGenesisLifecycle::ReadyForProject {
-            return Err(ApiError::bad_request(
-                "Product Genesis must be ready_for_project before Project creation",
-            ));
-        }
-        if let Some(existing_project_id) = session.project_id.as_deref() {
-            let existing = ProjectRepo::get_by_id(&*state.db, existing_project_id)
-                .await?
-                .filter(|project| project.owner_id.as_deref() == Some(user.user_id.as_str()))
-                .ok_or_else(|| ApiError::not_found("project", existing_project_id.to_owned()))?;
-            return Ok(Json(project_response(existing)?));
-        }
-        Some(session)
-    } else {
-        None
-    };
+        CreateProjectBody::Direct(request) => create_direct_project(state, user, request).await,
+    }
+}
+
+async fn create_direct_project(
+    state: AppState,
+    user: AuthenticatedUser,
+    request: CreateProjectRequest,
+) -> ApiResult<Response> {
     let now = now_rfc3339();
     let mut settings = request.settings.unwrap_or_else(|| serde_json::json!({}));
     apply_default_review_config(&mut settings, request.default_review_config.as_ref())?;
-    let workflow = WorkflowEngine::resolve_workflow("{}");
+    let workflow_definition = serde_json::to_string(&default_workflow())
+        .map_err(|error| ApiError::internal(format!("serialize default workflow: {error}")))?;
+    let workflow = WorkflowEngine::resolve_workflow(&workflow_definition);
     validate_project_settings(&state.db, &settings, &workflow, None, None).await?;
     let settings = serialize_settings(&settings)?;
     let (project_agent_identity_id, project_agent_profile_id) = match (
@@ -100,7 +105,7 @@ pub async fn create_project(
             id: new_uuid_v4(),
             name: request.name,
             settings,
-            workflow_definition: "{}".to_string(),
+            workflow_definition,
             primary_repo_id: None,
             owner_id: Some(user.user_id.clone()),
             created_at: now.clone(),
@@ -110,46 +115,6 @@ pub async fn create_project(
         project_agent_profile_id,
     )
     .await?;
-
-    if let Some(session) = genesis_session {
-        // The Project/binding/chat transaction has committed. Link its stable
-        // result before returning so the normal handoff endpoint can retry
-        // after a delivery failure without creating a second Project.
-        let mut linked = false;
-        let mut expected_version = session.version;
-        for _ in 0..3 {
-            match genesis
-                .record_project(&session.id, expected_version, &project.id)
-                .await
-            {
-                Ok(_) => {
-                    linked = true;
-                    break;
-                }
-                Err(ServiceError::Db(db::DbError::VersionConflict)) => {
-                    let current = genesis.get(&session.id).await?;
-                    if current.project_id.as_deref() == Some(project.id.as_str()) {
-                        linked = true;
-                        break;
-                    }
-                    if current.project_id.is_some() {
-                        return Err(ApiError::conflict(
-                            "product_genesis",
-                            "Product Genesis is already linked to another Project",
-                        ));
-                    }
-                    expected_version = current.version;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if !linked {
-            return Err(ApiError::conflict(
-                "product_genesis",
-                "Product Genesis changed while its Project was being linked",
-            ));
-        }
-    }
 
     // Auto-create owner membership (best-effort; may fail if user row doesn't exist yet)
     let _ = db::ProjectMemberRepo::add_member(
@@ -174,7 +139,57 @@ pub async fn create_project(
         },
     });
 
-    Ok(Json(project_response(project)?))
+    Ok((StatusCode::OK, Json(project_response(project)?)).into_response())
+}
+
+async fn create_project_from_charter_approval(
+    state: AppState,
+    user: AuthenticatedUser,
+    request: CreateProjectFromCharterApprovalRequest,
+) -> ApiResult<Response> {
+    // Scope the receipt lookup by the authenticated account before entering
+    // the materializer so an approval ID cannot be used to enumerate another
+    // account's Genesis state.
+    let visible: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM project_charter_approval
+             WHERE id = ? AND approving_principal_type = 'user'
+               AND approving_principal_id = ?
+         )",
+    )
+    .bind(&request.approval_id)
+    .bind(&user.user_id)
+    .fetch_one(state.db.pool())
+    .await?;
+    if visible != 1 {
+        return Err(ApiError::not_found(
+            "project_charter_approval",
+            request.approval_id,
+        ));
+    }
+    let created = materialize_project_from_charter_approval(
+        state.db.clone(),
+        CreateProjectFromCharterApprovalInput {
+            approval_id: request.approval_id,
+            idempotency_key: request.idempotency_key,
+            account_id: user.user_id.clone(),
+            authorization: CreateProjectAuthorization::from_api(&request.authorization),
+            correlation_id: new_uuid_v4(),
+            causation_depth: 1,
+        },
+    )
+    .await?;
+    let response = CreateProjectFromCharterApprovalResponse {
+        project_id: created.project.id,
+        project_agent_binding_id: created.project_agent_binding_id,
+        project_chat_id: created.project_chat_id,
+        charter_id: created.charter_id,
+        charter_revision_id: created.charter_revision_id,
+        handoff_id: created.handoff_id,
+        target_message_id: created.target_message_id,
+        target_turn_id: created.target_turn_id,
+    };
+    Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
 pub async fn list_projects(
@@ -186,19 +201,14 @@ pub async fn list_projects(
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
-    // Filter: keep projects where the user is a member OR owner_id is None (system projects)
+    // Owner visibility is canonical even if a legacy/direct-create row was
+    // left without its best-effort membership row.  Membership additionally
+    // grants visibility to collaborators; owner_id = NULL denotes a public
+    // system Project.
     let mut visible_items = Vec::new();
     for project in page.items {
-        if project.owner_id.is_none() {
+        if project_is_visible(&state, &project, &user.user_id).await? {
             visible_items.push(project);
-        } else {
-            let is_member =
-                db::ProjectMemberRepo::get_member(&*state.db, &project.id, &user.user_id)
-                    .await?
-                    .is_some();
-            if is_member {
-                visible_items.push(project);
-            }
         }
     }
     let response = PaginatedResponse {
@@ -221,14 +231,8 @@ pub async fn get_project(
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
-    // If project has an owner, verify user is a member
-    if project.owner_id.is_some() {
-        let is_member = db::ProjectMemberRepo::get_member(&*state.db, &project.id, &user.user_id)
-            .await?
-            .is_some();
-        if !is_member {
-            return Err(ApiError::not_found("project", id));
-        }
+    if !project_is_visible(&state, &project, &user.user_id).await? {
+        return Err(ApiError::not_found("project", id));
     }
     Ok(Json(project_response(project)?))
 }
@@ -557,14 +561,25 @@ async fn require_project_visible(
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.is_some()
-        && db::ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
-            .await?
-            .is_none()
-    {
+    if !project_is_visible(state, &project, user_id).await? {
         return Err(ApiError::not_found("project", project_id.to_owned()));
     }
     Ok(project)
+}
+
+async fn project_is_visible(
+    state: &AppState,
+    project: &db::Project,
+    user_id: &str,
+) -> ApiResult<bool> {
+    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
+        return Ok(true);
+    }
+    Ok(
+        db::ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
+            .await?
+            .is_some(),
+    )
 }
 
 fn project_hook_run_response(run: ProjectHookRun) -> ProjectHookRunResponse {

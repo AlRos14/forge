@@ -14,6 +14,9 @@ export const qk = {
   agent: (id: string) => ['agents', id] as const,
   agentTasks: (id: string, filterKey: string) => ['agents', id, 'tasks', filterKey] as const,
   project: (id: string) => ['projects', id] as const,
+  projectOverview: (id: string) => ['projects', id, 'overview'] as const,
+  projectRelease: (projectId: string, releaseId: string) =>
+    ['projects', projectId, 'releases', releaseId] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
   projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
   projectHookRunPages: (projectId: string, limit: number) =>

@@ -48,6 +48,67 @@ async fn project(db: &SqliteDb, id: &str) {
     .expect("project creates");
 }
 
+async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
+    let now = now_rfc3339();
+    let charter_id = format!("{project_id}-charter");
+    let revision_id = format!("{charter_id}-revision-1");
+    sqlx::query(
+        "INSERT INTO project_charter (
+             id, account_id, project_id, project_mode, maturity, lifecycle,
+             version, created_at, updated_at
+         ) VALUES (?, 'user-1', ?, 'compact', 'prototype', 'attached', 1, ?, ?)",
+    )
+    .bind(&charter_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("charter creates");
+    sqlx::query(
+        "INSERT INTO project_charter_revision (
+             id, charter_id, revision, base_revision, lifecycle, schema_version,
+             render_version, content_json, rendered_view, change_summary,
+             author_type, author_id, source_refs_json, content_digest,
+             rendered_digest, created_at
+         ) VALUES (?, ?, 1, 0, 'approved', 'forge.project-charter/v1',
+                   'forge.project-charter-render/v1', '{}', '# Project',
+                   'test fixture approval', 'user', 'user-1', '[]',
+                   'charter-content-digest', 'charter-render-digest', ?)",
+    )
+    .bind(&revision_id)
+    .bind(&charter_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("charter revision creates");
+    sqlx::query(
+        "UPDATE project_charter
+         SET current_approved_revision_id = ?, current_draft_revision_id = ?, version = 2
+         WHERE id = ?",
+    )
+    .bind(&revision_id)
+    .bind(&revision_id)
+    .bind(&charter_id)
+    .execute(db.pool())
+    .await
+    .expect("charter approval attaches");
+    sqlx::query(
+        "UPDATE project
+         SET current_charter_id = ?, current_charter_revision_id = ?,
+             current_charter_version = 1, charter_status = 'charter_backed',
+             charter_setup_required = 0, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&charter_id)
+    .bind(&revision_id)
+    .bind(&now)
+    .bind(project_id)
+    .execute(db.pool())
+    .await
+    .expect("approved Charter attaches to Project");
+}
+
 async fn main_identity(db: &Arc<SqliteDb>, identity_id: &str) -> String {
     let now = now_rfc3339();
     let profile_id = new_uuid_v4();
@@ -339,12 +400,8 @@ async fn main_provider_global_catalog_operations_are_bounded_and_live() {
                 "correlation_id":"main-search-correlation"
             }),
         )
-        .await
-        .expect("Main web-search proposal is live");
-    assert_eq!(search["requested_permission"], "propose_discovery");
-    assert_eq!(search["target_type"], "account");
-    assert_eq!(search["target_id"], "user-1");
-    assert_eq!(search["status"], "pending_approval");
+        .await;
+    assert!(search.is_err(), "web search must not become an AgentAction");
 
     let forged = provider
         .propose(
@@ -430,6 +487,7 @@ async fn project_proposal_target_is_derived_from_scope() {
     let db = database().await;
     project(&db, "project-a").await;
     project(&db, "project-b").await;
+    attach_approved_charter(&db, "project-a").await;
     identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
     let scope = CanonicalScope {

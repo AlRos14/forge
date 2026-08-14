@@ -9,6 +9,23 @@ pub(crate) async fn prepare_workspace(
     task_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<Workspace> {
+    Ok(
+        prepare_workspace_owned(db, workspace_root, task, task_id, repo_cache_locks)
+            .await?
+            .0,
+    )
+}
+
+/// Prepare a workspace and report whether this call won creation ownership.
+/// The ownership bit is consumed by admission-failure cleanup; callers must
+/// never infer it from a racy preflight existence query.
+pub(crate) async fn prepare_workspace_owned(
+    db: &SqliteDb,
+    workspace_root: &std::path::Path,
+    task: &Task,
+    task_id: &str,
+    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+) -> Result<(Workspace, bool)> {
     if let Some(parent_task_id) = task.parent_task_id.as_deref() {
         let Some(workspace) = WorkspaceRepo::get_by_task_id(db, parent_task_id).await? else {
             return Err(ServiceError::parent_workspace_required(parent_task_id));
@@ -23,7 +40,7 @@ pub(crate) async fn prepare_workspace(
                         worktree_path = %workspace.worktree_path,
                         "reusing parent workspace"
                     );
-                    return Ok(workspace);
+                    return Ok((workspace, false));
                 }
                 WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
                     let parent_task = TaskRepo::get_by_id(db, parent_task_id, false)
@@ -31,15 +48,18 @@ pub(crate) async fn prepare_workspace(
                         .ok_or_else(|| {
                             ServiceError::not_found("task", parent_task_id.to_owned())
                         })?;
-                    return recover_missing_worktree(
-                        db,
-                        workspace_root,
-                        &parent_task,
-                        parent_task_id,
-                        workspace,
-                        repo_cache_locks,
-                    )
-                    .await;
+                    return Ok((
+                        recover_missing_worktree(
+                            db,
+                            workspace_root,
+                            &parent_task,
+                            parent_task_id,
+                            workspace,
+                            repo_cache_locks,
+                        )
+                        .await?,
+                        false,
+                    ));
                 }
             }
         }
@@ -56,18 +76,21 @@ pub(crate) async fn prepare_workspace(
                         worktree_path = %workspace.worktree_path,
                         "reusing existing workspace"
                     );
-                    return Ok(workspace);
+                    return Ok((workspace, false));
                 }
                 WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
-                    return recover_missing_worktree(
-                        db,
-                        workspace_root,
-                        task,
-                        task_id,
-                        workspace,
-                        repo_cache_locks,
-                    )
-                    .await;
+                    return Ok((
+                        recover_missing_worktree(
+                            db,
+                            workspace_root,
+                            task,
+                            task_id,
+                            workspace,
+                            repo_cache_locks,
+                        )
+                        .await?,
+                        false,
+                    ));
                 }
             }
         }
@@ -76,7 +99,10 @@ pub(crate) async fn prepare_workspace(
         )));
     }
 
-    create_fresh_workspace(db, workspace_root, task, task_id, repo_cache_locks).await
+    Ok((
+        create_fresh_workspace(db, workspace_root, task, task_id, repo_cache_locks).await?,
+        true,
+    ))
 }
 
 async fn recover_missing_worktree(
@@ -283,26 +309,58 @@ async fn create_fresh_workspace(
         manager = manager.with_repo_cache_locks(locks);
     }
     let worktree_source = resolve_repo_source(&repo, workspace_root).await?;
-    let worktree_path = manager
-        .create_worktree_named(&worktree_source, task_id, &repo.name, &repo.default_branch)
+    let branch = ::workspace::task_branch_name(task_id);
+    let branch_exists = git::branch_exists(Path::new(&worktree_source), &branch)
         .await
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let worktree_path = if branch_exists {
+        // A rejected admission may have removed its fresh workspace row and
+        // directory after Git created the task branch. Recover that exact
+        // task-scoped branch so a corrected retry remains possible and no
+        // potentially useful work is discarded.
+        manager
+            .recover_worktree_named(&worktree_source, task_id, &repo.name, &branch)
+            .await
+    } else {
+        manager
+            .create_worktree_named(&worktree_source, task_id, &repo.name, &repo.default_branch)
+            .await
+    }
+    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     let before_sha = git::get_current_sha(&worktree_path).await.ok();
-    let workspace = WorkspaceRepo::create(
+    let workspace_id = new_uuid_v4();
+    let workspace = match WorkspaceRepo::create(
         db,
         CreateWorkspace {
-            id: new_uuid_v4(),
+            id: workspace_id,
             task_id: task_id.to_owned(),
             repo_id: repo_id.to_owned(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
-            branch: ::workspace::task_branch_name(task_id),
+            branch,
             status: WorkspaceStatus::Ready,
             before_sha,
             created_at: now.clone(),
             updated_at: now,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            // A concurrent creator may have won the Task-unique workspace
+            // row after this call observed no row.  Never remove its
+            // worktree when our INSERT loses that race.
+            if WorkspaceRepo::get_by_task_id(db, task_id)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                let _ = manager.cleanup_worktree(task_id).await;
+            }
+            return Err(error.into());
+        }
+    };
 
     info!(
         task_id = task_id,

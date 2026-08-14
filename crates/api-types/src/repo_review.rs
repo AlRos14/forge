@@ -11,6 +11,18 @@ fn default_json_object() -> Value {
     Value::Object(Default::default())
 }
 
+fn default_charter_status() -> String {
+    "legacy_unverified".to_owned()
+}
+
+fn default_charter_setup_required() -> bool {
+    true
+}
+
+fn default_project_version() -> i64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffFileStatus {
@@ -73,6 +85,20 @@ pub struct ProjectResponse {
     pub paused_at: Option<String>,
     #[serde(default)]
     pub paused: bool,
+    #[serde(default = "default_charter_status")]
+    pub charter_status: String,
+    #[serde(default = "default_charter_setup_required")]
+    pub charter_setup_required: bool,
+    #[serde(default)]
+    pub current_charter_id: Option<String>,
+    #[serde(default)]
+    pub current_charter_revision_id: Option<String>,
+    #[serde(default)]
+    pub current_charter_version: i64,
+    #[serde(default)]
+    pub primary_milestone_id: Option<String>,
+    #[serde(default = "default_project_version")]
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -334,5 +360,9 @@ mod tests {
         assert_eq!(response.settings, serde_json::json!({}));
         assert!(response.project_hooks.is_empty());
         assert!(!response.paused);
+        assert_eq!(response.charter_status, "legacy_unverified");
+        assert!(response.charter_setup_required);
+        assert_eq!(response.current_charter_version, 0);
+        assert_eq!(response.version, 1);
     }
 }

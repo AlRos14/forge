@@ -233,37 +233,38 @@ async fn run_execution_rechecks_cancelled_status_before_adapter_launch() {
     let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
     let execution = {
         let now = now_rfc3339();
-        ExecutionRepo::create(
-            &*db,
-            db::CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent_id),
-                role: "executor".to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some("echo should-not-run".to_owned()),
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: Some(
-                    r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-                ),
-                workspace_id: Some(workspace_id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .expect("execution creates")
+        service
+            .create_running_execution(
+                db::CreateExecution {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    agent_id: Some(agent_id),
+                    role: "executor".to_owned(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: Some("echo should-not-run".to_owned()),
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: Some(
+                        r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                    ),
+                    workspace_id: Some(workspace_id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                false,
+            )
+            .await
+            .expect("lease-backed execution creates")
     };
     let guard = locks.acquire(&workspace_id).await;
     let service_for_run = service.clone();

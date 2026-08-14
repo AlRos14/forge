@@ -72,6 +72,8 @@ import type {
   OAuthAuthorizeContext,
   PaginatedResponse,
   Project,
+  ProjectOverview,
+  ProjectRelease,
   Repo,
   Review,
   ReviewDecisionResponse,
@@ -215,6 +217,22 @@ export function useProjectQuery(projectId: string) {
   return useQuery({
     queryKey: qk.project(projectId),
     queryFn: () => apiFetch<Project>(`/projects/${projectId}`),
+  })
+}
+
+export function useProjectOverviewQuery(projectId: string) {
+  return useQuery({
+    queryKey: qk.projectOverview(projectId),
+    queryFn: () => apiFetch<ProjectOverview>(`/projects/${projectId}/overview`),
+    enabled: Boolean(projectId),
+  })
+}
+
+export function useProjectReleaseQuery(projectId: string, releaseId: string) {
+  return useQuery({
+    queryKey: qk.projectRelease(projectId, releaseId),
+    queryFn: () => apiFetch<ProjectRelease>(`/projects/${projectId}/releases/${releaseId}`),
+    enabled: Boolean(projectId && releaseId),
   })
 }
 

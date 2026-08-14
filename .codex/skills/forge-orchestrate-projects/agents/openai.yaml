@@ -1,0 +1,4 @@
+interface:
+  display_name: "Forge Orchestration Engineering"
+  short_description: "Build and review Forge orchestration contracts"
+  default_prompt: "Use $forge-orchestrate-projects to implement or review Forge's cross-role Charter, Task, evidence, and release contracts."

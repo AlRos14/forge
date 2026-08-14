@@ -7,7 +7,7 @@
 
 use api_types::{
     CancelProductGenesisRequest, ProductGenesisActiveResponse, ProductGenesisStartResponse,
-    ProductMaturity, ReadyProductGenesisRequest, StartProductGenesisRequest,
+    ProductMaturity, StartProductGenesisRequest,
 };
 use axum::{
     extract::{Path, State},
@@ -133,25 +133,6 @@ pub async fn get_product_genesis(
         return Err(ApiError::not_found("product_genesis_session", session_id));
     }
     Ok(Json(session))
-}
-
-/// Mark discovery ready for the normal Project creation path. This is the
-/// typed Main-protocol acknowledgement; it does not create a Project or
-/// bypass the atomic Project/chat/binding transaction.
-pub async fn ready_product_genesis(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-    Json(request): Json<ReadyProductGenesisRequest>,
-) -> ApiResult<Json<api_types::ProductGenesisSession>> {
-    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
-    let current = genesis.get(&session_id).await?;
-    if current.account_id != user.user_id {
-        return Err(ApiError::not_found("product_genesis_session", session_id));
-    }
-    Ok(Json(
-        genesis.ready(&current.id, request.expected_version).await?,
-    ))
 }
 
 /// Cancel an active Genesis session with optimistic concurrency.

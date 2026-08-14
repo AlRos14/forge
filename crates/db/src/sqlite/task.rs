@@ -512,6 +512,15 @@ impl TaskRepo for SqliteDb {
         if task.entry_barrier_json.is_some() {
             return Err(DbError::InvalidTransition);
         }
+        // Claim and its Running execution are one transaction. Re-check the
+        // active baseline here, before mutating Task assignment/status; the
+        // service's earlier read gate is only an optimization for avoiding
+        // workspace side effects.
+        if input.execution.status == ExecutionStatus::Running
+            && input.execution.workspace_id.is_some()
+        {
+            Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
+        }
 
         let assignee_agent_id = match input.assignee_type.as_str() {
             "agent" => {

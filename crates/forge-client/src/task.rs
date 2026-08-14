@@ -114,6 +114,7 @@ impl TaskArgs {
                     review_config: None,
                     merge_config: None,
                     role_assignments: None,
+                    governance: None,
                 };
                 let task: TaskResponse = client
                     .post(&format!("/api/v1/projects/{project_id}/tasks"), &request)

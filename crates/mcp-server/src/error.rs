@@ -46,6 +46,9 @@ impl From<ServiceError> for McpToolError {
             ServiceError::DependencyGate => Self::new(-32029, "dependency gate"),
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::new(-32602, message),
+            ServiceError::AuthorizationDenied { message } => {
+                Self::new(-32003, message).with_data(json!({ "code": "authorization.invalid" }))
+            }
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,

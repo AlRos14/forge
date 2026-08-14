@@ -49,6 +49,27 @@ async fn poll_task_status_after_execution(
     );
 }
 
+async fn poll_failed_task_recovery_state(db: &Arc<db::SqliteDb>, task_id: &str) -> db::Task {
+    for _ in 0..200 {
+        if let Some(task) = TaskRepo::get_by_id(&**db, task_id, false)
+            .await
+            .expect("task lookup")
+        {
+            if task.status == "in_progress"
+                && task.blocked_json.is_some()
+                && task.error_annotation.is_some()
+            {
+                return task;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    TaskRepo::get_by_id(&**db, task_id, false)
+        .await
+        .expect("task lookup")
+        .expect("task exists")
+}
+
 struct RemoteRoundtripFixture {
     harness: common::Harness,
     registration: api_types::DaemonRegisterResponse,
@@ -298,10 +319,10 @@ async fn remote_execution_failure_takes_failure_path() {
         failed.error
     );
 
-    let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
+    // The daemon terminal message persists the execution outcome before the
+    // task recovery projection is applied. Wait for both durable records so
+    // this assertion remains deterministic under workspace-wide test load.
+    let task = poll_failed_task_recovery_state(&fixture.harness.state.db, &task_id).await;
     assert_eq!(task.status, "in_progress");
     assert!(
         task.blocked_json.is_some(),

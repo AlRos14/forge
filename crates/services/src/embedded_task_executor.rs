@@ -186,7 +186,9 @@ impl EmbeddedTaskExecutor {
                     scope: CanonicalScope {
                         scope_type: CanonicalScopeType::Task,
                         scope_id: ctx.task_id.clone(),
-                        workspace_access: if role == "reviewer" {
+                        workspace_access: if role == "reviewer"
+                            || executors::is_worktree_read_only(&ctx.agent_config)
+                        {
                             WorkspaceAccess::TaskRead
                         } else {
                             WorkspaceAccess::TaskWrite
@@ -391,7 +393,9 @@ impl EmbeddedTaskExecutor {
                     "Task runtime context manifest idempotency conflict",
                 ));
             }
-            let existing_sources = service.sources(manifest_id).await?;
+            let existing_sources = service
+                .sources(manifest_id, identity_id, context_scope_id)
+                .await?;
             for source in &sources {
                 if existing_sources.iter().any(|stored| {
                     stored.ordinal == source.ordinal
@@ -400,7 +404,9 @@ impl EmbeddedTaskExecutor {
                 }) {
                     continue;
                 }
-                service.append_source(manifest_id, source.clone()).await?;
+                service
+                    .append_source(manifest_id, identity_id, context_scope_id, source.clone())
+                    .await?;
             }
             return Ok(());
         }
@@ -429,7 +435,12 @@ impl EmbeddedTaskExecutor {
             .await?;
         for source in sources {
             service
-                .append_source(manifest_uuid(&created)?, source)
+                .append_source(
+                    manifest_uuid(&created)?,
+                    identity_id,
+                    context_scope_id,
+                    source,
+                )
                 .await?;
         }
         Ok(())

@@ -124,6 +124,7 @@ impl SqliteProtectedRuntimeStore {
                     chat.kind AS agent_chat_kind,
                     chat.project_id AS agent_chat_project_id,
                     binding.permission_ceiling_json AS binding_permission_ceiling,
+                    bound_project.charter_setup_required AS project_charter_setup_required,
                     workspace.worktree_path
              FROM agent_session AS session
              JOIN agent_identity AS identity
@@ -140,8 +141,13 @@ impl SqliteProtectedRuntimeStore {
                     WHEN scope.scope_type = 'agent_chat' THEN chat.project_id
                     ELSE scope.project_id
                   END
-              AND binding.identity_id = session.identity_id
-              AND binding.state = 'active'
+             AND binding.identity_id = session.identity_id
+             AND binding.state = 'active'
+             LEFT JOIN project AS bound_project
+               ON bound_project.id = CASE
+                    WHEN scope.scope_type = 'agent_chat' THEN chat.project_id
+                    ELSE scope.project_id
+                  END
              LEFT JOIN workspace
                ON workspace.task_id = scope.scope_id
               AND workspace.status IN ('creating', 'ready', 'error')
@@ -200,6 +206,10 @@ impl SqliteProtectedRuntimeStore {
         let binding_permission_ceiling: Option<String> = row
             .try_get("binding_permission_ceiling")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let project_charter_setup_required: bool = row
+            .try_get::<Option<i64>, _>("project_charter_setup_required")
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+            .is_some_and(|value| value != 0);
         let scope_type = match scope_type.as_str() {
             "account" => crate::CanonicalScopeType::Account,
             "project" => crate::CanonicalScopeType::Project,
@@ -299,6 +309,7 @@ impl SqliteProtectedRuntimeStore {
                 scope.scope_type,
                 scope.workspace_access,
                 agent_chat_project_id.is_some(),
+                project_charter_setup_required,
             ),
         );
         if let Some(binding_permissions) = binding_permission_ceiling {
@@ -313,6 +324,7 @@ impl SqliteProtectedRuntimeStore {
             task_role,
             workspace_path: persisted_workspace_path,
             agent_chat_project_id,
+            project_charter_setup_required,
             allowed_permissions,
         })
     }
@@ -527,6 +539,7 @@ fn scope_permission_set(
     scope_type: crate::CanonicalScopeType,
     workspace_access: crate::WorkspaceAccess,
     project_agent_chat: bool,
+    project_charter_setup_required: bool,
 ) -> BTreeSet<String> {
     let mut values: Vec<&str> = match scope_type {
         crate::CanonicalScopeType::Account => vec![
@@ -534,30 +547,33 @@ fn scope_permission_set(
             "propose_discovery",
             "propose_project",
             "propose_handoff",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_session",
         ],
-        crate::CanonicalScopeType::Project => vec![
-            "read_project",
-            "read_memory",
-            "propose_task",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_review",
-            "propose_decision",
-            "propose_session",
-        ],
-        crate::CanonicalScopeType::AgentChat => vec![
-            "read_agent_chat",
-            "read_memory",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_session",
-        ],
+        crate::CanonicalScopeType::Project => {
+            let mut project = vec![
+                "read_project",
+                "read_memory",
+                "propose_project",
+                "propose_message",
+            ];
+            if !project_charter_setup_required {
+                project.extend([
+                    "propose_task",
+                    "propose_commitment",
+                    "propose_memory",
+                    "propose_review",
+                    "propose_decision",
+                    "propose_session",
+                ]);
+            }
+            project
+        }
+        crate::CanonicalScopeType::AgentChat => {
+            let mut chat = vec!["read_agent_chat", "read_memory", "propose_message"];
+            if project_agent_chat && !project_charter_setup_required {
+                chat.extend(["propose_commitment", "propose_memory", "propose_session"]);
+            }
+            chat
+        }
         crate::CanonicalScopeType::Task => match workspace_access {
             crate::WorkspaceAccess::TaskRead => {
                 vec!["read_task", "read_memory", "task_read", "propose_review"]
@@ -569,7 +585,10 @@ fn scope_permission_set(
         },
     };
     if matches!(scope_type, crate::CanonicalScopeType::AgentChat) && project_agent_chat {
-        values.push("propose_task");
+        values.push("propose_project");
+        if !project_charter_setup_required {
+            values.push("propose_task");
+        }
     } else if matches!(scope_type, crate::CanonicalScopeType::AgentChat) {
         values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
     }
@@ -749,6 +768,7 @@ mod tests {
                 crate::CanonicalScopeType::Project,
                 crate::WorkspaceAccess::Deny,
                 false,
+                false,
             ),
         );
         assert!(malformed.is_empty());
@@ -760,6 +780,7 @@ mod tests {
             crate::CanonicalScopeType::Task,
             crate::WorkspaceAccess::TaskWrite,
             false,
+            false,
         );
         assert!(task.contains("task_read"));
         assert!(task.contains("task_write"));
@@ -768,8 +789,25 @@ mod tests {
             crate::CanonicalScopeType::Project,
             crate::WorkspaceAccess::Deny,
             false,
+            false,
         );
         assert!(!project.contains("task_read"));
         assert!(!project.contains("task_write"));
+    }
+
+    #[test]
+    fn legacy_project_setup_scope_keeps_only_adoption_permission() {
+        let setup = scope_permission_set(
+            crate::CanonicalScopeType::Project,
+            crate::WorkspaceAccess::Deny,
+            true,
+            true,
+        );
+        assert!(setup.contains("read_project"));
+        assert!(setup.contains("propose_project"));
+        assert!(setup.contains("propose_message"));
+        assert!(!setup.contains("propose_task"));
+        assert!(!setup.contains("propose_review"));
+        assert!(!setup.contains("propose_session"));
     }
 }

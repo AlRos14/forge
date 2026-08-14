@@ -189,7 +189,7 @@ impl AgentChatScope {
                 AgentChatOperation::ProjectRead => Err(AgentChatPolicyError::OperationUnavailable),
             },
             Self::Project { project_id, .. } => match operation {
-                AgentChatOperation::ProjectRead => Ok(()),
+                AgentChatOperation::ProjectRead | AgentChatOperation::WebSearch => Ok(()),
                 AgentChatOperation::TaskManagement => {
                     let Some(target_project_id) = target_project_id else {
                         return Err(AgentChatPolicyError::ProjectTaskTargetRequired);
@@ -204,7 +204,6 @@ impl AgentChatScope {
                     Err(AgentChatPolicyError::RepositoryDenied)
                 }
                 AgentChatOperation::Discovery
-                | AgentChatOperation::WebSearch
                 | AgentChatOperation::ProjectLifecycle
                 | AgentChatOperation::PortfolioRead
                 | AgentChatOperation::HandoffPublish => {
@@ -244,6 +243,15 @@ mod tests {
     }
 
     #[test]
+    fn main_chat_allows_bounded_public_web_search() {
+        let scope = AgentChatScope::main("account-1");
+        assert_eq!(
+            scope.authorize(AgentChatOperation::WebSearch, Some("forged-project")),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn project_chat_can_manage_only_its_bound_project() {
         let scope = AgentChatScope::project("account-1", "project-1");
         assert_eq!(
@@ -271,6 +279,13 @@ mod tests {
             scope.authorize(AgentChatOperation::RepositoryWrite, Some("project-1")),
             Err(AgentChatPolicyError::RepositoryDenied)
         );
+    }
+
+    #[test]
+    fn project_chat_allows_bounded_public_web_search_only_as_project_scope() {
+        let scope = AgentChatScope::project("account-1", "project-1");
+        assert_eq!(scope.authorize(AgentChatOperation::WebSearch, None), Ok(()));
+        assert_eq!(scope.project_id(), Some("project-1"));
     }
 
     #[test]

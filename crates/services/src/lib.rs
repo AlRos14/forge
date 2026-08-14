@@ -23,25 +23,36 @@ pub mod domain_event_service;
 pub mod embedded_agent_service;
 pub mod embedded_daemon;
 pub mod embedded_task_executor;
+pub mod execution_baseline;
 pub mod external_api;
 pub mod external_sync;
 pub mod integration_service;
 pub mod lifecycle;
+pub mod main_orchestration_actions;
 pub mod memory;
 pub mod memory_source;
 pub mod merge_service;
+pub mod milestone_orchestration;
+pub mod milestone_runtime;
 pub mod native_tools;
 pub mod notification_service;
 pub mod oauth_service;
+pub mod operating_skills;
 pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod plan_artifact;
 pub mod pr_service;
 pub mod product_genesis;
+pub mod project_agent_actions;
+pub mod project_creation;
+pub mod project_documents;
 pub mod project_hooks;
 pub mod project_member_service;
+pub mod project_orchestration;
+pub mod project_runtime;
 pub mod prompt_preview;
 pub mod recovery;
+pub mod shared_media_cleanup;
 pub mod shutdown;
 pub mod task_diagnostics;
 pub mod task_dispatcher;
@@ -106,8 +117,17 @@ pub use domain_event_service::DomainEventService;
 pub use embedded_agent_service::EmbeddedAgentService;
 pub use embedded_daemon::EmbeddedDaemon;
 pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
+pub use execution_baseline::{
+    baseline_column_json, render_execution_baseline, validate_execution_baseline_policy,
+    BaselineColumnJson, ExecutionBaselineRender, EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
+    EXECUTION_BASELINE_RENDER_VERSION, EXECUTION_BASELINE_SCHEMA_VERSION,
+};
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
+pub use main_orchestration_actions::{
+    is_main_orchestration_operation, ExecuteMainOrchestrationActionInput,
+    MainOrchestrationActionService,
+};
 pub use memory::{
     BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
     MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
@@ -118,9 +138,31 @@ pub use memory_source::{
     MemorySourceBindingInput,
 };
 pub use merge_service::{MergeOutcome, MergeService};
+pub use milestone_orchestration::{
+    evaluate_readiness, milestone_identity, principals_equal, recompute_readiness_digest,
+    release_identity, release_snapshot_digest, validate_definition_transition,
+    validate_independent_principal, validate_milestone_transition, validate_primary_milestone,
+    validate_project_agent_action, validate_release_actor, verify_release_candidate,
+    MilestoneOrchestrationError, PrincipalAction, ReadinessDocumentState, ReadinessEvaluation,
+    ReadinessEvaluationInput, ReadinessTaskState, ReleaseCandidateVerification,
+    MILESTONE_READINESS_DIGEST_SCHEMA_VERSION, MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION,
+};
+pub use milestone_runtime::{validate_release_policy, MilestoneRuntime};
 pub use native_tools::CoordinationToolProvider;
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
+pub use operating_skills::{
+    canonical_main_operating_skill_body, canonical_project_operating_skill_body,
+    main_operating_skill_active, render_main_operating_skill, render_project_operating_skill,
+    EffectiveProjectStateContext, MainOperatingSkillContext, ProjectOperatingSkillContext,
+    MAIN_OPERATING_SKILL_CONTENT_DIGEST, MAIN_OPERATING_SKILL_KEY,
+    MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
+    MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
+    MAIN_OPERATING_SKILL_VERSION, PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
+    PROJECT_OPERATING_SKILL_KEY, PROJECT_OPERATING_SKILL_POLICY_DIGEST,
+    PROJECT_OPERATING_SKILL_POLICY_JSON, PROJECT_OPERATING_SKILL_RENDER_VERSION,
+    PROJECT_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_VERSION,
+};
 pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
 pub use product_genesis::{
@@ -129,10 +171,38 @@ pub use product_genesis::{
     ProductGenesisStore, SqliteProductGenesisStore, TransitionProductGenesis,
     PRODUCT_GENESIS_PROMPT_VERSION,
 };
+pub use project_agent_actions::{
+    is_project_orchestration_operation, ExecuteProjectOrchestrationActionInput,
+    ProjectOrchestrationActionService,
+};
+pub use project_creation::{
+    create_project_from_charter_approval, CreateProjectAuthorization,
+    CreateProjectFromCharterApprovalInput,
+};
+pub use project_documents::{
+    diff_project_document_views, document_content_digest, document_kind_name,
+    document_render_digest, parse_document_kind, parse_document_revision_lifecycle,
+    render_project_document, render_project_document_json, PROJECT_DOCUMENT_RENDER_VERSION,
+    PROJECT_DOCUMENT_SCHEMA_VERSION,
+};
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
+pub use project_orchestration::{
+    charter_change_summary, charter_content_digest, charter_render_digest, compute_charter_digests,
+    diff_project_charter_content, evaluate_charter_readiness, evaluate_project_charter_readiness,
+    render_and_digest_charter, render_charter, render_charter_markdown, render_project_charter,
+    semantic_revision_diff, semantic_revision_diff_between, try_charter_content_digest,
+    try_charter_render_digest, validate_approval_candidate, validate_charter_approval_candidate,
+    CharterApprovalValidationError, CharterFieldChange, CharterRender, CharterRevisionDiff,
+    CHARTER_DIFF_VERSION, CHARTER_READINESS_POLICY_VERSION, PROJECT_CHARTER_RENDER_VERSION,
+};
+pub use project_runtime::{
+    load_effective_project_state, ProjectCommitmentProjection, ProjectCurrentStateResponse,
+    ProjectEffectiveStateProjection, ProjectInboxProjection,
+};
 pub use prompt_preview::preview_effective_prompt;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
+pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{NewSubtaskInput, TaskService};
@@ -163,6 +233,9 @@ pub enum ServiceError {
 
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },
+
+    #[error("authorization denied: {message}")]
+    AuthorizationDenied { message: String },
 
     #[error("task action unavailable: {reason}")]
     TaskActionUnavailable {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Forge Main Agent"
+  short_description: "Discover and charter new Forge Projects"
+  default_prompt: "Use $forge-main-agent to turn this idea into an approved Project Charter and handoff."

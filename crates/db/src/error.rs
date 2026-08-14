@@ -13,6 +13,9 @@ pub enum DbError {
     #[error("version conflict")]
     VersionConflict,
 
+    #[error("idempotency key conflicts with a different mutation")]
+    IdempotencyConflict,
+
     #[error("task version conflict: expected {expected}, actual {actual}")]
     TaskVersionConflict { expected: i64, actual: i64 },
 

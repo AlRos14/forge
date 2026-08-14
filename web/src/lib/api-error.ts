@@ -35,6 +35,23 @@ export function getApiErrorCode(error: unknown): string | undefined {
   }
 }
 
+export type ApiConflictDetails = Record<string, unknown>
+
+function isRecord(value: unknown): value is ApiConflictDetails {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Return server-provided conflict metadata without exposing arbitrary error bodies in the UI. */
+export function getApiConflictDetails(error: unknown): ApiConflictDetails | undefined {
+  if (!(error instanceof ApiError)) return undefined
+  try {
+    const parsed = JSON.parse(error.message) as { details?: unknown }
+    return isRecord(parsed.details) ? parsed.details : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function toastApiError(error: unknown, fallback?: string): void {
   toast.error(getApiErrorMessage(error, fallback))
 }

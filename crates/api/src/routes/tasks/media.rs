@@ -192,9 +192,17 @@ pub async fn delete_media(
         .await?
         .ok_or_else(|| ApiError::not_found("media", media_id.clone()))?;
     require_task_media_delete_access(&state, &media.task_id, &user).await?;
+    let asset = SharedMediaRepo::get_media_asset_for_task_media(&*state.db, &media.id).await?;
     let deleted_at = now_rfc3339();
     let deleted = TaskMediaRepo::soft_delete_media(&*state.db, &media_id, &deleted_at).await?;
-    remove_media_file(&state, &media.storage_key)?;
+    if let Some(asset) = asset {
+        maybe_collect_media_asset(&state, &asset.id, &asset.storage_key, &deleted_at).await?;
+    } else {
+        // Databases created before the additive media metadata migration have
+        // no asset row yet.  Keep the historical behavior for that narrow
+        // fallback; normal migrated databases always take the guarded path.
+        remove_media_file(&state, &media.storage_key)?;
+    }
     publish_media_deleted(&state, &deleted);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -202,6 +210,7 @@ pub async fn delete_media(
 pub(crate) async fn delete_task_media_for_task(state: &AppState, task_id: &str) -> ApiResult<()> {
     let media = TaskMediaRepo::list_active_media_for_task(&*state.db, task_id).await?;
     for item in media {
+        let asset = SharedMediaRepo::get_media_asset_for_task_media(&*state.db, &item.id).await?;
         let deleted_at = now_rfc3339();
         let deleted =
             match TaskMediaRepo::soft_delete_media(&*state.db, &item.id, &deleted_at).await {
@@ -209,9 +218,70 @@ pub(crate) async fn delete_task_media_for_task(state: &AppState, task_id: &str) 
                 Err(db::DbError::NotFound) => continue,
                 Err(error) => return Err(error.into()),
             };
-        remove_media_file(state, &item.storage_key)?;
+        if let Some(asset) = asset {
+            maybe_collect_media_asset(state, &asset.id, &asset.storage_key, &deleted_at).await?;
+        } else {
+            remove_media_file(state, &item.storage_key)?;
+        }
         publish_media_deleted(state, &deleted);
     }
+    Ok(())
+}
+
+/// Claim and remove one unreferenced shared asset.  The claim is a guarded
+/// database transaction: active Project attachments, active Task references,
+/// and non-purged release pins are rechecked before the asset enters
+/// `gc_queued`.  Attachment/pin writers reject queued assets, so a cleanup
+/// worker can safely remove the existing bytes and then finalize the tombstone.
+/// A queued row is deliberately restartable; if the process dies after file
+/// removal, the next pass completes the idempotent database transition.
+async fn maybe_collect_media_asset(
+    state: &AppState,
+    asset_id: &str,
+    storage_key: &str,
+    now: &str,
+) -> ApiResult<()> {
+    let lease_owner = format!("task-media-delete:{}", db::new_uuid_v4());
+    let lease_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let candidate = SharedMediaRepo::claim_media_gc_candidate(
+        &*state.db,
+        asset_id,
+        now,
+        &lease_owner,
+        &lease_expires_at,
+    )
+    .await?;
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    if candidate.storage_key != storage_key {
+        return Err(ApiError::internal("shared media storage metadata changed"));
+    }
+
+    let path = media_storage_path(state, &candidate.storage_key)?;
+    if let Err(error) = remove_file_if_exists(&path) {
+        let _ = SharedMediaRepo::reset_media_gc_candidate(
+            &*state.db,
+            asset_id,
+            &lease_owner,
+            candidate.version,
+            now,
+        )
+        .await;
+        return Err(error);
+    }
+
+    // Finalization rechecks every reference in a fresh transaction and
+    // requires the exact persisted lease/version.  The schema also rejects
+    // direct SQL attempts to create a live attachment or pin while queued.
+    let _ = SharedMediaRepo::complete_media_gc(
+        &*state.db,
+        asset_id,
+        &lease_owner,
+        candidate.version,
+        now,
+    )
+    .await?;
     Ok(())
 }
 
@@ -352,7 +422,7 @@ async fn require_project_media_access(
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.is_none() {
+    if project.owner_id.as_deref() == Some(user.user_id.as_str()) || project.owner_id.is_none() {
         return Ok(());
     }
     let member = db::ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id).await?;
@@ -370,7 +440,7 @@ async fn require_project_media_delete_access(
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.is_none() {
+    if project.owner_id.as_deref() == Some(user.user_id.as_str()) || project.owner_id.is_none() {
         return Ok(());
     }
     let member = db::ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id)

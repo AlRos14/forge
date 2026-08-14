@@ -6,7 +6,10 @@ use crate::{
     project_hooks::{parse_project_hooks_json, ProjectHookRule},
     LifecycleEvent,
 };
-use crate::{InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskStatus, TaskType, WorkMode};
+use crate::{
+    InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
+    TaskType, WorkMode,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +24,10 @@ pub struct CreateTaskRequest {
     pub merge_config: Option<Value>,
     #[serde(default)]
     pub role_assignments: Option<Vec<InitialRoleAssignment>>,
+    /// Immutable Charter/baseline/milestone provenance for Charter-backed
+    /// implementation Tasks. Discovery/planning Tasks may omit it.
+    #[serde(default)]
+    pub governance: Option<TaskGovernanceRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -133,6 +140,7 @@ pub struct RejectGateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProjectRequest {
     pub name: String,
     pub settings: Option<Value>,
@@ -145,11 +153,6 @@ pub struct CreateProjectRequest {
     pub project_agent_identity_id: Option<String>,
     #[serde(default)]
     pub project_agent_profile_id: Option<String>,
-    /// Optional authenticated Product Genesis session being materialized.
-    /// The server treats this as a lookup/reference and verifies ownership,
-    /// readiness, and optimistic version before linking the created Project.
-    #[serde(default)]
-    pub product_genesis_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

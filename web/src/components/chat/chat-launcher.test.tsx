@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ChatLauncher } from './chat-launcher'
 import type { AgentChat, AgentChatEntry } from '@/features/agent-chat/types'
@@ -148,5 +148,41 @@ describe('ChatLauncher', () => {
 
     expect(screen.queryByTestId('launcher-timeline')).toBeNull()
     expect(screen.getByText(/setup required/i)).toBeTruthy()
+  })
+
+  it('moves focus into the panel and returns it to the launcher on Escape', async () => {
+    mocks.useAgentChatsQuery.mockReturnValue({
+      data: { items: [mainEntry] },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    })
+    mocks.useAgentChatQuery.mockReturnValue({
+      data: mainChat,
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    })
+    mocks.useSendAgentChatMessageMutation.mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    })
+    mocks.useCancelAgentChatTurnMutation.mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    })
+
+    render(<ChatLauncher />)
+    const launcher = screen.getByRole('button', { name: 'Open global chat' })
+    fireEvent.click(launcher)
+
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole('heading', { name: 'Global · Main' }),
+      ),
+    )
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(document.activeElement).toBe(launcher))
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 })

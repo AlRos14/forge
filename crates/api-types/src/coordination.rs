@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::{InitialRoleAssignment, TaskResponse, TaskType};
+use crate::{InitialRoleAssignment, TaskGovernanceRequest, TaskResponse, TaskType};
 
 /// Durable commitment representation.  The owner is an identity, while the
 /// actor performing a lifecycle operation is authenticated by the API and is
@@ -33,6 +33,7 @@ pub struct CommitmentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCommitmentRequest {
     pub scope_type: String,
     pub scope_id: String,
@@ -48,6 +49,7 @@ pub struct CreateCommitmentRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateCommitmentRequest {
     pub expected_version: i64,
     pub status: Option<String>,
@@ -66,6 +68,7 @@ pub struct UpdateCommitmentRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct CompleteCommitmentRequest {
     pub expected_version: i64,
     pub evidence_type: String,
@@ -79,6 +82,7 @@ pub struct CompleteCommitmentRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct TransferCommitmentRequest {
     pub expected_version: i64,
     pub to_identity_id: String,
@@ -106,6 +110,7 @@ pub struct CommitmentEvidenceResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct CoordinationListQuery {
     pub status: Option<String>,
     pub scope_type: Option<String>,
@@ -140,6 +145,7 @@ pub struct InboxItemResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateInboxItemRequest {
     pub expected_version: i64,
     pub status: String,
@@ -147,6 +153,7 @@ pub struct UpdateInboxItemRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct AskQuestionRequest {
     pub scope_type: String,
     pub scope_id: String,
@@ -186,6 +193,7 @@ pub struct QuestionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct AnswerQuestionRequest {
     pub expected_version: i64,
     pub answer: String,
@@ -215,6 +223,7 @@ pub struct AgentActionResponse {
     pub target_id: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]
     pub outcome: Option<Value>,
+    pub materialized: bool,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -222,6 +231,7 @@ pub struct AgentActionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct ProposeActionRequest {
     pub scope_type: String,
     pub scope_id: String,
@@ -238,6 +248,7 @@ pub struct ProposeActionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct TaskProposalRequest {
     pub project_id: String,
     pub title: String,
@@ -249,6 +260,8 @@ pub struct TaskProposalRequest {
     #[ts(type = "Record<string, unknown> | null")]
     pub merge_config: Option<Value>,
     pub role_assignments: Option<Vec<InitialRoleAssignment>>,
+    #[serde(default)]
+    pub governance: Option<TaskGovernanceRequest>,
     pub dedupe_key: String,
     pub correlation_id: String,
     pub causation_id: Option<String>,
@@ -257,6 +270,7 @@ pub struct TaskProposalRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct ApproveActionRequest {
     pub expected_version: i64,
     /// The API verifies this identity is owned by the authenticated account
@@ -268,6 +282,7 @@ pub struct ApproveActionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteActionRequest {
     pub expected_version: i64,
     pub attempt: Option<i64>,
@@ -277,8 +292,21 @@ pub struct ExecuteActionRequest {
     pub idempotency_key: String,
 }
 
+/// Executes a Main Agent orchestration proposal through its typed domain
+/// materializer. Generic action execution deliberately does not accept these
+/// operations because an arbitrary result would not prove that the Charter
+/// or Project domain mutation actually occurred.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteOrchestrationActionRequest {
+    pub expected_version: i64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteTaskProposalRequest {
     pub expected_version: i64,
     pub idempotency_key: String,
@@ -312,7 +340,49 @@ pub struct TaskProposalExecutionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
     use serde_json::json;
+
+    fn assert_rejects_unknown_field<T>(mut request: serde_json::Value)
+    where
+        T: DeserializeOwned,
+    {
+        request
+            .as_object_mut()
+            .expect("request envelope object")
+            .insert("unexpected_field".to_owned(), json!(true));
+        assert!(
+            serde_json::from_value::<T>(request).is_err(),
+            "request envelope silently accepted an unknown field"
+        );
+    }
+
+    #[test]
+    fn typed_coordination_envelopes_reject_unknown_fields() {
+        assert_rejects_unknown_field::<ExecuteOrchestrationActionRequest>(json!({
+            "expected_version": 1,
+            "idempotency_key": "execute-1"
+        }));
+        assert_rejects_unknown_field::<ExecuteTaskProposalRequest>(json!({
+            "expected_version": 1,
+            "idempotency_key": "execute-task-1"
+        }));
+        assert_rejects_unknown_field::<TaskProposalRequest>(json!({
+            "project_id": "project-1",
+            "title": "Bounded task",
+            "dedupe_key": "task-1",
+            "correlation_id": "correlation-1"
+        }));
+        assert_rejects_unknown_field::<ProposeActionRequest>(json!({
+            "scope_type": "account",
+            "scope_id": "account-1",
+            "operation": "charter.draft",
+            "payload": {},
+            "dedupe_key": "action-1",
+            "correlation_id": "correlation-1"
+        }));
+        assert_rejects_unknown_field::<CoordinationListQuery>(json!({}));
+    }
 
     #[test]
     fn task_proposal_rejects_unknown_task_type() {

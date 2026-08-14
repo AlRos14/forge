@@ -35,7 +35,9 @@ describe('AgentChatSwitcher', () => {
     expect(screen.getByRole('button', { name: /Global · Main/ }).getAttribute('aria-current')).toBe(
       'page',
     )
-    expect(screen.getByRole('button', { name: /Atlas: Project-owned/ })).toBeTruthy()
+    expect(
+      screen.getByRole('button', { name: /Atlas: Project-owned.*1 turn pending/ }),
+    ).toBeTruthy()
     expect(screen.getByText('1 turn pending')).toBeTruthy()
     expect(screen.queryByText(/Start a new chat|No eligible agents/)).toBeNull()
     expect(screen.queryByRole('button', { name: /Atlas Agent/ })).toBeNull()
@@ -63,7 +65,47 @@ describe('AgentChatSwitcher', () => {
       />,
     )
 
+    expect(screen.getByRole('button', { name: /Global · Main:.*Setup required/ })).toBeTruthy()
     expect(screen.getByText('Setup required')).toBeTruthy()
     expect(screen.getByText('No Project Agent chats are available yet.')).toBeTruthy()
+    expect(screen.getByRole('navigation', { name: 'Agent chat switcher' })).toBeTruthy()
+  })
+
+  it('distinguishes loading and unavailable Project chat lists', () => {
+    const { rerender } = render(
+      <AgentChatSwitcher
+        globalEntry={{
+          id: 'main-chat',
+          label: 'Global · Main',
+          description: 'Account-owned Main Agent timeline',
+          state: 'loading',
+        }}
+        projectEntries={[]}
+        projectListState="loading"
+        onSelectGlobal={vi.fn()}
+        onSelectProject={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: /Global · Main:.*Loading/ }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByText('Loading Project Agent chats…')).toBeTruthy()
+
+    rerender(
+      <AgentChatSwitcher
+        globalEntry={{
+          id: 'main-chat',
+          label: 'Global · Main',
+          description: 'Account-owned Main Agent timeline',
+          state: 'unavailable',
+        }}
+        projectEntries={[]}
+        projectListState="error"
+        onSelectGlobal={vi.fn()}
+        onSelectProject={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: /Global · Main:.*Unavailable/ })).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toContain('Project Agent chats unavailable')
   })
 })

@@ -58,6 +58,10 @@ pub struct ProductGenesisSession {
     pub lifecycle: ProductGenesisLifecycle,
     pub source_message_ids: Vec<String>,
     pub preferred_project_agent_identity_id: Option<String>,
+    pub charter_id: Option<String>,
+    pub charter_revision_id: Option<String>,
+    pub charter_approval_id: Option<String>,
+    pub charter_version: i64,
     pub project_id: Option<String>,
     pub handoff_id: Option<String>,
     pub failure_reason: Option<String>,
@@ -68,6 +72,7 @@ pub struct ProductGenesisSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct StartProductGenesisRequest {
     pub maturity: Option<ProductMaturity>,
     pub initial_idea: Option<String>,
@@ -76,18 +81,10 @@ pub struct StartProductGenesisRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct CancelProductGenesisRequest {
     pub expected_version: i64,
     pub reason: Option<String>,
-}
-
-/// A typed readiness acknowledgement from the Main discovery protocol. The
-/// Project creation request remains a separate normal Project mutation so its
-/// atomic chat/binding transaction is reused rather than duplicated here.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub struct ReadyProductGenesisRequest {
-    pub expected_version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -102,4 +99,25 @@ pub struct ProductGenesisStartResponse {
 #[ts(export)]
 pub struct ProductGenesisActiveResponse {
     pub session: Option<ProductGenesisSession>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn genesis_mutation_requests_reject_unknown_fields() {
+        let start = serde_json::from_value::<StartProductGenesisRequest>(json!({
+            "maturity": "mvp",
+            "unknown": true,
+        }));
+        assert!(start.is_err());
+
+        let cancel = serde_json::from_value::<CancelProductGenesisRequest>(json!({
+            "expected_version": 1,
+            "unknown": true,
+        }));
+        assert!(cancel.is_err());
+    }
 }
