@@ -63,6 +63,7 @@ const TURN_LEASE_SECONDS: i64 = 120;
 const MAX_ACTIVE_TURNS: usize = 32;
 const MAX_HISTORY: i64 = 100;
 const MAX_ERROR_CHARS: usize = 512;
+const MAX_CLI_ASSISTANT_CHARS: usize = 500;
 const PROJECT_HANDOFF_SCHEMA_VERSION: &str = "forge.project-charter-handoff/v1";
 const PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION: &str = "forge.project-context-reference/v1";
 const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
@@ -3962,7 +3963,7 @@ fn main_operating_context_sources(
 }
 
 fn cli_result_content(result: ExecutionResult) -> Result<String> {
-    match result.status {
+    let content = match result.status {
         ExecutionOutcome::Completed => result
             .assistant_output
             .or(result.summary)
@@ -3974,7 +3975,12 @@ fn cli_result_content(result: ExecutionResult) -> Result<String> {
         ExecutionOutcome::Failed => Err(ServiceError::invalid_operation(
             "Agent Chat CLI turn failed",
         )),
-    }
+    }?;
+    Ok(if content.chars().count() <= MAX_CLI_ASSISTANT_CHARS {
+        content
+    } else {
+        content.chars().take(MAX_CLI_ASSISTANT_CHARS).collect()
+    })
 }
 
 fn cli_executor_snapshot(executor_type: &str, config: Value) -> Value {
@@ -4050,6 +4056,17 @@ mod tests {
         assert_eq!(snapshot["executor_type"], "smith");
         assert_eq!(snapshot["config"]["profile"], "luna");
         assert_eq!(snapshot["config"]["approval"], "deny");
+    }
+
+    #[test]
+    fn cli_assistant_output_is_bounded_before_persistence() {
+        let content = cli_result_content(ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            assistant_output: Some("x".repeat(MAX_CLI_ASSISTANT_CHARS + 100)),
+            ..Default::default()
+        })
+        .expect("completed CLI output is admitted");
+        assert_eq!(content.chars().count(), MAX_CLI_ASSISTANT_CHARS);
     }
 
     #[test]

@@ -952,6 +952,19 @@ async fn queued_gc_is_restartable_and_rejects_new_typed_references() {
     .await
     .expect("restarted finalize")
     .expect("restarted tombstone");
+
+    let unreconciled = SharedMediaRepo::list_purged_media_assets(&restarted, 32)
+        .await
+        .expect("purged reconciliation list");
+    assert_eq!(unreconciled.len(), 1);
+    assert_eq!(unreconciled[0].id, media.id);
+    SharedMediaRepo::mark_purged_media_asset_reconciled(&restarted, &media.id, &now)
+        .await
+        .expect("purge reconciliation marker");
+    assert!(SharedMediaRepo::list_purged_media_assets(&restarted, 32)
+        .await
+        .expect("advanced purge reconciliation list")
+        .is_empty());
 }
 
 // Keep the import in this integration test explicit: it makes accidental use

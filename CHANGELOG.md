@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-08-14
+
 ### Breaking
 
 - Coordination mutation and typed execution envelopes now reject unknown JSON
@@ -119,12 +121,35 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   follow-up before mutating Task state.
 - HTTP request tracing records only the request path, preventing access tokens
   and other sensitive query parameters from being written to server logs.
-- Smith-backed Agent Chat preserves the complete assistant response while Task
-  projections retain their existing bounded 500-character summary.
+- Smith-backed Agent Chat bounds admitted assistant output to 500 characters
+  before chat-history, semantic-memory, and FTS persistence, preventing a
+  verbose turn from amplifying every later CLI prompt.
 - CLI-backed Agent Chat turns now pass the executor/config snapshot required by
   the shared adapter, Product Genesis closes when the handoff cites the Main
   Agent's response, and typed Task proposals reject unknown task types before
   persistence instead of surfacing a SQLite constraint failure.
+- Running repository executions renew their scheduler-owned WorkspaceLease
+  while the exact execution and authority bindings remain valid. Charter-backed
+  Task creation derives omitted governance instead of failing mainstream
+  clients, and the pre-baseline discovery/planning read-only lane now passes
+  transactional execution admission.
+- Charter-backed Projects can be deleted through a guarded transactional
+  teardown without weakening immutable-row protections. Milestone projections
+  accept typed check/evidence blockers, Project Agent definitions use canonical
+  `Mxxx` keys, primary-pointer validation applies only to active milestones,
+  and Project Agent readiness now computes a snapshot rather than emitting an
+  unconsumed request.
+- Nested artifact fields named `scope` no longer masquerade as authority
+  overrides, while root authority fields remain denied. Approval and manual
+  check idempotency keys are scoped to their operation, Project/account, and
+  authenticated principal, with access checks before replay lookup.
+- Approved Documents and canonical context-manifest pointers now project fresh
+  state correctly. Closed Task proposal payloads are validated before action
+  admission, and malformed payloads cannot become approved-but-unexecutable
+  ledger entries.
+- Shared-media cleanup isolates per-row/per-phase failures and checkpoints
+  reconciled purges, so one poisoned asset cannot halt garbage collection or
+  permanently pin the sweep to its first page.
 
 ## [0.7.3] - 2026-08-09
 

@@ -455,9 +455,9 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     let fixture = create_genesis_project(app, &token, "v076-typed").await;
     let baseline = create_active_baseline(app, &token, &fixture).await;
 
-    // A Charter-backed Task proposal without its exact governing baseline
-    // provenance may be recorded as a non-authoritative proposal, but the
-    // typed executor must reject it before any Task row is materialized.
+    // Mainstream Task surfaces may omit the orchestration envelope. Forge
+    // derives the current Charter binding and persists a non-runnable Task;
+    // exact baseline provenance is still required before repository work.
     let missing_governance = request_json(
         app,
         Method::POST,
@@ -469,7 +469,7 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         json!({
             "project_id": fixture.project_id,
             "title": "V076 ungoverned task",
-            "description": "Missing governance must remain non-materialized.",
+            "description": "Missing governance is safely derived at materialization.",
             "role_assignments": [],
             "dedupe_key": "v076-task-proposal-missing-governance",
             "correlation_id": "v076-task-proposal-missing-governance-correlation"
@@ -482,7 +482,7 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     let missing_governance_version = missing_governance["version"]
         .as_i64()
         .expect("ungoverned action version");
-    let denied = request_json(
+    let derived = request_json(
         app,
         Method::POST,
         &format!("/api/v1/actions/{missing_governance_id}/execute-task"),
@@ -491,10 +491,29 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
             "expected_version": missing_governance_version,
             "idempotency_key": "v076-task-execution-missing-governance"
         }),
-        &[StatusCode::BAD_REQUEST],
+        &[StatusCode::OK],
     )
     .await;
-    assert_eq!(denied["code"], json!("invalid_operation"));
+    let derived_task_id = required_string(&derived, &["task", "id"]);
+    let derived_governance = sqlx::query(
+        "SELECT charter_revision_id, baseline_id, baseline_revision_id, runnable
+         FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&derived_task_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("derived Task governance");
+    assert_eq!(
+        derived_governance.get::<String, _>("charter_revision_id"),
+        fixture.charter_revision_id
+    );
+    assert!(derived_governance
+        .get::<Option<String>, _>("baseline_id")
+        .is_none());
+    assert!(derived_governance
+        .get::<Option<String>, _>("baseline_revision_id")
+        .is_none());
+    assert_eq!(derived_governance.get::<i64, _>("runnable"), 0);
 
     // The existing typed Task executor is the authoritative Project Agent
     // materializer: proposal first, then an explicit user execution.

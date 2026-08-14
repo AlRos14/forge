@@ -653,31 +653,7 @@ pub async fn load_effective_project_state(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    match (
-        active_milestones.is_empty(),
-        primary_milestone_id.as_deref(),
-    ) {
-        (true, None) => {}
-        (true, Some(_)) => {
-            return Err(ServiceError::conflict(
-                "Project primary milestone points at a Project with no active milestones",
-            ));
-        }
-        (false, None) => {
-            return Err(ServiceError::conflict(
-                "Project with active milestones has no explicit primary milestone",
-            ));
-        }
-        (false, Some(primary_id))
-            if active_milestones
-                .iter()
-                .any(|milestone| milestone.id == primary_id) => {}
-        (false, Some(_)) => {
-            return Err(ServiceError::conflict(
-                "Project primary milestone is not one of the active milestones",
-            ));
-        }
-    }
+    validate_primary_milestone_pointer(&active_milestones, primary_milestone_id.as_deref())?;
 
     let readiness_rows = sqlx::query(
         "SELECT id, milestone_id, definition_revision_id, baseline_id,
@@ -1330,9 +1306,69 @@ fn json_string_array(value: String) -> Result<Vec<String>> {
     })
 }
 
+fn validate_primary_milestone_pointer(
+    milestones: &[MilestoneProjection],
+    primary_milestone_id: Option<&str>,
+) -> Result<()> {
+    let active = milestones
+        .iter()
+        .filter(|milestone| milestone.lifecycle == "active")
+        .collect::<Vec<_>>();
+    match (active.is_empty(), primary_milestone_id) {
+        (true, None) => Ok(()),
+        (true, Some(_)) => Err(ServiceError::conflict(
+            "Project primary milestone points at a Project with no active milestones",
+        )),
+        (false, None) => Err(ServiceError::conflict(
+            "Project with active milestones has no explicit primary milestone",
+        )),
+        (false, Some(primary_id)) if active.iter().any(|milestone| milestone.id == primary_id) => {
+            Ok(())
+        }
+        (false, Some(_)) => Err(ServiceError::conflict(
+            "Project primary milestone is not one of the active milestones",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn milestone(id: &str, lifecycle: &str) -> MilestoneProjection {
+        MilestoneProjection {
+            id: id.to_owned(),
+            milestone_key: "M001".to_owned(),
+            display_label: None,
+            lifecycle: lifecycle.to_owned(),
+            definition_revision_id: None,
+            definition_digest: None,
+            version: 1,
+            blocker_reasons: Vec::new(),
+            stale_reasons: Vec::new(),
+            reconciliation_reasons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn primary_pointer_is_required_only_for_active_milestones() {
+        assert!(
+            validate_primary_milestone_pointer(&[milestone("planned", "planned")], None).is_ok()
+        );
+        assert!(validate_primary_milestone_pointer(
+            &[milestone("ready", "ready_for_release")],
+            None,
+        )
+        .is_ok());
+        assert!(
+            validate_primary_milestone_pointer(&[milestone("active", "active")], None).is_err()
+        );
+        assert!(validate_primary_milestone_pointer(
+            &[milestone("active", "active")],
+            Some("active"),
+        )
+        .is_ok());
+    }
 
     #[test]
     fn projection_is_closed_and_has_all_authority_domains() {

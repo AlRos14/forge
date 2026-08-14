@@ -344,6 +344,7 @@ impl HeartbeatMonitor {
                 "heartbeat monitor detected timed out agents"
             );
         }
+        renew_workspace_leases(&self.db).await?;
         let expired = expire_workspace_leases(
             &self.db,
             &self.event_bus,
@@ -577,6 +578,28 @@ impl HeartbeatMonitor {
     fn publish(&self, event: ForgeEvent) {
         self.event_bus.publish(event);
     }
+}
+
+const WORKSPACE_LEASE_RENEW_WINDOW_SECONDS: i64 = 5 * 60;
+const WORKSPACE_LEASE_EXTENSION_SECONDS: i64 = 15 * 60;
+
+async fn renew_workspace_leases(db: &SqliteDb) -> Result<u64> {
+    let now = chrono::Utc::now();
+    let renewed = WorkspaceLeaseRepo::renew_active(
+        db,
+        &now.to_rfc3339(),
+        &(now + chrono::Duration::seconds(WORKSPACE_LEASE_RENEW_WINDOW_SECONDS)).to_rfc3339(),
+        &(now + chrono::Duration::seconds(WORKSPACE_LEASE_EXTENSION_SECONDS)).to_rfc3339(),
+        500,
+    )
+    .await?;
+    if !renewed.is_empty() {
+        tracing::debug!(
+            renewed_leases = renewed.len(),
+            "renewed active WorkspaceLeases"
+        );
+    }
+    Ok(renewed.len() as u64)
 }
 
 /// Expire scheduler grants and, during the live heartbeat pass, stop any

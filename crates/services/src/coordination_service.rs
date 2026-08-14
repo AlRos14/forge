@@ -601,6 +601,13 @@ impl AgentActionService {
         let requested_permission =
             required_text("requested permission", &input.requested_permission)?;
         let dedupe_key = required_text("action dedupe key", &input.dedupe_key)?;
+        if operation == "task.propose" {
+            serde_json::from_str::<TaskProposalPayload>(&input.payload_json).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "task proposal payload is invalid: {error}"
+                ))
+            })?;
+        }
         let payload_hash = sha256_hex(input.payload_json.as_bytes());
         let expected_payload_hash = payload_hash.clone();
         let (policy_result, evaluated_reason) = evaluate_action_policy(
@@ -1608,7 +1615,6 @@ fn contains_project_authority_override(value: &Value) -> bool {
     const FORBIDDEN_FIELDS: &[&str] = &[
         "actor_identity_id",
         "identity_id",
-        "scope",
         "scope_type",
         "scope_id",
         "project_id",
@@ -1624,8 +1630,8 @@ fn contains_project_authority_override(value: &Value) -> bool {
         "target_id",
     ];
     match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_project_authority_override(value)
+        Value::Object(object) => object.iter().any(|(key, nested)| {
+            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_project_authority_override(nested)
         }),
         Value::Array(values) => values.iter().any(contains_project_authority_override),
         _ => false,
@@ -1868,6 +1874,53 @@ mod tests {
             "unexpected_field": true,
         });
         assert!(serde_json::from_value::<TaskProposalPayload>(payload).is_err());
+    }
+
+    #[test]
+    fn nested_artifact_scope_is_not_a_project_authority_override() {
+        assert!(!contains_project_authority_override(&serde_json::json!({
+            "action": "draft_revision",
+            "content": {"scope": {"included": ["checkout"]}},
+        })));
+        assert!(contains_project_authority_override(&serde_json::json!({
+            "project_id": "forged-project",
+            "content": {},
+        })));
+    }
+
+    #[tokio::test]
+    async fn invalid_task_payload_is_rejected_before_action_admission() {
+        let db = db().await;
+        let result = AgentActionService::new(Arc::clone(&db))
+            .propose(ProposeActionInput {
+                id: None,
+                actor_identity_id: "agent-a".to_owned(),
+                scope_type: "project".to_owned(),
+                scope_id: "project-1".to_owned(),
+                operation: "task.propose".to_owned(),
+                payload_json: serde_json::json!({
+                    "title": "Bounded task",
+                    "project_id": "caller-authored-project",
+                })
+                .to_string(),
+                dedupe_key: "invalid-task-payload".to_owned(),
+                correlation_id: "corr-invalid-task-payload".to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                requested_permission: "propose_task".to_owned(),
+                policy_reason: None,
+                target_type: None,
+                target_id: None,
+            })
+            .await;
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_action WHERE dedupe_key = 'invalid-task-payload'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("action count");
+        assert_eq!(count, 0);
     }
 
     async fn db() -> Arc<SqliteDb> {

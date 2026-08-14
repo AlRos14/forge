@@ -13,6 +13,17 @@ fn workspace_lease_write_error(error: sqlx::Error) -> DbError {
     check_error(error)
 }
 
+fn is_stale_workspace_lease_renewal(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database_error) = error else {
+        return false;
+    };
+    matches!(
+        database_error.message(),
+        "Workspace lease renewal authority is stale"
+            | "Orchestration agents cannot receive Workspace leases"
+    )
+}
+
 fn map_workspace_lease(row: SqliteRow) -> Result<WorkspaceLease> {
     Ok(WorkspaceLease {
         id: row.try_get("id")?,
@@ -205,6 +216,68 @@ impl WorkspaceLeaseRepo for SqliteDb {
         WorkspaceLeaseRepo::get_by_id(self, id)
             .await?
             .ok_or(DbError::NotFound)
+    }
+
+    async fn renew_active(
+        &self,
+        now: &str,
+        renew_before: &str,
+        expires_at: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceLease>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease wl
+             WHERE wl.status = 'active'
+               AND wl.expires_at > ? AND wl.expires_at <= ?
+               AND EXISTS (
+                   SELECT 1 FROM execution e
+                   WHERE e.id = wl.execution_id AND e.task_id = wl.task_id
+                     AND e.status = 'running'
+               )
+             ORDER BY wl.expires_at ASC, wl.id ASC LIMIT ?"
+        ))
+        .bind(now)
+        .bind(renew_before)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(self.pool())
+        .await?;
+        let mut renewed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let lease = map_workspace_lease(row)?;
+            let result = sqlx::query(
+                "UPDATE workspace_lease
+                 SET expires_at = ?, version = version + 1, updated_at = ?
+                 WHERE id = ? AND status = 'active' AND version = ?
+                   AND expires_at > ? AND expires_at <= ?",
+            )
+            .bind(expires_at)
+            .bind(now)
+            .bind(&lease.id)
+            .bind(lease.version)
+            .bind(now)
+            .bind(renew_before)
+            .execute(self.pool())
+            .await;
+            match result {
+                Ok(result) if result.rows_affected() == 1 => {
+                    let row = sqlx::query(&format!(
+                        "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease WHERE id = ?"
+                    ))
+                    .bind(&lease.id)
+                    .fetch_one(self.pool())
+                    .await?;
+                    renewed.push(map_workspace_lease(row)?);
+                }
+                Ok(_) => {
+                    // A stopped execution or stale governance binding must
+                    // simply age out. The database renewal trigger performs
+                    // the authoritative recheck for every candidate.
+                }
+                Err(error) if is_stale_workspace_lease_renewal(&error) => {}
+                Err(error) => return Err(workspace_lease_write_error(error)),
+            }
+        }
+        Ok(renewed)
     }
 
     async fn expire(&self, now: &str, limit: i64) -> Result<Vec<WorkspaceLease>> {

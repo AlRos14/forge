@@ -3681,7 +3681,16 @@ fn projection_reasons_from_record(
         let reasons: Vec<MilestoneProjectionReason> =
             parse_json_required(json_value, "milestone projection reasons")?;
         for reason in &reasons {
-            if reason.kind != kind {
+            let kind_matches_bucket = match kind {
+                MilestoneProjectionReasonKind::Blocker => matches!(
+                    reason.kind,
+                    MilestoneProjectionReasonKind::Blocker
+                        | MilestoneProjectionReasonKind::CheckFailed
+                        | MilestoneProjectionReasonKind::EvidenceUnavailable
+                ),
+                _ => reason.kind == kind,
+            };
+            if !kind_matches_bucket {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: "persisted milestone projection reason kind is inconsistent"
                         .to_owned(),
@@ -4588,5 +4597,40 @@ mod tests {
             release_evidence_tombstone("purged").expect("purge overlay"),
             api_types::ReleaseEvidenceAvailability::EvidenceUnavailable
         );
+    }
+
+    #[test]
+    fn blocker_bucket_accepts_typed_check_and_evidence_reasons() {
+        let record = ProjectMilestoneRecord {
+            id: "milestone-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            milestone_sequence: 1,
+            milestone_key: "M001".to_owned(),
+            display_label: None,
+            current_definition_revision_id: Some("revision-1".to_owned()),
+            lifecycle: "active".to_owned(),
+            blocker_reason_json: serde_json::to_string(&vec![
+                MilestoneProjectionReason {
+                    kind: MilestoneProjectionReasonKind::CheckFailed,
+                    code: "check_missing".to_owned(),
+                    message: "required check has no result".to_owned(),
+                    source_ids: vec!["check-1".to_owned()],
+                },
+                MilestoneProjectionReason {
+                    kind: MilestoneProjectionReasonKind::EvidenceUnavailable,
+                    code: "evidence_missing".to_owned(),
+                    message: "required evidence is unavailable".to_owned(),
+                    source_ids: vec!["evidence-1".to_owned()],
+                },
+            ])
+            .expect("reasons serialize"),
+            stale_reason_json: "[]".to_owned(),
+            reconciliation_reason_json: "[]".to_owned(),
+            version: 1,
+            created_at: "2026-08-14T00:00:00Z".to_owned(),
+            updated_at: "2026-08-14T00:00:00Z".to_owned(),
+        };
+        let reasons = projection_reasons_from_record(&record).expect("typed blockers decode");
+        assert_eq!(reasons.len(), 2);
     }
 }

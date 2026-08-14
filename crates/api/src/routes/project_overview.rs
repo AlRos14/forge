@@ -646,9 +646,12 @@ async fn load_document_freshness(
         let draft = row
             .try_get::<Option<String>, _>("current_draft_revision_id")
             .map_err(sql_error)?;
-        let is_stale = document_lifecycle != "active"
-            || revision_lifecycle.as_deref() != Some("approved")
-            || draft.is_some_and(|id| id != current_revision_id);
+        let is_stale = document_is_stale(
+            &document_lifecycle,
+            revision_lifecycle.as_deref(),
+            draft.as_deref(),
+            &current_revision_id,
+        );
         stale |= is_stale;
         documents.push(json!({
             "document_id": try_get!(row, String, "id"),
@@ -660,6 +663,17 @@ async fn load_document_freshness(
         }));
     }
     Ok((documents, stale))
+}
+
+fn document_is_stale(
+    document_lifecycle: &str,
+    revision_lifecycle: Option<&str>,
+    draft_revision_id: Option<&str>,
+    approved_revision_id: &str,
+) -> bool {
+    document_lifecycle != "approved"
+        || revision_lifecycle != Some("approved")
+        || draft_revision_id.is_some_and(|id| id != approved_revision_id)
 }
 
 async fn load_unresolved_decisions(state: &AppState, project_id: &str) -> ApiResult<Vec<String>> {
@@ -1377,4 +1391,25 @@ fn sql_error(error: sqlx::Error) -> ApiError {
 fn db_error(error: db::DbError) -> ApiError {
     tracing::error!(error = ?error, "Project Overview repository query failed");
     ApiError::internal("Project Overview is temporarily unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::document_is_stale;
+
+    #[test]
+    fn approved_document_without_a_newer_draft_is_fresh() {
+        assert!(!document_is_stale(
+            "approved",
+            Some("approved"),
+            Some("revision-1"),
+            "revision-1",
+        ));
+        assert!(document_is_stale(
+            "approved",
+            Some("approved"),
+            Some("revision-2"),
+            "revision-1",
+        ));
+    }
 }

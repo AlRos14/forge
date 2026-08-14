@@ -314,13 +314,83 @@ impl ProjectRepo for SqliteDb {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !exists {
+            return Err(DbError::NotFound);
+        }
+
+        // Immutable orchestration rows remain protected from individual
+        // deletion. Project deletion is the one bounded teardown operation:
+        // the transaction installs a Project-scoped guard, removes immutable
+        // leaves in dependency order, then lets the existing cascades remove
+        // mutable projections. Deferring FKs closes self-referential and
+        // cross-artifact RESTRICT edges until the whole Project is gone.
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO project_deletion_guard (project_id, created_at) VALUES (?, ?)")
+            .bind(id)
+            .bind(now_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+
+        for statement in [
+            "DELETE FROM media_asset_tombstone WHERE asset_id IN
+                 (SELECT id FROM media_asset WHERE project_id = ?)",
+            "DELETE FROM project_release_media_pin WHERE project_id = ?",
+            "DELETE FROM project_release_reference WHERE release_id IN
+                 (SELECT id FROM project_release WHERE project_id = ?)",
+            "DELETE FROM project_release WHERE project_id = ?",
+            "DELETE FROM project_readiness_input WHERE readiness_snapshot_id IN
+                 (SELECT id FROM project_readiness_snapshot WHERE project_id = ?)",
+            "DELETE FROM project_readiness_snapshot WHERE project_id = ?",
+            "DELETE FROM project_milestone_check_result WHERE project_id = ?",
+            "DELETE FROM project_milestone_revision WHERE milestone_id IN
+                 (SELECT id FROM project_milestone WHERE project_id = ?)",
+            "DELETE FROM project_execution_baseline_approval WHERE baseline_id IN
+                 (SELECT id FROM project_execution_baseline WHERE project_id = ?)",
+            "DELETE FROM project_execution_baseline_revision WHERE baseline_id IN
+                 (SELECT id FROM project_execution_baseline WHERE project_id = ?)",
+            "DELETE FROM project_document_approval WHERE document_id IN
+                 (SELECT id FROM project_document WHERE project_id = ?)",
+            "DELETE FROM project_document_revision WHERE document_id IN
+                 (SELECT id FROM project_document WHERE project_id = ?)",
+            "DELETE FROM project_decision WHERE project_id = ?",
+            "DELETE FROM project_reconciliation_resolution WHERE reconciliation_id IN
+                 (SELECT id FROM project_reconciliation_record WHERE project_id = ?)",
+            "DELETE FROM project_reconciliation_record WHERE project_id = ?",
+            "DELETE FROM project_canonical_conflict WHERE project_id = ?",
+            "DELETE FROM project_charter_approval_event WHERE approval_id IN
+                 (SELECT a.id FROM project_charter_approval a
+                  JOIN project_charter c ON c.id = a.charter_id
+                  WHERE c.project_id = ?)",
+            "DELETE FROM project_charter_approval WHERE charter_id IN
+                 (SELECT id FROM project_charter WHERE project_id = ?)",
+            "DELETE FROM project_charter_revision WHERE charter_id IN
+                 (SELECT id FROM project_charter WHERE project_id = ?)",
+            "DELETE FROM workspace_lease WHERE project_id = ?",
+            "DELETE FROM project_charter WHERE project_id = ?",
+        ] {
+            sqlx::query(statement).bind(id).execute(&mut *tx).await?;
+        }
+
         let result = sqlx::query("DELETE FROM project WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        sqlx::query("DELETE FROM project_deletion_guard WHERE project_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

@@ -501,7 +501,7 @@ async fn project_proposal_target_is_derived_from_scope() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"bounded", "project_id":"project-b"},
+                "payload": {"title":"bounded"},
                 "dedupe_key":"scope-target-1",
                 "correlation_id":"scope-target-correlation"
             }),

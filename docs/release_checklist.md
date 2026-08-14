@@ -7,7 +7,7 @@ Use this checklist for public beta releases.
 - [ ] Run `./scripts/ci-rust.sh`.
 - [ ] Run `cargo audit`.
 - [ ] Run `./scripts/ci-web.sh`.
-- [ ] Run `cd web && pnpm exec playwright install --with-deps chromium && pnpm run e2e:smoke`.
+- [ ] Run `cd web && pnpm exec playwright install --with-deps chromium && pnpm run e2e`.
 - [ ] Run a repository history secret scan before making release artifacts public.
 - [ ] Build a release archive locally and verify it contains `forge`, `forge-ctl`, and `web/dist/index.html`.
 - [ ] Install from a release archive and confirm `forge` serves the web UI outside the repo checkout.

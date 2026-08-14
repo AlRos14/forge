@@ -31,7 +31,7 @@ use services::{
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{auth::AuthenticatedUser, client_idempotency_key, scoped_idempotency_key},
     state::AppState,
 };
 
@@ -289,9 +289,21 @@ pub async fn approve_genesis_charter_revision(
     Path((session_id, revision_id)): Path<(String, String)>,
     Json(request): Json<ApproveProjectCharterRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectCharterApproval>)> {
-    if let Some(replay) =
-        replay_genesis_charter_approval(&state, &user.user_id, &session_id, &revision_id, &request)
-            .await?
+    let storage_idempotency_key = scoped_idempotency_key(
+        "charter-approval",
+        &format!("account:{}", user.user_id),
+        &user.user_id,
+        &request.mutation.idempotency_key,
+    );
+    if let Some(replay) = replay_genesis_charter_approval(
+        &state,
+        &user.user_id,
+        &session_id,
+        &revision_id,
+        &storage_idempotency_key,
+        &request,
+    )
+    .await?
     {
         return Ok((StatusCode::CREATED, Json(replay)));
     }
@@ -441,12 +453,13 @@ async fn replay_genesis_charter_approval(
     user_id: &str,
     session_id: &str,
     revision_id: &str,
+    storage_idempotency_key: &str,
     request: &ApproveProjectCharterRequest,
 ) -> ApiResult<Option<ProjectCharterApproval>> {
     let approval_id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM project_charter_approval WHERE idempotency_key = ? LIMIT 1",
     )
-    .bind(&request.mutation.idempotency_key)
+    .bind(storage_idempotency_key)
     .fetch_optional(state.db.pool())
     .await?;
     let Some(approval_id) = approval_id else {
@@ -748,8 +761,10 @@ fn api_approval(record: ProjectCharterApprovalRecord) -> ApiResult<ProjectCharte
     }
     let approval_event_id =
         required_persisted("Charter approval event id", record.approval_event_id)?;
-    let idempotency_key =
-        required_text("Charter approval idempotency key", record.idempotency_key)?;
+    let idempotency_key = client_idempotency_key(&required_text(
+        "Charter approval idempotency key",
+        record.idempotency_key,
+    )?);
     let approving_kind = parse_principal_kind(&record.approving_principal_type)?;
     Ok(ProjectCharterApproval {
         id: record.id,

@@ -719,12 +719,13 @@ fn context_source_response(
     ) && matches!(source.disposition.as_str(), "included" | "summarized")
         && source.source_id.starts_with("project_context:");
     let current_revision = if pointer_backed {
-        let source_id = source
-            .source_id
-            .strip_prefix("project_context:")
-            .expect("pointer-backed Project context source has canonical prefix");
+        let canonical_prefix = format!("project_context:{}:", source.source_type);
+        let source_id = source.source_id.strip_prefix(&canonical_prefix);
         project_pointers
-            .and_then(|pointers| pointers.current_revision(&source.source_type, source_id))
+            .and_then(|pointers| {
+                source_id
+                    .and_then(|source_id| pointers.current_revision(&source.source_type, source_id))
+            })
             .map(safe_metadata_value)
     } else {
         None
@@ -844,7 +845,7 @@ mod tests {
         let source = db::ContextManifestSource {
             manifest_id: "manifest".to_owned(),
             ordinal: 1,
-            source_id: "project_context:document-1".to_owned(),
+            source_id: "project_context:project_document:document-1".to_owned(),
             source_type: "project_document".to_owned(),
             source_revision: "revision-1".to_owned(),
             selection_reason: "current_approved_document".to_owned(),
@@ -868,6 +869,21 @@ mod tests {
         let removed = context_source_response(source, Some(&ProjectContextPointers::default()));
         assert!(removed.is_stale);
         assert!(removed.current_revision.is_none());
+
+        let malformed = db::ContextManifestSource {
+            manifest_id: "manifest".to_owned(),
+            ordinal: 2,
+            source_id: "project_context:document-1".to_owned(),
+            source_type: "project_document".to_owned(),
+            source_revision: "revision-1".to_owned(),
+            selection_reason: "legacy malformed source".to_owned(),
+            disposition: "included".to_owned(),
+            retention_priority: 100,
+            fragment_fingerprint: "digest".to_owned(),
+        };
+        let malformed = context_source_response(malformed, Some(&pointers));
+        assert!(malformed.is_stale);
+        assert!(malformed.current_revision.is_none());
     }
 
     #[test]

@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{auth::AuthenticatedUser, scoped_idempotency_key},
     state::AppState,
 };
 
@@ -1091,11 +1091,12 @@ async fn replay_milestone_check_result(
     milestone_id: &str,
     check_id: &str,
     user_id: &str,
+    storage_idempotency_key: &str,
     request: &RecordMilestoneCheckRequest,
 ) -> ApiResult<Option<ValidationResult>> {
     let Some(existing) =
         sqlx::query("SELECT * FROM project_milestone_check_result WHERE idempotency_key = ?")
-            .bind(&request.mutation.idempotency_key)
+            .bind(storage_idempotency_key)
             .fetch_optional(state.db.pool())
             .await?
     else {
@@ -1187,22 +1188,26 @@ pub async fn record_milestone_check(
     Json(request): Json<RecordMilestoneCheckRequest>,
 ) -> ApiResult<Json<ValidationResult>> {
     require_idempotency_key(&request.mutation.idempotency_key)?;
-    // Resolve the immutable receipt before current Project access, authority,
-    // check, or governance validation. Replays must return the persisted
-    // result (or conflict) even after mutable state and authorization age.
+    ensure_project_access(&state, &project_id, &user).await?;
+    let storage_idempotency_key = scoped_idempotency_key(
+        "milestone-check",
+        &project_id,
+        &user.user_id,
+        &request.mutation.idempotency_key,
+    );
     if let Some(replay) = replay_milestone_check_result(
         &state,
         &project_id,
         &milestone_id,
         &check_id,
         &user.user_id,
+        &storage_idempotency_key,
         &request,
     )
     .await?
     {
         return Ok(Json(replay));
     }
-    ensure_project_access(&state, &project_id, &user).await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -1383,7 +1388,7 @@ pub async fn record_milestone_check(
     .bind(request.mutation.expected_version)
     .bind(&request.mutation.authorization.event_id)
     .bind(&request.mutation.authorization.occurred_at)
-    .bind(&request.mutation.idempotency_key)
+    .bind(&storage_idempotency_key)
     .bind(&created_at)
     .execute(&mut *tx)
     .await;

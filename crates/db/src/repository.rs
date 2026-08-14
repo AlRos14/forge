@@ -513,6 +513,16 @@ pub trait WorkspaceLeaseRepo: Send + Sync {
         expected_version: i64,
         revoked_at: &str,
     ) -> Result<WorkspaceLease>;
+    /// Extend scheduler-owned leases that are approaching expiry while their
+    /// exact Task, execution, assignment, and governance bindings remain
+    /// current. Invalid or concurrently changed candidates are skipped.
+    async fn renew_active(
+        &self,
+        now: &str,
+        renew_before: &str,
+        expires_at: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceLease>>;
     async fn expire(&self, now: &str, limit: i64) -> Result<Vec<WorkspaceLease>>;
 }
 
@@ -868,6 +878,11 @@ pub trait SharedMediaRepo: Send + Sync {
     /// Return purged assets whose bytes still need idempotent physical
     /// cleanup after a crash between the tombstone transaction and unlink.
     async fn list_purged_media_assets(&self, limit: i64) -> Result<Vec<MediaAsset>>;
+    async fn mark_purged_media_asset_reconciled(
+        &self,
+        asset_id: &str,
+        reconciled_at: &str,
+    ) -> Result<()>;
     /// Resolve an already committed Project media tombstone without applying
     /// a new mutation.  API routes use this before validating the current
     /// authorization so an immutable receipt can be replayed exactly; a

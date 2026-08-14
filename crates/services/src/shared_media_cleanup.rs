@@ -91,8 +91,15 @@ impl SharedMediaCleanupScheduler {
     /// rows are finalized on the same or a later pass.
     pub async fn cleanup_now(&self) -> Result<usize> {
         let now = now_rfc3339();
-        let mut completed = self.reconcile_purged_assets().await?;
-        completed += self.reconcile_pending_uploads(&now).await?;
+        let mut completed = 0;
+        match self.reconcile_purged_assets(&now).await {
+            Ok(count) => completed += count,
+            Err(error) => warn!(%error, "shared media purge reconciliation phase failed"),
+        }
+        match self.reconcile_pending_uploads(&now).await {
+            Ok(count) => completed += count,
+            Err(error) => warn!(%error, "shared media upload reconciliation phase failed"),
+        }
         let lease_expires_at =
             (chrono::Utc::now() + chrono::Duration::seconds(self.lease_seconds)).to_rfc3339();
         let candidates = SharedMediaRepo::claim_media_gc_candidates(
@@ -115,7 +122,8 @@ impl SharedMediaCleanupScheduler {
                         &now,
                     )
                     .await;
-                    return Err(error);
+                    warn!(asset_id = %candidate.id, %error, "invalid shared media GC candidate");
+                    continue;
                 }
             };
 
@@ -128,32 +136,55 @@ impl SharedMediaCleanupScheduler {
                     &now,
                 )
                 .await;
-                return Err(error);
+                warn!(asset_id = %candidate.id, %error, "shared media GC unlink failed");
+                continue;
             }
 
-            if SharedMediaRepo::complete_media_gc(
+            match SharedMediaRepo::complete_media_gc(
                 &*self.db,
                 &candidate.id,
                 &self.lease_owner,
                 candidate.version,
                 &now,
             )
-            .await?
-            .is_some()
+            .await
             {
-                completed += 1;
+                Ok(Some(_)) => completed += 1,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = SharedMediaRepo::reset_media_gc_candidate(
+                        &*self.db,
+                        &candidate.id,
+                        &self.lease_owner,
+                        candidate.version,
+                        &now,
+                    )
+                    .await;
+                    warn!(asset_id = %candidate.id, %error, "shared media GC finalization failed");
+                }
             }
         }
         Ok(completed)
     }
 
-    async fn reconcile_purged_assets(&self) -> Result<usize> {
+    async fn reconcile_purged_assets(&self, now: &str) -> Result<usize> {
         let assets = SharedMediaRepo::list_purged_media_assets(&*self.db, self.batch_size).await?;
         let mut completed = 0;
         for asset in assets {
-            let path = safe_media_path(&self.media_root, &asset.storage_key)?;
-            remove_file_if_exists(&path).await?;
-            completed += 1;
+            let result = async {
+                let path = safe_media_path(&self.media_root, &asset.storage_key)?;
+                remove_file_if_exists(&path).await?;
+                SharedMediaRepo::mark_purged_media_asset_reconciled(&*self.db, &asset.id, now)
+                    .await?;
+                Ok::<(), ServiceError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => completed += 1,
+                Err(error) => {
+                    warn!(asset_id = %asset.id, %error, "purged media byte reconciliation failed");
+                }
+            }
         }
         Ok(completed)
     }
@@ -171,114 +202,69 @@ impl SharedMediaCleanupScheduler {
             .map(|time| time - chrono::Duration::hours(1))
             .ok();
         for upload in uploads {
-            let staging_key = upload.staging_storage_key.as_deref().ok_or_else(|| {
-                ServiceError::invalid_operation("pending media upload has no staging key")
+            match self.reconcile_pending_upload(&upload, now, cutoff).await {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        project_id = %upload.project_id,
+                        asset_id = %upload.asset_id,
+                        %error,
+                        "pending media upload reconciliation failed"
+                    );
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn reconcile_pending_upload(
+        &self,
+        upload: &db::ProjectMediaUpload,
+        now: &str,
+        cutoff: Option<chrono::DateTime<chrono::FixedOffset>>,
+    ) -> Result<bool> {
+        let staging_key = upload.staging_storage_key.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("pending media upload has no staging key")
+        })?;
+        let staging_path = safe_media_path(&self.media_root, staging_key)?;
+        let final_path = safe_media_path(&self.media_root, &upload.final_storage_key)?;
+        let staging_exists = tokio::fs::try_exists(&staging_path)
+            .await
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let final_exists = tokio::fs::try_exists(&final_path)
+            .await
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+
+        let staging_valid = file_matches(&staging_path, upload.byte_size, &upload.checksum).await?;
+        let final_valid = file_matches(&final_path, upload.byte_size, &upload.checksum).await?;
+
+        // A crash can leave both names. Prefer the verified final bytes;
+        // otherwise promote only verified staging bytes. Never infer
+        // validity from existence alone.
+        if final_valid {
+            if staging_exists {
+                remove_file_if_exists(&staging_path).await?;
+            }
+        } else if staging_valid {
+            if final_exists {
+                remove_file_if_exists(&final_path).await?;
+            }
+            let parent = final_path.parent().ok_or_else(|| {
+                ServiceError::invalid_operation("media final path has no parent directory")
             })?;
-            let staging_path = safe_media_path(&self.media_root, staging_key)?;
-            let final_path = safe_media_path(&self.media_root, &upload.final_storage_key)?;
-            let staging_exists = tokio::fs::try_exists(&staging_path)
+            tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            let final_exists = tokio::fs::try_exists(&final_path)
+            tokio::fs::rename(&staging_path, &final_path)
                 .await
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        }
 
-            let staging_valid =
-                file_matches(&staging_path, upload.byte_size, &upload.checksum).await?;
-            let final_valid = file_matches(&final_path, upload.byte_size, &upload.checksum).await?;
+        let final_valid = file_matches(&final_path, upload.byte_size, &upload.checksum).await?;
 
-            // A crash can leave both names. Prefer the verified final bytes;
-            // otherwise promote only verified staging bytes. Never infer
-            // validity from existence alone.
+        if upload.status == "metadata_committed" {
             if final_valid {
-                if staging_exists {
-                    remove_file_if_exists(&staging_path).await?;
-                }
-            } else if staging_valid {
-                if final_exists {
-                    remove_file_if_exists(&final_path).await?;
-                }
-                let parent = final_path.parent().ok_or_else(|| {
-                    ServiceError::invalid_operation("media final path has no parent directory")
-                })?;
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-                tokio::fs::rename(&staging_path, &final_path)
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            }
-
-            let final_valid = file_matches(&final_path, upload.byte_size, &upload.checksum).await?;
-
-            if upload.status == "metadata_committed" {
-                if final_valid {
-                    SharedMediaRepo::finalize_project_media_upload(
-                        &*self.db,
-                        &upload.project_id,
-                        &upload.asset_id,
-                        now,
-                    )
-                    .await?;
-                    recovered += 1;
-                }
-                continue;
-            }
-
-            if upload.status != "pending" {
-                // Unknown durable states are not safe to interpret as
-                // finalized. Leave the row and bytes for an operator-visible
-                // retry rather than deleting them.
-                continue;
-            }
-
-            if final_valid {
-                let created_at = upload.created_at.clone();
-                let metadata = SharedMediaRepo::create_project_media_asset(
-                    &*self.db,
-                    CreateProjectMediaAsset {
-                        id: upload.asset_id.clone(),
-                        project_id: upload.project_id.clone(),
-                        display_filename: upload.display_filename.clone(),
-                        content_type: upload.content_type.clone(),
-                        byte_size: upload.byte_size,
-                        storage_key: upload.final_storage_key.clone(),
-                        checksum: upload.checksum.clone(),
-                        idempotency_key: upload.idempotency_key.clone(),
-                        mutation_fingerprint: upload.mutation_fingerprint.clone(),
-                        expected_project_version: upload.expected_project_version,
-                        actor_type: "system".to_owned(),
-                        actor_id: None,
-                        authorization_event_id: format!(
-                            "project-media-reconciliation:{}:{}",
-                            upload.project_id, upload.idempotency_key
-                        ),
-                        created_at: created_at.clone(),
-                    },
-                )
-                .await;
-                match metadata {
-                    Ok(_) => {}
-                    // The pending row reserved the upload only after the
-                    // original expected Project version matched.  If a
-                    // concurrent Project mutation advanced that version
-                    // before a crash was reconciled, this upload is a stale
-                    // operation: discard its unreferenced bytes and durable
-                    // marker instead of retrying forever on every tick.
-                    Err(db::DbError::VersionConflict) => {
-                        remove_file_if_exists(&staging_path).await?;
-                        remove_file_if_exists(&final_path).await?;
-                        SharedMediaRepo::delete_pending_project_media_upload(
-                            &*self.db,
-                            &upload.project_id,
-                            &upload.idempotency_key,
-                        )
-                        .await?;
-                        recovered += 1;
-                        continue;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
                 SharedMediaRepo::finalize_project_media_upload(
                     &*self.db,
                     &upload.project_id,
@@ -286,36 +272,99 @@ impl SharedMediaCleanupScheduler {
                     now,
                 )
                 .await?;
-                recovered += 1;
-                continue;
+                return Ok(true);
             }
-
-            // The pending row precedes metadata so a crash before the first
-            // byte write cannot create an untracked final asset. Keep a
-            // recent row for a client retry; remove stale rows and their
-            // staging bytes once no metadata transaction committed.
-            if !final_valid
-                && cutoff.is_some_and(|cutoff| {
-                    chrono::DateTime::parse_from_rfc3339(&upload.created_at)
-                        .is_ok_and(|created| created < cutoff)
-                })
-            {
-                if staging_exists {
-                    remove_file_if_exists(&staging_path).await?;
-                }
-                if final_exists {
-                    remove_file_if_exists(&final_path).await?;
-                }
-                SharedMediaRepo::delete_pending_project_media_upload(
-                    &*self.db,
-                    &upload.project_id,
-                    &upload.idempotency_key,
-                )
-                .await?;
-                recovered += 1;
-            }
+            return Ok(false);
         }
-        Ok(recovered)
+
+        if upload.status != "pending" {
+            // Unknown durable states are not safe to interpret as
+            // finalized. Leave the row and bytes for an operator-visible
+            // retry rather than deleting them.
+            return Ok(false);
+        }
+
+        if final_valid {
+            let created_at = upload.created_at.clone();
+            let metadata = SharedMediaRepo::create_project_media_asset(
+                &*self.db,
+                CreateProjectMediaAsset {
+                    id: upload.asset_id.clone(),
+                    project_id: upload.project_id.clone(),
+                    display_filename: upload.display_filename.clone(),
+                    content_type: upload.content_type.clone(),
+                    byte_size: upload.byte_size,
+                    storage_key: upload.final_storage_key.clone(),
+                    checksum: upload.checksum.clone(),
+                    idempotency_key: upload.idempotency_key.clone(),
+                    mutation_fingerprint: upload.mutation_fingerprint.clone(),
+                    expected_project_version: upload.expected_project_version,
+                    actor_type: "system".to_owned(),
+                    actor_id: None,
+                    authorization_event_id: format!(
+                        "project-media-reconciliation:{}:{}",
+                        upload.project_id, upload.idempotency_key
+                    ),
+                    created_at: created_at.clone(),
+                },
+            )
+            .await;
+            match metadata {
+                Ok(_) => {}
+                // The pending row reserved the upload only after the
+                // original expected Project version matched.  If a
+                // concurrent Project mutation advanced that version
+                // before a crash was reconciled, this upload is a stale
+                // operation: discard its unreferenced bytes and durable
+                // marker instead of retrying forever on every tick.
+                Err(db::DbError::VersionConflict) => {
+                    remove_file_if_exists(&staging_path).await?;
+                    remove_file_if_exists(&final_path).await?;
+                    SharedMediaRepo::delete_pending_project_media_upload(
+                        &*self.db,
+                        &upload.project_id,
+                        &upload.idempotency_key,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            SharedMediaRepo::finalize_project_media_upload(
+                &*self.db,
+                &upload.project_id,
+                &upload.asset_id,
+                now,
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        // The pending row precedes metadata so a crash before the first
+        // byte write cannot create an untracked final asset. Keep a
+        // recent row for a client retry; remove stale rows and their
+        // staging bytes once no metadata transaction committed.
+        if !final_valid
+            && cutoff.is_some_and(|cutoff| {
+                chrono::DateTime::parse_from_rfc3339(&upload.created_at)
+                    .is_ok_and(|created| created < cutoff)
+            })
+        {
+            if staging_exists {
+                remove_file_if_exists(&staging_path).await?;
+            }
+            if final_exists {
+                remove_file_if_exists(&final_path).await?;
+            }
+            SharedMediaRepo::delete_pending_project_media_upload(
+                &*self.db,
+                &upload.project_id,
+                &upload.idempotency_key,
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 

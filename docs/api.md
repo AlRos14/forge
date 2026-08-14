@@ -29,6 +29,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
+| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve` | Create the exact principal-bound, single-use Charter approval receipt |
@@ -92,7 +93,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
-| POST   | `/api/v1/projects/{id}/tasks` | Create task |
+| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
@@ -283,6 +284,13 @@ authorized human/API `POST /api/v1/projects` may still create an explicit
 user approval; release remains blocked until the user approves an exact
 adoption Charter revision.
 
+Approval and manual-check idempotency is scoped by operation, Project (or the
+account during pre-Project Genesis), and authenticated principal. Reusing the
+same client key in another Project or account is an independent mutation, while
+a replay in the same scope returns the original result. Project access is
+checked before replay lookup, so an idempotency key cannot be used to probe a
+foreign Charter, baseline, milestone check, or Document approval.
+
 ### Project Charters, Documents, Decisions, and effective state
 
 The Project Charter route exposes immutable revisions, exact content/render
@@ -308,10 +316,15 @@ reason rather than a global recency merge.
 Milestone definition revisions use `draft`, `proposed`, `approved`, or
 `superseded`; milestone instances use `planned`, `active`, `ready_for_release`,
 `released`, or `cancelled`. Multiple milestones may be active and the
-`primary_milestone_id` pointer is explicit. `ReadinessSnapshot` is an immutable
-candidate, not a release: standalone readiness creates no evidence pins. A
-ready snapshot moves an unreleased active milestone to `ready_for_release`;
-non-ready or stale results leave it active with typed reasons.
+`primary_milestone_id` pointer is explicit and required only while at least one
+milestone is `active`; planned and `ready_for_release` milestones do not require
+it. `ReadinessSnapshot` is an immutable candidate, not a release: standalone
+readiness creates no evidence pins. A ready snapshot moves an unreleased active
+milestone to `ready_for_release`; non-ready or stale results leave it active
+with typed reasons. Project Agent readiness actions execute that same Forge
+evaluation immediately and return the committed snapshot. Project Agent
+release-candidate actions validate the exact ready snapshot and surface a human
+attention item; they never perform the user-only release.
 
 Only an authorized user may call the milestone release route with the exact
 candidate snapshot ID and readiness digest. Forge re-authorizes every covered
@@ -437,7 +450,12 @@ idempotent by action/idempotency key.
 execution validates the Project Agent binding and proposal contract, then calls
 the existing `TaskService`; the resulting Task/workspace/workflow authority
 is not replaced by the action envelope. A denied or invalid proposal is never
-listed as a Task. `task_type`, when present, is the same closed enum as normal
+listed as a Task. The exact closed proposal payload is validated before the
+action ledger accepts it. For a Charter-backed Project, an omitted governance
+object is derived from the current Charter: implementation Tasks remain
+non-runnable until a matching baseline activates them, while pre-baseline
+`planning_task` and `discovery` claims are restricted to the read-only lane.
+`task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before an action is admitted. Terminal Task delivery,
 blocked, failed, and cancelled
@@ -481,6 +499,9 @@ message with a non-success turn is never rendered as a completed exchange.
 Cancellation is allowed only for an authorized non-terminal turn and requires
 its current optimistic version plus an idempotency key; stale or terminal
 requests return a conflict instead of rewriting the durable outcome.
+CLI-backed assistant output is bounded to 500 Unicode characters before it is
+admitted to the immutable message, semantic-memory, FTS, and subsequent prompt
+history surfaces.
 
 Main Agent tools are limited to discovery, configured web search, Project
 lifecycle/organization, bounded portfolio summaries, and explicit handoff. A
@@ -527,6 +548,12 @@ before any record becomes visible. The transaction creates the Project,
 binding, Chat, Charter attachment, handoff, target message/turn, events, and
 Genesis transition together. Replay returns the original result, while a
 failure leaves no Project or handoff and keeps Genesis ready for retry.
+
+`DELETE /api/v1/projects/{id}` performs one guarded transaction that removes
+the Project-owned dependency graph before deleting the Project. Immutable-row
+guards are relaxed only for that exact teardown transaction; individual
+Charter, milestone, readiness, release, baseline, decision, lease, and evidence
+records remain non-deletable through ordinary writes.
 
 There is no later primary-agent election. Projects imported from before the
 Charter model that cannot yield one safe binding remain `agent_setup_required`

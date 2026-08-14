@@ -33,7 +33,7 @@ use sqlx::{Row, Sqlite, Transaction};
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{auth::AuthenticatedUser, client_idempotency_key, scoped_idempotency_key},
     state::AppState,
 };
 
@@ -127,18 +127,6 @@ pub async fn create_execution_baseline(
             "the Project changed before the execution baseline was proposed",
         ));
     }
-    if sqlx::query_scalar::<_, i64>("SELECT 1 FROM project_execution_baseline WHERE id = ? LIMIT 1")
-        .bind(&request.baseline_id)
-        .fetch_optional(state.db.pool())
-        .await?
-        .is_some()
-    {
-        return Err(ApiError::conflict_with_code(
-            "idempotency_conflict",
-            "baseline_id already belongs to a different proposal",
-        ));
-    }
-
     let now = now_rfc3339();
     let mut tx = state.db.pool().begin().await?;
     let current_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
@@ -161,7 +149,17 @@ pub async fn create_execution_baseline(
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| {
+        if error.to_string().to_ascii_lowercase().contains("unique") {
+            ApiError::conflict_with_code(
+                "idempotency_conflict",
+                "baseline_id is unavailable; retry the proposal with a new identifier",
+            )
+        } else {
+            error.into()
+        }
+    })?;
     let advanced = sqlx::query(
         "UPDATE project SET version = version + 1, updated_at = ?
          WHERE id = ? AND version = ?",
@@ -479,6 +477,12 @@ pub async fn approve_execution_baseline(
 ) -> ApiResult<(StatusCode, Json<ExecutionBaselineResponse>)> {
     let project = authorized_project(&state, &user.user_id, &project_id).await?;
     validate_idempotency_key(&request.mutation.idempotency_key)?;
+    let storage_idempotency_key = scoped_idempotency_key(
+        "baseline-approval",
+        &project_id,
+        &user.user_id,
+        &request.mutation.idempotency_key,
+    );
     if request.revision_id != revision_id {
         return Err(ApiError::conflict_with_code(
             "idempotency_conflict",
@@ -497,7 +501,7 @@ pub async fn approve_execution_baseline(
     });
     if let Some(result) = replay_event(
         &state,
-        &event_key("approval", &request.mutation.idempotency_key),
+        &event_key("approval", &storage_idempotency_key),
         &input,
     )
     .await?
@@ -535,7 +539,7 @@ pub async fn approve_execution_baseline(
                 content_digest, rendered_digest
          FROM project_execution_baseline_approval WHERE idempotency_key = ?",
     )
-    .bind(&request.mutation.idempotency_key)
+    .bind(&storage_idempotency_key)
     .fetch_optional(state.db.pool())
     .await?
     {
@@ -740,7 +744,7 @@ pub async fn approve_execution_baseline(
     .bind(&request.mutation.authorization.event_id)
     .bind(&request.content_digest)
     .bind(&request.render_digest)
-    .bind(&request.mutation.idempotency_key)
+    .bind(&storage_idempotency_key)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -754,7 +758,7 @@ pub async fn approve_execution_baseline(
         Some(&user.user_id),
         &project_id,
         &request.mutation.idempotency_key,
-        &event_key("approval", &request.mutation.idempotency_key),
+        &event_key("approval", &storage_idempotency_key),
         json!({
             "input": input,
             "result": {"baseline_id": baseline_id, "revision_id": revision_id, "approval_id": approval_id},
@@ -1912,7 +1916,7 @@ async fn api_approval(
             occurred_at: row.try_get("authorization_occurred_at")?,
         },
         approved_at: row.try_get("created_at")?,
-        idempotency_key: row.try_get("idempotency_key")?,
+        idempotency_key: client_idempotency_key(&row.try_get::<String, _>("idempotency_key")?),
     })
 }
 

@@ -1719,6 +1719,9 @@ impl AttentionService {
 
 fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     let event_type = event.event_type.to_ascii_lowercase();
+    if event_type == "project_release.candidate_requested" {
+        return Some("human_input_required");
+    }
     if event_type == "agent.question.created" || event_type == "agent.interaction.required" {
         return Some("human_input_required");
     }
@@ -2056,6 +2059,10 @@ mod tests {
                 "review_ready",
                 "review_risk"
             ]
+        );
+        assert_eq!(
+            classify_event(&event("project_release.candidate_requested", "{}")),
+            Some("human_input_required")
         );
     }
 

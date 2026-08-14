@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use api_types::{
     canonical_digest_with_schema, canonical_json, AdaptiveEnvelope, ArtifactRef,
-    ExecutionBaselineContent, MilestoneDefinitionContent, ProjectCharterContent,
-    ProjectDocumentContent, ProjectDocumentKind, RevisionProvenance,
+    AuthorizationProvenance, ExecutionBaselineContent, MilestoneDefinitionContent, PrincipalKind,
+    PrincipalRef, ProjectCharterContent, ProjectDocumentContent, ProjectDocumentKind,
+    RevisionProvenance,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
@@ -33,14 +34,13 @@ use sqlx::Row;
 use crate::{
     baseline_column_json, document_content_digest, document_render_digest, parse_document_kind,
     render_execution_baseline, render_project_document, validate_execution_baseline_policy,
-    AgentActionService, Result, ServiceError, EXECUTION_BASELINE_RENDER_VERSION,
+    AgentActionService, MilestoneRuntime, Result, ServiceError, EXECUTION_BASELINE_RENDER_VERSION,
     EXECUTION_BASELINE_SCHEMA_VERSION, PROJECT_DOCUMENT_RENDER_VERSION,
     PROJECT_DOCUMENT_SCHEMA_VERSION,
 };
 
 const MILESTONE_DEFINITION_SCHEMA: &str = "forge.milestone-definition/v1";
 const MILESTONE_RENDER_SCHEMA: &str = "forge.milestone-definition-render/v1";
-const COMPUTING_POLICY_REVISION: &str = "forge.readiness.request/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteProjectOrchestrationActionInput {
@@ -1604,7 +1604,8 @@ impl ProjectOrchestrationActionService {
                         project_id: project_id.to_owned(),
                         expected_project_version: project_version,
                         milestone_sequence: sequence,
-                        milestone_key: slug(&content.name),
+                        milestone_key: crate::milestone_identity(sequence)
+                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
                         display_label: optional_string(payload, "display_label")
                             .or_else(|| Some(content.name.clone())),
                         created_at: now_rfc3339(),
@@ -1832,53 +1833,39 @@ impl ProjectOrchestrationActionService {
         if release_policy_revision != policy_revision {
             return Err(ServiceError::conflict("readiness request policy is stale"));
         }
-        let event_id = new_uuid_v4();
-        let dedupe = format!("project-readiness-request:{}", action.dedupe_key);
-        if let Some(existing) = DomainEventRepo::get_event_by_dedupe(&*self.db, &dedupe).await? {
-            return Ok(json!({
-                "operation": PROJECT_READINESS_OPERATION,
-                "project_id": project_id,
-                "request_event_id": existing.id,
-                "status": "pending_forge_computation",
-                "domain_committed": true,
-            }));
-        }
-        DomainEventRepo::append_event(
-            &*self.db,
-            CreateDomainEvent {
-                id: event_id.clone(),
-                event_type: "project_readiness.requested".to_owned(),
-                entity_type: "project_milestone".to_owned(),
-                entity_id: milestone_id.clone(),
-                actor_type: "agent".to_owned(),
-                actor_id: Some(action.actor_identity_id.clone()),
-                scope_type: "project".to_owned(),
-                scope_id: project_id.to_owned(),
-                correlation_id: action.correlation_id.clone(),
-                causation_id: Some(action.id.clone()),
-                causation_depth: action.causation_depth + 1,
-                dedupe_key: Some(dedupe),
-                payload_json: json!({
-                    "milestone_id": milestone_id,
-                    "milestone_version": payload.get("milestone_version"),
-                    "baseline_id": baseline_id,
-                    "baseline_revision_id": baseline_revision_id,
-                    "baseline_digest": baseline.try_get::<String, _>("content_digest")?,
-                    "release_policy_revision": release_policy_revision,
-                    "release_policy_digest": baseline.try_get::<String, _>("release_policy_digest")?,
-                    "computing_policy_revision": COMPUTING_POLICY_REVISION,
-                    "status": "pending_forge_computation",
-                })
-                .to_string(),
-                created_at: now_rfc3339(),
-            },
-        )
-        .await?;
+        let actor = PrincipalRef {
+            kind: PrincipalKind::Agent,
+            id: action.actor_identity_id.clone(),
+            display_name: None,
+        };
+        let authorization = AuthorizationProvenance {
+            principal: actor.clone(),
+            authorization_basis: "bound_project_agent_action".to_owned(),
+            action: "project.milestone.readiness".to_owned(),
+            event_id: action.id.clone(),
+            occurred_at: action.created_at.clone(),
+        };
+        let snapshot = MilestoneRuntime::new(Arc::clone(&self.db))
+            .evaluate(
+                project_id,
+                &actor,
+                &authorization,
+                &milestone_id,
+                integer(payload, "milestone_version")?,
+                &baseline_id,
+                &baseline_revision_id,
+                &release_policy_revision,
+                &format!("project-agent-readiness:{}", action.dedupe_key),
+            )
+            .await?;
         Ok(json!({
             "operation": PROJECT_READINESS_OPERATION,
             "project_id": project_id,
-            "request_event_id": event_id,
-            "status": "pending_forge_computation",
+            "milestone_id": milestone_id,
+            "readiness_snapshot_id": snapshot.id,
+            "readiness_digest": snapshot.readiness_digest,
+            "result": snapshot.result,
+            "status": "computed",
             "domain_committed": true,
         }))
     }
@@ -1916,6 +1903,14 @@ impl ProjectOrchestrationActionService {
         if stored_digest != snapshot_digest {
             return Err(ServiceError::conflict(
                 "release request readiness digest is stale",
+            ));
+        }
+        if snapshot.try_get::<String, _>("outcome")? != "ready"
+            || milestone.lifecycle != "ready_for_release"
+            || milestone.version != integer(payload, "milestone_version")?
+        {
+            return Err(ServiceError::conflict(
+                "release candidate requires the current ready-for-release milestone snapshot",
             ));
         }
         let event_id = new_uuid_v4();
@@ -2116,25 +2111,6 @@ fn parse_document_content(
     }
 }
 
-fn slug(value: &str) -> String {
-    let slug = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "milestone".to_owned()
-    } else {
-        slug.to_owned()
-    }
-}
-
 fn string(payload: &Value, field: &str) -> Result<String> {
     payload
         .get(field)
@@ -2324,6 +2300,71 @@ mod tests {
             rollback_and_recovery: Vec::new(),
             exclusions: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_defined_milestone_uses_canonical_project_sequence_key() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        run_migrations(&pool).await.expect("schema");
+        let db = SqliteDb::new(pool);
+        let now = now_rfc3339();
+        let project_id = new_uuid_v4();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Milestone key project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project");
+        let payload = json!({
+            "action": "define",
+            "content": {
+                "name": "Checkout flow",
+                "outcome": "Customers can complete checkout"
+            }
+        });
+        let action = AgentAction {
+            id: new_uuid_v4(),
+            actor_identity_id: new_uuid_v4(),
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            operation: PROJECT_MILESTONE_OPERATION.to_owned(),
+            payload_json: payload.to_string(),
+            payload_hash: "payload-hash".to_owned(),
+            dedupe_key: "milestone-key-action".to_owned(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            requested_permission: "propose_project".to_owned(),
+            policy_result: AgentActionPolicyResult::Allowed,
+            policy_reason: None,
+            status: AgentActionStatus::Proposed,
+            target_type: Some("project".to_owned()),
+            target_id: Some(project_id.clone()),
+            outcome_json: None,
+            version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        ProjectOrchestrationActionService::new(Arc::new(db.clone()))
+            .materialize_milestone(&action, &project_id, &payload)
+            .await
+            .expect("milestone definition materializes");
+        let key: String =
+            sqlx::query_scalar("SELECT milestone_key FROM project_milestone WHERE project_id = ?")
+                .bind(&project_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("milestone key");
+        assert_eq!(key, "M001");
     }
 
     #[tokio::test]

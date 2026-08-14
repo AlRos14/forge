@@ -8,6 +8,20 @@ use std::collections::BTreeMap;
 const PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 const PROJECT_OPERATING_SKILL_KEY: &str = "forge.project.orchestration/v1";
 
+fn orchestration_scoped_idempotency_key(
+    operation: &str,
+    scope_id: &str,
+    principal_id: &str,
+    client_key: &str,
+) -> String {
+    format!(
+        "forge-idem-v1:{}:{}:{}:{client_key}",
+        hex::encode(operation),
+        hex::encode(scope_id),
+        hex::encode(principal_id),
+    )
+}
+
 fn sha256_hex(value: &[u8]) -> String {
     Sha256::digest(value)
         .iter()
@@ -1304,10 +1318,25 @@ impl ProjectOrchestrationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         let mut transaction = self.pool().begin().await?;
+        let charter_scope =
+            sqlx::query("SELECT account_id, project_id FROM project_charter WHERE id = ?")
+                .bind(&input.charter_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(DbError::NotFound)?;
+        let account_id: String = charter_scope.try_get("account_id")?;
+        let project_id: Option<String> = charter_scope.try_get("project_id")?;
+        let scope_id = project_id.unwrap_or_else(|| format!("account:{account_id}"));
+        let storage_idempotency_key = orchestration_scoped_idempotency_key(
+            "charter-approval",
+            &scope_id,
+            &input.approving_principal_id,
+            &input.idempotency_key,
+        );
 
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_charter_approval WHERE idempotency_key = ?")
-                .bind(&input.idempotency_key)
+                .bind(&storage_idempotency_key)
                 .fetch_optional(&mut *transaction)
                 .await?
                 .map(map_charter_approval)
@@ -1475,7 +1504,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(&input.explicit_event)
             .bind(format!(
                 "{}:revoke:{}",
-                input.idempotency_key, previous_approval_id
+                storage_idempotency_key, previous_approval_id
             ))
             .bind(&input.authorization_occurred_at)
             .bind(&input.updated_at)
@@ -1573,7 +1602,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.explicit_event)
         .bind(&input.authorization_occurred_at)
         .bind(&input.source_action)
-        .bind(&input.idempotency_key)
+        .bind(&storage_idempotency_key)
         .bind(&input.created_at)
         .bind(&input.updated_at)
         .bind(&input.approved_project_mode)
@@ -1601,7 +1630,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.authorization_basis)
         .bind(&input.authorization_action)
         .bind(&input.explicit_event)
-        .bind(format!("{}:active", input.idempotency_key))
+        .bind(format!("{storage_idempotency_key}:active"))
         .bind(&input.authorization_occurred_at)
         .bind(&input.created_at)
         .execute(&mut *transaction)
@@ -2969,7 +2998,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 schema_version, render_version, rendered_view, content_digest,
                 rendered_digest,
                 author_type, author_id, source_refs_json, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.milestone_id)
@@ -3002,19 +3031,33 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;
-        let advanced = sqlx::query(
-            "UPDATE project_milestone
-             SET current_definition_revision_id = ?, version = version + 1,
-                 updated_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(&input.id)
-        .bind(&input.created_at)
-        .bind(&input.milestone_id)
-        .bind(input.expected_milestone_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
+        let advanced = if input.lifecycle == "draft" {
+            sqlx::query(
+                "UPDATE project_milestone
+                 SET version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = ?",
+            )
+            .bind(&input.created_at)
+            .bind(&input.milestone_id)
+            .bind(input.expected_milestone_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?
+        } else {
+            sqlx::query(
+                "UPDATE project_milestone
+                 SET current_definition_revision_id = ?, version = version + 1,
+                     updated_at = ?
+                 WHERE id = ? AND version = ?",
+            )
+            .bind(&input.id)
+            .bind(&input.created_at)
+            .bind(&input.milestone_id)
+            .bind(input.expected_milestone_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?
+        };
         if advanced.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }

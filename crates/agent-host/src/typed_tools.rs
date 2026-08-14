@@ -2363,7 +2363,6 @@ fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
     const FORBIDDEN_FIELDS: &[&str] = &[
         "actor_identity_id",
         "identity_id",
-        "scope",
         "scope_type",
         "scope_id",
         "authority",
@@ -2384,18 +2383,20 @@ fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
         "role",
     ];
 
-    fn visit(value: &Value, forbidden: &[&str]) -> bool {
+    fn contains_forbidden(value: &Value, forbidden_fields: &[&str]) -> bool {
         match value {
-            Value::Object(map) => {
-                map.keys().any(|key| forbidden.contains(&key.as_str()))
-                    || map.values().any(|value| visit(value, forbidden))
-            }
-            Value::Array(values) => values.iter().any(|value| visit(value, forbidden)),
+            Value::Object(object) => object.iter().any(|(key, nested)| {
+                forbidden_fields.contains(&key.as_str())
+                    || contains_forbidden(nested, forbidden_fields)
+            }),
+            Value::Array(values) => values
+                .iter()
+                .any(|value| contains_forbidden(value, forbidden_fields)),
             _ => false,
         }
     }
 
-    if visit(arguments, FORBIDDEN_FIELDS) {
+    if contains_forbidden(arguments, FORBIDDEN_FIELDS) {
         return Err(RuntimeError::tool(
             "Forge orchestration scope and authority are server-derived",
         ));
@@ -3331,6 +3332,23 @@ mod tests {
             missing_workspace,
             Err(AgentHostError::Authority(_))
         ));
+    }
+
+    #[test]
+    fn artifact_scope_content_is_not_mistaken_for_authority_override() {
+        assert!(
+            reject_authority_overrides(&json!({
+                "action": "draft_revision",
+                "content": {"scope": {"included": ["checkout"]}},
+            }))
+            .is_ok()
+        );
+        assert!(
+            reject_authority_overrides(&json!({
+                "scope": {"scope_type": "project", "scope_id": "forged"},
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]

@@ -188,14 +188,19 @@ independent reviewer may differ from the Task's primary worker). On a
 assignment boundary when neither the role nor Task has an assignee; an existing
 applicable assignment still must match. Charter-backed Projects always require
 the exact Task Worker/reviewer role or Task assignment.
-`WorkspaceLeaseRepo` provides CAS revoke and bounded expiry operations.
+`WorkspaceLeaseRepo` provides CAS renewal/revoke and bounded expiry operations.
+The heartbeat renews an active lease before its deadline only while the exact
+execution is still running and its Task, assignment, governance, repository,
+and capability bindings remain valid. Renewal changes only `expires_at`,
+`updated_at`, and the optimistic version; all authority fields stay immutable.
 
 The scheduler delivers authority through the internal execution channel by
 creating the running execution and lease together; the executor acknowledges
 that delivery by verifying the exact active lease immediately before provider
 start and before execution work. A missing, expired, revoked, reassigned, or
 superseded lease fails closed. Heartbeat/recovery expiry cancels and terminalizes
-the running attempt and records reconciliation, and all terminal, failed,
+the running attempt only after a valid running lease can no longer be renewed,
+and records reconciliation; all terminal, failed,
 cancelled, daemon-disconnected, and stalled paths revoke the grant. A retry
 gets a new execution identity and lease. The claim path canonicalizes executor,
 worker, and task-worker aliases to persisted `worker`, while reviewers remain
@@ -231,6 +236,14 @@ Documents/Decisions/Tasks/checks/milestones/releases, and records a visible
 canonical conflict plus `reconciliation_required` reason when authoritative
 records disagree. It blocks only the affected execution or readiness path.
 
+When Task creation omits an explicit governance envelope, Forge derives one
+from the Project's current Charter. Before baseline activation, ordinary
+implementation Tasks are retained as non-runnable instead of being rejected;
+baseline activation promotes matching Tasks. `planning_task` and `discovery`
+Tasks additionally have an explicit pre-baseline lane: they may be claimed only
+with the read-only repository capability and low risk, and both service and
+transactional admission enforce that same predicate.
+
 #### Milestones, readiness, and immutable releases
 
 Milestone definition revisions use only `draft`, `proposed`, `approved`, and
@@ -238,9 +251,11 @@ Milestone definition revisions use only `draft`, `proposed`, `approved`, and
 `ready_for_release`, `released`, and `cancelled`; blockers, stale results, and
 `reconciliation_required` remain typed projections while an unreleased
 milestone is `active`. Multiple milestones may be active, and the Project keeps
-an explicit `primary_milestone_id`; it is never inferred from recency or Task
-counts. Compact Project creation supplies `M001` (shown as `M1 — Deliver
-outcome`) when no other definition is present.
+an explicit `primary_milestone_id` whenever at least one milestone is `active`;
+planned or `ready_for_release` milestones do not require that pointer, and it
+is cleared when the last active milestone leaves that state. The primary is
+never inferred from recency or Task counts. Compact Project creation supplies
+`M001` (shown as `M1 — Deliver outcome`) when no other definition is present.
 
 Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
 It records the exact input manifest, source versions, evidence attachment
@@ -254,6 +269,13 @@ release-scoped evidence pins, lifecycle transition, and events. `released` is
 terminal; later corrections append the next release revision and never mutate
 history. Forge release is an internal frozen evidence snapshot, not a merge,
 tag, deployment, or external publication.
+
+A Project Agent readiness action invokes the same `MilestoneRuntime`
+evaluation as the authenticated REST route and returns the committed snapshot;
+it is not a request event awaiting an absent consumer. A Project Agent release
+candidate remains non-authoritative: Forge validates the exact ready snapshot
+and milestone version, records the candidate, and raises human attention for
+the user-only release decision.
 
 #### Shared media and evidence lifecycle
 
@@ -276,6 +298,11 @@ serves bytes only while the shared asset is `available` and authorized. A
 cleanup worker re-checks active Task/Project attachments and immutable release
 pins under a lease immediately before deleting bytes, so restart and Task-delete
 races cannot remove still-referenced evidence. Release pins remain immutable.
+Cleanup isolates failures per asset and per phase, so one poisoned upload or
+filesystem entry cannot stop unrelated reconciliation or garbage collection.
+Successful recovery of a purged asset is checkpointed, allowing later rows to
+advance through the bounded sweep instead of repeatedly occupying its first
+page.
 V076 and the internal shared-media repository persist an audited redaction or
 purge tombstone, retain the permitted checksum/audit metadata, and project a
 pinned release's evidence as `evidence_unavailable` without rewriting its
@@ -316,6 +343,13 @@ partial manifest or pin. Migration failures leave legacy media references and
 bytes usable; physical cleanup is a separate guarded operation. These recovery
 rules make replay safe without inventing approval or silently substituting a
 name, Charter revision, artifact, or evidence asset.
+
+Project deletion is a transactionally guarded teardown. It removes the
+Project-owned immutable graph in dependency order and then the Project itself;
+the database permits those deletes only while the exact Project deletion guard
+is active. Direct attempts to mutate or delete an individual immutable Charter,
+milestone, readiness, release, decision, baseline, lease, or evidence record
+remain rejected.
 
 ### Direct Agent Runtime host and LCM
 

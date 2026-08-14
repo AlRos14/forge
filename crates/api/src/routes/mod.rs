@@ -64,6 +64,36 @@ pub mod workflow;
 pub mod workflow_templates;
 pub mod workspaces;
 
+const SCOPED_IDEMPOTENCY_PREFIX: &str = "forge-idem-v1";
+
+pub(crate) fn scoped_idempotency_key(
+    operation: &str,
+    project_id: &str,
+    principal_id: &str,
+    client_key: &str,
+) -> String {
+    format!(
+        "{SCOPED_IDEMPOTENCY_PREFIX}:{}:{}:{}:{client_key}",
+        hex::encode(operation),
+        hex::encode(project_id),
+        hex::encode(principal_id),
+    )
+}
+
+pub(crate) fn client_idempotency_key(stored_key: &str) -> String {
+    let mut parts = stored_key.splitn(5, ':');
+    if parts.next() == Some(SCOPED_IDEMPOTENCY_PREFIX)
+        && parts.next().is_some()
+        && parts.next().is_some()
+        && parts.next().is_some()
+    {
+        if let Some(client_key) = parts.next() {
+            return client_key.to_owned();
+        }
+    }
+    stored_key.to_owned()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListParams {
     pub cursor: Option<String>,
@@ -971,5 +1001,20 @@ fn execution_status_response(value: db::ExecutionStatus) -> api_types::Execution
         db::ExecutionStatus::Completed => api_types::ExecutionStatus::Completed,
         db::ExecutionStatus::Failed => api_types::ExecutionStatus::Failed,
         db::ExecutionStatus::Cancelled => api_types::ExecutionStatus::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod idempotency_tests {
+    use super::{client_idempotency_key, scoped_idempotency_key};
+
+    #[test]
+    fn idempotency_storage_keys_are_project_and_principal_scoped() {
+        let first = scoped_idempotency_key("approval", "project-a", "user-a", "same:key");
+        let other_project = scoped_idempotency_key("approval", "project-b", "user-a", "same:key");
+        let other_user = scoped_idempotency_key("approval", "project-a", "user-b", "same:key");
+        assert_ne!(first, other_project);
+        assert_ne!(first, other_user);
+        assert_eq!(client_idempotency_key(&first), "same:key");
     }
 }

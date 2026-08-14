@@ -107,30 +107,23 @@ impl TaskService {
             return Ok(None);
         }
 
-        let mut requested = match requested {
-            Some(requested) => requested,
-            None if repository_capable && !implementation => TaskGovernanceRequest {
-                // Keep direct Task API callers from manufacturing an
-                // ungoverned repository planning/discovery row.  The row is
-                // still non-runnable until the user-approved baseline is
-                // active; executor configuration separately forces the
-                // planning/discovery profile read-only.
-                charter_revision_id: project.current_charter_revision_id.clone(),
-                baseline_id: None,
-                baseline_revision_id: None,
-                plan_item_id: None,
-                milestone_id: None,
-                document_revision_ids: Vec::new(),
-                capability_class: Some("repository_read".to_owned()),
-                risk_class: Some("low".to_owned()),
-                provenance: None,
-            },
-            None => {
-                return Err(ServiceError::invalid_operation(
-                    "Charter-backed repository Tasks require Charter, execution-baseline, milestone, and plan-item provenance",
-                ));
-            }
-        };
+        let mut requested = requested.unwrap_or_else(|| TaskGovernanceRequest {
+            // Mainstream Task creation surfaces do not carry an orchestration
+            // envelope.  Bind those Tasks to the current Charter and keep
+            // them non-runnable until a Project Agent supplies exact baseline
+            // provenance.  Discovery/planning Tasks receive the only
+            // pre-baseline repository capability admitted by the scheduler.
+            charter_revision_id: project.current_charter_revision_id.clone(),
+            baseline_id: None,
+            baseline_revision_id: None,
+            plan_item_id: None,
+            milestone_id: None,
+            document_revision_ids: Vec::new(),
+            capability_class: (repository_capable && !implementation)
+                .then(|| "repository_read".to_owned()),
+            risk_class: (repository_capable && !implementation).then(|| "low".to_owned()),
+            provenance: None,
+        });
 
         let current_charter_revision_id =
             project.current_charter_revision_id.clone().ok_or_else(|| {
@@ -1558,7 +1551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn charter_backed_repository_task_requires_governance() {
+    async fn charter_backed_repository_task_derives_pending_baseline_governance() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
@@ -1566,7 +1559,7 @@ mod tests {
             Arc::new(db::SqliteDb::new(pool)),
             Arc::new(EventBus::new(4)),
         );
-        let error = service
+        let governance = service
             .prepare_task_governance(
                 &charter_backed_project(),
                 Some(&"repo-1".to_owned()),
@@ -1574,8 +1567,17 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("implementation task must be gated");
-        assert!(error.to_string().contains("execution-baseline"));
+            .expect("implementation task can be recorded before the baseline")
+            .expect("repository task receives a governance row");
+        assert!(!governance.runnable);
+        assert_eq!(
+            governance.charter_revision_id.as_deref(),
+            Some("charter-revision-1")
+        );
+        assert!(governance.baseline_id.is_none());
+        assert!(governance.capability_class.is_none());
+        assert!(governance.risk_class.is_none());
+        assert!(governance.provenance_json.contains("baseline_pending"));
     }
 
     #[tokio::test]

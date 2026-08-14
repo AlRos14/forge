@@ -31,7 +31,7 @@ use sqlx::{Row, Sqlite, Transaction};
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{auth::AuthenticatedUser, client_idempotency_key, scoped_idempotency_key},
     state::AppState,
 };
 
@@ -797,6 +797,12 @@ pub async fn approve_project_document(
     let content_digest = request.content_digest.clone();
     let render_digest = request.render_digest.clone();
     let idempotency_key = request.mutation.idempotency_key.clone();
+    let storage_idempotency_key = scoped_idempotency_key(
+        "document-approval",
+        &project_id,
+        &user.user_id,
+        &idempotency_key,
+    );
     let authorization = request.mutation.authorization.clone();
     let principal_id = user.user_id.clone();
     let now = now_rfc3339();
@@ -827,7 +833,7 @@ pub async fn approve_project_document(
     let mut tx = state.db.pool().begin().await?;
     if let Some(row) =
         sqlx::query("SELECT * FROM project_document_approval WHERE idempotency_key = ?")
-            .bind(&idempotency_key)
+            .bind(&storage_idempotency_key)
             .fetch_optional(&mut *tx)
             .await?
     {
@@ -978,7 +984,7 @@ pub async fn approve_project_document(
     .bind(&authorization.occurred_at)
     .bind(&content_digest)
     .bind(&render_digest)
-    .bind(&idempotency_key)
+    .bind(&storage_idempotency_key)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -2388,7 +2394,7 @@ fn approval_to_api(
             occurred_at: record.authorization_occurred_at,
         },
         approved_at: record.created_at,
-        idempotency_key: record.idempotency_key,
+        idempotency_key: client_idempotency_key(&record.idempotency_key),
     })
 }
 

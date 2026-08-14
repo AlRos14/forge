@@ -698,9 +698,13 @@ impl SharedMediaRepo for SqliteDb {
 
     async fn list_purged_media_assets(&self, limit: i64) -> Result<Vec<MediaAsset>> {
         sqlx::query(&format!(
-            "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset
-             WHERE availability = 'purged' AND gc_state = 'deleted'
-             ORDER BY updated_at ASC, id ASC LIMIT ?"
+            "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset a
+             WHERE a.availability = 'purged' AND a.gc_state = 'deleted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_asset_purge_reconciliation r
+                   WHERE r.asset_id = a.id
+               )
+             ORDER BY a.updated_at ASC, a.id ASC LIMIT ?"
         ))
         .bind(limit.clamp(1, 500))
         .fetch_all(self.pool())
@@ -708,6 +712,24 @@ impl SharedMediaRepo for SqliteDb {
         .into_iter()
         .map(|row| map_media_asset(&row))
         .collect()
+    }
+
+    async fn mark_purged_media_asset_reconciled(
+        &self,
+        asset_id: &str,
+        reconciled_at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO media_asset_purge_reconciliation (asset_id, reconciled_at)
+             SELECT id, ? FROM media_asset
+             WHERE id = ? AND availability = 'purged' AND gc_state = 'deleted'
+             ON CONFLICT(asset_id) DO NOTHING",
+        )
+        .bind(reconciled_at)
+        .bind(asset_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     async fn replay_project_media_tombstone(
