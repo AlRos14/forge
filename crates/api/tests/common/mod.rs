@@ -347,6 +347,71 @@ fn test_jwt_with_admin(is_admin: bool) -> String {
     .expect("encode test jwt")
 }
 
+/// Create an API-key provider entry (the first half of the split connect
+/// contract).
+#[allow(dead_code)]
+pub async fn create_provider_entry(
+    app: &Router,
+    token: &str,
+    provider: &str,
+    label: &str,
+    credential: &str,
+    base_url: &str,
+) -> api_types::ProviderEntryResponse {
+    json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/providers",
+        token,
+        json!({
+            "provider": provider,
+            "label": label,
+            "credential": credential,
+            "base_url": base_url,
+        }),
+        StatusCode::OK,
+    )
+    .await
+}
+
+/// Provider entry + direct embedded agent in one helper: the canonical
+/// two-step replacement for the removed single-shot connect endpoint.
+#[allow(dead_code)]
+pub async fn connect_embedded_agent(
+    app: &Router,
+    token: &str,
+    name: &str,
+    credential_label: &str,
+    credential: &str,
+    account_permission_ceiling: Value,
+    tool_policy: Value,
+) -> api_types::ConnectedEmbeddedAgentResponse {
+    let entry = create_provider_entry(
+        app,
+        token,
+        "openai_compatible",
+        credential_label,
+        credential,
+        "https://8.8.8.8",
+    )
+    .await;
+    json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/embedded-agents",
+        token,
+        json!({
+            "name": name,
+            "credential_id": entry.id,
+            "model": "test-model",
+            "account_permission_ceiling": account_permission_ceiling,
+            "tool_policy": tool_policy,
+        }),
+        StatusCode::OK,
+    )
+    .await
+}
+
 pub async fn raw_json_request(
     app: &Router,
     method: Method,

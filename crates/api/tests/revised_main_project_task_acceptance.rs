@@ -210,12 +210,22 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     )
     .await;
     let project_id = required_string(&created_project, &["project_id"]);
+    let project_before_update = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        &token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
     request_json(
         app,
         Method::PATCH,
         &format!("/api/v1/projects/{project_id}"),
         &token,
         json!({
+            "version": project_before_update["version"],
             "default_review_config": {
                 "ci_steps": ["python3 -m unittest -v"],
                 "review_prompt": "Independently verify the Todo CLI."
@@ -750,19 +760,30 @@ async fn create_active_execution_baseline(
 }
 
 async fn connect_embedded(app: &Router, token: &str, name: &str, permissions: &[&str]) -> Value {
+    let entry = request_json(
+        app,
+        Method::POST,
+        "/api/v1/providers",
+        token,
+        json!({
+            "provider": "openai_compatible",
+            "label": name,
+            "credential": PROVIDER_SECRET,
+            "base_url": "https://8.8.8.8"
+        }),
+        &[StatusCode::OK],
+    )
+    .await;
     request_json(
         app,
         Method::POST,
-        "/api/v1/embedded-agents/connect",
+        "/api/v1/embedded-agents",
         token,
         json!({
             "name": name,
             "description": "V071 acceptance identity",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
+            "credential_id": entry["id"],
             "model": "acceptance-model",
-            "credential_label": name,
-            "credential": PROVIDER_SECRET,
             "account_permission_ceiling": { "permissions": permissions },
             "tool_policy": { "allowed": permissions }
         }),

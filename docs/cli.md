@@ -24,7 +24,7 @@ under the Forge data directory.
 | `memory`  | Search and retrieve project-scoped memory |
 | `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
 | `agent`   | Register / list / show agents |
-| `embedded` | Connect embedded identities, manage profiles/sessions, singular bindings/chats, handoffs, and protected credential handles |
+| `embedded` | Manage provider entries, embedded agents, profiles/sessions, singular bindings/chats, and handoffs |
 | `daemon`  | Link, start, and report an external daemon |
 | `run`     | Create + claim a task and follow the SSE stream until terminal state |
 | `mcp`     | Helpers for the MCP JSON-RPC endpoint |
@@ -149,30 +149,38 @@ calls to one Forge project.
 
 ### Direct embedded agents, bindings, and Agent Chats
 
-`forge-ctl embedded` manages account-owned embedded identities and their
-scope-bound native sessions. Connecting an identity does not create Main or
-Project authority; select it explicitly through a singular binding. Provider
-credentials are accepted only through a hidden terminal prompt or
-`--credential-stdin` and are never printed by the CLI.
+`forge-ctl embedded` manages account-owned provider entries, embedded agents,
+and their scope-bound native sessions. Adding a provider stores its credential
+as an entry and never creates an agent; creating an agent references an entry;
+neither creates Main or Project authority — select that explicitly through a
+singular binding. Provider credentials are accepted only through a hidden
+terminal prompt or `--credential-stdin` and are never printed by the CLI.
 
 ```bash
-# Connect an account-owned identity (the credential is prompted for)
-forge-ctl embedded connect \
-  --name "Forge Assistant" \
-  --provider openai \
-  --base-url https://api.openai.com/v1 \
-  --model gpt-5.6
+# Add an API-key provider entry (the credential is prompted for)
+forge-ctl embedded provider add --provider openai --label "primary"
 
 # Pipe a credential without putting it in shell history or process arguments
-printf '%s\n' "$OPENAI_API_KEY" | forge-ctl embedded connect \
-  --name "Forge Assistant" --provider openai \
-  --base-url https://api.openai.com/v1 --model gpt-5.6 \
-  --credential-stdin
+printf '%s\n' "$OPENAI_API_KEY" | forge-ctl embedded provider add \
+  --provider openai --label "primary" --credential-stdin
+
+# Sign in with OAuth from this machine (see "OAuth logins" below)
+forge-ctl embedded provider login --provider openai --label "chatgpt"
+forge-ctl embedded provider login --provider openai --method device
+
+forge-ctl embedded provider list
+forge-ctl embedded provider rename <ENTRY_ID> --label "work" --version <VERSION>
+forge-ctl embedded provider remove <ENTRY_ID> --version <VERSION>
+
+# Create a direct agent on an entry
+forge-ctl embedded create \
+  --name "Forge Assistant" \
+  --credential-id <ENTRY_ID> \
+  --model gpt-5.6
 
 forge-ctl embedded profile list <IDENTITY_ID>
 forge-ctl embedded profile connect <IDENTITY_ID> --version <VERSION> \
-  --provider openai --base-url https://api.openai.com/v1 --model gpt-5.6 \
-  --credential-stdin
+  --credential-id <ENTRY_ID> --model gpt-5.6
 forge-ctl embedded profile select <IDENTITY_ID> <PROFILE_ID> --version <VERSION>
 
 # Every session names one canonical scope; only Task scopes can receive a workspace.
@@ -191,6 +199,24 @@ forge-ctl embedded session steer <SESSION_ID> "Use the latest accepted requireme
 forge-ctl embedded session effective-permissions \
   --identity-id <IDENTITY_ID> --scope project --chat-id <PROJECT_CHAT_ID>
 ```
+
+#### OAuth logins
+
+Some providers' OAuth clients whitelist only a `localhost` callback — OpenAI's
+Codex client accepts `http://localhost:1455/auth/callback` (or `:1457`) and
+nothing else. The listener therefore has to run on the machine the browser runs
+on:
+
+| Where Forge runs | What to use |
+| --- | --- |
+| Same machine as the browser | The web UI's **Continue with ChatGPT**. Forge binds the callback port for the duration of the ceremony. |
+| Another host | `forge-ctl embedded provider login`. The CLI binds the port locally and relays only the authorization code to the server. |
+| No browser available | `--method device`, which prints a code to enter elsewhere. |
+
+`login` never sees the PKCE verifier or the resulting tokens: the server keeps
+both and performs the exchange, exactly as it does for the web flow. Browser
+login from a remote origin is rejected with an error pointing here, because no
+listener could answer the callback.
 
 Main and Project bindings are singular, versioned resources. Replacing a
 binding preserves the existing Agent Chat and historical attribution. A
@@ -248,10 +274,11 @@ forge-ctl embedded context get <MANIFEST_ID> \
   --identity-id <IDENTITY_ID> --context-scope-id <CONTEXT_SCOPE_ID>
 ```
 
-```bash
-forge-ctl embedded credential list
-forge-ctl embedded credential revoke <CREDENTIAL_HANDLE_ID>
-```
+Provider entry disconnect (`embedded provider remove`) uses optimistic
+concurrency. Pass the entry `version` returned by `provider list`; a stale
+version is rejected instead of revoking a connection changed by another
+session. Removal reports the agents that referenced the entry — they become
+visibly unhealthy and are never silently rebound.
 
 Commitments are durable identity-owned obligations. Create/list operations use
 the identity path and an explicitly authorized canonical scope; lifecycle

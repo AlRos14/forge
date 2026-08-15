@@ -2237,12 +2237,6 @@ impl FederatedAgentChatTurnRunner {
             .credential_ref
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no credential"))?;
-        let credential = self
-            .embedded_agents
-            .protected_store()
-            .load_credential(credential_ref, owner_user_id)
-            .await
-            .map_err(|_| ServiceError::invalid_operation("Agent credential is unavailable"))?;
         let config: NativeProfileConfig = serde_json::from_str(&profile.config_json)
             .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
         let runtime_session_id = session
@@ -2275,7 +2269,8 @@ impl FederatedAgentChatTurnRunner {
                         provider,
                         base_url: config.base_url,
                         model: model.clone(),
-                        credential,
+                        credential_handle_id: credential_ref.to_owned(),
+                        owner_user_id: owner_user_id.to_owned(),
                         context_tokens: config.context_tokens,
                         max_input_tokens: config.max_input_tokens,
                         max_output_tokens: config.max_output_tokens,

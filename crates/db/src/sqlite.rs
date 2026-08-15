@@ -77,6 +77,7 @@ mod pr_provider_config;
 mod project;
 mod project_hook_run;
 mod project_member;
+mod provider_authorization;
 mod repo;
 mod review;
 mod runtime;

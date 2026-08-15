@@ -119,6 +119,7 @@ pub struct TaskService {
     workspace_root: PathBuf,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
 }
 
 #[derive(Debug)]
@@ -194,6 +195,7 @@ impl TaskService {
             workspace_root: default_workspace_root(),
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
+            credential_env: None,
         }
     }
 
@@ -261,6 +263,17 @@ impl TaskService {
 
     pub fn with_memory_service(mut self, memory_service: Arc<MemoryService>) -> Self {
         self.memory_service = memory_service;
+        self
+    }
+
+    /// Enables `auth_source: forge_provider` dispatch: harness executions for
+    /// agents referencing a provider entry get the entry's API key injected
+    /// into their in-memory executor environment.
+    pub fn with_provider_credential_env(
+        mut self,
+        embedded: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
+    ) -> Self {
+        self.credential_env = Some(embedded);
         self
     }
 

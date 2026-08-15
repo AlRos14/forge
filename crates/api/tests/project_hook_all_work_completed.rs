@@ -242,11 +242,20 @@ async fn create_project_with_repo_and_completion_workflow(
 }
 
 async fn configure_create_task_hook(app: &Router, project_id: &str) {
+    let project: ProjectResponse = json_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
     let _: ProjectResponse = json_request(
         app,
         Method::PATCH,
         &format!("/api/v1/projects/{project_id}"),
         json!({
+            "version": project.version,
             "project_hooks": [{
                 "id": "create-follow-up",
                 "enabled": true,
@@ -270,11 +279,20 @@ async fn configure_create_task_hook(app: &Router, project_id: &str) {
 }
 
 async fn configure_dispatch_missing_agent_hook(app: &Router, project_id: &str) {
+    let project: ProjectResponse = json_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
     let _: ProjectResponse = json_request(
         app,
         Method::PATCH,
         &format!("/api/v1/projects/{project_id}"),
         json!({
+            "version": project.version,
             "project_hooks": [{
                 "id": "dispatch-missing-agent",
                 "enabled": true,

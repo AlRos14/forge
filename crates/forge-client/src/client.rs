@@ -122,6 +122,24 @@ impl ForgeClient {
         decode_json(response).await
     }
 
+    /// Relays a provider's browser OAuth callback to the server. The response
+    /// is a redirect meant for a browser, so redirects are not followed and
+    /// only the status is inspected.
+    pub async fn relay_provider_callback(&self, path: &str) -> Result<()> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let response = http.get(self.url(path)).send().await?;
+        let status = response.status();
+        if status.is_success() || status.is_redirection() {
+            return Ok(());
+        }
+        Err(request_error(
+            status,
+            response.text().await.unwrap_or_default(),
+        ))
+    }
+
     pub async fn delete(&self, path: &str) -> Result<()> {
         let response = self
             .apply_auth(self.http.delete(self.url(path)))

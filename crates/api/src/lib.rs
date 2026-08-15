@@ -62,6 +62,10 @@ pub fn build_router(state: AppState, web_dist_dir: impl Into<PathBuf>) -> Router
         )
         .route("/oauth/authorize", get(routes::oauth::authorize))
         .route("/oauth/token", post(routes::oauth::token))
+        .route(
+            "/api/v1/provider-authorizations/{provider}/callback",
+            get(routes::provider_authorizations::provider_authorization_callback),
+        )
         .with_state(state.clone())
         .merge(api_router(state))
         .fallback_service(static_service)
@@ -763,8 +767,37 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::agents::duplicate_agent),
         )
         .route(
-            "/api/v1/embedded-agents/connect",
-            post(routes::embedded_agents::connect_embedded_agent),
+            "/api/v1/embedded-agents",
+            post(routes::embedded_agents::create_embedded_agent),
+        )
+        .route(
+            "/api/v1/providers/catalog",
+            get(routes::providers::provider_catalog),
+        )
+        .route(
+            "/api/v1/providers",
+            get(routes::providers::list_providers).post(routes::providers::create_provider_entry),
+        )
+        .route(
+            "/api/v1/providers/{id}",
+            patch(routes::providers::rename_provider_entry)
+                .delete(routes::providers::delete_provider_entry),
+        )
+        .route(
+            "/api/v1/providers/{id}/test",
+            post(routes::providers::test_provider_entry),
+        )
+        .route(
+            "/api/v1/provider-authorizations",
+            post(routes::provider_authorizations::start_provider_authorization),
+        )
+        .route(
+            "/api/v1/provider-authorizations/{id}",
+            get(routes::provider_authorizations::get_provider_authorization),
+        )
+        .route(
+            "/api/v1/provider-authorizations/{id}/cancel",
+            post(routes::provider_authorizations::cancel_provider_authorization),
         )
         .route(
             "/api/v1/agents/{id}/profiles",
@@ -875,14 +908,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/actions/{id}/execute-task",
             post(routes::coordination::execute_task_proposal),
-        )
-        .route(
-            "/api/v1/credentials",
-            get(routes::embedded_agents::list_credentials),
-        )
-        .route(
-            "/api/v1/credentials/{id}",
-            delete(routes::embedded_agents::revoke_credential),
         )
         .route(
             "/api/v1/executor-types",

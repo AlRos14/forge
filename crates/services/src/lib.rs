@@ -51,6 +51,7 @@ pub mod project_member_service;
 pub mod project_orchestration;
 pub mod project_runtime;
 pub mod prompt_preview;
+pub mod provider_authorization;
 pub mod recovery;
 pub mod shared_media_cleanup;
 pub mod shutdown;
@@ -114,7 +115,7 @@ pub use default_agents::ensure_default_agents;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
 pub use domain_event_service::DomainEventService;
-pub use embedded_agent_service::EmbeddedAgentService;
+pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
 pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
 pub use execution_baseline::{
@@ -201,6 +202,7 @@ pub use project_runtime::{
     ProjectEffectiveStateProjection, ProjectInboxProjection,
 };
 pub use prompt_preview::preview_effective_prompt;
+pub use provider_authorization::ProviderAuthorizationService;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
@@ -236,6 +238,9 @@ pub enum ServiceError {
 
     #[error("authorization denied: {message}")]
     AuthorizationDenied { message: String },
+
+    #[error("rate limited; retry after {retry_after_seconds} seconds")]
+    RateLimited { retry_after_seconds: u64 },
 
     #[error("task action unavailable: {reason}")]
     TaskActionUnavailable {

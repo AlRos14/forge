@@ -277,6 +277,7 @@ async fn create_agent(harness: &Harness) -> String {
             prompt_template: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(daemon.id),
             max_concurrent_tasks: 2,
             heartbeat_interval_seconds: 30,

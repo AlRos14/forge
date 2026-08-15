@@ -3093,27 +3093,34 @@ async fn raw_request(
     (status, bytes)
 }
 
-fn connect_agent_body(name: &str, permissions: &[&str]) -> Value {
-    json!({
-        "name": name,
-        "description": "V076 acceptance identity",
-        "provider": "openai_compatible",
-        "base_url": "https://8.8.8.8",
-        "model": "v076-acceptance-model",
-        "credential_label": name,
-        "credential": PROVIDER_SECRET,
-        "account_permission_ceiling": {"permissions": permissions},
-        "tool_policy": {"allowed": permissions}
-    })
-}
-
 async fn connect_agent(app: &Router, token: &str, name: &str, permissions: &[&str]) -> Value {
+    let entry = request_json(
+        app,
+        Method::POST,
+        "/api/v1/providers",
+        token,
+        json!({
+            "provider": "openai_compatible",
+            "label": name,
+            "credential": PROVIDER_SECRET,
+            "base_url": "https://8.8.8.8"
+        }),
+        &[StatusCode::OK],
+    )
+    .await;
     request_json(
         app,
         Method::POST,
-        "/api/v1/embedded-agents/connect",
+        "/api/v1/embedded-agents",
         token,
-        connect_agent_body(name, permissions),
+        json!({
+            "name": name,
+            "description": "V076 acceptance identity",
+            "credential_id": entry["id"],
+            "model": "v076-acceptance-model",
+            "account_permission_ceiling": {"permissions": permissions},
+            "tool_policy": {"allowed": permissions}
+        }),
         &[StatusCode::OK],
     )
     .await

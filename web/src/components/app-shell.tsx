@@ -71,30 +71,40 @@ type NavItem = {
     | 'overview'
     | 'board'
     | 'tasks'
-    | 'chat'
-    | 'agents'
+    | 'mainChat'
+    | 'agentWorkspace'
+    | 'agentSettings'
     | 'missionControl'
     | 'daemons'
     | 'operations'
     | 'settings'
-    | 'system'
+    | 'forgeSettings'
   icon: ComponentType<{ size?: string | number; weight?: IconWeight }>
-  section: 'project' | 'global'
+  section: 'main' | 'project' | 'global'
 }
 
 const navItems: NavItem[] = [
   { to: '/projects/$projectId/overview', key: 'overview', icon: ChartLineUp, section: 'project' },
   { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'project' },
   { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
-  { to: '/projects/$projectId/chat', key: 'chat', icon: ChatCircleDots, section: 'project' },
+  {
+    to: '/projects/$projectId/chat',
+    key: 'agentWorkspace',
+    icon: ChatCircleDots,
+    section: 'project',
+  },
   { to: '/projects/$projectId/settings', key: 'settings', icon: Gear, section: 'project' },
-  { to: '/agents/federated', key: 'agents', icon: Robot, section: 'global' },
-  { to: '/chat', key: 'chat', icon: ChatCircleDots, section: 'global' },
+  { to: '/chat', key: 'mainChat', icon: ChatCircleDots, section: 'main' },
+  { to: '/agents', key: 'agentSettings', icon: Robot, section: 'global' },
   { to: '/mission-control', key: 'missionControl', icon: Pulse, section: 'global' },
   { to: '/daemons', key: 'daemons', icon: Desktop, section: 'global' },
   { to: '/operations', key: 'operations', icon: Pulse, section: 'global' },
-  { to: '/settings', key: 'system', icon: Sliders, section: 'global' },
+  { to: '/settings', key: 'forgeSettings', icon: Sliders, section: 'global' },
 ]
+
+export function navigationItemsForSection(section: NavItem['section']) {
+  return navItems.filter((item) => item.section === section)
+}
 
 const PROJECTS_PAGE_SIZE = 20
 
@@ -518,10 +528,13 @@ export function AppShell({ children }: { children: ReactNode }) {
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [closeDrawer, drawerOpen])
 
-  const projectNavItems = navItems.filter((item) => item.section === 'project')
-  const globalNavItems = navItems.filter((item) => {
-    if (item.section !== 'global') return false
-    if (item.key === 'daemons' || item.key === 'operations' || item.key === 'system') {
+  const projectNavItems = navigationItemsForSection('project')
+  const globalNavItems = navigationItemsForSection('global').filter((item) => {
+    if (
+      item.key === 'daemons' ||
+      item.key === 'operations' ||
+      item.key === 'forgeSettings'
+    ) {
       return isAdmin
     }
     return true
@@ -641,6 +654,11 @@ export function AppShell({ children }: { children: ReactNode }) {
           <nav className="flex flex-1 flex-col gap-4 overflow-y-auto py-3">
             {/* Project switcher */}
             <ProjectSwitcher projectId={projectId} collapsed={effectiveCollapsed} />
+
+            {/* Account-level Main Chat */}
+            <div className={effectiveCollapsed ? 'px-1' : 'px-2'}>
+              {navigationItemsForSection('main').map(renderNavLink)}
+            </div>
 
             {/* Project nav */}
             <NavSection

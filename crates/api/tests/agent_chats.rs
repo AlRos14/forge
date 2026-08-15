@@ -77,22 +77,14 @@ async fn project_creation_records_chat_binding_events_and_stale_binding_replacem
     let workspace = common::TestDir::new("agent-chat-project-events");
     let harness = common::test_app(workspace.path(), "agent-chat-project-events").await;
     let token = common::test_jwt();
-    let connected: ConnectedEmbeddedAgentResponse = common::json_request_with_bearer(
+    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
         &harness.app,
-        Method::POST,
-        "/api/v1/embedded-agents/connect",
         &token,
-        json!({
-            "name": "project-event-agent",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
-            "model": "test-model",
-            "credential_label": "project-event",
-            "credential": "project-event-secret",
-            "account_permission_ceiling": {"permissions": ["read_agent_chat", "propose_message"]},
-            "tool_policy": {"allowed": ["read_agent_chat", "propose_message"]}
-        }),
-        StatusCode::OK,
+        "project-event-agent",
+        "project-event",
+        "project-event-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
     )
     .await;
 
@@ -222,22 +214,14 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     let workspace = common::TestDir::new("agent-chat-turn-cancel");
     let harness = common::test_app(workspace.path(), "agent-chat-turn-cancel").await;
     let token = common::test_jwt();
-    let connected: ConnectedEmbeddedAgentResponse = common::json_request_with_bearer(
+    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
         &harness.app,
-        Method::POST,
-        "/api/v1/embedded-agents/connect",
         &token,
-        json!({
-            "name": "turn-cancel-agent",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
-            "model": "test-model",
-            "credential_label": "turn-cancel",
-            "credential": "turn-cancel-secret",
-            "account_permission_ceiling": {"permissions": ["read_agent_chat", "propose_message"]},
-            "tool_policy": {"allowed": ["read_agent_chat", "propose_message"]}
-        }),
-        StatusCode::OK,
+        "turn-cancel-agent",
+        "turn-cancel",
+        "turn-cancel-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
     )
     .await;
     let binding: MainAgentBindingResponse = common::json_request_with_bearer(

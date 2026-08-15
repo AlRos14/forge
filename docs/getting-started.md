@@ -187,41 +187,80 @@ walkthrough below.
 
 ## Connecting a direct embedded agent
 
-An embedded agent is account-owned and does not need a Project. The connection
-endpoint stores the provider credential through a protected write-only boundary;
-responses contain an opaque credential handle, bounded health, and capabilities,
-never the credential value.
+Open **Agent Settings** (`/agents`) to choose a provider and a method advertised
+by the server. Forge labels each method stable, experimental, or unavailable.
+API keys remain the universal fallback. ChatGPT browser/device login and xAI
+device login are experimental. Gemini uses Google's documented OAuth endpoints
+only when `FORGE_GEMINI_OAUTH_CLIENT_ID` is configured; set
+`FORGE_GEMINI_OAUTH_CLIENT_SECRET` too when the registered client requires it.
+Forge does not import Codex, Grok CLI, Gemini CLI, or Code Assist credential
+caches.
+
+Browser login redirects through the exact configured CORS origin. Device login
+shows a provider URL and user code while Forge polls a finite operation. Closing
+the dialog does not broaden its lease; reopening Agent Settings shows the
+terminal result after the provider callback. A successful login creates a
+protected renewable **provider entry** — it does not create an agent and does
+not bind anything. You can add the same provider more than once (for example
+two OpenAI accounts); every entry appears on the Agent Settings `Providers`
+tab with its usage.
+
+Agents are created afterwards from an entry, on the `Agents` tab or over the
+API. An entry stores the credential through a protected write-only boundary;
+responses contain an opaque credential handle, bounded health, and
+capabilities, never the credential value.
 
 ```bash
 read -rsp 'Provider API key: ' PROVIDER_KEY; printf '\n'
 
-CONNECTED=$(curl -sS -X POST "$FORGE_URL/api/v1/embedded-agents/connect" \
+# 1. Add a provider entry (stores the key; creates no agent).
+ENTRY=$(curl -sS -X POST "$FORGE_URL/api/v1/providers" \
   -H 'content-type: application/json' \
   -d "$(jq -n --arg key "$PROVIDER_KEY" '{
-    name: "my-forge-agent",
-    description: "A persistent account assistant",
     provider: "openai",
-    base_url: "https://api.openai.com/v1",
-    model: "gpt-5.6-terra",
-    credential_label: "primary",
+    label: "primary",
     credential: $key
   }')")
 unset PROVIDER_KEY
+ENTRY_ID=$(jq -r .id <<<"$ENTRY")
+
+# 2. Create a direct agent that uses the entry.
+CONNECTED=$(curl -sS -X POST "$FORGE_URL/api/v1/embedded-agents" \
+  -H 'content-type: application/json' \
+  -d "$(jq -n --arg entry "$ENTRY_ID" '{
+    name: "my-forge-agent",
+    description: "A persistent account assistant",
+    credential_id: $entry,
+    model: "gpt-5.6-terra"
+  }')")
 
 AGENT_ID=$(jq -r .agent.id <<<"$CONNECTED")
 ```
 
-The connection endpoint above is the implemented foundation: it creates a
-stable account-owned identity and immutable profile while keeping the provider
-credential behind a protected write-only boundary. It does not select a chat
-binding or grant Project/Task authority. Main and Project Agent Chat sessions
-remain filesystem-denied; only an identity admitted through the existing Task
+The same entry can also power a CLI harness: register a `codex` or `gemini`
+agent with `credential_id` and Forge injects the key into the harness
+environment at dispatch (`GET /api/v1/providers/catalog` declares which
+combinations are supported). Harnesses without an entry keep using their own
+CLI login, and the `Providers` tab lists those CLI runtimes with their
+authentication state. Creating an agent does not select a chat binding or grant
+Project/Task authority. Main and Project Agent Chat sessions remain
+filesystem-denied; only an identity admitted through the existing Task
 Worker/reviewer assignment and workflow can receive a Task Workspace.
 
-## Main Agent and Project Agent Chats
+To recover from an OAuth failure, cancel the visible operation and start a new
+one. Disconnecting a credential immediately invalidates its local lease. Forge
+reports whether remote provider revocation was `not_supported`, `succeeded`, or
+`failed`; after a failure, also revoke the app in the provider's account
+controls. Refresh tokens rotate inside encrypted storage and are never returned
+by a read endpoint.
+
+## Main Chat and the Project Agent Workspace
 
 The approved product model has one global Main Agent binding/chat per account
-and exactly one Project Agent binding/chat per operational Project. A connected
+and exactly one Project Agent binding/chat per operational Project. Main Chat
+appears directly below the Project switcher. Each Project's **Agent Workspace**
+keeps its durable conversation beside Project-record editing controls; on small
+screens, use the Conversation/Project segments without losing either draft. A connected
 but unbound identity stays available for later selection and does not appear as
 an extra chat-switcher entry. The revised binding and chat resources are:
 

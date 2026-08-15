@@ -1,12 +1,11 @@
 import { useEffect, useMemo } from 'react'
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link } from '@tanstack/react-router'
 import { ArrowUpRight, ChatCircleDots } from '@phosphor-icons/react'
 import { Avatar } from '@/components/ui/avatar'
 import { ErrorPanel, LoadingPanel, StatusDot } from '@/features/federation/components'
-import { AgentChatSwitcher } from '@/components/chat/agent-chat-switcher'
-import type { ChatSwitcherEntry } from '@/components/chat/agent-chat-switcher'
 import { AgentChatTimeline } from '@/components/chat/agent-chat-timeline'
 import { ChatSetupRequired } from '@/components/chat/chat-setup-required'
+import { ProjectAgentWorkbench } from '@/components/chat/project-agent-workbench'
 import { ProductGenesisControls } from '@/features/product-genesis/ProductGenesisControls'
 import {
   useAgentChatQuery,
@@ -30,51 +29,6 @@ function projectNameFor(
 
 function isBindingReady(entry: AgentChatEntry | undefined): boolean {
   return Boolean(entry && entry.binding_state === 'active' && entry.chat_status === 'ready')
-}
-
-function switcherState(entry: AgentChatEntry): 'ready' | 'setup_required' | 'unavailable' {
-  if (isBindingReady(entry)) return 'ready'
-  if (entry.binding_state === 'setup_required' || entry.chat_status === 'setup_required') {
-    return 'setup_required'
-  }
-  return 'unavailable'
-}
-
-function count(value: bigint | number): number {
-  return typeof value === 'bigint' ? Number(value) : value
-}
-
-function toSwitcherEntry(
-  entry: AgentChatEntry,
-  projectName: string,
-  active: boolean,
-): ChatSwitcherEntry {
-  const state = switcherState(entry)
-  return {
-    id: entry.chat_id,
-    label: entry.kind === 'main' ? 'Global · Main' : projectName,
-    description:
-      entry.kind === 'main' ? 'Account-owned Main Agent timeline' : 'Project-owned Agent timeline',
-    agentName: entry.identity_name,
-    agentStatus: state === 'ready' ? 'ready' : state === 'unavailable' ? 'unavailable' : null,
-    state,
-    setupRequired: state === 'setup_required',
-    pendingTurnCount: count(entry.pending_turn_count),
-    active,
-  }
-}
-
-function emptyGlobalEntry(active: boolean): ChatSwitcherEntry {
-  return {
-    id: 'main-agent-chat',
-    label: 'Global · Main',
-    description: 'Account-owned Main Agent timeline',
-    agentName: null,
-    agentStatus: null,
-    state: 'setup_required',
-    setupRequired: true,
-    active,
-  }
 }
 
 export function handoffProjectIdsForScope(
@@ -152,7 +106,6 @@ export function ProjectRecordNavigation({ projectId }: { projectId: string }) {
 }
 
 export function ChatPage({ projectId }: { projectId?: string }) {
-  const navigate = useNavigate()
   const chatsQuery = useAgentChatsQuery()
   const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
   const setGlobalChat = useChatSelection((state) => state.setGlobalChat)
@@ -164,59 +117,6 @@ export function ChatPage({ projectId }: { projectId?: string }) {
   )
   const globalSource = entries.find((entry) => entry.kind === 'main')
   const projectSources = entries.filter((entry) => entry.kind === 'project')
-  const projectEntries = useMemo(() => {
-    const mapped = projects.map((project) => {
-      const source = projectSources.find((entry) => entry.project_id === project.id)
-      if (source) {
-        return toSwitcherEntry(
-          source,
-          project.name,
-          Boolean(projectId && source.project_id === projectId),
-        )
-      }
-      return {
-        id: `project:${project.id}`,
-        label: project.name,
-        description: 'Project-owned Agent timeline',
-        agentName: null,
-        agentStatus: null,
-        state: 'setup_required' as const,
-        setupRequired: true,
-        active: project.id === projectId,
-      }
-    })
-    const knownProjects = new Set(projects.map((project) => project.id))
-    return [
-      ...mapped,
-      ...projectSources
-        .filter((entry) => entry.project_id && !knownProjects.has(entry.project_id))
-        .map((entry) =>
-          toSwitcherEntry(
-            entry,
-            entry.project_name ?? 'Project',
-            Boolean(projectId && entry.project_id === projectId),
-          ),
-        ),
-    ]
-  }, [projectId, projectSources, projects])
-
-  const globalEntry = chatsQuery.isLoading
-    ? {
-        ...emptyGlobalEntry(!projectId),
-        state: 'loading' as const,
-        setupRequired: false,
-        description: 'Loading account-owned Main Agent timeline',
-      }
-    : chatsQuery.isError
-      ? {
-          ...emptyGlobalEntry(!projectId),
-          state: 'unavailable' as const,
-          setupRequired: false,
-          description: 'Main Agent chat unavailable',
-        }
-      : globalSource
-        ? toSwitcherEntry(globalSource, 'Global', !projectId)
-        : emptyGlobalEntry(!projectId)
   const activeSource = projectId
     ? projectSources.find((entry) => entry.project_id === projectId)
     : globalSource
@@ -270,9 +170,9 @@ export function ChatPage({ projectId }: { projectId?: string }) {
     })
   }
 
-  const pageTitle = projectId ? `${activeProjectName} chat` : 'Global chat'
+  const pageTitle = projectId ? `${activeProjectName} Agent Workspace` : 'Main Chat'
   const pageDescription = projectId
-    ? 'Continue with this Project’s single Agent Chat. Its timeline and context remain scoped here.'
+    ? 'Shape Project records and Tasks beside this Project’s durable Agent timeline. Repository work remains Task-scoped.'
     : 'The account’s single Main Agent timeline for discovery, organization, and explicit handoff.'
 
   return (
@@ -280,7 +180,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
       <header className="flex shrink-0 flex-wrap items-start justify-between gap-4 border-b border-border-subtle px-4 py-4 sm:px-5">
         <div className="min-w-0">
           <p className="font-mono text-micro uppercase tracking-[0.18em] text-primary">
-            Agent Chat
+            {projectId ? 'Project Agent' : 'Account Agent'}
           </p>
           <h1 className="mt-1 truncate text-xl font-semibold tracking-tight text-foreground sm:text-2xl">
             {pageTitle}
@@ -299,27 +199,8 @@ export function ChatPage({ projectId }: { projectId?: string }) {
         </div>
         {!projectId ? <ProductGenesisControls /> : null}
       </header>
-      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <AgentChatSwitcher
-          globalEntry={globalEntry}
-          projectEntries={projectEntries}
-          projectListState={
-            chatsQuery.isError || projectsQuery.isError
-              ? 'error'
-              : chatsQuery.isLoading || projectsQuery.isLoading
-                ? 'loading'
-                : 'ready'
-          }
-          onSelectGlobal={() => void navigate({ to: '/chat' })}
-          onSelectProject={(entry) => {
-            const source = projectSources.find((candidate) => candidate.chat_id === entry.id)
-            const targetProjectId = source?.project_id ?? entry.id.replace(/^project:/, '')
-            void navigate({
-              to: '/projects/$projectId/chat',
-              params: { projectId: targetProjectId },
-            })
-          }}
-        />
+      <div className="flex min-h-0 flex-1 flex-col">
+        <ProjectAgentWorkbench projectId={projectId}>
         <section
           className="flex min-h-0 min-w-0 flex-1 flex-col"
           aria-label={`${pageTitle} timeline`}
@@ -352,8 +233,8 @@ export function ChatPage({ projectId }: { projectId?: string }) {
                 <>
                   <ProjectRecordNavigation projectId={projectId} />
                   <Link
-                    to="/projects/$projectId/settings/$tab"
-                    params={{ projectId, tab: 'project-agent' }}
+                    to="/agents"
+                    search={{ project: projectId }}
                     className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     Agent settings
@@ -397,15 +278,16 @@ export function ChatPage({ projectId }: { projectId?: string }) {
                 </p>
                 {projectId ? (
                   <Link
-                    to="/projects/$projectId/settings/$tab"
-                    params={{ projectId, tab: 'project-agent' }}
+                    to="/agents"
+                    search={{ project: projectId }}
                     className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     Open Agent settings <ArrowUpRight size={13} aria-hidden />
                   </Link>
                 ) : (
                   <Link
-                    to="/agents/federated"
+                    to="/agents"
+                    search={{ tab: 'bindings' }}
                     className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     Open Agent settings <ArrowUpRight size={13} aria-hidden />
@@ -433,6 +315,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
             </div>
           )}
         </section>
+        </ProjectAgentWorkbench>
       </div>
     </div>
   )

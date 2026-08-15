@@ -14,6 +14,7 @@ pub mod memory;
 pub mod output;
 mod password_prompt;
 pub mod project;
+pub mod provider_login;
 pub mod repo;
 pub mod run;
 pub mod task;

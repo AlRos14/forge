@@ -13,12 +13,17 @@ use agent_runtime::{
         event::{RuntimeEvent, TurnFinish},
         ids::SessionId,
         provider::{ModelId, Provider},
+        provider_credential::ProviderCredentialTarget,
         security::SecuritySubject,
         usage::CounterKind,
         workspace::DenyAllWorkspace,
     },
     harness::{LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver},
-    provider::openai::{OpenAiConfig, OpenAiProvider},
+    provider::{
+        gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider},
+        openai::{OpenAiConfig, OpenAiProvider},
+        responses::{ResponsesConfig, ResponsesProvider},
+    },
     runtime::{RuntimeBuilder, SessionHandle, StartSession},
 };
 use async_trait::async_trait;
@@ -65,19 +70,61 @@ impl NativeAgentRuntimeBackend {
         self.interaction_broker.clone()
     }
 
-    fn provider(request: &AgentTurnRequest) -> Result<Arc<dyn Provider>, AgentHostError> {
+    fn provider(&self, request: &AgentTurnRequest) -> Result<Arc<dyn Provider>, AgentHostError> {
+        let transport = ReqwestTransport::new()
+            .map_err(|error| AgentHostError::Configuration(error.message))?;
+        let target = ProviderCredentialTarget::new(request.provider.credential_handle_id.clone())
+            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+        let source = self.protected_store.credential_source(
+            request.provider.owner_user_id.clone(),
+            request.provider.credential_handle_id.clone(),
+        );
         match request.provider.provider.as_str() {
+            "xai" => {
+                let config = ResponsesConfig::new(
+                    request.provider.base_url.clone(),
+                    request.provider.model.clone(),
+                );
+                let provider =
+                    ResponsesProvider::with_credential_source(transport, config, target, source)
+                        .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+                Ok(Arc::new(provider))
+            }
+            "gemini" => {
+                let config = GeminiInteractionsConfig::new(
+                    request.provider.base_url.clone(),
+                    request.provider.model.clone(),
+                );
+                let provider = GeminiInteractionsProvider::with_credential_source(
+                    transport, config, target, source,
+                )
+                .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+                Ok(Arc::new(provider))
+            }
+            "openai"
+                if request
+                    .provider
+                    .base_url
+                    .contains("chatgpt.com/backend-api/codex") =>
+            {
+                let config = ResponsesConfig::new(
+                    request.provider.base_url.clone(),
+                    request.provider.model.clone(),
+                );
+                let provider =
+                    ResponsesProvider::with_credential_source(transport, config, target, source)
+                        .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+                Ok(Arc::new(provider))
+            }
             "openai" | "openai_compatible" | "openrouter" => {
                 let config = OpenAiConfig::new(
                     request.provider.base_url.clone(),
                     request.provider.model.clone(),
-                )
-                .with_api_key(request.provider.credential.clone());
-                Ok(Arc::new(OpenAiProvider::new(
-                    ReqwestTransport::new()
-                        .map_err(|error| AgentHostError::Configuration(error.message))?,
-                    config,
-                )))
+                );
+                let provider =
+                    OpenAiProvider::with_credential_source(transport, config, target, source)
+                        .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+                Ok(Arc::new(provider))
             }
             provider => Err(AgentHostError::Unsupported(format!(
                 "native provider `{provider}` is not configured"
@@ -155,7 +202,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             },
             self.forge_tool_provider.clone(),
         )?;
-        let provider = Self::provider(&request)?;
+        let provider = self.provider(&request)?;
         let model_id = ModelId::new(&request.provider.model);
         let lcm_store = self
             .protected_store

@@ -9,7 +9,7 @@
  * the caller-facing input.  The server derives the final `runnable` value
  * from the active baseline and never trusts a caller-provided flag.
  */
-export type TaskGovernanceRequest = { charter_revision_id: string | null, baseline_id: string | null, baseline_revision_id: string | null, plan_item_id: string | null, milestone_id: string | null, document_revision_ids: Array<string>, capability_class: string | null, risk_class: string | null,
+export type TaskGovernanceRequest = { charter_revision_id: string | null, baseline_id: string | null, baseline_revision_id: string | null, plan_item_id: string | null, milestone_id: string | null, document_revision_ids: Array<string>, capability_class: string | null, risk_class: string | null, 
 /**
  * Bounded caller provenance (for example adaptive split/replacement
  * origin).  Forge augments this with the governing baseline digest and

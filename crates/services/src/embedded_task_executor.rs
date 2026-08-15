@@ -17,8 +17,8 @@ use executors::{
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType,
-    NativeAgentRuntimeBackend, NativeProviderConfig, RuntimeContextManifestLink,
-    SqliteProtectedRuntimeStore, TurnEventSink, WorkspaceAccess,
+    NativeAgentRuntimeBackend, NativeProviderConfig, RuntimeContextManifestLink, TurnEventSink,
+    WorkspaceAccess,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -38,7 +38,6 @@ pub struct EmbeddedTaskExecutor {
     db: Arc<SqliteDb>,
     embedded_agents: Arc<EmbeddedAgentService>,
     backend: Arc<NativeAgentRuntimeBackend>,
-    protected_store: Arc<SqliteProtectedRuntimeStore>,
     active: Arc<RwLock<HashMap<String, ActiveTaskTurn>>>,
 }
 
@@ -63,12 +62,10 @@ impl std::fmt::Debug for EmbeddedTaskExecutor {
 impl EmbeddedTaskExecutor {
     pub fn new(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
         let backend = embedded_agents.native_backend();
-        let protected_store = embedded_agents.protected_store();
         Self {
             db,
             embedded_agents,
             backend,
-            protected_store,
             active: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -112,13 +109,6 @@ impl EmbeddedTaskExecutor {
             .ok_or_else(|| {
                 ServiceError::invalid_operation("embedded profile has no credential handle")
             })?;
-        let credential = self
-            .protected_store
-            .load_credential(credential_ref, &owner_user_id)
-            .await
-            .map_err(|_| {
-                ServiceError::invalid_operation("embedded Task credential is unavailable")
-            })?;
         let config = ctx
             .agent_config
             .get("config")
@@ -155,7 +145,7 @@ impl EmbeddedTaskExecutor {
         let session = self
             .embedded_agents
             .create_or_resume_session(CreateScopedSession {
-                actor_user_id: owner_user_id,
+                actor_user_id: owner_user_id.clone(),
                 identity_id: agent.id.clone(),
                 profile_id: Some(profile.id.clone()),
                 scope: RequestedCanonicalScope::Task {
@@ -199,7 +189,8 @@ impl EmbeddedTaskExecutor {
                         provider,
                         base_url: config.base_url,
                         model: model.clone(),
-                        credential,
+                        credential_handle_id: credential_ref.to_owned(),
+                        owner_user_id: owner_user_id.clone(),
                         context_tokens: config.context_tokens,
                         max_input_tokens: config.max_input_tokens,
                         max_output_tokens: config.max_output_tokens,

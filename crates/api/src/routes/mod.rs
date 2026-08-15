@@ -54,6 +54,8 @@ pub mod project_media;
 pub mod project_orchestration;
 pub mod project_overview;
 pub mod projects;
+pub mod provider_authorizations;
+pub mod providers;
 pub mod repos;
 pub mod reviews;
 pub mod scoped_memory;

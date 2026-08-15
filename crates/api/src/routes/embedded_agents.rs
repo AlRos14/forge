@@ -1,7 +1,7 @@
 use api_types::{
     AgentConnectionHealthResponse, AgentProfileResponse, AgentSessionResponse,
-    CanonicalScopeRequest, ConnectEmbeddedAgentRequest, ConnectEmbeddedProfileRequest,
-    ConnectedEmbeddedAgentResponse, ConnectedEmbeddedProfileResponse, CreateAgentSessionRequest,
+    CanonicalScopeRequest, ConnectEmbeddedProfileRequest, ConnectedEmbeddedAgentResponse,
+    ConnectedEmbeddedProfileResponse, CreateAgentSessionRequest, CreateEmbeddedAgentRequest,
     CredentialHandleResponse, EffectivePermissionsResponse, ProtectedInteractionAnswerRequest,
     ProtectedInteractionAnswerValue, ProtectedInteractionCancelRequest,
     ProtectedInteractionSummaryResponse, SessionVersionRequest, SteerAgentSessionRequest,
@@ -13,13 +13,13 @@ use axum::{
 };
 use db::{
     now_rfc3339, Agent, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession, CredentialHandle,
-    CredentialHandleRepo, ExecutionRepo, SelectAgentProfile,
+    ExecutionRepo, SelectAgentProfile,
 };
-use forge_agent_host::{AgentHostError, InteractionAnswer, InteractionAnswerValue, Secret};
+use forge_agent_host::{AgentHostError, InteractionAnswer, InteractionAnswerValue};
 use services::{
     agent_service::compute_effective_status,
     embedded_agent_service::{
-        ConnectEmbeddedAgent, ConnectEmbeddedProfile, CreateScopedSession, RequestedCanonicalScope,
+        ConnectEmbeddedProfile, CreateEmbeddedAgent, CreateScopedSession, RequestedCanonicalScope,
     },
 };
 
@@ -29,22 +29,19 @@ use crate::{
     state::AppState,
 };
 
-pub async fn connect_embedded_agent(
+pub async fn create_embedded_agent(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Json(request): Json<ConnectEmbeddedAgentRequest>,
+    Json(request): Json<CreateEmbeddedAgentRequest>,
 ) -> ApiResult<Json<ConnectedEmbeddedAgentResponse>> {
     let connected = state
         .embedded_agent_service
-        .connect_new_agent(ConnectEmbeddedAgent {
+        .create_agent_from_entry(CreateEmbeddedAgent {
             owner_user_id: user.user_id.clone(),
             name: request.name,
             description: request.description,
-            provider: request.provider,
-            base_url: request.base_url,
+            credential_id: request.credential_id,
             model: request.model,
-            credential_label: request.credential_label,
-            credential: Secret::new(request.credential),
             system_prompt: request.system_prompt,
             account_permission_ceiling: request
                 .account_permission_ceiling
@@ -79,11 +76,8 @@ pub async fn connect_embedded_profile(
             owner_user_id: user.user_id,
             identity_id,
             expected_identity_version: request.version,
-            provider: request.provider,
-            base_url: request.base_url,
+            credential_id: request.credential_id,
             model: request.model,
-            credential_label: request.credential_label,
-            credential: Secret::new(request.credential),
             system_prompt: request.system_prompt,
             permission_policy: request.permission_policy,
             tool_policy: request
@@ -301,28 +295,6 @@ pub async fn effective_permissions(
     }))
 }
 
-pub async fn list_credentials(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-) -> ApiResult<Json<Vec<CredentialHandleResponse>>> {
-    let handles = CredentialHandleRepo::list_credential_handles(&*state.db, &user.user_id).await?;
-    Ok(Json(handles.into_iter().map(credential_response).collect()))
-}
-
-pub async fn revoke_credential(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(handle_id): Path<String>,
-) -> ApiResult<StatusCode> {
-    state
-        .embedded_agent_service
-        .protected_store()
-        .revoke_credential(&handle_id, &user.user_id, &now_rfc3339())
-        .await
-        .map_err(|_| ApiError::not_found("credential_handle", handle_id))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn set_session_status(
     state: AppState,
     user: AuthenticatedUser,
@@ -378,12 +350,14 @@ fn requested_scope(scope: CanonicalScopeRequest) -> RequestedCanonicalScope {
     }
 }
 
-fn credential_response(handle: CredentialHandle) -> CredentialHandleResponse {
+pub(crate) fn credential_response(handle: CredentialHandle) -> CredentialHandleResponse {
     CredentialHandleResponse {
         id: handle.id,
         provider: handle.provider,
         label: handle.label,
+        credential_method: handle.credential_method,
         status: handle.status,
+        version: handle.version,
         created_at: handle.created_at,
         updated_at: handle.updated_at,
     }
@@ -434,6 +408,10 @@ fn protected_interaction_error(error: AgentHostError) -> ApiError {
             )
         }
         AgentHostError::Authority(_) => ApiError::conflict_with_code(
+            "protected_interaction.version_conflict",
+            "protected interaction is no longer pending or its version changed",
+        ),
+        AgentHostError::VersionConflict => ApiError::conflict_with_code(
             "protected_interaction.version_conflict",
             "protected interaction is no longer pending or its version changed",
         ),

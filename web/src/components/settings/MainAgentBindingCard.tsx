@@ -128,7 +128,10 @@ export function MainAgentBindingCard({
             identity alone never binds it to Main.
           </p>
         </div>
-        <StateBadge status={bindingQuery.data?.state ?? 'setup_required'} />
+        <StateBadge
+          status={bindingQuery.data?.state ?? 'setup_required'}
+          label={(bindingQuery.data?.state ?? 'setup required').replaceAll('_', ' ')}
+        />
       </div>
 
       {agents.length === 0 ? (

@@ -37,6 +37,24 @@ pub async fn register_agent(
         ));
     }
 
+    // A harness agent may reference one of the caller's provider entries; the
+    // capability matrix decides whether that entry can drive this executor.
+    let credential_ref = if let Some(credential_id) = request.credential_id.as_deref() {
+        let entry = state
+            .embedded_agent_service
+            .require_owned_entry(&user.user_id, credential_id)
+            .await?;
+        services::provider_authorization::runtime_supported(
+            &entry.provider,
+            &entry.credential_method,
+            &request.executor_type,
+        )
+        .map_err(ApiError::bad_request)?;
+        Some(entry.id)
+    } else {
+        None
+    };
+
     let agent = state
         .agent_service
         .register(
@@ -49,6 +67,7 @@ pub async fn register_agent(
             request.prompt_template,
             serialize_json(request.capabilities)?.unwrap_or_else(|| "[]".to_owned()),
             serialize_json(request.config_json)?.unwrap_or_else(|| "{}".to_owned()),
+            credential_ref,
             request.daemon_id,
             request.max_concurrent_tasks,
             request.heartbeat_interval_seconds,

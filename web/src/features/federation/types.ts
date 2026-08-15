@@ -112,7 +112,9 @@ export interface CredentialHandle {
   id: string
   provider: string
   label: string
+  credential_method: string
   status: string
+  version: number
   created_at: string
   updated_at: string
 }
@@ -132,16 +134,25 @@ export interface ConnectedEmbeddedProfile {
   health: AgentConnectionHealth
 }
 
-export interface ConnectEmbeddedAgentInput {
+export interface CreateEmbeddedAgentInput {
   name: string
   description?: string | null
-  provider: string
-  base_url: string
+  credential_id: string
   model: string
-  credential_label: string
-  credential: string
   system_prompt?: string | null
   account_permission_ceiling?: JsonObject | null
+  tool_policy?: JsonObject | null
+  context_tokens?: number | null
+  max_input_tokens?: number | null
+  max_output_tokens?: number | null
+}
+
+export interface ConnectEmbeddedProfileInput {
+  version: number
+  credential_id: string
+  model: string
+  system_prompt?: string | null
+  permission_policy?: string | null
   tool_policy?: JsonObject | null
   context_tokens?: number | null
   max_input_tokens?: number | null

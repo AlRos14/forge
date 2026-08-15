@@ -8,8 +8,8 @@ use services::{
     AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
     CommitmentService, DaemonService, EmbeddedAgentService, MemoryService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
-    TaskService, TerminalActivityTracker, TerminalService, WorkspaceCleanupScheduler,
-    WorkspaceExecutionLockManager,
+    ProviderAuthorizationService, TaskService, TerminalActivityTracker, TerminalService,
+    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -92,6 +92,7 @@ pub struct AppState {
     pub shutdown_signal: ShutdownSignal,
     pub auth_service: Arc<AuthService>,
     pub oauth_service: Arc<services::OAuthService>,
+    pub provider_authorization_service: Arc<ProviderAuthorizationService>,
     pub mcp_enabled: bool,
     pub config_path: Arc<PathBuf>,
     pub effective_config: Arc<ForgeConfig>,
@@ -229,6 +230,7 @@ impl AppState {
                 .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
                 .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
                 .with_memory_service(Arc::clone(&memory_service))
+                .with_provider_credential_env(Arc::clone(&embedded_agent_service))
                 .with_workspace_root(workspace_root.clone()),
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
@@ -274,6 +276,11 @@ impl AppState {
             Arc::clone(&auth_service),
             effective_config.mcp_resource_url(),
         ));
+        let provider_authorization_service = Arc::new(ProviderAuthorizationService::new(
+            Arc::clone(&db),
+            Arc::clone(&embedded_agent_service),
+            effective_config.server.cors_origins.clone(),
+        ));
 
         Self {
             db,
@@ -301,6 +308,7 @@ impl AppState {
             task_executor,
             auth_service,
             oauth_service,
+            provider_authorization_service,
             task_dispatcher: None,
             workspace_exec_locks,
             repo_cache_locks,
@@ -325,6 +333,8 @@ impl AppState {
             Arc::clone(&self.auth_service),
             config.mcp_resource_url(),
         ));
+        self.provider_authorization_service
+            .set_trusted_origins(config.server.cors_origins.clone());
         let terminal_activity = self.terminal_service.activity_tracker();
         let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
             Arc::clone(&self.db),

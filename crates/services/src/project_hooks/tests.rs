@@ -486,6 +486,7 @@ async fn seed_available_agent(db: &SqliteDb) -> String {
             permission_policy: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(daemon_id),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,

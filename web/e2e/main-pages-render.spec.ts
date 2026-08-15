@@ -13,6 +13,10 @@ async function firstProject(request: APIRequestContext): Promise<Project> {
   return project
 }
 
+function isExpectedUnboundMainAgent(url: string): boolean {
+  return new URL(url).pathname === '/api/v1/account/main-agent'
+}
+
 test('main pages and settings tabs render', async ({ page, request }) => {
   const project = await firstProject(request)
   const consoleErrors: string[] = []
@@ -20,23 +24,25 @@ test('main pages and settings tabs render', async ({ page, request }) => {
   page.on('console', (message) => {
     if (message.type() === 'error') {
       const location = message.location()
+      if (location.url && isExpectedUnboundMainAgent(location.url)) return
       const suffix = location.url ? ` (${location.url}:${location.lineNumber})` : ''
       consoleErrors.push(`${message.text()}${suffix}`)
     }
   })
   page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`))
   page.on('response', (response) => {
-    if (response.status() === 404) notFoundResources.push(response.url())
+    if (response.status() === 404 && !isExpectedUnboundMainAgent(response.url())) {
+      notFoundResources.push(response.url())
+    }
   })
 
   const routes: Array<{ path: string; visibleText: string | RegExp }> = [
     { path: `/projects/${project.id}/board`, visibleText: /^Todo$/ },
     { path: `/projects/${project.id}/tasks`, visibleText: /^Tasks$/ },
-    { path: `/projects/${project.id}/chat`, visibleText: /^.* chat$/ },
-    { path: '/chat', visibleText: /^Global chat$/ },
-    { path: '/agents/federated', visibleText: /^Agent identities$/ },
-    { path: '/agents', visibleText: /^Agents$/ },
-    { path: '/daemons', visibleText: /^Daemons$/ },
+    { path: `/projects/${project.id}/chat`, visibleText: /^.* Agent Workspace$/ },
+    { path: '/chat', visibleText: /^Main Chat$/ },
+    { path: '/agents', visibleText: /^Agent Settings$/ },
+    { path: '/daemons', visibleText: /^Runtimes$/ },
     { path: '/operations', visibleText: /^Operations$/ },
     { path: '/settings', visibleText: /^System Settings$/ },
     { path: `/projects/${project.id}/settings`, visibleText: /^Settings$/ },
@@ -52,7 +58,7 @@ test('main pages and settings tabs render', async ({ page, request }) => {
   for (const tab of [
     { nav: 'General', heading: 'General' },
     { nav: 'Repos', heading: 'Primary Repository' },
-    { nav: 'Project Agent', heading: 'One Project Agent binding' },
+    { nav: 'Members', heading: 'Members' },
     { nav: 'MCP', heading: 'MCP' },
     { nav: 'Hooks', heading: 'Lifecycle Hooks' },
     { nav: 'Analytics', heading: 'Analytics' },
@@ -66,14 +72,20 @@ test('main pages and settings tabs render', async ({ page, request }) => {
   }
 
   await page.getByRole('link', { name: 'MCP', exact: true }).click()
-  await expect(page.getByText('Project MCP', { exact: true })).toBeVisible()
-  await expect(page.getByLabel('MCP client')).toBeVisible()
-  await expect(page.getByText(/Not installed|Installed/).first()).toBeVisible({ timeout: 15000 })
-  await expect(
-    page
-      .getByText(/\.claude\/settings\.json|\.codex\/config\.toml|\.cursor\/mcp\.json|\/mcp\?project_id=/)
-      .first(),
-  ).toBeVisible()
+  const projectMcp = page.getByText('Project MCP', { exact: true })
+  const noLocalRepo = page.getByText('No local repository configured', { exact: true })
+  await expect(projectMcp.or(noLocalRepo)).toBeVisible()
+  if (await projectMcp.isVisible()) {
+    await expect(page.getByLabel('MCP client')).toBeVisible()
+    await expect(page.getByText(/Not installed|Installed/).first()).toBeVisible({ timeout: 15000 })
+    await expect(
+      page
+        .getByText(/\.claude\/settings\.json|\.codex\/config\.toml|\.cursor\/mcp\.json|\/mcp\?project_id=/)
+        .first(),
+    ).toBeVisible()
+  } else {
+    await expect(page.getByRole('link', { name: 'Go to Repos', exact: true })).toBeVisible()
+  }
 
   await page.goto('/settings')
   for (const tab of ['Server', 'Agent', 'Paths']) {

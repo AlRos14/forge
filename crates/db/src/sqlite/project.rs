@@ -265,6 +265,58 @@ impl ProjectRepo for SqliteDb {
         Ok(project)
     }
 
+    async fn update_at_version(
+        &self,
+        input: UpdateProject,
+        expected_version: i64,
+        project_hooks_json: Option<String>,
+    ) -> Result<Project> {
+        let mut project = ProjectRepo::get_by_id(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if project.version != expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        if let Some(name) = input.name {
+            project.name = name;
+        }
+        if let Some(settings) = input.settings {
+            project.settings = settings;
+        }
+        if let Some(primary_repo_id) = input.primary_repo_id {
+            project.primary_repo_id = primary_repo_id;
+        }
+        if let Some(paused_at) = input.paused_at {
+            project.paused_at = paused_at;
+        }
+        if let Some(project_hooks_json) = project_hooks_json {
+            project.project_hooks_json = project_hooks_json;
+        }
+        project.updated_at = input.updated_at;
+        let result = sqlx::query(
+            "UPDATE project
+             SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
+                 project_hooks_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(&project.name)
+        .bind(&project.settings)
+        .bind(project.primary_repo_id.as_deref())
+        .bind(project.paused_at.as_deref())
+        .bind(&project.project_hooks_json)
+        .bind(&project.updated_at)
+        .bind(&project.id)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        ProjectRepo::get_by_id(self, &project.id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
     async fn set_project_hooks_json(
         &self,
         id: &str,

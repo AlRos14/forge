@@ -2582,6 +2582,9 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::CredentialNotFound | AgentHostError::SessionNotFound => {
             RuntimeError::not_found("Forge runtime resource unavailable")
         }
+        AgentHostError::VersionConflict => {
+            RuntimeError::tool("Forge runtime resource changed; retry with the current version")
+        }
         AgentHostError::Runtime(_) | AgentHostError::ProtectedPersistence => {
             RuntimeError::tool("Forge tool provider failed")
         }

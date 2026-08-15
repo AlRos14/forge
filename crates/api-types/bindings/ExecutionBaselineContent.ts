@@ -4,13 +4,13 @@ import type { AdaptiveEnvelope } from "./AdaptiveEnvelope";
 import type { ArtifactRef } from "./ArtifactRef";
 import type { ExecutionBaselineReleasePolicy } from "./ExecutionBaselineReleasePolicy";
 
-export type ExecutionBaselineContent = { charter_revision: ArtifactRef, document_revisions: Array<ArtifactRef>, plan_item_ids: Array<string>, milestone_ids: Array<string>,
+export type ExecutionBaselineContent = { charter_revision: ArtifactRef, document_revisions: Array<ArtifactRef>, plan_item_ids: Array<string>, milestone_ids: Array<string>, 
 /**
  * Immutable definition revision paired positionally with each milestone.
  * Activation revalidates these exact revisions before promoting the
  * milestone projection.
  */
-milestone_definition_revision_ids: Array<string>, primary_milestone_id: string | null, release_policy_revision: string, release_policy_digest: string,
+milestone_definition_revision_ids: Array<string>, primary_milestone_id: string | null, release_policy_revision: string, release_policy_digest: string, 
 /**
  * The exact frozen release-policy contract whose canonical digest must
  * equal `release_policy_digest`.

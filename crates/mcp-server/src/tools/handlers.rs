@@ -573,6 +573,7 @@ pub(super) async fn forge_register_agent(
             None,
             "[]".to_owned(),
             "{}".to_owned(),
+            None,
             params.daemon_id,
             None,
             None,

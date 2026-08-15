@@ -186,6 +186,7 @@ async fn seed_agent(
             permission_policy: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(daemon_id),
             max_concurrent_tasks,
             heartbeat_interval_seconds: 30,

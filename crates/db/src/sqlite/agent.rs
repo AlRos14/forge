@@ -59,7 +59,7 @@ impl AgentRepo for SqliteDb {
                 capabilities_json: input.capabilities_json,
                 tool_policy_json: DEFAULT_CLI_SCOPE_PERMISSIONS.to_string(),
                 config_json: input.config_json,
-                credential_ref: None,
+                credential_ref: input.credential_ref,
                 daemon_id: input.daemon_id,
                 created_at: input.created_at,
                 updated_at: input.updated_at.clone(),
@@ -404,6 +404,7 @@ impl AgentRepo for SqliteDb {
                 prompt_template: source.prompt_template,
                 capabilities_json: source.capabilities_json,
                 config_json: source.config_json,
+                credential_ref: source.credential_ref,
                 daemon_id: source.daemon_id,
                 max_concurrent_tasks: source.max_concurrent_tasks,
                 heartbeat_interval_seconds: source.heartbeat_interval_seconds,
@@ -504,6 +505,51 @@ impl AgentProfileRepo for SqliteDb {
         AgentProfileRepo::get_profile(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
+    }
+
+    async fn create_and_select_profile(
+        &self,
+        profile: CreateAgentProfile,
+        selection: SelectAgentProfile,
+    ) -> Result<(AgentProfile, Agent)> {
+        if profile.id != selection.profile_id || profile.identity_id != selection.identity_id {
+            return Err(DbError::VersionConflict);
+        }
+        let mut transaction = self.pool.begin().await?;
+        insert_profile(&mut transaction, &profile).await?;
+        let selected = sqlx::query(
+            "UPDATE agent_identity
+             SET selected_profile_id = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(&selection.profile_id)
+        .bind(&selection.updated_at)
+        .bind(&selection.identity_id)
+        .bind(selection.expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        if selected.rows_affected() == 0 {
+            transaction.rollback().await?;
+            let identity_exists =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_identity WHERE id = ?")
+                    .bind(&selection.identity_id)
+                    .fetch_one(&self.pool)
+                    .await?
+                    > 0;
+            return Err(if identity_exists {
+                DbError::VersionConflict
+            } else {
+                DbError::NotFound
+            });
+        }
+        transaction.commit().await?;
+        let created = AgentProfileRepo::get_profile(self, &profile.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let agent = AgentRepo::get_by_id(self, &selection.identity_id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        Ok((created, agent))
     }
 
     async fn get_profile(&self, id: &str) -> Result<Option<AgentProfile>> {

@@ -1,22 +1,24 @@
 use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4,
-    AgentContextScopeRepo, AgentListQuery, AgentRepo, AgentSessionRepo, AgentStatus,
-    AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimTask, CompareAndMoveTask,
-    CompleteDomainEvent, CreateAgent, CreateAgentContextScope, CreateAgentSession,
-    CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
-    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
-    CreateProjectMember, CreateRepo, CreateReview, CreateSkill, CreateTask,
+    AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo, AgentSessionRepo,
+    AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimTask, CompareAndMoveTask,
+    CompleteDomainEvent, CreateAgent, CreateAgentContextScope, CreateAgentIdentity,
+    CreateAgentProfile, CreateAgentSession, CreateDomainEvent, CreateExecution, CreateProject,
+    CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
+    CreateProjectCharterRevisionAtomically, CreateProjectMember,
+    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateSkill, CreateTask,
     CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace, CreateWorkspaceLease,
-    DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo, ExecutionStatus,
-    MemoryAccessQuery, MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository,
-    MemoryScopeGrant, MemorySourceType, MoveTaskIdentity, MoveTaskPersistence,
+    CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo,
+    ExecutionStatus, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind,
+    MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity, MoveTaskPersistence,
     NotificationListQuery, NotificationRepo, PageRequest, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus,
-    RotateAgentSession, ScopedMemoryRepository, SkillRepo, SortBy, SortOrder, SqliteDb, Task,
-    TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo,
-    TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution, UpdateProject,
-    UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
-    UpsertDaemon, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
+    ReviewRepo, ReviewStatus, RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile,
+    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery,
+    TaskRepo, TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill,
+    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
+    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -37,6 +39,203 @@ async fn sqlite_db() -> SqliteDb {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     SqliteDb::new(pool)
+}
+
+#[tokio::test]
+async fn profile_publication_and_selection_are_atomic_on_version_conflict() {
+    let db = sqlite_db().await;
+    let owner = seed_user(&db).await;
+    let now = now_rfc3339();
+    let identity_id = new_uuid_v4();
+    let initial_profile_id = new_uuid_v4();
+    let profile = |id: String| CreateAgentProfile {
+        id,
+        identity_id: identity_id.clone(),
+        backend_kind: "native".to_owned(),
+        executor_type: "embedded".to_owned(),
+        provider: Some("openai".to_owned()),
+        model: Some("gpt-test".to_owned()),
+        reasoning_effort: None,
+        permission_policy: Some("scoped_proposals".to_owned()),
+        prompt_template: None,
+        capabilities_json: "{}".to_owned(),
+        tool_policy_json: "{}".to_owned(),
+        config_json: "{}".to_owned(),
+        credential_ref: None,
+        daemon_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let agent = AgentRepo::create_identity_with_profile(
+        &db,
+        CreateAgentIdentity {
+            id: identity_id.clone(),
+            name: "Atomic identity".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: Some(owner),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        profile(initial_profile_id.clone()),
+    )
+    .await
+    .expect("identity creates");
+
+    let stale_profile_id = new_uuid_v4();
+    let error = AgentProfileRepo::create_and_select_profile(
+        &db,
+        profile(stale_profile_id.clone()),
+        SelectAgentProfile {
+            identity_id: identity_id.clone(),
+            profile_id: stale_profile_id.clone(),
+            expected_version: agent.version - 1,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect_err("stale publication conflicts");
+    assert!(matches!(error, DbError::VersionConflict));
+    assert!(
+        AgentProfileRepo::get_profile(&db, &stale_profile_id)
+            .await
+            .expect("profile lookup succeeds")
+            .is_none(),
+        "the profile insert must roll back with the selection conflict"
+    );
+
+    let current = AgentRepo::get_by_id(&db, &identity_id)
+        .await
+        .expect("identity lookup succeeds")
+        .expect("identity exists");
+    assert_eq!(current.profile_id, initial_profile_id);
+
+    let next_profile_id = new_uuid_v4();
+    let (published, selected) = AgentProfileRepo::create_and_select_profile(
+        &db,
+        profile(next_profile_id.clone()),
+        SelectAgentProfile {
+            identity_id,
+            profile_id: next_profile_id.clone(),
+            expected_version: current.version,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("current publication succeeds");
+    assert_eq!(published.id, next_profile_id);
+    assert_eq!(selected.profile_id, published.id);
+}
+
+#[tokio::test]
+async fn provider_authorization_operations_are_owner_scoped_and_versioned() {
+    let db = sqlite_db().await;
+    let owner = seed_user(&db).await;
+    let other = seed_user(&db).await;
+    let now = now_rfc3339();
+    let id = new_uuid_v4();
+    let created = ProviderAuthorizationRepo::create_provider_authorization(
+        &db,
+        CreateProviderAuthorizationOperation {
+            id: id.clone(),
+            owner_user_id: owner.clone(),
+            provider: "openai".to_owned(),
+            method: "browser_oauth".to_owned(),
+            status: "awaiting_browser".to_owned(),
+            authorization_url: Some("https://auth.openai.com/oauth/authorize".to_owned()),
+            user_code: None,
+            redirect_origin: "http://localhost:5173".to_owned(),
+            callback_state_hash: Some("state-hash".to_owned()),
+            request_json: "{}".to_owned(),
+            poll_interval_seconds: 5,
+            expires_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("authorization creates");
+    assert_eq!(created.version, 1);
+    assert!(
+        ProviderAuthorizationRepo::get_provider_authorization(&db, &id, &other)
+            .await
+            .expect("other-owner lookup succeeds")
+            .is_none()
+    );
+    let updated = ProviderAuthorizationRepo::update_provider_authorization(
+        &db,
+        UpdateProviderAuthorizationOperation {
+            id: id.clone(),
+            expected_version: 1,
+            status: "exchanging".to_owned(),
+            authorization_url: created.authorization_url,
+            user_code: None,
+            poll_interval_seconds: 5,
+            profile_id: None,
+            credential_handle_id: None,
+            error_code: None,
+            error_message: None,
+            updated_at: now.clone(),
+            completed_at: None,
+        },
+    )
+    .await
+    .expect("authorization advances");
+    assert_eq!(updated.version, 2);
+    let conflict = ProviderAuthorizationRepo::update_provider_authorization(
+        &db,
+        UpdateProviderAuthorizationOperation {
+            id,
+            expected_version: 1,
+            status: "cancelled".to_owned(),
+            authorization_url: None,
+            user_code: None,
+            poll_interval_seconds: 5,
+            profile_id: None,
+            credential_handle_id: None,
+            error_code: None,
+            error_message: None,
+            updated_at: now.clone(),
+            completed_at: Some(now),
+        },
+    )
+    .await;
+    assert!(matches!(conflict, Err(DbError::VersionConflict)));
+}
+
+#[tokio::test]
+async fn provider_credential_migration_preserves_legacy_handle_defaults() {
+    let db = sqlite_db().await;
+    let owner = seed_user(&db).await;
+    let now = now_rfc3339();
+    let id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO credential_handle (
+            id, owner_user_id, provider, label, status, created_at, updated_at
+         ) VALUES (?, ?, 'openai', 'Legacy key', 'configured', ?, ?)",
+    )
+    .bind(&id)
+    .bind(&owner)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("legacy-shaped handle inserts");
+    let handle = CredentialHandleRepo::get_credential_handle(&db, &id)
+        .await
+        .expect("handle reads")
+        .expect("handle exists");
+    assert_eq!(handle.credential_method, "api_key");
+    assert_eq!(handle.metadata_json, "{}");
+    assert_eq!(handle.version, 1);
 }
 
 #[tokio::test]
@@ -226,6 +425,7 @@ async fn cli_agent_creation_gets_scope_bounded_permission_layers() {
             prompt_template: None,
             capabilities_json: "[]".to_owned(),
             config_json: r#"{"profile":"luna"}"#.to_owned(),
+            credential_ref: None,
             daemon_id: None,
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,
@@ -348,6 +548,7 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             permission_policy: None,
             capabilities_json: r#"["rust"]"#.to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(daemon_id),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,
@@ -910,6 +1111,7 @@ async fn seed_agent(
             prompt_template: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: None,
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,
@@ -2230,6 +2432,7 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
             prompt_template: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(daemon_id),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,
@@ -4251,6 +4454,7 @@ async fn test_dependency_gate_blocks_non_context_holder() {
             permission_policy: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(other_daemon_id),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,

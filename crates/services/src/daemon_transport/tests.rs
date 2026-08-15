@@ -156,6 +156,7 @@ async fn seed_running_execution(
             prompt_template: None,
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: Some(owner_daemon_id.to_owned()),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,

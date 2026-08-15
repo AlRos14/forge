@@ -77,6 +77,11 @@ pub struct CreateAgentRequest {
     pub heartbeat_interval_seconds: Option<i64>,
     pub max_missed_heartbeats: Option<i64>,
     pub is_default: Option<bool>,
+    /// Optional provider entry powering this harness agent. When set, Forge
+    /// injects the credential at dispatch (`auth_source: forge_provider`);
+    /// when absent the harness uses its own CLI-managed login.
+    #[serde(default)]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,16 +112,15 @@ pub struct DuplicateAgentRequest {
     pub name: String,
 }
 
+/// Create a direct (embedded-runtime) agent referencing an existing provider
+/// entry. Credentials are never part of this request.
 #[derive(Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct ConnectEmbeddedAgentRequest {
+pub struct CreateEmbeddedAgentRequest {
     pub name: String,
     pub description: Option<String>,
-    pub provider: String,
-    pub base_url: String,
+    pub credential_id: String,
     pub model: String,
-    pub credential_label: String,
-    pub credential: String,
     pub system_prompt: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]
     pub account_permission_ceiling: Option<Value>,
@@ -127,15 +131,15 @@ pub struct ConnectEmbeddedAgentRequest {
     pub max_output_tokens: Option<u32>,
 }
 
+/// Publish a replacement profile for an existing embedded identity,
+/// referencing an existing provider entry.
 #[derive(Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ConnectEmbeddedProfileRequest {
+    #[ts(type = "number")]
     pub version: i64,
-    pub provider: String,
-    pub base_url: String,
+    pub credential_id: String,
     pub model: String,
-    pub credential_label: String,
-    pub credential: String,
     pub system_prompt: Option<String>,
     pub permission_policy: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]
@@ -165,6 +169,7 @@ pub struct CreateAgentSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionVersionRequest {
+    #[ts(type = "number")]
     pub version: i64,
 }
 
@@ -180,9 +185,32 @@ pub struct CredentialHandleResponse {
     pub id: String,
     pub provider: String,
     pub label: String,
+    pub credential_method: String,
     pub status: String,
+    #[ts(type = "number")]
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ProviderRevocationStatus {
+    NotSupported,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct DisconnectCredentialResponse {
+    pub id: String,
+    pub status: String,
+    pub provider_revocation: ProviderRevocationStatus,
+    /// Agents that referenced the removed entry and are now visibly
+    /// unhealthy. They are never silently rebound or deleted.
+    pub affected_agents: Vec<crate::ProviderEntryAgentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

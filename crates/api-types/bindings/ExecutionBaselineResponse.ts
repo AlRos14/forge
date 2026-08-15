@@ -3,7 +3,7 @@ import type { ExecutionBaseline } from "./ExecutionBaseline";
 import type { ExecutionBaselineApproval } from "./ExecutionBaselineApproval";
 import type { ExecutionBaselineRevision } from "./ExecutionBaselineRevision";
 
-export type ExecutionBaselineResponse = { baseline: ExecutionBaseline, current_revision: ExecutionBaselineRevision | null,
+export type ExecutionBaselineResponse = { baseline: ExecutionBaseline, current_revision: ExecutionBaselineRevision | null, 
 /**
  * A proposed/approved successor that is not authoritative until
  * activation.  This is populated when an active baseline is being

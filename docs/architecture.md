@@ -353,6 +353,46 @@ remain rejected.
 
 ### Direct Agent Runtime host and LCM
 
+Agent Settings at `/agents` is the single account-owned surface, organized as
+three tabs over one model: `Providers` (configured provider entries — multiple
+entries per provider type — plus CLI runtimes discovered on daemons), `Agents`
+(the roster of direct and harness agents, each referencing one authentication
+source), and `Bindings` (the Main Agent binding, the optional Project Agent
+binding via a `?project=` deep link, and the read-only chat-scope list; `?tab=`
+deep-links any tab). Provider setup is driven by a server-owned capability
+catalog that also declares runtime compatibility per credential method; agent
+creation re-validates that matrix. Browser and device login create finite,
+account-owned authorization operations; only bounded public state is returned,
+while callback state, PKCE verifiers, device codes, token bundles, and client
+secrets are encrypted beside the existing protected runtime state. A completed
+authorization publishes a provider entry only. Connection, agent creation, and
+binding are deliberately separate transactions.
+
+Harness agents may reference a provider entry (`credential_ref` on the active
+profile). At dispatch, `TaskService` asks `EmbeddedAgentService` to inject the
+entry's API key into the in-memory executor snapshot as the provider's
+environment variable; the stored snapshot, events, and logs never carry the
+key, and OAuth bundles are refused for harness injection. Harness agents
+without an entry keep their CLI-managed login and are surfaced from daemon CLI
+discovery.
+
+Credential handles distinguish static `api_key` payloads from renewable
+`oauth_bundle` payloads and carry optimistic versions. Native adapters acquire
+short-lived leases through Agent Runtime's `ProviderCredentialSource` rather
+than receiving plaintext configuration. Expiring bundles refresh under a
+per-credential single-flight lock and rotate ciphertext plus the handle version
+in one transaction. Exact-revision invalidation prevents an older rejected
+request from invalidating a newer lease. Provider errors, events, public rows,
+and Debug output remain redacted.
+
+The Project Agent route is an Agent Workspace: one durable conversation beside
+a typed Project-record rail on desktop and a Conversation/Project segmented
+view on compact screens. The rail calls the existing Project, Task, artifact,
+Decision, and milestone services and surfaces saved/conflict/error receipts.
+It does not widen authority. Main and Project Agent sessions still use
+`WorkspaceAccess::Deny`, receive no repository path or shell, and can cause
+repository work only by creating/admitting a Task through the workflow.
+
 `forge-agent-host` composes Agent Runtime directly at immutable revision
 `a7075b1d2dd1cee05db63bc480ff46b0f97ec239`. It owns provider construction,
 protected credential/checkpoint/session stores, interaction handling, runtime

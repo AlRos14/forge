@@ -240,6 +240,12 @@ impl From<ServiceError> for ApiError {
             ServiceError::AuthorizationDenied { message } => {
                 Self::forbidden_with_code("authorization.invalid", message)
             }
+            ServiceError::RateLimited {
+                retry_after_seconds,
+            } => Self::too_many_requests_with_code(
+                "provider_authorization.rate_limited",
+                format!("retry provider authorization in {retry_after_seconds} seconds"),
+            ),
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,

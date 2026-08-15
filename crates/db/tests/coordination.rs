@@ -25,6 +25,7 @@ async fn sqlite_db() -> SqliteDb {
                 prompt_template: None,
                 capabilities_json: "{}".to_owned(),
                 config_json: "{}".to_owned(),
+                credential_ref: None,
                 daemon_id: None,
                 max_concurrent_tasks: 1,
                 heartbeat_interval_seconds: 30,

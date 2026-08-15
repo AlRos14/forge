@@ -160,12 +160,13 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Copy:** stale moves say “Board changed while you were dragging; refreshed to the latest version.”
 - **Accessibility:** `role="status"` for reconciliation and `role="alert"` only when user action is required.
 
-### Agent chat switcher
+### Agent scope navigation
 
-- **Structure:** one `Global · Main` entry followed by one entry per Project. Each Project entry opens that Project's single Agent Chat; unbound identities never appear here.
-- **States:** active, ready, setup required, loading, unavailable, and empty Project list. Setup status stays visible in the entry and in the chat surface.
-- **Accessibility:** entries are keyboard-operable buttons with `aria-current="page"` for the active scope, visible focus rings, and a named navigation region. There is no arbitrary identity roster or “new chat” action in this switcher.
-- **Responsive:** the switcher is a compact horizontal list below the chat header on narrow screens and a bounded left rail on larger screens; it must not create document-wide horizontal overflow.
+- **Structure:** scope is represented only in the application shell. `Main Chat` appears immediately after the Project switcher and before the `Project` section label. The selected Project contributes one `Agent Workspace` entry within that section. `Agent Settings` appears once in `Workspace`; chat pages never render a second global/Project roster.
+- **Order:** Project switcher; Main Chat; Project label and Overview, Board, Tasks, Agent Workspace, Project Settings; Workspace label and Agent Settings, Mission Control, Daemons, Operations, Forge Settings.
+- **States:** active, ready, setup required, loading, unavailable, and empty Project selection. Setup status stays visible on the destination surface rather than adding a duplicate navigation model.
+- **Accessibility:** entries are semantic links with `aria-current="page"`, visible focus rings, and names that include scope where needed. The compact drawer preserves the same order, closes on activation, and restores focus to its trigger.
+- **Responsive:** the full sidebar, compact rail, and overlay drawer expose the same hierarchy. Navigation never creates document-wide horizontal overflow.
 
 ### Agent chat timeline and composer
 
@@ -176,15 +177,46 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **States:** loading, recoverable error with retry, empty timeline, setup required, pending turn, and settled timeline all have explicit copy and keyboard-visible actions.
 - **Refresh:** server events may accelerate updates, but mounted timelines poll messages, turns, handoffs, and chat status at a bounded interval so a completed response never depends on an unavailable event channel.
 
+### Project Agent Workspace
+
+- **Structure:** `/projects/:projectId/chat` is titled `Agent Workspace` and identifies the active Project and bound Project Agent. At desktop it pairs the durable timeline with a bounded editing rail for Project summary/status, Decisions, artifacts, milestones, and Tasks. All mutations use typed Forge services and return a durable receipt.
+- **Edit states:** every editor exposes idle, dirty, saving, saved, conflict, and failed outcomes without collapsing geometry. A conflict preserves the user's draft and shows the current server revision; it never silently overwrites or retries.
+- **Authority:** the surface never exposes a repository path, worktree, shell, raw filesystem tool, or Workspace lease. Repository work is represented as a traceable Task for an authorized Task Worker or reviewer.
+- **Responsive:** at 1280px, use conversation plus a bounded editing rail; at 768px and 375px, use a labeled `Conversation` / `Project` segmented view. Segment changes preserve drafts and focus context and warn before abandoning unsaved changes.
+- **Accessibility:** the segment control follows the tab pattern, mutation results use polite status announcements, actionable failures use alerts, and saved receipts remain inspectable from the timeline or editing rail.
+
 ### Global chat launcher
 
 - **Structure:** a bottom-right launcher opens the same account-owned Main Agent timeline as `/chat`; it never creates a second chat or local fork.
 - **Accessibility:** the launcher has an accessible name, Escape closes the panel, focus moves into the panel on open, and focus returns to the launcher on close. The panel is responsive to viewport height and keeps the composer reachable above the safe area.
 
-### Binding setup controls
+### Settings tab bar
 
-- **Structure:** Agent settings can connect identities; Main settings select exactly one identity/profile through `/account/main-agent`; Project settings select exactly one identity/profile through `/projects/{id}/project-agent`.
-- **Truthfulness:** binding controls show server state and expected version, preserve optimistic-concurrency errors, and display the server-enforced permission ceiling as read-only metadata. Role, primary/steward, participant, archive-membership, and arbitrary capability-grant controls are not part of this surface.
+- **Structure:** a `role="tablist"` row of `role="tab"` buttons controlling named tab panels; each tab is a text label plus a mono count badge.
+- **States:** the active tab uses foreground text, an ember underline indicator (`bg-primary`), and an ember-tinted count badge (`ember-surface`/`ember-border`); inactive tabs are muted with hover to foreground; keyboard focus uses the `ring` token.
+- **Motion:** color transitions only, micro timing.
+- **Accessibility:** `aria-selected` and `aria-controls` wire tabs to panels; counts are part of the accessible label.
+- **Responsive:** tabs wrap within their own row and never cause page-level overflow.
+
+### Canonical Agent Settings and binding controls
+
+- **Structure:** `/agents` is the only agent configuration destination, organized as three tabs over one settings model. The `Providers` tab is an inventory of configured provider entries (multiple entries per provider type are allowed) plus a `CLI runtimes` group for harnesses discovered on connected runtimes; the `Agents` tab is the searchable/filterable roster with connection health and profile activation; the `Bindings` tab holds the account's Main Agent binding, the optional Project Agent binding, and the read-only Main/Project chat-scope list. Project links may add a non-authoritative `project` query parameter that opens the Bindings tab, and a `tab` query parameter may deep-link any tab.
+- **Provider entries:** each card shows provider type, editable display name, credential method, redacted account identity, endpoint, connection status, usage (which agents reference it and when it was last used), a live connection test, and rename/disconnect actions. Disconnecting warns with the dependent agent list first; dependents become visibly unhealthy and are never silently rebound. CLI runtime cards show authentication availability, host, version, usage, and a login-command hint instead of a credential form.
+- **Provider setup wizard:** `Add provider` is a four-step wizard — choose a provider from the server catalog, choose an authentication method (guided login never replaces an available API-key path), connect (API-key form or the public OAuth operation view), then verify. The verify step confirms the stored entry, auto-runs the connection test, and offers agent creation as an explicit follow-up; completing a connection never creates an agent.
+- **Connection test:** idle, testing, responding (with round-trip latency), and failed states are text plus structure in a `role="status"` region. The failure reason is server-redacted (HTTP class or transport kind only) and a retry stays keyboard-visible; secrets and provider response bodies never render.
+- **Agent registration:** `New agent` is a three-step wizard — authentication source (a provider entry or CLI-managed runtime, with an inline add-provider path), runtime (`Direct · built-in runtime` or a harness, enabled/disabled by the server capability matrix with the server's reason shown), then configure (name, model, prompt). Completing a provider connection never creates an agent; the success state offers agent creation as an explicit follow-up.
+- **Actions:** add/rename/disconnect a provider entry, create an agent, publish a replacement profile on another entry, activate a profile revision, select exactly one Main identity/profile through `/account/main-agent`, and select exactly one Project identity/profile through `/projects/{id}/project-agent`. Provider authorization, agent creation, and binding remain three separate operations.
+- **Truthfulness:** controls show server state and expected version, preserve optimistic-concurrency errors, and display the server-enforced permission ceiling as read-only metadata. Forge-wide runtime defaults remain under `Forge Settings`. Role, primary/steward, participant, archive-membership, and arbitrary capability-grant controls are not part of this surface.
+- **States:** loading inventory, empty/filter-empty, connected, authorization pending, refresh required, disconnected, unavailable, stale version, and recoverable failure each have explicit copy and a keyboard-visible next action.
+- **Responsive:** filters wrap without truncating scope; inventory becomes one ordered column at compact widths; dialogs keep the primary action and operation status reachable above the safe area.
+
+### Provider capability and connection controls
+
+- **Provider card:** name, support level (`stable`, `experimental`, or `unavailable`), model-discovery support, configuration readiness, and only the credential methods declared by the server. Each method also declares which runtimes its entries can drive (`direct` or harness kinds) with per-combination support levels; the client renders — and disables with the server's reason — from that matrix and never infers compatibility from provider names. Guided login never visually replaces the API-key alternative when both are available.
+- **Methods:** `Continue with ChatGPT` uses browser authorization with a device fallback and carries an experimental label; `Continue with xAI` uses a device flow and carries an experimental label; `Continue with Google` is available only for a registered Forge Gemini API OAuth client; OpenRouter and OpenAI-compatible providers use API-key forms.
+- **Operation states:** starting, awaiting browser, awaiting device confirmation, polling, exchanging, verifying, publishing, succeeded, denied, expired, cancelled, and failed. Public views show only the opaque operation ID, public URL/code, expiry/polling guidance, and redacted error/recovery copy.
+- **Credential states:** API key, renewable OAuth, refreshing, refresh failed, revoked, and disconnected are represented by text plus structure. Secret values, authorization codes, refresh tokens, device secrets, and PKCE material never render, enter URLs owned by Forge, or appear in debug details.
+- **Accessibility:** provider method selection uses labeled controls; status changes are announced without stealing focus; the device code has an explicit copy action and readable fallback; cancellation remains available until terminal state; successful completion returns focus to the connected provider card.
 
 ### Mission Control and Agent detail
 

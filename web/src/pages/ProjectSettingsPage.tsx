@@ -36,7 +36,6 @@ import { DangerTab } from '@/components/settings/DangerTab'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
 import { MembersTab } from '@/components/settings/MembersTab'
-import { ProjectAgentTab } from '@/components/settings/ProjectAgentTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
 import { ReposTab } from '@/components/settings/ReposTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
@@ -67,7 +66,6 @@ export type ProjectSettingsTab =
   | 'general'
   | 'repos'
   | 'members'
-  | 'project-agent'
   | 'mcp'
   | 'hooks'
   | 'analytics'
@@ -83,7 +81,6 @@ const SETTINGS_TABS: Array<{
   { id: 'general', label: 'General', icon: Gear },
   { id: 'repos', label: 'Repos', icon: GitBranch },
   { id: 'members', label: 'Members', icon: Users },
-  { id: 'project-agent', label: 'Project Agent', icon: Users },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
   { id: 'analytics', label: 'Analytics', icon: ChartBar },
@@ -223,6 +220,7 @@ export function ProjectSettingsPage({
       {
         projectId,
         body: {
+          version: project.version,
           name: nextName,
           settings: nextSettings,
           default_review_config: {
@@ -341,8 +339,6 @@ export function ProjectSettingsPage({
           {initialTab === 'repos' && <ReposTab project={project} projectId={projectId} />}
 
           {initialTab === 'members' && <MembersTab projectId={projectId} />}
-
-          {initialTab === 'project-agent' && <ProjectAgentTab projectId={projectId} />}
 
           {initialTab === 'mcp' && <ProjectMcpTab projectId={projectId} />}
 

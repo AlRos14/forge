@@ -212,6 +212,7 @@ async fn find_or_create_null_agent(db: &SqliteDb, now: &str) -> Result<String> {
             permission_policy: None,
             capabilities_json: "[]".to_owned(),
             config_json: r#"{"delay_seconds":5}"#.to_owned(),
+            credential_ref: None,
             daemon_id: None,
             max_concurrent_tasks: 10,
             heartbeat_interval_seconds: 30,

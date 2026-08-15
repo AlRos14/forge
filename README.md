@@ -33,8 +33,8 @@ that: every task runs in its own git worktree, hits your CI gate, and waits for
 review before it merges. **Agents collaborate; they don't collide.**
 
 - **One isolated git worktree per task** — Claude Code, Codex, Cursor, Gemini, and Smith can each work in parallel without overwriting each other or polluting your main checkout.
-- **Main and Project Agent Chats** — keep one global discovery chat, one durable Project chat per Project, and make Main-to-Project handoffs explicit and provenance-linked.
-- **Persistent embedded identities** — connect a provider profile once, bind it explicitly as Main or Project Agent when needed, and keep Task Worker/reviewer authority separate from chat bindings.
+- **Main Chat and Agent Workspaces** — keep one global discovery timeline, one durable Project conversation beside typed Project records, and make Main-to-Project handoffs explicit and provenance-linked.
+- **Persistent embedded identities** — use canonical Agent Settings for API keys or guided provider login, bind a profile explicitly as Main or Project Agent, and keep Task Worker/reviewer authority separate from chat bindings.
 - **Mission Control** — inspect attention, commitments, current scope, health, and recent outcomes without opening a wall of runtime logs.
 - **Review gate with your CI** — define `ci_steps` per task; the review runner blocks merge until they pass. Human approval is an explicit transition, not an afterthought.
 - **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with an audit log and explicit cancellation paths so handoffs between agents (and humans) are legible.

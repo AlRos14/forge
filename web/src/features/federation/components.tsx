@@ -108,12 +108,13 @@ export function LoadingPanel({ label = 'Loading projection' }: { label?: string 
   )
 }
 
-export function EmptyPanel({ title, description, icon = <Info size={19} /> }: { title: string; description: string; icon?: ReactNode }) {
+export function EmptyPanel({ title, description, icon = <Info size={19} />, action }: { title: string; description: string; icon?: ReactNode; action?: ReactNode }) {
   return (
     <Card className="border-dashed border-border-subtle bg-card/50 p-8 text-center">
       <div className="mx-auto flex h-9 w-9 items-center justify-center rounded-full bg-muted text-muted-foreground">{icon}</div>
       <h2 className="mt-3 text-sm font-semibold text-foreground">{title}</h2>
       <p className="mx-auto mt-1 max-w-md text-sm leading-6 text-muted-foreground">{description}</p>
+      {action ? <div className="mt-4 flex justify-center">{action}</div> : null}
     </Card>
   )
 }

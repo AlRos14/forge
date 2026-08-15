@@ -11,8 +11,17 @@ async fn project_hook_test_endpoint_returns_debug_fields_without_launching_execu
     let repo_path = common::setup_git_repo(workspace_root.path());
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Hook Test Project", &repo_path).await;
+    let project: Value = common::json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        json!(null),
+        StatusCode::OK,
+    )
+    .await;
 
     let update_body = json!({
+      "version": project["version"],
       "settings": {
         "lifecycle_hooks": {
           "before_work": [{

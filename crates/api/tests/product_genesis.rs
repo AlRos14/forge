@@ -700,38 +700,26 @@ async fn connect_genesis_agent(
     token: &str,
     name: &str,
 ) -> ConnectedEmbeddedAgentResponse {
-    common::json_request_with_bearer(
+    common::connect_embedded_agent(
         app,
-        Method::POST,
-        "/api/v1/embedded-agents/connect",
         token,
-        json!({
-            "name": name,
-            "description": "Product Genesis integration fixture",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
-            "model": "genesis-test-model",
-            "credential_label": "genesis-test",
-            "credential": "fixture-secret",
-            "account_permission_ceiling": {
-                "permissions": ["read_account", "read_project", "handoff"]
-            },
-            "tool_policy": {
-                "allowed": ["read_account", "read_project", "handoff"]
-            }
-        }),
-        StatusCode::OK,
+        name,
+        "genesis-test",
+        "fixture-secret",
+        json!({"permissions": ["read_account", "read_project", "handoff"]}),
+        json!({"allowed": ["read_account", "read_project", "handoff"]}),
     )
     .await
 }
 
 fn user_authorization(action: &str, event_id: impl Into<String>) -> serde_json::Value {
+    static AUTHORIZATION_OCCURRED_AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     json!({
         "principal": { "kind": "user", "id": "test-user-id" },
         "authorization_basis": "explicit_user_authorization",
         "action": action,
         "event_id": event_id.into(),
-        "occurred_at": "2026-08-13T00:00:00Z"
+        "occurred_at": AUTHORIZATION_OCCURRED_AT.get_or_init(db::now_rfc3339)
     })
 }
 

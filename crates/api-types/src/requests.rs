@@ -157,6 +157,7 @@ pub struct CreateProjectRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateProjectRequest {
+    pub version: i64,
     pub name: Option<String>,
     pub settings: Option<Value>,
     pub default_review_config: Option<ReviewConfig>,

@@ -130,15 +130,25 @@ database for historical provenance.
 | POST   | `/api/v1/terminals/{id}/resize` | Resize task terminal session |
 | POST   | `/api/v1/terminals/{id}/terminate` | Terminate task terminal session |
 | GET    | `/api/v1/terminals/{id}/ws?attach_token=TOKEN` | Terminal WebSocket upgrade |
-| POST   | `/api/v1/agents` | Create an account-owned stable agent identity with its initial CLI profile |
+| POST   | `/api/v1/agents` | Create an account-owned harness agent; optional `credential_id` references a provider entry for dispatch-time key injection, gated by the capability runtime matrix |
 | GET    | `/api/v1/agents` | List visible agent identities with selected-profile fields |
 | GET    | `/api/v1/agents/{id}` | Get an agent identity with selected-profile fields |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
-| POST   | `/api/v1/embedded-agents/connect` | Create an account identity plus protected native-provider connection, profile, health, and initial account session |
+| POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
+| GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
+| GET    | `/api/v1/providers` | List the account's configured provider entries with usage (referencing agents, last used) plus CLI runtimes discovered on connected daemons |
+| POST   | `/api/v1/providers` | Create an API-key provider entry (`provider`, `label`, `credential`, optional `base_url`; required for `openai_compatible`); never creates an agent |
+| PATCH  | `/api/v1/providers/{id}` | Rename a provider entry with optimistic concurrency |
+| POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at` |
+| DELETE | `/api/v1/providers/{id}?version={version}` | Disconnect a provider entry; returns redacted provider-revocation status plus the affected agents, which become visibly unhealthy |
+| POST   | `/api/v1/provider-authorizations` | Start a finite browser/device provider authorization operation |
+| GET    | `/api/v1/provider-authorizations/{id}` | Poll an account-owned provider authorization operation |
+| POST   | `/api/v1/provider-authorizations/{id}/cancel` | Cancel a non-terminal provider authorization using `expected_version` |
+| GET    | `/api/v1/provider-authorizations/{provider}/callback` | Complete a browser callback after validating the protected state and trusted redirect origin |
 | GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
-| POST   | `/api/v1/agents/{id}/profiles/connect` | Ingest a protected credential and create/select a new native profile revision |
+| POST   | `/api/v1/agents/{id}/profiles/connect` | Create/select a new native profile revision referencing an existing provider entry (`credential_id`) |
 | POST   | `/api/v1/agents/{id}/profiles/{profile_id}/select` | Select an immutable profile using the identity version |
 | GET    | `/api/v1/agents/{id}/sessions` | List safe scope-bound session status/capability snapshots |
 | POST   | `/api/v1/agents/{id}/sessions` | Create or resume an explicitly scoped session |
@@ -151,8 +161,6 @@ database for historical provenance.
 | GET    | `/api/v1/agent-sessions/{session_id}/interactions` | List redaction-safe pending protected interactions for an owned session |
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer` | Answer a protected interaction with an optimistic version |
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel` | Cancel a protected interaction with an optimistic version |
-| GET    | `/api/v1/credentials` | List safe opaque credential handles owned by the account |
-| DELETE | `/api/v1/credentials/{id}` | Revoke an owned protected credential handle |
 | GET    | `/api/v1/account/main-agent` | `V071+` — Get the account's single Main Agent binding |
 | PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency |
 | POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat and admit its first finite turn |
@@ -225,6 +233,51 @@ assignment and workflow authority and derives only that Task Workspace.
 session capability snapshot. Sending an ordinary Agent Chat message does not
 imply either action. Mutable identity/profile-pointer, binding, and session
 operations use optimistic versions and return HTTP 409 on a stale version.
+
+Provider entries and agents are separate resources. An entry is one
+credentialed connection (multiple entries per provider type may coexist);
+agents reference an entry through `credential_id` and are created separately —
+completing a connection never creates an agent. Connection methods come from
+`GET /api/v1/providers/catalog`; clients must not invent their own
+provider/method matrix. Each credential-method entry includes the authoritative
+`action_label`, `support_level`, `configured`, optional `setup_guidance`,
+optional `boundary_note`, and a `runtimes` matrix declaring which runtimes
+(`direct` or harness kinds such as `codex` and `gemini`) entries of that method
+can drive, with per-combination support levels and user-safe unavailability
+reasons; agent creation re-validates that matrix server-side. API keys use
+`POST /api/v1/providers`. Browser/device methods create a short-lived
+authorization operation with states `starting`, `awaiting_browser`,
+`awaiting_device`, `polling`, `exchanging`, `verifying`, and `publishing`.
+Terminal states are `succeeded`, `denied`, `expired`, `cancelled`, and
+`failed`; a successful operation publishes a provider entry only. Public
+operation responses may contain only an authorization URL, device user code,
+expiry, safe error code/message, and the resulting opaque credential handle ID.
+Callback state, PKCE verifier, device code, access token, refresh token, and
+OAuth client secret stay in encrypted storage.
+
+A harness agent may set `auth_source: forge_provider` implicitly by referencing
+a provider entry: at dispatch Forge injects the entry's API key into the
+spawned executor's environment only (for example `OPENAI_API_KEY`); the stored
+execution snapshot, events, and logs never contain the key. OAuth entries
+cannot drive a CLI harness. Harness agents without an entry keep their
+CLI-managed login, and `GET /api/v1/providers` surfaces those CLI runtimes with
+authentication availability, host, and usage.
+
+OpenAI Platform API keys remain stable. ChatGPT browser/device login and its
+direct Responses adapter are experimental. xAI API keys remain stable while
+OIDC-discovered RFC 8628 device login and the direct Responses adapter are
+experimental. Gemini supports AI Studio API keys and a configured Google OAuth
+client for the documented Gemini API; Forge never imports Gemini CLI/Code
+Assist credentials. Login publishes a profile but never changes Main or
+Project bindings. Disconnect revokes the local handle, deletes its protected
+secret, invalidates future leases, and marks dependent profile/session health
+unavailable in one local transaction. The response is
+`{"id":"...","status":"revoked","provider_revocation":"not_supported|succeeded|failed"}`;
+remote provider revocation is best effort when supported and a failure never
+restores the local secret.
+
+`PATCH /api/v1/projects/{id}` requires `version`. A successful mutation
+increments the Project version; a stale request returns HTTP 409.
 
 Native sessions may also pause on a protected questionnaire. The interaction
 routes are scoped by the session path and derive account ownership solely from

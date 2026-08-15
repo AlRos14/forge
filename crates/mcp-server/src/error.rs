@@ -49,6 +49,12 @@ impl From<ServiceError> for McpToolError {
             ServiceError::AuthorizationDenied { message } => {
                 Self::new(-32003, message).with_data(json!({ "code": "authorization.invalid" }))
             }
+            ServiceError::RateLimited {
+                retry_after_seconds,
+            } => Self::new(-32029, "rate limit exceeded").with_data(json!({
+                "code": "rate_limited",
+                "retry_after_seconds": retry_after_seconds,
+            })),
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,

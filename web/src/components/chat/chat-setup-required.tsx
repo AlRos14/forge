@@ -21,8 +21,8 @@ export function ChatSetupRequired({ projectId }: { projectId?: string }) {
       </p>
       {projectId ? (
         <Link
-          to="/projects/$projectId/settings/$tab"
-          params={{ projectId, tab: 'project-agent' }}
+          to="/agents"
+          search={{ project: projectId }}
           className="mt-5 inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-primary px-[14px] py-[7px] text-ui font-medium text-primary-foreground ring-offset-background transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         >
           <Gear size={14} aria-hidden />
@@ -31,7 +31,8 @@ export function ChatSetupRequired({ projectId }: { projectId?: string }) {
         </Link>
       ) : (
         <Link
-          to="/agents/federated"
+          to="/agents"
+          search={{ tab: 'bindings' }}
           className="mt-5 inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-primary px-[14px] py-[7px] text-ui font-medium text-primary-foreground ring-offset-background transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         >
           <Gear size={14} aria-hidden />

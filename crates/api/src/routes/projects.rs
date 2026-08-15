@@ -507,6 +507,7 @@ pub async fn update_project(
         primary_repo_id,
         paused,
         project_hooks,
+        version,
     } = request;
     let project_hooks_json = match project_hooks {
         Some(rules) => {
@@ -526,12 +527,7 @@ pub async fn update_project(
         default_review_config.as_ref(),
     )
     .await?;
-    if let Some(project_hooks_json) = project_hooks_json.as_deref() {
-        let updated_at = now_rfc3339();
-        ProjectRepo::set_project_hooks_json(&*state.db, &id, project_hooks_json, &updated_at)
-            .await?;
-    }
-    let project = ProjectRepo::update(
+    let project = ProjectRepo::update_at_version(
         &*state.db,
         UpdateProject {
             id,
@@ -541,6 +537,8 @@ pub async fn update_project(
             paused_at: paused.map(|paused: bool| paused.then(now_rfc3339)),
             updated_at: now_rfc3339(),
         },
+        version,
+        project_hooks_json,
     )
     .await?;
     state.event_bus.publish(ForgeEvent {

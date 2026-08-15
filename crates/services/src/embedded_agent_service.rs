@@ -11,14 +11,15 @@ use db::{
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
     AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo, AgentStatus, AssigneeKind,
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CredentialHandle, ExecutionRepo, ExecutionStatus, PageRequest, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectRepo, RotateAgentSession, SelectAgentProfile, SortBy, SortOrder,
-    SqliteDb, TaskRepo, TaskRoleAssignmentRepo, UpdateAgentSession, UpsertAgentConnectionHealth,
+    CredentialHandle, CredentialHandleRepo, ExecutionRepo, ExecutionStatus, PageRequest,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RotateAgentSession,
+    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
+    UpdateAgentSession, UpsertAgentConnectionHealth,
 };
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType,
-    InteractionBrokerHandle, NativeAgentRuntimeBackend, Secret, SqliteProtectedRuntimeStore,
-    WorkspaceAccess,
+    CreateOAuthCredential, InteractionBrokerHandle, NativeAgentRuntimeBackend,
+    OAuthCredentialBundle, Secret, SqliteProtectedRuntimeStore, WorkspaceAccess,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,16 +45,15 @@ pub struct EmbeddedAgentService {
     tool_provider: Arc<CoordinationToolProvider>,
 }
 
+/// Create a direct (embedded-runtime) agent referencing an existing provider
+/// entry. The entry owns the credential; this input never carries one.
 #[derive(Clone)]
-pub struct ConnectEmbeddedAgent {
+pub struct CreateEmbeddedAgent {
     pub owner_user_id: String,
     pub name: String,
     pub description: Option<String>,
-    pub provider: String,
-    pub base_url: String,
+    pub credential_id: String,
     pub model: String,
-    pub credential_label: String,
-    pub credential: Secret,
     pub system_prompt: Option<String>,
     pub account_permission_ceiling: Value,
     pub tool_policy: Value,
@@ -67,17 +67,36 @@ pub struct ConnectEmbeddedProfile {
     pub owner_user_id: String,
     pub identity_id: String,
     pub expected_identity_version: i64,
-    pub provider: String,
-    pub base_url: String,
+    pub credential_id: String,
     pub model: String,
-    pub credential_label: String,
-    pub credential: Secret,
     pub system_prompt: Option<String>,
     pub permission_policy: Option<String>,
     pub tool_policy: Value,
     pub context_tokens: Option<u32>,
     pub max_input_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
+}
+
+/// Create an API-key provider entry. Publishing an entry never creates an
+/// agent.
+#[derive(Clone)]
+pub struct ConnectApiKeyCredential {
+    pub owner_user_id: String,
+    pub provider: String,
+    pub label: String,
+    pub credential: Secret,
+    pub base_url: Option<String>,
+}
+
+/// Store a completed OAuth authorization as a provider entry. Publishing an
+/// entry never creates an agent.
+#[derive(Clone)]
+pub struct ConnectOAuthCredential {
+    pub owner_user_id: String,
+    pub provider: String,
+    pub base_url: String,
+    pub credential_label: String,
+    pub credential: OAuthCredentialBundle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +130,35 @@ pub struct EffectivePermissions {
     pub allowed: BTreeSet<String>,
     pub denied: BTreeSet<String>,
     pub requires_approval: BTreeSet<String>,
+}
+
+/// Redacted result of a live provider connectivity test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderEntryTestOutcome {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub message: Option<String>,
+    pub checked_at: String,
+}
+
+impl ProviderEntryTestOutcome {
+    fn ok(latency_ms: u64, message: Option<String>) -> Self {
+        Self {
+            ok: true,
+            latency_ms,
+            message,
+            checked_at: now_rfc3339(),
+        }
+    }
+
+    fn failed(latency_ms: u64, message: String) -> Self {
+        Self {
+            ok: false,
+            latency_ms,
+            message: Some(message),
+            checked_at: now_rfc3339(),
+        }
+    }
 }
 
 impl EmbeddedAgentService {
@@ -156,44 +204,234 @@ impl EmbeddedAgentService {
         self.native_backend.interaction_broker()
     }
 
-    pub async fn connect_new_agent(
+    /// Create an API-key provider entry after validating the provider,
+    /// endpoint, and key shape. No agent, profile, or binding changes.
+    pub async fn connect_api_key_credential(
         &self,
-        input: ConnectEmbeddedAgent,
+        input: ConnectApiKeyCredential,
+    ) -> Result<CredentialHandle> {
+        if input.label.trim().is_empty() || input.credential.expose().trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "label and credential are required",
+            ));
+        }
+        if !matches!(
+            input.provider.as_str(),
+            "openai" | "xai" | "gemini" | "openai_compatible" | "openrouter"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "provider is not supported by the embedded runtime",
+            ));
+        }
+        let base_url = match input.base_url.as_deref().map(str::trim) {
+            Some(value) if !value.is_empty() => value.to_owned(),
+            _ => default_api_key_base_url(&input.provider)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("base_url is required for this provider")
+                })?
+                .to_owned(),
+        };
+        provider_url_addresses(&base_url)
+            .await
+            .map_err(ServiceError::invalid_operation)?;
+        let now = now_rfc3339();
+        let credential_id = new_uuid_v4();
+        let handle = self
+            .protected_store
+            .create_credential(
+                &credential_id,
+                &input.owner_user_id,
+                &input.provider,
+                &input.label,
+                input.credential.clone(),
+                &now,
+            )
+            .await
+            .map_err(redacted_host_error)?;
+        self.record_entry_base_url(&credential_id, &base_url).await;
+        Ok(CredentialHandle {
+            metadata_json: json!({ "base_url": base_url }).to_string(),
+            ..handle
+        })
+    }
+
+    /// Store a completed OAuth authorization as a provider entry. No agent,
+    /// profile, or binding changes.
+    pub async fn connect_oauth_credential(
+        &self,
+        input: ConnectOAuthCredential,
+    ) -> Result<CredentialHandle> {
+        if input.provider.trim().is_empty()
+            || input.credential.access_token.trim().is_empty()
+            || input.credential.refresh_token.trim().is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "OAuth connection is missing required provider or token data",
+            ));
+        }
+        if !matches!(input.provider.as_str(), "openai" | "xai" | "gemini") {
+            return Err(ServiceError::invalid_operation(
+                "provider does not support Forge-managed OAuth",
+            ));
+        }
+        provider_url_addresses(&input.base_url)
+            .await
+            .map_err(ServiceError::invalid_operation)?;
+        let now = now_rfc3339();
+        let credential_id = new_uuid_v4();
+        let metadata_json = json!({
+            "base_url": input.base_url.trim_end_matches('/'),
+            "scopes": input.credential.scopes.clone(),
+            "provider_account_id": input.credential.provider_account_id.clone(),
+        })
+        .to_string();
+        self.protected_store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: &credential_id,
+                owner_user_id: &input.owner_user_id,
+                provider: &input.provider,
+                label: &input.credential_label,
+                bundle: &input.credential,
+                metadata_json: &metadata_json,
+                now: &now,
+            })
+            .await
+            .map_err(redacted_host_error)
+    }
+
+    /// Resolve a provider entry owned by the caller and still usable.
+    pub async fn require_owned_entry(
+        &self,
+        owner_user_id: &str,
+        credential_id: &str,
+    ) -> Result<CredentialHandle> {
+        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, credential_id)
+            .await?
+            .filter(|handle| handle.owner_user_id == owner_user_id)
+            .ok_or_else(|| {
+                ServiceError::not_found("credential_handle", credential_id.to_owned())
+            })?;
+        if handle.status != "configured" {
+            return Err(ServiceError::invalid_operation(
+                "provider entry is disconnected",
+            ));
+        }
+        Ok(handle)
+    }
+
+    /// Make one minimal authenticated request against the entry's API to
+    /// check the provider is responding and the credential is accepted.
+    /// The outcome message is always redacted: HTTP status classes and
+    /// transport error kinds only, never credential material or bodies.
+    pub async fn test_provider_entry(
+        &self,
+        owner_user_id: &str,
+        credential_id: &str,
+    ) -> Result<ProviderEntryTestOutcome> {
+        let entry = self
+            .require_owned_entry(owner_user_id, credential_id)
+            .await?;
+        let base_url = entry_base_url(&entry)?;
+        provider_url_addresses(&base_url)
+            .await
+            .map_err(ServiceError::invalid_operation)?;
+        let secret = self
+            .protected_store
+            .acquire_provider_credential(owner_user_id, credential_id, 60_000)
+            .await
+            .map_err(redacted_host_error)?;
+
+        let base = base_url.trim_end_matches('/');
+        let is_oauth = entry.credential_method == "oauth_bundle";
+        // ChatGPT OAuth has no cheap read endpoint; probing the base URL still
+        // exercises DNS, TLS, and the authorization layer.
+        let openai_oauth = is_oauth && entry.provider == "openai";
+        let probe_url = match entry.provider.as_str() {
+            "openrouter" => format!("{base}/key"),
+            "openai" if openai_oauth => base.to_owned(),
+            _ => format!("{base}/models"),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| ServiceError::invalid_operation("provider test client unavailable"))?;
+        let mut request = client.get(&probe_url);
+        request = if entry.provider == "gemini" && !is_oauth {
+            request.header("x-goog-api-key", secret.expose())
+        } else {
+            request.bearer_auth(secret.expose())
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = match request.send().await {
+            Ok(response) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let status = response.status();
+                if status.is_success() {
+                    ProviderEntryTestOutcome::ok(latency_ms, None)
+                } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                    ProviderEntryTestOutcome::failed(
+                        latency_ms,
+                        format!(
+                            "provider rejected the credential (HTTP {})",
+                            status.as_u16()
+                        ),
+                    )
+                } else if openai_oauth {
+                    // Auth middleware answers before routing: a non-401/403
+                    // response means the token was accepted.
+                    ProviderEntryTestOutcome::ok(
+                        latency_ms,
+                        Some("endpoint reachable; authorization accepted".to_owned()),
+                    )
+                } else {
+                    ProviderEntryTestOutcome::failed(
+                        latency_ms,
+                        format!("provider returned HTTP {}", status.as_u16()),
+                    )
+                }
+            }
+            Err(error) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let reason = if error.is_timeout() {
+                    "provider did not respond within 10 seconds"
+                } else if error.is_connect() {
+                    "provider could not be reached"
+                } else {
+                    "provider request failed before a response arrived"
+                };
+                ProviderEntryTestOutcome::failed(latency_ms, reason.to_owned())
+            }
+        };
+        Ok(outcome)
+    }
+
+    pub async fn create_agent_from_entry(
+        &self,
+        input: CreateEmbeddedAgent,
     ) -> Result<ConnectedEmbeddedAgent> {
-        validate_native_connection(
-            &input.name,
-            &input.provider,
-            &input.base_url,
-            &input.model,
-            input.credential.expose(),
-        )
-        .await?;
+        if input.name.trim().is_empty() || input.model.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "name and model are required",
+            ));
+        }
+        let entry = self
+            .require_owned_entry(&input.owner_user_id, &input.credential_id)
+            .await?;
+        let base_url = entry_base_url(&entry)?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
         validate_public_runtime_json(&input.account_permission_ceiling)?;
         validate_public_runtime_json(&input.tool_policy)?;
         let now = now_rfc3339();
         let identity_id = new_uuid_v4();
         let profile_id = new_uuid_v4();
-        let credential_id = new_uuid_v4();
-        let credential_handle = self
-            .protected_store
-            .create_credential(
-                &credential_id,
-                &input.owner_user_id,
-                &input.provider,
-                &input.credential_label,
-                input.credential.clone(),
-                &now,
-            )
-            .await
-            .map_err(redacted_host_error)?;
         let capabilities = native_capabilities();
         let profile = CreateAgentProfile {
             id: profile_id.clone(),
             identity_id: identity_id.clone(),
             backend_kind: "native".to_owned(),
             executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
-            provider: Some(input.provider.clone()),
+            provider: Some(entry.provider.clone()),
             model: Some(input.model.clone()),
             reasoning_effort: None,
             permission_policy: Some("scoped_proposals".to_owned()),
@@ -201,18 +439,18 @@ impl EmbeddedAgentService {
             capabilities_json: serde_json::to_string(&capabilities).unwrap_or_else(|_| "{}".into()),
             tool_policy_json: input.tool_policy.to_string(),
             config_json: native_config_json(
-                &input.base_url,
+                &base_url,
                 input.context_tokens,
                 input.max_input_tokens,
                 input.max_output_tokens,
             )
             .to_string(),
-            credential_ref: Some(credential_id.clone()),
+            credential_ref: Some(entry.id.clone()),
             daemon_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let create_result = AgentRepo::create_identity_with_profile(
+        let agent = AgentRepo::create_identity_with_profile(
             &*self.db,
             CreateAgentIdentity {
                 id: identity_id.clone(),
@@ -233,17 +471,7 @@ impl EmbeddedAgentService {
             },
             profile,
         )
-        .await;
-        let agent = match create_result {
-            Ok(agent) => agent,
-            Err(error) => {
-                let _ = self
-                    .protected_store
-                    .revoke_credential(&credential_id, &input.owner_user_id, &now)
-                    .await;
-                return Err(error.into());
-            }
-        };
+        .await?;
         let profile = AgentProfileRepo::get_profile(&*self.db, &profile_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.clone()))?;
@@ -260,7 +488,7 @@ impl EmbeddedAgentService {
             .await?;
         Ok(ConnectedEmbeddedAgent {
             agent,
-            credential_handle,
+            credential_handle: entry,
             profile,
             health,
             session,
@@ -277,14 +505,13 @@ impl EmbeddedAgentService {
         if identity.version != input.expected_identity_version {
             return Err(ServiceError::Db(db::DbError::VersionConflict));
         }
-        validate_native_connection(
-            &identity.name,
-            &input.provider,
-            &input.base_url,
-            &input.model,
-            input.credential.expose(),
-        )
-        .await?;
+        if input.model.trim().is_empty() {
+            return Err(ServiceError::invalid_operation("model is required"));
+        }
+        let entry = self
+            .require_owned_entry(&input.owner_user_id, &input.credential_id)
+            .await?;
+        let base_url = entry_base_url(&entry)?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
         let account_permission_ceiling = sqlx::query_scalar::<_, String>(
             "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
@@ -298,28 +525,15 @@ impl EmbeddedAgentService {
         validate_public_runtime_json(&input.tool_policy)?;
         let permission_policy = validate_public_runtime_text(input.permission_policy.as_deref())?;
         let now = now_rfc3339();
-        let credential_id = new_uuid_v4();
-        let credential_handle = self
-            .protected_store
-            .create_credential(
-                &credential_id,
-                &input.owner_user_id,
-                &input.provider,
-                &input.credential_label,
-                input.credential.clone(),
-                &now,
-            )
-            .await
-            .map_err(redacted_host_error)?;
         let profile_id = new_uuid_v4();
-        let profile = AgentProfileRepo::create_profile(
+        let (profile, agent) = AgentProfileRepo::create_and_select_profile(
             &*self.db,
             CreateAgentProfile {
                 id: profile_id.clone(),
                 identity_id: input.identity_id.clone(),
                 backend_kind: "native".to_owned(),
                 executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
-                provider: Some(input.provider),
+                provider: Some(entry.provider.clone()),
                 model: Some(input.model),
                 reasoning_effort: None,
                 permission_policy: permission_policy
@@ -329,43 +543,115 @@ impl EmbeddedAgentService {
                     .unwrap_or_else(|_| "{}".into()),
                 tool_policy_json: input.tool_policy.to_string(),
                 config_json: native_config_json(
-                    &input.base_url,
+                    &base_url,
                     input.context_tokens,
                     input.max_input_tokens,
                     input.max_output_tokens,
                 )
                 .to_string(),
-                credential_ref: Some(credential_id.clone()),
+                credential_ref: Some(entry.id.clone()),
                 daemon_id: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
-        )
-        .await;
-        let profile = match profile {
-            Ok(profile) => profile,
-            Err(error) => {
-                let _ = self
-                    .protected_store
-                    .revoke_credential(&credential_id, &input.owner_user_id, &now)
-                    .await;
-                return Err(error.into());
-            }
-        };
-        let agent = AgentProfileRepo::select_profile(
-            &*self.db,
             SelectAgentProfile {
                 identity_id: input.identity_id,
                 profile_id: profile_id.clone(),
                 expected_version: input.expected_identity_version,
-                updated_at: now,
+                updated_at: now.clone(),
             },
         )
         .await?;
         let health = self
             .check_and_record_connection(&profile, &input.owner_user_id)
             .await?;
-        Ok((agent, credential_handle, profile, health))
+        Ok((agent, entry, profile, health))
+    }
+
+    /// Inject the referenced provider entry's API key into an in-memory
+    /// executor config snapshot as the provider's environment variable
+    /// (`auth_source: forge_provider` dispatch). The mutated value is handed
+    /// to the spawned executor only — it is never written back to the
+    /// database, events, or logs.
+    pub async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()> {
+        let executor_type = agent_config
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if executor_type == NATIVE_EXECUTOR_TYPE {
+            return Ok(());
+        }
+        let Some(agent_id) = agent_config
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? else {
+            return Ok(());
+        };
+        let Some(credential_ref) = agent.credential_ref.as_deref() else {
+            return Ok(());
+        };
+        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, credential_ref)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("referenced provider entry is unavailable")
+            })?;
+        if handle.status != "configured" {
+            return Err(ServiceError::invalid_operation(
+                "referenced provider entry is disconnected",
+            ));
+        }
+        if handle.credential_method != "api_key" {
+            return Err(ServiceError::invalid_operation(
+                "referenced provider entry cannot drive a CLI harness",
+            ));
+        }
+        let variable = provider_env_variable(&handle.provider).ok_or_else(|| {
+            ServiceError::invalid_operation("provider has no harness environment contract")
+        })?;
+        let secret = self
+            .protected_store
+            .acquire_provider_credential(&handle.owner_user_id, &handle.id, 60_000)
+            .await
+            .map_err(redacted_host_error)?;
+        let env = agent_config
+            .as_object_mut()
+            .and_then(|snapshot| snapshot.get_mut("config"))
+            .and_then(Value::as_object_mut)
+            .map(|config| {
+                config
+                    .entry("command_overrides")
+                    .or_insert_with(|| json!({}))
+            })
+            .and_then(Value::as_object_mut)
+            .map(|overrides| overrides.entry("env").or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("executor config snapshot is not injectable")
+            })?;
+        env.insert(
+            variable.to_owned(),
+            Value::String(secret.expose().to_owned()),
+        );
+        Ok(())
+    }
+
+    /// Best-effort persistence of the resolved base URL in entry metadata so
+    /// later agent creation does not need to re-derive it.
+    async fn record_entry_base_url(&self, credential_id: &str, base_url: &str) {
+        let _ = sqlx::query(
+            "UPDATE credential_handle
+             SET metadata_json = json_set(metadata_json, '$.base_url', ?)
+             WHERE id = ?",
+        )
+        .bind(base_url.trim_end_matches('/'))
+        .bind(credential_id)
+        .execute(self.db.pool())
+        .await;
     }
 
     pub async fn create_or_resume_session(
@@ -984,7 +1270,7 @@ impl EmbeddedAgentService {
             .ok_or_else(|| "credential_missing".to_owned())?;
         let credential = self
             .protected_store
-            .load_credential(handle, owner_user_id)
+            .acquire_provider_credential(owner_user_id, handle, 30_000)
             .await
             .map_err(|_| "credential_unavailable".to_owned())?;
         let config: Value = serde_json::from_str(&profile.config_json)
@@ -1028,31 +1314,60 @@ impl EmbeddedAgentService {
     }
 }
 
-async fn validate_native_connection(
-    name: &str,
-    provider: &str,
-    base_url: &str,
-    model: &str,
-    credential: &str,
-) -> Result<()> {
-    if name.trim().is_empty()
-        || provider.trim().is_empty()
-        || model.trim().is_empty()
-        || credential.trim().is_empty()
-    {
-        return Err(ServiceError::invalid_operation(
-            "name, provider, model, and credential are required",
-        ));
+/// Environment variable a CLI harness reads for each provider's API key.
+fn provider_env_variable(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" | "openai_compatible" => Some("OPENAI_API_KEY"),
+        "gemini" => Some("GEMINI_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        _ => None,
     }
-    if !matches!(provider, "openai" | "openai_compatible" | "openrouter") {
-        return Err(ServiceError::invalid_operation(
-            "provider is not supported by the embedded runtime",
-        ));
+}
+
+/// Default API endpoint for API-key entries. `openai_compatible` has no
+/// default and requires an explicit base URL.
+pub fn default_api_key_base_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("https://api.openai.com/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        _ => None,
     }
-    provider_url_addresses(base_url)
-        .await
-        .map_err(ServiceError::invalid_operation)?;
-    Ok(())
+}
+
+fn default_oauth_base_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("https://chatgpt.com/backend-api/codex"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
+        _ => None,
+    }
+}
+
+/// The API endpoint an agent built on this entry talks to: stored entry
+/// metadata first, then the provider/method default.
+pub fn entry_base_url(entry: &CredentialHandle) -> Result<String> {
+    let stored = serde_json::from_str::<Value>(&entry.metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("base_url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    if let Some(base_url) = stored {
+        return Ok(base_url);
+    }
+    let fallback = if entry.credential_method == "oauth_bundle" {
+        default_oauth_base_url(&entry.provider)
+    } else {
+        default_api_key_base_url(&entry.provider)
+    };
+    fallback
+        .map(str::to_owned)
+        .ok_or_else(|| ServiceError::invalid_operation("provider entry has no usable API endpoint"))
 }
 
 async fn provider_url_addresses(
@@ -1437,7 +1752,8 @@ fn intersect_non_empty_layers(layers: &[BTreeSet<String>]) -> BTreeSet<String> {
 fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError {
     match error {
         forge_agent_host::AgentHostError::CredentialNotFound
-        | forge_agent_host::AgentHostError::SessionNotFound => {
+        | forge_agent_host::AgentHostError::SessionNotFound
+        | forge_agent_host::AgentHostError::VersionConflict => {
             ServiceError::not_found("protected_runtime_resource", "unavailable")
         }
         forge_agent_host::AgentHostError::Authority(message)
@@ -1555,5 +1871,252 @@ mod tests {
             Some(default_roles::CODER),
             "reviewer"
         ));
+    }
+
+    #[test]
+    fn entry_base_url_prefers_metadata_then_method_default() {
+        let handle = |method: &str, metadata: &str| CredentialHandle {
+            id: "entry-1".to_owned(),
+            owner_user_id: "user-1".to_owned(),
+            provider: "openai".to_owned(),
+            label: "entry".to_owned(),
+            status: "configured".to_owned(),
+            credential_method: method.to_owned(),
+            metadata_json: metadata.to_owned(),
+            version: 1,
+            created_at: "2026-08-15T00:00:00Z".to_owned(),
+            updated_at: "2026-08-15T00:00:00Z".to_owned(),
+        };
+        assert_eq!(
+            entry_base_url(&handle(
+                "api_key",
+                r#"{"base_url":"https://proxy.example/v1"}"#
+            ))
+            .expect("metadata wins"),
+            "https://proxy.example/v1"
+        );
+        assert_eq!(
+            entry_base_url(&handle("api_key", "{}")).expect("api-key default"),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            entry_base_url(&handle("oauth_bundle", "{}")).expect("oauth default"),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        let mut compatible = handle("api_key", "{}");
+        compatible.provider = "openai_compatible".to_owned();
+        assert!(entry_base_url(&compatible).is_err());
+    }
+
+    async fn test_service_with_owner() -> (EmbeddedAgentService, String) {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let owner = new_uuid_v4();
+        let now = now_rfc3339();
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: owner.clone(),
+                email: "owner@example.com".to_owned(),
+                password_hash: "test".to_owned(),
+                display_name: Some("Owner".to_owned()),
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("owner creates");
+        (
+            EmbeddedAgentService::new(db, b"entry-split-test-key"),
+            owner,
+        )
+    }
+
+    #[tokio::test]
+    async fn api_key_entry_publishes_no_agent_and_stores_base_url() {
+        let (service, owner) = test_service_with_owner().await;
+        let entry = service
+            .connect_api_key_credential(ConnectApiKeyCredential {
+                owner_user_id: owner.clone(),
+                provider: "openai_compatible".to_owned(),
+                label: "work key".to_owned(),
+                credential: Secret::new("provider-secret-value".to_owned()),
+                base_url: Some("https://8.8.8.8".to_owned()),
+            })
+            .await
+            .expect("entry creates");
+        assert_eq!(entry.status, "configured");
+        assert_eq!(entry.credential_method, "api_key");
+        assert_eq!(
+            entry_base_url(&entry).expect("stored endpoint"),
+            "https://8.8.8.8"
+        );
+        let agents = AgentRepo::list(
+            &*service.db,
+            db::AgentListQuery {
+                status: None,
+                executor_type: None,
+                capabilities: Vec::new(),
+                page: PageRequest {
+                    cursor: None,
+                    limit: 10,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc,
+                },
+            },
+        )
+        .await
+        .expect("agents list");
+        assert!(agents.items.is_empty(), "connecting must not create agents");
+        assert!(!entry.metadata_json.contains("provider-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn provider_env_injection_is_in_memory_only_and_refuses_oauth() {
+        let (service, owner) = test_service_with_owner().await;
+        let entry = service
+            .connect_api_key_credential(ConnectApiKeyCredential {
+                owner_user_id: owner.clone(),
+                provider: "openai_compatible".to_owned(),
+                label: "harness key".to_owned(),
+                credential: Secret::new("injected-secret-value".to_owned()),
+                base_url: Some("https://8.8.8.8".to_owned()),
+            })
+            .await
+            .expect("entry creates");
+        let now = now_rfc3339();
+        let agent = AgentRepo::create(
+            &*service.db,
+            db::CreateAgent {
+                id: new_uuid_v4(),
+                name: "codex-worker".to_owned(),
+                description: None,
+                executor_type: "codex".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: Some(entry.id.clone()),
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner.clone()),
+                visibility: "account".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("harness agent creates");
+
+        let mut snapshot = json!({
+            "executor_type": "codex",
+            "agent_id": agent.id,
+            "profile_id": agent.profile_id,
+            "config": {}
+        });
+        service
+            .inject_provider_env(&mut snapshot)
+            .await
+            .expect("injection succeeds");
+        assert_eq!(
+            snapshot["config"]["command_overrides"]["env"]["OPENAI_API_KEY"],
+            Value::String("injected-secret-value".to_owned())
+        );
+        // The stored agent row never gains the secret: injection mutates only
+        // the in-memory dispatch snapshot.
+        let stored = AgentRepo::get_by_id(&*service.db, &agent.id)
+            .await
+            .expect("agent reads")
+            .expect("agent exists");
+        assert!(!stored.config_json.contains("injected-secret-value"));
+
+        // Embedded agents resolve credentials inside the native runtime; the
+        // injector must leave their snapshots untouched.
+        let mut embedded_snapshot = json!({
+            "executor_type": "embedded",
+            "agent_id": agent.id,
+            "config": {}
+        });
+        service
+            .inject_provider_env(&mut embedded_snapshot)
+            .await
+            .expect("embedded snapshots pass through");
+        assert_eq!(embedded_snapshot["config"], json!({}));
+
+        // An OAuth-backed entry cannot drive a CLI harness.
+        let oauth_entry = service
+            .connect_oauth_credential(ConnectOAuthCredential {
+                owner_user_id: owner.clone(),
+                provider: "openai".to_owned(),
+                base_url: "https://8.8.8.8".to_owned(),
+                credential_label: "chatgpt login".to_owned(),
+                credential: OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "oauth-access-secret".to_owned(),
+                    refresh_token: "oauth-refresh-secret".to_owned(),
+                    expires_at_ms: u64::MAX,
+                    token_endpoint: "https://auth.openai.com/oauth/token".to_owned(),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec!["openid".to_owned()],
+                    provider_account_id: Some("acct".to_owned()),
+                },
+            })
+            .await
+            .expect("oauth entry creates");
+        let now = now_rfc3339();
+        let oauth_agent = AgentRepo::create(
+            &*service.db,
+            db::CreateAgent {
+                id: new_uuid_v4(),
+                name: "oauth-harness".to_owned(),
+                description: None,
+                executor_type: "codex".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: Some(oauth_entry.id.clone()),
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner.clone()),
+                visibility: "account".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("oauth harness agent creates");
+        let mut oauth_snapshot = json!({
+            "executor_type": "codex",
+            "agent_id": oauth_agent.id,
+            "config": {}
+        });
+        let error = service
+            .inject_provider_env(&mut oauth_snapshot)
+            .await
+            .expect_err("oauth entries cannot drive a harness");
+        assert!(!error.to_string().contains("oauth-access-secret"));
     }
 }

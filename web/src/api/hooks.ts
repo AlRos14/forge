@@ -381,6 +381,7 @@ export function useCreateTask(projectId: string) {
       }),
     onSuccess: (task) => {
       void queryClient.invalidateQueries({ queryKey: qk.projectTasks(projectId) })
+      void queryClient.invalidateQueries({ queryKey: qk.projectOverview(projectId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
     },
   })

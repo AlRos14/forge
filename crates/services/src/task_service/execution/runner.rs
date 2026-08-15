@@ -130,6 +130,13 @@ impl TaskService {
         if agent_config.get("executor_type").and_then(Value::as_str) == Some("embedded") {
             crate::embedded_task_executor::set_task_role_marker(&mut agent_config, &execution.role);
         }
+        // Provider-entry-backed harness agents get their API key injected into
+        // the in-memory snapshot only; the stored snapshot never holds it.
+        if let Some(credential_env) = self.credential_env.as_ref() {
+            credential_env
+                .inject_provider_env(&mut agent_config)
+                .await?;
+        }
         let max_turns = self.resolve_max_turns(&task).await?;
         let logs_path = self
             .resolve_execution_logs_path(&execution, &task, &workspace, &execution_id)

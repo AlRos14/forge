@@ -27,7 +27,9 @@ const AccountPage = lazy(() =>
   import('@/pages/AccountPage').then((module) => ({ default: module.AccountPage })),
 )
 const AgentsPage = lazy(() =>
-  import('@/pages/AgentsPage').then((module) => ({ default: module.AgentsPage })),
+  import('@/pages/FederatedAgentsPage').then((module) => ({
+    default: module.FederatedAgentsPage,
+  })),
 )
 const BoardPage = lazy(() =>
   import('@/features/board/BoardPage').then((module) => ({ default: module.BoardPage })),
@@ -52,9 +54,6 @@ const OperationsPage = lazy(() =>
 )
 const MissionControlPage = lazy(() =>
   import('@/pages/MissionControlPage').then((module) => ({ default: module.MissionControlPage })),
-)
-const FederatedAgentsPage = lazy(() =>
-  import('@/pages/FederatedAgentsPage').then((module) => ({ default: module.FederatedAgentsPage })),
 )
 const ChatPage = lazy(() =>
   import('@/pages/ChatPage').then((module) => ({ default: module.ChatPage })),
@@ -90,7 +89,6 @@ const projectSettingsTabs = new Set<ProjectSettingsTab>([
   'general',
   'repos',
   'members',
-  'project-agent',
   'mcp',
   'hooks',
   'analytics',
@@ -386,43 +384,29 @@ function ExecutionDetailRouteComponent() {
 const agentsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/agents',
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): {
+    tab?: string
+    project?: string
+    provider?: string
+    status?: string
+    authorization?: string
+    identity?: string
+  } => ({
+    tab: typeof search.tab === 'string' ? search.tab : undefined,
+    project: typeof search.project === 'string' ? search.project : undefined,
+    provider: typeof search.provider === 'string' ? search.provider : undefined,
+    status: typeof search.status === 'string' ? search.status : undefined,
+    authorization:
+      typeof search.authorization === 'string' ? search.authorization : undefined,
+    identity: typeof search.identity === 'string' ? search.identity : undefined,
+  }),
   component: AgentsRouteComponent,
 })
 
 function AgentsRouteComponent() {
   return <AgentsPage />
-}
-
-const agentCreateRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/agents/new',
-  component: AgentCreateRouteComponent,
-})
-
-function AgentCreateRouteComponent() {
-  return <AgentsPage mode="create" />
-}
-
-const agentDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/agents/$agentId',
-  component: AgentDetailRouteComponent,
-})
-
-function AgentDetailRouteComponent() {
-  const { agentId } = agentDetailRoute.useParams()
-  return <AgentsPage selectedAgentId={agentId} />
-}
-
-const agentEditRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/agents/$agentId/edit',
-  component: AgentEditRouteComponent,
-})
-
-function AgentEditRouteComponent() {
-  const { agentId } = agentEditRoute.useParams()
-  return <AgentsPage selectedAgentId={agentId} mode="edit" />
 }
 
 const daemonsRoute = createRoute({
@@ -582,12 +566,6 @@ const accountTabRoute = createRoute({
   component: AccountTabRouteComponent,
 })
 
-const federatedAgentsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/agents/federated',
-  component: FederatedAgentsPage,
-})
-
 function AccountTabRouteComponent() {
   const { tab } = accountTabRoute.useParams()
   return <AccountPage initialTab={isAccountTab(tab) ? tab : 'profile'} />
@@ -638,10 +616,6 @@ const routeTree = rootRoute.addChildren([
   taskDetailTabRoute,
   executionDetailRoute,
   agentsRoute,
-  federatedAgentsRoute,
-  agentCreateRoute,
-  agentEditRoute,
-  agentDetailRoute,
   daemonsRoute,
   daemonDetailRoute,
   operationsRoute,

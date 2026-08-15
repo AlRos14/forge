@@ -39,15 +39,13 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         let error: ErrorResponse = common::json_request_with_bearer(
             app,
             Method::POST,
-            "/api/v1/embedded-agents/connect",
+            "/api/v1/providers",
             &token,
             json!({
-                "name": format!("rejected-provider-url-{index}"),
                 "provider": "openai_compatible",
-                "base_url": base_url,
-                "model": "test-model",
-                "credential_label": "adversarial",
+                "label": format!("rejected-provider-url-{index}"),
                 "credential": PROVIDER_SECRET,
+                "base_url": base_url,
             }),
             StatusCode::BAD_REQUEST,
         )
@@ -78,6 +76,16 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         assert_eq!(legacy_embedded.code, "invalid_operation");
     }
 
+    let adversarial_entry = common::create_provider_entry(
+        app,
+        &token,
+        "openai_compatible",
+        "adversarial",
+        PROVIDER_SECRET,
+        "https://8.8.8.8",
+    )
+    .await;
+
     for (index, (system_prompt, account_permission_ceiling, tool_policy)) in [
         (
             Some("Authorization: Bearer placeholder-prompt"),
@@ -101,15 +109,12 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         let error: ErrorResponse = common::json_request_with_bearer(
             app,
             Method::POST,
-            "/api/v1/embedded-agents/connect",
+            "/api/v1/embedded-agents",
             &token,
             json!({
                 "name": format!("rejected-runtime-policy-{index}"),
-                "provider": "openai_compatible",
-                "base_url": "https://8.8.8.8",
+                "credential_id": adversarial_entry.id,
                 "model": "test-model",
-                "credential_label": "adversarial",
-                "credential": PROVIDER_SECRET,
                 "system_prompt": system_prompt,
                 "account_permission_ceiling": account_permission_ceiling,
                 "tool_policy": tool_policy,
@@ -127,16 +132,13 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let connected: api_types::ConnectedEmbeddedAgentResponse = common::json_request_with_bearer(
         app,
         Method::POST,
-        "/api/v1/embedded-agents/connect",
+        "/api/v1/embedded-agents",
         &token,
         json!({
             "name": "unavailable-but-not-authorized",
             "description": "adversarial provider",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
+            "credential_id": adversarial_entry.id,
             "model": "test-model",
-            "credential_label": "adversarial",
-            "credential": PROVIDER_SECRET,
             "system_prompt": null,
             "account_permission_ceiling": {
                 "permissions": ["read_account", "read_project", "read_room", "read_task", "task_write"]
@@ -187,17 +189,21 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         PROVIDER_SECRET,
     );
 
-    let credentials: Vec<api_types::CredentialHandleResponse> = common::empty_request_with_bearer(
+    let providers: api_types::ProviderEntriesResponse = common::empty_request_with_bearer(
         app,
         Method::GET,
-        "/api/v1/credentials",
+        "/api/v1/providers",
         &token,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(credentials.len(), 1);
+    assert_eq!(providers.items.len(), 1);
+    assert!(providers.items[0]
+        .used_by
+        .iter()
+        .any(|usage| usage.agent_id == connected.agent.id));
     assert_json_does_not_contain_secret(
-        &serde_json::to_value(&credentials).expect("credential list serializes"),
+        &serde_json::to_value(&providers).expect("provider list serializes"),
         PROVIDER_SECRET,
     );
 
@@ -224,11 +230,8 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         &token,
         json!({
             "version": connected.agent.version,
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
+            "credential_id": adversarial_entry.id,
             "model": "test-model",
-            "credential_label": "adversarial-profile",
-            "credential": PROVIDER_SECRET,
             "system_prompt": "authorization:\tBEARER\tplaceholder-profile-token",
             "permission_policy": "safe policy",
             "tool_policy": {"nested": [{"api_key": "placeholder-profile-key"}]}
@@ -390,24 +393,14 @@ async fn agent_chats_reject_protected_content_and_opaque_cross_chat_references()
     let harness = common::test_app(workspace.path(), "security-agent-chat").await;
     let app = &harness.app;
     let token = common::test_jwt();
-    let connected: api_types::ConnectedEmbeddedAgentResponse = common::json_request_with_bearer(
+    let connected: api_types::ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
         app,
-        Method::POST,
-        "/api/v1/embedded-agents/connect",
         &token,
-        json!({
-            "name": "agent-chat-security-agent",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
-            "model": "test-model",
-            "credential_label": "adversarial",
-            "credential": PROVIDER_SECRET,
-            "account_permission_ceiling": {"permissions": [
-                "read_agent_chat", "propose_message"
-            ]},
-            "tool_policy": {"allowed": ["read_agent_chat", "propose_message"]}
-        }),
-        StatusCode::OK,
+        "agent-chat-security-agent",
+        "adversarial",
+        PROVIDER_SECRET,
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
     )
     .await;
     let binding: api_types::MainAgentBindingResponse = common::json_request_with_bearer(

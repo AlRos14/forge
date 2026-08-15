@@ -163,7 +163,7 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
           icon={<Robot size={19} />}
         />
         <Link
-          to="/agents/federated"
+          to="/agents"
           className="inline-flex items-center gap-1.5 text-sm font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           Open Agent settings

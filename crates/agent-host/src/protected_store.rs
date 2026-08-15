@@ -1,9 +1,18 @@
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use agent_runtime::core::{
     checkpoint::{CheckpointStore, TurnCheckpoint},
     error::{ErrorKind, RuntimeError},
     ids::SessionId,
+    prelude::{
+        Clock, CredentialInvalidation, Deadline, ProviderAuthRejection, ProviderCredentialError,
+        ProviderCredentialLease, ProviderCredentialRevision, ProviderCredentialSource,
+        ProviderCredentialTarget, SystemClock, Timestamp,
+    },
     store::{Secret, SessionSnapshot, SessionStore},
 };
 use async_trait::async_trait;
@@ -12,13 +21,91 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
 use db::{CredentialHandle, SqliteDb};
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use tokio::sync::Mutex;
+
+const OAUTH_REFRESH_SKEW_MS: u64 = 30_000;
+const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRevocationOutcome {
+    NotSupported,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OAuthCredentialBundle {
+    pub schema_version: u32,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at_ms: u64,
+    pub token_endpoint: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub provider_account_id: Option<String>,
+}
+
+pub struct CreateOAuthCredential<'a> {
+    pub id: &'a str,
+    pub owner_user_id: &'a str,
+    pub provider: &'a str,
+    pub label: &'a str,
+    pub bundle: &'a OAuthCredentialBundle,
+    pub metadata_json: &'a str,
+    pub now: &'a str,
+}
+
+impl fmt::Debug for OAuthCredentialBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthCredentialBundle")
+            .field("schema_version", &self.schema_version)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("scopes", &self.scopes)
+            .field("provider_account_id", &self.provider_account_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredCredential {
+    provider: String,
+    method: String,
+    version: i64,
+    plaintext: String,
+}
+
+#[derive(Clone)]
+pub struct SqliteProviderCredentialSource {
+    store: SqliteProtectedRuntimeStore,
+    owner_user_id: String,
+    handle_id: String,
+    refresh_lock: Arc<Mutex<()>>,
+    client: reqwest::Client,
+}
+
+impl fmt::Debug for SqliteProviderCredentialSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqliteProviderCredentialSource")
+            .field("handle", &"[opaque]")
+            .finish()
+    }
+}
 
 #[derive(Clone)]
 pub struct SqliteProtectedRuntimeStore {
     db: Arc<SqliteDb>,
     cipher: Arc<XChaCha20Poly1305>,
     key_revision: i64,
+    refresh_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
+    revocation_client: reqwest::Client,
+    gemini_revocation_endpoint: Arc<str>,
 }
 
 impl SqliteProtectedRuntimeStore {
@@ -27,6 +114,13 @@ impl SqliteProtectedRuntimeStore {
             db,
             cipher: Arc::new(XChaCha20Poly1305::new((&master_key).into())),
             key_revision,
+            refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
+            revocation_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("credential revocation client configuration is valid"),
+            gemini_revocation_endpoint: Arc::from("https://oauth2.googleapis.com/revoke"),
         }
     }
 
@@ -399,8 +493,9 @@ impl SqliteProtectedRuntimeStore {
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         sqlx::query(
             "INSERT INTO credential_handle (
-                id, owner_user_id, provider, label, status, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'configured', ?, ?)",
+                id, owner_user_id, provider, label, status,
+                credential_method, metadata_json, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'configured', 'api_key', '{}', 1, ?, ?)",
         )
         .bind(id)
         .bind(owner_user_id)
@@ -435,6 +530,9 @@ impl SqliteProtectedRuntimeStore {
             provider: provider.to_owned(),
             label: label.to_owned(),
             status: "configured".to_owned(),
+            credential_method: "api_key".to_owned(),
+            metadata_json: "{}".to_owned(),
+            version: 1,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
         })
@@ -471,12 +569,317 @@ impl SqliteProtectedRuntimeStore {
         Ok(Secret::new(value))
     }
 
+    pub async fn create_oauth_credential(
+        &self,
+        input: CreateOAuthCredential<'_>,
+    ) -> Result<CredentialHandle, crate::AgentHostError> {
+        let plaintext = serde_json::to_vec(input.bundle)
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let (ciphertext, nonce) = self
+            .seal(&plaintext)
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let mut transaction = self
+            .db
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        sqlx::query(
+            "INSERT INTO credential_handle (
+                id, owner_user_id, provider, label, status,
+                credential_method, metadata_json, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'configured', 'oauth_bundle', ?, 1, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.owner_user_id)
+        .bind(input.provider)
+        .bind(input.label)
+        .bind(input.metadata_json)
+        .bind(input.now)
+        .bind(input.now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        sqlx::query(
+            "INSERT INTO protected_credential_secret (
+                handle_id, ciphertext, nonce, key_revision, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(ciphertext)
+        .bind(nonce)
+        .bind(self.key_revision)
+        .bind(input.now)
+        .bind(input.now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        Ok(CredentialHandle {
+            id: input.id.to_owned(),
+            owner_user_id: input.owner_user_id.to_owned(),
+            provider: input.provider.to_owned(),
+            label: input.label.to_owned(),
+            status: "configured".to_owned(),
+            credential_method: "oauth_bundle".to_owned(),
+            metadata_json: input.metadata_json.to_owned(),
+            version: 1,
+            created_at: input.now.to_owned(),
+            updated_at: input.now.to_owned(),
+        })
+    }
+
+    pub fn credential_source(
+        &self,
+        owner_user_id: impl Into<String>,
+        handle_id: impl Into<String>,
+    ) -> Arc<dyn ProviderCredentialSource> {
+        let handle_id = handle_id.into();
+        Arc::new(SqliteProviderCredentialSource {
+            store: self.clone(),
+            owner_user_id: owner_user_id.into(),
+            refresh_lock: self.refresh_lock(&handle_id),
+            handle_id,
+            client: reqwest::Client::new(),
+        })
+    }
+
+    pub async fn acquire_provider_credential(
+        &self,
+        owner_user_id: &str,
+        handle_id: &str,
+        minimum_validity_ms: u64,
+    ) -> Result<Secret, crate::AgentHostError> {
+        let source = SqliteProviderCredentialSource {
+            store: self.clone(),
+            owner_user_id: owner_user_id.to_owned(),
+            handle_id: handle_id.to_owned(),
+            refresh_lock: self.refresh_lock(handle_id),
+            client: reqwest::Client::new(),
+        };
+        let target = ProviderCredentialTarget::new(handle_id.to_owned())
+            .map_err(|_| crate::AgentHostError::CredentialNotFound)?;
+        let lease = source
+            .acquire(
+                &target,
+                minimum_validity_ms,
+                &agent_runtime::core::cancel::Cancellation::new(),
+                Deadline::after(&SystemClock, 8_000),
+            )
+            .await
+            .map_err(|_| crate::AgentHostError::CredentialNotFound)?;
+        Ok(lease.secret().clone())
+    }
+
+    pub async fn seal_provider_authorization_state(
+        &self,
+        operation_id: &str,
+        plaintext: &[u8],
+        now: &str,
+    ) -> Result<(), crate::AgentHostError> {
+        let (ciphertext, nonce) = self
+            .seal(plaintext)
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        sqlx::query(
+            "INSERT INTO protected_provider_authorization_state (
+                operation_id, ciphertext, nonce, key_revision, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(operation_id) DO UPDATE SET
+                ciphertext = excluded.ciphertext, nonce = excluded.nonce,
+                key_revision = excluded.key_revision, updated_at = excluded.updated_at",
+        )
+        .bind(operation_id)
+        .bind(ciphertext)
+        .bind(nonce)
+        .bind(self.key_revision)
+        .bind(now)
+        .bind(now)
+        .execute(self.db.pool())
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        Ok(())
+    }
+
+    pub async fn open_provider_authorization_state(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<u8>, crate::AgentHostError> {
+        let row = sqlx::query(
+            "SELECT ciphertext, nonce FROM protected_provider_authorization_state
+             WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+        .ok_or(crate::AgentHostError::ProtectedPersistence)?;
+        let ciphertext: Vec<u8> = row
+            .try_get("ciphertext")
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let nonce: Vec<u8> = row
+            .try_get("nonce")
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        self.open(&ciphertext, &nonce)
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)
+    }
+
+    pub async fn delete_provider_authorization_state(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), crate::AgentHostError> {
+        sqlx::query("DELETE FROM protected_provider_authorization_state WHERE operation_id = ?")
+            .bind(operation_id)
+            .execute(self.db.pool())
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        Ok(())
+    }
+
+    async fn load_stored_credential(
+        &self,
+        handle_id: &str,
+        owner_user_id: &str,
+    ) -> Result<StoredCredential, ProviderCredentialError> {
+        let row = sqlx::query(
+            "SELECT handle.provider, handle.credential_method, handle.version,
+                    secret.ciphertext, secret.nonce
+             FROM protected_credential_secret AS secret
+             JOIN credential_handle AS handle ON handle.id = secret.handle_id
+             WHERE handle.id = ? AND handle.owner_user_id = ?
+               AND handle.status = 'configured'",
+        )
+        .bind(handle_id)
+        .bind(owner_user_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| ProviderCredentialError::RefreshFailed)?
+        .ok_or(ProviderCredentialError::Unavailable)?;
+        let ciphertext: Vec<u8> = row
+            .try_get("ciphertext")
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let nonce: Vec<u8> = row
+            .try_get("nonce")
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let plaintext = self
+            .open(&ciphertext, &nonce)
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        Ok(StoredCredential {
+            provider: row
+                .try_get("provider")
+                .map_err(|_| ProviderCredentialError::RefreshFailed)?,
+            method: row
+                .try_get("credential_method")
+                .map_err(|_| ProviderCredentialError::RefreshFailed)?,
+            version: row
+                .try_get("version")
+                .map_err(|_| ProviderCredentialError::RefreshFailed)?,
+            plaintext: String::from_utf8(plaintext)
+                .map_err(|_| ProviderCredentialError::RefreshFailed)?,
+        })
+    }
+
+    fn refresh_lock(&self, handle_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .expect("provider credential refresh lock registry poisoned");
+        Arc::clone(
+            locks
+                .entry(handle_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    async fn mark_credential_invalid(
+        &self,
+        handle_id: &str,
+        owner_user_id: &str,
+        expected_version: i64,
+    ) {
+        let _ = sqlx::query(
+            "UPDATE credential_handle
+             SET status = 'invalid', version = version + 1, updated_at = ?
+             WHERE id = ? AND owner_user_id = ? AND version = ?",
+        )
+        .bind(db::now_rfc3339())
+        .bind(handle_id)
+        .bind(owner_user_id)
+        .bind(expected_version)
+        .execute(self.db.pool())
+        .await;
+    }
+
+    async fn rotate_oauth_bundle(
+        &self,
+        handle_id: &str,
+        owner_user_id: &str,
+        expected_version: i64,
+        bundle: &OAuthCredentialBundle,
+    ) -> Result<i64, ProviderCredentialError> {
+        let plaintext =
+            serde_json::to_vec(bundle).map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let (ciphertext, nonce) = self
+            .seal(&plaintext)
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let now = db::now_rfc3339();
+        let mut transaction = self
+            .db
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let result = sqlx::query(
+            "UPDATE credential_handle
+             SET version = version + 1, status = 'configured', updated_at = ?
+             WHERE id = ? AND owner_user_id = ? AND version = ?
+               AND credential_method = 'oauth_bundle' AND status = 'configured'",
+        )
+        .bind(&now)
+        .bind(handle_id)
+        .bind(owner_user_id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        if result.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+            return Err(ProviderCredentialError::RefreshFailed);
+        }
+        sqlx::query(
+            "UPDATE protected_credential_secret
+             SET ciphertext = ?, nonce = ?, key_revision = ?, updated_at = ?
+             WHERE handle_id = ?",
+        )
+        .bind(ciphertext)
+        .bind(nonce)
+        .bind(self.key_revision)
+        .bind(&now)
+        .bind(handle_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        Ok(expected_version + 1)
+    }
+
     pub async fn revoke_credential(
         &self,
         handle_id: &str,
         owner_user_id: &str,
         now: &str,
-    ) -> Result<(), crate::AgentHostError> {
+    ) -> Result<CredentialRevocationOutcome, crate::AgentHostError> {
+        let remote_bundle = self
+            .remote_revocation_bundle(handle_id, owner_user_id)
+            .await;
         let mut transaction = self
             .db
             .pool()
@@ -485,7 +888,7 @@ impl SqliteProtectedRuntimeStore {
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let result = sqlx::query(
             "UPDATE credential_handle
-             SET status = 'revoked', updated_at = ?
+             SET status = 'revoked', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ?",
         )
         .bind(now)
@@ -502,11 +905,349 @@ impl SqliteProtectedRuntimeStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
             .await
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        Ok(self.best_effort_remote_revocation(remote_bundle).await)
+    }
+
+    pub async fn revoke_credential_at_version(
+        &self,
+        handle_id: &str,
+        owner_user_id: &str,
+        expected_version: i64,
+        now: &str,
+    ) -> Result<CredentialRevocationOutcome, crate::AgentHostError> {
+        let remote_bundle = self
+            .remote_revocation_bundle(handle_id, owner_user_id)
+            .await;
+        let mut transaction = self
+            .db
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let result = sqlx::query(
+            "UPDATE credential_handle
+             SET status = 'revoked', version = version + 1, updated_at = ?
+             WHERE id = ? AND owner_user_id = ? AND version = ?",
+        )
+        .bind(now)
+        .bind(handle_id)
+        .bind(owner_user_id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        if result.rows_affected() == 0 {
+            return Err(crate::AgentHostError::VersionConflict);
+        }
+        sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
+            .bind(handle_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        Ok(self.best_effort_remote_revocation(remote_bundle).await)
+    }
+
+    async fn remote_revocation_bundle(
+        &self,
+        handle_id: &str,
+        owner_user_id: &str,
+    ) -> Option<OAuthCredentialBundle> {
+        let Ok(stored) = self.load_stored_credential(handle_id, owner_user_id).await else {
+            return None;
+        };
+        if stored.method != "oauth_bundle" || stored.provider != "gemini" {
+            return None;
+        }
+        serde_json::from_str::<OAuthCredentialBundle>(&stored.plaintext).ok()
+    }
+
+    async fn best_effort_remote_revocation(
+        &self,
+        bundle: Option<OAuthCredentialBundle>,
+    ) -> CredentialRevocationOutcome {
+        let Some(bundle) = bundle else {
+            return CredentialRevocationOutcome::NotSupported;
+        };
+        match self
+            .revocation_client
+            .post(self.gemini_revocation_endpoint.as_ref())
+            .form(&[("token", bundle.refresh_token)])
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                CredentialRevocationOutcome::Succeeded
+            }
+            _ => CredentialRevocationOutcome::Failed,
+        }
+    }
+}
+
+async fn mark_credential_dependents_unavailable(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    handle_id: &str,
+    now: &str,
+) -> Result<(), crate::AgentHostError> {
+    sqlx::query(
+        "UPDATE agent_connection_health
+         SET status = 'unavailable', error_code = 'credential_revoked', updated_at = ?
+         WHERE profile_id IN (
+             SELECT id FROM agent_profile WHERE credential_ref = ?
+         )",
+    )
+    .bind(now)
+    .bind(handle_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+    sqlx::query(
+        "UPDATE agent_session
+         SET status = 'degraded', connection_status = 'unavailable',
+             version = version + 1, updated_at = ?
+         WHERE profile_id IN (
+             SELECT id FROM agent_profile WHERE credential_ref = ?
+         ) AND status NOT IN ('replaced', 'terminated')",
+    )
+    .bind(now)
+    .bind(handle_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RefreshTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    expires_in: u64,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+impl SqliteProviderCredentialSource {
+    fn ensure_active(
+        cancel: &agent_runtime::core::cancel::Cancellation,
+        deadline: Deadline,
+    ) -> Result<(), ProviderCredentialError> {
+        if cancel.is_cancelled() {
+            return Err(ProviderCredentialError::Cancelled);
+        }
+        if deadline.is_expired(&SystemClock) {
+            return Err(ProviderCredentialError::Timeout);
+        }
         Ok(())
+    }
+
+    async fn refresh(
+        &self,
+        cancel: &agent_runtime::core::cancel::Cancellation,
+        deadline: Deadline,
+    ) -> Result<(OAuthCredentialBundle, i64), ProviderCredentialError> {
+        Self::ensure_active(cancel, deadline)?;
+        let current = self
+            .store
+            .load_stored_credential(&self.handle_id, &self.owner_user_id)
+            .await?;
+        let mut bundle: OAuthCredentialBundle = serde_json::from_str(&current.plaintext)
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let now_ms = SystemClock.now().as_millis();
+        if bundle.expires_at_ms > now_ms.saturating_add(OAUTH_REFRESH_SKEW_MS) {
+            return Ok((bundle, current.version));
+        }
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_owned()),
+            ("refresh_token", bundle.refresh_token.clone()),
+            ("client_id", bundle.client_id.clone()),
+        ];
+        if let Some(client_secret) = bundle.client_secret.clone() {
+            form.push(("client_secret", client_secret));
+        }
+        let request = self.client.post(&bundle.token_endpoint).form(&form);
+        let remaining = deadline
+            .remaining_millis(&SystemClock)
+            .unwrap_or(30_000)
+            .max(1);
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ProviderCredentialError::Cancelled),
+            result = tokio::time::timeout(
+                std::time::Duration::from_millis(remaining),
+                request.send(),
+            ) => result
+                .map_err(|_| ProviderCredentialError::Timeout)?
+                .map_err(|_| ProviderCredentialError::RefreshFailed)?,
+        };
+        if !response.status().is_success() {
+            if matches!(response.status().as_u16(), 400 | 401 | 403) {
+                self.store
+                    .mark_credential_invalid(&self.handle_id, &self.owner_user_id, current.version)
+                    .await;
+            }
+            return Err(ProviderCredentialError::RefreshFailed);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES as u64)
+        {
+            return Err(ProviderCredentialError::RefreshFailed);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        if body.len() > MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES {
+            return Err(ProviderCredentialError::RefreshFailed);
+        }
+        let refreshed: RefreshTokenResponse =
+            serde_json::from_slice(&body).map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        if refreshed.access_token.trim().is_empty() || refreshed.expires_in == 0 {
+            return Err(ProviderCredentialError::RefreshFailed);
+        }
+        bundle.access_token = refreshed.access_token;
+        if let Some(refresh_token) = refreshed.refresh_token {
+            bundle.refresh_token = refresh_token;
+        }
+        bundle.expires_at_ms = SystemClock
+            .now()
+            .as_millis()
+            .saturating_add(refreshed.expires_in.saturating_mul(1000));
+        if let Some(scope) = refreshed.scope {
+            bundle.scopes = scope.split_whitespace().map(str::to_owned).collect();
+        }
+        let version = self
+            .store
+            .rotate_oauth_bundle(
+                &self.handle_id,
+                &self.owner_user_id,
+                current.version,
+                &bundle,
+            )
+            .await?;
+        Ok((bundle, version))
+    }
+
+    fn lease(
+        stored: StoredCredential,
+        minimum_validity_ms: u64,
+    ) -> Result<ProviderCredentialLease, ProviderCredentialError> {
+        let revision = ProviderCredentialRevision::new(format!("credential-v{}", stored.version))?;
+        if stored.method == "api_key" {
+            return Ok(ProviderCredentialLease::non_expiring(
+                Secret::new(stored.plaintext),
+                revision,
+            ));
+        }
+        let bundle: OAuthCredentialBundle = serde_json::from_str(&stored.plaintext)
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        if bundle.expires_at_ms
+            <= SystemClock
+                .now()
+                .as_millis()
+                .saturating_add(minimum_validity_ms)
+        {
+            return Err(ProviderCredentialError::InvalidLease);
+        }
+        let lease = ProviderCredentialLease::expiring(
+            Secret::new(bundle.access_token),
+            Timestamp(bundle.expires_at_ms),
+            revision,
+        );
+        Ok(match bundle.provider_account_id {
+            Some(account) => lease.with_account(account),
+            None => lease,
+        })
+    }
+}
+
+#[async_trait]
+impl ProviderCredentialSource for SqliteProviderCredentialSource {
+    async fn acquire(
+        &self,
+        target: &ProviderCredentialTarget,
+        minimum_validity_ms: u64,
+        cancel: &agent_runtime::core::cancel::Cancellation,
+        deadline: Deadline,
+    ) -> Result<ProviderCredentialLease, ProviderCredentialError> {
+        Self::ensure_active(cancel, deadline)?;
+        if target.as_str() != self.handle_id {
+            return Err(ProviderCredentialError::Unavailable);
+        }
+        let stored = self
+            .store
+            .load_stored_credential(&self.handle_id, &self.owner_user_id)
+            .await?;
+        if stored.method == "api_key" {
+            return Self::lease(stored, minimum_validity_ms);
+        }
+        let bundle: OAuthCredentialBundle = serde_json::from_str(&stored.plaintext)
+            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        let now_ms = SystemClock.now().as_millis();
+        if bundle.expires_at_ms > now_ms.saturating_add(minimum_validity_ms) {
+            return Self::lease(stored, minimum_validity_ms);
+        }
+        let _guard = self.refresh_lock.lock().await;
+        let (bundle, version) = self.refresh(cancel, deadline).await?;
+        Self::lease(
+            StoredCredential {
+                provider: stored.provider,
+                method: "oauth_bundle".to_owned(),
+                version,
+                plaintext: serde_json::to_string(&bundle)
+                    .map_err(|_| ProviderCredentialError::RefreshFailed)?,
+            },
+            minimum_validity_ms,
+        )
+    }
+
+    async fn invalidate(
+        &self,
+        target: &ProviderCredentialTarget,
+        rejected_revision: &ProviderCredentialRevision,
+        _rejection: ProviderAuthRejection,
+        cancel: &agent_runtime::core::cancel::Cancellation,
+        deadline: Deadline,
+    ) -> Result<CredentialInvalidation, ProviderCredentialError> {
+        Self::ensure_active(cancel, deadline)?;
+        if target.as_str() != self.handle_id {
+            return Err(ProviderCredentialError::Unavailable);
+        }
+        let stored = self
+            .store
+            .load_stored_credential(&self.handle_id, &self.owner_user_id)
+            .await?;
+        let current = ProviderCredentialRevision::new(format!("credential-v{}", stored.version))?;
+        if &current != rejected_revision {
+            return Ok(CredentialInvalidation::StaleRevision);
+        }
+        if stored.method == "api_key" {
+            return Ok(CredentialInvalidation::NoReplacement);
+        }
+        let _guard = self.refresh_lock.lock().await;
+        self.store
+            .rotate_oauth_bundle(
+                &self.handle_id,
+                &self.owner_user_id,
+                stored.version,
+                &OAuthCredentialBundle {
+                    expires_at_ms: 0,
+                    ..serde_json::from_str(&stored.plaintext)
+                        .map_err(|_| ProviderCredentialError::RefreshFailed)?
+                },
+            )
+            .await?;
+        self.refresh(cancel, deadline).await?;
+        Ok(CredentialInvalidation::ReplacementPossible)
     }
 }
 
@@ -754,6 +1495,302 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_store() -> (SqliteProtectedRuntimeStore, Arc<SqliteDb>) {
+        use db::{User, UserRepo};
+
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        UserRepo::create_user(
+            &*db,
+            &User {
+                id: "credential-owner".to_owned(),
+                email: "credential-owner@example.com".to_owned(),
+                password_hash: "hash".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("owner creates");
+        (
+            SqliteProtectedRuntimeStore::new(Arc::clone(&db), [7_u8; 32], 1),
+            db,
+        )
+    }
+
+    #[test]
+    fn oauth_bundle_debug_redacts_token_material() {
+        let bundle = OAuthCredentialBundle {
+            schema_version: 1,
+            access_token: "sensitive-access".to_owned(),
+            refresh_token: "sensitive-refresh".to_owned(),
+            expires_at_ms: 42,
+            token_endpoint: "https://example.com/token".to_owned(),
+            client_id: "public-client".to_owned(),
+            client_secret: Some("sensitive-client-secret".to_owned()),
+            scopes: vec!["openid".to_owned()],
+            provider_account_id: Some("account".to_owned()),
+        };
+        let debug = format!("{bundle:?}");
+        assert!(!debug.contains("sensitive-access"));
+        assert!(!debug.contains("sensitive-refresh"));
+        assert!(!debug.contains("sensitive-client-secret"));
+    }
+
+    #[tokio::test]
+    async fn renewable_bundle_is_acquired_through_runtime_credential_contract() {
+        let (store, db) = test_store().await;
+        let now = db::now_rfc3339();
+        store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: "oauth-handle",
+                owner_user_id: "credential-owner",
+                provider: "xai",
+                label: "xAI login",
+                bundle: &OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "short-lived-access".to_owned(),
+                    refresh_token: "renewable-refresh".to_owned(),
+                    expires_at_ms: SystemClock.now().as_millis().saturating_add(60_000),
+                    token_endpoint: "https://auth.x.ai/token".to_owned(),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec!["openid".to_owned()],
+                    provider_account_id: None,
+                },
+                metadata_json: "{}",
+                now: &now,
+            })
+            .await
+            .expect("bundle stores");
+        let secret = store
+            .acquire_provider_credential("credential-owner", "oauth-handle", 30_000)
+            .await
+            .expect("lease acquires");
+        assert_eq!(secret.expose(), "short-lived-access");
+        let ciphertext: Vec<u8> = sqlx::query_scalar(
+            "SELECT ciphertext FROM protected_credential_secret WHERE handle_id = 'oauth-handle'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("ciphertext reads");
+        assert!(!String::from_utf8_lossy(&ciphertext).contains("short-lived-access"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_expired_leases_single_flight_and_rotate_tokens_atomically() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider binds");
+        let address = listener.local_addr().expect("mock address exists");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&request_count);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("refresh request arrives");
+            server_count.fetch_add(1, Ordering::SeqCst);
+            let mut request = vec![0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("request reads");
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600,"scope":"openid profile"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response writes");
+        });
+
+        let (store, _) = test_store().await;
+        let now = db::now_rfc3339();
+        store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: "refresh-handle",
+                owner_user_id: "credential-owner",
+                provider: "xai",
+                label: "xAI login",
+                bundle: &OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "expired-access".to_owned(),
+                    refresh_token: "initial-refresh".to_owned(),
+                    expires_at_ms: 0,
+                    token_endpoint: format!("http://{address}/token"),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec!["openid".to_owned()],
+                    provider_account_id: None,
+                },
+                metadata_json: "{}",
+                now: &now,
+            })
+            .await
+            .expect("expired bundle stores");
+        let source = store.credential_source("credential-owner", "refresh-handle");
+        let target = ProviderCredentialTarget::new("refresh-handle").expect("target is valid");
+        let cancel = agent_runtime::core::cancel::Cancellation::new();
+        let deadline = Deadline::after(&SystemClock, 5_000);
+        let (first, second) = tokio::join!(
+            source.acquire(&target, 30_000, &cancel, deadline),
+            source.acquire(&target, 30_000, &cancel, deadline),
+        );
+        let first = first.expect("first lease refreshes");
+        let second = second.expect("second lease reuses refresh");
+        assert_eq!(first.secret().expose(), "rotated-access");
+        assert_eq!(second.secret().expose(), "rotated-access");
+        server.await.expect("mock provider completes");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        let stored = store
+            .load_stored_credential("refresh-handle", "credential-owner")
+            .await
+            .expect("rotated bundle loads");
+        let bundle: OAuthCredentialBundle =
+            serde_json::from_str(&stored.plaintext).expect("bundle decodes");
+        assert_eq!(stored.version, 2);
+        assert_eq!(bundle.refresh_token, "rotated-refresh");
+        assert_eq!(bundle.scopes, vec!["openid", "profile"]);
+    }
+
+    #[tokio::test]
+    async fn stale_disconnect_preserves_the_current_credential() {
+        let (store, db) = test_store().await;
+        let now = db::now_rfc3339();
+        store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: "disconnect-handle",
+                owner_user_id: "credential-owner",
+                provider: "xai",
+                label: "xAI login",
+                bundle: &OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "access".to_owned(),
+                    refresh_token: "refresh".to_owned(),
+                    expires_at_ms: SystemClock.now().as_millis().saturating_add(60_000),
+                    token_endpoint: "https://auth.x.ai/token".to_owned(),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec![],
+                    provider_account_id: None,
+                },
+                metadata_json: "{}",
+                now: &now,
+            })
+            .await
+            .expect("bundle stores");
+        assert!(matches!(
+            store
+                .revoke_credential_at_version("disconnect-handle", "credential-owner", 0, &now,)
+                .await,
+            Err(crate::AgentHostError::VersionConflict)
+        ));
+        let preserved = store
+            .load_stored_credential("disconnect-handle", "credential-owner")
+            .await
+            .expect("stale disconnect preserves secret");
+        assert_eq!(preserved.version, 1);
+        let preserved_bundle: OAuthCredentialBundle =
+            serde_json::from_str(&preserved.plaintext).expect("preserved bundle decodes");
+        assert_eq!(preserved_bundle.access_token, "access");
+        store
+            .revoke_credential_at_version("disconnect-handle", "credential-owner", 1, &now)
+            .await
+            .expect("current disconnect succeeds");
+        assert!(matches!(
+            store
+                .load_credential("disconnect-handle", "credential-owner")
+                .await,
+            Err(crate::AgentHostError::CredentialNotFound)
+        ));
+        let (status, version): (String, i64) = sqlx::query_as(
+            "SELECT status, version FROM credential_handle WHERE id = 'disconnect-handle'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("handle remains as safe metadata");
+        assert_eq!(status, "revoked");
+        assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn provider_revocation_failure_never_rolls_back_local_disconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock revocation provider binds");
+        let address = listener.local_addr().expect("mock address exists");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("revocation request arrives");
+            let mut request = vec![0_u8; 4096];
+            let size = stream.read(&mut request).await.expect("request reads");
+            assert!(String::from_utf8_lossy(&request[..size]).contains("token=refresh"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("failure response writes");
+        });
+
+        let (mut store, db) = test_store().await;
+        store.gemini_revocation_endpoint = Arc::from(format!("http://{address}/revoke"));
+        let now = db::now_rfc3339();
+        store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: "gemini-disconnect-handle",
+                owner_user_id: "credential-owner",
+                provider: "gemini",
+                label: "Google login",
+                bundle: &OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "access".to_owned(),
+                    refresh_token: "refresh".to_owned(),
+                    expires_at_ms: SystemClock.now().as_millis().saturating_add(60_000),
+                    token_endpoint: "https://oauth2.googleapis.com/token".to_owned(),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec![],
+                    provider_account_id: None,
+                },
+                metadata_json: "{}",
+                now: &now,
+            })
+            .await
+            .expect("bundle stores");
+
+        let outcome = store
+            .revoke_credential_at_version("gemini-disconnect-handle", "credential-owner", 1, &now)
+            .await
+            .expect("local disconnect commits");
+        assert_eq!(outcome, CredentialRevocationOutcome::Failed);
+        server.await.expect("mock provider completes");
+
+        assert!(matches!(
+            store
+                .load_credential("gemini-disconnect-handle", "credential-owner")
+                .await,
+            Err(crate::AgentHostError::CredentialNotFound)
+        ));
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM credential_handle WHERE id = 'gemini-disconnect-handle'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("revoked metadata remains");
+        assert_eq!(status, "revoked");
+    }
 
     #[test]
     fn effective_permission_intersection_fails_closed() {

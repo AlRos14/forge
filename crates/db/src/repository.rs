@@ -95,6 +95,11 @@ pub trait AgentRepo: Send + Sync {
 #[async_trait]
 pub trait AgentProfileRepo: Send + Sync {
     async fn create_profile(&self, input: CreateAgentProfile) -> Result<AgentProfile>;
+    async fn create_and_select_profile(
+        &self,
+        profile: CreateAgentProfile,
+        selection: SelectAgentProfile,
+    ) -> Result<(AgentProfile, Agent)>;
     async fn get_profile(&self, id: &str) -> Result<Option<AgentProfile>>;
     async fn list_profiles(&self, identity_id: &str) -> Result<Vec<AgentProfile>>;
     async fn select_profile(&self, input: SelectAgentProfile) -> Result<Agent>;
@@ -104,12 +109,44 @@ pub trait AgentProfileRepo: Send + Sync {
 pub trait CredentialHandleRepo: Send + Sync {
     async fn get_credential_handle(&self, id: &str) -> Result<Option<CredentialHandle>>;
     async fn list_credential_handles(&self, owner_user_id: &str) -> Result<Vec<CredentialHandle>>;
+    async fn rename_credential_handle(
+        &self,
+        id: &str,
+        owner_user_id: &str,
+        label: &str,
+        expected_version: i64,
+        updated_at: &str,
+    ) -> Result<CredentialHandle>;
+    /// Agents whose active profile references each of the owner's provider
+    /// entries, with the identity's most recent session activity.
+    async fn list_credential_usage(&self, owner_user_id: &str) -> Result<Vec<CredentialUsage>>;
     async fn revoke_credential_handle(
         &self,
         id: &str,
         owner_user_id: &str,
         updated_at: &str,
     ) -> Result<CredentialHandle>;
+}
+
+#[async_trait]
+pub trait ProviderAuthorizationRepo: Send + Sync {
+    async fn create_provider_authorization(
+        &self,
+        input: CreateProviderAuthorizationOperation,
+    ) -> Result<ProviderAuthorizationOperation>;
+    async fn get_provider_authorization(
+        &self,
+        id: &str,
+        owner_user_id: &str,
+    ) -> Result<Option<ProviderAuthorizationOperation>>;
+    async fn get_provider_authorization_by_state_hash(
+        &self,
+        callback_state_hash: &str,
+    ) -> Result<Option<ProviderAuthorizationOperation>>;
+    async fn update_provider_authorization(
+        &self,
+        input: UpdateProviderAuthorizationOperation,
+    ) -> Result<ProviderAuthorizationOperation>;
 }
 
 #[async_trait]
@@ -1009,6 +1046,12 @@ pub trait ProjectRepo: Send + Sync {
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
     async fn update(&self, input: UpdateProject) -> Result<Project>;
+    async fn update_at_version(
+        &self,
+        input: UpdateProject,
+        expected_version: i64,
+        project_hooks_json: Option<String>,
+    ) -> Result<Project>;
     async fn set_project_hooks_json(
         &self,
         id: &str,
@@ -1283,6 +1326,7 @@ pub struct CreateAgent {
     pub prompt_template: Option<String>,
     pub capabilities_json: String,
     pub config_json: String,
+    pub credential_ref: Option<String>,
     pub daemon_id: Option<String>,
     pub max_concurrent_tasks: i64,
     pub heartbeat_interval_seconds: i64,

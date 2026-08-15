@@ -6,6 +6,97 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Agent navigation is consolidated around one canonical `/agents` settings
+  surface. `/agents/federated`, the legacy `/agents/new` and per-agent UI
+  routes, and the Project-local `project-agent` settings tab are removed
+  without aliases. Main Chat now sits directly below the Project switcher, and
+  each Project's former Chat entry is now an Agent Workspace with a scoped
+  Project-record editing rail.
+- `PATCH /api/v1/projects/{id}` now requires the current Project `version` and
+  increments it on success; stale edits return HTTP 409. This prevents the
+  Project Agent Workspace and Project Settings from silently overwriting each
+  other.
+- Credential handle responses now include `credential_method` and `version`,
+  and disconnect requires that version and returns a redacted provider
+  revocation outcome. Migration V078 classifies every existing protected
+  credential as `api_key` while adding encrypted renewable OAuth bundles and
+  finite provider authorization operations.
+- Provider entries are now separate from agents. The single-shot
+  `POST /api/v1/embedded-agents/connect` contract (credential + model + agent
+  in one call) is removed. Connecting stores a provider entry only:
+  `POST /api/v1/providers` for API keys, or a provider authorization operation
+  for OAuth (its response no longer contains `profile_id`, and
+  `StartProviderAuthorizationRequest` loses its identity/model fields). Agents
+  are created afterwards referencing the entry: `POST /api/v1/embedded-agents`
+  (`credential_id` + `model`) for the direct runtime, or `POST /api/v1/agents`
+  with the new optional `credential_id` for a CLI harness with dispatch-time
+  key injection. `GET /api/v1/agent-providers` moved to
+  `GET /api/v1/providers/catalog` and each credential method now declares a
+  `runtimes` compatibility matrix; `GET/DELETE /api/v1/credentials*` moved to
+  `GET/PATCH/DELETE /api/v1/providers*` with usage data and dependent-agent
+  reporting. `forge-ctl embedded connect` became `forge-ctl embedded create`
+  (`--credential-id`), and `forge-ctl embedded credential` became
+  `forge-ctl embedded provider` with `add`/`rename` support. The web Agent
+  Settings surface is reorganized into `Providers` and `Agents` tabs with a
+  three-step agent-creation wizard.
+
+### Added
+
+- `forge-ctl embedded provider login` signs in to a provider with OAuth from the
+  machine the browser runs on. It binds the provider's localhost callback
+  locally and relays only the authorization code to Forge, so browser login
+  works against a remote server; the PKCE verifier and the tokens never leave
+  the server. `--method device` prints a code instead.
+
+### Fixed
+
+- Browser OAuth used the requesting web origin as the OAuth `redirect_uri`,
+  which OpenAI's Codex client never accepts — it whitelists only
+  `http://localhost:1455/auth/callback` (or `:1457`). Forge now issues that
+  loopback callback and, when the browser is on the server's machine, binds the
+  port itself for the length of the ceremony. `StartProviderAuthorizationRequest`
+  gained `loopback_owner` (`server`/`client`, default `server`) and
+  `loopback_port` so a client that already owns the socket can say so. Browser
+  login from a non-loopback origin is now rejected up front with guidance
+  instead of failing at the provider. Gemini keeps its operator-registered
+  Forge callback route.
+- Device-code logins (OpenAI, xAI) no longer require the caller's origin to be
+  in `server.cors_origins`. They never redirect a browser, so the trusted-origin
+  check applied only to browser OAuth; previously any origin outside
+  `cors_origins` failed with `redirect_origin is not a configured trusted
+  origin`.
+- The ChatGPT authorization URL now sends `id_token_add_organizations=true` and
+  `originator`, and no longer sends Google's `access_type`/`prompt` parameters.
+
+- Server-owned provider capability discovery and guided authorization through
+  `GET /api/v1/agent-providers` and short-lived
+  `/api/v1/provider-authorizations` operations. Forge supports stable API keys,
+  experimental ChatGPT browser/device login, experimental xAI device login,
+  and configured Google OAuth for the documented Gemini API without importing
+  provider CLI credential caches.
+- Native OpenAI Responses, xAI Responses, and Gemini Interactions adapters now
+  acquire renewable credentials through Agent Runtime's host-injected lease
+  contract. Refresh is single-flight, encrypted token rotation is atomic, and
+  Main/Project Agent sessions remain deny-all for filesystem access.
+- `POST /api/v1/providers/{id}/test` runs a live connection test against a
+  provider entry's API (one minimal authenticated request; refresh-aware for
+  OAuth bundles) and returns `status`, `latency_ms`, a redacted `message`, and
+  `checked_at`. Secrets and provider response bodies are never echoed.
+- Adding a provider is now a four-step wizard (choose provider → choose
+  authentication method → connect → verify). The verify step auto-runs the
+  connection test, and every provider entry card gained a `Test connection`
+  action.
+
+### Changed
+
+- Agent Settings is now three tabs: `Providers`, `Agents` (roster only), and
+  `Bindings` (Main Agent binding, optional Project Agent binding, and the
+  chat-scope list). Project deep links (`?project=`) open the Bindings tab and
+  `?tab=` deep-links any tab. When the server is unreachable, each tab shows a
+  single retryable error panel instead of one per section.
+
 ## [0.7.4] - 2026-08-14
 
 ### Breaking

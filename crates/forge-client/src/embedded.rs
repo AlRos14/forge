@@ -4,15 +4,17 @@ use anyhow::{bail, Context, Result};
 use api_types::{
     AgentChatDetailResponse, AgentChatListQuery, AgentChatListResponse,
     AgentChatMessageListResponse, AgentChatMessagesQuery, AgentHandoffResponse,
-    AgentProfileResponse, AgentResponse, AgentSessionResponse, CanonicalScopeRequest,
-    CommitmentEvidenceResponse, CommitmentResponse, CompleteCommitmentRequest,
-    ConnectEmbeddedAgentRequest, ConnectEmbeddedProfileRequest, ConnectedEmbeddedAgentResponse,
+    AgentProfileResponse, AgentProviderId, AgentResponse, AgentSessionResponse,
+    CanonicalScopeRequest, CommitmentEvidenceResponse, CommitmentResponse,
+    CompleteCommitmentRequest, ConnectEmbeddedProfileRequest, ConnectedEmbeddedAgentResponse,
     ConnectedEmbeddedProfileResponse, ContextManifestListResponse, ContextManifestResponse,
     CreateAgentHandoffRequest, CreateAgentSessionRequest, CreateCommitmentRequest,
-    CredentialHandleResponse, EffectivePermissionsResponse, MainAgentBindingResponse,
-    ProjectAgentBindingResponse, SendAgentChatMessageRequest, SendAgentChatMessageResponse,
-    SessionVersionRequest, SetMainAgentBindingRequest, SetProjectAgentBindingRequest,
-    SteerAgentSessionRequest, TransferCommitmentRequest, UpdateCommitmentRequest,
+    CreateEmbeddedAgentRequest, CreateProviderEntryRequest, DisconnectCredentialResponse,
+    EffectivePermissionsResponse, MainAgentBindingResponse, ProjectAgentBindingResponse,
+    ProviderEntriesResponse, ProviderEntryResponse, RenameProviderEntryRequest,
+    SendAgentChatMessageRequest, SendAgentChatMessageResponse, SessionVersionRequest,
+    SetMainAgentBindingRequest, SetProjectAgentBindingRequest, SteerAgentSessionRequest,
+    TransferCommitmentRequest, UpdateCommitmentRequest,
 };
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -22,7 +24,7 @@ use crate::{
     client::ForgeClient,
     output::print_json,
     password_prompt::{prompt_password, stdin_is_terminal},
-    OutputFormat,
+    provider_login, OutputFormat,
 };
 
 #[derive(Args)]
@@ -33,8 +35,8 @@ pub struct EmbeddedArgs {
 
 #[derive(Subcommand)]
 enum EmbeddedCommand {
-    /// Connect a new account-owned embedded identity and native profile.
-    Connect(ConnectArgs),
+    /// Create a direct (embedded-runtime) agent from an existing provider entry.
+    Create(ConnectArgs),
     /// Inspect or replace immutable executable profiles.
     Profile(ProfileArgs),
     /// Create, inspect, and explicitly control canonical sessions.
@@ -51,25 +53,19 @@ enum EmbeddedCommand {
     Context(ContextArgs),
     /// Inspect and administer durable identity-owned commitments.
     Commitment(CommitmentArgs),
-    /// List or revoke opaque protected credential handles.
-    Credential(CredentialArgs),
+    /// List, add, rename, or remove account provider entries.
+    Provider(ProviderArgs),
 }
 
 #[derive(Args)]
 struct ConnectArgs {
     #[arg(long)]
     name: String,
-    #[arg(long, default_value = "openai")]
-    provider: String,
+    /// Provider entry (credential handle) that powers this agent.
     #[arg(long)]
-    base_url: String,
+    credential_id: String,
     #[arg(long)]
     model: String,
-    #[arg(long, default_value = "default")]
-    credential_label: String,
-    /// Read the credential from stdin. Without this flag a terminal prompt is used.
-    #[arg(long)]
-    credential_stdin: bool,
     #[arg(long)]
     description: Option<String>,
     #[arg(long)]
@@ -109,16 +105,11 @@ struct ProfileConnectArgs {
     identity_id: String,
     #[arg(long)]
     version: i64,
-    #[arg(long, default_value = "openai")]
-    provider: String,
+    /// Provider entry (credential handle) that powers the new profile.
     #[arg(long)]
-    base_url: String,
+    credential_id: String,
     #[arg(long)]
     model: String,
-    #[arg(long, default_value = "default")]
-    credential_label: String,
-    #[arg(long)]
-    credential_stdin: bool,
     #[arg(long)]
     system_prompt: Option<String>,
     #[arg(long)]
@@ -337,15 +328,91 @@ struct HandoffCreateArgs {
 }
 
 #[derive(Args)]
-struct CredentialArgs {
+struct ProviderArgs {
     #[command(subcommand)]
-    command: CredentialCommand,
+    command: ProviderCommand,
 }
 
 #[derive(Subcommand)]
-enum CredentialCommand {
+enum ProviderCommand {
+    /// List configured provider entries and discovered CLI runtimes.
     List,
-    Revoke { id: String },
+    /// Add an API-key provider entry. OAuth entries come from `login`.
+    Add(ProviderAddArgs),
+    /// Sign in to a provider with OAuth from this machine. Use this when Forge
+    /// runs on another host: the browser callback is bound here and only the
+    /// authorization code is relayed to the server.
+    Login(ProviderLoginArgs),
+    /// Rename a provider entry.
+    Rename {
+        id: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        version: i64,
+    },
+    /// Disconnect a provider entry; referencing agents become visibly unhealthy.
+    Remove {
+        id: String,
+        #[arg(long)]
+        version: i64,
+    },
+}
+
+#[derive(Args)]
+struct ProviderAddArgs {
+    #[arg(long, value_enum)]
+    provider: ProviderKind,
+    #[arg(long, default_value = "default")]
+    label: String,
+    /// Read the API key from stdin. Without this flag a terminal prompt is used.
+    #[arg(long)]
+    credential_stdin: bool,
+    /// Required for openai-compatible; defaults to the provider endpoint otherwise.
+    #[arg(long)]
+    base_url: Option<String>,
+}
+
+#[derive(Args)]
+struct ProviderLoginArgs {
+    #[arg(long, value_enum)]
+    provider: ProviderKind,
+    #[arg(long, default_value = "default")]
+    label: String,
+    /// `browser` runs the localhost-callback ceremony from this machine;
+    /// `device` prints a code to enter on another device.
+    #[arg(long, value_enum, default_value = "browser")]
+    method: ProviderLoginMethod,
+    /// Print the authorization URL without launching a browser.
+    #[arg(long)]
+    no_open: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProviderLoginMethod {
+    Browser,
+    Device,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum ProviderKind {
+    Openai,
+    Xai,
+    Gemini,
+    Openrouter,
+    OpenaiCompatible,
+}
+
+impl From<ProviderKind> for AgentProviderId {
+    fn from(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Openai => AgentProviderId::OpenAi,
+            ProviderKind::Xai => AgentProviderId::XAi,
+            ProviderKind::Gemini => AgentProviderId::Gemini,
+            ProviderKind::Openrouter => AgentProviderId::OpenRouter,
+            ProviderKind::OpenaiCompatible => AgentProviderId::OpenAiCompatible,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -513,7 +580,7 @@ struct CommitmentCancelArgs {
 impl EmbeddedArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
         match &self.command {
-            EmbeddedCommand::Connect(args) => connect(client, output, args).await,
+            EmbeddedCommand::Create(args) => connect(client, output, args).await,
             EmbeddedCommand::Profile(args) => profile(client, output, args).await,
             EmbeddedCommand::Session(args) => session(client, output, args).await,
             EmbeddedCommand::Main(args) => main_binding(client, output, args).await,
@@ -522,20 +589,17 @@ impl EmbeddedArgs {
             EmbeddedCommand::Handoff(args) => handoff(client, output, args).await,
             EmbeddedCommand::Context(args) => context(client, output, args).await,
             EmbeddedCommand::Commitment(args) => commitment(client, output, args).await,
-            EmbeddedCommand::Credential(args) => credential(client, output, args).await,
+            EmbeddedCommand::Provider(args) => provider(client, output, args).await,
         }
     }
 }
 
 async fn connect(client: &ForgeClient, output: &OutputFormat, args: &ConnectArgs) -> Result<()> {
-    let request = ConnectEmbeddedAgentRequest {
+    let request = CreateEmbeddedAgentRequest {
         name: args.name.clone(),
         description: args.description.clone(),
-        provider: args.provider.clone(),
-        base_url: args.base_url.clone(),
+        credential_id: args.credential_id.clone(),
         model: args.model.clone(),
-        credential_label: args.credential_label.clone(),
-        credential: read_credential(args.credential_stdin)?,
         system_prompt: args.system_prompt.clone(),
         account_permission_ceiling: None,
         tool_policy: args.tool_policy.as_deref().map(parse_json).transpose()?,
@@ -543,9 +607,8 @@ async fn connect(client: &ForgeClient, output: &OutputFormat, args: &ConnectArgs
         max_input_tokens: args.max_input_tokens,
         max_output_tokens: args.max_output_tokens,
     };
-    let response: ConnectedEmbeddedAgentResponse = client
-        .post("/api/v1/embedded-agents/connect", &request)
-        .await?;
+    let response: ConnectedEmbeddedAgentResponse =
+        client.post("/api/v1/embedded-agents", &request).await?;
     print_result(output, &response)
 }
 
@@ -560,11 +623,8 @@ async fn profile(client: &ForgeClient, output: &OutputFormat, args: &ProfileArgs
         ProfileCommand::Connect(args) => {
             let request = ConnectEmbeddedProfileRequest {
                 version: args.version,
-                provider: args.provider.clone(),
-                base_url: args.base_url.clone(),
+                credential_id: args.credential_id.clone(),
                 model: args.model.clone(),
-                credential_label: args.credential_label.clone(),
-                credential: read_credential(args.credential_stdin)?,
                 system_prompt: args.system_prompt.clone(),
                 permission_policy: args.permission_policy.clone(),
                 tool_policy: args.tool_policy.as_deref().map(parse_json).transpose()?,
@@ -848,18 +908,55 @@ async fn handoff(client: &ForgeClient, output: &OutputFormat, args: &HandoffArgs
     }
 }
 
-async fn credential(
-    client: &ForgeClient,
-    output: &OutputFormat,
-    args: &CredentialArgs,
-) -> Result<()> {
+async fn provider(client: &ForgeClient, output: &OutputFormat, args: &ProviderArgs) -> Result<()> {
     match &args.command {
-        CredentialCommand::List => {
-            let response: Vec<CredentialHandleResponse> = client.get("/api/v1/credentials").await?;
+        ProviderCommand::List => {
+            let response: ProviderEntriesResponse = client.get("/api/v1/providers").await?;
             print_result(output, &response)
         }
-        CredentialCommand::Revoke { id } => {
-            client.delete(&format!("/api/v1/credentials/{id}")).await
+        ProviderCommand::Add(args) => {
+            let request = CreateProviderEntryRequest {
+                provider: args.provider.clone().into(),
+                label: args.label.clone(),
+                credential: read_credential(args.credential_stdin)?,
+                base_url: args.base_url.clone(),
+            };
+            let response: ProviderEntryResponse =
+                client.post("/api/v1/providers", &request).await?;
+            print_result(output, &response)
+        }
+        ProviderCommand::Login(args) => {
+            let provider = args.provider.clone().into();
+            let operation = match args.method {
+                ProviderLoginMethod::Browser => {
+                    provider_login::browser_login(client, provider, &args.label, args.no_open)
+                        .await?
+                }
+                ProviderLoginMethod::Device => {
+                    provider_login::device_login(client, provider, &args.label).await?
+                }
+            };
+            print_result(output, &operation)?;
+            match provider_login::failed_reason(&operation) {
+                Some(reason) => Err(anyhow::anyhow!(reason)),
+                None => Ok(()),
+            }
+        }
+        ProviderCommand::Rename { id, label, version } => {
+            let request = RenameProviderEntryRequest {
+                label: label.clone(),
+                version: *version,
+            };
+            let response: ProviderEntryResponse = client
+                .patch(&format!("/api/v1/providers/{id}"), &request)
+                .await?;
+            print_result(output, &response)
+        }
+        ProviderCommand::Remove { id, version } => {
+            let response: DisconnectCredentialResponse = client
+                .delete_json(&format!("/api/v1/providers/{id}?version={version}"))
+                .await?;
+            print_result(output, &response)
         }
     }
 }

@@ -19,7 +19,7 @@ describe('ChatSetupRequired', () => {
     )
     expect(
       screen.getByRole('link', { name: /Open Project Agent settings/ }).getAttribute('href'),
-    ).toBe('/projects/$projectId/settings/$tab')
+    ).toBe('/agents')
   })
 
   it('points Main setup to the binding screen without inventing an identity', () => {
@@ -28,6 +28,6 @@ describe('ChatSetupRequired', () => {
     expect(screen.getByRole('status').textContent).toContain('no Main Agent binding is configured')
     expect(
       screen.getByRole('link', { name: /Open Main Agent settings/ }).getAttribute('href'),
-    ).toBe('/agents/federated')
+    ).toBe('/agents')
   })
 })

@@ -295,8 +295,78 @@ pub struct CredentialHandle {
     pub provider: String,
     pub label: String,
     pub status: String,
+    pub credential_method: String,
+    pub metadata_json: String,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialUsage {
+    pub credential_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub runtime: String,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAuthorizationOperation {
+    pub id: String,
+    pub owner_user_id: String,
+    pub provider: String,
+    pub method: String,
+    pub status: String,
+    pub authorization_url: Option<String>,
+    pub user_code: Option<String>,
+    pub redirect_origin: String,
+    pub callback_state_hash: Option<String>,
+    pub request_json: String,
+    pub poll_interval_seconds: i64,
+    pub expires_at: String,
+    pub profile_id: Option<String>,
+    pub credential_handle_id: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProviderAuthorizationOperation {
+    pub id: String,
+    pub owner_user_id: String,
+    pub provider: String,
+    pub method: String,
+    pub status: String,
+    pub authorization_url: Option<String>,
+    pub user_code: Option<String>,
+    pub redirect_origin: String,
+    pub callback_state_hash: Option<String>,
+    pub request_json: String,
+    pub poll_interval_seconds: i64,
+    pub expires_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateProviderAuthorizationOperation {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: String,
+    pub authorization_url: Option<String>,
+    pub user_code: Option<String>,
+    pub poll_interval_seconds: i64,
+    pub profile_id: Option<String>,
+    pub credential_handle_id: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

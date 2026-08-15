@@ -2,32 +2,47 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '@/api/client'
 import {
   cancelAgentSessionTurn,
-  connectEmbeddedAgent,
+  cancelProviderAuthorization,
+  connectEmbeddedProfile,
   createAgentSession,
+  createEmbeddedAgent,
+  createProviderEntry,
   getEffectivePermissions,
   getContextManifest,
   getMainAgentBinding,
   getMissionControl,
+  getProviderAuthorization,
   listContextManifests,
   listAgentProfiles,
   listAgentSessions,
-  listCredentials,
   listFederatedAgents,
+  listAgentProviderCapabilities,
+  listProviders,
   getProjectAgentBinding,
-  revokeCredential,
+  registerHarnessAgent,
+  removeProviderEntry,
+  renameProviderEntry,
   rotateAgentSession,
   selectAgentProfile,
   setMainAgentBinding,
   setProjectAgentBinding,
   setAgentSessionStatus,
+  startProviderAuthorization,
   steerAgentSessionTurn,
 } from './api'
 import type {
-  ConnectEmbeddedAgentInput,
+  ConnectEmbeddedProfileInput,
   ContextManifestLookup,
   CreateAgentSessionInput,
+  CreateEmbeddedAgentInput,
   ProjectAgentBindingInput,
 } from './types'
+import type {
+  CancelProviderAuthorizationRequest,
+  CreateProviderEntryRequest,
+  RenameProviderEntryRequest,
+  StartProviderAuthorizationRequest,
+} from '@/types/generated'
 
 export const federationQueryKeys = {
   agents: ['federated-agents'] as const,
@@ -41,6 +56,8 @@ export const federationQueryKeys = {
   contextManifestDiscovery: (identityId: string, contextScopeId: string) =>
     ['context-manifests', 'discovery', identityId, contextScopeId] as const,
   projectAgent: (projectId: string) => ['projects', projectId, 'project-agent'] as const,
+  providers: ['agent-providers'] as const,
+  providerAuthorization: (id: string) => ['provider-authorizations', id] as const,
 } as const
 
 export function useFederatedAgentsQuery() {
@@ -69,10 +86,10 @@ export function useAgentSessionsQuery(identityId: string | undefined) {
   })
 }
 
-export function useConnectEmbeddedAgentMutation() {
+export function useCreateEmbeddedAgentMutation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (input: ConnectEmbeddedAgentInput) => connectEmbeddedAgent(input),
+    mutationFn: (input: CreateEmbeddedAgentInput) => createEmbeddedAgent(input),
     onSuccess: (connected) => {
       queryClient.setQueryData(
         federationQueryKeys.agents,
@@ -96,6 +113,26 @@ export function useConnectEmbeddedAgentMutation() {
         connected.session,
       ])
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+    },
+  })
+}
+
+export function useConnectEmbeddedProfileMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      identityId,
+      input,
+    }: {
+      identityId: string
+      input: ConnectEmbeddedProfileInput
+    }) => connectEmbeddedProfile(identityId, input),
+    onSuccess: (connected) => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({
+        queryKey: federationQueryKeys.profiles(connected.agent.id),
+      })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
     },
   })
 }
@@ -173,12 +210,84 @@ export function useSteerAgentSessionMutation(identityId: string) {
   })
 }
 
-export function useCredentialsQuery() {
+export function useRegisterHarnessAgentMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: Parameters<typeof registerHarnessAgent>[0]) => registerHarnessAgent(input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+    },
+  })
+}
+
+export function useProvidersQuery() {
   return useQuery({
     queryKey: federationQueryKeys.credentials,
-    queryFn: listCredentials,
+    queryFn: listProviders,
     staleTime: 15_000,
   })
+}
+
+export function useCreateProviderEntryMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: CreateProviderEntryRequest) => createProviderEntry(input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+    },
+  })
+}
+
+export function useRenameProviderEntryMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string; input: RenameProviderEntryRequest }) =>
+      renameProviderEntry(id, input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+    },
+  })
+}
+
+export function useAgentProviderCapabilitiesQuery() {
+  return useQuery({
+    queryKey: federationQueryKeys.providers,
+    queryFn: listAgentProviderCapabilities,
+    staleTime: 60_000,
+  })
+}
+
+export function useProviderAuthorizationQuery(id: string | undefined) {
+  return useQuery({
+    queryKey: federationQueryKeys.providerAuthorization(id ?? 'none'),
+    queryFn: () => getProviderAuthorization(id!),
+    enabled: Boolean(id),
+    refetchInterval: (query) => {
+      const state = query.state.data?.state
+      return state && ['succeeded', 'denied', 'expired', 'cancelled', 'failed'].includes(state)
+        ? false
+        : 1500
+    },
+  })
+}
+
+export function useStartProviderAuthorizationMutation() {
+  return useMutation({
+    mutationFn: (input: StartProviderAuthorizationRequest) => startProviderAuthorization(input),
+  })
+}
+
+export function useCancelProviderAuthorizationMutation() {
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string; input: CancelProviderAuthorizationRequest }) =>
+      cancelProviderAuthorization(id, input),
+  })
+}
+
+/** A 404 means "no binding yet" — an expected state, never worth retrying. */
+function retryUnlessMissing(failureCount: number, error: unknown): boolean {
+  return !(error instanceof ApiError && error.status === 404) && failureCount < 1
 }
 
 export function useMainAgentBindingQuery() {
@@ -186,6 +295,7 @@ export function useMainAgentBindingQuery() {
     queryKey: federationQueryKeys.mainAgent,
     queryFn: getMainAgentBinding,
     staleTime: 10_000,
+    retry: retryUnlessMissing,
   })
 }
 
@@ -201,12 +311,15 @@ export function useSetMainAgentBindingMutation() {
   })
 }
 
-export function useRevokeCredentialMutation() {
+export function useRemoveProviderEntryMutation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (handleId: string) => revokeCredential(handleId),
+    mutationFn: ({ handleId, version }: { handleId: string; version: number }) =>
+      removeProviderEntry(handleId, version),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
     },
   })
 }
@@ -268,6 +381,7 @@ export function useProjectAgentBindingQuery(projectId: string | undefined) {
     queryFn: () => getProjectAgentBinding(projectId!),
     enabled: Boolean(projectId),
     staleTime: 10_000,
+    retry: retryUnlessMissing,
   })
 }
 

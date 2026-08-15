@@ -534,6 +534,7 @@ async fn create_agent(client: &ForgeClient) -> AgentResponse {
                 heartbeat_interval_seconds: None,
                 max_missed_heartbeats: None,
                 is_default: None,
+                credential_id: None,
             },
         )
         .await

@@ -286,11 +286,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let first_execution = single_execution_for_task(&harness.app, &task.id).await;
     assert_eq!(first_execution.role.to_string(), "worker");
 
-    let review_task = poll_until_task_status(&harness.app, &task.id, "review".to_owned()).await;
-    assert!(
-        review_task.awaiting_human,
-        "autonomous review must pause for human approval without a reviewer role"
-    );
+    let review_task = poll_until_task_awaiting_human(&harness.app, &task.id).await;
 
     let approved: TaskResponse = json_request(
         &harness.app,
@@ -367,9 +363,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     )
     .await;
 
-    let ci_review =
-        poll_until_task_status(&harness.app, &ci_failure_task.id, "review".to_owned()).await;
-    assert!(ci_review.awaiting_human);
+    let ci_review = poll_until_task_awaiting_human(&harness.app, &ci_failure_task.id).await;
     let ci_approved: TaskResponse = json_request(
         &harness.app,
         Method::POST,
@@ -414,8 +408,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     .await;
     assert_eq!(claimed_second.status, "working".to_owned());
     let second_execution = single_execution_for_task(&harness.app, &second_task.id).await;
-    let second_review =
-        poll_until_task_status(&harness.app, &second_task.id, "review".to_owned()).await;
+    let second_review = poll_until_task_awaiting_human(&harness.app, &second_task.id).await;
 
     let rejected: TaskResponse = json_request(
         &harness.app,
@@ -767,6 +760,23 @@ async fn poll_until_task_status(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("task did not reach {expected_status:?} within timeout");
+}
+
+async fn poll_until_task_awaiting_human(app: &Router, task_id: &str) -> TaskResponse {
+    for _ in 0..100 {
+        let task: TaskResponse = empty_request(
+            app,
+            Method::GET,
+            &format!("/api/v1/tasks/{task_id}"),
+            StatusCode::OK,
+        )
+        .await;
+        if task.status == "review" && task.awaiting_human {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("task did not reach human review within timeout");
 }
 
 async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionResponse {

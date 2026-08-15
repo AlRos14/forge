@@ -968,6 +968,7 @@ export interface CreateProjectRequest {
 }
 
 export interface UpdateProjectRequest {
+  version: number
   name?: string
   primary_repo_id?: string | null
   settings?: Record<string, unknown> | null
@@ -1018,6 +1019,8 @@ export interface CreateAgentRequest {
   heartbeat_interval_seconds?: number
   max_missed_heartbeats?: number
   is_default?: boolean
+  /** Provider entry powering this harness agent (dispatch-time key injection). */
+  credential_id?: string | null
 }
 
 export interface UpdateAgentRequest {

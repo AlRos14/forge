@@ -40,7 +40,10 @@ pub use manifest::{
     RuntimeLosslessSummaryLink, RuntimeSummaryCoverageLink,
 };
 pub use native::NativeAgentRuntimeBackend;
-pub use protected_store::SqliteProtectedRuntimeStore;
+pub use protected_store::{
+    CreateOAuthCredential, CredentialRevocationOutcome, OAuthCredentialBundle,
+    SqliteProtectedRuntimeStore,
+};
 pub use typed_tools::{
     FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
@@ -142,7 +145,8 @@ pub struct NativeProviderConfig {
     pub provider: String,
     pub base_url: String,
     pub model: String,
-    pub credential: Secret,
+    pub credential_handle_id: String,
+    pub owner_user_id: String,
     pub context_tokens: u32,
     pub max_input_tokens: u32,
     pub max_output_tokens: u32,
@@ -155,7 +159,7 @@ impl fmt::Debug for NativeProviderConfig {
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
-            .field("credential", &"[redacted]")
+            .field("credential", &"[protected handle]")
             .field("context_tokens", &self.context_tokens)
             .field("max_input_tokens", &self.max_input_tokens)
             .field("max_output_tokens", &self.max_output_tokens)
@@ -227,6 +231,8 @@ pub enum AgentHostError {
     SessionNotFound,
     #[error("credential handle not found")]
     CredentialNotFound,
+    #[error("runtime version conflict")]
+    VersionConflict,
     #[error("runtime operation unsupported: {0}")]
     Unsupported(String),
     #[error("runtime failed: {0}")]

@@ -23,6 +23,9 @@ enum AgentCmd {
         executor_type: String,
         #[arg(long)]
         daemon_id: Option<String>,
+        /// Provider entry that powers this harness agent (dispatch-time key injection).
+        #[arg(long)]
+        credential_id: Option<String>,
     },
     List {
         #[arg(long)]
@@ -40,6 +43,7 @@ impl AgentArgs {
                 name,
                 executor_type,
                 daemon_id,
+                credential_id,
             } => {
                 let request = CreateAgentRequest {
                     name: name.clone(),
@@ -56,6 +60,7 @@ impl AgentArgs {
                     heartbeat_interval_seconds: None,
                     max_missed_heartbeats: None,
                     is_default: None,
+                    credential_id: credential_id.clone(),
                 };
                 let agent: AgentResponse = client.post("/api/v1/agents", &request).await?;
                 print_agent(output, &agent)

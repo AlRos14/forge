@@ -49,6 +49,7 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
             config_json: "{}".to_owned(),
+            credential_ref: None,
             daemon_id: None,
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,

@@ -569,23 +569,14 @@ async fn connect_embedded_agent(
     token: &str,
     name: &str,
 ) -> ConnectedEmbeddedAgentResponse {
-    common::json_request_with_bearer(
+    common::connect_embedded_agent(
         app,
-        Method::POST,
-        "/api/v1/embedded-agents/connect",
         token,
-        json!({
-            "name": name,
-            "description": "Project Charter integration fixture",
-            "provider": "openai_compatible",
-            "base_url": "https://8.8.8.8",
-            "model": "project-charter-test-model",
-            "credential_label": "project-charter-test",
-            "credential": "fixture-secret",
-            "account_permission_ceiling": { "permissions": ["read_project", "handoff"] },
-            "tool_policy": { "allowed": ["read_project", "handoff"] }
-        }),
-        StatusCode::OK,
+        name,
+        "project-charter-test",
+        "fixture-secret",
+        json!({"permissions": ["read_project", "handoff"]}),
+        json!({"allowed": ["read_project", "handoff"]}),
     )
     .await
 }
@@ -599,12 +590,13 @@ fn project_agent_policy_digest(policy: &serde_json::Value) -> String {
 }
 
 fn user_authorization(action: &str, event_id: &str) -> serde_json::Value {
+    static AUTHORIZATION_OCCURRED_AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     json!({
         "principal": { "kind": "user", "id": "test-user-id" },
         "authorization_basis": "explicit_user_authorization",
         "action": action,
         "event_id": event_id,
-        "occurred_at": "2026-08-13T00:00:00Z"
+        "occurred_at": AUTHORIZATION_OCCURRED_AT.get_or_init(db::now_rfc3339)
     })
 }
 
