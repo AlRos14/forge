@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-15
+
 ### Breaking
 
 - Agent navigation is consolidated around one canonical `/agents` settings
