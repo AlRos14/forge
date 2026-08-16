@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '@/api/client'
 import {
@@ -259,7 +260,8 @@ export function useAgentProviderCapabilitiesQuery() {
 }
 
 export function useProviderAuthorizationQuery(id: string | undefined) {
-  return useQuery({
+  const queryClient = useQueryClient()
+  const query = useQuery({
     queryKey: federationQueryKeys.providerAuthorization(id ?? 'none'),
     queryFn: () => getProviderAuthorization(id!),
     enabled: Boolean(id),
@@ -270,6 +272,15 @@ export function useProviderAuthorizationQuery(id: string | undefined) {
         : 1500
     },
   })
+  // A succeeded authorization created a provider entry server-side; refresh
+  // the entries list so the new credential shows up without a reload.
+  const succeeded = query.data?.state === 'succeeded'
+  useEffect(() => {
+    if (!succeeded) return
+    void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+    void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+  }, [succeeded, queryClient])
+  return query
 }
 
 export function useStartProviderAuthorizationMutation() {

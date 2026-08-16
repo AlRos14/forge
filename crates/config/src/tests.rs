@@ -516,6 +516,35 @@ fn resolve_jwt_secret_persists_file_with_restricted_permissions() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
+#[test]
+fn trusted_web_origins_include_the_serving_origin_with_both_loopback_spellings() {
+    let mut config = ForgeConfig::default();
+    config.server.bind = "127.0.0.1:8080".to_owned();
+
+    let origins = config.trusted_web_origins();
+
+    assert!(origins.contains(&"http://localhost:5173".to_owned()));
+    assert!(origins.contains(&"http://127.0.0.1:8080".to_owned()));
+    assert!(origins.contains(&"http://localhost:8080".to_owned()));
+}
+
+#[test]
+fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
+    let mut config = ForgeConfig::default();
+    config.server.public_base_url = Some("https://forge.example.com/app".to_owned());
+    config.server.cors_origins = vec!["https://ui.example.com".to_owned()];
+
+    let origins = config.trusted_web_origins();
+
+    assert_eq!(
+        origins,
+        vec![
+            "https://ui.example.com".to_owned(),
+            "https://forge.example.com".to_owned(),
+        ]
+    );
+}
+
 fn clear_forge_env() {
     for key in [
         "FORGE_SERVER_BIND",

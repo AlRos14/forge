@@ -15,6 +15,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   agent's identity, scope, and boundaries, includes the bounded portfolio
   projection, and is recorded in the turn's context manifest.
 
+### Fixed
+
+- Browser OAuth login no longer fails with `redirect_origin is not a
+  configured trusted origin` when the UI is served by Forge itself. The
+  trusted-origin list now includes the server's own serving origin (both
+  `localhost` and `127.0.0.1` spellings for a loopback bind, and the
+  `public_base_url` origin when configured) in addition to the configured
+  CORS origins.
+- After a device-code (or browser) OAuth login succeeds, the Providers tab now
+  refreshes immediately. Previously the new provider entry was stored
+  server-side but the UI kept showing "No providers connected" until a full
+  page reload, which made the login look like it had failed.
+
 ## [0.8.0] - 2026-08-15
 
 ### Breaking

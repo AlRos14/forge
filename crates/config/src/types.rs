@@ -134,6 +134,51 @@ impl ForgeConfig {
             .unwrap_or_else(|| format!("http://{}", self.server.bind))
     }
 
+    /// Origins allowed to start a browser OAuth ceremony and receive its
+    /// post-login bounce: the configured CORS origins plus the server's own
+    /// serving origin. A loopback serving origin is added under both the
+    /// `localhost` and `127.0.0.1` spellings, since browsers treat them as
+    /// distinct origins.
+    #[must_use]
+    pub fn trusted_web_origins(&self) -> Vec<String> {
+        let mut origins: Vec<String> = self
+            .server
+            .cors_origins
+            .iter()
+            .filter_map(|value| parse_trusted_origin(value))
+            .collect();
+        let mut push = |origin: String| {
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        };
+        let own = self.trusted_origin();
+        if let Some(origin) = parse_trusted_origin(&own) {
+            push(origin);
+        }
+        if let Ok(url) = Url::parse(&own) {
+            let loopback = match url.host() {
+                Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                None => false,
+            };
+            if loopback {
+                let scheme = url.scheme();
+                for host in ["localhost", "127.0.0.1"] {
+                    let candidate = match url.port_or_known_default() {
+                        Some(port) => format!("{scheme}://{host}:{port}"),
+                        None => format!("{scheme}://{host}"),
+                    };
+                    if let Some(origin) = parse_trusted_origin(&candidate) {
+                        push(origin);
+                    }
+                }
+            }
+        }
+        origins
+    }
+
     #[must_use]
     pub fn mcp_resource_url(&self) -> String {
         format!("{}/mcp", self.trusted_origin())

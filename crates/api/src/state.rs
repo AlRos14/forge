@@ -279,7 +279,7 @@ impl AppState {
         let provider_authorization_service = Arc::new(ProviderAuthorizationService::new(
             Arc::clone(&db),
             Arc::clone(&embedded_agent_service),
-            effective_config.server.cors_origins.clone(),
+            effective_config.trusted_web_origins(),
         ));
 
         Self {
@@ -334,7 +334,7 @@ impl AppState {
             config.mcp_resource_url(),
         ));
         self.provider_authorization_service
-            .set_trusted_origins(config.server.cors_origins.clone());
+            .set_trusted_origins(config.trusted_web_origins());
         let terminal_activity = self.terminal_service.activity_tracker();
         let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
             Arc::clone(&self.db),
