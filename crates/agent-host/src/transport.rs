@@ -33,6 +33,34 @@ impl ReqwestTransport {
             ProviderError::new(kind, "provider HTTP request failed").retryable()
         })?;
         let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            // Providers in agent-runtime never see raw HTTP statuses — this
+            // transport owns turning them into typed errors. Auth in
+            // particular must be surfaced as `ProviderErrorKind::Auth` or the
+            // provider's credential-refresh path can never trigger; anything
+            // else would otherwise be parsed as an SSE stream and fail with
+            // an empty-stream error that hides the real cause.
+            let body_excerpt = response
+                .bytes()
+                .await
+                .ok()
+                .map(|bytes| {
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            tracing::warn!(status, body = %body_excerpt, "provider request rejected");
+            let (kind, retryable) = match status {
+                401 | 403 => (ProviderErrorKind::Auth, false),
+                429 => (ProviderErrorKind::RateLimited, true),
+                400..=499 => (ProviderErrorKind::BadRequest, false),
+                _ => (ProviderErrorKind::Server, true),
+            };
+            let error = ProviderError::new(kind, format!("provider returned HTTP {status}"));
+            return Err(if retryable { error.retryable() } else { error });
+        }
         let headers = response
             .headers()
             .iter()

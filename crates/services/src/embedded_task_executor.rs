@@ -158,6 +158,10 @@ impl EmbeddedTaskExecutor {
             .runtime_session_id
             .clone()
             .ok_or_else(|| ServiceError::invalid_operation("Task session has no runtime id"))?;
+        let provider_account_id = self
+            .embedded_agents
+            .credential_provider_account_id(credential_ref)
+            .await?;
 
         self.active.write().await.insert(
             ctx.execution_id.clone(),
@@ -191,6 +195,7 @@ impl EmbeddedTaskExecutor {
                         model: model.clone(),
                         credential_handle_id: credential_ref.to_owned(),
                         owner_user_id: owner_user_id.clone(),
+                        provider_account_id,
                         context_tokens: config.context_tokens,
                         max_input_tokens: config.max_input_tokens,
                         max_output_tokens: config.max_output_tokens,

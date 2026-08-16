@@ -19,8 +19,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo, AgentChatTurnJob,
-    AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession, PageRequest,
-    ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
+    AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession,
+    CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
 use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
 use forge_agent_host::RuntimeContextManifestLink;
@@ -2303,6 +2303,11 @@ impl FederatedAgentChatTurnRunner {
             .model
             .clone()
             .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no model"))?;
+        let provider_account_id =
+            CredentialHandleRepo::get_credential_handle(&*self.db, credential_ref)
+                .await?
+                .as_ref()
+                .and_then(crate::embedded_agent_service::entry_provider_account_id);
         let started = std::time::Instant::now();
         let output = self
             .embedded_agents
@@ -2323,6 +2328,7 @@ impl FederatedAgentChatTurnRunner {
                         model: model.clone(),
                         credential_handle_id: credential_ref.to_owned(),
                         owner_user_id: owner_user_id.to_owned(),
+                        provider_account_id,
                         context_tokens: config.context_tokens,
                         max_input_tokens: config.max_input_tokens,
                         max_output_tokens: config.max_output_tokens,

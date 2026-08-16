@@ -107,10 +107,18 @@ impl NativeAgentRuntimeBackend {
                     .base_url
                     .contains("chatgpt.com/backend-api/codex") =>
             {
-                let config = ResponsesConfig::new(
+                // The Codex backend authenticates the OAuth bearer token
+                // against the Codex CLI OAuth client, and rejects requests
+                // that do not carry that client's identifying headers.
+                let mut config = ResponsesConfig::new(
                     request.provider.base_url.clone(),
                     request.provider.model.clone(),
-                );
+                )
+                .with_extra_header("OpenAI-Beta", "responses=experimental")
+                .with_extra_header("originator", "codex_cli_rs");
+                if let Some(account_id) = request.provider.provider_account_id.as_deref() {
+                    config = config.with_extra_header("chatgpt-account-id", account_id);
+                }
                 let provider =
                     ResponsesProvider::with_credential_source(transport, config, target, source)
                         .map_err(|error| AgentHostError::Configuration(error.to_string()))?;

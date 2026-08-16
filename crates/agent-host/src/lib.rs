@@ -147,6 +147,10 @@ pub struct NativeProviderConfig {
     pub model: String,
     pub credential_handle_id: String,
     pub owner_user_id: String,
+    /// The provider-side account the credential belongs to (for OAuth
+    /// entries). The ChatGPT Codex backend requires it as the
+    /// `chatgpt-account-id` request header.
+    pub provider_account_id: Option<String>,
     pub context_tokens: u32,
     pub max_input_tokens: u32,
     pub max_output_tokens: u32,

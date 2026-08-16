@@ -17,6 +17,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Agents built on a ChatGPT OAuth login (the Codex backend) now work. Native
+  turns send the backend's required request headers (`chatgpt-account-id`,
+  `OpenAI-Beta: responses=experimental`, `originator`), and the native
+  transport now surfaces non-2xx provider responses as typed errors — a 401
+  triggers the provider's credential-refresh path instead of being parsed as
+  an empty event stream.
+- OAuth-backed OpenAI agents are no longer permanently reported as degraded.
+  The connection health probe (`GET /models`) has no such route on the
+  ChatGPT Codex backend; any authenticated non-401/403 answer from that
+  backend now counts as a healthy credential.
 - Browser OAuth login no longer fails with `redirect_origin is not a
   configured trusted origin` when the UI is served by Forge itself. The
   trusted-origin list now includes the server's own serving origin (both

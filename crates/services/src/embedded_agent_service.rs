@@ -1234,6 +1234,20 @@ impl EmbeddedAgentService {
         }
     }
 
+    /// The provider-side account id stored on one of the caller's provider
+    /// entries during OAuth login, if any.
+    pub async fn credential_provider_account_id(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(
+            CredentialHandleRepo::get_credential_handle(&*self.db, credential_id)
+                .await?
+                .as_ref()
+                .and_then(entry_provider_account_id),
+        )
+    }
+
     async fn check_and_record_connection(
         &self,
         profile: &AgentProfile,
@@ -1304,10 +1318,21 @@ impl EmbeddedAgentService {
                     "provider_unreachable".to_owned()
                 }
             })?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            tracing::warn!(status, profile_id = %profile.id, "provider health probe rejected");
+        }
         if response.status().is_success() {
             Ok(())
-        } else if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+        } else if status == 401 || status == 403 {
             Err("provider_authentication_failed".to_owned())
+        } else if is_codex_backend(base_url) {
+            // The ChatGPT Codex backend has no `GET /models` route (it
+            // answers 400) but authenticates every request before routing,
+            // so any non-401/403 answer proves the credential is accepted.
+            // Without this an OAuth-backed OpenAI agent is permanently
+            // reported degraded even though turns work.
+            Ok(())
         } else {
             Err("provider_health_failed".to_owned())
         }
@@ -1335,6 +1360,12 @@ pub fn default_api_key_base_url(provider: &str) -> Option<&'static str> {
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         _ => None,
     }
+}
+
+/// Whether a base URL points at the ChatGPT Codex backend, which speaks the
+/// Responses API only and has no OpenAI-compatible `GET /models` route.
+fn is_codex_backend(base_url: &str) -> bool {
+    base_url.contains("chatgpt.com/backend-api/codex")
 }
 
 fn default_oauth_base_url(provider: &str) -> Option<&'static str> {
@@ -1368,6 +1399,19 @@ pub fn entry_base_url(entry: &CredentialHandle) -> Result<String> {
     fallback
         .map(str::to_owned)
         .ok_or_else(|| ServiceError::invalid_operation("provider entry has no usable API endpoint"))
+}
+
+/// The provider-side account id recorded on an entry during OAuth login.
+/// The ChatGPT Codex backend requires it as the `chatgpt-account-id` header.
+pub fn entry_provider_account_id(entry: &CredentialHandle) -> Option<String> {
+    serde_json::from_str::<Value>(&entry.metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("provider_account_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 async fn provider_url_addresses(
