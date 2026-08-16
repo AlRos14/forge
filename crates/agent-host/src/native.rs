@@ -275,6 +275,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
             .insert(request.runtime_session_id.clone(), session.clone());
         let turn_id = turn.id().clone();
+        let mut last_turn_error: Option<String> = None;
         let finish_result = loop {
             tokio::select! {
                 _ = request.cancellation.cancelled() => {
@@ -292,6 +293,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                     }
                     match &event.payload {
                         RuntimeEvent::TextDelta { text, .. } => sink.text_delta(text).await,
+                        RuntimeEvent::Error { error } => {
+                            last_turn_error = Some(error.to_string());
+                        }
                         RuntimeEvent::TurnCompleted { finish, .. } => break Ok(finish.clone()),
                         _ => {}
                     }
@@ -317,7 +321,12 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             TurnFinish::LimitReached { .. } => {
                 return Err(AgentHostError::Runtime("turn limit reached".to_owned()));
             }
-            TurnFinish::Failed => return Err(AgentHostError::Runtime("turn failed".to_owned())),
+            TurnFinish::Failed => {
+                return Err(AgentHostError::Runtime(match last_turn_error {
+                    Some(detail) => format!("turn failed: {detail}"),
+                    None => "turn failed".to_owned(),
+                }));
+            }
             TurnFinish::NeedsInput { .. } => {
                 return Err(AgentHostError::Runtime(
                     "turn requires protected host interaction".to_owned(),

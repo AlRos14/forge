@@ -27,6 +27,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   The connection health probe (`GET /models`) has no such route on the
   ChatGPT Codex backend; any authenticated non-401/403 answer from that
   backend now counts as a healthy credential.
+- Failed native Agent Chat turns now record the underlying runtime error
+  (e.g. "turn limit reached", an auth rejection) in the turn job and the
+  server log instead of the opaque "native Agent Chat turn failed".
 - Browser OAuth login no longer fails with `redirect_origin is not a
   configured trusted origin` when the UI is served by Forge itself. The
   trusted-origin list now includes the server's own serving origin (both

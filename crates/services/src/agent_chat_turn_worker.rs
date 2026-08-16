@@ -2344,7 +2344,15 @@ impl FederatedAgentChatTurnRunner {
                 Arc::new(NoopTurnEventSink),
             )
             .await
-            .map_err(|_| ServiceError::invalid_operation("native Agent Chat turn failed"))?;
+            .map_err(|error| {
+                tracing::warn!(
+                    job_id = %job.id,
+                    chat_id = %job.chat_id,
+                    %error,
+                    "native Agent Chat turn failed"
+                );
+                ServiceError::invalid_operation(format!("native Agent Chat turn failed: {error}"))
+            })?;
         let content = output.text.trim().to_owned();
         guard_agent_chat_content(&content)?;
         let context_manifest_id = if let Some(manifest) = output.context_manifest.as_ref() {
