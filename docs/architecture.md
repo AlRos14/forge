@@ -209,6 +209,14 @@ token exposes the row.
 
 #### Charter, Documents, Decisions, and effective state
 
+Every Main Agent Chat turn carries a server-owned operating instruction.
+Outside an active Product Genesis session, the account baseline skill
+`forge.main.baseline/v1` is in force: it tells the model it is Forge's Main
+Agent, hands it the bounded portfolio projection, and restates the no-Task/
+no-repository/no-credential boundary. The baseline is compiled into the server
+(its content digest is pinned by a test, not a seeded row) and is recorded in
+the turn's context manifest like the seeded skills.
+
 Product Genesis uses the server-owned `forge.main.project-discovery/v2` skill
 only while its Genesis session is `discovering` or `ready_for_project`. It asks
 no more than two consequential questions per turn and keeps facts, explicit

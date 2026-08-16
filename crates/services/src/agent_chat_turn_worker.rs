@@ -45,13 +45,16 @@ use crate::{
     embedded_agent_service::{CreateScopedSession, RequestedCanonicalScope},
     operating_skills::{
         canonical_main_operating_skill_body, canonical_project_operating_skill_body,
-        render_project_operating_skill, EffectiveProjectStateContext, ProjectOperatingSkillContext,
-        MAIN_OPERATING_SKILL_CONTENT_DIGEST, MAIN_OPERATING_SKILL_KEY,
-        MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
-        MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
-        PROJECT_OPERATING_SKILL_CONTENT_DIGEST, PROJECT_OPERATING_SKILL_KEY,
-        PROJECT_OPERATING_SKILL_POLICY_DIGEST, PROJECT_OPERATING_SKILL_POLICY_JSON,
-        PROJECT_OPERATING_SKILL_RENDER_VERSION, PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
+        render_main_baseline_operating_skill, render_project_operating_skill,
+        EffectiveProjectStateContext, MainBaselineSkillContext, ProjectOperatingSkillContext,
+        MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST, MAIN_BASELINE_OPERATING_SKILL_KEY,
+        MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_CONTENT_DIGEST,
+        MAIN_OPERATING_SKILL_KEY, MAIN_OPERATING_SKILL_POLICY_DIGEST,
+        MAIN_OPERATING_SKILL_POLICY_JSON, MAIN_OPERATING_SKILL_RENDER_VERSION,
+        MAIN_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
+        PROJECT_OPERATING_SKILL_KEY, PROJECT_OPERATING_SKILL_POLICY_DIGEST,
+        PROJECT_OPERATING_SKILL_POLICY_JSON, PROJECT_OPERATING_SKILL_RENDER_VERSION,
+        PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
     },
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
     EmbeddedAgentService, Result, ServiceError,
@@ -721,8 +724,11 @@ impl FederatedAgentChatTurnRunner {
                     (
                         Some(instruction_body),
                         main_operating_context_sources(
+                            MAIN_OPERATING_SKILL_KEY,
                             &main_skill_revision,
                             &main_skill_content_digest,
+                            "server_owned_main_genesis_operating_skill",
+                            "main_genesis_context",
                             &references,
                         ),
                     )
@@ -744,7 +750,53 @@ impl FederatedAgentChatTurnRunner {
                             "Active Product Genesis has no immutable Main instruction revision",
                         ));
                     }
-                    (None, Vec::new())
+                    // Outside Genesis the server-owned account baseline is the
+                    // operating instruction, so a Main turn never reaches a
+                    // model backend without knowing it is Forge's Main Agent.
+                    let account_id = chat.account_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Main Agent Chat has no authenticated account for baseline context",
+                        )
+                    })?;
+                    if agent.owner_id.as_deref() != Some(account_id) {
+                        return Err(ServiceError::invalid_operation(
+                            "Main Agent identity is not owned by the Chat account",
+                        ));
+                    }
+                    let mut references = vec![OperatingContextReference::included(
+                        format!("main_profile:{}@v{}", profile.id, profile.version),
+                        &profile.id,
+                        "main_profile",
+                        format!("v{}", profile.version),
+                        fingerprint_id(&format!(
+                            "profile:{}:v{}:policy:{}",
+                            profile.id, profile.version, profile.tool_policy_json
+                        )),
+                        "authenticated_main_profile",
+                    )];
+                    references.extend(self.load_main_portfolio_context(account_id).await?);
+                    let instruction =
+                        render_main_baseline_operating_skill(&MainBaselineSkillContext {
+                            portfolio_references: references
+                                .iter()
+                                .filter(|reference| {
+                                    reference.source_type == "main_portfolio_projection"
+                                })
+                                .map(|reference| reference.display.clone())
+                                .collect(),
+                            profile_text: profile.prompt_template.clone().unwrap_or_default(),
+                        });
+                    (
+                        Some(instruction),
+                        main_operating_context_sources(
+                            MAIN_BASELINE_OPERATING_SKILL_KEY,
+                            MAIN_BASELINE_OPERATING_SKILL_REVISION,
+                            MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST,
+                            "server_owned_main_baseline_operating_skill",
+                            "main_baseline_context",
+                            &references,
+                        ),
+                    )
                 }
             }
             "project" => {
@@ -3922,17 +3974,20 @@ fn project_operating_context_sources(
 }
 
 fn main_operating_context_sources(
+    skill_key: &str,
     skill_revision_id: &str,
     skill_content_digest: &str,
+    selection_reason: &str,
+    context_prefix: &str,
     context_references: &[OperatingContextReference],
 ) -> Vec<ContextSourceInput> {
     let mut sources = Vec::with_capacity(context_references.len() + 1);
     sources.push(ContextSourceInput {
         ordinal: 0,
-        source_id: format!("operating_skill:{MAIN_OPERATING_SKILL_KEY}"),
+        source_id: format!("operating_skill:{skill_key}"),
         source_type: "server_operating_skill".to_owned(),
         source_revision: skill_revision_id.to_owned(),
-        selection_reason: "server_owned_main_genesis_operating_skill".to_owned(),
+        selection_reason: selection_reason.to_owned(),
         disposition: "included".to_owned(),
         retention_priority: 100,
         fragment_fingerprint: skill_content_digest.to_owned(),
@@ -3942,7 +3997,7 @@ fn main_operating_context_sources(
         sources.push(ContextSourceInput {
             ordinal: ordinal as i64 + 1,
             source_id: format!(
-                "main_genesis_context:{}:{}",
+                "{context_prefix}:{}:{}",
                 reference.source_type, reference.source_id
             ),
             source_type: reference.source_type.clone(),
@@ -4750,8 +4805,11 @@ mod tests {
     #[test]
     fn main_genesis_context_provenance_names_skill_instruction_and_charter() {
         let sources = main_operating_context_sources(
+            MAIN_OPERATING_SKILL_KEY,
             "forge.main.project-discovery/v2@1",
             "main-skill-content-digest",
+            "server_owned_main_genesis_operating_skill",
+            "main_genesis_context",
             &[
                 OperatingContextReference::included(
                     "genesis:genesis-1@v2",
@@ -4803,6 +4861,51 @@ mod tests {
             source.source_type == "main_portfolio_projection"
                 && source.disposition == "included"
                 && source.sensitivity != "secret"
+        }));
+    }
+
+    #[test]
+    fn main_baseline_context_provenance_names_skill_profile_and_portfolio() {
+        let sources = main_operating_context_sources(
+            MAIN_BASELINE_OPERATING_SKILL_KEY,
+            MAIN_BASELINE_OPERATING_SKILL_REVISION,
+            MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST,
+            "server_owned_main_baseline_operating_skill",
+            "main_baseline_context",
+            &[
+                OperatingContextReference::included(
+                    "main_profile:profile-1@v2",
+                    "profile-1",
+                    "main_profile",
+                    "v2",
+                    "profile-digest",
+                    "authenticated_main_profile",
+                ),
+                OperatingContextReference::included(
+                    "portfolio:project-1@v4",
+                    "project-1",
+                    "main_portfolio_projection",
+                    "v4:2026-08-13T00:00:00Z",
+                    "portfolio-digest",
+                    "bounded_account_portfolio_projection",
+                ),
+            ],
+        );
+        assert_eq!(
+            sources[0].source_id,
+            "operating_skill:forge.main.baseline/v1"
+        );
+        assert_eq!(sources[0].source_revision, "forge.main.baseline/v1@1");
+        assert_eq!(
+            sources[0].selection_reason,
+            "server_owned_main_baseline_operating_skill"
+        );
+        assert_eq!(
+            sources[1].source_id,
+            "main_baseline_context:main_profile:profile-1"
+        );
+        assert!(sources.iter().any(|source| {
+            source.source_type == "main_portfolio_projection" && source.disposition == "included"
         }));
     }
 

@@ -153,11 +153,14 @@ pub use native_tools::CoordinationToolProvider;
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
 pub use operating_skills::{
-    canonical_main_operating_skill_body, canonical_project_operating_skill_body,
-    main_operating_skill_active, render_main_operating_skill, render_project_operating_skill,
-    EffectiveProjectStateContext, MainOperatingSkillContext, ProjectOperatingSkillContext,
-    MAIN_OPERATING_SKILL_CONTENT_DIGEST, MAIN_OPERATING_SKILL_KEY,
-    MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
+    canonical_main_baseline_operating_skill_body, canonical_main_operating_skill_body,
+    canonical_project_operating_skill_body, main_operating_skill_active,
+    render_main_baseline_operating_skill, render_main_operating_skill,
+    render_project_operating_skill, EffectiveProjectStateContext, MainBaselineSkillContext,
+    MainOperatingSkillContext, ProjectOperatingSkillContext,
+    MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST, MAIN_BASELINE_OPERATING_SKILL_KEY,
+    MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_CONTENT_DIGEST,
+    MAIN_OPERATING_SKILL_KEY, MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
     MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
     MAIN_OPERATING_SKILL_VERSION, PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
     PROJECT_OPERATING_SKILL_KEY, PROJECT_OPERATING_SKILL_POLICY_DIGEST,

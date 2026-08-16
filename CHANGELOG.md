@@ -6,6 +6,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Main Agent Chat turns outside an active Product Genesis session now carry a
+  server-owned baseline operating skill (`forge.main.baseline/v1`). Previously
+  a plain Main Agent chat could reach the model with no system prompt at all,
+  so the agent had no idea it was running inside Forge. The baseline states the
+  agent's identity, scope, and boundaries, includes the bounded portfolio
+  projection, and is recorded in the turn's context manifest.
+
 ## [0.8.0] - 2026-08-15
 
 ### Breaking
