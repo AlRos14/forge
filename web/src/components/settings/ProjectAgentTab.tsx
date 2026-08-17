@@ -3,8 +3,10 @@ import { Link } from '@tanstack/react-router'
 import { ArrowUpRight, Robot, ShieldCheck } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
+import { cn } from '@/lib/cn'
 import {
   EmptyPanel,
   ErrorPanel,
@@ -12,6 +14,7 @@ import {
   SectionKicker,
   StateBadge,
 } from '@/features/federation/components'
+import { DEFAULT_PROJECT_PERMISSION_CEILING, numberValue } from '@/features/federation/format'
 import {
   isVersionConflict,
   useAgentProfilesQuery,
@@ -19,30 +22,8 @@ import {
   useProjectAgentBindingQuery,
   useSetProjectAgentBindingMutation,
 } from '@/features/federation/hooks'
-import type { ProjectAgentBindingInput } from '@/features/federation/types'
+import type { FederatedAgent, ProjectAgentBindingInput } from '@/features/federation/types'
 import { ApiError } from '@/api/client'
-
-const DEFAULT_PERMISSION_CEILING = {
-  allowed: [
-    'read_project',
-    'read_agent_chat',
-    'read_task',
-    'read_memory',
-    'propose_task',
-    'propose_message',
-    'propose_review',
-    'propose_commitment',
-    'propose_memory',
-    'propose_decision',
-    'propose_session',
-  ],
-}
-
-function numberValue(value: number | bigint | null | undefined, fallback: number): number {
-  if (value === null || value === undefined) return fallback
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
 
 function policyValues(policy: Record<string, unknown> | null | undefined): string[] {
   const allowed = policy?.allowed
@@ -51,7 +32,17 @@ function policyValues(policy: Record<string, unknown> | null | undefined): strin
     : []
 }
 
-export function ProjectAgentTab({ projectId }: { projectId: string }) {
+export function ProjectAgentTab({
+  projectId,
+  projectName,
+  highlighted = false,
+  onChangeModel,
+}: {
+  projectId: string
+  projectName?: string
+  highlighted?: boolean
+  onChangeModel?: (agent: FederatedAgent) => void
+}) {
   const bindingQuery = useProjectAgentBindingQuery(projectId)
   const agentsQuery = useFederatedAgentsQuery()
   const [identityId, setIdentityId] = useState('')
@@ -64,7 +55,7 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
   const selectedAgent = agents.find((agent) => agent.id === identityId)
   const profilesQuery = useAgentProfilesQuery(identityId || undefined)
   const profiles = profilesQuery.data ?? []
-  const permissionCeiling = bindingQuery.data?.permission_ceiling ?? DEFAULT_PERMISSION_CEILING
+  const permissionCeiling = bindingQuery.data?.permission_ceiling ?? DEFAULT_PROJECT_PERMISSION_CEILING
 
   useEffect(() => {
     const binding = bindingQuery.data
@@ -148,9 +139,12 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
   }
   if (agents.length === 0) {
     return (
-      <div className="space-y-6">
+      <Card
+        id={`project-agent-${projectId}`}
+        className={cn('space-y-6 p-4 sm:p-5', highlighted && 'border-primary ring-2 ring-primary/30')}
+      >
         <div>
-          <SectionKicker>Project Agent</SectionKicker>
+          <SectionKicker>{projectName ?? 'Project Agent'}</SectionKicker>
           <h2 className="mt-1 text-page font-semibold tracking-tight">Connect one Project Agent</h2>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
             A Project has one durable Agent Chat and one binding. Connect an identity in Agent
@@ -169,15 +163,20 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
           Open Agent settings
           <ArrowUpRight size={14} aria-hidden />
         </Link>
-      </div>
+      </Card>
     )
   }
 
   return (
-    <div className="space-y-6">
+    <Card
+      id={`project-agent-${projectId}`}
+      className={cn('space-y-6 p-4 sm:p-5', highlighted && 'border-primary ring-2 ring-primary/30')}
+    >
       <div>
-        <SectionKicker>Project Agent</SectionKicker>
-        <h2 className="mt-1 text-page font-semibold tracking-tight">One Project Agent binding</h2>
+        <SectionKicker>{projectName ?? 'Project Agent'}</SectionKicker>
+        <h2 className="mt-1 text-page font-semibold tracking-tight">
+          {bindingMissing ? 'Not configured' : 'Project Agent binding'}
+        </h2>
         <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
           Select the single identity and profile admitted to this Project&apos;s durable Agent Chat.
           Replacing it preserves the chat timeline and uses optimistic concurrency.
@@ -185,7 +184,7 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
       </div>
 
       <form onSubmit={(event) => void save(event)} className="space-y-5">
-        <div className="rounded-lg border border-border-subtle bg-card p-4 sm:p-5">
+        <div className="rounded-lg border border-border-subtle bg-muted/10 p-4 sm:p-5">
           <div className="grid gap-5 md:grid-cols-2">
             <div className="space-y-2">
               <label
@@ -264,9 +263,8 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
               </span>
               <div className="flex h-9 items-center gap-2 rounded-md border border-border-subtle bg-muted/20 px-3">
                 <StateBadge
-                  status={
-                    bindingQuery.data?.state ?? (bindingMissing ? 'setup_required' : 'unknown')
-                  }
+                  status={bindingQuery.data?.state ?? (bindingMissing ? 'setup_required' : 'unknown')}
+                  label={bindingMissing ? 'Not configured' : undefined}
                 />
                 <span className="font-mono text-micro text-muted-foreground">
                   expected version {numberValue(bindingQuery.data?.version, 0)}
@@ -322,6 +320,16 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
                 ? 'Set Project Agent'
                 : 'Save Project Agent'}
           </Button>
+          {onChangeModel ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={!selectedAgent}
+              onClick={() => selectedAgent && onChangeModel(selectedAgent)}
+            >
+              Change model…
+            </Button>
+          ) : null}
           {bindingQuery.data?.chat_id ? (
             <span className="font-mono text-micro text-muted-foreground">
               Timeline {bindingQuery.data.chat_id.slice(0, 8)}…
@@ -329,6 +337,6 @@ export function ProjectAgentTab({ projectId }: { projectId: string }) {
           ) : null}
         </div>
       </form>
-    </div>
+    </Card>
   )
 }

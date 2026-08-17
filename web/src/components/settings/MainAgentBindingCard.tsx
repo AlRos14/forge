@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Select } from '@/components/ui/select'
 import { Card } from '@/components/ui/card'
 import { ErrorPanel, SectionKicker, StateBadge } from '@/features/federation/components'
+import { numberValue } from '@/features/federation/format'
 import {
   isVersionConflict,
   useAgentProfilesQuery,
@@ -14,18 +15,14 @@ import {
 import type { FederatedAgent, MainAgentBindingInput } from '@/features/federation/types'
 import { ApiError } from '@/api/client'
 
-function numberValue(value: number | bigint | null | undefined, fallback: number): number {
-  if (value === null || value === undefined) return fallback
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
 export function MainAgentBindingCard({
   agents,
   onConnect,
+  onChangeModel,
 }: {
   agents: FederatedAgent[]
   onConnect: () => void
+  onChangeModel: (agent: FederatedAgent) => void
 }) {
   const bindingQuery = useMainAgentBindingQuery()
   const setBinding = useSetMainAgentBindingMutation()
@@ -194,6 +191,14 @@ export function MainAgentBindingCard({
           disabled={setBinding.isPending || !identityId || !profileId || agents.length === 0}
         >
           {setBinding.isPending ? 'Saving…' : bindingMissing ? 'Set Main Agent' : 'Save Main Agent'}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={!selectedAgent}
+          onClick={() => selectedAgent && onChangeModel(selectedAgent)}
+        >
+          Change model…
         </Button>
         <Button type="button" variant="outline" onClick={onConnect}>
           Connect identity

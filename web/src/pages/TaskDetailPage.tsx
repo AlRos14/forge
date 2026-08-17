@@ -20,7 +20,6 @@ import {
   useRejectGate,
   useTransitionTask,
   useTriggerReview,
-  useUpdateAgent,
   useUpdateTask,
   useWorkflowQuery,
 } from '@/api/hooks'
@@ -131,7 +130,6 @@ export function TaskDetailPage({
   const rolePicker = useRolePicker()
   const launchExecution = useLaunchExecution()
   const triggerReview = useTriggerReview()
-  const updateAgent = useUpdateAgent()
   const cancelTask = useCancelTask()
   const duplicateTask = useDuplicateTask()
   const recoverTask = useRecoverTask()
@@ -530,31 +528,6 @@ export function TaskDetailPage({
               permissionPolicy: null,
             },
           )
-          if (config.saveToAgent) {
-            const agent = agentsQuery.data?.items.find((item) => item.id === config.agentId)
-            if (agent) {
-              updateAgent.mutate(
-                {
-                  agentId: agent.id,
-                  body: {
-                    model: config.modelId,
-                    reasoning_effort: config.reasoningEffort,
-                    permission_policy: config.permissionPolicy,
-                    version: agent.version,
-                  },
-                },
-                {
-                  onError: (error) =>
-                    toast.error(
-                      getApiErrorMessage(
-                        error,
-                        `${productTerm('run')} launched, but agent update failed`,
-                      ),
-                    ),
-                },
-              )
-            }
-          }
           toast.success(`${productTerm('run')} launched`)
           setLaunchDialogOpen(false)
           void navigate({

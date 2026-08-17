@@ -33,6 +33,7 @@ import type {
   Page,
   ProjectAgentBinding,
   ProjectAgentBindingInput,
+  ProviderUsage,
 } from './types'
 
 /**
@@ -188,6 +189,15 @@ export function removeProviderEntry(
 
 export function listAgentProviderCapabilities(): Promise<AgentProviderCapabilitiesResponse> {
   return apiFetch<AgentProviderCapabilitiesResponse>('/providers/catalog')
+}
+
+/**
+ * Usage-window projection for one provider entry (rate-limit/quota
+ * consumption). The server may not be able to probe every provider; a
+ * `source: "unknown"` response is a valid, non-error answer.
+ */
+export function getProviderUsage(id: string): Promise<ProviderUsage> {
+  return apiFetch<ProviderUsage>(`/providers/${id}/usage`)
 }
 
 export function startProviderAuthorization(

@@ -14,7 +14,6 @@ export type ExecutionConfigValue = {
   permissionPolicy: string | null
   selection: ExecutionConfigSelection
   overrides: ExecutionOverrides | undefined
-  saveToAgent: boolean
 }
 
 export type AgentDefaults = Pick<Agent, 'model' | 'reasoning_effort' | 'permission_policy'>
@@ -102,7 +101,6 @@ export function useExecutionOverrides({
       useRecentSelections,
     ),
   )
-  const [saveToAgent, setSaveToAgent] = useState(false)
   const discoveredOptions = useDiscoveredOptions(agentId)
 
   useEffect(() => {
@@ -123,7 +121,6 @@ export function useExecutionOverrides({
 
   const setAgentId = useCallback((nextAgentId: string | null) => {
     setAgentIdState(valueOrNull(nextAgentId))
-    setSaveToAgent(false)
   }, [])
 
   const setModelId = useCallback((modelId: string | null) => {
@@ -148,7 +145,6 @@ export function useExecutionOverrides({
       reasoningEffort: valueOrNull(agentDefaults?.reasoning_effort),
       permissionPolicy: valueOrNull(agentDefaults?.permission_policy),
     })
-    setSaveToAgent(false)
   }, [agentDefaults])
 
   const hasCustomValues = useMemo(() => {
@@ -171,9 +167,8 @@ export function useExecutionOverrides({
       permissionPolicy: selection.permissionPolicy,
       selection,
       overrides,
-      saveToAgent,
     }
-  }, [agentDefaults, agentId, saveToAgent, selection])
+  }, [agentDefaults, agentId, selection])
 
   return {
     ...value,
@@ -183,7 +178,6 @@ export function useExecutionOverrides({
     setModelId,
     setReasoningEffort,
     setPermissionPolicy,
-    setSaveToAgent,
     resetToAgentDefaults,
   }
 }

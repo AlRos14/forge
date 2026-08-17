@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from '@tanstack/react-router'
 import {
   ExecutionConfigBar,
   type ExecutionConfigValue,
@@ -52,7 +53,14 @@ export function TaskLaunchDialog({
               onChange={(event) => setLaunchSummary(event.target.value)}
             />
           </div>
-          <ExecutionConfigBar showSaveToAgent disabled={isPending} onChange={setLaunchConfig} />
+          <ExecutionConfigBar disabled={isPending} onChange={setLaunchConfig} />
+          <p className="text-[11px] text-muted-foreground">
+            Persistent model changes live in{' '}
+            <Link to="/agents" className="underline-offset-2 hover:underline">
+              Agent Settings
+            </Link>
+            .
+          </p>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>

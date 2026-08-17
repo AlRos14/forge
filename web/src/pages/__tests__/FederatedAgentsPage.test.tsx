@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { FederatedAgentsPage } from '@/pages/FederatedAgentsPage'
@@ -14,6 +15,7 @@ const connectProfile = vi.fn().mockResolvedValue({})
 const createProviderEntry = vi.fn()
 const removeProviderEntry = vi.fn().mockResolvedValue({ provider_revocation: 'succeeded' })
 const cancelAuthorization = vi.fn().mockResolvedValue({})
+const updateAgent = vi.fn().mockResolvedValue({})
 const testProviderEntry = vi.fn().mockResolvedValue({
   status: 'ok',
   latency_ms: 123,
@@ -54,16 +56,25 @@ vi.mock('@tanstack/react-router', () => ({
 vi.mock('@/stores/auth', () => ({
   useAuthStore: (selector: (state: { user: null }) => unknown) => selector({ user: null }),
 }))
+// The Projects section on the Bindings tab lists every project; keep it empty here.
+vi.mock('@/api/hooks', () => ({
+  useProjectsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false, refetch: vi.fn() }),
+  useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
+}))
+// ChangeModelDialog offers model suggestions from discovery; not under test here.
+vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/hooks/useDiscoveredOptions')>()),
+  useDiscoveredOptions: () => ({ data: undefined, isLoading: false, isError: false }),
+}))
 vi.mock('@/features/federation/hooks', () => ({
   isVersionConflict: () => false,
   useFederatedAgentsQuery: () => ({
-    data: { items: [agent], has_more: false },
+    data: { items: [agent, cliAgent], has_more: false },
     isLoading: false,
     isError: false,
     refetch: vi.fn(),
   }),
   useAgentProfilesQuery: () => ({ data: [], isLoading: false, isError: false }),
-  useAgentSessionsQuery: () => ({ data: [], isLoading: false, isError: false }),
   useSelectAgentProfileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useCreateEmbeddedAgentMutation: () => ({ mutateAsync: createEmbeddedAgent, isPending: false }),
   useRegisterHarnessAgentMutation: () => ({
@@ -136,6 +147,28 @@ vi.mock('@/features/federation/hooks', () => ({
     isError: false,
     refetch: vi.fn(),
   }),
+  useProviderUsageQuery: () => ({
+    data: {
+      id: 'credential-1',
+      provider: 'openai',
+      source: 'probe',
+      windows: [
+        { id: 'primary', used_percent: 42, window_minutes: 300, resets_at: '2026-08-16T06:00:00Z' },
+      ],
+      fetched_at: '2026-08-16T00:00:00Z',
+    },
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+    refetch: vi.fn(),
+  }),
+  useProjectAgentBindingQuery: () => ({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useSetProjectAgentBindingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useCreateProviderEntryMutation: () => ({ mutateAsync: createProviderEntry, isPending: false }),
   useRenameProviderEntryMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useRemoveProviderEntryMutation: () => ({ mutateAsync: removeProviderEntry, isPending: false }),
@@ -155,20 +188,6 @@ vi.mock('@/features/federation/hooks', () => ({
     refetch: vi.fn(),
   }),
   useSetMainAgentBindingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useContextManifestDiscoveryQuery: () => ({
-    data: [],
-    isLoading: false,
-    isError: false,
-    isFetching: false,
-    refetch: vi.fn(),
-  }),
-  useContextManifestQuery: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    isFetching: false,
-    refetch: vi.fn(),
-  }),
 }))
 vi.mock('@/features/agent-chat/hooks', () => ({
   useAgentChatsQuery: () => ({
@@ -271,6 +290,52 @@ const agent: FederatedAgent = {
   updated_at: '2026-08-12T12:00:00Z',
 }
 
+const cliAgent: FederatedAgent = {
+  id: 'agent-2',
+  name: 'Codex Runner',
+  description: 'A CLI-harness worker.',
+  profile_id: 'profile-2',
+  backend_kind: 'harness',
+  executor_type: 'codex',
+  provider: 'openai',
+  model: 'gpt-5-codex',
+  reasoning_effort: 'medium',
+  permission_policy: 'scoped_proposals',
+  prompt_template: null,
+  capabilities: [],
+  config_json: {},
+  credential_handle_id: 'credential-2',
+  daemon_id: null,
+  max_concurrent_tasks: 1,
+  status: 'idle',
+  active_task_count: 0,
+  effective_status: 'ready',
+  total_runs: 0,
+  avg_duration_ms: null,
+  success_rate: null,
+  is_default: false,
+  paused: false,
+  owner_id: 'user-1',
+  visibility: 'private',
+  version: 3,
+  created_at: '2026-08-12T11:00:00Z',
+  updated_at: '2026-08-12T12:00:00Z',
+}
+
+function renderPage() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  })
+  render(
+    <QueryClientProvider client={queryClient}>
+      <FederatedAgentsPage />
+    </QueryClientProvider>,
+  )
+}
+
 function openProvidersTab() {
   fireEvent.click(screen.getByRole('tab', { name: /providers/i }))
 }
@@ -286,10 +351,11 @@ describe('FederatedAgentsPage', () => {
     removeProviderEntry.mockClear()
     startAuthorization.mockClear()
     cancelAuthorization.mockClear()
+    updateAgent.mockClear()
   })
 
   it('defaults to the agents roster and keeps bindings on their own tab', () => {
-    render(<FederatedAgentsPage />)
+    renderPage()
     expect(screen.getByRole('tab', { name: /agents/i }).getAttribute('aria-selected')).toBe('true')
     expect(screen.getByText('Forge Guide')).toBeTruthy()
     expect(screen.queryByText('Main and Project Agent bindings')).toBeNull()
@@ -299,20 +365,56 @@ describe('FederatedAgentsPage', () => {
     ).toBe('true')
     expect(screen.getByText('Main and Project Agent bindings')).toBeTruthy()
     expect(screen.getByText('Global · Main')).toBeTruthy()
+    // The Projects section is always present on the Bindings tab, never gated on `?project=`.
+    expect(screen.getByText('Project Agent bindings')).toBeTruthy()
+  })
+
+  it('selects an agent from the roster and opens Change model from its detail panel', () => {
+    renderPage()
+    fireEvent.click(screen.getByText('Forge Guide'))
+    fireEvent.click(screen.getByRole('button', { name: /change model…/i }))
+    const dialog = within(screen.getByRole('dialog'))
+    expect(dialog.getByText(/Forge Guide/)).toBeTruthy()
+    expect(dialog.getByText(/New model on an entry/i)).toBeTruthy()
+  })
+
+  it('changes a CLI-harness agent model directly through the core agent PATCH', async () => {
+    renderPage()
+    fireEvent.click(screen.getByText('Codex Runner'))
+    fireEvent.click(screen.getByRole('button', { name: /change model…/i }))
+    const dialog = within(screen.getByRole('dialog'))
+    expect(dialog.getByText(/Codex Runner/)).toBeTruthy()
+    // No more "can only switch between published profiles" hint — CLI-harness
+    // agents get a real, direct model-change path now.
+    expect(screen.queryByText(/change the model itself in the harness/i)).toBeNull()
+
+    fireEvent.click(dialog.getByRole('tab', { name: /update model/i }))
+    const modelInput = dialog.getByLabelText('Model')
+    fireEvent.change(modelInput, { target: { value: 'gpt-5.2-codex' } })
+    fireEvent.change(dialog.getByLabelText('Reasoning effort'), { target: { value: 'high' } })
+    fireEvent.click(dialog.getByRole('button', { name: /change model/i }))
+
+    await vi.waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith({
+        agentId: 'agent-2',
+        body: { model: 'gpt-5.2-codex', reasoning_effort: 'high', version: 3 },
+      }),
+    )
   })
 
   it('lists provider entries and CLI runtimes with usage on the providers tab', () => {
-    render(<FederatedAgentsPage />)
+    renderPage()
     openProvidersTab()
     expect(screen.getByText('Personal ChatGPT')).toBeTruthy()
     expect(screen.getByText('Work key')).toBeTruthy()
     expect(screen.getByRole('button', { name: /used by 1 agent/i })).toBeTruthy()
     expect(screen.getByText(/Claude Code harness/)).toBeTruthy()
     expect(screen.getByText(/Run `claude` on the host/)).toBeTruthy()
+    expect(screen.getAllByText(/42% used · resets/).length).toBeGreaterThan(0)
   })
 
   it('creates an API-key provider entry step by step and tests the connection', async () => {
-    render(<FederatedAgentsPage />)
+    renderPage()
     openProvidersTab()
     fireEvent.click(screen.getByRole('button', { name: /add provider/i }))
     const wizard = within(screen.getByRole('dialog'))
@@ -339,7 +441,7 @@ describe('FederatedAgentsPage', () => {
   })
 
   it('renders and cancels a device authorization operation without exposing tokens', async () => {
-    render(<FederatedAgentsPage />)
+    renderPage()
     openProvidersTab()
     fireEvent.click(screen.getByRole('button', { name: /add provider/i }))
     const wizard = within(screen.getByRole('dialog'))
@@ -360,7 +462,7 @@ describe('FederatedAgentsPage', () => {
 
   it('starts only one provider authorization for a repeated form submission', () => {
     startAuthorization.mockReturnValueOnce(new Promise(() => {}))
-    render(<FederatedAgentsPage />)
+    renderPage()
     openProvidersTab()
     fireEvent.click(screen.getByRole('button', { name: /add provider/i }))
     const wizard = within(screen.getByRole('dialog'))
@@ -375,7 +477,7 @@ describe('FederatedAgentsPage', () => {
   })
 
   it('warns with dependent agents before disconnecting an entry', async () => {
-    render(<FederatedAgentsPage />)
+    renderPage()
     openProvidersTab()
     const disconnectButtons = screen.getAllByRole('button', { name: /^disconnect$/i })
     fireEvent.click(disconnectButtons[0])
@@ -390,8 +492,8 @@ describe('FederatedAgentsPage', () => {
   })
 
   it('creates a direct agent from a provider entry through the wizard', async () => {
-    render(<FederatedAgentsPage />)
-    fireEvent.click(screen.getByRole('button', { name: /new agent/i }))
+    renderPage()
+    fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     expect(wizard.getByText('Codex CLI harness')).toBeTruthy()
@@ -411,8 +513,8 @@ describe('FederatedAgentsPage', () => {
   })
 
   it('disables incompatible runtimes with the server-provided reason', () => {
-    render(<FederatedAgentsPage />)
-    fireEvent.click(screen.getByRole('button', { name: /new agent/i }))
+    renderPage()
+    fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     fireEvent.click(screen.getByRole('button', { name: /Openai · Personal ChatGPT/i }))
     const codexOption = screen
       .getByText(/OAuth handoff into the Codex CLI is not supported/)
@@ -421,8 +523,8 @@ describe('FederatedAgentsPage', () => {
   })
 
   it('creates a harness agent referencing a provider entry', async () => {
-    render(<FederatedAgentsPage />)
-    fireEvent.click(screen.getByRole('button', { name: /new agent/i }))
+    renderPage()
+    fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))

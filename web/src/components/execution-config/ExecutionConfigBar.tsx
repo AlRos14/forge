@@ -5,7 +5,6 @@ import { AgentSelector } from '@/components/execution-config/AgentSelector'
 import { ModelSelector } from '@/components/execution-config/ModelSelector'
 import { PolicySelector } from '@/components/execution-config/PolicySelector'
 import { ReasoningSelector } from '@/components/execution-config/ReasoningSelector'
-import { Checkbox } from '@/components/ui/checkbox'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useExecutionOverrides, type ExecutionConfigValue } from '@/hooks/useExecutionOverrides'
@@ -21,7 +20,6 @@ export function ExecutionConfigBar({
   executorTypeConstraint,
   disabled,
   useRecentSelections = true,
-  showSaveToAgent = false,
   showAgentSelector = true,
   showPolicySelector = true,
   className,
@@ -36,7 +34,6 @@ export function ExecutionConfigBar({
   executorTypeConstraint?: string | null
   disabled?: boolean
   useRecentSelections?: boolean
-  showSaveToAgent?: boolean
   showAgentSelector?: boolean
   showPolicySelector?: boolean
   className?: string
@@ -98,7 +95,6 @@ export function ExecutionConfigBar({
       permissionPolicy: config.permissionPolicy,
       selection: config.selection,
       overrides: config.overrides,
-      saveToAgent: config.saveToAgent,
     })
   }, [
     config.agentId,
@@ -106,7 +102,6 @@ export function ExecutionConfigBar({
     config.overrides,
     config.permissionPolicy,
     config.reasoningEffort,
-    config.saveToAgent,
     config.selection,
     onChange,
   ])
@@ -200,8 +195,8 @@ export function ExecutionConfigBar({
             )}
           </div>
 
-          <div className="flex items-center justify-between gap-2 min-h-[20px]">
-            {hasCustomValues ? (
+          {hasCustomValues ? (
+            <div className="flex items-center min-h-[20px]">
               <button
                 type="button"
                 className="flex items-center gap-1 text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline cursor-pointer transition-colors duration-150"
@@ -210,22 +205,8 @@ export function ExecutionConfigBar({
                 <ArrowCounterClockwise size={11} />
                 Reset to agent defaults
               </button>
-            ) : (
-              <span />
-            )}
-
-            {showSaveToAgent ? (
-              <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground select-none hover:text-foreground transition-colors duration-150">
-                <Checkbox
-                  className="h-3 w-3 rounded accent-primary cursor-pointer"
-                  checked={config.saveToAgent}
-                  disabled={disabled}
-                  onChange={(e) => config.setSaveToAgent(e.target.checked)}
-                />
-                Save changes to agent
-              </label>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
         </>
       ) : null}
 

@@ -20,6 +20,7 @@ import {
   listAgentProviderCapabilities,
   listProviders,
   getProjectAgentBinding,
+  getProviderUsage,
   registerHarnessAgent,
   removeProviderEntry,
   renameProviderEntry,
@@ -58,6 +59,7 @@ export const federationQueryKeys = {
     ['context-manifests', 'discovery', identityId, contextScopeId] as const,
   projectAgent: (projectId: string) => ['projects', projectId, 'project-agent'] as const,
   providers: ['agent-providers'] as const,
+  providerUsage: (id: string) => ['agent-providers', id, 'usage'] as const,
   providerAuthorization: (id: string) => ['provider-authorizations', id] as const,
 } as const
 
@@ -256,6 +258,21 @@ export function useAgentProviderCapabilitiesQuery() {
     queryKey: federationQueryKeys.providers,
     queryFn: listAgentProviderCapabilities,
     staleTime: 60_000,
+  })
+}
+
+/**
+ * Usage is a best-effort projection: some providers cannot be probed, and
+ * the endpoint itself may not exist on an older server. Never retry hard —
+ * a stale "usage unavailable" is preferable to hammering the provider.
+ */
+export function useProviderUsageQuery(entryId: string | undefined) {
+  return useQuery({
+    queryKey: federationQueryKeys.providerUsage(entryId ?? 'none'),
+    queryFn: () => getProviderUsage(entryId!),
+    enabled: Boolean(entryId),
+    staleTime: 3 * 60_000,
+    retry: false,
   })
 }
 

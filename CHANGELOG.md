@@ -6,6 +6,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Launching a task no longer offers a "Save changes to agent" checkbox on
+  the launch dialog's model/reasoning/policy overrides. Those overrides
+  remain execution-scoped (they only affect the run being launched); the
+  side effect that silently PATCHed the agent's persistent defaults from the
+  Task Detail launch flow is gone. Persistent model changes now live
+  entirely in Agent Settings (`/agents`) — `ChangeModelDialog` also gained a
+  real "Update model" path for CLI-harness agents there (previously they had
+  no way to change their model at all from `/agents`; only the removed
+  launch-dialog checkbox could touch it).
+
 ### Added
 
 - New endpoint `GET /api/v1/providers/{id}/usage` reports a provider entry's
@@ -20,6 +32,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   so the agent had no idea it was running inside Forge. The baseline states the
   agent's identity, scope, and boundaries, includes the bounded portfolio
   projection, and is recorded in the turn's context manifest.
+
+### Changed
+
+- Redesigned the `/agents` page. The Agents tab is now a Runtimes-style
+  master/detail: a searchable/filterable roster on the left, one agent's
+  model, profiles, and bound scopes on the right — the inline session list
+  and capability strips are gone (profiles are the unit of continuity users
+  act on; session internals stay reachable from the chat context inspector).
+  Changing a model is now one `ChangeModelDialog` flow (pick an
+  already-published profile, or publish a new model on a provider entry) that
+  replaces the old two-step "publish profile" + "select profile" dance, and
+  can update a Main/Project Agent binding to the result in the same submit.
+  The Bindings tab now always lists every project's Agent binding — including
+  "Not configured" ones — instead of only rendering a Project Agent section
+  when the page was opened with `?project=`; that param now just
+  scrolls/highlights the matching project's card. Provider entries on the
+  Providers tab show their usage window(s) from the new usage endpoint. The
+  dead legacy `web/src/pages/agents/` UI (unreferenced since the federated
+  agents rewrite) is deleted.
 
 ### Fixed
 

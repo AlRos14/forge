@@ -263,3 +263,25 @@ export type ContextManifestSource = ContextManifestResponse['sources'][number]
 export type ContextManifestLookup = ContextManifestQuery
 export type ContextManifestDiscoveryQuery = ContextManifestListQuery
 export type ContextManifestDiscoveryResponse = ContextManifestListResponse
+
+/**
+ * Provider usage projection (`GET /providers/{id}/usage`). Not yet part of
+ * the generated API types, so it is modeled locally against the contract
+ * the endpoint is being built against.
+ */
+export interface ProviderUsageWindow {
+  id: 'primary' | 'secondary' | string
+  used_percent: number
+  window_minutes: number | null
+  resets_at: string | null
+}
+
+export interface ProviderUsage {
+  id: string
+  provider: string
+  source: 'probe' | 'unknown'
+  plan_type?: string | null
+  windows: ProviderUsageWindow[]
+  fetched_at: string
+  detail?: string | null
+}
