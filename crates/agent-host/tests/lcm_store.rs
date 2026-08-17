@@ -80,7 +80,7 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
     assert_eq!(store.store_revision().as_str(), "forge-sqlite-lcm-1");
     assert_eq!(
         AGENT_RUNTIME_REVISION,
-        "a7075b1d2dd1cee05db63bc480ff46b0f97ec239"
+        "b3f966b0e108e6d4683c0a9c94055aaa6aa7d919"
     );
 
     let entry = LcmEntry::new(
@@ -730,4 +730,137 @@ fn runtime_manifest_link_is_reproducible_and_body_free() {
     assert!(!serialized.contains("known-secret-body"));
     assert!(!serialized.contains("provider-secret"));
     assert!(serialized.contains("content_hash"));
+}
+
+#[tokio::test]
+async fn provisional_tail_truncation_removes_orphans_but_never_node_covered_entries() {
+    let pool = db::create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool");
+    db::run_migrations(&pool).await.expect("migrations");
+    let db = Arc::new(SqliteDb::new(pool));
+    AgentRepo::create(
+        &*db,
+        CreateAgent {
+            id: "truncate-agent".to_owned(),
+            name: "Truncate Agent".to_owned(),
+            description: None,
+            executor_type: "codex".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "account".to_owned(),
+            created_at: "2026-08-12T00:00:00Z".to_owned(),
+            updated_at: "2026-08-12T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("identity");
+
+    let store = SqliteLcmStore::open_for_binding(
+        Arc::clone(&db),
+        "truncate-agent",
+        "account",
+        "account-1",
+        "test-auth",
+        "2026-08-12T00:00:00Z",
+    )
+    .await
+    .expect("store");
+    let view = store.view();
+
+    let classification = || {
+        LcmSourceMetadata::new(LcmClassification::new(
+            agent_runtime::context::Sensitivity::Internal,
+            TrustClass::UserContent,
+        ))
+    };
+    let entries = (0..3)
+        .map(|sequence| {
+            LcmEntry::new(
+                LcmTimelineId::new(store.timeline_id()),
+                LcmEntryId::new(format!("entry-{sequence}")),
+                LcmSequence::new(sequence),
+                Message::user(format!("message {sequence}")),
+                classification(),
+            )
+        })
+        .collect::<Vec<_>>();
+    store
+        .append(
+            &view,
+            LcmAppendRequest::new(LcmOperationId::new("append-0"), entries.clone()),
+        )
+        .await
+        .expect("append");
+
+    // Orphan tail (entries 1..) is removable while no node covers it.
+    let truncated = store
+        .truncate_from(&view, LcmSequence::new(1))
+        .await
+        .expect("truncate provisional tail");
+    assert_eq!(truncated.removed, 2);
+    assert_eq!(truncated.revision.get(), 2);
+    assert_eq!(
+        store
+            .load_range(
+                &view,
+                LcmRange::new(LcmSequence::new(0), LcmSequence::new(2)).unwrap(),
+                8
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Truncating an already-empty tail is a no-op that keeps the revision.
+    let noop = store
+        .truncate_from(&view, LcmSequence::new(1))
+        .await
+        .expect("empty tail truncation");
+    assert_eq!(noop.removed, 0);
+    assert_eq!(noop.revision.get(), 2);
+
+    // Once a node covers an entry, that entry can never be truncated.
+    let node = LeafCommit {
+        expected_revision: noop.revision,
+        operation_id: LcmOperationId::new("leaf-0"),
+        node_id: LcmNodeId::new("node-0"),
+        range: LcmRange::single(LcmSequence::new(0)),
+        entry_ids: vec![entries[0].id.clone()],
+        source_fingerprint: source_fingerprint_entries(std::slice::from_ref(&entries[0])),
+        summary: "covered".to_owned(),
+        token_count: 1,
+        source_token_count: 8,
+        policy_revision: RegistryRevision::new("policy-1"),
+        algorithm_revision: RegistryRevision::new("algorithm-1"),
+        sizer_revision: RegistryRevision::new("sizer-1"),
+        provenance: SummaryProvenance::Deterministic {
+            revision: RegistryRevision::new("deterministic-1"),
+        },
+        classification: LcmClassification::new(
+            agent_runtime::context::Sensitivity::Internal,
+            TrustClass::UserContent,
+        ),
+        operation_fingerprint: None,
+    };
+    store.commit_leaf(&view, node).await.expect("leaf");
+    assert!(matches!(
+        store.truncate_from(&view, LcmSequence::new(0)).await,
+        Err(agent_runtime::lcm::LcmError::RangeOverlap)
+    ));
 }

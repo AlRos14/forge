@@ -5,8 +5,9 @@ use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
 
 use crate::{
     AgentLcmEntryRecord, AgentLcmMutationResult, AgentLcmNodeRecord, AgentLcmOperation,
-    AgentLcmRepo, AgentLcmTimeline, AppendAgentLcmEntries, CommitAgentLcmCondensation,
-    CommitAgentLcmLeaf, CreateAgentLcmTimeline, DbError, Result, SqliteDb,
+    AgentLcmRepo, AgentLcmTimeline, AgentLcmTruncation, AppendAgentLcmEntries,
+    CommitAgentLcmCondensation, CommitAgentLcmLeaf, CreateAgentLcmTimeline, DbError, Result,
+    SqliteDb,
 };
 
 const MAX_LCM_PAGE: i64 = 1_024;
@@ -269,6 +270,53 @@ impl AgentLcmRepo for SqliteDb {
             already_committed: input.entries.is_empty() || all_existing,
             entries: input.entries.len() as i64,
             node_id: None,
+        })
+    }
+
+    async fn truncate_lcm_entries_from(
+        &self,
+        timeline_id: &str,
+        from_sequence: i64,
+        updated_at: &str,
+    ) -> Result<AgentLcmTruncation> {
+        let mut transaction = self.pool().begin().await?;
+        let current = timeline_revision(&mut transaction, timeline_id).await?;
+        let node_reaches_span: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM agent_lcm_node
+                WHERE timeline_id = ? AND range_end >= ?
+             )",
+        )
+        .bind(timeline_id)
+        .bind(from_sequence)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if node_reaches_span {
+            return Err(DbError::Check(
+                "LCM truncation reaches a summary node's source range".to_owned(),
+            ));
+        }
+        let removed =
+            sqlx::query("DELETE FROM agent_lcm_entry WHERE timeline_id = ? AND sequence >= ?")
+                .bind(timeline_id)
+                .bind(from_sequence)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+        let revision = if removed == 0 {
+            current
+        } else {
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| DbError::Check("LCM revision exhausted".to_owned()))?;
+            update_timeline_revision(&mut transaction, timeline_id, next, updated_at).await?;
+            next
+        };
+        transaction.commit().await?;
+        Ok(AgentLcmTruncation {
+            revision,
+            removed: i64::try_from(removed)
+                .map_err(|_| DbError::Check("LCM truncation count exceeds i64".to_owned()))?,
         })
     }
 

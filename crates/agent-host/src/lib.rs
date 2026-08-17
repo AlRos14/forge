@@ -58,7 +58,7 @@ pub use typed_tools::{
 };
 
 /// The immutable revision Forge is built and tested against.
-pub const AGENT_RUNTIME_REVISION: &str = "a7075b1d2dd1cee05db63bc480ff46b0f97ec239";
+pub const AGENT_RUNTIME_REVISION: &str = "b3f966b0e108e6d4683c0a9c94055aaa6aa7d919";
 pub const AGENT_RUNTIME_MINIMUM_RUST: &str = "1.86";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

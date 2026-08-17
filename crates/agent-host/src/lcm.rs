@@ -24,7 +24,7 @@ use agent_runtime::{
         LcmNode, LcmNodeId, LcmNodeKind, LcmOperationFingerprint, LcmOperationId, LcmRange,
         LcmReader, LcmRevision, LcmSequence, LcmSourceMetadata, LcmSummaryError, LcmSummaryModel,
         LcmSummaryModelRequest, LcmSummaryModelResponse, LcmTimelineId, LcmView, LcmWriter,
-        LeafCommit,
+        LeafCommit, TruncateResult,
     },
     registry::{RegistryRevision, TrustClass},
 };
@@ -1089,6 +1089,29 @@ impl LcmWriter for SqliteLcmStore {
             node,
             revision: LcmRevision::new(nonnegative_revision(result.revision)?),
             already_committed: result.already_committed,
+        })
+    }
+
+    async fn truncate_from(
+        &self,
+        view: &LcmView,
+        from: LcmSequence,
+    ) -> Result<TruncateResult, LcmError> {
+        self.authorize_view(view)?;
+        let from = i64::try_from(from.get()).map_err(|_| LcmError::InvalidBound)?;
+        let result = self
+            .db
+            .truncate_lcm_entries_from(&self.timeline.id, from, &db::now_rfc3339())
+            .await
+            .map_err(|error| match error {
+                DbError::Check(message) if message.contains("summary node") => {
+                    LcmError::RangeOverlap
+                }
+                other => map_db_error(other),
+            })?;
+        Ok(TruncateResult {
+            revision: LcmRevision::new(nonnegative_revision(result.revision)?),
+            removed: usize::try_from(result.removed).map_err(|_| LcmError::StoreFailure)?,
         })
     }
 }

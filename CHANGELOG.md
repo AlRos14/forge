@@ -17,6 +17,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A native Agent Chat session no longer wedges permanently after a failed
+  turn ("Conflict: cannot accept a new turn over a non-terminal checkpoint").
+  The embedded runtime synchronized its lossless context memory (LCM) before
+  checking whether the turn completed, so a mid-stream provider failure
+  immortalized disowned history in the immutable LCM store; every later turn
+  then hit "LCM immutable sequence has a gap" during finalization and the
+  checkpoint could never reach terminal. The runtime (bumped to agent-runtime
+  `b3f966b`) now skips LCM sync on non-completed turns and self-heals an
+  already-diverged timeline by truncating the orphaned provisional tail;
+  migration `V079` narrows the LCM entry delete guard so that truncation is
+  possible while entries covered by summary nodes stay immutable. Existing
+  wedged chats recover automatically on their next turn.
 - Agents built on a ChatGPT OAuth login (the Codex backend) now work. Native
   turns send the backend's required request headers (`chatgpt-account-id`,
   `OpenAI-Beta: responses=experimental`, `originator`), and the native

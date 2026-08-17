@@ -298,6 +298,15 @@ pub trait AgentLcmRepo: Send + Sync {
         &self,
         input: AppendAgentLcmEntries,
     ) -> Result<AgentLcmMutationResult>;
+    /// Removes the provisional tail of a timeline's immutable sequence,
+    /// starting at `from_sequence` (inclusive). Fails when any summary
+    /// node's source range reaches into the truncated span.
+    async fn truncate_lcm_entries_from(
+        &self,
+        timeline_id: &str,
+        from_sequence: i64,
+        updated_at: &str,
+    ) -> Result<AgentLcmTruncation>;
     async fn commit_lcm_leaf(&self, input: CommitAgentLcmLeaf) -> Result<AgentLcmMutationResult>;
     async fn commit_lcm_condensation(
         &self,
@@ -355,6 +364,12 @@ pub struct AgentLcmMutationResult {
     pub already_committed: bool,
     pub entries: i64,
     pub node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentLcmTruncation {
+    pub revision: i64,
+    pub removed: i64,
 }
 
 #[async_trait]
