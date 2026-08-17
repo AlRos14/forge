@@ -29,6 +29,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   migration `V079` narrows the LCM entry delete guard so that truncation is
   possible while entries covered by summary nodes stay immutable. Existing
   wedged chats recover automatically on their next turn.
+- A spent provider usage window (e.g. ChatGPT's `usage_limit_reached` 429) is
+  no longer retried until the turn deadline and reported as the misleading
+  "turn limit reached". The transport maps it to a non-retryable
+  limit-exhausted error with the reset horizon, and Agent Chat turn jobs
+  record the structured error code `usage_limit`.
 - Agents built on a ChatGPT OAuth login (the Codex backend) now work. Native
   turns send the backend's required request headers (`chatgpt-account-id`,
   `OpenAI-Beta: responses=experimental`, `originator`), and the native

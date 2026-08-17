@@ -54,7 +54,18 @@ impl ReqwestTransport {
             tracing::warn!(status, body = %body_excerpt, "provider request rejected");
             let (kind, retryable) = match status {
                 401 | 403 => (ProviderErrorKind::Auth, false),
-                429 => (ProviderErrorKind::RateLimited, true),
+                // A spent usage window is not a momentary throttle: retrying
+                // cannot clear it, so surface it as LimitExhausted with the
+                // reset horizon instead of burning the turn deadline.
+                429 => match usage_limit_rejection(&body_excerpt) {
+                    Some(message) => {
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::LimitExhausted,
+                            message,
+                        ));
+                    }
+                    None => (ProviderErrorKind::RateLimited, true),
+                },
                 400..=499 => (ProviderErrorKind::BadRequest, false),
                 _ => (ProviderErrorKind::Server, true),
             };
@@ -86,6 +97,44 @@ impl ReqwestTransport {
             body,
         })
     }
+}
+
+/// Detects a spent usage window in a 429 body (e.g. ChatGPT's
+/// `usage_limit_reached`), as opposed to a transient burst throttle a short
+/// backoff clears. Returns the user-facing message when the window is spent.
+fn usage_limit_rejection(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let kind = error
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let resets_in = error.get("resets_in_seconds").and_then(|v| v.as_u64());
+    if kind != "usage_limit_reached" && resets_in.is_none_or(|seconds| seconds < 60) {
+        return None;
+    }
+    Some(match resets_in {
+        Some(seconds) => format!(
+            "provider usage limit reached; resets in {}",
+            coarse_duration(seconds)
+        ),
+        None => "provider usage limit reached".to_owned(),
+    })
+}
+
+fn coarse_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return "under a minute".to_owned();
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{}h {}m", hours, minutes % 60);
+    }
+    format!("{}d {}h", hours / 24, hours % 24)
 }
 
 async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String), ProviderError> {
@@ -220,5 +269,37 @@ mod tests {
         ] {
             assert!(provider_client_for_url(url).await.is_err(), "{url}");
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_limit_tests {
+    use super::usage_limit_rejection;
+
+    #[test]
+    fn spent_usage_window_is_detected_with_reset_horizon() {
+        let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1787196675,"resets_in_seconds":286375}}"#;
+        let message = usage_limit_rejection(body).expect("spent window detected");
+        assert!(message.contains("usage limit reached"), "{message}");
+        assert!(message.contains("3d"), "{message}");
+    }
+
+    #[test]
+    fn transient_throttle_and_junk_bodies_stay_retryable() {
+        for body in [
+            r#"{"error":{"type":"rate_limit_exceeded","resets_in_seconds":5}}"#,
+            r#"{"error":{"type":"rate_limit_exceeded"}}"#,
+            "not json at all",
+            "{}",
+        ] {
+            assert!(usage_limit_rejection(body).is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn long_reset_without_explicit_type_counts_as_spent() {
+        let body = r#"{"error":{"type":"rate_limit_exceeded","resets_in_seconds":7200}}"#;
+        let message = usage_limit_rejection(body).expect("long reset is a spent window");
+        assert!(message.contains("2h"), "{message}");
     }
 }

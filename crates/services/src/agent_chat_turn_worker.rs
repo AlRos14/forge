@@ -4076,7 +4076,9 @@ fn bounded_error_message(value: &str) -> String {
 
 fn classify_turn_error(error: &ServiceError) -> &'static str {
     let text = error.to_string().to_ascii_lowercase();
-    if text.contains("credential") {
+    if text.contains("usage limit") || text.contains("limit exhausted") {
+        "usage_limit"
+    } else if text.contains("credential") {
         "credential_unavailable"
     } else if text.contains("cancel") {
         "cancelled"
