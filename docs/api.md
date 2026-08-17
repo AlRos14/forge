@@ -142,6 +142,7 @@ database for historical provenance.
 | POST   | `/api/v1/providers` | Create an API-key provider entry (`provider`, `label`, `credential`, optional `base_url`; required for `openai_compatible`); never creates an agent |
 | PATCH  | `/api/v1/providers/{id}` | Rename a provider entry with optimistic concurrency |
 | POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at` |
+| GET    | `/api/v1/providers/{id}/usage` | Account usage (rate-limit windows) for the entry, e.g. ChatGPT's 5h/weekly windows; `source` is `probe` when live data was fetched, `unknown` (empty `windows`, a `detail` message) otherwise — only ChatGPT-OAuth (Codex backend) entries are probeable today |
 | DELETE | `/api/v1/providers/{id}?version={version}` | Disconnect a provider entry; returns redacted provider-revocation status plus the affected agents, which become visibly unhealthy |
 | POST   | `/api/v1/provider-authorizations` | Start a finite browser/device provider authorization operation |
 | GET    | `/api/v1/provider-authorizations/{id}` | Poll an account-owned provider authorization operation |

@@ -1745,3 +1745,20 @@ export interface UserSearchResult {
   email: string
   display_name: string | null
 }
+
+export interface ProviderUsageWindow {
+  id: string
+  used_percent: number
+  window_minutes: number | null
+  resets_at: string | null
+}
+
+export interface ProviderUsageResponse {
+  id: string
+  provider: string
+  source: 'probe' | 'unknown'
+  plan_type?: string | null
+  windows: ProviderUsageWindow[]
+  fetched_at: string
+  detail: string | null
+}

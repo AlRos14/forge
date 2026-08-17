@@ -788,6 +788,10 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::providers::test_provider_entry),
         )
         .route(
+            "/api/v1/providers/{id}/usage",
+            get(routes::providers::usage_provider_entry),
+        )
+        .route(
             "/api/v1/provider-authorizations",
             post(routes::provider_authorizations::start_provider_authorization),
         )

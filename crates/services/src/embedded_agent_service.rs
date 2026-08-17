@@ -36,6 +36,11 @@ const NATIVE_EXECUTOR_TYPE: &str = "embedded";
 const DEFAULT_CONTEXT_TOKENS: u32 = 128_000;
 const DEFAULT_MAX_INPUT_TOKENS: u32 = 96_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_000;
+/// The Codex CLI's usage API — `GET /wham/usage` beside the `backend-api`
+/// Responses endpoint used by native turns — the only way to read an
+/// account's ChatGPT rate-limit consumption without spending a model
+/// request.
+const CHATGPT_USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 #[derive(Clone)]
 pub struct EmbeddedAgentService {
@@ -157,6 +162,43 @@ impl ProviderEntryTestOutcome {
             latency_ms,
             message: Some(message),
             checked_at: now_rfc3339(),
+        }
+    }
+}
+
+/// One provider-reported rate-limit window, already normalized to the API
+/// shape (`window_minutes`, RFC3339 `resets_at`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderUsageWindowOutcome {
+    pub id: String,
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<String>,
+}
+
+/// Redacted result of a live provider account-usage probe. `probed` is
+/// `false` — with empty `windows` and a `detail` message — whenever the
+/// provider isn't probeable or the probe failed. Usage is never fabricated
+/// as 0%.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderUsageOutcome {
+    pub provider: String,
+    pub probed: bool,
+    pub plan_type: Option<String>,
+    pub windows: Vec<ProviderUsageWindowOutcome>,
+    pub fetched_at: String,
+    pub detail: Option<String>,
+}
+
+impl ProviderUsageOutcome {
+    fn unsupported(provider: String, detail: impl Into<String>) -> Self {
+        Self {
+            provider,
+            probed: false,
+            plan_type: None,
+            windows: Vec::new(),
+            fetched_at: now_rfc3339(),
+            detail: Some(detail.into()),
         }
     }
 }
@@ -404,6 +446,106 @@ impl EmbeddedAgentService {
             }
         };
         Ok(outcome)
+    }
+
+    /// Fetch the entry's provider-side account usage (rate-limit windows)
+    /// when the provider supports a usage probe. Only ChatGPT-OAuth (Codex
+    /// backend) entries are probeable today; every other entry — and any
+    /// probe failure — reports `probed: false` with a redacted `detail`.
+    /// Usage is never fabricated as 0%.
+    pub async fn usage_provider_entry(
+        &self,
+        owner_user_id: &str,
+        credential_id: &str,
+    ) -> Result<ProviderUsageOutcome> {
+        let entry = self
+            .require_owned_entry(owner_user_id, credential_id)
+            .await?;
+        let base_url = entry_base_url(&entry)?;
+        let is_codex_oauth = entry.credential_method == "oauth_bundle"
+            && entry.provider == "openai"
+            && is_codex_backend(&base_url);
+        if !is_codex_oauth {
+            return Ok(ProviderUsageOutcome::unsupported(
+                entry.provider,
+                "usage probe not supported for this provider",
+            ));
+        }
+
+        let secret = match self
+            .protected_store
+            .acquire_provider_credential(owner_user_id, credential_id, 60_000)
+            .await
+        {
+            Ok(secret) => secret,
+            Err(error) => {
+                let message = match redacted_host_error(error) {
+                    ServiceError::NotFound { .. } => {
+                        "provider credential is unavailable".to_owned()
+                    }
+                    _ => "provider credential could not be refreshed".to_owned(),
+                };
+                return Ok(ProviderUsageOutcome::unsupported(entry.provider, message));
+            }
+        };
+
+        let account_id = entry_provider_account_id(&entry);
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                return Ok(ProviderUsageOutcome::unsupported(
+                    entry.provider,
+                    "usage probe client unavailable",
+                ));
+            }
+        };
+        let mut request = client
+            .get(CHATGPT_USAGE_ENDPOINT)
+            .header("originator", "codex_cli_rs")
+            .bearer_auth(secret.expose());
+        if let Some(account_id) = account_id.as_deref() {
+            request = request.header("chatgpt-account-id", account_id);
+        }
+
+        Ok(match request.send().await {
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(body) => match usage_snapshot_from_wham_json(&body, now_unix_seconds()) {
+                    Ok((plan_type, windows)) => ProviderUsageOutcome {
+                        provider: entry.provider,
+                        probed: true,
+                        plan_type,
+                        windows,
+                        fetched_at: now_rfc3339(),
+                        detail: None,
+                    },
+                    Err(_) => ProviderUsageOutcome::unsupported(
+                        entry.provider,
+                        "usage probe returned an unreadable response",
+                    ),
+                },
+                Err(_) => ProviderUsageOutcome::unsupported(
+                    entry.provider,
+                    "usage probe response could not be read",
+                ),
+            },
+            Ok(response) => ProviderUsageOutcome::unsupported(
+                entry.provider,
+                format!("usage probe returned HTTP {}", response.status().as_u16()),
+            ),
+            Err(error) => {
+                let reason = if error.is_timeout() {
+                    "usage probe did not respond within 10 seconds"
+                } else if error.is_connect() {
+                    "usage probe could not be reached"
+                } else {
+                    "usage probe request failed before a response arrived"
+                };
+                ProviderUsageOutcome::unsupported(entry.provider, reason)
+            }
+        })
     }
 
     pub async fn create_agent_from_entry(
@@ -1414,6 +1556,82 @@ pub fn entry_provider_account_id(entry: &CredentialHandle) -> Option<String> {
         })
 }
 
+/// The subset of a `GET /wham/usage` response this probe reads. Everything
+/// else the endpoint reports — credits, spend controls — is account
+/// commerce, not limit state, and stays unread.
+#[derive(Debug, Deserialize)]
+struct WhamUsageWindowWire {
+    used_percent: Option<f64>,
+    limit_window_seconds: Option<i64>,
+    reset_after_seconds: Option<i64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhamUsageRateLimitWire {
+    primary_window: Option<WhamUsageWindowWire>,
+    secondary_window: Option<WhamUsageWindowWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhamUsagePayloadWire {
+    plan_type: Option<String>,
+    rate_limit: Option<WhamUsageRateLimitWire>,
+}
+
+/// Converts a `/wham/usage` response body into the plan type and normalized
+/// usage windows the API reports. Pure (given `now_unix_seconds`) so the
+/// `reset_at`/`reset_after_seconds`/`window_minutes` edge cases are
+/// unit-testable without a live probe.
+fn usage_snapshot_from_wham_json(
+    body: &str,
+    now_unix_seconds: i64,
+) -> std::result::Result<(Option<String>, Vec<ProviderUsageWindowOutcome>), serde_json::Error> {
+    let payload: WhamUsagePayloadWire = serde_json::from_str(body)?;
+    let mut windows = Vec::new();
+    if let Some(rate_limit) = payload.rate_limit {
+        for (id, window) in [
+            ("primary", rate_limit.primary_window),
+            ("secondary", rate_limit.secondary_window),
+        ] {
+            let Some(window) = window else { continue };
+            let Some(used_percent) = window.used_percent.filter(|percent| percent.is_finite())
+            else {
+                continue;
+            };
+            // The absolute reset time speaks when present; a `0` delay
+            // beside it is filler, not "resets now". Only fall back to the
+            // relative delay when no absolute time was given.
+            let resets_at = window
+                .reset_at
+                .and_then(rfc3339_from_unix_seconds)
+                .or_else(|| {
+                    window
+                        .reset_after_seconds
+                        .filter(|seconds| *seconds > 0)
+                        .and_then(|seconds| {
+                            rfc3339_from_unix_seconds(now_unix_seconds.saturating_add(seconds))
+                        })
+                });
+            windows.push(ProviderUsageWindowOutcome {
+                id: id.to_owned(),
+                used_percent,
+                window_minutes: window.limit_window_seconds.map(|seconds| seconds / 60),
+                resets_at,
+            });
+        }
+    }
+    Ok((payload.plan_type, windows))
+}
+
+fn rfc3339_from_unix_seconds(seconds: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(seconds, 0).map(|instant| instant.to_rfc3339())
+}
+
+fn now_unix_seconds() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
 async fn provider_url_addresses(
     base_url: &str,
 ) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
@@ -1950,6 +2168,88 @@ mod tests {
         let mut compatible = handle("api_key", "{}");
         compatible.provider = "openai_compatible".to_owned();
         assert!(entry_base_url(&compatible).is_err());
+    }
+
+    #[test]
+    fn usage_payload_maps_windows_and_prefers_absolute_reset_over_a_zero_filler_delay() {
+        let now = 1_700_000_000;
+        let body = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 42,
+                    "limit_window_seconds": 300,
+                    "reset_after_seconds": 0,
+                    "reset_at": 1_704_069_000,
+                },
+                "secondary_window": {
+                    "used_percent": 84.5,
+                    "limit_window_seconds": 3600,
+                    "reset_after_seconds": 1800,
+                },
+            },
+        })
+        .to_string();
+        let (plan_type, windows) =
+            usage_snapshot_from_wham_json(&body, now).expect("payload parses");
+        assert_eq!(plan_type.as_deref(), Some("pro"));
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].id, "primary");
+        assert_eq!(windows[0].used_percent, 42.0);
+        assert_eq!(windows[0].window_minutes, Some(5));
+        // The zero delay beside an absolute reset is filler, not "resets now".
+        assert_eq!(
+            windows[0].resets_at,
+            rfc3339_from_unix_seconds(1_704_069_000)
+        );
+        assert_eq!(windows[1].id, "secondary");
+        assert_eq!(windows[1].used_percent, 84.5);
+        assert_eq!(windows[1].window_minutes, Some(60));
+        assert_eq!(windows[1].resets_at, rfc3339_from_unix_seconds(now + 1800));
+    }
+
+    #[test]
+    fn usage_payload_without_rate_limit_reports_no_windows_not_zeroes() {
+        let body = serde_json::json!({ "plan_type": "plus" }).to_string();
+        let (plan_type, windows) =
+            usage_snapshot_from_wham_json(&body, 1_700_000_000).expect("payload parses");
+        assert_eq!(plan_type.as_deref(), Some("plus"));
+        assert!(windows.is_empty());
+    }
+
+    #[test]
+    fn usage_window_with_no_reset_signal_reports_no_resets_at() {
+        let body = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 10,
+                    "limit_window_seconds": 300,
+                },
+            },
+        })
+        .to_string();
+        let (_, windows) = usage_snapshot_from_wham_json(&body, 1_700_000_000).expect("parses");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].resets_at, None);
+    }
+
+    #[test]
+    fn usage_window_missing_used_percent_is_skipped() {
+        let body = serde_json::json!({
+            "rate_limit": {
+                "primary_window": { "limit_window_seconds": 300 },
+                "secondary_window": { "used_percent": 12.5, "limit_window_seconds": 60 },
+            },
+        })
+        .to_string();
+        let (_, windows) = usage_snapshot_from_wham_json(&body, 1_700_000_000).expect("parses");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "secondary");
+    }
+
+    #[test]
+    fn usage_payload_malformed_json_is_an_error() {
+        assert!(usage_snapshot_from_wham_json("not json", 1_700_000_000).is_err());
     }
 
     async fn test_service_with_owner() -> (EmbeddedAgentService, String) {

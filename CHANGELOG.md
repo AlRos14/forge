@@ -8,6 +8,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- New endpoint `GET /api/v1/providers/{id}/usage` reports a provider entry's
+  account usage (e.g. ChatGPT's 5h/weekly rate-limit windows) so the UI can
+  show it on provider entries. Only ChatGPT-OAuth (Codex backend) entries are
+  probeable today, via the Codex CLI's `GET /wham/usage` endpoint; every other
+  entry — and any probe failure — reports `source: "unknown"` with a redacted
+  `detail` message and no windows. Usage is never fabricated as 0%.
 - Main Agent Chat turns outside an active Product Genesis session now carry a
   server-owned baseline operating skill (`forge.main.baseline/v1`). Previously
   a plain Main Agent chat could reach the model with no system prompt at all,

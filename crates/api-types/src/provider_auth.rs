@@ -259,3 +259,30 @@ pub struct RenameProviderEntryRequest {
     #[ts(type = "number")]
     pub version: i64,
 }
+
+/// One provider-reported rate-limit window (e.g. ChatGPT's rolling 5h/weekly
+/// windows).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct ProviderUsageWindow {
+    pub id: String,
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<String>,
+}
+
+/// Live (or best-effort) account usage for a provider entry. `source` is
+/// `probe` only when live data was actually fetched; `unknown` — with empty
+/// `windows` and a `detail` message — whenever the provider isn't probeable
+/// or the probe failed. Usage is never fabricated as 0%.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct ProviderUsageResponse {
+    pub id: String,
+    pub provider: String,
+    pub source: String,
+    pub plan_type: Option<String>,
+    pub windows: Vec<ProviderUsageWindow>,
+    pub fetched_at: String,
+    pub detail: Option<String>,
+}

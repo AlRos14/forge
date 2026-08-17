@@ -8,7 +8,7 @@ use api_types::{
     AgentProviderCapabilitiesResponse, CliRuntimeEntryResponse, CreateProviderEntryRequest,
     DetectedCli, DisconnectCredentialResponse, ProviderEntriesResponse, ProviderEntryAgentRef,
     ProviderEntryResponse, ProviderEntryTestResponse, ProviderRevocationStatus,
-    RenameProviderEntryRequest, SessionVersionRequest,
+    ProviderUsageResponse, ProviderUsageWindow, RenameProviderEntryRequest, SessionVersionRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -96,6 +96,35 @@ pub async fn test_provider_entry(
         latency_ms: outcome.latency_ms,
         message: outcome.message,
         checked_at: outcome.checked_at,
+    }))
+}
+
+pub async fn usage_provider_entry(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ProviderUsageResponse>> {
+    let outcome = state
+        .embedded_agent_service
+        .usage_provider_entry(&user.user_id, &id)
+        .await?;
+    Ok(Json(ProviderUsageResponse {
+        id,
+        provider: outcome.provider,
+        source: if outcome.probed { "probe" } else { "unknown" }.to_owned(),
+        plan_type: outcome.plan_type,
+        windows: outcome
+            .windows
+            .into_iter()
+            .map(|window| ProviderUsageWindow {
+                id: window.id,
+                used_percent: window.used_percent,
+                window_minutes: window.window_minutes,
+                resets_at: window.resets_at,
+            })
+            .collect(),
+        fetched_at: outcome.fetched_at,
+        detail: outcome.detail,
     }))
 }
 
