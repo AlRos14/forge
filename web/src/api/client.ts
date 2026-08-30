@@ -58,7 +58,11 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
   const makeHeaders = (overrideToken?: string) => {
     const h = new Headers(headers)
     const isFormDataBody = typeof FormData !== 'undefined' && fetchInit.body instanceof FormData
-    if (!h.has('content-type') && !isFormDataBody) {
+    const hasJsonBody =
+      fetchInit.body !== undefined && fetchInit.body !== null && fetchInit.body !== '' && !isFormDataBody
+    // Only advertise JSON when a body is present. Axum's Json extractor
+    // treats `Content-Type: application/json` + empty body as a parse error.
+    if (!h.has('content-type') && hasJsonBody) {
       h.set('content-type', 'application/json')
     }
     const token = overrideToken ?? useAuthStore.getState().accessToken

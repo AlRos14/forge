@@ -16,6 +16,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
+mod extract;
 pub mod errors;
 pub mod middleware;
 mod path_input;
