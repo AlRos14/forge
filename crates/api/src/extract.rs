@@ -12,11 +12,7 @@ use crate::errors::ApiError;
 pub struct OptionalJson<T>(pub T);
 
 pub fn parse_optional_json<T: Default + DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
-    let trimmed = bytes
-        .iter()
-        .copied()
-        .skip_while(u8::is_ascii_whitespace)
-        .collect::<Vec<_>>();
+    let trimmed = bytes.trim_ascii();
     if trimmed.is_empty() || trimmed == b"null" {
         return Ok(T::default());
     }
@@ -62,6 +58,13 @@ mod tests {
     #[test]
     fn null_body_is_default() {
         let parsed = parse_optional_json::<TaskActionRequest>(b"null").expect("null");
+        assert_eq!(parsed.version, None);
+    }
+
+    #[test]
+    fn null_body_with_surrounding_whitespace_is_default() {
+        let parsed = parse_optional_json::<TaskActionRequest>(b" \tnull\r\n").expect("padded null");
+        assert_eq!(parsed.reason, None);
         assert_eq!(parsed.version, None);
     }
 

@@ -694,6 +694,9 @@ Intent endpoints accept an optional `TaskActionRequest` body:
 ```
 
 Both fields are optional. Successful responses are the normal `TaskResponse`.
+An omitted body, an empty or whitespace-only payload, and JSON `null` all use
+the request defaults, including when the client sends
+`Content-Type: application/json` with no bytes.
 The action service resolves the project's workflow at request time, so clients
 do not need to encode concrete state names. `start` claims an available agent
 when needed and enters the first claimable active/gate state; `submit` follows

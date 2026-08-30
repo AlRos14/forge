@@ -54,6 +54,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Task intent-action POSTs now accept omitted, empty, whitespace-only, or JSON
+  `null` bodies even when a client advertises `Content-Type: application/json`;
+  the web client no longer emits that content type when it sends no body.
 - A native Agent Chat session no longer wedges permanently after a failed
   turn ("Conflict: cannot accept a new turn over a non-terminal checkpoint").
   The embedded runtime synchronized its lossless context memory (LCM) before
