@@ -108,6 +108,8 @@ export function ExecutionConfigBar({
 
   useEffect(() => {
     if (!discoveredOptions || !config.modelId) return
+    // An empty catalog (historically Cursor) must not wipe a selected or custom id.
+    if (discoveredOptions.models.length === 0) return
     if (!discoveredOptions.models.some((m) => m.id === config.modelId)) {
       config.setModelId(null)
     }

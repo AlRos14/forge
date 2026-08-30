@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 500;
 const STATUS_TIMEOUT_SECONDS: u64 = 2;
+const LIST_MODELS_TIMEOUT_SECONDS: u64 = 5;
 
 pub struct CursorAdapter {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
@@ -126,7 +127,7 @@ impl CodingExecutorAdapter for CursorAdapter {
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
-            models: vec![],
+            models: discover_cursor_models(),
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
             cli_specific: serde_json::json!({
                 "output_formats": ["text", "json", "stream-json"],
@@ -515,6 +516,60 @@ fn truncate_summary(content: &str) -> String {
     }
 }
 
+fn default_cursor_models() -> Vec<String> {
+    vec![
+        "auto".into(),
+        "composer-2.5".into(),
+        "composer-2.5-fast".into(),
+        "cursor-grok-4.6-medium-fast".into(),
+        "cursor-grok-4.6-high-fast".into(),
+        "cursor-grok-4.6-xhigh-fast".into(),
+        "claude-sonnet-5-thinking-high".into(),
+        "claude-opus-5-thinking-high".into(),
+        "gpt-5.6-sol-high".into(),
+        "gpt-5.3-codex".into(),
+    ]
+}
+
+fn parse_cursor_list_models(output: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("available models") {
+            continue;
+        }
+        let Some((id, _)) = line.split_once(" - ") else {
+            continue;
+        };
+        let id = id.trim();
+        if id.is_empty() || id.contains(' ') {
+            continue;
+        }
+        if !models.iter().any(|existing| existing == id) {
+            models.push(id.to_owned());
+        }
+    }
+    models
+}
+
+fn discover_cursor_models() -> Vec<String> {
+    if executable_in_path("cursor-agent") {
+        let mut command = std::process::Command::new("cursor-agent");
+        command.arg("--list-models");
+        if let Some(output) =
+            command_output_timeout(command, Duration::from_secs(LIST_MODELS_TIMEOUT_SECONDS))
+        {
+            if output.status.success() {
+                let parsed = parse_cursor_list_models(&String::from_utf8_lossy(&output.stdout));
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+        }
+    }
+    default_cursor_models()
+}
+
 fn detect_cursor_availability() -> AvailabilityInfo {
     if std::env::var("CURSOR_API_KEY")
         .ok()
@@ -665,6 +720,23 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert!(args.contains(&"--force".to_owned()));
+    }
+
+    #[test]
+    fn parses_cursor_list_models_text() {
+        let models = parse_cursor_list_models(
+            "Available models\n\nauto - Auto (default)\ncursor-grok-4.6-medium-fast - Cursor Grok 4.6 Medium Fast\n",
+        );
+        assert_eq!(
+            models,
+            vec!["auto", "cursor-grok-4.6-medium-fast"]
+        );
+    }
+
+    #[test]
+    fn default_cursor_models_are_non_empty() {
+        assert!(default_cursor_models().contains(&"auto".to_owned()));
+        assert!(default_cursor_models().contains(&"cursor-grok-4.6-medium-fast".to_owned()));
     }
 
     #[test]

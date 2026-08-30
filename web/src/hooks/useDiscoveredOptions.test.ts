@@ -50,6 +50,18 @@ describe('normalizeDiscoveredOptions', () => {
     })
   })
 
+  it('labels cursor, grok, and gemini model providers', () => {
+    const options = normalizeDiscoveredOptions({
+      models: ['cursor-grok-4.6-medium-fast', 'composer-2.5', 'gemini-3.7-flash-high'],
+    })
+
+    expect(options.models.map((model) => [model.id, model.provider])).toEqual([
+      ['cursor-grok-4.6-medium-fast', 'xAI'],
+      ['composer-2.5', 'Cursor'],
+      ['gemini-3.7-flash-high', 'Google'],
+    ])
+  })
+
   it('keeps the legacy shared effort fallback when adapters omit per-model metadata', () => {
     const options = normalizeDiscoveredOptions({ models: ['custom-model'] })
 

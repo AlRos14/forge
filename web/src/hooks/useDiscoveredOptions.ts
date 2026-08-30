@@ -39,6 +39,9 @@ function providerForModel(modelId: string): string | null {
   const lower = modelId.toLowerCase()
   if (lower.includes('claude')) return 'Anthropic'
   if (lower.includes('gpt') || lower.includes('codex') || lower.includes('o3')) return 'OpenAI'
+  if (lower.includes('grok')) return 'xAI'
+  if (lower.includes('gemini')) return 'Google'
+  if (lower.includes('composer') || lower.startsWith('cursor-')) return 'Cursor'
   return null
 }
 
