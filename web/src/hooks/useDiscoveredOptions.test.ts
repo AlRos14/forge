@@ -60,15 +60,12 @@ describe('normalizeDiscoveredOptions', () => {
       ['composer-2.5', 'Cursor'],
       ['gemini-3.7-flash-high', 'Google'],
     ])
+    expect(options.models.every((model) => model.reasoningOptions.length === 0)).toBe(true)
   })
 
-  it('keeps the legacy shared effort fallback when adapters omit per-model metadata', () => {
+  it('does not invent reasoning controls when an adapter omits the capability', () => {
     const options = normalizeDiscoveredOptions({ models: ['custom-model'] })
 
-    expect(getReasoningOptionsForModel(options, 'custom-model').map((entry) => entry.id)).toEqual([
-      'low',
-      'medium',
-      'high',
-    ])
+    expect(getReasoningOptionsForModel(options, 'custom-model')).toEqual([])
   })
 })

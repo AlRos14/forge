@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 500;
 const STATUS_TIMEOUT_SECONDS: u64 = 2;
-const LIST_MODELS_TIMEOUT_SECONDS: u64 = 5;
+const LIST_MODELS_TIMEOUT_SECONDS: u64 = 10;
 
 pub struct CursorAdapter {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
@@ -127,7 +127,7 @@ impl CodingExecutorAdapter for CursorAdapter {
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
-            models: discover_cursor_models(),
+            models: discover_cursor_models().await,
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
             cli_specific: serde_json::json!({
                 "output_formats": ["text", "json", "stream-json"],
@@ -552,18 +552,20 @@ fn parse_cursor_list_models(output: &str) -> Vec<String> {
     models
 }
 
-fn discover_cursor_models() -> Vec<String> {
+async fn discover_cursor_models() -> Vec<String> {
     if executable_in_path("cursor-agent") {
-        let mut command = std::process::Command::new("cursor-agent");
+        let mut command = tokio::process::Command::new("cursor-agent");
         command.arg("--list-models");
-        if let Some(output) =
-            command_output_timeout(command, Duration::from_secs(LIST_MODELS_TIMEOUT_SECONDS))
+        if let Some(output) = crate::command::output_with_timeout(
+            command,
+            Duration::from_secs(LIST_MODELS_TIMEOUT_SECONDS),
+        )
+        .await
+            && output.status.success()
         {
-            if output.status.success() {
-                let parsed = parse_cursor_list_models(&String::from_utf8_lossy(&output.stdout));
-                if !parsed.is_empty() {
-                    return parsed;
-                }
+            let parsed = parse_cursor_list_models(&String::from_utf8_lossy(&output.stdout));
+            if !parsed.is_empty() {
+                return parsed;
             }
         }
     }
@@ -727,10 +729,7 @@ mod tests {
         let models = parse_cursor_list_models(
             "Available models\n\nauto - Auto (default)\ncursor-grok-4.6-medium-fast - Cursor Grok 4.6 Medium Fast\n",
         );
-        assert_eq!(
-            models,
-            vec!["auto", "cursor-grok-4.6-medium-fast"]
-        );
+        assert_eq!(models, vec!["auto", "cursor-grok-4.6-medium-fast"]);
     }
 
     #[test]

@@ -20,6 +20,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Codex and Cursor execution options now discover their selectable models from
+  their CLI harness (`codex debug models` and `cursor-agent --list-models`).
+  Both retain bounded built-in fallbacks, preserve custom model ids, and only
+  show reasoning controls that the selected harness explicitly supports.
 - New endpoint `GET /api/v1/providers/{id}/usage` reports a provider entry's
   account usage (e.g. ChatGPT's 5h/weekly rate-limit windows) so the UI can
   show it on provider entries. Only ChatGPT-OAuth (Codex backend) entries are
