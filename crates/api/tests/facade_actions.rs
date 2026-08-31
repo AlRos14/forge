@@ -1,9 +1,13 @@
 mod common;
 
 use api_types::{ErrorResponse, TaskResponse, WorkflowDefinition};
-use axum::http::{Method, StatusCode};
+use axum::{
+    body::Body,
+    http::{header, Method, Request, StatusCode},
+};
 use db::TransitionLogRepo;
 use serde_json::{json, Value};
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn unavailable_actions_include_capabilities_for_both_workflows() {
@@ -48,6 +52,38 @@ async fn unavailable_actions_include_capabilities_for_both_workflows() {
         assert!(actions.iter().any(|action| action == "start"));
         assert!(actions.iter().any(|action| action == "cancel"));
     }
+}
+
+#[tokio::test]
+async fn task_actions_accept_an_empty_json_body() {
+    let workspace_root = common::TestDir::new("facade-empty-json-action");
+    let repo_root = common::TestDir::new("facade-empty-json-repo");
+    let repo_path = common::setup_git_repo(repo_root.path());
+    let harness = common::test_app(workspace_root.path(), "facade-empty-json-action").await;
+    let (project_id, _) =
+        common::create_project_and_repo(&harness.app, "Empty JSON", &repo_path).await;
+    let task = create_task(&harness.app, &project_id, "empty JSON cancel").await;
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/tasks/{}/cancel", task.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", common::test_jwt()),
+                )
+                .body(Body::empty())
+                .expect("build empty JSON action request"),
+        )
+        .await
+        .expect("task action response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_api_transition(&harness, &task.id, "todo", "cancelled").await;
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 pub mod errors;
+mod extract;
 pub mod middleware;
 mod path_input;
 pub mod routes;
