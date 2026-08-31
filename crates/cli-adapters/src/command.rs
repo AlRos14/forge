@@ -1,7 +1,21 @@
 use executors::CommandOverrides;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::time::Duration;
 use tokio::process::Command;
+
+/// Run a discovery command without letting a stalled CLI pin an async worker
+/// or survive after the timeout expires.
+pub async fn output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    command.kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .ok()?
+        .ok()
+}
 
 /// Builds a tokio Command from adapter defaults + user overrides.
 pub struct CommandBuilder {

@@ -655,13 +655,21 @@ reasoning controls, `cli_specific.model_reasoning_efforts` maps each model id
 to its supported values; `cli_specific.reasoning_efforts` is the union used
 when no model is selected.
 
-Codex currently advertises GPT-5.6 Sol, Terra, and Luna plus supported older
-picker models. Claude Code advertises Claude Fable 5, Opus 5, Sonnet 5, and
-Haiku 4.5. The web client uses the per-model map so, for example, Codex
-`ultra` is not offered for Luna and reasoning controls are not offered for
-Claude Haiku 4.5. Clients may still submit a custom model id because providers
-and account entitlements can expose additional models. Gemini advertises its
-stable aliases plus the current visible Gemini 3.x and 2.5 CLI models.
+Codex discovers the visible catalog and each model's reasoning ladder from
+`codex debug models` using the same pinned CLI harness that runs executions.
+If refresh fails, Forge retries the CLI's bundled catalog and finally falls
+back to a small built-in catalog.
+Cursor similarly discovers models from `cursor-agent --list-models` and uses a
+built-in fallback when the CLI is unavailable. Discovery commands are bounded
+by a timeout and terminated if they stall.
+
+Claude Code advertises Claude Fable 5, Opus 5, Sonnet 5, and Haiku 4.5. The
+web client only renders reasoning choices advertised explicitly by an adapter;
+for example, Codex `ultra` is not offered for Luna and Cursor does not show a
+separate reasoning selector because effort is encoded in its model ids.
+Clients may still submit a custom model id, and a partial or fallback catalog
+never clears that selection. Gemini advertises its stable aliases plus the
+current visible Gemini 3.x and 2.5 CLI models.
 
 Smith's options are not a fixed vendor list: they are discovered from the
 user's `~/.smith/config.toml` on the discovering host — configured models

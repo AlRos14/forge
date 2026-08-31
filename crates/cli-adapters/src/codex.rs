@@ -17,18 +17,47 @@ use protocol::{
     AskForApproval, SandboxMode, ThreadForkParams, ThreadForkResponse, ThreadResumeParams,
     ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnHandle,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CODEX_VERSION: &str = "0.147.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+const MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
+
+#[derive(Debug, Deserialize)]
+struct CodexModelCatalog {
+    #[serde(default)]
+    models: Vec<CodexDiscoveredModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDiscoveredModel {
+    slug: String,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CodexReasoningLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
+
+struct CodexModelOptions {
+    models: Vec<String>,
+    reasoning_efforts: Vec<String>,
+    model_reasoning_efforts: BTreeMap<String, Vec<String>>,
+}
 
 #[derive(Clone)]
 struct RunningProcess {
@@ -95,6 +124,25 @@ impl CodexAdapter {
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "error");
         cmd
+    }
+
+    fn build_model_discovery_command(bundled_only: bool) -> tokio::process::Command {
+        let mut adapter_args = vec!["debug".to_owned(), "models".to_owned()];
+        if bundled_only {
+            adapter_args.push("--bundled".to_owned());
+        }
+        let builder = crate::command::CommandBuilder::new("npx")
+            .default_args(vec![
+                "-y".to_owned(),
+                format!("@openai/codex@{DEFAULT_CODEX_VERSION}"),
+            ])
+            .adapter_args(adapter_args);
+        let mut command = builder.build();
+        command
+            .env("NPM_CONFIG_LOGLEVEL", "error")
+            .env("NODE_NO_WARNINGS", "1")
+            .env("NO_COLOR", "1");
+        command
     }
 
     fn thread_start_params(config: &CodexConfig, worktree_path: &str) -> ThreadStartParams {
@@ -251,30 +299,15 @@ impl CodingExecutorAdapter for CodexAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        let discovered = discover_codex_model_options().await;
         Ok(DiscoveredOptions {
-            models: vec![
-                "gpt-5.6-sol".into(),
-                "gpt-5.6-terra".into(),
-                "gpt-5.6-luna".into(),
-                "gpt-5.5".into(),
-                "gpt-5.4".into(),
-                "gpt-5.4-mini".into(),
-                "gpt-5.3-codex-spark".into(),
-            ],
+            models: discovered.models,
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
             cli_specific: json!({
                 "sandbox_modes": ["read-only", "workspace-write", "danger-full-access"],
                 "approval_modes": ["never", "on-request", "on-failure", "unless-trusted"],
-                "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
-                "model_reasoning_efforts": {
-                    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
-                    "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
-                    "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
-                    "gpt-5.5": ["low", "medium", "high", "xhigh"],
-                    "gpt-5.4": ["low", "medium", "high", "xhigh"],
-                    "gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
-                    "gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"]
-                },
+                "reasoning_efforts": discovered.reasoning_efforts,
+                "model_reasoning_efforts": discovered.model_reasoning_efforts,
                 "codex_version": DEFAULT_CODEX_VERSION,
             }),
         })
@@ -815,6 +848,112 @@ fn availability_from_codex_home(codex_home: &Path) -> AvailabilityInfo {
     }
 }
 
+fn parse_codex_model_catalog(output: &[u8]) -> Option<CodexModelOptions> {
+    let catalog: CodexModelCatalog = serde_json::from_slice(output).ok()?;
+    let mut models = Vec::new();
+    let mut reasoning_efforts = Vec::new();
+    let mut model_reasoning_efforts = BTreeMap::new();
+
+    for model in catalog.models {
+        let slug = model.slug.trim();
+        if slug.is_empty()
+            || model.visibility.as_deref() == Some("hide")
+            || models.iter().any(|existing| existing == slug)
+        {
+            continue;
+        }
+
+        let mut model_efforts = Vec::new();
+        for level in model.supported_reasoning_levels {
+            let effort = level.effort.trim();
+            if effort.is_empty() || model_efforts.iter().any(|existing| existing == effort) {
+                continue;
+            }
+            model_efforts.push(effort.to_owned());
+            if !reasoning_efforts.iter().any(|existing| existing == effort) {
+                reasoning_efforts.push(effort.to_owned());
+            }
+        }
+
+        models.push(slug.to_owned());
+        model_reasoning_efforts.insert(slug.to_owned(), model_efforts);
+    }
+
+    (!models.is_empty()).then_some(CodexModelOptions {
+        models,
+        reasoning_efforts,
+        model_reasoning_efforts,
+    })
+}
+
+fn default_codex_model_options() -> CodexModelOptions {
+    let entries = [
+        (
+            "gpt-5.6-sol",
+            &["low", "medium", "high", "xhigh", "max", "ultra"][..],
+        ),
+        (
+            "gpt-5.6-terra",
+            &["low", "medium", "high", "xhigh", "max", "ultra"][..],
+        ),
+        (
+            "gpt-5.6-luna",
+            &["low", "medium", "high", "xhigh", "max"][..],
+        ),
+        ("gpt-5.5", &["low", "medium", "high", "xhigh"][..]),
+        ("gpt-5.4", &["low", "medium", "high", "xhigh"][..]),
+        ("gpt-5.4-mini", &["low", "medium", "high", "xhigh"][..]),
+        (
+            "gpt-5.3-codex-spark",
+            &["low", "medium", "high", "xhigh"][..],
+        ),
+    ];
+    let mut models = Vec::new();
+    let mut reasoning_efforts = Vec::new();
+    let mut model_reasoning_efforts = BTreeMap::new();
+
+    for (model, efforts) in entries {
+        models.push(model.to_owned());
+        let efforts = efforts
+            .iter()
+            .map(|effort| (*effort).to_owned())
+            .collect::<Vec<_>>();
+        for effort in &efforts {
+            if !reasoning_efforts.contains(effort) {
+                reasoning_efforts.push(effort.clone());
+            }
+        }
+        model_reasoning_efforts.insert(model.to_owned(), efforts);
+    }
+
+    CodexModelOptions {
+        models,
+        reasoning_efforts,
+        model_reasoning_efforts,
+    }
+}
+
+async fn discover_codex_model_options() -> CodexModelOptions {
+    if which::which("npx").is_ok() {
+        for bundled_only in [false, true] {
+            let command = CodexAdapter::build_model_discovery_command(bundled_only);
+
+            if let Some(output) = crate::command::output_with_timeout(
+                command,
+                Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
+            )
+            .await
+                && output.status.success()
+                && let Some(discovered) = parse_codex_model_catalog(&output.stdout)
+            {
+                return discovered;
+            }
+        }
+    }
+
+    default_codex_model_options()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,32 +986,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn discovery_advertises_current_models_and_per_model_efforts() {
-        let discovered = CodexAdapter::new()
-            .discover_options(DiscoverContext { project_path: None })
-            .await
-            .expect("Codex options should be discoverable");
-
+    #[test]
+    fn model_discovery_uses_the_pinned_codex_harness() {
+        let command = CodexAdapter::build_model_discovery_command(true);
+        assert_eq!(command.as_std().get_program(), "npx");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         assert_eq!(
-            discovered.models,
+            args,
             vec![
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
+                "-y",
+                "@openai/codex@0.147.0",
+                "debug",
+                "models",
+                "--bundled"
             ]
         );
+    }
+
+    #[test]
+    fn parses_visible_codex_models_and_per_model_efforts() {
+        let discovered = parse_codex_model_catalog(
+            br#"{"models":[
+                {"slug":"gpt-5.6-sol","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]},
+                {"slug":"hidden-model","visibility":"hide","supported_reasoning_levels":[{"effort":"high"}]},
+                {"slug":"gpt-5.6-luna","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}]}
+            ]}"#,
+        )
+        .expect("Codex catalog should parse");
+        assert_eq!(discovered.models, vec!["gpt-5.6-sol", "gpt-5.6-luna"]);
         assert_eq!(
-            discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-sol"],
-            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+            discovered.model_reasoning_efforts["gpt-5.6-sol"],
+            vec!["low", "ultra"]
         );
+        assert_eq!(discovered.reasoning_efforts, vec!["low", "ultra", "max"]);
+    }
+
+    #[test]
+    fn default_codex_catalog_remains_available() {
+        let discovered = default_codex_model_options();
+        assert!(discovered.models.contains(&"gpt-5.6-sol".to_owned()));
         assert_eq!(
-            discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-luna"],
-            json!(["low", "medium", "high", "xhigh", "max"])
+            discovered.model_reasoning_efforts["gpt-5.6-luna"],
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
     }
 

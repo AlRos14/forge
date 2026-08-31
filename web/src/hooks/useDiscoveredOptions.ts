@@ -39,6 +39,9 @@ function providerForModel(modelId: string): string | null {
   const lower = modelId.toLowerCase()
   if (lower.includes('claude')) return 'Anthropic'
   if (lower.includes('gpt') || lower.includes('codex') || lower.includes('o3')) return 'OpenAI'
+  if (lower.includes('grok')) return 'xAI'
+  if (lower.includes('gemini')) return 'Google'
+  if (lower.includes('composer') || lower.startsWith('cursor-')) return 'Cursor'
   return null
 }
 
@@ -49,15 +52,15 @@ function uniqueStrings(values: unknown): string[] {
   )
 }
 
-function reasoningFromCliSpecific(cliSpecific: unknown, hasModels: boolean): string[] {
+function reasoningFromCliSpecific(cliSpecific: unknown): string[] {
   if (cliSpecific && typeof cliSpecific === 'object') {
     const record = cliSpecific as Record<string, unknown>
-    for (const key of ['reasoning_efforts', 'reasoning_options', 'model_reasoning_efforts']) {
+    for (const key of ['reasoning_efforts', 'reasoning_options']) {
       const values = uniqueStrings(record[key])
       if (values.length > 0) return values
     }
   }
-  return hasModels ? ['low', 'medium', 'high'] : []
+  return []
 }
 
 function reasoningByModelFromCliSpecific(cliSpecific: unknown): Map<string, string[]> {
@@ -78,8 +81,7 @@ export function normalizeDiscoveredOptions(
 ): DiscoveredExecutionOptions {
   const allReasoningIds = new Set<string>()
   const models: DiscoveredModelOption[] = []
-  const hasModels = Boolean(response.models?.length)
-  const sharedReasoningIds = reasoningFromCliSpecific(response.cli_specific, hasModels)
+  const sharedReasoningIds = reasoningFromCliSpecific(response.cli_specific)
   const reasoningByModel = reasoningByModelFromCliSpecific(response.cli_specific)
 
   sharedReasoningIds.forEach((id) => allReasoningIds.add(id))

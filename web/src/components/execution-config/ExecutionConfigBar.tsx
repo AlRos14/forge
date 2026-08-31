@@ -107,13 +107,6 @@ export function ExecutionConfigBar({
   ])
 
   useEffect(() => {
-    if (!discoveredOptions || !config.modelId) return
-    if (!discoveredOptions.models.some((m) => m.id === config.modelId)) {
-      config.setModelId(null)
-    }
-  }, [config, discoveredOptions])
-
-  useEffect(() => {
     if (!discoveredOptions || !config.reasoningEffort) return
     if (!reasoningOptionsForModel.some((o) => o.id === config.reasoningEffort)) {
       config.setReasoningEffort(null)
