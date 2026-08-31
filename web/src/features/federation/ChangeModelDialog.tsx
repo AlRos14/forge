@@ -2,6 +2,9 @@ import { useEffect, useId, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { ShieldCheck } from '@phosphor-icons/react'
 import { useUpdateAgent } from '@/api/hooks'
+import { ModelSelector } from '@/components/execution-config/ModelSelector'
+import { PolicySelector } from '@/components/execution-config/PolicySelector'
+import { ReasoningSelector } from '@/components/execution-config/ReasoningSelector'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -66,8 +69,11 @@ export function ChangeModelDialog({
   const canPublish = agent ? canPublishEmbeddedProfile(agent.backend_kind) : false
   const [mode, setMode] = useState<Mode>('existing')
   const [entryId, setEntryId] = useState('')
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
   const [model, setModel] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
+  const [permissionPolicy, setPermissionPolicy] = useState('')
   const [profileId, setProfileId] = useState('')
   const [error, setError] = useState<string>()
 
@@ -92,10 +98,13 @@ export function ChangeModelDialog({
 
   useEffect(() => {
     if (!agent) return
-    setMode(canPublish ? 'new' : 'existing')
-    setEntryId(activeEntries.find((entry) => entry.id === agent.credential_handle_id)?.id ?? activeEntries[0]?.id ?? '')
+    setMode('new')
+    setEntryId(agent.credential_handle_id ?? activeEntries[0]?.id ?? '')
+    setName(agent.name)
+    setDescription(agent.description ?? '')
     setModel(agent.model ?? '')
     setReasoningEffort(agent.reasoning_effort ?? '')
+    setPermissionPolicy(agent.permission_policy ?? '')
     setProfileId(otherProfiles[0]?.id ?? '')
     setError(undefined)
     // Reset only when the target agent identity changes.
@@ -119,6 +128,13 @@ export function ChangeModelDialog({
     setMainBinding.isPending ||
     setProjectBinding.isPending ||
     updateAgent.isPending
+
+  useEffect(() => {
+    if (!reasoningEffort || !discovered.data) return
+    if (!reasoningOptionsForModel.some((option) => option.id === reasoningEffort)) {
+      setReasoningEffort('')
+    }
+  }, [discovered.data, reasoningEffort, reasoningOptionsForModel])
 
   async function applyBindingIfNeeded(finalProfileId: string) {
     if (!agent || !binding) return
@@ -145,24 +161,65 @@ export function ChangeModelDialog({
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!agent) return
+    if (!binding && !name.trim()) {
+      setError('A name is required.')
+      return
+    }
+    const profileChanged =
+      canPublish &&
+      (entryId !== (agent.credential_handle_id ?? '') || model.trim() !== (agent.model ?? ''))
+    if (mode === 'existing' && !profileId) {
+      setError('Choose a profile to activate.')
+      return
+    }
+    if (mode === 'new' && (!model.trim() || (profileChanged && !entryId))) {
+      setError(canPublish ? 'A provider entry and a model are required.' : 'A model is required.')
+      return
+    }
     setError(undefined)
     try {
+      let currentVersion = agent.version
+      const metadataChanged =
+        !binding &&
+        (name.trim() !== agent.name ||
+          (description.trim() ? description.trim() : null) !== agent.description)
+
+      if (canPublish && metadataChanged) {
+        const updated = await updateAgent.mutateAsync({
+          agentId: agent.id,
+          body: {
+            name: name.trim(),
+            description: description.trim() ? description.trim() : null,
+            version: currentVersion,
+          },
+        })
+        currentVersion = updated.version
+      }
+
+      if (mode === 'new' && canPublish && !profileChanged) {
+        onClose()
+        return
+      }
+
       if (mode === 'existing') {
-        if (!profileId) {
-          setError('Choose a profile to activate.')
-          return
+        if (!canPublish && metadataChanged) {
+          const updated = await updateAgent.mutateAsync({
+            agentId: agent.id,
+            body: {
+              name: name.trim(),
+              description: description.trim() ? description.trim() : null,
+              version: currentVersion,
+            },
+          })
+          currentVersion = updated.version
         }
-        await selectProfile.mutateAsync({ profileId, version: agent.version })
+        await selectProfile.mutateAsync({ profileId, version: currentVersion })
         await applyBindingIfNeeded(profileId)
       } else if (canPublish) {
-        if (!entryId || !model.trim()) {
-          setError('A provider entry and a model are required.')
-          return
-        }
         const connected = await connectProfile.mutateAsync({
           identityId: agent.id,
           input: {
-            version: agent.version,
+            version: currentVersion,
             credential_id: entryId,
             model: model.trim(),
             permission_policy: 'scoped_proposals',
@@ -175,16 +232,15 @@ export function ChangeModelDialog({
         })
         await applyBindingIfNeeded(connected.profile.id)
       } else {
-        if (!model.trim()) {
-          setError('A model is required.')
-          return
-        }
         await updateAgent.mutateAsync({
           agentId: agent.id,
           body: {
+            name: name.trim(),
+            description: description.trim() ? description.trim() : null,
             model: model.trim(),
             reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
-            version: agent.version,
+            permission_policy: permissionPolicy.trim() ? permissionPolicy.trim() : null,
+            version: currentVersion,
           },
         })
         void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
@@ -206,7 +262,7 @@ export function ChangeModelDialog({
       <DialogContent className="max-w-lg">
         <form id={formId} onSubmit={submit}>
           <DialogHeader>
-            <SectionKicker>Change model</SectionKicker>
+            <SectionKicker>{binding ? 'Change model' : 'Edit agent'}</SectionKicker>
             <DialogTitle className="mt-1">
               {agent?.name ?? 'this agent'}
               {binding?.kind === 'main' ? ' · Main Agent Chat' : null}
@@ -215,11 +271,33 @@ export function ChangeModelDialog({
             <DialogDescription>
               {binding
                 ? 'Activating a profile here also updates this binding, preserving its chat timeline.'
-                : 'The current profile stays active until the replacement is published and selected.'}
+                : 'Update the agent identity and its harness defaults. Direct-agent model changes publish a new profile.'}
             </DialogDescription>
           </DialogHeader>
 
           <div className="mt-5 space-y-4">
+            {!binding ? (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="edit-agent-name">Agent name</Label>
+                  <Input
+                    id="edit-agent-name"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    required
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-agent-description">Description</Label>
+                  <Input
+                    id="edit-agent-description"
+                    value={description}
+                    onChange={(event) => setDescription(event.target.value)}
+                    placeholder="What this agent is for"
+                  />
+                </div>
+              </div>
+            ) : null}
             <div className="flex gap-1.5 rounded-md border border-border-subtle bg-muted/30 p-1" role="tablist" aria-label="Change model mode">
               <button
                 type="button"
@@ -303,48 +381,33 @@ export function ChangeModelDialog({
               </>
             ) : (
               <>
-                <div className="space-y-2">
-                  <Label htmlFor="change-model-model">Model</Label>
-                  <Input
-                    id="change-model-model"
-                    list={`${formId}-model-suggestions`}
-                    value={model}
-                    onChange={(event) => setModel(event.target.value)}
-                    placeholder="e.g. gpt-5.2-codex"
-                    required
+                <ModelSelector
+                  id="change-model-model"
+                  models={modelSuggestions}
+                  recentModelIds={[]}
+                  value={model || null}
+                  isLoading={discovered.isLoading}
+                  hasError={discovered.isError}
+                  onChange={(value) => setModel(value ?? '')}
+                />
+                {reasoningOptionsForModel.length > 0 ? (
+                  <ReasoningSelector
+                    id="change-model-reasoning"
+                    options={reasoningOptionsForModel}
+                    value={reasoningEffort || null}
+                    isLoading={discovered.isLoading}
+                    hasError={discovered.isError}
+                    onChange={(value) => setReasoningEffort(value ?? '')}
                   />
-                  {modelSuggestions.length > 0 ? (
-                    <datalist id={`${formId}-model-suggestions`}>
-                      {modelSuggestions.map((suggestion) => (
-                        <option key={suggestion.id} value={suggestion.id}>
-                          {suggestion.displayName}
-                        </option>
-                      ))}
-                    </datalist>
-                  ) : null}
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="change-model-reasoning">Reasoning effort</Label>
-                  {reasoningOptionsForModel.length > 0 ? (
-                    <Select
-                      id="change-model-reasoning"
-                      value={reasoningEffort}
-                      placeholder="Unspecified"
-                      onChange={setReasoningEffort}
-                      options={reasoningOptionsForModel.map((option) => ({
-                        value: option.id,
-                        label: option.label,
-                      }))}
-                    />
-                  ) : (
-                    <Input
-                      id="change-model-reasoning"
-                      value={reasoningEffort}
-                      onChange={(event) => setReasoningEffort(event.target.value)}
-                      placeholder="e.g. medium (optional)"
-                    />
-                  )}
-                </div>
+                ) : null}
+                {(discovered.data?.permissionPolicies.length ?? 0) > 0 ? (
+                  <PolicySelector
+                    id="change-model-permission-policy"
+                    policies={discovered.data?.permissionPolicies}
+                    value={permissionPolicy || null}
+                    onChange={(value) => setPermissionPolicy(value ?? '')}
+                  />
+                ) : null}
               </>
             )}
 
@@ -361,7 +424,7 @@ export function ChangeModelDialog({
             </Button>
             <Button type="submit" disabled={pending}>
               <ShieldCheck size={15} aria-hidden />
-              {pending ? 'Applying…' : 'Change model'}
+              {pending ? 'Applying…' : binding ? 'Change model' : 'Save changes'}
             </Button>
           </DialogFooter>
         </form>

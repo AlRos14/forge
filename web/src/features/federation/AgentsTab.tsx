@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CaretRight, Key, MagnifyingGlass, Plus, Robot, ShieldCheck } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
+import { ModelSelector } from '@/components/execution-config/ModelSelector'
+import { PolicySelector } from '@/components/execution-config/PolicySelector'
+import { ReasoningSelector } from '@/components/execution-config/ReasoningSelector'
 import {
   Dialog,
   DialogContent,
@@ -14,6 +17,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/cn'
+import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import {
   useAgentProviderCapabilitiesQuery,
@@ -53,6 +57,8 @@ export function NewAgentDialog({
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [model, setModel] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState<string | null>(null)
+  const [permissionPolicy, setPermissionPolicy] = useState<string | null>(null)
   const [systemPrompt, setSystemPrompt] = useState('')
   const [error, setError] = useState<string>()
   const inFlight = useRef(false)
@@ -65,6 +71,8 @@ export function NewAgentDialog({
     setName('')
     setDescription('')
     setModel('')
+    setReasoningEffort(null)
+    setPermissionPolicy(null)
     setSystemPrompt('')
     setError(undefined)
   }, [open, preselectedEntryId])
@@ -80,12 +88,24 @@ export function NewAgentDialog({
     ? capabilities.data?.items.find((item) => item.provider === selectedEntry.provider)
     : undefined
   const step: 1 | 2 | 3 = !selectedEntry && !cliKind ? 1 : !runtime ? 2 : 3
+  const discovered = useDiscoveredOptions(null, runtime === 'direct' ? null : runtime)
+  const reasoningOptionsForModel = useMemo(
+    () => getReasoningOptionsForModel(discovered.data, model),
+    [discovered.data, model],
+  )
 
   useEffect(() => {
     if (step === 3 && selectedEntry && !model) {
       setModel(capability?.default_model ?? '')
     }
   }, [capability?.default_model, model, selectedEntry, step])
+
+  useEffect(() => {
+    if (!reasoningEffort || !discovered.data) return
+    if (!reasoningOptionsForModel.some((option) => option.id === reasoningEffort)) {
+      setReasoningEffort(null)
+    }
+  }, [discovered.data, reasoningEffort, reasoningOptionsForModel])
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -117,6 +137,8 @@ export function NewAgentDialog({
           description: description.trim() ? description.trim() : null,
           executor_type: runtime,
           model: model.trim() ? model.trim() : null,
+          reasoning_effort: reasoningEffort,
+          permission_policy: permissionPolicy,
           credential_id: selectedEntry?.id ?? null,
         })
       }
@@ -283,14 +305,46 @@ export function NewAgentDialog({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="agent-model">Model{runtime === 'direct' ? '' : ' (optional)'}</Label>
-                <Input
-                  id="agent-model"
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
-                  required={runtime === 'direct'}
-                />
+                {runtime === 'direct' ? (
+                  <>
+                    <Label htmlFor="agent-model">Model</Label>
+                    <Input
+                      id="agent-model"
+                      value={model}
+                      onChange={(event) => setModel(event.target.value)}
+                      required
+                    />
+                  </>
+                ) : (
+                  <ModelSelector
+                    id="agent-model"
+                    models={discovered.data?.models ?? []}
+                    recentModelIds={[]}
+                    value={model || null}
+                    isLoading={discovered.isLoading}
+                    hasError={discovered.isError}
+                    onChange={(value) => setModel(value ?? '')}
+                  />
+                )}
               </div>
+              {runtime !== 'direct' && reasoningOptionsForModel.length > 0 ? (
+                <ReasoningSelector
+                  id="agent-reasoning"
+                  options={reasoningOptionsForModel}
+                  value={reasoningEffort}
+                  isLoading={discovered.isLoading}
+                  hasError={discovered.isError}
+                  onChange={setReasoningEffort}
+                />
+              ) : null}
+              {runtime !== 'direct' && (discovered.data?.permissionPolicies.length ?? 0) > 0 ? (
+                <PolicySelector
+                  id="agent-permission-policy"
+                  policies={discovered.data?.permissionPolicies}
+                  value={permissionPolicy}
+                  onChange={setPermissionPolicy}
+                />
+              ) : null}
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="agent-description">Description</Label>
                 <Input

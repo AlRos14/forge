@@ -84,18 +84,12 @@ export function AgentDetailPanel({
 
       <div className="flex-1 space-y-6 px-6 py-5">
         {/* Stat grid */}
-        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 xl:grid-cols-5">
           {[
             { label: 'Model', value: agent.model ?? 'Pending' },
             { label: 'Provider', value: agent.provider ? humanize(agent.provider) : 'CLI-managed' },
-            {
-              label: agent.reasoning_effort ? 'Reasoning' : 'Permission',
-              value: agent.reasoning_effort
-                ? humanize(agent.reasoning_effort)
-                : agent.permission_policy
-                  ? humanize(agent.permission_policy)
-                  : '—',
-            },
+            { label: 'Reasoning', value: agent.reasoning_effort ? humanize(agent.reasoning_effort) : '—' },
+            { label: 'Execution policy', value: agent.permission_policy ? humanize(agent.permission_policy) : '—' },
             { label: 'Total runs', value: agent.total_runs },
           ].map((stat) => (
             <div key={stat.label} className="rounded-lg border border-border-subtle bg-muted/40 px-3.5 py-3">
@@ -110,7 +104,7 @@ export function AgentDetailPanel({
         </div>
 
         <div>
-          <Button onClick={() => onChangeModel(agent)}>Change model…</Button>
+          <Button onClick={() => onChangeModel(agent)}>Edit agent…</Button>
         </div>
 
         {/* Profiles */}

@@ -41,6 +41,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Agent Settings now uses adapter discovery consistently when creating or
+  editing CLI-harness agents. The same model picker is used in both flows;
+  reasoning and execution-policy controls appear independently only when the
+  harness advertises them, and policy choices are limited to the adapter's
+  supported values. Agent metadata such as name and description can now be
+  edited alongside harness defaults, and the roster detail no longer hides an
+  execution policy merely because reasoning effort is configured.
 - Redesigned the `/agents` page. The Agents tab is now a Runtimes-style
   master/detail: a searchable/filterable roster on the left, one agent's
   model, profiles, and bound scopes on the right — the inline session list

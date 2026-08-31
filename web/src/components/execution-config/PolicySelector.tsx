@@ -3,7 +3,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
 
-const policyOptions = [
+const allPolicyOptions = [
   {
     id: 'auto',
     label: 'Auto',
@@ -26,24 +26,28 @@ const policyOptions = [
 
 export function PolicySelector({
   id,
+  policies,
   value,
   disabled,
   className,
   onChange,
 }: {
   id: string
+  policies?: string[]
   value: string | null
   disabled?: boolean
   className?: string
   onChange: (policy: string | null) => void
 }) {
+  const allowedPolicies = policies ?? allPolicyOptions.map((policy) => policy.id)
+  const policyOptions = allPolicyOptions.filter((policy) => allowedPolicies.includes(policy.id))
   const selectedPolicy = policyOptions.find((policy) => policy.id === value)
 
   return (
     <div className={cn('min-w-0 space-y-1', className)}>
       <Label htmlFor={id} className="flex items-center gap-1.5">
         {selectedPolicy ? <selectedPolicy.Icon size={12} /> : <FastForward size={12} />}
-        Policy
+        Execution policy
       </Label>
       <Select
         id={id}

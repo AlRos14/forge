@@ -126,7 +126,18 @@ export function ExecutionConfigBar({
     )
   }
 
-  const overrideGridCols = showPolicySelector ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
+  const showReasoningSelector =
+    config.discoveredOptions.isFetching ||
+    reasoningOptionsForModel.length > 0 ||
+    Boolean(config.reasoningEffort)
+  const showDiscoveredPolicySelector =
+    showPolicySelector &&
+    (config.discoveredOptions.isFetching ||
+      (discoveredOptions?.permissionPolicies.length ?? 0) > 0 ||
+      Boolean(config.permissionPolicy))
+  const overrideCount = 1 + Number(showReasoningSelector) + Number(showDiscoveredPolicySelector)
+  const overrideGridCols =
+    overrideCount === 3 ? 'sm:grid-cols-3' : overrideCount === 2 ? 'sm:grid-cols-2' : ''
   const showOverrides = showAgentSelector ? config.agentId : config.agentId || initialAgentId
 
   return (
@@ -169,18 +180,21 @@ export function ExecutionConfigBar({
               hasError={config.discoveredOptions.isError}
               onChange={config.setModelId}
             />
-            <ReasoningSelector
-              id="execution-config-reasoning"
-              options={reasoningOptionsForModel}
-              value={config.reasoningEffort}
-              disabled={disabled}
-              isLoading={config.discoveredOptions.isFetching}
-              hasError={config.discoveredOptions.isError}
-              onChange={config.setReasoningEffort}
-            />
-            {showPolicySelector && (
+            {showReasoningSelector ? (
+              <ReasoningSelector
+                id="execution-config-reasoning"
+                options={reasoningOptionsForModel}
+                value={config.reasoningEffort}
+                disabled={disabled}
+                isLoading={config.discoveredOptions.isFetching}
+                hasError={config.discoveredOptions.isError}
+                onChange={config.setReasoningEffort}
+              />
+            ) : null}
+            {showDiscoveredPolicySelector && (
               <PolicySelector
                 id="execution-config-policy"
+                policies={discoveredOptions?.permissionPolicies ?? []}
                 value={config.permissionPolicy}
                 disabled={disabled}
                 onChange={config.setPermissionPolicy}

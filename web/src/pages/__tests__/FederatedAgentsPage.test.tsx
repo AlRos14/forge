@@ -61,10 +61,37 @@ vi.mock('@/api/hooks', () => ({
   useProjectsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false, refetch: vi.fn() }),
   useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
 }))
-// ChangeModelDialog offers model suggestions from discovery; not under test here.
 vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/hooks/useDiscoveredOptions')>()),
-  useDiscoveredOptions: () => ({ data: undefined, isLoading: false, isError: false }),
+  useDiscoveredOptions: (_agentId: string | null, executorType?: string | null) => ({
+    data:
+      executorType === 'codex'
+        ? {
+            models: [
+              {
+                id: 'gpt-5-codex',
+                displayName: 'gpt-5-codex',
+                provider: 'OpenAI',
+                reasoningOptions: ['low', 'medium', 'high'],
+              },
+              {
+                id: 'gpt-5.2-codex',
+                displayName: 'gpt-5.2-codex',
+                provider: 'OpenAI',
+                reasoningOptions: ['low', 'medium', 'high'],
+              },
+            ],
+            reasoningOptions: [
+              { id: 'low', label: 'Low' },
+              { id: 'medium', label: 'Medium' },
+              { id: 'high', label: 'High' },
+            ],
+            permissionPolicies: ['auto', 'supervised', 'plan'],
+          }
+        : undefined,
+    isLoading: false,
+    isError: false,
+  }),
 }))
 vi.mock('@/features/federation/hooks', () => ({
   isVersionConflict: () => false,
@@ -369,35 +396,47 @@ describe('FederatedAgentsPage', () => {
     expect(screen.getByText('Project Agent bindings')).toBeTruthy()
   })
 
-  it('selects an agent from the roster and opens Change model from its detail panel', () => {
+  it('shows reasoning and execution policy independently and opens agent editing', () => {
     renderPage()
-    fireEvent.click(screen.getByText('Forge Guide'))
-    fireEvent.click(screen.getByRole('button', { name: /change model…/i }))
+    fireEvent.click(screen.getByText('Codex Runner'))
+    expect(screen.getByText('Reasoning')).toBeTruthy()
+    expect(screen.getByText('Execution policy')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /edit agent…/i }))
     const dialog = within(screen.getByRole('dialog'))
-    expect(dialog.getByText(/Forge Guide/)).toBeTruthy()
-    expect(dialog.getByText(/New model on an entry/i)).toBeTruthy()
+    expect(dialog.getByText(/Codex Runner/)).toBeTruthy()
+    expect(dialog.getByLabelText('Agent name')).toBeTruthy()
   })
 
   it('changes a CLI-harness agent model directly through the core agent PATCH', async () => {
     renderPage()
     fireEvent.click(screen.getByText('Codex Runner'))
-    fireEvent.click(screen.getByRole('button', { name: /change model…/i }))
+    fireEvent.click(screen.getByRole('button', { name: /edit agent…/i }))
     const dialog = within(screen.getByRole('dialog'))
     expect(dialog.getByText(/Codex Runner/)).toBeTruthy()
     // No more "can only switch between published profiles" hint — CLI-harness
     // agents get a real, direct model-change path now.
     expect(screen.queryByText(/change the model itself in the harness/i)).toBeNull()
 
-    fireEvent.click(dialog.getByRole('tab', { name: /update model/i }))
-    const modelInput = dialog.getByLabelText('Model')
-    fireEvent.change(modelInput, { target: { value: 'gpt-5.2-codex' } })
-    fireEvent.change(dialog.getByLabelText('Reasoning effort'), { target: { value: 'high' } })
-    fireEvent.click(dialog.getByRole('button', { name: /change model/i }))
+    fireEvent.change(dialog.getByLabelText('Agent name'), { target: { value: 'Codex Reviewer' } })
+    fireEvent.click(dialog.getByLabelText('Model'))
+    fireEvent.click(screen.getByRole('option', { name: /gpt-5.2-codex/i }))
+    fireEvent.click(dialog.getByLabelText('Reasoning'))
+    fireEvent.click(screen.getByRole('option', { name: 'High' }))
+    fireEvent.click(dialog.getByLabelText('Execution policy'))
+    fireEvent.click(screen.getByRole('option', { name: /Supervised/ }))
+    fireEvent.click(dialog.getByRole('button', { name: /save changes/i }))
 
     await vi.waitFor(() =>
       expect(updateAgent).toHaveBeenCalledWith({
         agentId: 'agent-2',
-        body: { model: 'gpt-5.2-codex', reasoning_effort: 'high', version: 3 },
+        body: {
+          name: 'Codex Reviewer',
+          description: 'A CLI-harness worker.',
+          model: 'gpt-5.2-codex',
+          reasoning_effort: 'high',
+          permission_policy: 'supervised',
+          version: 3,
+        },
       }),
     )
   })
@@ -529,12 +568,21 @@ describe('FederatedAgentsPage', () => {
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))
     fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Codex worker' } })
+    fireEvent.click(wizard.getByLabelText('Model'))
+    fireEvent.click(screen.getByRole('option', { name: /gpt-5.2-codex/i }))
+    fireEvent.click(wizard.getByLabelText('Reasoning'))
+    fireEvent.click(screen.getByRole('option', { name: 'High' }))
+    fireEvent.click(wizard.getByLabelText('Execution policy'))
+    fireEvent.click(screen.getByRole('option', { name: /Supervised/ }))
     fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
     await vi.waitFor(() =>
       expect(registerHarnessAgent).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'Codex worker',
           executor_type: 'codex',
+          model: 'gpt-5.2-codex',
+          reasoning_effort: 'high',
+          permission_policy: 'supervised',
           credential_id: 'credential-2',
         }),
       ),

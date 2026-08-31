@@ -384,6 +384,14 @@ key, and OAuth bundles are refused for harness injection. Harness agents
 without an entry keep their CLI-managed login and are surfaced from daemon CLI
 discovery.
 
+The create and edit flows for harness agents both consume the executor's
+`discovered-options` response. Model ids remain open to custom values, while
+reasoning and execution-policy selectors are capability-driven: a control is
+shown only when the adapter advertises it, and permission choices are filtered
+to that adapter's supported policies. Reasoning effort and execution policy
+are independent persisted defaults. Agent name and description are mutable
+identity metadata; changing them does not publish a profile or alter a binding.
+
 Credential handles distinguish static `api_key` payloads from renewable
 `oauth_bundle` payloads and carry optimistic versions. Native adapters acquire
 short-lived leases through Agent Runtime's `ProviderCredentialSource` rather

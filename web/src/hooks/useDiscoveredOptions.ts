@@ -120,7 +120,7 @@ export function normalizeDiscoveredOptions(
   return {
     models,
     reasoningOptions: reasoningIds.map((id) => ({ id, label: titleCase(id) })),
-    permissionPolicies: policies.length > 0 ? policies : ['auto', 'supervised', 'plan'],
+    permissionPolicies: policies,
   }
 }
 

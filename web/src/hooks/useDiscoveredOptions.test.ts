@@ -67,5 +67,15 @@ describe('normalizeDiscoveredOptions', () => {
     const options = normalizeDiscoveredOptions({ models: ['custom-model'] })
 
     expect(getReasoningOptionsForModel(options, 'custom-model')).toEqual([])
+    expect(options.permissionPolicies).toEqual([])
+  })
+
+  it('preserves only permission policies advertised by the adapter', () => {
+    const options = normalizeDiscoveredOptions({
+      models: ['gemini-3.1-pro-preview'],
+      permission_policies: ['auto', 'supervised'],
+    })
+
+    expect(options.permissionPolicies).toEqual(['auto', 'supervised'])
   })
 })
