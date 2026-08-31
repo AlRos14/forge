@@ -20,6 +20,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- A downstream relationship record documents the operational fork, its
+  intentional divergences, and how useful upstream changes remain integrated.
 - Codex and Cursor execution options now discover their selectable models from
   their CLI harness (`codex debug models` and `cursor-agent --list-models`).
   Both retain bounded built-in fallbacks, preserve custom model ids, and only

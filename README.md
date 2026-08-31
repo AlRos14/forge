@@ -121,6 +121,7 @@ Deeper dive → [docs/architecture.md](docs/architecture.md).
 | [API reference](docs/api.md) | Charter/Project/Document/Milestone/Release REST endpoints, media retention, pagination, MCP tools, SSE. |
 | [forge-ctl CLI](docs/cli.md) | Subcommands, daemon link, scripted runs. |
 | [Execution logs](docs/execution-logs.md) | JSONL log schema and chat-history reconstruction. |
+| [Downstream relationship](docs/downstream.md) | Operational-fork policy, intentional divergences, and upstream integration guidance. |
 | [Changelog](CHANGELOG.md) | Per-release changes and breaking notes. |
 
 ## Status
