@@ -240,7 +240,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
         let resolve_follow_up = self.resolve_follow_up;
         let conflict_prepared = Arc::clone(&self.conflict_prepared);
         Box::pin(async move {
-            if ctx.description.contains("===REVIEW: PASS===") {
+            if ctx.description.contains("FORGE_RESULT:") {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -312,7 +312,7 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({ "text": "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}" }),
         )
         .await?;
     Ok(())
@@ -503,7 +503,7 @@ async fn seed_review_task_with_executor(
             assignee_id: None,
             title: "Merge conflict task".to_owned(),
             description: Some("resolve a conflicting change".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "review".to_owned(),
             is_automation: false,
             priority: 0,

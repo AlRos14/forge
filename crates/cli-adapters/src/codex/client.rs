@@ -38,6 +38,7 @@ pub struct TurnRunResult {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage: Option<TokenUsage>,
+    pub account_usage: Option<Value>,
 }
 
 impl CodexClient {
@@ -240,6 +241,7 @@ impl CodexClient {
         raw: Value,
         result: &mut TurnRunResult,
     ) -> Result<(), ExecutorError> {
+        capture_account_usage(&raw, result);
         if let Some(usage) = extract_token_usage(&raw) {
             result.usage = Some(usage);
         }
@@ -414,6 +416,12 @@ impl CodexClient {
             normalize_path(self.worktree_path.join(candidate))
         };
         absolute.starts_with(&self.worktree_path)
+    }
+}
+
+fn capture_account_usage(raw: &Value, result: &mut TurnRunResult) {
+    if raw.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
+        result.account_usage = raw.get("params").cloned().or_else(|| Some(raw.clone()));
     }
 }
 
@@ -634,6 +642,24 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 48512);
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn captures_latest_codex_account_rate_limits_without_transforming_provider_fields() {
+        let mut result = TurnRunResult::default();
+        let first = json!({
+            "method": "account/rateLimits/updated",
+            "params": {"planType":"plus","primary":{"usedPercent":1,"windowDurationMins":300}}
+        });
+        let latest = json!({
+            "method": "account/rateLimits/updated",
+            "params": {"planType":"plus","primary":{"usedPercent":2,"windowDurationMins":300},"secondary":{"usedPercent":0,"windowDurationMins":10080},"credits":{"balance":0}}
+        });
+
+        capture_account_usage(&first, &mut result);
+        capture_account_usage(&latest, &mut result);
+
+        assert_eq!(result.account_usage, latest.get("params").cloned());
     }
 
     #[tokio::test]

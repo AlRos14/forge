@@ -231,6 +231,20 @@ impl TaskService {
             ));
         }
 
+        crate::plan_artifact::capture_plan_revision(
+            &self.db,
+            &task.id,
+            std::path::Path::new(&workspace.worktree_path),
+            "planner_ready",
+            None,
+        )
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "planning plan artifact could not be persisted: {error}"
+            ))
+        })?;
+
         Ok(())
     }
 

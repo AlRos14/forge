@@ -966,23 +966,66 @@ impl TaskService {
         }
         let user_approval_required = self.gate_requires_user_approval(&task).await?;
         let final_message = reviewer_final_message(execution).await?;
-        let (status, auditor_details) = match ::review::auditor::parse_verdict(&final_message) {
-            ::review::auditor::AuditorVerdict::Passed if user_approval_required => {
-                (ReviewStatus::AwaitingHuman, json!({ "verdict": "pass" }))
+        let stale_evidence = match sqlx::query_as::<_, (String, String)>(
+            "SELECT head_sha, diff_digest FROM review_evidence_bundle WHERE review_id = ?",
+        )
+        .bind(&review.id)
+        .fetch_optional(self.db.pool())
+        .await?
+        {
+            Some((bound_head, bound_diff_digest)) => crate::DiffService::new(Arc::clone(&self.db))
+                .task_diff(&task.id)
+                .await
+                .map(|diff| {
+                    review_evidence_is_stale(
+                        &bound_head,
+                        &bound_diff_digest,
+                        &diff.head_sha,
+                        &diff.diff,
+                    )
+                })
+                .unwrap_or(true),
+            None => true,
+        };
+        let (status, auditor_details) = if stale_evidence {
+            (
+                ReviewStatus::AwaitingHuman,
+                json!({
+                    "verdict": "needs_human",
+                    "reason": "review evidence is missing or stale; run a fresh review"
+                }),
+            )
+        } else {
+            match ::review::auditor::parse_verdict(&final_message) {
+                ::review::auditor::AuditorVerdict::Passed if user_approval_required => {
+                    (ReviewStatus::AwaitingHuman, json!({ "verdict": "pass" }))
+                }
+                ::review::auditor::AuditorVerdict::Passed => {
+                    (ReviewStatus::Passed, json!({ "verdict": "pass" }))
+                }
+                ::review::auditor::AuditorVerdict::Failed { reason } => (
+                    ReviewStatus::Failed,
+                    json!({ "verdict": "fail", "reason": reason }),
+                ),
+                ::review::auditor::AuditorVerdict::NeedsHuman { reason } => (
+                    ReviewStatus::AwaitingHuman,
+                    json!({ "verdict": "needs_human", "reason": reason }),
+                ),
             }
-            ::review::auditor::AuditorVerdict::Passed => {
-                (ReviewStatus::Passed, json!({ "verdict": "pass" }))
-            }
-            ::review::auditor::AuditorVerdict::Failed { reason } => (
-                ReviewStatus::Failed,
-                json!({ "verdict": "fail", "reason": reason }),
-            ),
         };
         let comment = reviewer_comment(status.clone(), review.attempt_number, &final_message);
 
         let finished_at = now_rfc3339();
         let mut review_details = normalize_review_details(&review.step_results_json);
         review_details["auditor"] = auditor_details;
+        if let Some(payload) = final_message
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix("FORGE_RESULT: "))
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        {
+            review_details["structured_result"] = payload;
+        }
         if status == ReviewStatus::AwaitingHuman {
             review_details["user_approval"] = json!({
                 "status": "awaiting_human",
@@ -1737,13 +1780,14 @@ fn reviewer_comment(status: ReviewStatus, attempt_number: i64, final_message: &s
         ReviewStatus::Failed => {
             let reason = match ::review::auditor::parse_verdict(final_message) {
                 ::review::auditor::AuditorVerdict::Failed { reason } => reason,
+                ::review::auditor::AuditorVerdict::NeedsHuman { reason } => reason,
                 ::review::auditor::AuditorVerdict::Passed => "review failed".to_owned(),
             };
             format!("Review failed (attempt {attempt_number}): {reason}")
         }
         _ => format!("Review updated (attempt {attempt_number})"),
     };
-    let cleaned = strip_review_verdict_marker(final_message).trim().to_owned();
+    let cleaned = strip_review_result(final_message).trim().to_owned();
     if cleaned.is_empty() {
         fallback
     } else {
@@ -1751,16 +1795,23 @@ fn reviewer_comment(status: ReviewStatus, attempt_number: i64, final_message: &s
     }
 }
 
-fn strip_review_verdict_marker(message: &str) -> String {
-    let mut cleaned = message.replace("===REVIEW: PASS===", "");
-    while let Some(start) = cleaned.find("===REVIEW: FAIL: ") {
-        let Some(relative_end) = cleaned[start + "===REVIEW: FAIL: ".len()..].find("===") else {
-            break;
-        };
-        let end = start + "===REVIEW: FAIL: ".len() + relative_end + "===".len();
-        cleaned.replace_range(start..end, "");
-    }
-    cleaned
+fn strip_review_result(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("FORGE_RESULT: "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn review_evidence_is_stale(
+    bound_head: &str,
+    bound_diff_digest: &str,
+    current_head: &str,
+    current_diff: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let current_diff_digest = hex::encode(Sha256::digest(current_diff.as_bytes()));
+    current_head != bound_head || current_diff_digest != bound_diff_digest
 }
 
 #[cfg(test)]
@@ -1812,7 +1863,7 @@ mod reviewer_message_tests {
                     "content": [
                         {
                             "type": "text",
-                            "text": "No issues found.\n===REVIEW: PASS==="
+                            "text": "No issues found.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}"
                         }
                     ]
                 }
@@ -1829,7 +1880,7 @@ mod reviewer_message_tests {
         let message = reviewer_final_message(&execution)
             .await
             .expect("message extracts");
-        assert!(message.contains("===REVIEW: PASS==="));
+        assert!(message.contains("FORGE_RESULT:"));
     }
 
     #[tokio::test]
@@ -1844,7 +1895,7 @@ mod reviewer_message_tests {
             "stream": "main",
             "payload": {
                 "subtype": "success",
-                "result": "Looks good.\n===REVIEW: PASS==="
+                "result": "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}"
             },
             "truncated": false
         });
@@ -1858,7 +1909,7 @@ mod reviewer_message_tests {
         let message = reviewer_final_message(&execution)
             .await
             .expect("message extracts");
-        assert!(message.contains("===REVIEW: PASS==="));
+        assert!(message.contains("FORGE_RESULT:"));
     }
 
     #[test]
@@ -1866,7 +1917,7 @@ mod reviewer_message_tests {
         let comment = reviewer_comment(
             ReviewStatus::Passed,
             1,
-            "No blocking issues found.\n===REVIEW: PASS===",
+            "No blocking issues found.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}",
         );
 
         assert_eq!(comment, "No blocking issues found.");
@@ -1874,8 +1925,32 @@ mod reviewer_message_tests {
 
     #[test]
     fn reviewer_comment_falls_back_when_only_marker_exists() {
-        let comment = reviewer_comment(ReviewStatus::Passed, 2, "===REVIEW: PASS===");
+        let comment = reviewer_comment(
+            ReviewStatus::Passed,
+            2,
+            "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}",
+        );
 
         assert_eq!(comment, "Review passed (attempt 2)");
+    }
+
+    #[test]
+    fn evidence_staleness_checks_uncommitted_diff_as_well_as_head() {
+        use sha2::{Digest, Sha256};
+        let bound_diff = "diff --git a/a b/a\n-old\n+new\n";
+        let digest = hex::encode(Sha256::digest(bound_diff.as_bytes()));
+
+        assert!(!review_evidence_is_stale(
+            "head-1", &digest, "head-1", bound_diff
+        ));
+        assert!(review_evidence_is_stale(
+            "head-1",
+            &digest,
+            "head-1",
+            "diff --git a/a b/a\n-old\n+different\n"
+        ));
+        assert!(review_evidence_is_stale(
+            "head-1", &digest, "head-2", bound_diff
+        ));
     }
 }

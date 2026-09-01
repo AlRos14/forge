@@ -49,7 +49,7 @@ async fn seed_project_and_task(db: &SqliteDb, status: &str) -> (Uuid, String) {
             assignee_id: None,
             title: "Task".to_owned(),
             description: Some("Task description".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,

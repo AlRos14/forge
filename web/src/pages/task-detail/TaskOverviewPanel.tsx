@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanChecklist } from '@/components/plan-checklist'
+import { TaskDecisionRequests } from '@/components/task-decision-requests'
 import {
   type AssigneeSelection,
   AgentAssigneeDropdown,
@@ -460,6 +461,7 @@ export function TaskOverviewPanel({
             />
             {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
             <TaskPrSummaryCard task={task} />
+            <TaskDecisionRequests taskId={task.id} />
 
             {task.plan_progress || task.plan_artifact ? (
               <PlanChecklist progress={task.plan_progress} artifact={task.plan_artifact} />

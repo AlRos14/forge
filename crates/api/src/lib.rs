@@ -505,6 +505,12 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::reset_task_workspace),
         )
         .route("/api/v1/tasks/{id}/diff", get(routes::tasks::get_task_diff))
+        .route("/api/v1/tasks/{id}/plan", get(routes::tasks::get_task_plan))
+        .route("/api/v1/tasks/{id}/decisions", get(routes::tasks::list_task_decisions))
+        .route(
+            "/api/v1/tasks/{id}/decisions/{request_id}/answer",
+            post(routes::tasks::answer_task_decision),
+        )
         .route(
             "/api/v1/tasks/{id}/dependencies",
             post(routes::tasks::add_dependency).get(routes::tasks::list_dependencies),
@@ -758,6 +764,14 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/agents/{id}/availability",
             get(routes::agents::agent_availability),
+        )
+        .route(
+            "/api/v1/agents/{id}/usage",
+            get(routes::agents::get_agent_usage),
+        )
+        .route(
+            "/api/v1/agents/{id}/usage/refresh",
+            post(routes::agents::refresh_agent_usage),
         )
         .route(
             "/api/v1/agents/{id}/discovered-options",

@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
-import { useAgentProfilesQuery, useSelectAgentProfileMutation, isVersionConflict } from '@/features/federation/hooks'
+import { useAgentProfilesQuery, useAgentUsageQuery, useRefreshAgentUsageMutation, useSelectAgentProfileMutation, isVersionConflict } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { StateBadge, StatusDot } from '@/features/federation/components'
@@ -21,6 +21,8 @@ export function AgentDetailPanel({
   onChangeModel: (agent: FederatedAgent) => void
 }) {
   const profilesQuery = useAgentProfilesQuery(agent.id)
+  const usageQuery = useAgentUsageQuery(agent.id)
+  const refreshUsage = useRefreshAgentUsageMutation(agent.id)
   const selectProfile = useSelectAgentProfileMutation(agent.id)
   const [profileError, setProfileError] = useState<string | null>(null)
   const profiles = profilesQuery.data ?? []
@@ -106,6 +108,33 @@ export function AgentDetailPanel({
         <div>
           <Button onClick={() => onChangeModel(agent)}>Edit agent…</Button>
         </div>
+
+        <section aria-labelledby="agent-usage-heading" className="rounded-lg border border-border-subtle bg-muted/20 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 id="agent-usage-heading" className="text-sm font-semibold">Account usage</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {usageQuery.data?.shared_account ? 'Shared by agents using the same harness account.' : 'Scoped to this daemon account.'}
+              </p>
+            </div>
+            <Button size="sm" variant="ghost" disabled={refreshUsage.isPending} onClick={() => void refreshUsage.mutateAsync()}>
+              Refresh
+            </Button>
+          </div>
+          {usageQuery.isLoading ? <p className="mt-3 text-xs text-muted-foreground">Checking usage…</p> : null}
+          {usageQuery.data?.available && usageQuery.data.usage ? (
+            <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-card p-3 font-mono text-xs">
+              {JSON.stringify(usageQuery.data.usage, null, 2)}
+            </pre>
+          ) : (
+            <p className="mt-3 text-xs text-muted-foreground">{usageQuery.data?.message ?? 'Usage is not reported by this harness.'}</p>
+          )}
+          {usageQuery.data?.captured_at ? (
+            <p className="mt-2 font-mono text-micro text-muted-foreground">
+              {usageQuery.data.stale ? 'Stale snapshot' : 'Current snapshot'} · {usageQuery.data.captured_at}
+            </p>
+          ) : null}
+        </section>
 
         {/* Profiles */}
         <section aria-labelledby="agent-detail-profiles-heading">

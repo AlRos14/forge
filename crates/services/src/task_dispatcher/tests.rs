@@ -228,7 +228,7 @@ async fn seed_task(
             assignee_id: None,
             title: title.to_owned(),
             description: Some("echo test".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority,
@@ -907,7 +907,7 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
         .expect("reviewer execution spawned in time")
         .expect("reviewer execution context received");
     assert_eq!(ctx.task_id, task.id);
-    assert!(ctx.description.contains("===REVIEW: PASS==="));
+    assert!(ctx.description.contains("FORGE_RESULT:"));
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
             &*db,

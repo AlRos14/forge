@@ -2,6 +2,7 @@ use super::*;
 
 pub async fn approve_gate(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path((id, state_name)): Path<(String, String)>,
     Json(request): Json<ApproveGateRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
@@ -12,6 +13,7 @@ pub async fn approve_gate(
         request.version,
         request.reason,
         GateDecision::Approve,
+        Some(user.user_id),
     )
     .await?;
     Ok(Json(task))
@@ -29,6 +31,7 @@ pub async fn reject_gate(
         request.version,
         Some(required_reject_reason(request.reason)?),
         GateDecision::Reject,
+        None,
     )
     .await?;
     Ok(Json(task))
@@ -47,6 +50,7 @@ async fn transition_gate(
     version: i64,
     reason: Option<String>,
     decision: GateDecision,
+    principal_id: Option<String>,
 ) -> ApiResult<TaskResponse> {
     let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
         .await?
@@ -54,7 +58,11 @@ async fn transition_gate(
     let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let workflow = WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &api_types::Actor::user(api_types::UserActionSource::Api),
+    );
     let gate_state = workflow
         .states
         .iter()
@@ -97,15 +105,45 @@ async fn transition_gate(
     let result = state
         .task_service
         .transition(
-            task_id,
+            task_id.clone(),
             target_state,
             (
                 version,
-                Some(trigger_reason),
+                Some(trigger_reason.clone()),
                 decision == GateDecision::Reject,
             ),
         )
         .await?;
+
+    if decision == GateDecision::Approve && state_name == default_states::PLANNING {
+        let workspace = WorkspaceRepo::get_by_task_id(&*state.db, &task_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::invalid_operation_conflict("approved plan workspace is missing")
+            })?;
+        let plan = services::plan_artifact::capture_plan_revision(
+            &state.db,
+            &task_id,
+            std::path::Path::new(&workspace.worktree_path),
+            "approved",
+            None,
+        )
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let plan_revision_id = plan
+            .revision_id
+            .ok_or_else(|| ApiError::bad_request("approved plan revision is missing"))?;
+        let digest = plan
+            .content_digest
+            .ok_or_else(|| ApiError::bad_request("approved plan digest is missing"))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO task_plan_approval
+             (id, task_id, plan_revision_id, content_digest, principal_type, principal_id, decision, reason, created_at)
+             VALUES (?, ?, ?, ?, 'user', ?, 'approved', ?, ?)",
+        ).bind(db::new_uuid_v4()).bind(&task_id).bind(plan_revision_id).bind(digest)
+            .bind(principal_id.unwrap_or_else(|| "authenticated-user".to_owned()))
+            .bind(trigger_reason).bind(now_rfc3339()).execute(state.db.pool()).await?;
+    }
 
     let mut response = task_response(&state.db, result.task).await?;
     response.awaiting_human = state

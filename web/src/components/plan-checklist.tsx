@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { CaretDown, WarningCircle } from '@phosphor-icons/react'
 import { Checkbox } from '@/components/ui/checkbox'
+import { MarkdownView } from '@/components/ui/markdown-editor'
 import { cn } from '@/lib/cn'
 import type { PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary } from '@/types/generated'
 
@@ -77,6 +78,11 @@ export function PlanChecklist({
 
       {expanded && (
         <div className="border-t px-3 pb-3 pt-2 space-y-2">
+          {artifact?.revision ? (
+            <p className="font-mono text-micro text-muted-foreground">
+              Revision {artifact.revision} · {artifact.checkpoint} · {artifact.content_digest?.slice(0, 12)}
+            </p>
+          ) : null}
           {warnings.length > 0 ? (
             <div className="space-y-1">
               {warnings.map((warning, index) => (
@@ -97,6 +103,12 @@ export function PlanChecklist({
                 <ChecklistItem key={`${item.line_number}-${item.label}`} item={item} />
               ))}
             </div>
+          ) : null}
+          {artifact?.markdown ? (
+            <details className="rounded-md border border-border-subtle bg-card p-3">
+              <summary className="cursor-pointer text-xs font-medium">Full plan</summary>
+              <MarkdownView content={artifact.markdown} className="mt-3" />
+            </details>
           ) : null}
         </div>
       )}

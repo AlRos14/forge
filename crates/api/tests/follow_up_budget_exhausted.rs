@@ -378,10 +378,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 });
             }
 
-            if ctx
-                .description
-                .contains("===REVIEW: FAIL: <short reason>===")
-            {
+            if ctx.description.contains("FORGE_RESULT:") {
                 write_auditor_failure(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -434,7 +431,8 @@ async fn write_auditor_failure(ctx: &ExecutionContext) -> Result<(), ExecutorErr
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": format!("No.\n===REVIEW: FAIL: {REVIEW_FAIL_REASON}===") }),
+            json!({ "text": format!(r#"No.
+FORGE_RESULT: {{"schema_version":1,"kind":"review","verdict":"fail","summary":"{REVIEW_FAIL_REASON}","findings":[],"questions":[]}}"#) }),
         )
         .await?;
     Ok(())

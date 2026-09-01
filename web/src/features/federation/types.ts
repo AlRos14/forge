@@ -64,6 +64,18 @@ export interface FederatedAgent {
   updated_at: string
 }
 
+export interface AgentUsage {
+  available: boolean
+  executor_type: string
+  account_key: string
+  shared_account: boolean
+  source: string | null
+  usage: JsonObject | null
+  captured_at: string | null
+  stale: boolean
+  message: string | null
+}
+
 export interface AgentProfile {
   id: string
   identity_id: string

@@ -2,7 +2,7 @@ use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
 
 use api_types::{
     Actor, FailurePolicy, StateDefinition, StateKind, TaskMovedEventPayload, WorkflowDefinition,
-    WorkflowTrigger,
+    WorkflowDispatch, WorkflowTrigger,
 };
 use db::{
     new_uuid_v4, now_rfc3339, CompareAndMoveTask, CreateDomainEvent, DomainEventRepo,
@@ -26,7 +26,10 @@ use crate::{
     deferred_dispatch,
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
-    workflow::{default_workflow, inherited_subtask_workflow, registry, HookContext, HookResult},
+    workflow::{
+        default_roles, default_states, default_workflow, inherited_subtask_workflow, registry,
+        HookContext, HookResult,
+    },
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
     ServiceError,
@@ -564,6 +567,21 @@ impl WorkflowEngine {
         inherited_subtask_workflow()
     }
 
+    pub fn resolve_workflow_for_type(
+        workflow_definition_json: &str,
+        task_type: &str,
+        is_subtask: bool,
+    ) -> WorkflowDefinition {
+        if is_subtask {
+            return inherited_subtask_workflow();
+        }
+        let raw = workflow_definition_json.trim();
+        if !raw.is_empty() && raw != "{}" {
+            return Self::resolve_workflow(raw);
+        }
+        semantic_default_workflow(task_type)
+    }
+
     /// Single source of truth for which workflow governs a task at transition entry.
     ///
     /// - Root tasks always use the project workflow.
@@ -576,7 +594,12 @@ impl WorkflowEngine {
         workflow_definition_json: &str,
         actor: &Actor,
     ) -> WorkflowDefinition {
-        let project_workflow = Self::resolve_workflow(workflow_definition_json);
+        let raw = workflow_definition_json.trim();
+        let project_workflow = if raw.is_empty() || raw == "{}" {
+            semantic_default_workflow(&task.task_type)
+        } else {
+            Self::resolve_workflow(workflow_definition_json)
+        };
         if task.parent_task_id.is_none() {
             return project_workflow;
         }
@@ -1818,6 +1841,103 @@ impl WorkflowEngine {
     }
 }
 
+fn semantic_default_workflow(task_type: &str) -> WorkflowDefinition {
+    let mut workflow = default_workflow::default_workflow();
+    if task_type == "implementation" {
+        return workflow;
+    }
+    let done = default_states::DONE.to_owned();
+    let review = default_states::REVIEW.to_owned();
+    let active = default_states::IN_PROGRESS.to_owned();
+    if let Some(todo) = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == default_states::TODO)
+    {
+        if matches!(task_type, "review" | "validation") {
+            if let Some(trigger) = todo.triggers.get_mut(&WorkflowTrigger::Accept) {
+                trigger.to = review.clone();
+            }
+        } else if let Some(trigger) = todo.triggers.get_mut(&WorkflowTrigger::Accept) {
+            trigger.to = active.clone();
+        }
+    }
+    if let Some(state) = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == default_states::IN_PROGRESS)
+    {
+        state.role = Some(
+            if task_type == "planning" {
+                default_roles::PLANNER
+            } else {
+                default_roles::WORKER
+            }
+            .to_owned(),
+        );
+        state
+            .hooks
+            .before_exit
+            .retain(|hook| hook.action != "require_plan_checklist_complete");
+        state.dispatch = Some(WorkflowDispatch {
+            builder: Some(
+                if task_type == "planning" {
+                    "planner.default.v2"
+                } else {
+                    "worker.autonomous.v1"
+                }
+                .to_owned(),
+            ),
+            execution_policy: None,
+            prompt: None,
+        });
+        if let Some(trigger) = state.triggers.get_mut(&WorkflowTrigger::Accept) {
+            trigger.to = review.clone();
+        }
+    }
+    if let Some(state) = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == default_states::REVIEW)
+    {
+        if matches!(task_type, "planning" | "discovery") {
+            state.role = None;
+            state.dispatch = None;
+            state.hooks = api_types::StateHooks::default();
+        }
+        state.display_name = if task_type == "validation" {
+            "Validation"
+        } else {
+            "Human acceptance"
+        }
+        .to_owned();
+        if let Some(gate) = state.gate_config.as_mut() {
+            gate.requires_user_approval = Some(true);
+            gate.reject_target = Some(
+                if matches!(task_type, "review" | "validation") {
+                    default_states::TODO
+                } else {
+                    default_states::IN_PROGRESS
+                }
+                .to_owned(),
+            );
+        }
+        if let Some(trigger) = state.triggers.get_mut(&WorkflowTrigger::Accept) {
+            trigger.to = done;
+        }
+        if let Some(trigger) = state.triggers.get_mut(&WorkflowTrigger::Reject) {
+            trigger.to = if matches!(task_type, "review" | "validation") {
+                default_states::TODO
+            } else {
+                default_states::IN_PROGRESS
+            }
+            .to_owned();
+            trigger.dispatch = None;
+        }
+    }
+    workflow
+}
+
 #[cfg(test)]
 mod resolve_workflow_tests {
     use db::{new_uuid_v4, now_rfc3339};
@@ -1837,7 +1957,7 @@ mod resolve_workflow_tests {
             assignee_id: None,
             title: "task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1894,6 +2014,55 @@ mod resolve_workflow_tests {
                 uses_project_workflow(&resolved),
                 "root task in {status} with actor {actor} must use project workflow"
             );
+        }
+    }
+
+    #[test]
+    fn semantic_defaults_route_non_implementation_work_to_human_acceptance() {
+        for task_type in ["planning", "discovery", "review", "validation"] {
+            let workflow = WorkflowEngine::resolve_workflow_for_type("{}", task_type, false);
+            let review = workflow
+                .states
+                .iter()
+                .find(|state| state.name == default_states::REVIEW)
+                .expect("semantic workflow has an acceptance state");
+            assert_eq!(
+                review
+                    .triggers
+                    .get(&api_types::WorkflowTrigger::Accept)
+                    .map(|trigger| trigger.to.as_str()),
+                Some(default_states::DONE),
+                "{task_type} must finish through human acceptance"
+            );
+            assert_eq!(
+                review
+                    .gate_config
+                    .as_ref()
+                    .and_then(|gate| gate.requires_user_approval),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_review_and_validation_start_with_a_read_only_reviewer() {
+        for task_type in ["review", "validation"] {
+            let workflow = WorkflowEngine::resolve_workflow_for_type("{}", task_type, false);
+            let todo = workflow
+                .states
+                .iter()
+                .find(|state| state.name == default_states::TODO)
+                .expect("workflow has todo");
+            assert_eq!(
+                todo.triggers[&api_types::WorkflowTrigger::Accept].to,
+                default_states::REVIEW
+            );
+            let review = workflow
+                .states
+                .iter()
+                .find(|state| state.name == default_states::REVIEW)
+                .expect("workflow has review");
+            assert_eq!(review.role.as_deref(), Some("reviewer"));
         }
     }
 

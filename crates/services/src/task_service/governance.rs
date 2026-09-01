@@ -12,7 +12,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 
-const IMPLEMENTATION_CAPABILITY_TYPES: &[&str] = &["task", "sub_task"];
+const IMPLEMENTATION_CAPABILITY_TYPES: &[&str] = &["implementation"];
+const READ_ONLY_CAPABILITY_TYPES: &[&str] = &["planning", "discovery", "review", "validation"];
 const WORKSPACE_LEASE_SECONDS: i64 = 15 * 60;
 const CAPABILITY_PROFILE_REVISION: &str = "forge.capability-profile/v1";
 
@@ -261,7 +262,7 @@ impl TaskService {
 
         if repository_capable
             && baseline.is_none()
-            && matches!(task_type, "planning_task" | "discovery")
+            && READ_ONLY_CAPABILITY_TYPES.contains(&task_type)
         {
             if let Some(capability_class) = requested.capability_class.as_deref() {
                 if !is_read_only_capability(capability_class) {
@@ -565,7 +566,7 @@ impl TaskService {
             return Ok(());
         }
         let task_type: String = row.get("task_type");
-        if matches!(task_type.as_str(), "planning_task" | "discovery")
+        if READ_ONLY_CAPABILITY_TYPES.contains(&task_type.as_str())
             && row.get::<Option<String>, _>("baseline_id").is_none()
             && row
                 .get::<Option<String>, _>("baseline_revision_id")
@@ -844,13 +845,13 @@ impl TaskService {
         .flatten()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
-            if matches!(task_type.as_str(), "planning_task" | "discovery") {
+            if READ_ONLY_CAPABILITY_TYPES.contains(&task_type.as_str()) {
                 "repository_read".to_owned()
             } else {
                 "repository_write".to_owned()
             }
         });
-        if matches!(task_type.as_str(), "planning_task" | "discovery")
+        if READ_ONLY_CAPABILITY_TYPES.contains(&task_type.as_str())
             && !is_read_only_capability(&capability_class)
         {
             return Err(ServiceError::invalid_operation(
@@ -896,7 +897,7 @@ impl TaskService {
         let charter_backed = gate.get::<String, _>("charter_status") == "charter_backed"
             && gate.get::<i64, _>("charter_setup_required") == 0;
         let prebaseline_read_only = charter_backed
-            && matches!(task_type.as_str(), "planning_task" | "discovery")
+            && READ_ONLY_CAPABILITY_TYPES.contains(&task_type.as_str())
             && gate.get::<Option<String>, _>("baseline_id").is_none()
             && gate
                 .get::<Option<String>, _>("baseline_revision_id")
@@ -1085,7 +1086,7 @@ impl TaskService {
         .flatten()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
-            if matches!(task.task_type.as_str(), "planning_task" | "discovery") {
+            if READ_ONLY_CAPABILITY_TYPES.contains(&task.task_type.as_str()) {
                 "repository_read".to_owned()
             } else {
                 "repository_write".to_owned()
@@ -1097,7 +1098,7 @@ impl TaskService {
                 capability_class
             )));
         }
-        if matches!(task.task_type.as_str(), "planning_task" | "discovery")
+        if READ_ONLY_CAPABILITY_TYPES.contains(&task.task_type.as_str())
             && !is_read_only_capability(&capability_class)
         {
             return Err(ServiceError::invalid_operation(
@@ -1563,7 +1564,7 @@ mod tests {
             .prepare_task_governance(
                 &charter_backed_project(),
                 Some(&"repo-1".to_owned()),
-                "task",
+                "implementation",
                 None,
             )
             .await
@@ -1621,7 +1622,7 @@ mod tests {
             .prepare_task_governance(
                 &charter_backed_project(),
                 Some(&"repo-1".to_owned()),
-                "planning_task",
+                "planning",
                 Some(TaskGovernanceRequest {
                     charter_revision_id: Some("charter-revision-1".to_owned()),
                     baseline_id: None,

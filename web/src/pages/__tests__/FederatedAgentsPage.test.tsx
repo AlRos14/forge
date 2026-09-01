@@ -102,6 +102,8 @@ vi.mock('@/features/federation/hooks', () => ({
     refetch: vi.fn(),
   }),
   useAgentProfilesQuery: () => ({ data: [], isLoading: false, isError: false }),
+  useAgentUsageQuery: () => ({ data: undefined, isLoading: false, isError: false }),
+  useRefreshAgentUsageMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useSelectAgentProfileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useCreateEmbeddedAgentMutation: () => ({ mutateAsync: createEmbeddedAgent, isPending: false }),
   useRegisterHarnessAgentMutation: () => ({

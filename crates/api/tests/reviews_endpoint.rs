@@ -220,7 +220,7 @@ async fn seed_review(db: &db::SqliteDb, step_results_json: String) -> String {
             assignee_id: None,
             title: "Review details".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "review".to_owned(),
             is_automation: false,
             priority: 0,

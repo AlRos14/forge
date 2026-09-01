@@ -150,6 +150,22 @@ impl WorkspaceCleanupScheduler {
                 .cleanup_workspace_terminals(workspace_id)
                 .await?;
         }
+        match crate::plan_artifact::capture_plan_revision(
+            &self.db,
+            &workspace.task_id,
+            Path::new(&workspace.worktree_path),
+            "final",
+            None,
+        )
+        .await
+        {
+            Ok(_) | Err(crate::plan_artifact::PlanArtifactError::NotFound) => {}
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "workspace cleanup blocked because the final plan could not be persisted: {error}"
+                )));
+            }
+        }
         let manager = WorkspaceManager::new(self.workspace_root.clone());
         match manager.cleanup_worktree(&workspace.task_id).await {
             Ok(()) => {}
@@ -270,7 +286,7 @@ mod tests {
                 assignee_id: None,
                 title: "Cleanup task".to_owned(),
                 description: None,
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status: "done".to_owned(),
                 is_automation: false,
                 priority: 0,
@@ -350,6 +366,47 @@ mod tests {
             .expect("workspace exists");
         assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
         assert!(workspace.cleanup_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_persists_final_plan_before_removing_workspace() {
+        let db = sqlite_db().await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let temp = TempDir::new().expect("temp dir creates");
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let plan_path = worktree_path
+            .parent()
+            .expect("task root exists")
+            .join("plan.md");
+        std::fs::write(
+            &plan_path,
+            "# Final plan\n\n- [x] Implement\n- [x] Verify\n",
+        )
+        .expect("plan writes");
+        let task_id: String = sqlx::query_scalar("SELECT task_id FROM workspace WHERE id = ?")
+            .bind(&workspace_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("workspace task loads");
+        let scheduler =
+            WorkspaceCleanupScheduler::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+
+        scheduler
+            .cleanup_now(workspace_id)
+            .await
+            .expect("cleanup succeeds");
+
+        assert!(!plan_path.exists());
+        let persisted: (String, String) = sqlx::query_as(
+            "SELECT checkpoint, markdown FROM task_plan_revision WHERE task_id = ? ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("final plan revision persists");
+        assert_eq!(persisted.0, "final");
+        assert!(persisted.1.contains("- [x] Verify"));
     }
 
     #[tokio::test]

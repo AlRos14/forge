@@ -67,14 +67,23 @@ impl TaskService {
             (project.primary_repo_id.clone(), None)
         };
 
-        let now = now_rfc3339();
         let is_subtask = parent_task_id.is_some();
         let is_root = !is_subtask;
-        let workflow = if is_subtask {
-            WorkflowEngine::resolve_subtask_workflow()
-        } else {
-            WorkflowEngine::resolve_workflow(&project.workflow_definition)
-        };
+        let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
+        if !matches!(
+            effective_task_type.as_str(),
+            "implementation" | "planning" | "discovery" | "review" | "validation"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "task_type must be implementation, planning, discovery, review, or validation",
+            ));
+        }
+        let now = now_rfc3339();
+        let workflow = WorkflowEngine::resolve_workflow_for_type(
+            &project.workflow_definition,
+            &effective_task_type,
+            is_subtask,
+        );
         let no_repo = repo_id.is_none();
         let initial_status = if no_repo {
             workflow
@@ -91,21 +100,6 @@ impl TaskService {
                 .map(|state| state.name.clone())
                 .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
         };
-        let effective_task_type = task_type.unwrap_or_else(|| {
-            if is_subtask {
-                "sub_task".to_owned()
-            } else {
-                "task".to_owned()
-            }
-        });
-        if !matches!(
-            effective_task_type.as_str(),
-            "task" | "planning_task" | "sub_task" | "discovery"
-        ) {
-            return Err(ServiceError::invalid_operation(
-                "task_type must be task, planning_task, sub_task, or discovery",
-            ));
-        }
         let prepared_governance = self
             .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, governance)
             .await?;
@@ -268,7 +262,7 @@ impl TaskService {
         };
 
         let now = now_rfc3339();
-        let effective_task_type = task_type.unwrap_or_else(|| "task".to_owned());
+        let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
         let prepared_governance = self
             .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, None)
             .await?;

@@ -309,7 +309,7 @@ mod tests {
                 assignee_id: agent_id,
                 title: "Shutdown test".to_owned(),
                 description: None,
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status,
                 is_automation: false,
                 priority: 0,

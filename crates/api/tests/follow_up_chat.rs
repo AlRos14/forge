@@ -440,7 +440,7 @@ async fn seed_parent_execution(
             assignee_id: Some(agent_id.to_owned()),
             title: "Follow-up task".to_owned(),
             description: Some("execute follow-up".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: task_status,
             is_automation: false,
             priority: 0,

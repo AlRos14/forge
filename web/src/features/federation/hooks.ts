@@ -9,6 +9,7 @@ import {
   createEmbeddedAgent,
   createProviderEntry,
   getEffectivePermissions,
+  getAgentUsage,
   getContextManifest,
   getMainAgentBinding,
   getMissionControl,
@@ -25,6 +26,7 @@ import {
   removeProviderEntry,
   renameProviderEntry,
   rotateAgentSession,
+  refreshAgentUsage,
   selectAgentProfile,
   setMainAgentBinding,
   setProjectAgentBinding,
@@ -49,6 +51,7 @@ import type {
 export const federationQueryKeys = {
   agents: ['federated-agents'] as const,
   profiles: (identityId: string) => ['federated-agents', identityId, 'profiles'] as const,
+  usage: (identityId: string) => ['federated-agents', identityId, 'usage'] as const,
   sessions: (identityId: string) => ['federated-agents', identityId, 'sessions'] as const,
   credentials: ['federated-agents', 'credentials'] as const,
   mainAgent: ['federated-agents', 'main-agent'] as const,
@@ -77,6 +80,23 @@ export function useAgentProfilesQuery(identityId: string | undefined) {
     queryFn: () => listAgentProfiles(identityId!),
     enabled: Boolean(identityId),
     staleTime: 15_000,
+  })
+}
+
+export function useAgentUsageQuery(identityId: string | undefined) {
+  return useQuery({
+    queryKey: federationQueryKeys.usage(identityId ?? 'none'),
+    queryFn: () => getAgentUsage(identityId!),
+    enabled: Boolean(identityId),
+    staleTime: 60_000,
+  })
+}
+
+export function useRefreshAgentUsageMutation(identityId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => refreshAgentUsage(identityId),
+    onSuccess: (usage) => queryClient.setQueryData(federationQueryKeys.usage(identityId), usage),
   })
 }
 

@@ -167,7 +167,7 @@ pub(super) async fn seed_task_with_status_at(
             assignee_id: None,
             title: format!("task-{status}"),
             description: Some("seeded task".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,

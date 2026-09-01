@@ -16,10 +16,11 @@ import { toastApiError } from '@/lib/api-error'
 import type { Task, TaskType } from '@/types/generated'
 
 const taskTypes: { value: TaskType; label: string }[] = [
-  { value: 'task', label: 'Task' },
-  { value: 'planning_task', label: 'Planning Task' },
+  { value: 'implementation', label: 'Implementation' },
+  { value: 'planning', label: 'Planning' },
   { value: 'discovery', label: 'Discovery' },
-  { value: 'sub_task', label: 'Sub Task' },
+  { value: 'review', label: 'Review' },
+  { value: 'validation', label: 'Validation' },
 ]
 
 interface TaskCreateDialogProps {
@@ -37,13 +38,13 @@ export function TaskCreateDialog({
 }: TaskCreateDialogProps) {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [taskType, setTaskType] = useState<TaskType>('task')
+  const [taskType, setTaskType] = useState<TaskType>('implementation')
   const createTask = useCreateTask(projectId)
 
   const reset = () => {
     setTitle('')
     setDescription('')
-    setTaskType('task')
+    setTaskType('implementation')
   }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {

@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 
 use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
 use db::{SqliteDb, WorkspaceRepo};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 pub const DEFAULT_PLAN_ARTIFACT_PATH: &str = "plan.md";
 pub const PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = "Write an implementation plan as a Markdown checklist at `../plan.md`, next to the repository worktree and outside the git repository. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation.";
@@ -30,6 +32,7 @@ pub struct ParsedPlanItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPlanArtifact {
+    pub markdown: String,
     pub items: Vec<ParsedPlanItem>,
     pub warnings: Vec<String>,
 }
@@ -104,7 +107,11 @@ pub fn parse_plan_markdown(content: &str) -> ParsedPlanArtifact {
         }
     }
 
-    ParsedPlanArtifact { items, warnings }
+    ParsedPlanArtifact {
+        markdown: content.to_owned(),
+        items,
+        warnings,
+    }
 }
 
 pub async fn read_plan_for_workspace(
@@ -119,16 +126,17 @@ pub async fn read_plan_for_workspace(
     let worktree_path = Path::new(&workspace.worktree_path);
 
     match read_plan_artifact(worktree_path, None) {
-        Ok(artifact) => {
-            let source_path = default_plan_artifact_path(worktree_path)
-                .to_string_lossy()
-                .to_string();
-            Ok(Some((
-                to_plan_progress_summary(&artifact),
-                to_plan_artifact_detail(&artifact, Some(source_path), None),
-            )))
+        Ok(artifact) => Ok(Some((
+            to_plan_progress_summary(&artifact),
+            to_plan_artifact_detail(&artifact, None, None, None, None),
+        ))),
+        Err(PlanArtifactError::NotFound) => {
+            let persisted = latest_plan_for_task(db, &workspace.task_id).await?;
+            Ok(persisted.map(|artifact| {
+                let parsed = parse_plan_markdown(&artifact.markdown);
+                (to_plan_progress_summary(&parsed), artifact)
+            }))
         }
-        Err(PlanArtifactError::NotFound) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -174,6 +182,109 @@ pub fn read_plan_artifact(
     Ok(parse_plan_markdown(&content))
 }
 
+pub async fn capture_plan_revision(
+    db: &SqliteDb,
+    task_id: &str,
+    workspace_root: &Path,
+    checkpoint: &str,
+    source_execution_id: Option<&str>,
+) -> Result<PlanArtifactDetail, PlanArtifactError> {
+    let artifact = read_plan_artifact(workspace_root, None)?;
+    let digest = hex::encode(Sha256::digest(artifact.markdown.as_bytes()));
+    let checklist_json = serde_json::to_string(
+        &artifact
+            .items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "checked": item.checked,
+                    "label": item.label,
+                    "nesting_level": item.nesting_level,
+                    "line_number": item.line_number,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| PlanArtifactError::IoError(io::Error::other(error)))?;
+    let warnings_json = serde_json::to_string(&artifact.warnings)
+        .map_err(|error| PlanArtifactError::IoError(io::Error::other(error)))?;
+    let existing = sqlx::query(
+        "SELECT id, revision, created_at FROM task_plan_revision
+         WHERE task_id = ? AND checkpoint = ? AND content_digest = ?",
+    )
+    .bind(task_id)
+    .bind(checkpoint)
+    .bind(&digest)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db::DbError::from)?;
+    let (id, revision, created_at) = if let Some(row) = existing {
+        (row.get("id"), row.get("revision"), row.get("created_at"))
+    } else {
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM task_plan_revision WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = db::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO task_plan_revision
+             (id, task_id, revision, checkpoint, markdown, content_digest, checklist_json,
+              warnings_json, source_execution_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(task_id)
+        .bind(revision)
+        .bind(checkpoint)
+        .bind(&artifact.markdown)
+        .bind(&digest)
+        .bind(checklist_json)
+        .bind(warnings_json)
+        .bind(source_execution_id)
+        .bind(&created_at)
+        .execute(db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        (id, revision, created_at)
+    };
+    Ok(to_plan_artifact_detail(
+        &artifact,
+        Some(id),
+        Some(revision),
+        Some(checkpoint.to_owned()),
+        Some((digest, created_at)),
+    ))
+}
+
+pub async fn latest_plan_for_task(
+    db: &SqliteDb,
+    task_id: &str,
+) -> Result<Option<PlanArtifactDetail>, PlanArtifactError> {
+    let row = sqlx::query(
+        "SELECT id, revision, checkpoint, markdown, content_digest, created_at
+         FROM task_plan_revision WHERE task_id = ? ORDER BY revision DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db::DbError::from)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let artifact = parse_plan_markdown(row.get("markdown"));
+    Ok(Some(to_plan_artifact_detail(
+        &artifact,
+        Some(row.get("id")),
+        Some(row.get("revision")),
+        Some(row.get("checkpoint")),
+        Some((row.get("content_digest"), row.get("created_at"))),
+    )))
+}
+
 pub fn default_plan_artifact_path(worktree_root: &Path) -> PathBuf {
     worktree_root
         .parent()
@@ -197,10 +308,17 @@ pub fn to_plan_progress_summary(artifact: &ParsedPlanArtifact) -> PlanProgressSu
 
 pub fn to_plan_artifact_detail(
     artifact: &ParsedPlanArtifact,
-    source_path: Option<String>,
-    last_modified: Option<String>,
+    revision_id: Option<String>,
+    revision: Option<i64>,
+    checkpoint: Option<String>,
+    persisted: Option<(String, String)>,
 ) -> PlanArtifactDetail {
     PlanArtifactDetail {
+        revision_id,
+        revision,
+        checkpoint,
+        content_digest: persisted.as_ref().map(|value| value.0.clone()),
+        markdown: artifact.markdown.clone(),
         items: artifact
             .items
             .iter()
@@ -212,8 +330,7 @@ pub fn to_plan_artifact_detail(
             })
             .collect(),
         warnings: artifact.warnings.clone(),
-        source_path,
-        last_modified,
+        last_modified: persisted.map(|value| value.1),
     }
 }
 
@@ -394,6 +511,7 @@ mod tests {
     #[test]
     fn plan_progress_summary_counts_checked_and_unchecked_items() {
         let artifact = ParsedPlanArtifact {
+            markdown: "- [x] one\n- [x] two\n- [x] three\n- [ ] four\n- [ ] five".to_string(),
             items: vec![
                 ParsedPlanItem {
                     checked: true,
@@ -441,6 +559,7 @@ mod tests {
     #[test]
     fn plan_artifact_detail_preserves_nesting_and_line_numbers() {
         let artifact = ParsedPlanArtifact {
+            markdown: "- [ ] root\n  - [x] child\n    - [ ] grandchild".to_string(),
             items: vec![
                 ParsedPlanItem {
                     checked: false,
@@ -466,8 +585,13 @@ mod tests {
 
         let detail = to_plan_artifact_detail(
             &artifact,
-            Some("/tmp/worktree/.forge/plan.md".to_string()),
-            Some("2026-04-29T00:00:00Z".to_string()),
+            Some("revision-1".to_string()),
+            Some(1),
+            Some("approved".to_string()),
+            Some((
+                "sha256:plan".to_string(),
+                "2026-04-29T00:00:00Z".to_string(),
+            )),
         );
 
         assert_eq!(detail.items.len(), 3);
@@ -484,10 +608,11 @@ mod tests {
         assert_eq!(detail.items[2].line_number, 8);
         assert!(!detail.items[2].checked);
         assert_eq!(detail.warnings, artifact.warnings);
-        assert_eq!(
-            detail.source_path.as_deref(),
-            Some("/tmp/worktree/.forge/plan.md")
-        );
+        assert_eq!(detail.revision_id.as_deref(), Some("revision-1"));
+        assert_eq!(detail.revision, Some(1));
+        assert_eq!(detail.checkpoint.as_deref(), Some("approved"));
+        assert_eq!(detail.content_digest.as_deref(), Some("sha256:plan"));
+        assert_eq!(detail.markdown, artifact.markdown);
         assert_eq!(
             detail.last_modified.as_deref(),
             Some("2026-04-29T00:00:00Z")

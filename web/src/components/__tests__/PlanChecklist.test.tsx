@@ -12,13 +12,17 @@ const progress: PlanProgressSummary = {
 }
 
 const artifact: PlanArtifactDetail = {
+  revision_id: 'revision-1',
+  revision: 1,
+  checkpoint: 'approved',
+  content_digest: 'sha256:plan',
+  markdown: '- [x] Prepare rollout\n  - [x] Validate daemon health\n  - [ ] Clear cleanup backlog',
   items: [
     { checked: true, label: 'Prepare rollout', nesting_level: 0, line_number: 1 },
     { checked: true, label: 'Validate daemon health', nesting_level: 1, line_number: 2 },
     { checked: false, label: 'Clear cleanup backlog', nesting_level: 1, line_number: 3 },
   ],
   warnings: [],
-  source_path: '/tmp/plan.md',
   last_modified: '2026-04-29T12:00:00Z',
 }
 
@@ -40,10 +44,11 @@ describe('PlanChecklist', () => {
 
     fireEvent.click(screen.getByRole('button', { expanded: false }))
 
-    expect(screen.getByText('Prepare rollout')).toBeTruthy()
-    expect(screen.getByText('Validate daemon health')).toBeTruthy()
-    expect(screen.getByText('Clear cleanup backlog')).toBeTruthy()
-    expect(screen.getByText('Validate daemon health').parentElement?.style.paddingLeft).toBe('14px')
+    expect(screen.getAllByText('Prepare rollout')).toHaveLength(2)
+    const validationEntries = screen.getAllByText('Validate daemon health')
+    expect(validationEntries).toHaveLength(2)
+    expect(screen.getAllByText('Clear cleanup backlog')).toHaveLength(2)
+    expect(validationEntries[0].parentElement?.style.paddingLeft).toBe('14px')
   })
 
   it('renders empty state when unavailable', () => {

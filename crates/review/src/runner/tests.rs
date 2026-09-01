@@ -155,7 +155,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             assignee_id: None,
             title: "Review me".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "in_progress".to_string(),
             is_automation: false,
             priority: 0,
@@ -259,7 +259,7 @@ impl TaskExecutor for MutatingAuditor {
             .write(
                 LogKind::Assistant,
                 LogStream::Main,
-                json!({ "text": "No issues.\n===REVIEW: PASS===" }),
+                json!({ "text": "No issues.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}" }),
             )
             .await?;
 
@@ -338,7 +338,7 @@ async fn assistant_entries_are_concatenated_for_verdict_text() {
             (LogKind::Assistant, json!({ "text": "Verifying...\n" })),
             (
                 LogKind::Assistant,
-                json!({ "text": "All clear.\n===REVIEW: PASS===" }),
+                json!({ "text": "All clear.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}" }),
             ),
         ],
     )
@@ -348,16 +348,16 @@ async fn assistant_entries_are_concatenated_for_verdict_text() {
         .await
         .unwrap();
 
-    assert_eq!(message, "Verifying...\nAll clear.\n===REVIEW: PASS===");
+    assert!(message.starts_with("Verifying...\nAll clear.\nFORGE_RESULT: "));
 }
 
 #[tokio::test]
-async fn assistant_entry_with_pass_marker_parses_as_passed() {
+async fn assistant_entry_with_structured_pass_parses_as_passed() {
     let tempdir = tempfile::tempdir().expect("tempdir creates");
     let logs_path = tempdir.path().join("auditor.jsonl");
     write_jsonl_log(
         &logs_path,
-        vec![(LogKind::Assistant, json!({ "text": "===REVIEW: PASS===" }))],
+        vec![(LogKind::Assistant, json!({ "text": "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}" }))],
     )
     .await;
 
@@ -380,7 +380,7 @@ async fn claude_assistant_message_content_parses_as_passed() {
                 "message": {
                     "content": [{
                         "type": "text",
-                        "text": "No issues found.\n===REVIEW: PASS==="
+                        "text": "No issues found.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}"
                     }]
                 }
             }),
@@ -405,7 +405,7 @@ async fn claude_success_result_parses_as_passed() {
             LogKind::SessionInfo,
             json!({
                 "subtype": "success",
-                "result": "No issues found.\n===REVIEW: PASS==="
+                "result": "No issues found.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}"
             }),
         )],
     )
@@ -439,13 +439,13 @@ async fn assistant_delta_entries_alone_do_not_count_for_verdict_text() {
     assert_eq!(
         auditor::parse_verdict(&message),
         AuditorVerdict::Failed {
-            reason: "verdict marker missing".to_owned()
+            reason: "structured review result missing".to_owned()
         }
     );
 }
 
 #[tokio::test]
-async fn codex_auditor_snapshot_carries_resume_thread_hint_for_codex_executor() {
+async fn codex_auditor_snapshot_starts_without_producer_thread() {
     let now = now_rfc3339();
     let auditor_agent = Agent {
         id: "auditor-agent".to_owned(),
@@ -477,7 +477,7 @@ async fn codex_auditor_snapshot_carries_resume_thread_hint_for_codex_executor() 
         created_at: now.clone(),
         updated_at: now.clone(),
     };
-    let executor_execution = Execution {
+    let _executor_execution = Execution {
         id: "executor-exec".to_owned(),
         task_id: "task".to_owned(),
         agent_id: Some("executor-agent".to_owned()),
@@ -503,17 +503,12 @@ async fn codex_auditor_snapshot_carries_resume_thread_hint_for_codex_executor() 
         updated_at: now,
     };
 
-    let extra_config =
-        auditor_resume_thread_extra_config(&executor_execution, Some("codex"), &auditor_agent);
-    let snapshot = build_auditor_config_snapshot(&auditor_agent, extra_config)
+    let snapshot = build_auditor_config_snapshot(&auditor_agent, None)
         .await
         .expect("snapshot builds");
     let snapshot: Value = serde_json::from_str(&snapshot).expect("snapshot parses");
 
-    assert_eq!(
-        snapshot["config"][RESUME_THREAD_ID_CONFIG_KEY],
-        json!("thread-123")
-    );
+    assert!(snapshot["config"].get("resume_thread_id").is_none());
 }
 
 #[tokio::test]

@@ -42,10 +42,15 @@ impl TaskService {
                 self.repo_cache_locks.clone(),
             )
             .await?;
-        let executor_config_snapshot_json = with_dispatch_metadata(
+        let mut executor_config_snapshot_json = with_dispatch_metadata(
             build_executor_config_snapshot(&self.db, &task, &agent, None).await?,
             dispatch_metadata,
         )?;
+        if role == crate::workflow::default_roles::REVIEWER {
+            executor_config_snapshot_json = executor_config_snapshot_json
+                .map(|snapshot| executor_snapshot_without_resume_thread(&snapshot))
+                .transpose()?;
+        }
         let now = now_rfc3339();
         let execution = self
             .create_running_execution(

@@ -117,9 +117,11 @@
       "viewDetail": "View Detail"
     },
     "taskTypes": {
-      "task": "task",
-      "planningTask": "planning_task",
-      "subTask": "sub_task"
+      "implementation": "implementation",
+      "planning": "planning",
+      "discovery": "discovery",
+      "review": "review",
+      "validation": "validation"
     }
   },
   "taskCreateDialog": {

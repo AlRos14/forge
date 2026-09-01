@@ -247,8 +247,8 @@ records disagree. It blocks only the affected execution or readiness path.
 When Task creation omits an explicit governance envelope, Forge derives one
 from the Project's current Charter. Before baseline activation, ordinary
 implementation Tasks are retained as non-runnable instead of being rejected;
-baseline activation promotes matching Tasks. `planning_task` and `discovery`
-Tasks additionally have an explicit pre-baseline lane: they may be claimed only
+baseline activation promotes matching Tasks. `planning`, `discovery`, `review`,
+and `validation` Tasks additionally have an explicit pre-baseline lane: they may be claimed only
 with the read-only repository capability and low risk, and both service and
 transactional admission enforce that same predicate.
 
@@ -594,6 +594,23 @@ server records the sessions as exited, timed out, orphaned, or cleanup
 terminated when it observes the terminal lifecycle event.
 
 ## Task state machine
+
+Task hierarchy and purpose are independent. `parent_task_id` alone represents
+hierarchy. The semantic `task_type` values are `implementation`, `planning`,
+`discovery`, `review`, and `validation`. On the built-in workflow,
+implementation retains planning, coding, independent review, merge, and done;
+planning/discovery run a read-only worker followed by human acceptance;
+review/validation use a fresh read-only evaluator followed by human acceptance
+and never enter merge. A custom Project workflow remains authoritative, while
+the semantic type still enforces the read/write capability ceiling.
+
+Plans are append-only `task_plan_revision` records. Forge captures
+`planner_ready` and `final` snapshots; the final capture occurs synchronously
+before Workspace cleanup. The checklist is a projection of canonical Markdown,
+not a second authority. Reviewer runs bind immutable evidence to the plan
+digest, base/head SHA, full diff, CI result records, reviewer execution, and
+fresh-session provenance. Structured `needs_human` results pause rather than
+consuming coder retry budget.
 
 ```
 todo ──────────────► in_progress ──────► review ──────► merging ──────► done

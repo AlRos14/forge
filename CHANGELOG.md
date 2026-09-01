@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Task types now describe purpose and capability: `implementation`, `planning`,
+  `discovery`, `review`, and `validation`. Hierarchy is represented only by
+  `parent_task_id`; existing `task` and `sub_task` rows migrate to
+  `implementation`, and `planning_task` migrates to `planning`.
+- Planner and reviewer agents must end with the server-owned `FORGE_RESULT`
+  JSON contract. Legacy review verdict markers are no longer accepted.
+
 - Launching a task no longer offers a "Save changes to agent" checkbox on
   the launch dialog's model/reasoning/policy overrides. Those overrides
   remain execution-scoped (they only affect the run being launched); the
@@ -19,6 +26,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   launch-dialog checkbox could touch it).
 
 ### Added
+
+- Durable, immutable Task plan revisions survive Workspace cleanup, expose the
+  full Markdown and revision digest through `GET /api/v1/tasks/{id}/plan`, and
+  bind review evidence to the exact plan and git head.
+- Task-scoped decision requests pause planning for principal-bound answers;
+  Project/policy/risk questions require a Project Decision and reconciliation.
+- Agent account-usage snapshots are available at
+  `GET /api/v1/agents/{id}/usage`; Cursor refresh uses its interactive `/usage`
+  command through a bounded PTY without starting a model turn, while Codex
+  captures `account/rateLimits/updated` events.
+- Independent reviews now use a fresh read-only session, immutable diff/plan/CI
+  evidence, structured findings, and `pass`, `fail`, or `needs_human` verdicts.
 
 - A downstream relationship record documents the operational fork, its
   intentional divergences, and how useful upstream changes remain integrated.

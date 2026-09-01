@@ -51,6 +51,12 @@ impl PromptBuilder for PlannerPromptBuilder {
         user.push_str("\nPlanning output:\n");
         user.push_str(PLAN_ARTIFACT_AGENT_INSTRUCTION);
         user.push('\n');
+        user.push_str(r#"
+Required result contract: End with exactly one machine-readable line. Use one of:
+FORGE_RESULT: {"schema_version":1,"kind":"plan_ready"}
+FORGE_RESULT: {"schema_version":1,"kind":"decision_request","authority_scope":"task|project_scope|policy|risk","context":"...","questions":[{"id":"...","question":"..."}]}
+Request a decision instead of guessing whenever missing product, policy, scope, or risk authority could materially change the plan. A Task answer cannot amend a Project Charter or approved execution baseline."#);
+        user.push('\n');
 
         AgentPrompt {
             system: format!(

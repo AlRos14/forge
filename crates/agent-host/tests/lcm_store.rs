@@ -368,7 +368,7 @@ async fn runtime_session_rotation_restart_preserves_scope_timeline_and_isolation
             assignee_id: None,
             title: "Continuity task".to_owned(),
             description: Some("continuity fixture".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "todo".to_owned(),
             is_automation: false,
             priority: 0,

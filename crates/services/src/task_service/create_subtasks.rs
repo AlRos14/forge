@@ -49,7 +49,7 @@ impl TaskService {
                 .bind(Option::<&str>::None)
                 .bind(&item.title)
                 .bind(item.description.as_deref())
-                .bind("sub_task")
+                .bind("implementation")
                 .bind("todo")
                 .bind(0_i64)
                 .bind(start_order + offset as i64)

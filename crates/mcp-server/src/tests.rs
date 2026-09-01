@@ -912,7 +912,7 @@ fn forge_create_task_persists_validated_task_type() {
         let (project_id, _) = seed_project_repo(&state).await;
         for (task_type, title) in [
             ("discovery", "Discovery task"),
-            ("planning_task", "Planning task"),
+            ("planning", "Planning task"),
         ] {
             let result = call_tool(
                 &state,
@@ -978,7 +978,13 @@ fn forge_create_task_rejects_invalid_type_with_field_error() {
         assert_eq!(data["field"], "type");
         assert_eq!(
             data["accepted"]["enum"],
-            json!(["task", "planning_task", "sub_task", "discovery"])
+            json!([
+                "implementation",
+                "planning",
+                "discovery",
+                "review",
+                "validation"
+            ])
         );
     });
 }
@@ -1515,7 +1521,7 @@ fn forge_create_sub_tasks_nested_rejected() {
                 assignee_id: None,
                 title: "Existing subtask".to_owned(),
                 description: None,
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status: "todo".to_owned(),
                 is_automation: false,
                 priority: 0,

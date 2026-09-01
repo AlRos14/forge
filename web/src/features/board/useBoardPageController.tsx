@@ -325,7 +325,7 @@ export function useBoardPageController(projectId: string) {
     const description = quickCreateDescription.trim()
     if (!title || !description || createTask.isPending) return
     createTask.mutate(
-      { title, description, task_type: 'task', priority: 0 },
+      { title, description, task_type: 'implementation', priority: 0 },
       {
         onError: (error) => toastApiError(error, 'Task creation failed'),
         onSuccess: () => {

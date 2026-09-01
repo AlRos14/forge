@@ -409,6 +409,22 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
     .execute(&pool)
     .await
     .expect("legacy task inserts");
+    sqlx::query(
+        "INSERT INTO task (id, project_id, repo_id, title, task_type, created_at, updated_at) VALUES ('legacy-plan', 'discovery-project', 'discovery-repo', 'Legacy plan', 'planning_task', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy planning task inserts");
+    sqlx::query(
+        "INSERT INTO task (id, project_id, repo_id, parent_task_id, title, task_type, created_at, updated_at) VALUES ('legacy-child', 'discovery-project', 'discovery-repo', 'legacy-task', 'Legacy child', 'sub_task', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy subtask inserts");
 
     run_migrations(&pool)
         .await
@@ -420,7 +436,18 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
         .expect("legacy task loads")
         .expect("legacy task survives");
     assert_eq!(legacy.title, "Legacy task");
-    assert_eq!(legacy.task_type, "task");
+    assert_eq!(legacy.task_type, "implementation");
+    let legacy_plan = TaskRepo::get_by_id(&db, "legacy-plan", true)
+        .await
+        .expect("legacy plan loads")
+        .expect("legacy plan survives");
+    assert_eq!(legacy_plan.task_type, "planning");
+    let legacy_child = TaskRepo::get_by_id(&db, "legacy-child", true)
+        .await
+        .expect("legacy child loads")
+        .expect("legacy child survives");
+    assert_eq!(legacy_child.task_type, "implementation");
+    assert_eq!(legacy_child.parent_task_id.as_deref(), Some("legacy-task"));
 
     let discovery = TaskRepo::create(
         &db,
@@ -454,7 +481,18 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
             .fetch_one(&pool)
             .await
             .expect("task schema loads");
-    assert!(task_sql.contains("'discovery'"));
+    for task_type in [
+        "'implementation'",
+        "'planning'",
+        "'discovery'",
+        "'review'",
+        "'validation'",
+    ] {
+        assert!(
+            task_sql.contains(task_type),
+            "missing semantic type {task_type}"
+        );
+    }
     for object in [
         "idx_task_status_project",
         "idx_task_parent",

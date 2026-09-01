@@ -232,12 +232,27 @@ pub struct AuditorVerdictEntry {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewEvidenceEntry {
+    pub bundle_id: String,
+    pub plan_revision_id: Option<String>,
+    pub plan_digest: Option<String>,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub diff_digest: String,
+    pub fresh_session: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReviewDetails {
     #[serde(default)]
     pub ci_steps: Vec<StepResultEntry>,
     #[serde(default)]
     pub auditor: Option<AuditorVerdictEntry>,
+    #[serde(default)]
+    pub evidence: Option<ReviewEvidenceEntry>,
+    #[serde(default)]
+    pub structured_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

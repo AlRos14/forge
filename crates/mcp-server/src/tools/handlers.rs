@@ -248,21 +248,22 @@ fn validate_create_task_arguments(params: &Value) -> Result<(), McpToolError> {
                 "must be one of the accepted values",
                 Some(json!({
                     "type": "string",
-                    "enum": ["task", "planning_task", "sub_task", "discovery"]
+                    "enum": ["implementation", "planning", "discovery", "review", "validation"]
                 })),
             ));
         };
-        if task_type != "task"
-            && task_type != "planning_task"
-            && task_type != "sub_task"
+        if task_type != "implementation"
+            && task_type != "planning"
             && task_type != "discovery"
+            && task_type != "review"
+            && task_type != "validation"
         {
             return Err(invalid_field_error(
                 "type",
                 format!("unsupported value `{task_type}`"),
                 Some(json!({
                     "type": "string",
-                    "enum": ["task", "planning_task", "sub_task", "discovery"]
+                    "enum": ["implementation", "planning", "discovery", "review", "validation"]
                 })),
             ));
         }

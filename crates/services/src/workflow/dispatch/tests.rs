@@ -25,7 +25,7 @@ fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
         assignee_id: None,
         title: title.to_string(),
         description: description.map(str::to_string),
-        task_type: "task".to_string(),
+        task_type: "implementation".to_string(),
         status: default_states::IN_PROGRESS.to_string(),
         is_automation: false,
         priority: 0,
@@ -75,6 +75,7 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         transition_log: Vec::new(),
         comments: Vec::new(),
         plan: Some("1. Load context\n2. Build prompt".to_string()),
+        review_evidence: None,
         prior_reviews: Vec::new(),
         parent_task: None,
         sub_tasks: Vec::new(),
@@ -253,7 +254,7 @@ fn coder_family_prompts_require_structured_completion_handoff() {
 }
 
 #[test]
-fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
+fn reviewer_prompt_requires_structured_findings_and_result_contract() {
     let prompt = resolve_prompt_builder(BUILDER_ID_REVIEWER_DEFAULT_V2)
         .build(&fake_context(default_roles::REVIEWER));
 
@@ -269,9 +270,9 @@ fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
         .contains("Separate NON-BLOCKING findings from BLOCKING findings."));
     assert!(prompt
         .system
-        .contains("End your response with EXACTLY ONE verdict marker in the existing format:"));
-    assert!(prompt.system.contains("===REVIEW: PASS==="));
-    assert!(prompt.system.contains("===REVIEW: FAIL: <short reason>==="));
+        .contains("End with exactly one machine-readable line:"));
+    assert!(prompt.system.contains("FORGE_RESULT:"));
+    assert!(prompt.system.contains("needs_human"));
 }
 
 #[test]

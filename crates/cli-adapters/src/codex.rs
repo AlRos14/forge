@@ -523,6 +523,7 @@ impl CodexAdapter {
         let mut outcome = run.outcome.unwrap_or(ExecutionOutcome::Failed);
         let mut summary = run.summary;
         let mut usage = run.usage;
+        let mut account_usage = run.account_usage;
 
         if outcome == ExecutionOutcome::Cancelled {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
@@ -557,6 +558,9 @@ impl CodexAdapter {
                         summary = Some(s);
                     }
                     usage = merge_usage(usage, followup.usage);
+                    if followup.account_usage.is_some() {
+                        account_usage = followup.account_usage;
+                    }
                 }
             }
         }
@@ -577,6 +581,7 @@ impl CodexAdapter {
                 summary,
                 error,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
+                account_usage,
                 ..Default::default()
             });
         }
@@ -592,6 +597,7 @@ impl CodexAdapter {
                 summary,
                 error: None,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
+                account_usage,
                 ..Default::default()
             });
         }
@@ -612,6 +618,7 @@ impl CodexAdapter {
                         summary,
                         error: Some(error.to_string()),
                         usage: usage.map(|usage| usage_with_model(usage, &config)),
+                        account_usage,
                         ..Default::default()
                     });
                 }
@@ -624,6 +631,7 @@ impl CodexAdapter {
             summary,
             error: None,
             usage: usage.map(|usage| usage_with_model(usage, &config)),
+            account_usage,
             ..Default::default()
         })
     }

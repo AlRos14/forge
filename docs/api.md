@@ -135,6 +135,8 @@ database for historical provenance.
 | GET    | `/api/v1/agents/{id}` | Get an agent identity with selected-profile fields |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
+| GET    | `/api/v1/agents/{id}/usage` | Get the latest account-scoped harness usage snapshot, including freshness |
+| POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh usage when the harness exposes a no-model probe (Cursor `/usage`) |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -449,6 +451,21 @@ rejected at dispatch time; an empty `{}` candidate config is valid. See
 
 ## Main and Project Agent bindings
 
+Task evidence routes:
+
+- `GET /api/v1/tasks/{id}/plan` returns the latest immutable full-Markdown plan
+  plus its revision history. Filesystem source paths are never exposed.
+- `GET /api/v1/tasks/{id}/decisions` lists planner/reviewer decision requests.
+- `POST /api/v1/tasks/{id}/decisions/{request_id}/answer` records a
+  principal-bound Task answer and resumes the planner. Project-scope, policy,
+  and risk requests must instead be resolved through a Project Decision and
+  baseline reconciliation.
+
+Review responses include the immutable evidence bundle identity, bound plan
+revision/digest, base/head SHA, diff digest, fresh-session provenance, actual CI
+results, and the structured reviewer result. A changed head makes the verdict
+stale and prevents an automatic pass.
+
 Bindings are authority, not identity ownership. An account has at most one
 active Main Agent binding and an operational Project has exactly one active
 Project Agent binding. Only an authorized account or Project administrator may
@@ -508,9 +525,9 @@ listed as a Task. The exact closed proposal payload is validated before the
 action ledger accepts it. For a Charter-backed Project, an omitted governance
 object is derived from the current Charter: implementation Tasks remain
 non-runnable until a matching baseline activates them, while pre-baseline
-`planning_task` and `discovery` claims are restricted to the read-only lane.
+`planning`, `discovery`, `review`, and `validation` claims are restricted to the read-only lane.
 `task_type`, when present, is the same closed enum as normal
-Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
+Task creation: `implementation`, `planning`, `discovery`, `review`, or `validation`; unknown
 values are rejected before an action is admitted. Terminal Task delivery,
 blocked, failed, and cancelled
 events are reconciled by the durable `agent-coordination-outcomes` consumer:
@@ -1538,8 +1555,8 @@ Task IDs are only references that Forge authorizes.
 
 Disable the endpoint with `forge --no-mcp` if you don't want it.
 
-`forge_create_task` accepts the optional `type` field (`task`, `planning_task`,
-`sub_task`, or `discovery`) and passes it through to the authoritative Task service. A
+`forge_create_task` accepts the optional `type` field (`implementation`, `planning`,
+`discovery`, `review`, or `validation`) and passes it through to the authoritative Task service. A
 project-scoped MCP connection may omit `project_id`; Forge injects the bound
 Project and rejects a conflicting reference.
 

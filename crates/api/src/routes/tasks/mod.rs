@@ -44,10 +44,12 @@ use crate::{
 mod actions;
 mod comments;
 mod crud;
+mod decisions;
 mod dependencies;
 mod execution;
 mod gates;
 mod media;
+mod plans;
 mod prompt_preview;
 mod reviews;
 mod roles;
@@ -63,10 +65,12 @@ pub use crud::{
     advance_task, archive_task, create_task, delete_task, duplicate_task, get_task, list_tasks,
     move_task, recover_task, reorder_subtasks, update_task,
 };
+pub use decisions::{answer_task_decision, list_task_decisions};
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
 pub use gates::{approve_gate, reject_gate};
 pub use media::{delete_media, get_media, list_media, upload_media};
+pub use plans::get_task_plan;
 pub use prompt_preview::prompt_preview;
 pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
 pub use roles::{

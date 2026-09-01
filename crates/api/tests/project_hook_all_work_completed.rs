@@ -39,7 +39,7 @@ async fn all_work_completed_create_task_refires_after_hook_created_work_complete
         json!({
             "title": "Finish milestone",
             "description": "complete the source task",
-            "task_type": "task",
+            "task_type": "implementation",
             "priority": 0,
             "review_config": null,
             "merge_config": null
@@ -121,7 +121,7 @@ async fn hook_action_failure_does_not_roll_back_source_task_transition() {
         json!({
             "title": "Finish despite hook failure",
             "description": "the source transition must stay committed",
-            "task_type": "task",
+            "task_type": "implementation",
             "priority": 0,
             "review_config": null,
             "merge_config": null
@@ -266,7 +266,7 @@ async fn configure_create_task_hook(app: &Router, project_id: &str) {
                     "type": "create_task",
                     "title": "Hook follow-up",
                     "description": "Created after all project work completed",
-                    "task_type": "task",
+                    "task_type": "implementation",
                     "priority": 0
                 },
                 "cooldown_seconds": null,

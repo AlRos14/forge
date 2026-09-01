@@ -1,4 +1,20 @@
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentUsageResponse {
+    pub available: bool,
+    pub executor_type: String,
+    pub account_key: String,
+    pub shared_account: bool,
+    pub source: Option<String>,
+    #[ts(type = "Record<string, unknown> | null")]
+    pub usage: Option<serde_json::Value>,
+    pub captured_at: Option<String>,
+    pub stale: bool,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectAnalyticsResponse {

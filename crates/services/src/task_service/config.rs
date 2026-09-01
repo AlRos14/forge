@@ -195,15 +195,9 @@ pub(super) fn executor_snapshot_with_sticky_resume(
     }
 }
 
-#[allow(dead_code)]
 pub(super) fn executor_snapshot_without_resume_thread(snapshot_json: &str) -> Result<String> {
     let mut snapshot = parse_json_value("executor config snapshot", snapshot_json)?;
-    if let Some(config) = snapshot.get_mut("config").and_then(Value::as_object_mut) {
-        config.remove(RESUME_THREAD_ID_CONFIG_KEY);
-        config.remove("resume_thread_in_place");
-        config.remove("resume_fallback_prompt");
-        config.remove("resume_session_id");
-    }
+    scrub_resume_fields(&mut snapshot);
     if let Some(obj) = snapshot.as_object_mut() {
         obj.remove("dispatch_metadata");
         if let Some(dispatch_obj) = obj.get_mut("dispatch").and_then(Value::as_object_mut) {
@@ -213,6 +207,22 @@ pub(super) fn executor_snapshot_without_resume_thread(snapshot_json: &str) -> Re
     serde_json::to_string(&snapshot).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
     })
+}
+
+fn scrub_resume_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove(RESUME_THREAD_ID_CONFIG_KEY);
+            object.remove("resume_thread_in_place");
+            object.remove("resume_fallback_prompt");
+            object.remove("resume_session_id");
+            for child in object.values_mut() {
+                scrub_resume_fields(child);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(scrub_resume_fields),
+        _ => {}
+    }
 }
 
 pub(super) fn truncate_utf8_bytes(bytes: &[u8], max_bytes: usize) -> String {
@@ -290,7 +300,10 @@ pub(super) async fn build_executor_config_snapshot(
     // but they are never allowed to receive a write-capable execution
     // profile.  Persist the capability in the immutable execution snapshot
     // so every executor backend sees the same server-derived restriction.
-    if matches!(task.task_type.as_str(), "planning_task" | "discovery") {
+    if matches!(
+        task.task_type.as_str(),
+        "planning" | "discovery" | "review" | "validation"
+    ) {
         executors::mark_worktree_read_only(&mut snapshot);
     }
     serde_json::to_string(&snapshot)
@@ -798,5 +811,31 @@ mod tests {
             snapshot["dispatch_metadata"]["execution_policy"],
             "resume_latest_target_role_thread"
         );
+    }
+
+    #[test]
+    fn reviewer_snapshot_recursively_removes_every_resume_field() {
+        let snapshot_json = r#"{
+            "executor_type":"cursor",
+            "dispatch":{"execution_policy":"resume_latest_target_role_thread","target_role":"reviewer"},
+            "dispatch_metadata":{"execution_policy":"resume_latest_target_role_thread"},
+            "config":{"resume_session_id":"top","fallbacks":[
+                {"config":{"resume_thread_id":"nested","resume_thread_in_place":true}},
+                {"config":{"resume_session_id":"fallback","resume_fallback_prompt":"old"}}
+            ]}
+        }"#;
+
+        let cleaned = executor_snapshot_without_resume_thread(snapshot_json)
+            .expect("reviewer snapshot is valid");
+        let snapshot: Value = serde_json::from_str(&cleaned).expect("cleaned snapshot is json");
+        let rendered = snapshot.to_string();
+
+        assert!(!rendered.contains("resume_session_id"));
+        assert!(!rendered.contains("resume_thread_id"));
+        assert!(!rendered.contains("resume_thread_in_place"));
+        assert!(!rendered.contains("resume_fallback_prompt"));
+        assert!(snapshot.get("dispatch_metadata").is_none());
+        assert!(snapshot["dispatch"].get("execution_policy").is_none());
+        assert_eq!(snapshot["dispatch"]["target_role"], "reviewer");
     }
 }

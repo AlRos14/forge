@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod account_usage;
 pub(crate) mod agent_capacity;
 pub mod agent_chat_memory_consumer;
 pub mod agent_chat_policy;

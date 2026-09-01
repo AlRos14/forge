@@ -15,7 +15,7 @@ function task(id: string, status: string, position: number, version = 1): Task {
     project_id: 'project',
     repo_id: null,
     title: id,
-    task_type: 'task',
+    task_type: 'implementation',
     status,
     priority: 0,
     board_position: position,

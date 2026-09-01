@@ -79,6 +79,7 @@ import type {
   ReviewDecisionResponse,
   Task,
   TaskMediaResponse,
+  TaskDecisionRequestResponse,
   TaskRoleAssignmentResponse,
   TransitionLogEntry,
   TransitionTaskResponse,
@@ -368,6 +369,28 @@ export function useTaskQuery(taskId: string) {
   return useQuery({
     queryKey: qk.task(taskId),
     queryFn: () => apiFetch<Task>(`/tasks/${taskId}`),
+  })
+}
+
+export function useTaskDecisionsQuery(taskId: string) {
+  return useQuery({
+    queryKey: ['tasks', taskId, 'decisions'],
+    queryFn: () => apiFetch<TaskDecisionRequestResponse[]>(`/tasks/${taskId}/decisions`),
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useAnswerTaskDecision(taskId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ requestId, answers }: { requestId: string; answers: Record<string, unknown> }) =>
+      apiFetch<TaskDecisionRequestResponse>(`/tasks/${taskId}/decisions/${requestId}/answer`, {
+        method: 'POST', body: JSON.stringify({ answers }),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tasks', taskId, 'decisions'] })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+    },
   })
 }
 

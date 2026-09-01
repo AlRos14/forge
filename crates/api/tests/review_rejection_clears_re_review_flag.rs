@@ -172,10 +172,7 @@ impl CodingExecutorAdapter for RejectClearsFlagCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let auditor_calls = Arc::clone(&self.auditor_calls);
         Box::pin(async move {
-            if ctx
-                .description
-                .contains("===REVIEW: FAIL: <short reason>===")
-            {
+            if ctx.description.contains("FORGE_RESULT:") {
                 auditor_calls.fetch_add(1, Ordering::SeqCst);
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
@@ -232,7 +229,7 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({ "text": "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}" }),
         )
         .await?;
     Ok(())
@@ -327,7 +324,7 @@ async fn seed_awaiting_human_review_with_passed_flag(
             assignee_id: None,
             title: "Reviewer rejection task".to_owned(),
             description: Some("exercise reviewer rejection".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "review".to_owned(),
             is_automation: false,
             priority: 0,

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::workflow::engine::WorkflowEngine;
 use services::{
-    plan_artifact::{read_plan_for_workspace, PlanArtifactError},
+    plan_artifact::{latest_plan_for_task, read_plan_for_workspace, PlanArtifactError},
     task_diagnostics::{derive_workflow_exception, derive_workflow_health},
     task_service::action_resolver::resolve_execution_actions,
 };
@@ -308,7 +308,18 @@ async fn task_response_inner(
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
             Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
-            None => (None, None),
+            None => match latest_plan_for_task(db, &task.id).await {
+                Ok(Some(artifact)) => {
+                    let parsed = services::plan_artifact::parse_plan_markdown(&artifact.markdown);
+                    (
+                        Some(services::plan_artifact::to_plan_progress_summary(&parsed)),
+                        Some(artifact),
+                    )
+                }
+                Ok(None) => (None, None),
+                Err(PlanArtifactError::DbError(error)) => return Err(ApiError::from(error)),
+                Err(_) => (None, None),
+            },
         }
     } else {
         (None, None)
@@ -548,10 +559,11 @@ async fn task_execution_observability(
 
 fn parse_task_type(task_type: &str) -> TaskType {
     match task_type {
-        "planning_task" => TaskType::PlanningTask,
-        "sub_task" => TaskType::SubTask,
+        "planning" => TaskType::Planning,
         "discovery" => TaskType::Discovery,
-        _ => TaskType::Task,
+        "review" => TaskType::Review,
+        "validation" => TaskType::Validation,
+        _ => TaskType::Implementation,
     }
 }
 
@@ -813,6 +825,8 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
         return Ok(ReviewDetails {
             ci_steps: serde_json::from_value(value)?,
             auditor: None,
+            evidence: None,
+            structured_result: None,
         });
     }
     serde_json::from_value(value)

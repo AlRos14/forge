@@ -8,6 +8,7 @@ use db::{
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use crate::workflow::{
@@ -472,17 +473,98 @@ pub(super) async fn ensure_review_record_for_dispatch(
         return Ok(());
     }
 
-    match latest_review(ctx).await? {
+    let review = match latest_review(ctx).await? {
         Some(review)
             if matches!(
                 review.status,
                 ReviewStatus::Running | ReviewStatus::AwaitingHuman
             ) =>
         {
-            Ok(())
+            review
         }
-        _ => create_review_attempt(ctx, execution_id).await.map(|_| ()),
+        _ => create_review_attempt(ctx, execution_id).await?,
+    };
+    bind_review_evidence(ctx, &review, execution_id).await
+}
+
+async fn bind_review_evidence(
+    ctx: &HookContext,
+    review: &db::Review,
+    execution_id: &str,
+) -> Result<(), String> {
+    if sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM review_evidence_bundle WHERE review_id = ?",
+    )
+    .bind(&review.id)
+    .fetch_one(ctx.db.pool())
+    .await
+    .map_err(|error| error.to_string())?
+        > 0
+    {
+        return Ok(());
     }
+    let diff = crate::DiffService::new(Arc::clone(&ctx.db))
+        .task_diff(&ctx.task_id)
+        .await
+        .map_err(|error| format!("review evidence diff unavailable: {error}"))?;
+    let plan = sqlx::query(
+        "SELECT id, content_digest FROM task_plan_revision WHERE task_id = ? ORDER BY revision DESC LIMIT 1",
+    ).bind(&ctx.task_id).fetch_optional(ctx.db.pool()).await.map_err(|error| error.to_string())?;
+    use sqlx::Row;
+    let plan_revision_id = plan.as_ref().map(|row| row.get::<String, _>("id"));
+    let plan_digest = plan
+        .as_ref()
+        .map(|row| row.get::<String, _>("content_digest"));
+    let diff_digest = hex::encode(Sha256::digest(diff.diff.as_bytes()));
+    let bundle_id = new_uuid_v4();
+    let existing_details: Value = serde_json::from_str(&review.step_results_json)
+        .unwrap_or_else(|_| json!({ "ci_steps": [] }));
+    let ci_results = existing_details
+        .get("ci_steps")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    sqlx::query(
+        "INSERT INTO review_evidence_bundle
+         (id, review_id, task_id, reviewer_execution_id, plan_revision_id, plan_digest,
+          base_sha, head_sha, diff_text, diff_digest, ci_results_json, fresh_session, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+    )
+    .bind(&bundle_id)
+    .bind(&review.id)
+    .bind(&ctx.task_id)
+    .bind(execution_id)
+    .bind(plan_revision_id.as_deref())
+    .bind(plan_digest.as_deref())
+    .bind(&diff.base_sha)
+    .bind(&diff.head_sha)
+    .bind(&diff.diff)
+    .bind(&diff_digest)
+    .bind(ci_results.to_string())
+    .bind(now_rfc3339())
+    .execute(ctx.db.pool())
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut details = existing_details;
+    details["evidence"] = json!({
+        "bundle_id": bundle_id,
+        "plan_revision_id": plan_revision_id,
+        "plan_digest": plan_digest,
+        "base_sha": diff.base_sha,
+        "head_sha": diff.head_sha,
+        "diff_digest": diff_digest,
+        "fresh_session": true,
+    });
+    ReviewRepo::update_status(
+        &*ctx.db,
+        &review.id,
+        review.status.clone(),
+        details.to_string(),
+        review.finished_at.clone(),
+        &now_rfc3339(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<(), String> {

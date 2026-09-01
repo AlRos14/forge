@@ -96,7 +96,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             assignee_id: None,
             title: "test task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,
@@ -144,7 +144,7 @@ async fn seed_project_without_repo_and_task(db: &SqliteDb, task_id: &str, status
             assignee_id: None,
             title: "test task".to_owned(),
             description: Some("echo test".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             priority: 0,
             is_automation: false,
@@ -261,7 +261,7 @@ async fn seed_local_project_repo_and_task(
             assignee_id: None,
             title: "test task".to_owned(),
             description: Some("echo test".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,
@@ -908,7 +908,7 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
         .expect("reviewer executor spawned in time")
         .expect("reviewer execution context received");
     assert_eq!(execution_ctx.task_id, ctx.task_id);
-    assert!(execution_ctx.description.contains("===REVIEW: PASS==="));
+    assert!(execution_ctx.description.contains("FORGE_RESULT:"));
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
@@ -1040,7 +1040,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
             assignee_id: None,
             title: "other review task".to_owned(),
             description: Some("echo other".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::REVIEW.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1524,7 +1524,7 @@ async fn dispatch_role_agent_initial_dispatch_skips_at_capacity() {
             assignee_id: None,
             title: "other task".to_owned(),
             description: Some("echo other".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::IN_PROGRESS.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1784,7 +1784,7 @@ async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
             assignee_id: None,
             title: "ordered child".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::DONE.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1846,7 +1846,7 @@ async fn reviewer_dispatch_ignores_waiting_review_tasks_without_running_executio
             assignee_id: None,
             title: "other waiting review task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::REVIEW.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1949,7 +1949,7 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
             assignee_id: None,
             title: "other review task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::REVIEW.to_owned(),
             is_automation: false,
             priority: 0,

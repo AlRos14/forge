@@ -13,7 +13,9 @@ use db::{
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use executors::{DiscoverContext, ExecutorKind};
+use serde_json::Value;
 use services::agent_service::{compute_effective_status, resolve_daemon_for_agent};
+use sqlx::Row;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -138,6 +140,96 @@ pub async fn get_agent(
     Ok(Json(
         build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
     ))
+}
+
+pub async fn get_agent_usage(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::AgentUsageResponse>> {
+    agent_usage_response(&state, &user, &id).await.map(Json)
+}
+
+pub async fn refresh_agent_usage(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::AgentUsageResponse>> {
+    let agent = AgentRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
+    require_agent_visible(&agent, &user, &id)?;
+    if agent.executor_type == "cursor" {
+        let usage = services::account_usage::refresh_cursor_usage().await?;
+        let account_key = usage_account_key(&agent);
+        let captured_at = now_rfc3339();
+        let stale_after = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO account_usage_snapshot
+             (id, account_key, executor_type, daemon_id, source, usage_json, captured_at, stale_after)
+             VALUES (?, ?, 'cursor', ?, 'manual_refresh', ?, ?, ?)",
+        ).bind(new_uuid_v4()).bind(account_key).bind(agent.daemon_id.as_deref())
+            .bind(usage.to_string()).bind(captured_at).bind(stale_after)
+            .execute(state.db.pool()).await?;
+    }
+    agent_usage_response(&state, &user, &id).await.map(Json)
+}
+
+async fn agent_usage_response(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    id: &str,
+) -> ApiResult<api_types::AgentUsageResponse> {
+    let agent = AgentRepo::get_by_id(&*state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("agent", id.to_owned()))?;
+    require_agent_visible(&agent, user, id)?;
+    let account_key = usage_account_key(&agent);
+    let row = sqlx::query(
+        "SELECT source, usage_json, captured_at, stale_after FROM account_usage_snapshot
+         WHERE account_key = ? ORDER BY captured_at DESC LIMIT 1",
+    )
+    .bind(&account_key)
+    .fetch_optional(state.db.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(api_types::AgentUsageResponse {
+            available: false,
+            executor_type: agent.executor_type,
+            account_key,
+            shared_account: agent.daemon_id.is_none(),
+            source: None,
+            usage: None,
+            captured_at: None,
+            stale: true,
+            message: Some("This harness has not reported account quota yet".to_owned()),
+        });
+    };
+    let stale_after: String = row.get("stale_after");
+    Ok(api_types::AgentUsageResponse {
+        available: true,
+        executor_type: agent.executor_type,
+        account_key,
+        shared_account: agent.daemon_id.is_none(),
+        source: Some(row.get("source")),
+        usage: serde_json::from_str::<Value>(&row.get::<String, _>("usage_json")).ok(),
+        captured_at: Some(row.get("captured_at")),
+        stale: stale_after < now_rfc3339(),
+        message: None,
+    })
+}
+
+fn usage_account_key(agent: &Agent) -> String {
+    let config: Value = serde_json::from_str(&agent.config_json).unwrap_or(Value::Null);
+    let kind = agent.executor_type.parse::<ExecutorKind>();
+    let mut key = kind
+        .map(|kind| executors::account_key(&kind, &config))
+        .unwrap_or_else(|_| agent.executor_type.clone());
+    if let Some(daemon_id) = agent.daemon_id.as_deref() {
+        key.push('@');
+        key.push_str(daemon_id);
+    }
+    key
 }
 
 pub async fn list_agent_tasks(

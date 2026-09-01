@@ -133,6 +133,28 @@ pub struct ApproveGateRequest {
     pub version: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AnswerTaskDecisionRequest {
+    #[ts(type = "Record<string, unknown>")]
+    pub answers: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskDecisionRequestResponse {
+    pub id: String,
+    pub task_id: String,
+    pub execution_id: String,
+    pub role: String,
+    pub authority_scope: String,
+    #[ts(type = "Array<Record<string, unknown>>")]
+    pub questions: Value,
+    pub context: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejectGateRequest {
     pub reason: String,

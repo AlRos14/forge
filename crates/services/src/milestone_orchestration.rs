@@ -1293,7 +1293,7 @@ mod tests {
             task_states: vec![ReadinessTaskState {
                 task_id: "task-1".to_owned(),
                 version: 2,
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 state: "done".to_owned(),
                 observed_at: "2026-08-13T00:00:00Z".to_owned(),
             }],

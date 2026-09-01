@@ -117,10 +117,11 @@ pub async fn execute_action(
 
 pub(crate) fn task_type_to_string(task_type: TaskType) -> String {
     match task_type {
-        TaskType::Task => "task",
-        TaskType::PlanningTask => "planning_task",
-        TaskType::SubTask => "sub_task",
+        TaskType::Implementation => "implementation",
+        TaskType::Planning => "planning",
         TaskType::Discovery => "discovery",
+        TaskType::Review => "review",
+        TaskType::Validation => "validation",
     }
     .to_owned()
 }

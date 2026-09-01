@@ -624,7 +624,7 @@ mod tests {
                 assignee_id: Some(agent_id.to_owned()),
                 title: "Active task".to_owned(),
                 description: None,
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status: "in_progress".to_owned(),
                 is_automation: false,
                 priority: 0,
