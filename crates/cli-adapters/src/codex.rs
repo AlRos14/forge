@@ -219,6 +219,37 @@ impl CodexAdapter {
     }
 }
 
+/// Read the current Codex account rate-limit snapshot without starting a model turn.
+pub async fn query_account_usage(config: &CodexConfig) -> Result<Value, ExecutorError> {
+    let mut command = CodexAdapter::build_command(config);
+    command.stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Codex usage probe has no stdin".to_owned()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Codex usage probe has no stdout".to_owned()))?;
+    let cancel = CancellationToken::new();
+    let client = CodexClient::spawn(stdin, stdout, ".", cancel.clone());
+
+    let result = async {
+        client.initialize().await?;
+        client.initialized().await?;
+        tokio::time::timeout(Duration::from_secs(20), client.account_rate_limits())
+            .await
+            .map_err(|_| ExecutorError::Other("Codex account usage probe timed out".to_owned()))?
+    }
+    .await;
+
+    cancel.cancel();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    result
+}
+
 impl Default for CodexAdapter {
     fn default() -> Self {
         Self::new()

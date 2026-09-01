@@ -4,10 +4,126 @@ import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import { useAgentProfilesQuery, useAgentUsageQuery, useRefreshAgentUsageMutation, useSelectAgentProfileMutation, isVersionConflict } from '@/features/federation/hooks'
+import { toastApiError } from '@/lib/api-error'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { StateBadge, StatusDot } from '@/features/federation/components'
 import { allowedPolicyValues, humanize, runtimeDisplayNames } from './format'
+
+type UsageWindow = {
+  label: string
+  usedPercent: number
+  resetsAt?: number | string
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function asPercent(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(100, Math.max(0, value))
+    : null
+}
+
+function formatReset(value: number | string | undefined) {
+  if (value == null) return null
+  const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value)
+  if (Number.isNaN(date.getTime())) return `Resets ${value}`
+  return `Resets ${date.toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  })}`
+}
+
+function windowLabel(duration: unknown, fallback: string) {
+  if (duration === 300) return '5-hour limit'
+  if (duration === 10_080) return 'Weekly limit'
+  if (typeof duration === 'number') {
+    if (duration % 1_440 === 0) return `${duration / 1_440}-day limit`
+    if (duration % 60 === 0) return `${duration / 60}-hour limit`
+  }
+  return fallback
+}
+
+function cursorPercentFromPools(usage: Record<string, unknown>, category: string) {
+  const pools = Array.isArray(usage.pools) ? usage.pools : []
+  const line = pools.find((item) => typeof item === 'string' && item.startsWith(category))
+  const match = typeof line === 'string' ? line.match(/(\d+(?:\.\d+)?)%/) : null
+  return match ? Number(match[1]) : null
+}
+
+function UsageMeter({ window }: { window: UsageWindow }) {
+  const remaining = Math.max(0, 100 - window.usedPercent)
+  return (
+    <div className="rounded-md border border-border-subtle bg-card px-3 py-3">
+      <div className="flex items-baseline justify-between gap-3 text-xs">
+        <span className="font-medium text-foreground">{window.label}</span>
+        <span className="font-mono tabular-nums text-muted-foreground">{remaining}% left</span>
+      </div>
+      <div
+        className="mt-2 h-2 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-label={`${window.label} used`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={window.usedPercent}
+      >
+        <div className="h-full rounded-full bg-primary" style={{ width: `${window.usedPercent}%` }} />
+      </div>
+      <div className="mt-1.5 flex justify-between gap-3 font-mono text-micro text-muted-foreground">
+        <span>{window.usedPercent}% used</span>
+        {formatReset(window.resetsAt) ? <span>{formatReset(window.resetsAt)}</span> : null}
+      </div>
+    </div>
+  )
+}
+
+export function AccountUsageDetails({ executorType, usage }: { executorType: string, usage: Record<string, unknown> }) {
+  if (executorType === 'codex') {
+    const limits = asRecord(usage.rateLimits)
+    const windows = (['primary', 'secondary'] as const).flatMap((key, index) => {
+      const window = asRecord(limits?.[key])
+      const usedPercent = asPercent(window?.usedPercent)
+      return usedPercent == null ? [] : [{
+        label: windowLabel(window?.windowDurationMins, index === 0 ? 'Primary limit' : 'Secondary limit'),
+        usedPercent,
+        resetsAt: typeof window?.resetsAt === 'number' ? window.resetsAt : undefined,
+      }]
+    })
+    const plan = typeof limits?.planType === 'string' ? humanize(limits.planType) : 'Codex'
+    return (
+      <div className="mt-3 space-y-2.5">
+        <p className="text-xs text-muted-foreground"><span className="font-medium text-foreground">{plan} plan</span> · Codex account</p>
+        {windows.map((window) => <UsageMeter key={window.label} window={window} />)}
+      </div>
+    )
+  }
+
+  if (executorType === 'cursor') {
+    const categories = asRecord(usage.categories)
+    const categoryDefinitions = [['Included', 'included'], ['Auto', 'auto'], ['API', 'api']] as const
+    const windows = categoryDefinitions.flatMap(([label, key]) => {
+      const usedPercent = asPercent(categories?.[key]) ?? cursorPercentFromPools(usage, label)
+      return usedPercent == null ? [] : [{ label, usedPercent }]
+    })
+    const plan = typeof usage.plan === 'string' ? usage.plan : 'Cursor'
+    const reset = typeof usage.resets_at === 'string' ? usage.resets_at : undefined
+    return (
+      <div className="mt-3 space-y-2.5">
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{plan} plan</span>
+          {reset ? ` · Resets ${reset}` : ''}
+          {usage.on_demand_enabled === false ? ' · On-demand disabled' : ''}
+        </p>
+        {windows.map((window) => <UsageMeter key={window.label} window={window} />)}
+      </div>
+    )
+  }
+
+  return <p className="mt-3 text-xs text-muted-foreground">Usage was refreshed, but this provider does not expose a visual summary.</p>
+}
 
 export function AgentDetailPanel({
   agent,
@@ -117,21 +233,27 @@ export function AgentDetailPanel({
                 {usageQuery.data?.shared_account ? 'Shared by agents using the same harness account.' : 'Scoped to this daemon account.'}
               </p>
             </div>
-            <Button size="sm" variant="ghost" disabled={refreshUsage.isPending} onClick={() => void refreshUsage.mutateAsync()}>
-              Refresh
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={refreshUsage.isPending}
+              onClick={() => refreshUsage.mutate(undefined, {
+                onError: (error) => toastApiError(error, 'Account usage refresh failed'),
+              })}
+            >
+              {refreshUsage.isPending ? 'Refreshing…' : 'Refresh'}
             </Button>
           </div>
           {usageQuery.isLoading ? <p className="mt-3 text-xs text-muted-foreground">Checking usage…</p> : null}
           {usageQuery.data?.available && usageQuery.data.usage ? (
-            <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-card p-3 font-mono text-xs">
-              {JSON.stringify(usageQuery.data.usage, null, 2)}
-            </pre>
+            <AccountUsageDetails executorType={usageQuery.data.executor_type} usage={usageQuery.data.usage} />
           ) : (
             <p className="mt-3 text-xs text-muted-foreground">{usageQuery.data?.message ?? 'Usage is not reported by this harness.'}</p>
           )}
           {usageQuery.data?.captured_at ? (
             <p className="mt-2 font-mono text-micro text-muted-foreground">
-              {usageQuery.data.stale ? 'Stale snapshot' : 'Current snapshot'} · {usageQuery.data.captured_at}
+              {usageQuery.data.stale ? 'Stale snapshot' : 'Current snapshot'} · Updated{' '}
+              {new Date(usageQuery.data.captured_at).toLocaleString()}
             </p>
           ) : null}
         </section>

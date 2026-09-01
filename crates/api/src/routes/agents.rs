@@ -159,16 +159,21 @@ pub async fn refresh_agent_usage(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
-    if agent.executor_type == "cursor" {
-        let usage = services::account_usage::refresh_cursor_usage().await?;
+    let usage = match agent.executor_type.as_str() {
+        "codex" => Some(services::account_usage::refresh_codex_usage(&agent.config_json).await?),
+        "cursor" => Some(services::account_usage::refresh_cursor_usage().await?),
+        _ => None,
+    };
+    if let Some(usage) = usage {
         let account_key = usage_account_key(&agent);
         let captured_at = now_rfc3339();
         let stale_after = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
         sqlx::query(
             "INSERT INTO account_usage_snapshot
              (id, account_key, executor_type, daemon_id, source, usage_json, captured_at, stale_after)
-             VALUES (?, ?, 'cursor', ?, 'manual_refresh', ?, ?, ?)",
-        ).bind(new_uuid_v4()).bind(account_key).bind(agent.daemon_id.as_deref())
+             VALUES (?, ?, ?, ?, 'manual_refresh', ?, ?, ?)",
+        ).bind(new_uuid_v4()).bind(account_key).bind(&agent.executor_type)
+            .bind(agent.daemon_id.as_deref())
             .bind(usage.to_string()).bind(captured_at).bind(stale_after)
             .execute(state.db.pool()).await?;
     }

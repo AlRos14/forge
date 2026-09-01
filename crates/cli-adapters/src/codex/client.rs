@@ -79,6 +79,12 @@ impl CodexClient {
         self.rpc.notify::<Value>("initialized", None).await
     }
 
+    pub async fn account_rate_limits(&self) -> Result<Value, ExecutorError> {
+        self.rpc
+            .request("account/rateLimits/read", None::<Value>)
+            .await
+    }
+
     pub async fn thread_start(
         &self,
         params: ThreadStartParams,

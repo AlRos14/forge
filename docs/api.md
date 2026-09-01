@@ -136,7 +136,7 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 | GET    | `/api/v1/agents/{id}/usage` | Get the latest account-scoped harness usage snapshot, including freshness |
-| POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh usage when the harness exposes a no-model probe (Cursor `/usage`) |
+| POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh usage when the harness exposes a no-model probe (Codex `account/rateLimits/read`; Cursor `/usage`) |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -153,6 +153,14 @@ database for historical provenance.
 | GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
 | POST   | `/api/v1/agents/{id}/profiles/connect` | Create/select a new native profile revision referencing an existing provider entry (`credential_id`) |
 | POST   | `/api/v1/agents/{id}/profiles/{profile_id}/select` | Select an immutable profile using the identity version |
+
+Agent usage is stored as the provider's JSON payload. Codex snapshots include
+the primary and secondary rate-limit windows returned by the app server. Cursor
+snapshots normalize the interactive `/usage` panel into `plan`, `resets_at`,
+`categories` (`included`, `auto`, and `api` percentages), and
+`on_demand_enabled`; `pools` retains the recognized terminal lines for
+diagnostics. Cursor refresh waits for the CLI readiness and completed usage
+panel markers, so slower startup or quota fetches do not depend on fixed sleeps.
 | GET    | `/api/v1/agents/{id}/sessions` | List safe scope-bound session status/capability snapshots |
 | POST   | `/api/v1/agents/{id}/sessions` | Create or resume an explicitly scoped session |
 | POST   | `/api/v1/agents/{id}/effective-permissions` | Inspect the fail-closed permission intersection for one canonical scope |
