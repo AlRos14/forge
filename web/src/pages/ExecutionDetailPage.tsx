@@ -21,6 +21,8 @@ import {
   type ExecutionLogsParams,
 } from '@/api/hooks'
 import { apiFetch } from '@/api/client'
+import { asUsageRecord } from '@/components/execution-detail/execution-detail-format'
+import { useAgentUsageQuery } from '@/features/federation/hooks'
 import { ExecutionViewer, type ExecutionViewerMode } from '@/components/execution-viewer'
 import { ExecutionDetailSidebar } from '@/components/execution-detail/ExecutionDetailSidebar'
 import { ExecutionFollowUpComposer } from '@/components/execution-detail/ExecutionFollowUpComposer'
@@ -326,6 +328,14 @@ export function ExecutionDetailPage({
     snapshotString(execution?.executor_config_snapshot, 'executor_type') ??
     parentAgent?.executor_type ??
     null
+  const agentUsageQuery = useAgentUsageQuery(
+    parentExecutorType === 'codex' || parentExecutorType === 'cursor'
+      ? (execution?.agent_id ?? undefined)
+      : undefined,
+  )
+  const accountUsage =
+    asUsageRecord(execution?.account_usage) ??
+    (agentUsageQuery.data?.available ? agentUsageQuery.data.usage : null)
 
   const followUpInitialAgentId = execution?.agent_id ?? null
   const followUpInitialOverrides = useMemo(
@@ -593,6 +603,8 @@ export function ExecutionDetailPage({
                 execution={execution ?? null}
                 logs={logs}
                 usage={executionUsage}
+                executorType={parentExecutorType}
+                accountUsage={accountUsage}
                 hookLogs={hookLogsQuery.data ?? []}
                 agentName={agentName}
                 taskId={taskId}

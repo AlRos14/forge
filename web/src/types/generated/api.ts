@@ -603,6 +603,7 @@ export interface Execution {
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
   usage?: ExecutionUsage[] | null
+  account_usage?: Record<string, unknown> | null
   created_at: string
   updated_at: string
 }

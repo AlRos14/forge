@@ -607,8 +607,13 @@ the semantic type still enforces the read/write capability ceiling.
 Plans are append-only `task_plan_revision` records. Forge captures
 `planner_ready` and `final` snapshots; the final capture occurs synchronously
 before Workspace cleanup. The checklist is a projection of canonical Markdown,
-not a second authority. Reviewer runs bind immutable evidence to the plan
-digest, base/head SHA, full diff, CI result records, reviewer execution, and
+not a second authority. Task Overview renders the full canonical Markdown plan;
+checklist projections remain operational signals for execution progress and
+workflow gates. A planning-gate rejection keeps the user's reason in the
+transition log, and the next eligible planner prompt receives that feedback,
+the latest canonical plan, and Task comments as revision context. Reviewer runs
+bind immutable evidence to the plan digest,
+base/head SHA, full diff, CI result records, reviewer execution, and
 fresh-session provenance. Structured `needs_human` results pause rather than
 consuming coder retry budget.
 
@@ -804,9 +809,15 @@ during validation. `DefaultWorkflow` is unchanged and uses declared `planner`,
 
 Audit-log derived. Gate states may set `gate_config.max_rejections`;
 `check_retry_budget` counts `transition_log` rows with `from_state = gate` and
-`rejection = true`, then cascades to `blocked` when exhausted. Generic
+`rejection = true`. Non-review gates allow that many rejected revisions and
+cascade to `blocked` when a later rejection exceeds the configured limit;
+review gates retain their dedicated attempt-budget semantics. Generic
 user-triggered gate-to-active bounces are logged with `rejection = false` and
-do not consume budget.
+do not consume budget. Role dispatch consults the same persisted count before
+creating an execution or WorkspaceLease, so an exhausted gate is blocked by
+the authoritative hook without launching a doomed attempt. Reset Retry Window
+on a non-review gate re-enters that gate so dispatch can start a fresh
+revision run; it does not leave the Task idle in the same state.
 
 ### Crash recovery
 

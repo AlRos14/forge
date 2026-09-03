@@ -4,7 +4,7 @@ import { FastForwardIcon as FastForward } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
-import { PlanChecklist } from '@/components/plan-checklist'
+import { PlanDocument } from '@/components/plan-document'
 import { TaskDecisionRequests } from '@/components/task-decision-requests'
 import {
   type AssigneeSelection,
@@ -463,8 +463,10 @@ export function TaskOverviewPanel({
             <TaskPrSummaryCard task={task} />
             <TaskDecisionRequests taskId={task.id} />
 
-            {task.plan_progress || task.plan_artifact ? (
-              <PlanChecklist progress={task.plan_progress} artifact={task.plan_artifact} />
+            {task.plan_artifact ? (
+              <div id="task-plan" className="scroll-mt-4">
+                <PlanDocument artifact={task.plan_artifact} />
+              </div>
             ) : null}
 
             <div>

@@ -533,6 +533,7 @@ impl TaskService {
             if let Err(error) = super::persist_account_usage_snapshot(
                 &self.db,
                 current_execution.executor_config_snapshot_json.as_deref(),
+                &updated.id,
                 account_usage,
             )
             .await

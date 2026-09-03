@@ -60,6 +60,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Run observability no longer treats missing USD cost as `$0.00`. Subscription
+  Codex and Cursor runs show account quota instead, and Turns counts harness
+  protocol turns rather than `assistant` log rows in the loaded tail.
 - Agent Settings now uses adapter discovery consistently when creating or
   editing CLI-harness agents. The same model picker is used in both flows;
   reasoning and execution-policy controls appear independently only when the
@@ -83,9 +86,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Providers tab show their usage window(s) from the new usage endpoint. The
   dead legacy `web/src/pages/agents/` UI (unreferenced since the federated
   agents rewrite) is deleted.
+- Task Overview renders the full canonical Markdown plan immediately. Checklist
+  projections remain operational signals on execution surfaces and workflow
+  gates, not a second plan authority in the overview.
 
 ### Fixed
 
+- Planner reruns now receive the latest canonical plan, rejected-plan feedback,
+  and Task comments. Non-review `max_rejections` now permits that many revision
+  runs instead of blocking the final permitted run, and an exceeded budget is
+  checked before role dispatch, preventing a blocked Task mutation from
+  invalidating a newly issued WorkspaceLease and creating a phantom failed run.
+  Reset Retry Window on a planning gate now re-enters planning so the planner
+  actually starts again; a failed planner run offers Retry Planning.
+- Task detail and plan-artifact reads now enforce Project membership, returning
+  the same `404` to authenticated non-members as an unknown Task.
+- Plan capture rejects symbolic links and non-regular files, and Unix opens use
+  `O_NOFOLLOW` so a final-component symlink swap cannot escape the Task artifact
+  directory.
 - Task intent-action POSTs now accept omitted, empty, whitespace-only, or JSON
   `null` bodies even when a client advertises `Content-Type: application/json`;
   the web client no longer emits that content type when it sends no body.

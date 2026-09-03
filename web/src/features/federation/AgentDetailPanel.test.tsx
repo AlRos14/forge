@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
-import { AccountUsageDetails } from './AgentDetailPanel'
+import { AccountUsageDetails } from '@/components/account-usage'
 
 describe('AccountUsageDetails', () => {
   it('renders Codex windows as labeled meters', () => {
@@ -42,6 +42,20 @@ describe('AccountUsageDetails', () => {
     expect(screen.getByText(/On-demand disabled/)).toBeTruthy()
     expect(screen.getByRole('progressbar', { name: 'Included used' }).getAttribute('aria-valuenow')).toBe('11')
     expect(screen.getByRole('progressbar', { name: 'API used' }).getAttribute('aria-valuenow')).toBe('0')
+  })
+
+  it('renders Codex windows from an unwrapped provider-event snapshot', () => {
+    render(
+      <AccountUsageDetails
+        executorType="codex"
+        usage={{
+          planType: 'plus',
+          primary: { usedPercent: 19, windowDurationMins: 300, resetsAt: 1_788_301_664 },
+        }}
+      />,
+    )
+
+    expect(screen.getByRole('progressbar', { name: '5-hour limit used' }).getAttribute('aria-valuenow')).toBe('19')
   })
 
   it('keeps older Cursor snapshots readable', () => {

@@ -101,9 +101,23 @@ fn usage_provider_for_executor_type(executor_type: Option<&str>) -> String {
     .to_owned()
 }
 
+pub(super) fn normalize_account_usage(executor_type: &str, account_usage: &Value) -> Value {
+    if executor_type != "codex" {
+        return account_usage.clone();
+    }
+    if account_usage.get("rateLimits").is_some() {
+        return account_usage.clone();
+    }
+    if account_usage.get("primary").is_some() || account_usage.get("planType").is_some() {
+        return json!({ "rateLimits": account_usage });
+    }
+    account_usage.clone()
+}
+
 pub(super) async fn persist_account_usage_snapshot(
     db: &SqliteDb,
     snapshot: Option<&str>,
+    execution_id: &str,
     account_usage: &Value,
 ) -> Result<()> {
     let Some(snapshot) = snapshot else {
@@ -127,20 +141,22 @@ pub(super) async fn persist_account_usage_snapshot(
         account_key.push('@');
         account_key.push_str(daemon_id);
     }
+    let usage_json = normalize_account_usage(executor_type, account_usage);
     let captured_at = now_rfc3339();
     let stale_after = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
     sqlx::query(
         "INSERT INTO account_usage_snapshot
-         (id, account_key, executor_type, daemon_id, source, usage_json, captured_at, stale_after)
-         VALUES (?, ?, ?, ?, 'provider_event', ?, ?, ?)",
+         (id, account_key, executor_type, daemon_id, source, usage_json, captured_at, stale_after, execution_id)
+         VALUES (?, ?, ?, ?, 'provider_event', ?, ?, ?, ?)",
     )
     .bind(new_uuid_v4())
     .bind(account_key)
     .bind(executor_type)
     .bind(daemon_id)
-    .bind(account_usage.to_string())
+    .bind(usage_json.to_string())
     .bind(captured_at)
     .bind(stale_after)
+    .bind(execution_id)
     .execute(db.pool())
     .await?;
     Ok(())
@@ -279,5 +295,33 @@ pub(super) async fn persist_planner_result(
         _ => Err(ServiceError::invalid_operation(
             "planner structured result kind is invalid",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_account_usage;
+    use serde_json::json;
+
+    #[test]
+    fn wraps_codex_rate_limit_params_as_rate_limits() {
+        let params = json!({
+            "planType": "plus",
+            "primary": { "usedPercent": 19, "windowDurationMins": 300 }
+        });
+        assert_eq!(
+            normalize_account_usage("codex", &params),
+            json!({ "rateLimits": params })
+        );
+    }
+
+    #[test]
+    fn leaves_cursor_and_wrapped_codex_payloads_unchanged() {
+        let cursor = json!({ "plan": "Pro", "categories": { "included": 11 } });
+        let wrapped = json!({
+            "rateLimits": { "planType": "plus", "primary": { "usedPercent": 2 } }
+        });
+        assert_eq!(normalize_account_usage("cursor", &cursor), cursor);
+        assert_eq!(normalize_account_usage("codex", &wrapped), wrapped);
     }
 }

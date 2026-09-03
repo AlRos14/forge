@@ -4,11 +4,10 @@ use sqlx::Row;
 
 pub async fn get_task_plan(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskPlanHistoryResponse>> {
-    TaskRepo::get_by_id(&*state.db, &id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
+    require_task_visible(&state, &id, &user).await?;
     let current = services::plan_artifact::latest_plan_for_task(&state.db, &id)
         .await
         .map_err(|error| match error {

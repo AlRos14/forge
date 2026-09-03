@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
@@ -42,6 +42,8 @@ pub enum PlanArtifactError {
     NotFound,
     WorkspaceNotFound { workspace_id: String },
     PathEscape { path: PathBuf },
+    SymlinkNotAllowed { path: PathBuf },
+    NotRegularFile { path: PathBuf },
     IoError(io::Error),
     DbError(db::DbError),
     FileTooLarge { size: u64, max: u64 },
@@ -60,6 +62,16 @@ impl fmt::Display for PlanArtifactError {
                     "plan artifact path escapes workspace: {}",
                     path.display()
                 )
+            }
+            Self::SymlinkNotAllowed { path } => {
+                write!(
+                    f,
+                    "plan artifact must not be a symbolic link: {}",
+                    path.display()
+                )
+            }
+            Self::NotRegularFile { path } => {
+                write!(f, "plan artifact is not a regular file: {}", path.display())
             }
             Self::IoError(error) => write!(f, "failed to read plan artifact: {error}"),
             Self::DbError(error) => write!(f, "failed to read workspace: {error}"),
@@ -162,7 +174,7 @@ pub fn read_plan_artifact(
         });
     }
 
-    let metadata = match fs::metadata(&normalized_candidate) {
+    let metadata = match fs::symlink_metadata(&normalized_candidate) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(PlanArtifactError::NotFound);
@@ -170,7 +182,27 @@ pub fn read_plan_artifact(
         Err(error) => return Err(PlanArtifactError::IoError(error)),
     };
 
-    let size = metadata.len();
+    if metadata.file_type().is_symlink() {
+        return Err(PlanArtifactError::SymlinkNotAllowed {
+            path: normalized_candidate,
+        });
+    }
+    if !metadata.is_file() {
+        return Err(PlanArtifactError::NotRegularFile {
+            path: normalized_candidate,
+        });
+    }
+
+    let canonical_allowed_root = fs::canonicalize(&normalized_workspace_root)?;
+    let canonical_candidate = fs::canonicalize(&normalized_candidate)?;
+    if !canonical_candidate.starts_with(&canonical_allowed_root) {
+        return Err(PlanArtifactError::PathEscape {
+            path: canonical_candidate,
+        });
+    }
+
+    let mut file = open_plan_without_following_symlink(&normalized_candidate)?;
+    let size = file.metadata()?.len();
     if size > MAX_PLAN_ARTIFACT_SIZE_BYTES {
         return Err(PlanArtifactError::FileTooLarge {
             size,
@@ -178,8 +210,22 @@ pub fn read_plan_artifact(
         });
     }
 
-    let content = fs::read_to_string(&normalized_candidate)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
     Ok(parse_plan_markdown(&content))
+}
+
+fn open_plan_without_following_symlink(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    options.open(path)
 }
 
 pub async fn capture_plan_revision(
@@ -506,6 +552,34 @@ mod tests {
             .expect_err("escape fails");
 
         assert!(matches!(error, PlanArtifactError::PathEscape { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_plan_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let worktree = tempdir.path().join("repo");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        let outside = tempfile::NamedTempFile::new().expect("create outside file");
+        symlink(outside.path(), tempdir.path().join("plan.md")).expect("create plan symlink");
+
+        let error = read_plan_artifact(&worktree, None).expect_err("symlink plan fails");
+
+        assert!(matches!(error, PlanArtifactError::SymlinkNotAllowed { .. }));
+    }
+
+    #[test]
+    fn directory_plan_is_rejected() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let worktree = tempdir.path().join("repo");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        fs::create_dir(tempdir.path().join("plan.md")).expect("create plan directory");
+
+        let error = read_plan_artifact(&worktree, None).expect_err("directory plan fails");
+
+        assert!(matches!(error, PlanArtifactError::NotRegularFile { .. }));
     }
 
     #[test]

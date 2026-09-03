@@ -460,6 +460,64 @@ fn planner_prompt_includes_parent_task_context() {
 }
 
 #[test]
+fn planner_prompt_includes_current_plan_latest_rejection_and_comments() {
+    let mut ctx = fake_context(default_roles::PLANNER);
+    ctx.state_name = default_states::PLANNING.to_owned();
+    ctx.plan = Some("# Existing plan\n\n- Preserve the provider boundary.".to_owned());
+    ctx.transition_log = vec![
+        db::TransitionLog {
+            id: "transition-old".to_owned(),
+            task_id: ctx.task.id.clone(),
+            from_state: default_states::PLANNING.to_owned(),
+            to_state: default_states::PLANNING.to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:api".to_owned(),
+            trigger_reason: "gate rejected: old feedback".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-04-17T00:00:00Z".to_owned(),
+        },
+        db::TransitionLog {
+            id: "transition-latest".to_owned(),
+            task_id: ctx.task.id.clone(),
+            from_state: default_states::PLANNING.to_owned(),
+            to_state: default_states::PLANNING.to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:api".to_owned(),
+            trigger_reason: "gate rejected: keep canonical identity separate".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-04-17T00:01:00Z".to_owned(),
+        },
+    ];
+    ctx.comments = vec![db::TaskComment {
+        id: "comment-1".to_owned(),
+        task_id: ctx.task.id.clone(),
+        author_type: db::CommentAuthorType::User,
+        author_id: Some("user-1".to_owned()),
+        author_name: "Alejandro".to_owned(),
+        content: "Keep the phases independently testable.".to_owned(),
+        created_at: "2026-04-17T00:02:00Z".to_owned(),
+        updated_at: "2026-04-17T00:02:00Z".to_owned(),
+    }];
+
+    let prompt = PlannerPromptBuilder.build(&ctx);
+
+    assert!(prompt.user.contains("Current plan to revise:"));
+    assert!(prompt.user.contains("Preserve the provider boundary."));
+    assert!(prompt
+        .user
+        .contains("User feedback from the latest rejected plan:"));
+    assert!(prompt
+        .user
+        .contains("gate rejected: keep canonical identity separate"));
+    assert!(!prompt.user.contains("gate rejected: old feedback"));
+    assert!(prompt
+        .user
+        .contains("Alejandro: Keep the phases independently testable."));
+}
+
+#[test]
 fn generic_prompt_dumps_core_context_for_unknown_role() {
     let mut ctx = fake_context("security_engineer");
     ctx.state_name = "security_review".to_string();

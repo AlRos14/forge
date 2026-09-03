@@ -1,5 +1,6 @@
 import { Info } from '@phosphor-icons/react'
 
+import { AccountUsageDetails, compactQuotaLabel, quotaWindows } from '@/components/account-usage'
 import {
   formatCostUsd,
   formatRuntimeSeconds,
@@ -7,9 +8,12 @@ import {
 } from '@/components/task-execution-observability'
 import { Tooltip } from '@/components/ui/tooltip'
 import {
+  accountUsageFromLogs,
+  asUsageRecord,
   executionRuntimeSeconds,
   formatDate,
   formatRelativeDate,
+  harnessTurnCount,
   latestLog,
   usageTotals,
 } from '@/components/execution-detail/execution-detail-format'
@@ -32,10 +36,14 @@ export function ExecutionObservabilitySection({
   execution,
   logs,
   usage,
+  executorType,
+  accountUsage,
 }: {
   execution: Execution
   logs: LogEntry[]
   usage: ExecutionUsage[]
+  executorType?: string | null
+  accountUsage?: Record<string, unknown> | null
 }) {
   const totals = usageTotals(usage)
   const totalTokens =
@@ -43,8 +51,14 @@ export function ExecutionObservabilitySection({
     totals.outputTokens +
     totals.cacheReadTokens +
     totals.cacheWriteTokens
-  const assistantTurns = logs.filter((log) => log.kind === 'assistant').length
+  const turns = harnessTurnCount(logs)
   const recentLog = latestLog(logs)
+  const resolvedUsage =
+    accountUsage ?? accountUsageFromLogs(logs) ?? asUsageRecord(execution.account_usage)
+  const windows = quotaWindows(executorType, resolvedUsage)
+  const quotaLabel = compactQuotaLabel(windows)
+  const showCost = totals.costUsd != null
+  const showQuotaTile = !showCost && quotaLabel != null
 
   return (
     <section className="space-y-3">
@@ -54,14 +68,33 @@ export function ExecutionObservabilitySection({
       </div>
       <div className="grid grid-cols-2 gap-2">
         <Metric label="Runtime" value={formatRuntimeSeconds(executionRuntimeSeconds(execution))} />
-        <Metric label="Turns" value={assistantTurns.toLocaleString()} />
+        <Metric label="Turns" value={turns.toLocaleString()} />
         <Metric
           label="Tokens"
           title={`${formatTokenCount(totals.inputTokens)} input / ${formatTokenCount(totals.outputTokens)} output / ${formatTokenCount(totals.cacheReadTokens)} cache read / ${formatTokenCount(totals.cacheWriteTokens)} cache write`}
           value={formatTokenCount(totalTokens, true)}
         />
-        <Metric label="Cost" value={formatCostUsd(totals.costUsd)} />
+        {showQuotaTile ? (
+          <Metric label="Quota" value={quotaLabel} title="Account quota after this run" />
+        ) : (
+          <Metric
+            label="Cost"
+            value={formatCostUsd(totals.costUsd)}
+            title={
+              totals.costUsd == null
+                ? 'USD cost is only reported for on-demand API billing'
+                : undefined
+            }
+          />
+        )}
       </div>
+      {resolvedUsage && windows.length > 0 && executorType ? (
+        <AccountUsageDetails
+          className="space-y-2.5"
+          executorType={executorType}
+          usage={resolvedUsage}
+        />
+      ) : null}
       <div className="rounded-md border bg-background px-3 py-2">
         <div className="flex items-center justify-between gap-3">
           <p className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">

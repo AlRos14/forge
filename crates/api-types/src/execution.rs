@@ -268,6 +268,8 @@ pub struct ExecutionResponse {
     pub plan_progress: Option<PlanProgressSummary>,
     pub plan_artifact: Option<PlanArtifactDetail>,
     pub usage: Option<Vec<ExecutionUsageResponse>>,
+    #[serde(default)]
+    pub account_usage: Option<Value>,
     pub created_at: String,
     pub updated_at: String,
 }

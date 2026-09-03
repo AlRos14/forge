@@ -1473,6 +1473,111 @@ async fn dispatch_role_agent_initial_dispatch_creates_execution_with_capacity() 
 }
 
 #[tokio::test]
+async fn planning_rejection_budget_allows_revision_at_configured_limit() {
+    let agent_id = "agent-planner-budget-limit";
+    let mut harness = build_role_dispatch_harness(
+        "task-planner-budget-limit",
+        default_states::PLANNING,
+        default_states::PLANNING,
+        default_roles::PLANNER,
+        agent_id,
+        1,
+    )
+    .await;
+    let ctx = harness.ctx.clone();
+    for _ in 0..2 {
+        seed_transition_log(
+            &ctx.db,
+            &ctx.task_id,
+            default_states::PLANNING,
+            default_states::PLANNING,
+            true,
+        )
+        .await;
+    }
+
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    let budget_result = CheckRetryBudget.execute(&ctx).await;
+
+    assert!(matches!(dispatch_result, HookResult::Ok));
+    assert!(matches!(budget_result, HookResult::Ok));
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("planner executor spawned in time")
+        .expect("planner execution context received");
+    assert_eq!(execution_ctx.task_id, ctx.task_id);
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(task.blocked_json.is_none());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::PLANNER)
+            .await
+            .expect("execution count loads"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exceeded_planning_rejection_budget_blocks_without_dispatching() {
+    let agent_id = "agent-planner-budget-exhausted";
+    let mut harness = build_role_dispatch_harness(
+        "task-planner-budget-exhausted",
+        default_states::PLANNING,
+        default_states::PLANNING,
+        default_roles::PLANNER,
+        agent_id,
+        1,
+    )
+    .await;
+    let ctx = harness.ctx.clone();
+    for _ in 0..3 {
+        seed_transition_log(
+            &ctx.db,
+            &ctx.task_id,
+            default_states::PLANNING,
+            default_states::PLANNING,
+            true,
+        )
+        .await;
+    }
+
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    let budget_result = CheckRetryBudget.execute(&ctx).await;
+
+    assert!(matches!(
+        dispatch_result,
+        HookResult::Skipped { reason }
+            if reason == "retry budget exhausted (3/2); task will be blocked before dispatch"
+    ));
+    assert!(matches!(budget_result, HookResult::Ok));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::PLANNER)
+            .await
+            .expect("execution count loads"),
+        0
+    );
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let blocked: serde_json::Value = serde_json::from_str(
+        task.blocked_json
+            .as_deref()
+            .expect("retry exhaustion blocks the task"),
+    )
+    .expect("blocking annotation parses");
+    assert_eq!(blocked["kind"], "retry_exhausted");
+    assert_eq!(blocked["reason"], "gate rejection budget exhausted: 3/2");
+}
+
+#[tokio::test]
 async fn dispatch_role_agent_skips_initial_dispatch_without_repo() {
     let agent_id = "agent-coder-no-repo";
     let mut harness = build_no_repo_dispatch_harness("task-dispatch-no-repo", agent_id, 1).await;

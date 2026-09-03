@@ -18,7 +18,21 @@ const SyntaxHighlighter = lazy(async () => {
   return { default: module.Prism as ComponentType<SyntaxHighlighterProps> }
 })
 
+function capturedPlanHref(href: string | undefined) {
+  if (!href) return null
+  const match = href.match(/\/worktrees\/([0-9a-f-]{36})\/plan\.md$/i)
+  return match ? `/tasks/${match[1]}/overview#task-plan` : null
+}
+
 const markdownComponents: Components = {
+  a({ href, children, ...props }) {
+    const planHref = capturedPlanHref(href)
+    return (
+      <a href={planHref ?? href} {...props}>
+        {children}
+      </a>
+    )
+  },
   code({ className, children, ...props }) {
     const match = /language-(\w+)/.exec(className ?? '')
     const code = String(children).replace(/\n$/, '')

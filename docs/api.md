@@ -13,6 +13,11 @@ access token (see `/.well-known/oauth-authorization-server`). The
 Do not expose Forge to the public internet without an authenticating reverse
 proxy in front of it.
 
+Task detail and plan-artifact reads additionally enforce Project visibility on
+the server: owners and Project members may read them, ownerless system Projects
+remain visible, and other authenticated users receive the same `404` as an
+unknown Task. A Task UUID is a reference, never an authorization capability.
+
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).
 
@@ -96,6 +101,7 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
+| GET    | `/api/v1/tasks/{id}/plan` | Get the current captured plan and immutable revision summaries; reads the persisted artifact, never a caller-supplied filesystem path |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
@@ -161,6 +167,10 @@ snapshots normalize the interactive `/usage` panel into `plan`, `resets_at`,
 `on_demand_enabled`; `pools` retains the recognized terminal lines for
 diagnostics. Cursor refresh waits for the CLI readiness and completed usage
 panel markers, so slower startup or quota fetches do not depend on fixed sleeps.
+Codex `account/rateLimits/updated` events captured during a run are stored as
+`{ "rateLimits": … }` and linked to that execution (`account_usage` on
+`GET /api/v1/executions/{id}`). USD `cost_usd` is only present when a harness
+reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | GET    | `/api/v1/agents/{id}/sessions` | List safe scope-bound session status/capability snapshots |
 | POST   | `/api/v1/agents/{id}/sessions` | Create or resume an explicitly scoped session |
 | POST   | `/api/v1/agents/{id}/effective-permissions` | Inspect the fail-closed permission intersection for one canonical scope |

@@ -66,6 +66,8 @@ export function ExecutionDetailSidebar({
   execution,
   logs,
   usage,
+  executorType,
+  accountUsage,
   hookLogs,
   agentName,
   taskId,
@@ -76,6 +78,8 @@ export function ExecutionDetailSidebar({
   execution: Execution | null
   logs: LogEntry[]
   usage: ExecutionUsage[]
+  executorType?: string | null
+  accountUsage?: Record<string, unknown> | null
   hookLogs: HookLogEntry[]
   agentName: (agentId?: string | null) => string | null | undefined
   taskId: string
@@ -156,7 +160,13 @@ export function ExecutionDetailSidebar({
 
             <Separator />
 
-            <ExecutionObservabilitySection execution={execution} logs={logs} usage={usage} />
+            <ExecutionObservabilitySection
+              execution={execution}
+              logs={logs}
+              usage={usage}
+              executorType={executorType}
+              accountUsage={accountUsage}
+            />
 
             {execution.plan_progress || execution.plan_artifact ? (
               <>

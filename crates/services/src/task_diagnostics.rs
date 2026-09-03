@@ -473,6 +473,45 @@ pub fn derive_workflow_exception(
         }
     }
 
+    if task.status == crate::workflow::default_states::PLANNING {
+        if let Some(execution) = latest_execution.filter(|execution| {
+            execution.role == crate::workflow::default_roles::PLANNER
+                && execution.status == ExecutionStatus::Failed
+        }) {
+            return Some(WorkflowExceptionSummary {
+                exception_type: "planner_failed".to_owned(),
+                message: execution
+                    .error
+                    .clone()
+                    .filter(|error| !error.trim().is_empty())
+                    .unwrap_or_else(|| "Planner run failed".to_owned()),
+                review_id: None,
+                execution_id: Some(execution.id.clone()),
+                state: Some(task.status.clone()),
+                role: role.clone(),
+                target_state: Some(task.status.clone()),
+                target_role: role.clone(),
+                failing_step: None,
+                related_evidence: Vec::new(),
+                actions: vec![
+                    action(
+                        RecoveryAction::RetryHook,
+                        "Retry Planning",
+                        true,
+                        None,
+                        false,
+                        false,
+                        false,
+                        Some(task.status.clone()),
+                        role.clone(),
+                        Some(execution.id.clone()),
+                    ),
+                    open_interactive_action(task, role, latest_execution),
+                ],
+            });
+        }
+    }
+
     recovery_unavailable(task, workflow, role, latest_execution)
 }
 
