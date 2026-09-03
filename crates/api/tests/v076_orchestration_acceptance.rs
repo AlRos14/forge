@@ -390,7 +390,7 @@ async fn v076_project_task_is_gated_by_active_user_approved_baseline() {
         json!({
             "title": "V076 repository task",
             "description": "Must remain blocked until the approved baseline is active.",
-            "task_type": "task",
+            "task_type": "implementation",
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
                 "baseline_id": baseline.baseline_id,

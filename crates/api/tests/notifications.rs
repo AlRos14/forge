@@ -35,7 +35,7 @@ async fn event_bus_creates_notification_and_api_manages_inbox() {
             assignee_id: None,
             title: "Blocked task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "in_progress".to_owned(),
             is_automation: false,
             priority: 0,

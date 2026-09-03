@@ -25,7 +25,7 @@ fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
         assignee_id: None,
         title: title.to_string(),
         description: description.map(str::to_string),
-        task_type: "task".to_string(),
+        task_type: "implementation".to_string(),
         status: default_states::IN_PROGRESS.to_string(),
         is_automation: false,
         priority: 0,
@@ -75,6 +75,7 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         transition_log: Vec::new(),
         comments: Vec::new(),
         plan: Some("1. Load context\n2. Build prompt".to_string()),
+        review_evidence: None,
         prior_reviews: Vec::new(),
         parent_task: None,
         sub_tasks: Vec::new(),
@@ -253,7 +254,7 @@ fn coder_family_prompts_require_structured_completion_handoff() {
 }
 
 #[test]
-fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
+fn reviewer_prompt_requires_structured_findings_and_result_contract() {
     let prompt = resolve_prompt_builder(BUILDER_ID_REVIEWER_DEFAULT_V2)
         .build(&fake_context(default_roles::REVIEWER));
 
@@ -269,9 +270,9 @@ fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
         .contains("Separate NON-BLOCKING findings from BLOCKING findings."));
     assert!(prompt
         .system
-        .contains("End your response with EXACTLY ONE verdict marker in the existing format:"));
-    assert!(prompt.system.contains("===REVIEW: PASS==="));
-    assert!(prompt.system.contains("===REVIEW: FAIL: <short reason>==="));
+        .contains("End with exactly one machine-readable line:"));
+    assert!(prompt.system.contains("FORGE_RESULT:"));
+    assert!(prompt.system.contains("needs_human"));
 }
 
 #[test]
@@ -456,6 +457,64 @@ fn planner_prompt_includes_parent_task_context() {
     assert!(prompt
         .user
         .contains("Parent description for planning context."));
+}
+
+#[test]
+fn planner_prompt_includes_current_plan_latest_rejection_and_comments() {
+    let mut ctx = fake_context(default_roles::PLANNER);
+    ctx.state_name = default_states::PLANNING.to_owned();
+    ctx.plan = Some("# Existing plan\n\n- Preserve the provider boundary.".to_owned());
+    ctx.transition_log = vec![
+        db::TransitionLog {
+            id: "transition-old".to_owned(),
+            task_id: ctx.task.id.clone(),
+            from_state: default_states::PLANNING.to_owned(),
+            to_state: default_states::PLANNING.to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:api".to_owned(),
+            trigger_reason: "gate rejected: old feedback".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-04-17T00:00:00Z".to_owned(),
+        },
+        db::TransitionLog {
+            id: "transition-latest".to_owned(),
+            task_id: ctx.task.id.clone(),
+            from_state: default_states::PLANNING.to_owned(),
+            to_state: default_states::PLANNING.to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:api".to_owned(),
+            trigger_reason: "gate rejected: keep canonical identity separate".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-04-17T00:01:00Z".to_owned(),
+        },
+    ];
+    ctx.comments = vec![db::TaskComment {
+        id: "comment-1".to_owned(),
+        task_id: ctx.task.id.clone(),
+        author_type: db::CommentAuthorType::User,
+        author_id: Some("user-1".to_owned()),
+        author_name: "Alejandro".to_owned(),
+        content: "Keep the phases independently testable.".to_owned(),
+        created_at: "2026-04-17T00:02:00Z".to_owned(),
+        updated_at: "2026-04-17T00:02:00Z".to_owned(),
+    }];
+
+    let prompt = PlannerPromptBuilder.build(&ctx);
+
+    assert!(prompt.user.contains("Current plan to revise:"));
+    assert!(prompt.user.contains("Preserve the provider boundary."));
+    assert!(prompt
+        .user
+        .contains("User feedback from the latest rejected plan:"));
+    assert!(prompt
+        .user
+        .contains("gate rejected: keep canonical identity separate"));
+    assert!(!prompt.user.contains("gate rejected: old feedback"));
+    assert!(prompt
+        .user
+        .contains("Alejandro: Keep the phases independently testable."));
 }
 
 #[test]

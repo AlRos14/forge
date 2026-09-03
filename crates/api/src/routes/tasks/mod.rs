@@ -33,8 +33,8 @@ use uuid::Uuid;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, paginated, parse_csv, review_response, serialize_json,
-        task_page_request, task_response, task_response_light_with_latest,
+        auth::AuthenticatedUser, execution_response, paginated, parse_csv, review_response,
+        serialize_json, task_page_request, task_response, task_response_light_with_latest,
         task_response_with_awaiting_human, task_role_assignment_response, workspace_response,
         ListParams,
     },
@@ -44,10 +44,12 @@ use crate::{
 mod actions;
 mod comments;
 mod crud;
+mod decisions;
 mod dependencies;
 mod execution;
 mod gates;
 mod media;
+mod plans;
 mod prompt_preview;
 mod reviews;
 mod roles;
@@ -63,10 +65,12 @@ pub use crud::{
     advance_task, archive_task, create_task, delete_task, duplicate_task, get_task, list_tasks,
     move_task, recover_task, reorder_subtasks, update_task,
 };
+pub use decisions::{answer_task_decision, list_task_decisions};
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
 pub use gates::{approve_gate, reject_gate};
 pub use media::{delete_media, get_media, list_media, upload_media};
+pub use plans::get_task_plan;
 pub use prompt_preview::prompt_preview;
 pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
 pub use roles::{
@@ -75,6 +79,30 @@ pub use roles::{
 };
 pub use transitions::{list_transitions, transition_task, TransitionLogListResponse};
 pub use workspace::{get_task_diff, get_task_workspace, reset_task_workspace};
+
+async fn require_task_visible(
+    state: &AppState,
+    task_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<db::Task> {
+    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
+    let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
+
+    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user.user_id.as_str()) {
+        return Ok(task);
+    }
+
+    let member = db::ProjectMemberRepo::get_member(&*state.db, &project.id, &user.user_id).await?;
+    if member.is_none() {
+        return Err(ApiError::not_found("task", task_id.to_owned()));
+    }
+
+    Ok(task)
+}
 
 async fn project_default_review_config(
     db: &db::SqliteDb,

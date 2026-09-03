@@ -309,9 +309,14 @@ fn export_typescript() {
     TokenTotalsSummary::export().expect("export TokenTotalsSummary");
     OperationsRefreshResponse::export().expect("export OperationsRefreshResponse");
     UsageSummary::export().expect("export UsageSummary");
+    AgentUsageResponse::export().expect("export AgentUsageResponse");
     RecentErrorSummary::export().expect("export RecentErrorSummary");
     PlanArtifactDetail::export().expect("export PlanArtifactDetail");
+    TaskPlanRevisionSummary::export().expect("export TaskPlanRevisionSummary");
+    TaskPlanHistoryResponse::export().expect("export TaskPlanHistoryResponse");
     PlanChecklistItem::export().expect("export PlanChecklistItem");
+    AnswerTaskDecisionRequest::export().expect("export AnswerTaskDecisionRequest");
+    TaskDecisionRequestResponse::export().expect("export TaskDecisionRequestResponse");
     EffectiveExecutionPolicy::export().expect("export EffectiveExecutionPolicy");
     PlanProgressSummary::export().expect("export PlanProgressSummary");
     SettingsResponse::export().expect("export SettingsResponse");

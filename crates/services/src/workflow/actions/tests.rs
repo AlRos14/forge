@@ -96,7 +96,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             assignee_id: None,
             title: "test task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,
@@ -144,7 +144,7 @@ async fn seed_project_without_repo_and_task(db: &SqliteDb, task_id: &str, status
             assignee_id: None,
             title: "test task".to_owned(),
             description: Some("echo test".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             priority: 0,
             is_automation: false,
@@ -261,7 +261,7 @@ async fn seed_local_project_repo_and_task(
             assignee_id: None,
             title: "test task".to_owned(),
             description: Some("echo test".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,
@@ -908,7 +908,7 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
         .expect("reviewer executor spawned in time")
         .expect("reviewer execution context received");
     assert_eq!(execution_ctx.task_id, ctx.task_id);
-    assert!(execution_ctx.description.contains("===REVIEW: PASS==="));
+    assert!(execution_ctx.description.contains("FORGE_RESULT:"));
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
@@ -1040,7 +1040,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
             assignee_id: None,
             title: "other review task".to_owned(),
             description: Some("echo other".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::REVIEW.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1473,6 +1473,111 @@ async fn dispatch_role_agent_initial_dispatch_creates_execution_with_capacity() 
 }
 
 #[tokio::test]
+async fn planning_rejection_budget_allows_revision_at_configured_limit() {
+    let agent_id = "agent-planner-budget-limit";
+    let mut harness = build_role_dispatch_harness(
+        "task-planner-budget-limit",
+        default_states::PLANNING,
+        default_states::PLANNING,
+        default_roles::PLANNER,
+        agent_id,
+        1,
+    )
+    .await;
+    let ctx = harness.ctx.clone();
+    for _ in 0..2 {
+        seed_transition_log(
+            &ctx.db,
+            &ctx.task_id,
+            default_states::PLANNING,
+            default_states::PLANNING,
+            true,
+        )
+        .await;
+    }
+
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    let budget_result = CheckRetryBudget.execute(&ctx).await;
+
+    assert!(matches!(dispatch_result, HookResult::Ok));
+    assert!(matches!(budget_result, HookResult::Ok));
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("planner executor spawned in time")
+        .expect("planner execution context received");
+    assert_eq!(execution_ctx.task_id, ctx.task_id);
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(task.blocked_json.is_none());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::PLANNER)
+            .await
+            .expect("execution count loads"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exceeded_planning_rejection_budget_blocks_without_dispatching() {
+    let agent_id = "agent-planner-budget-exhausted";
+    let mut harness = build_role_dispatch_harness(
+        "task-planner-budget-exhausted",
+        default_states::PLANNING,
+        default_states::PLANNING,
+        default_roles::PLANNER,
+        agent_id,
+        1,
+    )
+    .await;
+    let ctx = harness.ctx.clone();
+    for _ in 0..3 {
+        seed_transition_log(
+            &ctx.db,
+            &ctx.task_id,
+            default_states::PLANNING,
+            default_states::PLANNING,
+            true,
+        )
+        .await;
+    }
+
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    let budget_result = CheckRetryBudget.execute(&ctx).await;
+
+    assert!(matches!(
+        dispatch_result,
+        HookResult::Skipped { reason }
+            if reason == "retry budget exhausted (3/2); task will be blocked before dispatch"
+    ));
+    assert!(matches!(budget_result, HookResult::Ok));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::PLANNER)
+            .await
+            .expect("execution count loads"),
+        0
+    );
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let blocked: serde_json::Value = serde_json::from_str(
+        task.blocked_json
+            .as_deref()
+            .expect("retry exhaustion blocks the task"),
+    )
+    .expect("blocking annotation parses");
+    assert_eq!(blocked["kind"], "retry_exhausted");
+    assert_eq!(blocked["reason"], "gate rejection budget exhausted: 3/2");
+}
+
+#[tokio::test]
 async fn dispatch_role_agent_skips_initial_dispatch_without_repo() {
     let agent_id = "agent-coder-no-repo";
     let mut harness = build_no_repo_dispatch_harness("task-dispatch-no-repo", agent_id, 1).await;
@@ -1524,7 +1629,7 @@ async fn dispatch_role_agent_initial_dispatch_skips_at_capacity() {
             assignee_id: None,
             title: "other task".to_owned(),
             description: Some("echo other".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::IN_PROGRESS.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1784,7 +1889,7 @@ async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
             assignee_id: None,
             title: "ordered child".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::DONE.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1846,7 +1951,7 @@ async fn reviewer_dispatch_ignores_waiting_review_tasks_without_running_executio
             assignee_id: None,
             title: "other waiting review task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::REVIEW.to_owned(),
             is_automation: false,
             priority: 0,
@@ -1949,7 +2054,7 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
             assignee_id: None,
             title: "other review task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: default_states::REVIEW.to_owned(),
             is_automation: false,
             priority: 0,

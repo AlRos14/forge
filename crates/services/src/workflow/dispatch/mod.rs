@@ -48,6 +48,7 @@ pub struct AgentDispatchContext {
     pub transition_log: Vec<db::TransitionLog>,
     pub comments: Vec<db::TaskComment>,
     pub plan: Option<String>,
+    pub review_evidence: Option<String>,
     pub prior_reviews: Vec<db::Review>,
     pub parent_task: Option<db::Task>,
     pub sub_tasks: Vec<db::Task>,

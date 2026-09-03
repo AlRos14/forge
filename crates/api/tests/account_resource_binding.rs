@@ -2,8 +2,8 @@
 mod common;
 
 use api_types::{
-    AgentResponse, PaginatedResponse, ProjectMemberResponse, ProjectResponse, TokenResponse,
-    UserResponse,
+    AgentResponse, PaginatedResponse, ProjectMemberResponse, ProjectResponse,
+    TaskPlanHistoryResponse, TaskResponse, TokenResponse, UserResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -440,6 +440,15 @@ async fn project_auto_membership_and_non_member_scoping() {
     );
     let project_id = &project.id;
 
+    let task: TaskResponse = common::json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "private task", "description": "private plan material" }),
+        StatusCode::OK,
+    )
+    .await;
+
     // Auto-created owner member
     let members: Vec<ProjectMemberResponse> = bearer_get(
         app,
@@ -479,6 +488,60 @@ async fn project_auto_membership_and_non_member_scoping() {
         StatusCode::NOT_FOUND,
         "non-member must receive 404 on get_project"
     );
+
+    let owner_task: TaskResponse = bearer_get(
+        app,
+        &format!("/api/v1/tasks/{}", task.id),
+        &jwt_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(owner_task.id, task.id);
+    let _: TaskPlanHistoryResponse = bearer_get(
+        app,
+        &format!("/api/v1/tasks/{}/plan", task.id),
+        &jwt_a,
+        StatusCode::OK,
+    )
+    .await;
+
+    for path in [
+        format!("/api/v1/tasks/{}", task.id),
+        format!("/api/v1/tasks/{}/plan", task.id),
+    ] {
+        let status = bearer_get_status(app, &path, &token_b).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-member must not discover a task through {path}"
+        );
+    }
+
+    let user_b: UserResponse = bearer_get(app, "/api/v1/auth/me", &token_b, StatusCode::OK).await;
+    let _: ProjectMemberResponse = bearer_json(
+        app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/members"),
+        &jwt_a,
+        json!({ "user_id": user_b.id, "role": "viewer" }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let _: TaskResponse = bearer_get(
+        app,
+        &format!("/api/v1/tasks/{}", task.id),
+        &token_b,
+        StatusCode::OK,
+    )
+    .await;
+    let _: TaskPlanHistoryResponse = bearer_get(
+        app,
+        &format!("/api/v1/tasks/{}/plan", task.id),
+        &token_b,
+        StatusCode::OK,
+    )
+    .await;
 }
 
 // ── 6.6 Agent account-visibility scoping ─────────────────────────────────

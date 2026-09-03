@@ -22,7 +22,7 @@ const task = {
   project_id: 'project-1',
   repo_id: null,
   title: 'Task',
-  task_type: 'task',
+  task_type: 'implementation',
   status: 'todo',
   priority: 0,
   board_position: 0,

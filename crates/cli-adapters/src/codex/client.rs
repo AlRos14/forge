@@ -1,6 +1,6 @@
 use super::{
     jsonrpc::{JsonRpcPeer, ServerMessage},
-    normalize::{is_turn_completed, normalize_event},
+    normalize::{extract_thread_id, extract_turn_id, is_expected_turn_completed, normalize_event},
     protocol::{
         ApprovalDecision, CancelTurnParams, CancelTurnResponse, CommandExecutionApprovalResponse,
         DynamicToolCallOutputContentItem, DynamicToolCallResponse, FileChangeApprovalResponse,
@@ -38,6 +38,7 @@ pub struct TurnRunResult {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage: Option<TokenUsage>,
+    pub account_usage: Option<Value>,
 }
 
 impl CodexClient {
@@ -76,6 +77,12 @@ impl CodexClient {
 
     pub async fn initialized(&self) -> Result<(), ExecutorError> {
         self.rpc.notify::<Value>("initialized", None).await
+    }
+
+    pub async fn account_rate_limits(&self) -> Result<Value, ExecutorError> {
+        self.rpc
+            .request("account/rateLimits/read", None::<Value>)
+            .await
     }
 
     pub async fn thread_start(
@@ -150,11 +157,16 @@ impl CodexClient {
 
     pub async fn run_until_turn_complete(
         &mut self,
+        expected_thread_id: &str,
+        expected_turn_id: Option<&str>,
         writer: Arc<AsyncMutex<LogWriter>>,
         mut stderr_rx: mpsc::Receiver<String>,
         heartbeat_interval_seconds: u64,
     ) -> Result<TurnRunResult, ExecutorError> {
-        let mut result = TurnRunResult::default();
+        let mut result = TurnRunResult {
+            thread_id: Some(expected_thread_id.to_owned()),
+            ..TurnRunResult::default()
+        };
         let heartbeat_interval = std::time::Duration::from_secs(heartbeat_interval_seconds.max(1));
         let mut heartbeat = time::interval_at(
             time::Instant::now() + heartbeat_interval,
@@ -186,7 +198,13 @@ impl CodexClient {
                         result.error = Some("codex app-server stdout closed".to_owned());
                         return Ok(result);
                     };
-                    if self.handle_server_message(message, &writer, &mut result).await? {
+                    if self.handle_server_message(
+                        message,
+                        expected_thread_id,
+                        expected_turn_id,
+                        &writer,
+                        &mut result,
+                    ).await? {
                         result.outcome = Some(if result.error.is_some() {
                             ExecutionOutcome::Failed
                         } else {
@@ -202,28 +220,43 @@ impl CodexClient {
     async fn handle_server_message(
         &self,
         message: ServerMessage,
+        expected_thread_id: &str,
+        expected_turn_id: Option<&str>,
         writer: &Arc<AsyncMutex<LogWriter>>,
         result: &mut TurnRunResult,
     ) -> Result<bool, ExecutorError> {
         match message {
             ServerMessage::Request(request, raw) => {
-                let diagnostic = set_error_if_present(&raw, result);
-                self.write_normalized(writer, raw.clone(), result).await?;
+                let diagnostic =
+                    set_scoped_error_if_present(&raw, expected_thread_id, expected_turn_id, result);
+                self.write_normalized(
+                    writer,
+                    raw.clone(),
+                    expected_thread_id,
+                    expected_turn_id,
+                    result,
+                )
+                .await?;
                 write_error_diagnostic(writer, diagnostic).await?;
                 self.handle_server_request(request.id, &request.method, request.params, writer)
                     .await?;
                 Ok(false)
             }
             ServerMessage::Notification(_notification, raw) => {
-                let completed = is_turn_completed(&raw);
-                let diagnostic = set_error_if_present(&raw, result);
-                self.write_normalized(writer, raw, result).await?;
+                let completed =
+                    is_expected_turn_completed(&raw, expected_thread_id, expected_turn_id);
+                let diagnostic =
+                    set_scoped_error_if_present(&raw, expected_thread_id, expected_turn_id, result);
+                self.write_normalized(writer, raw, expected_thread_id, expected_turn_id, result)
+                    .await?;
                 write_error_diagnostic(writer, diagnostic).await?;
                 Ok(completed)
             }
             ServerMessage::Response(raw) => {
-                let diagnostic = set_error_if_present(&raw, result);
-                self.write_normalized(writer, raw, result).await?;
+                let diagnostic =
+                    set_scoped_error_if_present(&raw, expected_thread_id, expected_turn_id, result);
+                self.write_normalized(writer, raw, expected_thread_id, expected_turn_id, result)
+                    .await?;
                 write_error_diagnostic(writer, diagnostic).await?;
                 Ok(false)
             }
@@ -238,16 +271,18 @@ impl CodexClient {
         &self,
         writer: &Arc<AsyncMutex<LogWriter>>,
         raw: Value,
+        expected_thread_id: &str,
+        expected_turn_id: Option<&str>,
         result: &mut TurnRunResult,
     ) -> Result<(), ExecutorError> {
-        if let Some(usage) = extract_token_usage(&raw) {
+        capture_account_usage(&raw, result);
+        let belongs_to_expected_turn =
+            event_belongs_to_expected_turn(&raw, expected_thread_id, expected_turn_id);
+        if belongs_to_expected_turn && let Some(usage) = extract_token_usage(&raw) {
             result.usage = Some(usage);
         }
         let normalized = normalize_event(raw);
-        if let Some(thread_id) = normalized.thread_id {
-            result.thread_id = Some(thread_id);
-        }
-        if let Some(message) = normalized.assistant_message {
+        if belongs_to_expected_turn && let Some(message) = normalized.assistant_message {
             result.summary = Some(message);
         }
         write_log(writer, normalized.kind, normalized.payload).await
@@ -417,6 +452,12 @@ impl CodexClient {
     }
 }
 
+fn capture_account_usage(raw: &Value, result: &mut TurnRunResult) {
+    if raw.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
+        result.account_usage = raw.get("params").cloned().or_else(|| Some(raw.clone()));
+    }
+}
+
 fn mcp_tool_elicitation_allowed(params: &Value) -> bool {
     let approval_kind = params
         .get("_meta")
@@ -424,7 +465,15 @@ fn mcp_tool_elicitation_allowed(params: &Value) -> bool {
     approval_kind == Some("mcp_tool_call")
 }
 
-fn set_error_if_present(raw: &Value, result: &mut TurnRunResult) -> Option<String> {
+fn set_scoped_error_if_present(
+    raw: &Value,
+    expected_thread_id: &str,
+    expected_turn_id: Option<&str>,
+    result: &mut TurnRunResult,
+) -> Option<String> {
+    if !event_belongs_to_expected_turn(raw, expected_thread_id, expected_turn_id) {
+        return None;
+    }
     let error = super::codex_event_error_message(raw)?;
 
     let should_replace = match result.error.as_deref() {
@@ -440,6 +489,20 @@ fn set_error_if_present(raw: &Value, result: &mut TurnRunResult) -> Option<Strin
         Some(error)
     } else {
         None
+    }
+}
+
+fn event_belongs_to_expected_turn(
+    raw: &Value,
+    expected_thread_id: &str,
+    expected_turn_id: Option<&str>,
+) -> bool {
+    if extract_thread_id(raw).as_deref() != Some(expected_thread_id) {
+        return false;
+    }
+    match (expected_turn_id, extract_turn_id(raw)) {
+        (Some(expected), Some(actual)) => actual == expected,
+        _ => true,
     }
 }
 
@@ -634,6 +697,24 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 48512);
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn captures_latest_codex_account_rate_limits_without_transforming_provider_fields() {
+        let mut result = TurnRunResult::default();
+        let first = json!({
+            "method": "account/rateLimits/updated",
+            "params": {"planType":"plus","primary":{"usedPercent":1,"windowDurationMins":300}}
+        });
+        let latest = json!({
+            "method": "account/rateLimits/updated",
+            "params": {"planType":"plus","primary":{"usedPercent":2,"windowDurationMins":300},"secondary":{"usedPercent":0,"windowDurationMins":10080},"credits":{"balance":0}}
+        });
+
+        capture_account_usage(&first, &mut result);
+        capture_account_usage(&latest, &mut result);
+
+        assert_eq!(result.account_usage, latest.get("params").cloned());
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +24,7 @@ const LIST_MODELS_TIMEOUT_SECONDS: u64 = 10;
 
 pub struct CursorAdapter {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
+    usage_cache: Arc<AsyncMutex<Option<(std::time::Instant, Value)>>>,
 }
 
 #[derive(Clone)]
@@ -38,12 +39,30 @@ struct CursorStreamResult {
     summary: Option<String>,
     error: Option<String>,
     stderr_tail: String,
+    usage: Option<executors::TokenUsage>,
 }
 
 impl CursorAdapter {
     pub fn new() -> Self {
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
+            usage_cache: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    async fn cached_account_usage(&self) -> Option<Value> {
+        let cached = self.usage_cache.lock().await.clone();
+        if let Some((captured, value)) = cached.as_ref()
+            && captured.elapsed() < Duration::from_secs(300)
+        {
+            return Some(value.clone());
+        }
+        match query_cursor_usage().await {
+            Ok(value) => {
+                *self.usage_cache.lock().await = Some((std::time::Instant::now(), value.clone()));
+                Some(value)
+            }
+            Err(_) => cached.map(|(_, value)| value),
         }
     }
 
@@ -219,7 +238,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 agent_session_id: stream.agent_session_id,
                 summary: stream.summary,
                 error: None,
-                usage: None,
+                usage: stream.usage,
                 ..Default::default()
             });
         }
@@ -231,7 +250,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 agent_session_id: stream.agent_session_id,
                 summary: stream.summary,
                 error: Some(error),
-                usage: None,
+                usage: stream.usage,
                 ..Default::default()
             });
         }
@@ -243,7 +262,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 agent_session_id: stream.agent_session_id,
                 summary: stream.summary,
                 error: Some(cursor_run_error(status, &stream.stderr_tail)),
-                usage: None,
+                usage: stream.usage,
                 ..Default::default()
             });
         }
@@ -265,13 +284,15 @@ impl CodingExecutorAdapter for CursorAdapter {
                 .ok(),
         };
 
+        let account_usage = self.cached_account_usage().await;
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,
             after_sha,
             agent_session_id: stream.agent_session_id,
             summary: stream.summary,
             error: None,
-            usage: None,
+            usage: stream.usage,
+            account_usage,
             ..Default::default()
         })
     }
@@ -295,6 +316,69 @@ impl CodingExecutorAdapter for CursorAdapter {
     }
 }
 
+async fn query_cursor_usage() -> Result<Value, ExecutorError> {
+    let mut child = tokio::process::Command::new("script")
+        .args(["-qec", "cursor-agent", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("NO_COLOR", "1")
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Cursor usage PTY has no stdin".to_owned()))?;
+    stdin.write_all(b"/usage\r/quit\r").await?;
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(12), child.wait_with_output())
+        .await
+        .map_err(|_| ExecutorError::Other("Cursor /usage timed out".to_owned()))??;
+    parse_cursor_usage(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_cursor_usage(output: &str) -> Result<Value, ExecutorError> {
+    let text = strip_ansi(output);
+    let pools = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("plan")
+                || lower.contains("included")
+                || lower.contains("auto")
+                || lower.contains("api")
+                || lower.contains("on-demand")
+                || lower.contains("reset")
+        })
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if pools.is_empty() {
+        return Err(ExecutorError::Other(
+            "Cursor /usage returned no quota pools".to_owned(),
+        ));
+    }
+    Ok(serde_json::json!({ "pools": pools, "raw_kind": "cursor_interactive_usage" }))
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+        } else if ch != '\r' {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 async fn stream_child_output(
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
@@ -311,6 +395,7 @@ async fn stream_child_output(
     let mut assistant_text = String::new();
     let mut error = None;
     let mut stderr_tail = String::new();
+    let mut usage = None;
 
     while !stdout_done || !stderr_done {
         tokio::select! {
@@ -329,6 +414,7 @@ async fn stream_child_output(
                                 &mut summary,
                                 &mut assistant_text,
                                 &mut error,
+                                &mut usage,
                             );
                             writer
                                 .write(classify_cursor_event(&event), LogStream::Main, event)
@@ -370,6 +456,7 @@ async fn stream_child_output(
         summary,
         error,
         stderr_tail,
+        usage,
     })
 }
 
@@ -379,6 +466,7 @@ fn capture_cursor_event(
     summary: &mut Option<String>,
     assistant_text: &mut String,
     error: &mut Option<String>,
+    usage: &mut Option<executors::TokenUsage>,
 ) {
     if agent_session_id.is_none() {
         *agent_session_id = extract_session_id(event);
@@ -392,6 +480,22 @@ fn capture_cursor_event(
             }
         }
         "result" => {
+            if let Some(value) = event.get("usage") {
+                *usage = Some(executors::TokenUsage {
+                    input_tokens: cursor_i64(value, &["inputTokens", "input_tokens"]),
+                    output_tokens: cursor_i64(value, &["outputTokens", "output_tokens"]),
+                    cache_read_tokens: cursor_i64(value, &["cacheReadTokens", "cache_read_tokens"]),
+                    cache_write_tokens: cursor_i64(
+                        value,
+                        &["cacheWriteTokens", "cache_write_tokens"],
+                    ),
+                    cost_usd: None,
+                    model: event
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
             if let Some(text) = event.get("result").and_then(Value::as_str) {
                 *summary = Some(truncate_summary(text));
             }
@@ -412,6 +516,12 @@ fn capture_cursor_event(
         }
         _ => {}
     }
+}
+
+fn cursor_i64(value: &Value, keys: &[&str]) -> i64 {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_i64))
+        .unwrap_or_default()
 }
 
 fn classify_cursor_event(event: &Value) -> LogKind {
@@ -744,6 +854,7 @@ mod tests {
         let mut summary = None;
         let mut assistant_text = String::new();
         let mut error = None;
+        let mut usage = None;
 
         capture_cursor_event(
             &serde_json::json!({
@@ -754,6 +865,7 @@ mod tests {
             &mut summary,
             &mut assistant_text,
             &mut error,
+            &mut usage,
         );
         capture_cursor_event(
             &serde_json::json!({
@@ -770,6 +882,7 @@ mod tests {
             &mut summary,
             &mut assistant_text,
             &mut error,
+            &mut usage,
         );
         capture_cursor_event(
             &serde_json::json!({
@@ -777,16 +890,42 @@ mod tests {
                 "subtype": "success",
                 "is_error": false,
                 "result": "final text",
-                "session_id": "session-1"
+                "session_id": "session-1",
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 4,
+                    "cacheReadTokens": 3,
+                    "cacheWriteTokens": 2
+                }
             }),
             &mut session_id,
             &mut summary,
             &mut assistant_text,
             &mut error,
+            &mut usage,
         );
 
         assert_eq!(session_id.as_deref(), Some("session-1"));
         assert_eq!(summary.as_deref(), Some("final text"));
         assert!(error.is_none());
+        assert_eq!(usage.expect("usage").input_tokens, 10);
+    }
+
+    #[test]
+    fn parses_cursor_interactive_quota_pools_without_inventing_numbers() {
+        let usage = parse_cursor_usage(
+            "\u{1b}[32mPlan: Pro\u{1b}[0m\r\nIncluded usage: 37%\r\nAuto requests reset Sep 1\r\n",
+        )
+        .expect("quota pools parse");
+
+        assert_eq!(
+            usage["pools"],
+            serde_json::json!([
+                "Plan: Pro",
+                "Included usage: 37%",
+                "Auto requests reset Sep 1"
+            ])
+        );
+        assert_eq!(usage["raw_kind"], "cursor_interactive_usage");
     }
 }

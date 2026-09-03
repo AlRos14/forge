@@ -13,6 +13,7 @@ import type {
 } from '@/types/generated'
 import type {
   AgentConnectionHealth,
+  AgentUsage,
   AgentProfile,
   AgentSession,
   AttentionItem,
@@ -59,6 +60,14 @@ export function listFederatedAgents(limit = 100, cursor?: string): Promise<Page<
 
 export function listAgentProfiles(identityId: string): Promise<AgentProfile[]> {
   return apiFetch<AgentProfile[]>(`/agents/${identityId}/profiles`)
+}
+
+export function getAgentUsage(identityId: string): Promise<AgentUsage> {
+  return apiFetch<AgentUsage>(`/agents/${identityId}/usage`)
+}
+
+export function refreshAgentUsage(identityId: string): Promise<AgentUsage> {
+  return apiFetch<AgentUsage>(`/agents/${identityId}/usage/refresh`, { method: 'POST' })
 }
 
 /** Register a CLI-harness agent, optionally powered by a provider entry. */

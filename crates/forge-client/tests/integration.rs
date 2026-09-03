@@ -375,7 +375,7 @@ async fn create_task_route(
         data.next_id("task"),
         project_id,
         request.title,
-        request.task_type.unwrap_or(TaskType::Task),
+        request.task_type.unwrap_or(TaskType::Implementation),
         "todo",
     );
     data.tasks.insert(task.id.clone(), task.clone());

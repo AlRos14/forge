@@ -619,7 +619,7 @@ mod tests {
             assignee_id: None,
             title: title.to_owned(),
             description: description.map(str::to_owned),
-            task_type: "task".to_string(),
+            task_type: "implementation".to_string(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,

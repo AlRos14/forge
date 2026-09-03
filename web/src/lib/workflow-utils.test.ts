@@ -116,7 +116,7 @@ describe('task interruption annotations', () => {
       project_id: 'project-1',
       repo_id: 'repo-1',
       title: 'Annotated task',
-      task_type: 'task',
+      task_type: 'implementation',
       description: null,
       status: 'in_progress',
       priority: 0,

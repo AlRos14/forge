@@ -336,7 +336,7 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(NoDiffExecutor))
+        .with_task_executor(Arc::new(PlannerReadyExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -412,22 +412,6 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
         .is_awaiting_human(task.id.clone())
         .await
         .expect("awaiting human resolves"));
-
-    let workspace = WorkspaceRepo::get_by_id(
-        &*db,
-        completed
-            .workspace_id
-            .as_deref()
-            .expect("execution has workspace"),
-    )
-    .await
-    .expect("workspace loads")
-    .expect("workspace exists");
-    let plan_path = std::path::Path::new(&workspace.worktree_path)
-        .parent()
-        .expect("worktree has workspace parent")
-        .join("plan.md");
-    std::fs::write(plan_path, "- [x] verify plan\n").expect("plan writes");
 
     let approved = service
         .transition(
@@ -1141,7 +1125,7 @@ async fn passed_reviewer_execution_with_user_approval_gate_waits_for_human() {
             agent_session_id: Some("reviewer-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
-            summary: Some("Looks good.\n===REVIEW: PASS===".to_owned()),
+            summary: Some("Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}".to_owned()),
             logs_path: None,
             before_sha: None,
             after_sha: None,

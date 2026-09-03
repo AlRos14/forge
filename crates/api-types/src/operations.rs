@@ -208,10 +208,31 @@ pub struct RecentErrorSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct PlanArtifactDetail {
+    pub revision_id: Option<String>,
+    pub revision: Option<i64>,
+    pub checkpoint: Option<String>,
+    pub content_digest: Option<String>,
+    pub markdown: String,
     pub items: Vec<PlanChecklistItem>,
     pub warnings: Vec<String>,
-    pub source_path: Option<String>,
     pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskPlanRevisionSummary {
+    pub id: String,
+    pub revision: i64,
+    pub checkpoint: String,
+    pub content_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskPlanHistoryResponse {
+    pub current: Option<PlanArtifactDetail>,
+    pub revisions: Vec<TaskPlanRevisionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

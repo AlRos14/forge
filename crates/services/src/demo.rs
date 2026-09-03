@@ -324,7 +324,7 @@ async fn install_demo_tasks(
                 },
                 title: demo_task.title.to_owned(),
                 description: Some(demo_task.description.to_owned()),
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status: demo_task.status.to_owned(),
                 is_automation: false,
                 priority: demo_task.priority,

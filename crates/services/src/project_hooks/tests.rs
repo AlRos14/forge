@@ -333,7 +333,7 @@ async fn all_work_completed_ignores_running_automation_task_and_automation_does_
             project.id.clone(),
             "Automation: completion",
             Some("hook-run automation task".to_owned()),
-            Some("task".to_owned()),
+            Some("implementation".to_owned()),
             None,
             None,
         )
@@ -540,7 +540,7 @@ async fn seed_task(db: &SqliteDb, project_id: &str, status: &str, is_automation:
             assignee_id: None,
             title: format!("{status} task"),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation,
             priority: 0,

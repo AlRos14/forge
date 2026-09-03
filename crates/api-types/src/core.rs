@@ -7,10 +7,11 @@ pub type TaskStatus = String;
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum TaskType {
-    Task,
-    PlanningTask,
-    SubTask,
+    Implementation,
+    Planning,
     Discovery,
+    Review,
+    Validation,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]

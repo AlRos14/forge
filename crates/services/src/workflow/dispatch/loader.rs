@@ -59,7 +59,25 @@ pub async fn load_agent_dispatch_context(
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
-    let plan = task.plan.clone();
+    let plan = match crate::plan_artifact::latest_plan_for_task(&db, task_id).await {
+        Ok(Some(plan)) => Some(plan.markdown),
+        Ok(None) => task.plan.clone(),
+        Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
+    };
+    let review_evidence = if role == crate::workflow::default_roles::REVIEWER {
+        match crate::DiffService::new(Arc::clone(&db))
+            .task_diff(task_id)
+            .await
+        {
+            Ok(diff) => Some(format!(
+                "Base SHA: {}\nHead SHA: {}\n\nExact diff:\n```diff\n{}\n```",
+                diff.base_sha, diff.head_sha, diff.diff
+            )),
+            Err(error) => Some(format!("Diff evidence unavailable: {error}")),
+        }
+    } else {
+        None
+    };
 
     Ok(AgentDispatchContext {
         task,
@@ -69,6 +87,7 @@ pub async fn load_agent_dispatch_context(
         transition_log,
         comments,
         plan,
+        review_evidence,
         prior_reviews,
         parent_task,
         sub_tasks,
@@ -352,7 +371,7 @@ mod tests {
                 assignee_id: None,
                 title: "parent".to_owned(),
                 description: None,
-                task_type: "task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status: "in_progress".to_owned(),
                 is_automation: false,
                 priority: 0,
@@ -377,7 +396,7 @@ mod tests {
                 assignee_id: None,
                 title: "child".to_owned(),
                 description: None,
-                task_type: "sub_task".to_owned(),
+                task_type: "implementation".to_owned(),
                 status: "todo".to_owned(),
                 is_automation: false,
                 priority: 0,
@@ -398,7 +417,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, child.id);
-        assert_eq!(loaded[0].task_type, "sub_task");
+        assert_eq!(loaded[0].task_type, "implementation");
         assert_eq!(
             loaded[0].parent_task_id.as_deref(),
             Some(parent.id.as_str())

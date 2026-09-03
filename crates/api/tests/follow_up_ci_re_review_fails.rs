@@ -207,10 +207,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let allow_follow_up = Arc::clone(&self.allow_follow_up);
         Box::pin(async move {
-            if ctx
-                .description
-                .contains("===REVIEW: FAIL: <short reason>===")
-            {
+            if ctx.description.contains("FORGE_RESULT:") {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -285,7 +282,7 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({ "text": "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}" }),
         )
         .await?;
     Ok(())

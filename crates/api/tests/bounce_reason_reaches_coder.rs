@@ -164,7 +164,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
             assignee_id: None,
             title: "bounce reason task".to_owned(),
             description: None,
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: status.to_owned(),
             is_automation: false,
             priority: 0,

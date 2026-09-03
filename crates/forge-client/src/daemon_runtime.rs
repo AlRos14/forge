@@ -377,6 +377,7 @@ async fn run_execution_task(
             summary: None,
             after_sha: None,
             usage: None,
+            account_usage: None,
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -413,6 +414,7 @@ fn terminal_notification_from_result(
             cost_usd: usage.cost_usd,
             model: usage.model,
         }),
+        account_usage: result.account_usage,
         failure_class: result.failure_class.map(|class| match class {
             ExecutionFailureClass::TaskFailed => RemoteExecutionFailureClass::TaskFailed,
             ExecutionFailureClass::ExecutorUnavailable => {

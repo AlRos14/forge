@@ -41,6 +41,38 @@ impl TaskExecutor for NoDiffExecutor {
     }
 }
 
+struct PlannerReadyExecutor;
+
+#[async_trait]
+impl TaskExecutor for PlannerReadyExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        let plan_path = std::path::Path::new(&ctx.worktree_path)
+            .parent()
+            .expect("worktree has workspace parent")
+            .join("plan.md");
+        std::fs::write(plan_path, "- [x] verify plan\n")
+            .map_err(|error| ExecutorError::Other(error.to_string()))?;
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            after_sha: None,
+            agent_session_id: None,
+            summary: Some(
+                "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"plan_ready\"}".to_owned(),
+            ),
+            error: None,
+            usage: None,
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
 struct BurstLogExecutor {
     count: u64,
 }
@@ -331,7 +363,7 @@ async fn seed_task_with_status(
             assignee_id: None,
             title: format!("task-{status}"),
             description: Some("seeded task".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status,
             is_automation: false,
             priority: 0,
@@ -366,7 +398,7 @@ async fn seed_subtask_with_status(
             assignee_id: None,
             title: title.to_owned(),
             description: Some("seeded subtask".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status,
             is_automation: false,
             priority: 0,

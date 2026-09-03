@@ -73,7 +73,8 @@ use self::config::{
 use self::{
     config::{
         build_executor_config_snapshot, create_failed_execution_record,
-        executor_snapshot_with_resume_thread, parse_json_value, truncate_utf8_bytes,
+        executor_snapshot_with_resume_thread, executor_snapshot_without_resume_thread,
+        parse_json_value, truncate_utf8_bytes,
     },
     logs::execution_logs_path,
     review_config::review_config_from_json,
@@ -537,6 +538,19 @@ impl TaskService {
         if updated.status != ExecutionStatus::Running {
             self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)
                 .await;
+        }
+
+        if let Some(account_usage) = notification.account_usage.as_ref() {
+            if let Err(error) = execution::persist_account_usage_snapshot(
+                &self.db,
+                current_execution.executor_config_snapshot_json.as_deref(),
+                &updated.id,
+                account_usage,
+            )
+            .await
+            {
+                tracing::warn!(execution_id = %updated.id, %error, "failed to persist remote account usage snapshot");
+            }
         }
 
         if let Some(usage) = notification.usage {

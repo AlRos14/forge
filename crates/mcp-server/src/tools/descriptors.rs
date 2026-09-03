@@ -10,7 +10,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
                 "title": { "type": "string" },
                 "description": { "type": "string" },
                 "parent_task_id": { "type": "string" },
-                "type": { "type": "string", "enum": ["task", "planning_task", "sub_task", "discovery"] },
+                "type": { "type": "string", "enum": ["implementation", "planning", "discovery", "review", "validation"] },
                 "priority": { "type": "integer" }
             }),
             required(scoped_project, &["project_id", "title"], &["title"]),

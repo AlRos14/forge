@@ -15,10 +15,11 @@ pub async fn create_task(
     )?;
     let task_type = request.task_type.map(|t| {
         match t {
-            api_types::TaskType::Task => "task",
-            api_types::TaskType::PlanningTask => "planning_task",
-            api_types::TaskType::SubTask => "sub_task",
+            api_types::TaskType::Implementation => "implementation",
+            api_types::TaskType::Planning => "planning",
             api_types::TaskType::Discovery => "discovery",
+            api_types::TaskType::Review => "review",
+            api_types::TaskType::Validation => "validation",
         }
         .to_owned()
     });
@@ -155,12 +156,11 @@ pub async fn list_tasks(
 
 pub async fn get_task(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
+    let task = require_task_visible(&state, &id, &user).await?;
     let awaiting_human = state.task_service.is_awaiting_human(id.clone()).await?;
-    let task = TaskRepo::get_by_id(&*state.db, &id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", id))?;
     let response = task_response_with_awaiting_human(&state.db, task, awaiting_human).await?;
     Ok(Json(response))
 }

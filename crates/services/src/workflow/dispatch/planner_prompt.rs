@@ -48,8 +48,37 @@ impl PromptBuilder for PlannerPromptBuilder {
             }
         }
 
+        if let Some(plan) = ctx.plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
+            user.push_str("\nCurrent plan to revise:\n");
+            user.push_str(plan);
+            user.push('\n');
+        }
+
+        if let Some(feedback) = latest_plan_rejection_feedback(ctx) {
+            user.push_str("\nUser feedback from the latest rejected plan:\n");
+            user.push_str(feedback);
+            user.push('\n');
+        }
+
+        if !ctx.comments.is_empty() {
+            user.push_str("\nRecent comments:\n");
+            for comment in &ctx.comments {
+                user.push_str("- ");
+                user.push_str(&comment.author_name);
+                user.push_str(": ");
+                user.push_str(&comment.content);
+                user.push('\n');
+            }
+        }
+
         user.push_str("\nPlanning output:\n");
         user.push_str(PLAN_ARTIFACT_AGENT_INSTRUCTION);
+        user.push('\n');
+        user.push_str(r#"
+Required result contract: End with exactly one machine-readable line. Use one of:
+FORGE_RESULT: {"schema_version":1,"kind":"plan_ready"}
+FORGE_RESULT: {"schema_version":1,"kind":"decision_request","authority_scope":"task|project_scope|policy|risk","context":"...","questions":[{"id":"...","question":"..."}]}
+Request a decision instead of guessing whenever missing product, policy, scope, or risk authority could materially change the plan. A Task answer cannot amend a Project Charter or approved execution baseline."#);
         user.push('\n');
 
         AgentPrompt {
@@ -60,4 +89,16 @@ impl PromptBuilder for PlannerPromptBuilder {
             tools: default_tool_names(default_roles::PLANNER),
         }
     }
+}
+
+fn latest_plan_rejection_feedback(ctx: &AgentDispatchContext) -> Option<&str> {
+    ctx.transition_log
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.rejection
+                && entry.from_state == ctx.state_name
+                && entry.to_state == ctx.state_name
+        })
+        .map(|entry| entry.trigger_reason.as_str())
 }

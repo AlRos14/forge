@@ -123,7 +123,10 @@ impl TaskService {
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
         if execution.role == crate::workflow::default_roles::REVIEWER
-            || matches!(task.task_type.as_str(), "planning_task" | "discovery")
+            || matches!(
+                task.task_type.as_str(),
+                "planning" | "discovery" | "review" | "validation"
+            )
         {
             executors::mark_worktree_read_only(&mut agent_config);
         }
@@ -526,6 +529,19 @@ impl TaskService {
         self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)
             .await;
 
+        if let Some(account_usage) = result.account_usage.as_ref() {
+            if let Err(error) = super::persist_account_usage_snapshot(
+                &self.db,
+                current_execution.executor_config_snapshot_json.as_deref(),
+                &updated.id,
+                account_usage,
+            )
+            .await
+            {
+                tracing::warn!(execution_id = %updated.id, %error, "failed to persist account usage snapshot");
+            }
+        }
+
         if let Some(token_usage) = result.usage {
             let model = token_usage
                 .model
@@ -576,6 +592,15 @@ impl TaskService {
             if updated.role == crate::workflow::default_roles::PLANNER
                 && task.status == crate::workflow::default_states::PLANNING
             {
+                let awaiting_reason =
+                    match super::persist_planner_result(&self.db, &task, &updated).await {
+                        Ok(reason) => reason,
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, execution_id = %updated.id, %error,
+                            "planner result protocol failed");
+                            "planner_protocol_error"
+                        }
+                    };
                 if let Err(error) = super::set_planning_awaiting_review_metadata(
                     &self.db,
                     &task,
@@ -590,6 +615,25 @@ impl TaskService {
                         %error,
                         "failed to mark planning awaiting review"
                     );
+                }
+                if awaiting_reason != "plan_review" {
+                    if let Ok(Some(current)) = TaskRepo::get_by_id(&*self.db, &task.id, false).await
+                    {
+                        if let Ok(mut metadata) =
+                            TaskMetadata::parse(current.metadata_json.as_deref())
+                        {
+                            metadata
+                                .extra
+                                .insert("awaiting_human_reason".to_owned(), json!(awaiting_reason));
+                            let _ = TaskRepo::set_metadata_json(
+                                &*self.db,
+                                &task.id,
+                                metadata.to_json(),
+                                &now_rfc3339(),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
         } else if updated.status == ExecutionStatus::Failed && max_turns_exceeded {
@@ -729,7 +773,10 @@ impl TaskService {
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
         if execution.role == crate::workflow::default_roles::REVIEWER
-            || matches!(task.task_type.as_str(), "planning_task" | "discovery")
+            || matches!(
+                task.task_type.as_str(),
+                "planning" | "discovery" | "review" | "validation"
+            )
         {
             executors::mark_worktree_read_only(&mut executor_config);
         }
@@ -759,7 +806,7 @@ fn execution_description(execution: &Execution, task: &Task, agent_config: &Valu
     let is_shell_executor =
         agent_config.get("executor_type").and_then(Value::as_str) == Some("shell");
     if is_shell_executor && execution.role == crate::workflow::default_roles::REVIEWER {
-        r#"echo "===REVIEW: PASS===""#.to_owned()
+        r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#.to_owned()
     } else {
         execution
             .summary

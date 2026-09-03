@@ -17,7 +17,7 @@ pub fn parse_optional_json<T: Default + DeserializeOwned>(bytes: &[u8]) -> Resul
         return Ok(T::default());
     }
 
-    serde_json::from_slice(&trimmed).map_err(|error| {
+    serde_json::from_slice(trimmed).map_err(|error| {
         ApiError::bad_request(format!("Failed to parse the request body as JSON: {error}"))
     })
 }

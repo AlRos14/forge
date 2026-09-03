@@ -101,7 +101,15 @@ export function TaskExecutionObservabilityPanel({
           title={`${formatTokenCount(value.total_input_tokens)} input / ${formatTokenCount(value.total_output_tokens)} output / ${formatTokenCount(value.total_cache_read_tokens)} cache read / ${formatTokenCount(value.total_cache_write_tokens)} cache write`}
           value={formatTokenCount(value.total_tokens, true)}
         />
-        <Metric label="Cost" value={formatCostUsd(value.total_cost_usd)} />
+          <Metric
+            label="Cost"
+            title={
+              value.total_cost_usd == null
+                ? 'USD cost is only reported for on-demand API billing'
+                : undefined
+            }
+            value={formatCostUsd(value.total_cost_usd)}
+          />
       </div>
 
       {active ? (

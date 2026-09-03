@@ -24,7 +24,13 @@ export interface ColumnGroup extends BoardColumn {
   taskCount: number
 }
 
-export const taskTypes: TaskType[] = ['task', 'planning_task', 'discovery', 'sub_task']
+export const taskTypes: TaskType[] = [
+  'implementation',
+  'planning',
+  'discovery',
+  'review',
+  'validation',
+]
 
 export type BoardSearchTypes = string[] | string | undefined
 

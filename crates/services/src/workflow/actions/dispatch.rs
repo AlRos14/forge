@@ -23,6 +23,7 @@ use super::common::{
     follow_up_trigger, get_role_assignment, has_running_execution_for_roles, latest_review,
     review_is_ci_only, task,
 };
+use super::gates::non_review_gate_retry_budget;
 
 pub struct DispatchRoleAgent;
 
@@ -54,6 +55,17 @@ impl HookAction for DispatchRoleAgent {
             return HookResult::Skipped {
                 reason: "task is blocked".to_string(),
             };
+        }
+        match non_review_gate_retry_budget(ctx).await {
+            Ok(Some((max_rejections, count))) if count > i64::from(max_rejections) => {
+                return HookResult::Skipped {
+                    reason: format!(
+                        "retry budget exhausted ({count}/{max_rejections}); task will be blocked before dispatch"
+                    ),
+                };
+            }
+            Ok(_) => {}
+            Err(reason) => return HookResult::Failed { reason },
         }
         // Note: we used to skip dispatch here for parents-with-subtasks because a
         // separate SubtaskOrchestrator drove the agent. After collapsing to the

@@ -52,7 +52,7 @@ impl HookActionHandler for DispatchAgentAction<'_> {
                 context.project.id.clone(),
                 format!("Automation: {}", context.rule_id),
                 Some(automation_task_description(context)),
-                Some(task_type_to_string(api_types::TaskType::Task)),
+                Some(task_type_to_string(api_types::TaskType::Implementation)),
                 None,
                 None,
             )

@@ -8,13 +8,15 @@ use crate::workflow::{
 
 pub struct ReviewerPromptBuilder;
 
-const VERDICT_INSTRUCTION: &str = "End your response with EXACTLY ONE verdict marker in the existing format:\n===REVIEW: PASS===\n===REVIEW: FAIL: <short reason>===";
+const VERDICT_INSTRUCTION: &str = r#"End with exactly one machine-readable line:
+FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass|fail|needs_human","summary":"...","findings":[{"severity":"blocking|non_blocking","evidence":"...","expected":"...","actual":"..."}],"questions":[]}
+Use needs_human only for missing product, policy, scope, or risk authority. Missing or invalid structured output is a protocol failure."#;
 
 const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:
-- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, produce structured findings, and end with one verdict marker.
+- Must remain read-only, inspect the exact diff, approved plan revision, and actual CI evidence, produce structured findings, and end with one FORGE_RESULT line.
 - Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
-- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, multiple verdict markers.";
+- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, multiple result lines.";
 
 const REVIEWER_FINDINGS_CONTRACT: &str = "\
 Reviewer findings: Put structured findings before the verdict. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings.";
@@ -83,9 +85,21 @@ impl PromptBuilder for ReviewerPromptBuilder {
             user.push('\n');
         }
 
+        if let Some(plan) = ctx.plan.as_deref() {
+            user.push_str("\nApproved implementation plan:\n");
+            user.push_str(plan);
+            user.push('\n');
+        }
+
+        if let Some(evidence) = ctx.review_evidence.as_deref() {
+            user.push_str("\nRepository evidence:\n");
+            user.push_str(evidence);
+            user.push('\n');
+        }
+
         if !ci_steps.is_empty() {
-            user.push_str("\nCI steps (already passed):\n");
-            user.push_str("The following automated checks ran and passed before this review was triggered. They confirm the build is green:\n");
+            user.push_str("\nConfigured CI commands:\n");
+            user.push_str("Do not infer success from this list. Verify the actual result evidence below or rerun the checks:\n");
             for step in ci_steps {
                 user.push_str("- ");
                 user.push_str(step);
@@ -107,6 +121,9 @@ impl PromptBuilder for ReviewerPromptBuilder {
                     "- Attempt {}: {}\n",
                     review.attempt_number, status_str
                 ));
+                user.push_str("  Recorded evidence: ");
+                user.push_str(&review.step_results_json);
+                user.push('\n');
             }
         }
 

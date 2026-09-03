@@ -800,3 +800,55 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
         "expected invalid_operation, got {error:?}"
     );
 }
+
+#[tokio::test]
+async fn test_derive_workflow_exception_failed_planner_offers_retry() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        crate::workflow::default_states::PLANNING,
+    )
+    .await;
+    let mut execution = seed_execution(
+        &db,
+        &task.id,
+        None,
+        crate::workflow::default_roles::PLANNER,
+        ExecutionStatus::Failed,
+        Some("planner-session"),
+        "2026-09-02T10:51:18Z",
+    )
+    .await;
+    execution.error = Some(
+        "invalid operation: active WorkspaceLease does not exactly match Task execution authority"
+            .to_owned(),
+    );
+    let remaining_retries = std::collections::HashMap::new();
+
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        None,
+        Some(&execution),
+        &remaining_retries,
+    )
+    .expect("workflow exception derives");
+
+    assert_eq!(exception.exception_type, "planner_failed");
+    assert!(exception.message.contains("WorkspaceLease"));
+    let action_kinds = exception
+        .actions
+        .iter()
+        .map(|action| {
+            serde_json::to_value(action.kind)
+                .expect("kind serializes")
+                .as_str()
+                .expect("kind serializes as string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
+}

@@ -140,6 +140,9 @@ pub struct ExecutionResult {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage: Option<TokenUsage>,
+    /// Latest provider/account quota snapshot emitted without a model turn.
+    /// This is account-scoped telemetry, not Task usage or authority.
+    pub account_usage: Option<serde_json::Value>,
     pub failure_class: Option<ExecutionFailureClass>,
     pub retry_after: Option<std::time::Duration>,
     pub resolved_candidate: Option<ResolvedExecutorCandidate>,

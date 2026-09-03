@@ -91,6 +91,8 @@ impl TaskService {
             api_types::RecoveryAction::RetryHook => {
                 if let Some(ref annotation) = annotation {
                     self.recover_retry_hook(task, annotation, reason).await
+                } else if task.status == crate::workflow::default_states::PLANNING {
+                    self.recover_retry_current_state_hooks(task, reason).await
                 } else {
                     self.recover_retry_review(task, reason).await
                 }
@@ -779,7 +781,10 @@ impl TaskService {
                 .recover_resume_process(updated, Some(reason), None)
                 .await;
         }
-        Ok(updated)
+        // Planning and other non-review gates stay in the gate. Re-enter so
+        // role dispatch can start a revision run against the refreshed budget.
+        self.recover_retry_current_state_hooks(updated, Some(reason))
+            .await
     }
 
     async fn recover_proceed_once(

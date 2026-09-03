@@ -361,7 +361,7 @@ async fn seed_review_task_with_executor(
             assignee_id: None,
             title: "Merge conflict task".to_owned(),
             description: Some("resolve a conflicting change".to_owned()),
-            task_type: "task".to_owned(),
+            task_type: "implementation".to_owned(),
             status: "review".to_owned(),
             is_automation: false,
             priority: 0,

@@ -65,7 +65,7 @@ function task(
     project_id: 'project-1',
     repo_id: 'repo-1',
     title: 'Task',
-    task_type: 'task',
+    task_type: 'implementation',
     status,
     awaiting_human: awaitingHuman,
     priority: 0,

@@ -677,7 +677,7 @@ impl SqliteDb {
                                           AND g.charter_revision_id = p.current_charter_revision_id
                                           AND g.baseline_id IS NULL
                                           AND g.baseline_revision_id IS NULL
-                                          AND t.task_type IN ('planning_task', 'discovery')
+                                          AND t.task_type IN ('planning', 'discovery', 'review', 'validation')
                                           AND g.capability_class IN (
                                               'repository_read', 'read_only',
                                               'discovery_read', 'planning_read'

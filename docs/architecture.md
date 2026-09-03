@@ -247,8 +247,8 @@ records disagree. It blocks only the affected execution or readiness path.
 When Task creation omits an explicit governance envelope, Forge derives one
 from the Project's current Charter. Before baseline activation, ordinary
 implementation Tasks are retained as non-runnable instead of being rejected;
-baseline activation promotes matching Tasks. `planning_task` and `discovery`
-Tasks additionally have an explicit pre-baseline lane: they may be claimed only
+baseline activation promotes matching Tasks. `planning`, `discovery`, `review`,
+and `validation` Tasks additionally have an explicit pre-baseline lane: they may be claimed only
 with the read-only repository capability and low risk, and both service and
 transactional admission enforce that same predicate.
 
@@ -595,6 +595,28 @@ terminated when it observes the terminal lifecycle event.
 
 ## Task state machine
 
+Task hierarchy and purpose are independent. `parent_task_id` alone represents
+hierarchy. The semantic `task_type` values are `implementation`, `planning`,
+`discovery`, `review`, and `validation`. On the built-in workflow,
+implementation retains planning, coding, independent review, merge, and done;
+planning/discovery run a read-only worker followed by human acceptance;
+review/validation use a fresh read-only evaluator followed by human acceptance
+and never enter merge. A custom Project workflow remains authoritative, while
+the semantic type still enforces the read/write capability ceiling.
+
+Plans are append-only `task_plan_revision` records. Forge captures
+`planner_ready` and `final` snapshots; the final capture occurs synchronously
+before Workspace cleanup. The checklist is a projection of canonical Markdown,
+not a second authority. Task Overview renders the full canonical Markdown plan;
+checklist projections remain operational signals for execution progress and
+workflow gates. A planning-gate rejection keeps the user's reason in the
+transition log, and the next eligible planner prompt receives that feedback,
+the latest canonical plan, and Task comments as revision context. Reviewer runs
+bind immutable evidence to the plan digest,
+base/head SHA, full diff, CI result records, reviewer execution, and
+fresh-session provenance. Structured `needs_human` results pause rather than
+consuming coder retry budget.
+
 ```
 todo ──────────────► in_progress ──────► review ──────► merging ──────► done
  │                      │                  │              │
@@ -787,9 +809,15 @@ during validation. `DefaultWorkflow` is unchanged and uses declared `planner`,
 
 Audit-log derived. Gate states may set `gate_config.max_rejections`;
 `check_retry_budget` counts `transition_log` rows with `from_state = gate` and
-`rejection = true`, then cascades to `blocked` when exhausted. Generic
+`rejection = true`. Non-review gates allow that many rejected revisions and
+cascade to `blocked` when a later rejection exceeds the configured limit;
+review gates retain their dedicated attempt-budget semantics. Generic
 user-triggered gate-to-active bounces are logged with `rejection = false` and
-do not consume budget.
+do not consume budget. Role dispatch consults the same persisted count before
+creating an execution or WorkspaceLease, so an exhausted gate is blocked by
+the authoritative hook without launching a doomed attempt. Reset Retry Window
+on a non-review gate re-enters that gate so dispatch can start a fresh
+revision run; it does not leave the Task idle in the same state.
 
 ### Crash recovery
 

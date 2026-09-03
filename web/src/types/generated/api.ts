@@ -6,7 +6,7 @@ import type { ProjectHookRule } from './bindings/ProjectHookRule'
 
 export type TaskStatus = string
 
-export type TaskType = 'task' | 'planning_task' | 'sub_task' | 'discovery'
+export type TaskType = 'implementation' | 'planning' | 'discovery' | 'review' | 'validation'
 
 export type ExecutionRole = string
 export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'cancelled'
@@ -603,6 +603,7 @@ export interface Execution {
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
   usage?: ExecutionUsage[] | null
+  account_usage?: Record<string, unknown> | null
   created_at: string
   updated_at: string
 }
@@ -1625,10 +1626,38 @@ export interface PlanProgressSummary {
 }
 
 export interface PlanArtifactDetail {
+  revision_id: string | null
+  revision: number | null
+  checkpoint: string | null
+  content_digest: string | null
+  markdown: string
   items: PlanChecklistItem[]
   warnings: string[]
-  source_path: string | null
   last_modified: string | null
+}
+
+export interface AgentUsageResponse {
+  available: boolean
+  executor_type: string
+  account_key: string
+  shared_account: boolean
+  source: string | null
+  usage: Record<string, unknown> | null
+  captured_at: string | null
+  stale: boolean
+  message: string | null
+}
+
+export interface TaskDecisionRequestResponse {
+  id: string
+  task_id: string
+  execution_id: string
+  role: string
+  authority_scope: 'task' | 'project_scope' | 'policy' | 'risk'
+  questions: Array<Record<string, unknown>>
+  context: string | null
+  status: 'pending' | 'answered' | 'cancelled'
+  created_at: string
 }
 
 export interface PlanChecklistItem {

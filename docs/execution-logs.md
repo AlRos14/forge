@@ -38,6 +38,21 @@ Adapters differ in where user-visible chat messages come from.
 | Cursor      | Cursor Agent stream JSON normalized into Forge JSONL.         | Cursor emits a native `user` event in print mode; the UI renders `execution.prompt` first and skips matching native prompt events to avoid duplicates.                                           |
 | Shell       | Process stdout/stderr written into Forge JSONL.               | Shell has no structured agent conversation; stdout/stderr render as shell output.                                                                                                                |
 
+Codex may emit events for root and child-agent threads over the same app-server
+connection. Forge preserves all of those events in JSONL, but only the exact
+root thread and turn returned by `turn/start` can set the execution summary,
+failure, token usage, or terminal completion. A child-agent `turn/completed`
+event therefore cannot finish the parent execution before it synthesizes its
+result.
+
+Run observability counts Codex `turn/started` / `turn/completed` ids (and Cursor
+`result` events) as harness turns. It does not count loaded `assistant` JSONL
+rows, because a long run's log tail is mostly tool output and Codex stores
+protocol turns as `session_info`. Quota meters come from the execution's
+account-usage snapshot when present; otherwise from Codex `account/rateLimits/updated`
+events in the loaded logs or the agent's latest Cursor/Codex snapshot.
+Cost is shown only when `execution_usage.cost_usd` was actually reported.
+
 ## Resume Identifiers
 
 `execution.agent_session_id` stores the adapter session/thread id used for
@@ -103,6 +118,13 @@ Use this checklist when revisiting prompt/resume behavior:
   key off the Forge `kind` first.
 - Native user-message events are supplemental. The chat mapper should deduplicate
   events whose text matches `execution.prompt`.
+- Assistant Markdown links to a captured
+  `<workspace-root>/worktrees/<task-id>/plan.md` resolve to the authorized Task
+  overview's full canonical Markdown plan instead of requesting the daemon's
+  local filesystem path from the web server.
+- Plan capture accepts only a regular file whose canonical path remains inside
+  the Task artifact directory. Symbolic links are rejected; Unix opens also use
+  `O_NOFOLLOW` so a final-component symlink swap fails closed.
 - Older executions may have logs under temporary paths or task workspace
   metadata directories. New execution logs are stored under the durable
   workspace log root at `.forge/logs/<project_id>/<task_id>/`.

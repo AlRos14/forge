@@ -482,6 +482,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             summary: None,
             after_sha: None,
             usage: None,
+            account_usage: None,
             failure_class: Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable),
             retry_at: Some(retry_at),
             resolved_candidate: None,

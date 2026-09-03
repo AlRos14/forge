@@ -155,6 +155,9 @@ pub struct ExecutionTerminalNotification {
     pub after_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RemoteTokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
+    pub account_usage: Option<serde_json::Value>,
     /// Structured failure disposition. Absent on older daemons — the server
     /// then falls back to generic executor-failed handling.
     #[serde(default, skip_serializing_if = "Option::is_none")]

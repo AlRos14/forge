@@ -18,7 +18,6 @@ use uuid::Uuid;
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_DIFF_BYTES: usize = 64 * 1024;
 const STDERR_TAIL_BYTES: usize = 4096;
-const RESUME_THREAD_ID_CONFIG_KEY: &str = "resume_thread_id";
 
 pub struct ReviewRunner {
     db: Arc<SqliteDb>,
@@ -398,13 +397,9 @@ impl ReviewRunner {
         let auditor_execution_id = new_uuid_v4();
         let auditor_before_sha = git::get_current_sha(&req.workspace_path).await?;
         let auditor_logs_path = auditor_logs_path(&req.logs_path, &auditor_execution_id);
-        let executor_type = executor_type_for_execution(&self.db, executor_execution).await?;
-        let extra_config = auditor_resume_thread_extra_config(
-            executor_execution,
-            executor_type.as_deref(),
-            &auditor_agent,
-        );
-        let snapshot = build_auditor_config_snapshot(&auditor_agent, extra_config).await?;
+        // An auditor is independent by session boundary, even when the same
+        // agent identity or harness produced the implementation.
+        let snapshot = build_auditor_config_snapshot(&auditor_agent, None).await?;
         let now = now_rfc3339();
         let auditor_execution = ExecutionRepo::create(
             &*self.db,
@@ -541,6 +536,13 @@ impl ReviewRunner {
                 details: AuditorDetails::passed(),
             },
             AuditorVerdict::Failed { reason } => AuditorRunResult::failed(reason),
+            AuditorVerdict::NeedsHuman { reason } => AuditorRunResult {
+                status: ReviewStatus::AwaitingHuman,
+                outcome: ReviewOutcome::AuditorFailed {
+                    reason: reason.clone(),
+                },
+                details: AuditorDetails::failed(reason),
+            },
         }))
     }
 
@@ -730,42 +732,6 @@ async fn build_auditor_config_snapshot(
         "snapshotted_at": now_rfc3339(),
     }))
     .map_err(Into::into)
-}
-
-fn auditor_resume_thread_extra_config(
-    executor_execution: &Execution,
-    executor_type: Option<&str>,
-    auditor_agent: &Agent,
-) -> Option<Value> {
-    let thread_id = executor_execution.agent_session_id.as_deref()?;
-    if executor_type == Some("codex") && auditor_agent.executor_type == "codex" {
-        Some(json!({ RESUME_THREAD_ID_CONFIG_KEY: thread_id }))
-    } else {
-        None
-    }
-}
-
-async fn executor_type_for_execution(
-    db: &SqliteDb,
-    executor_execution: &Execution,
-) -> Result<Option<String>, ReviewError> {
-    if let Some(snapshot) = executor_execution
-        .executor_config_snapshot_json
-        .as_deref()
-        .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
-    {
-        if let Some(executor_type) = snapshot.get("executor_type").and_then(Value::as_str) {
-            return Ok(Some(executor_type.to_owned()));
-        }
-    }
-
-    let Some(agent_id) = executor_execution.agent_id.as_deref() else {
-        return Ok(None);
-    };
-    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
-        return Ok(None);
-    };
-    Ok(Some(agent.executor_type))
 }
 
 fn apply_agent_fields_to_config(agent: &Agent, config: &mut Value) -> Result<(), ReviewError> {

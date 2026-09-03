@@ -100,6 +100,40 @@ pub fn extract_thread_id(value: &Value) -> Option<String> {
     }
 }
 
+pub fn extract_turn_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in ["turn_id", "turnId"] {
+                if let Some(id) = map.get(key).and_then(Value::as_str) {
+                    return Some(id.to_owned());
+                }
+            }
+            if let Some(id) = map
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+            {
+                return Some(id.to_owned());
+            }
+            map.values().find_map(extract_turn_id)
+        }
+        Value::Array(items) => items.iter().find_map(extract_turn_id),
+        _ => None,
+    }
+}
+
+pub fn is_expected_turn_completed(
+    value: &Value,
+    expected_thread_id: &str,
+    expected_turn_id: Option<&str>,
+) -> bool {
+    is_turn_completed(value)
+        && extract_thread_id(value).as_deref() == Some(expected_thread_id)
+        && expected_turn_id
+            .map(|expected| extract_turn_id(value).as_deref() == Some(expected))
+            .unwrap_or(true)
+}
+
 pub fn is_turn_completed(value: &Value) -> bool {
     event_name(value)
         .map(|name| {
@@ -331,5 +365,37 @@ mod tests {
         assert_eq!(normalized[3].payload["itemId"], "item-1");
         assert_eq!(normalized[3].payload["threadId"], "thread-1");
         assert_eq!(normalized[3].payload["turnId"], "turn-1");
+    }
+
+    #[test]
+    fn only_the_expected_root_turn_is_completed() {
+        let child = json!({
+            "method": "turn/completed",
+            "params": {"threadId": "child-thread", "turn": {"id": "child-turn"}}
+        });
+        let stale_root = json!({
+            "method": "turn/completed",
+            "params": {"threadId": "root-thread", "turn": {"id": "old-turn"}}
+        });
+        let root = json!({
+            "method": "turn/completed",
+            "params": {"threadId": "root-thread", "turn": {"id": "root-turn"}}
+        });
+
+        assert!(!is_expected_turn_completed(
+            &child,
+            "root-thread",
+            Some("root-turn")
+        ));
+        assert!(!is_expected_turn_completed(
+            &stale_root,
+            "root-thread",
+            Some("root-turn")
+        ));
+        assert!(is_expected_turn_completed(
+            &root,
+            "root-thread",
+            Some("root-turn")
+        ));
     }
 }

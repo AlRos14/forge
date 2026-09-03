@@ -77,6 +77,24 @@ impl HookAction for AutoCascadeOnUnassignedRole {
 
 pub struct CheckRetryBudget;
 
+pub(super) async fn non_review_gate_retry_budget(
+    ctx: &HookContext,
+) -> Result<Option<(i32, i64)>, String> {
+    if ctx.to_state == default_states::REVIEW {
+        return Ok(None);
+    }
+    let Some(gate_config) = &ctx.gate_config else {
+        return Ok(None);
+    };
+    let Some(max_rejections) = gate_config.max_rejections else {
+        return Ok(None);
+    };
+    let count = TransitionLogRepo::count_gate_rejections(&*ctx.db, &ctx.task_id, &ctx.to_state)
+        .await
+        .map_err(|error| format!("retry budget unavailable: {error}"))?;
+    Ok(Some((max_rejections, count)))
+}
+
 #[async_trait]
 impl HookAction for CheckRetryBudget {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
@@ -109,30 +127,19 @@ impl HookAction for CheckRetryBudget {
             let count = review_rejections_since_boundary(&entries);
             (budget, count)
         } else {
-            let Some(gate_config) = &ctx.gate_config else {
-                return HookResult::Ok;
-            };
-            let Some(max_rejections) = gate_config.max_rejections else {
-                return HookResult::Ok;
-            };
-            let count = match TransitionLogRepo::count_gate_rejections(
-                &*ctx.db,
-                &ctx.task_id,
-                &ctx.to_state,
-            )
-            .await
-            {
-                Ok(count) => count,
-                Err(error) => {
-                    return HookResult::Skipped {
-                        reason: format!("retry budget unavailable: {error}"),
-                    };
-                }
-            };
-            (max_rejections, count)
+            match non_review_gate_retry_budget(ctx).await {
+                Ok(Some(budget)) => budget,
+                Ok(None) => return HookResult::Ok,
+                Err(reason) => return HookResult::Skipped { reason },
+            }
         };
 
-        if count >= i64::from(max_rejections) {
+        let exhausted = if ctx.to_state == default_states::REVIEW {
+            count >= i64::from(max_rejections)
+        } else {
+            count > i64::from(max_rejections)
+        };
+        if exhausted {
             if ctx.to_state == default_states::REVIEW {
                 tracing::debug!(
                     task_id = %ctx.task_id,

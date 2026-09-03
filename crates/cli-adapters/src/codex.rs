@@ -219,6 +219,37 @@ impl CodexAdapter {
     }
 }
 
+/// Read the current Codex account rate-limit snapshot without starting a model turn.
+pub async fn query_account_usage(config: &CodexConfig) -> Result<Value, ExecutorError> {
+    let mut command = CodexAdapter::build_command(config);
+    command.stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Codex usage probe has no stdin".to_owned()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Codex usage probe has no stdout".to_owned()))?;
+    let cancel = CancellationToken::new();
+    let client = CodexClient::spawn(stdin, stdout, ".", cancel.clone());
+
+    let result = async {
+        client.initialize().await?;
+        client.initialized().await?;
+        tokio::time::timeout(Duration::from_secs(20), client.account_rate_limits())
+            .await
+            .map_err(|_| ExecutorError::Other("Codex account usage probe timed out".to_owned()))?
+    }
+    .await;
+
+    cancel.cancel();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    result
+}
+
 impl Default for CodexAdapter {
     fn default() -> Self {
         Self::new()
@@ -518,11 +549,18 @@ impl CodexAdapter {
         .await?;
 
         let run = client
-            .run_until_turn_complete(writer.clone(), stderr_rx, ctx.heartbeat_interval_seconds)
+            .run_until_turn_complete(
+                &thread_id,
+                turn_id.as_deref(),
+                writer.clone(),
+                stderr_rx,
+                ctx.heartbeat_interval_seconds,
+            )
             .await?;
         let mut outcome = run.outcome.unwrap_or(ExecutionOutcome::Failed);
         let mut summary = run.summary;
         let mut usage = run.usage;
+        let mut account_usage = run.account_usage;
 
         if outcome == ExecutionOutcome::Cancelled {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
@@ -542,10 +580,12 @@ impl CodexAdapter {
                 "You have uncommitted changes in the worktree. \
                  Please stage and commit them with a descriptive message before stopping.\n{status_lines}"
             );
-            if let Ok(_handle) = client.turn_start(thread_id.clone(), reminder).await {
+            if let Ok(handle) = client.turn_start(thread_id.clone(), reminder).await {
                 let (_, empty_rx) = mpsc::channel(1);
                 if let Ok(followup) = client
                     .run_until_turn_complete(
+                        &thread_id,
+                        handle.turn_id.as_deref(),
                         writer.clone(),
                         empty_rx,
                         ctx.heartbeat_interval_seconds,
@@ -557,6 +597,9 @@ impl CodexAdapter {
                         summary = Some(s);
                     }
                     usage = merge_usage(usage, followup.usage);
+                    if followup.account_usage.is_some() {
+                        account_usage = followup.account_usage;
+                    }
                 }
             }
         }
@@ -577,6 +620,7 @@ impl CodexAdapter {
                 summary,
                 error,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
+                account_usage,
                 ..Default::default()
             });
         }
@@ -592,6 +636,7 @@ impl CodexAdapter {
                 summary,
                 error: None,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
+                account_usage,
                 ..Default::default()
             });
         }
@@ -612,6 +657,7 @@ impl CodexAdapter {
                         summary,
                         error: Some(error.to_string()),
                         usage: usage.map(|usage| usage_with_model(usage, &config)),
+                        account_usage,
                         ..Default::default()
                     });
                 }
@@ -624,6 +670,7 @@ impl CodexAdapter {
             summary,
             error: None,
             usage: usage.map(|usage| usage_with_model(usage, &config)),
+            account_usage,
             ..Default::default()
         })
     }
@@ -1382,5 +1429,66 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
         let logs = fs::read_to_string(dir.path().join("codex.jsonl")).expect("logs written");
         assert!(logs.contains("codex_protocol_error"));
         assert!(logs.contains("model rejected"));
+    }
+
+    #[tokio::test]
+    async fn child_agent_completion_does_not_finish_the_root_turn() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let script_path = dir.path().join("fake-codex.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read line || exit 1
+read line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"root-thread"}}}'
+read line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"root-turn"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"agentMessage","text":"Child review complete"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":false,"error":{"message":"child failed"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"agentMessage","text":"Root plan ready\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"plan_ready\"}"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn"}}}'
+"#,
+        )
+        .expect("script writes");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).unwrap();
+        }
+
+        let result = CodexAdapter::new()
+            .execute(ExecutionContext {
+                task_id: "task-1".to_owned(),
+                execution_id: "exec-1".to_owned(),
+                worktree_path: dir.path().display().to_string(),
+                description: "Plan the task".to_owned(),
+                agent_config: json!({
+                    "base_command_override": script_path.display().to_string(),
+                    "auto_commit": false
+                }),
+                logs_path: dir.path().join("codex.jsonl").display().to_string(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await
+            .expect("adapter returns execution result");
+
+        assert_eq!(result.status, ExecutionOutcome::Completed);
+        assert_eq!(result.agent_session_id.as_deref(), Some("root-thread"));
+        assert_eq!(
+            result.summary.as_deref(),
+            Some("Root plan ready\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"plan_ready\"}")
+        );
+        assert_eq!(result.error, None);
+
+        let logs = fs::read_to_string(dir.path().join("codex.jsonl")).expect("logs written");
+        assert!(logs.contains("Child review complete"));
+        assert!(logs.contains("Root plan ready"));
+        assert!(!logs.contains("codex_protocol_error"));
     }
 }
