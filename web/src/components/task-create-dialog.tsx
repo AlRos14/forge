@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { useCreateTask } from '@/api/hooks'
+import { PlanReviewCheckbox, taskStateConfigWithPlanReview } from '@/components/plan-review-checkbox'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -39,12 +40,14 @@ export function TaskCreateDialog({
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [taskType, setTaskType] = useState<TaskType>('implementation')
+  const [planReview, setPlanReview] = useState(false)
   const createTask = useCreateTask(projectId)
 
   const reset = () => {
     setTitle('')
     setDescription('')
     setTaskType('implementation')
+    setPlanReview(false)
   }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -57,6 +60,7 @@ export function TaskCreateDialog({
         title: trimmedTitle,
         description: description.trim() || undefined,
         task_type: taskType,
+        task_state_config: taskStateConfigWithPlanReview(planReview),
       },
       {
         onError: (error) => toastApiError(error, 'Task creation failed'),
@@ -108,6 +112,11 @@ export function TaskCreateDialog({
               onChange={setDescription}
             />
           </div>
+          <PlanReviewCheckbox
+            checked={planReview}
+            disabled={createTask.isPending}
+            onChange={setPlanReview}
+          />
           <DialogFooter>
             <Button
               disabled={createTask.isPending}

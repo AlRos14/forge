@@ -126,6 +126,7 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
                 review_config: None,
                 merge_config: None,
                 role_assignments: None,
+                task_state_config: None,
                 governance: None,
             },
         )

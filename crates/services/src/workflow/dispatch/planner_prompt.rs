@@ -49,13 +49,18 @@ impl PromptBuilder for PlannerPromptBuilder {
         }
 
         if let Some(plan) = ctx.plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
+            user.push_str(
+                "\nThis is a planning revision. Address the latest plan-review or human feedback. Produce the next plan revision. Do not implement.\n",
+            );
             user.push_str("\nCurrent plan to revise:\n");
             user.push_str(plan);
             user.push('\n');
         }
 
-        if let Some(feedback) = latest_plan_rejection_feedback(ctx) {
-            user.push_str("\nUser feedback from the latest rejected plan:\n");
+        if let Some((heading, feedback)) = latest_plan_rejection_feedback(ctx) {
+            user.push_str("\n");
+            user.push_str(heading);
+            user.push('\n');
             user.push_str(feedback);
             user.push('\n');
         }
@@ -91,14 +96,25 @@ Request a decision instead of guessing whenever missing product, policy, scope, 
     }
 }
 
-fn latest_plan_rejection_feedback(ctx: &AgentDispatchContext) -> Option<&str> {
-    ctx.transition_log
-        .iter()
-        .rev()
-        .find(|entry| {
-            entry.rejection
-                && entry.from_state == ctx.state_name
-                && entry.to_state == ctx.state_name
-        })
-        .map(|entry| entry.trigger_reason.as_str())
+fn latest_plan_rejection_feedback(ctx: &AgentDispatchContext) -> Option<(&'static str, &str)> {
+    ctx.transition_log.iter().rev().find_map(|entry| {
+        if !entry.rejection {
+            return None;
+        }
+        if entry.from_state == crate::workflow::default_states::PLAN_REVIEW
+            && entry.to_state == crate::workflow::default_states::PLANNING
+        {
+            return Some((
+                "Plan-review findings from the last reviewer pass (revise the plan, then a new review session will run):",
+                entry.trigger_reason.as_str(),
+            ));
+        }
+        if entry.from_state == ctx.state_name && entry.to_state == ctx.state_name {
+            return Some((
+                "User feedback from the latest rejected plan:",
+                entry.trigger_reason.as_str(),
+            ));
+        }
+        None
+    })
 }

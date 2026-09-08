@@ -1,6 +1,74 @@
 use super::super::*;
 
 #[tokio::test]
+async fn re_execute_after_coder_reassignment_uses_new_principal() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial role assignment succeeds");
+    let now = now_rfc3339();
+    let parent_execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_a),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: Some("exhausted-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("quota exhausted".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("usage exhausted".to_owned()),
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("failed parent execution creates");
+    service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(agent_b.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("role reassignment succeeds");
+
+    let result = service
+        .re_execute_execution(parent_execution.id)
+        .await
+        .expect("re-execute after reassignment succeeds");
+
+    assert_eq!(result.execution.agent_id.as_deref(), Some(agent_b.as_str()));
+    assert_eq!(result.execution.role, "coder");
+    assert_eq!(result.execution.status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
 async fn reassign_role_updates_assignment_and_emits_event() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

@@ -88,7 +88,8 @@ export function useAgentUsageQuery(identityId: string | undefined) {
     queryKey: federationQueryKeys.usage(identityId ?? 'none'),
     queryFn: () => getAgentUsage(identityId!),
     enabled: Boolean(identityId),
-    staleTime: 60_000,
+    staleTime: 10_000,
+    refetchInterval: 15_000,
   })
 }
 

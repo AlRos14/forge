@@ -966,26 +966,33 @@ impl TaskService {
         }
         let user_approval_required = self.gate_requires_user_approval(&task).await?;
         let final_message = reviewer_final_message(execution).await?;
-        let stale_evidence = match sqlx::query_as::<_, (String, String)>(
-            "SELECT head_sha, diff_digest FROM review_evidence_bundle WHERE review_id = ?",
-        )
-        .bind(&review.id)
-        .fetch_optional(self.db.pool())
-        .await?
-        {
-            Some((bound_head, bound_diff_digest)) => crate::DiffService::new(Arc::clone(&self.db))
-                .task_diff(&task.id)
-                .await
-                .map(|diff| {
-                    review_evidence_is_stale(
-                        &bound_head,
-                        &bound_diff_digest,
-                        &diff.head_sha,
-                        &diff.diff,
-                    )
-                })
-                .unwrap_or(true),
-            None => true,
+        let plan_review = task.status == crate::workflow::default_states::PLAN_REVIEW;
+        let stale_evidence = if plan_review {
+            false
+        } else {
+            match sqlx::query_as::<_, (String, String)>(
+                "SELECT head_sha, diff_digest FROM review_evidence_bundle WHERE review_id = ?",
+            )
+            .bind(&review.id)
+            .fetch_optional(self.db.pool())
+            .await?
+            {
+                Some((bound_head, bound_diff_digest)) => {
+                    crate::DiffService::new(Arc::clone(&self.db))
+                        .task_diff(&task.id)
+                        .await
+                        .map(|diff| {
+                            review_evidence_is_stale(
+                                &bound_head,
+                                &bound_diff_digest,
+                                &diff.head_sha,
+                                &diff.diff,
+                            )
+                        })
+                        .unwrap_or(true)
+                }
+                None => true,
+            }
         };
         let (status, auditor_details) = if stale_evidence {
             (
@@ -997,7 +1004,9 @@ impl TaskService {
             )
         } else {
             match ::review::auditor::parse_verdict(&final_message) {
-                ::review::auditor::AuditorVerdict::Passed if user_approval_required => {
+                ::review::auditor::AuditorVerdict::Passed
+                    if user_approval_required || plan_review =>
+                {
                     (ReviewStatus::AwaitingHuman, json!({ "verdict": "pass" }))
                 }
                 ::review::auditor::AuditorVerdict::Passed => {
@@ -1056,7 +1065,7 @@ impl TaskService {
 
         match status {
             ReviewStatus::Passed => {
-                let task = if task.review_passed_at.is_some() {
+                let task = if plan_review || task.review_passed_at.is_some() {
                     task
                 } else {
                     TaskRepo::set_review_passed_at(
@@ -1081,8 +1090,16 @@ impl TaskService {
                     .await?;
                 self.cascade_completed_review_task(
                     &task,
-                    crate::workflow::default_states::MERGING,
-                    "review passed",
+                    if plan_review {
+                        crate::workflow::default_states::IN_PROGRESS
+                    } else {
+                        crate::workflow::default_states::MERGING
+                    },
+                    if plan_review {
+                        "plan review passed"
+                    } else {
+                        "review passed"
+                    },
                     false,
                 )
                 .await?;
@@ -1090,6 +1107,23 @@ impl TaskService {
             ReviewStatus::AwaitingHuman => {
                 self.publish_reviewer_comment(execution, &task.id, comment)
                     .await?;
+                if plan_review {
+                    if let Err(error) = super::set_planning_awaiting_review_metadata(
+                        &self.db,
+                        &task,
+                        Some(&execution.id),
+                        true,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            execution_id = %execution.id,
+                            %error,
+                            "failed to mark plan review awaiting human"
+                        );
+                    }
+                }
                 self.publish(ForgeEvent {
                     event_type: "task.awaiting_human".to_owned(),
                     entity_id: task.id.clone(),
@@ -1098,7 +1132,11 @@ impl TaskService {
                         task_id: task.id.clone(),
                         role: crate::workflow::default_roles::REVIEWER.to_owned(),
                         assignee_id: "human".to_owned(),
-                        state: crate::workflow::default_states::REVIEW.to_owned(),
+                        state: if plan_review {
+                            crate::workflow::default_states::PLAN_REVIEW.to_owned()
+                        } else {
+                            crate::workflow::default_states::REVIEW.to_owned()
+                        },
                     },
                 });
             }
@@ -1287,6 +1325,13 @@ impl TaskService {
         task: &Task,
         execution_id: Option<&str>,
     ) -> Result<(Task, Option<String>, String)> {
+        if task.status == crate::workflow::default_states::PLAN_REVIEW {
+            return Ok((
+                task.clone(),
+                Some(crate::workflow::default_states::PLANNING.to_string()),
+                "plan review failed".to_string(),
+            ));
+        }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1307,6 +1352,13 @@ impl TaskService {
         )?;
         let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
         let existing_count = review_rejections_since_boundary(&entries);
+        if task.status == crate::workflow::default_states::PLAN_REVIEW {
+            return Ok((
+                task.clone(),
+                Some(crate::workflow::default_states::PLANNING.to_string()),
+                "plan review failed".to_string(),
+            ));
+        }
         if existing_count + 1 >= i64::from(budget) {
             let reason = "review retry budget exhausted";
             if let Some((task, recovery_reason)) = self

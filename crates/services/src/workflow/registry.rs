@@ -2,12 +2,13 @@ use crate::{
     workflow::{
         actions::{
             AutoCascadeOnCompletion, AutoCascadeOnMergeResult, AutoCascadeOnReviewPass,
-            AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
-            CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
-            DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
-            PropagateDoneToSubtasks, RequireCleanWorktree, RequirePlanChecklistComplete,
-            RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
-            SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
+            AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview,
+            AutoCascadeUnlessPlanReview, CancelPendingSubtasks, CheckMergeFixBudget,
+            CheckRetryBudget, CleanupWorkspaceNow, DependencyGate, DispatchExecutor,
+            DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder, PropagateDoneToSubtasks,
+            RequireCleanWorktree, RequirePlanChecklistComplete, RequireUpstreamRolesCompleted,
+            RunBeforeWorkHooks, RunCiSteps, RunMerge, SatisfyDependents, ScheduleWorkspaceCleanup,
+            SubtaskSequenceComplete,
         },
         HookAction,
     },
@@ -29,6 +30,7 @@ pub fn is_known_action(name: &str) -> bool {
             | "auto_cascade_on_merge_result"
             | "auto_cascade_on_completion"
             | "auto_cascade_on_unassigned_role"
+            | "auto_cascade_unless_plan_review"
             | "check_merge_fix_budget"
             | "check_retry_budget"
             | "require_clean_worktree"
@@ -58,6 +60,7 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "auto_cascade_on_merge_result" => Box::new(AutoCascadeOnMergeResult),
         "auto_cascade_on_completion" => Box::new(AutoCascadeOnCompletion),
         "auto_cascade_on_unassigned_role" => Box::new(AutoCascadeOnUnassignedRole),
+        "auto_cascade_unless_plan_review" => Box::new(AutoCascadeUnlessPlanReview),
         "check_merge_fix_budget" => Box::new(CheckMergeFixBudget),
         "check_retry_budget" => Box::new(CheckRetryBudget),
         "require_clean_worktree" => Box::new(RequireCleanWorktree),

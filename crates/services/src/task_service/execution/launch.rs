@@ -27,10 +27,14 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let agent_id = self
+            .resolve_role_agent_id(&task.id, role, Some(agent_id.to_owned()))
+            .await?
+            .unwrap_or_else(|| agent_id.to_owned());
         self.ensure_task_runnable(&task).await?;
         self.ensure_no_running_repository_execution(&task).await?;
-        self.check_dependency_gate(&task, agent_id).await?;
-        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+        self.check_dependency_gate(&task, &agent_id).await?;
+        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
         let (workspace, workspace_created_by_attempt) =
@@ -286,13 +290,50 @@ impl TaskService {
             _ => task,
         };
 
-        let resolved_agent_id = agent_id
-            .or_else(|| parent_execution.agent_id.clone())
+        let assignment_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role)
+            .unwrap_or(parent_execution.role.as_str());
+        let resolved_agent_id = self
+            .resolve_role_agent_id(
+                &task.id,
+                assignment_role,
+                agent_id.or_else(|| parent_execution.agent_id.clone()),
+            )
+            .await?
             .ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "follow-up requires agent_id either in request or parent execution",
                 )
             })?;
+        if parent_execution.agent_id.as_deref() != Some(resolved_agent_id.as_str()) {
+            let execution = self
+                .dispatch_initial_role_execution(
+                    &task.id,
+                    &resolved_agent_id,
+                    assignment_role,
+                    message,
+                )
+                .await?;
+            let workspace_id = execution.workspace_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "fresh follow-up after role reassignment missing workspace",
+                )
+            })?;
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
+            let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            return Ok(LaunchExecutionResult {
+                task,
+                execution,
+                workspace,
+            });
+        }
         let agent = AgentRepo::get_by_id(&*self.db, &resolved_agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", resolved_agent_id.clone()))?;
@@ -500,16 +541,6 @@ impl TaskService {
             )));
         }
 
-        let agent_id = parent_execution.agent_id.clone().ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "parent execution {} missing agent_id",
-                parent_execution.id
-            ))
-        })?;
-        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -559,6 +590,25 @@ impl TaskService {
             _ => task,
         };
         self.ensure_task_runnable(&task).await?;
+
+        let assignment_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role)
+            .unwrap_or(parent_execution.role.as_str());
+        let agent_id = self
+            .resolve_role_agent_id(&task.id, assignment_role, parent_execution.agent_id.clone())
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "parent execution {} missing agent_id",
+                    parent_execution.id
+                ))
+            })?;
+        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
 
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(

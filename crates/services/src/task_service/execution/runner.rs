@@ -272,11 +272,13 @@ impl TaskService {
         let cancellation_executor = self.task_executor.clone();
         let sse_execution_id = execution_id.clone();
         let sse_task_id = task.id.clone();
+        let usage_snapshot_json = execution.executor_config_snapshot_json.clone();
         let log_max_turns = max_turns;
         let log_max_turns_exceeded = Arc::clone(&max_turns_exceeded);
         let log_assistant_turn_count = Arc::clone(&assistant_turn_count);
         tokio::spawn(async move {
             let mut last_db_update: Option<std::time::Instant> = None;
+            let mut last_usage_persist: Option<std::time::Instant> = None;
             let mut assistant_turn_count = 0_u32;
             let mut pending_batch: Vec<executors::LogEntry> = Vec::new();
             let mut flush_deadline: Option<tokio::time::Instant> = None;
@@ -346,6 +348,28 @@ impl TaskService {
                     }
                     last_db_update = Some(std::time::Instant::now());
                 }
+                if let Some(account_usage) = super::account_usage_from_log_entry(&entry) {
+                    let should_persist = last_usage_persist
+                        .map(|instant| instant.elapsed() >= Duration::from_secs(5))
+                        .unwrap_or(true);
+                    if should_persist {
+                        if let Err(error) = super::persist_account_usage_snapshot(
+                            &*activity_db,
+                            usage_snapshot_json.as_deref(),
+                            &sse_execution_id,
+                            &account_usage,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                execution_id = %sse_execution_id,
+                                %error,
+                                "failed to persist live account usage snapshot"
+                            );
+                        }
+                        last_usage_persist = Some(std::time::Instant::now());
+                    }
+                }
                 if entry.kind == executors::LogKind::Assistant {
                     assistant_turn_count = assistant_turn_count.saturating_add(1);
                     log_assistant_turn_count
@@ -391,6 +415,11 @@ impl TaskService {
         } else {
             None
         };
+        let cursor_usage_probe = super::spawn_cursor_usage_probe(
+            Arc::clone(&self.db),
+            execution.executor_config_snapshot_json.clone(),
+            execution_id.clone(),
+        );
         let execution_result = executor
             .execute(ExecutionContext {
                 task_id: task.id.clone(),
@@ -404,6 +433,7 @@ impl TaskService {
                 log_sender: Some(log_tx),
             })
             .await;
+        drop(cursor_usage_probe);
         let restore_result = if let Some(head) = read_only_head.as_deref() {
             git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
                 .await
@@ -601,39 +631,15 @@ impl TaskService {
                             "planner_protocol_error"
                         }
                     };
-                if let Err(error) = super::set_planning_awaiting_review_metadata(
-                    &self.db,
-                    &task,
-                    Some(&updated.id),
-                    true,
-                )
-                .await
+                if let Err(error) =
+                    super::conclude_planner_ready(self, &task, &updated.id, awaiting_reason).await
                 {
                     tracing::warn!(
                         task_id = %task.id,
                         execution_id = %updated.id,
                         %error,
-                        "failed to mark planning awaiting review"
+                        "failed to conclude planner ready"
                     );
-                }
-                if awaiting_reason != "plan_review" {
-                    if let Ok(Some(current)) = TaskRepo::get_by_id(&*self.db, &task.id, false).await
-                    {
-                        if let Ok(mut metadata) =
-                            TaskMetadata::parse(current.metadata_json.as_deref())
-                        {
-                            metadata
-                                .extra
-                                .insert("awaiting_human_reason".to_owned(), json!(awaiting_reason));
-                            let _ = TaskRepo::set_metadata_json(
-                                &*self.db,
-                                &task.id,
-                                metadata.to_json(),
-                                &now_rfc3339(),
-                            )
-                            .await;
-                        }
-                    }
                 }
             }
         } else if updated.status == ExecutionStatus::Failed && max_turns_exceeded {

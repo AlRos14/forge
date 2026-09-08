@@ -110,8 +110,10 @@ impl TaskService {
             task =
                 TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
         }
-        if previous_status == crate::workflow::default_states::PLANNING
-            && (task.status != crate::workflow::default_states::PLANNING || options.rejection)
+        if (previous_status == crate::workflow::default_states::PLANNING
+            && (task.status != crate::workflow::default_states::PLANNING || options.rejection))
+            || (previous_status == crate::workflow::default_states::PLAN_REVIEW
+                && task.status != crate::workflow::default_states::PLAN_REVIEW)
         {
             task = super::execution::set_planning_awaiting_review_metadata(
                 &self.db, &task, None, false,

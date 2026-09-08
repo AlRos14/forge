@@ -147,7 +147,7 @@ async fn transition_from_planning_requires_plan_checklist_but_allows_unchecked_w
     let result = service
         .transition(
             task.id.clone(),
-            crate::workflow::default_states::IN_PROGRESS.to_owned(),
+            crate::workflow::default_states::PLAN_REVIEW.to_owned(),
             task.version,
         )
         .await

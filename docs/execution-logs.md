@@ -50,7 +50,12 @@ Run observability counts Codex `turn/started` / `turn/completed` ids (and Cursor
 rows, because a long run's log tail is mostly tool output and Codex stores
 protocol turns as `session_info`. Quota meters come from the execution's
 account-usage snapshot when present; otherwise from Codex `account/rateLimits/updated`
-events in the loaded logs or the agent's latest Cursor/Codex snapshot.
+events in the loaded logs or the agent's latest Cursor/Codex snapshot. Those
+provider events are also persisted to `account_usage_snapshot` while the run
+is still active so Agent Settings can refresh without waiting for the
+execution to finish. Cursor quota uses the same snapshot table: Forge probes
+the interactive `/usage` panel on a short interval while a Cursor execution
+is running, because that harness does not emit live rate-limit events.
 Cost is shown only when `execution_usage.cost_usd` was actually reported.
 
 ## Resume Identifiers

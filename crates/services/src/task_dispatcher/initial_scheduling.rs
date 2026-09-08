@@ -110,7 +110,7 @@ impl TaskDispatcher {
         task: &Task,
     ) -> Result<Option<InitialScheduleTarget>> {
         let mut cursor_state = task.status.clone();
-        let mut target_kinds = vec![StateKind::Active, StateKind::Gate];
+        let target_kinds = vec![StateKind::Active, StateKind::Gate];
         let mut visited = HashSet::new();
         let mut first_hop: Option<String> = None;
 
@@ -150,12 +150,10 @@ impl TaskDispatcher {
                         && helpers::auto_cascades_on_unassigned_role(target_state) =>
                 {
                     cursor_state = target_state.name.clone();
-                    target_kinds = vec![StateKind::Active];
                 }
                 Some(_) => return Ok(None),
                 None if helpers::auto_cascades_on_unassigned_role(target_state) => {
                     cursor_state = target_state.name.clone();
-                    target_kinds = vec![StateKind::Active];
                 }
                 None => return Ok(None),
             }

@@ -10,6 +10,7 @@ import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { StateBadge, StatusDot } from '@/features/federation/components'
 import { allowedPolicyValues, humanize, runtimeDisplayNames } from './format'
+import { cliCommandFromConfig, envStringFromConfig } from './harness-command'
 
 export function AgentDetailPanel({
   agent,
@@ -36,6 +37,8 @@ export function AgentDetailPanel({
     ? 'recovery_required'
     : (agent.effective_status ?? agent.status)
   const runtime = agent.executor_type === 'embedded' ? 'direct' : agent.executor_type
+  const cliCommand = cliCommandFromConfig(agent.config_json)
+  const codexHome = envStringFromConfig(agent.config_json, 'CODEX_HOME')
 
   const boundChips = chatEntries
     .filter((entry) => entry.identity_id === agent.id)
@@ -70,6 +73,8 @@ export function AgentDetailPanel({
           <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
             {runtimeDisplayNames[runtime] ?? humanize(runtime)}
             {selectedEntry ? ` · ${selectedEntry.label}` : ''}
+            {codexHome ? ` · ${codexHome}` : ''}
+            {cliCommand ? ` · ${cliCommand}` : ''}
           </p>
           {boundChips.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">

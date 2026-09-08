@@ -182,6 +182,15 @@ account-specific models. Gemini advertises the CLI's stable `auto`, `pro`,
 models. Cursor and OpenCode keep the custom-model field open because their
 catalogs are provider- or installation-defined.
 
+Harness create/edit in Agent Settings accept an optional **Codex home**
+(`CODEX_HOME`) and **CLI command** (`config_json.base_command_override`). Use
+Codex home for a second Codex login (the directory that contains that
+account's `auth.json`, often `~/.codex2`). Refresh quota probes that home.
+A bash alias such as `codex2='CODEX_HOME=$HOME/.codex-plus2 codex'` is resolved
+through interactive bash, then Forge runs the real `codex` binary with that
+`CODEX_HOME`. You can still set Codex home explicitly if you prefer not to use
+an alias.
+
 The `shell` executor is always available and useful for scripted tests — see the
 walkthrough below.
 

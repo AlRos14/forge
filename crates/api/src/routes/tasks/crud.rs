@@ -10,9 +10,27 @@ pub async fn create_task(
         Some(review_config) => Some(review_config),
         None => project_default_review_config(&state.db, &project_id).await?,
     };
-    let review_config = serialize_json(
-        review_config.map(|review_config| serde_json::json!({ "review": review_config })),
-    )?;
+    let mut state_config = match request.task_state_config {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "task_state_config must be a JSON object".to_owned(),
+            ));
+        }
+        None => serde_json::Map::new(),
+    };
+    if let Some(review_config) = review_config {
+        state_config.insert(
+            "review".to_owned(),
+            serde_json::to_value(review_config)
+                .map_err(|error| ApiError::bad_request(format!("invalid JSON value: {error}")))?,
+        );
+    }
+    let task_state_config = if state_config.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(state_config).to_string())
+    };
     let task_type = request.task_type.map(|t| {
         match t {
             api_types::TaskType::Implementation => "implementation",
@@ -32,7 +50,7 @@ pub async fn create_task(
             request.parent_task_id,
             request.priority,
             task_type,
-            review_config,
+            task_state_config,
             request.merge_config,
             request.role_assignments,
             request.governance,

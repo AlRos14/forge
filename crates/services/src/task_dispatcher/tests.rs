@@ -679,9 +679,17 @@ async fn dispatcher_enters_unassigned_auto_planning_gate_before_coder_dispatch()
     assert!(transitions
         .iter()
         .any(|entry| entry.from_state == "todo" && entry.to_state == "planning"));
-    assert!(transitions
-        .iter()
-        .any(|entry| entry.from_state == "planning" && entry.to_state == "in_progress"));
+    assert!(
+        transitions
+            .iter()
+            .any(|entry| entry.from_state == "planning" && entry.to_state == "in_progress")
+            || (transitions
+                .iter()
+                .any(|entry| entry.from_state == "planning" && entry.to_state == "plan_review")
+                && transitions.iter().any(|entry| {
+                    entry.from_state == "plan_review" && entry.to_state == "in_progress"
+                }))
+    );
 }
 
 #[tokio::test]

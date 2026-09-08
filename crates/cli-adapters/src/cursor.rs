@@ -13,8 +13,10 @@ use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
@@ -50,14 +52,14 @@ impl CursorAdapter {
         }
     }
 
-    async fn cached_account_usage(&self) -> Option<Value> {
+    async fn cached_account_usage(&self, config: &CursorConfig) -> Option<Value> {
         let cached = self.usage_cache.lock().await.clone();
         if let Some((captured, value)) = cached.as_ref()
-            && captured.elapsed() < Duration::from_secs(300)
+            && captured.elapsed() < Duration::from_secs(60)
         {
             return Some(value.clone());
         }
-        match query_cursor_usage().await {
+        match query_account_usage(config).await {
             Ok(value) => {
                 *self.usage_cache.lock().await = Some((std::time::Instant::now(), value.clone()));
                 Some(value)
@@ -70,7 +72,31 @@ impl CursorAdapter {
         serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
     }
 
-    fn build_command(config: &CursorConfig, prompt: &str) -> tokio::process::Command {
+    fn workspace_prompt_relpath(execution_id: &str) -> String {
+        format!(".forge/cursor-prompt-{execution_id}.md")
+    }
+
+    fn write_workspace_prompt(
+        worktree_path: &str,
+        execution_id: &str,
+        prompt: &str,
+    ) -> Result<String, ExecutorError> {
+        let relpath = Self::workspace_prompt_relpath(execution_id);
+        let path = Path::new(worktree_path).join(&relpath);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ExecutorError::Other(format!("failed to create Cursor prompt directory: {error}"))
+            })?;
+        }
+        std::fs::write(&path, prompt).map_err(|error| {
+            ExecutorError::Other(format!("failed to write Cursor prompt file: {error}"))
+        })?;
+        Ok(format!(
+            "Follow the instructions in the file `{relpath}` exactly. Do not commit, edit, or delete that file except to read it."
+        ))
+    }
+
+    fn build_command(config: &CursorConfig) -> tokio::process::Command {
         let mut adapter_args = vec![
             "-p".to_owned(),
             "--output-format".to_owned(),
@@ -96,8 +122,7 @@ impl CursorAdapter {
             .overrides(&config.command_overrides);
 
         let mut cmd = builder.build();
-        cmd.arg(prompt)
-            .kill_on_drop(true)
+        cmd.kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("NO_COLOR", "1");
@@ -162,7 +187,9 @@ impl CodingExecutorAdapter for CursorAdapter {
             ctx.description.clone()
         };
 
-        let mut command = Self::build_command(&config, &prompt);
+        let pointer = Self::write_workspace_prompt(&ctx.worktree_path, &ctx.execution_id, &prompt)?;
+        let mut command = Self::build_command(&config);
+        command.arg(&pointer);
         command.current_dir(&ctx.worktree_path);
         let mut child = command.group_spawn()?;
 
@@ -284,7 +311,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 .ok(),
         };
 
-        let account_usage = self.cached_account_usage().await;
+        let account_usage = self.cached_account_usage(&config).await;
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,
             after_sha,
@@ -316,27 +343,192 @@ impl CodingExecutorAdapter for CursorAdapter {
     }
 }
 
-async fn query_cursor_usage() -> Result<Value, ExecutorError> {
-    let mut child = tokio::process::Command::new("script")
-        .args(["-qec", "cursor-agent", "/dev/null"])
+/// Read Cursor plan quota without starting a model turn (`/usage` in a PTY).
+pub async fn query_account_usage(config: &CursorConfig) -> Result<Value, ExecutorError> {
+    let builder = crate::command::CommandBuilder::new("cursor-agent")
+        .overrides(&config.command_overrides);
+    let program = builder
+        .resolve_executable()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            config
+                .command_overrides
+                .base_command_override
+                .clone()
+                .unwrap_or_else(|| "cursor-agent".to_owned())
+        });
+    let shell = format!("stty cols 100 rows 40; exec {}", sh_single_quote(&program));
+    let mut command = Command::new("script");
+    command
+        .args(["-qec", &shell, "/dev/null"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env("NO_COLOR", "1")
-        .spawn()?;
+        .kill_on_drop(true);
+    if let Some(env) = &config.command_overrides.env {
+        for (key, value) in env {
+            command.env(key, value);
+        }
+    }
+    let mut child = command.spawn()?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| ExecutorError::Other("Cursor usage PTY has no stdin".to_owned()))?;
-    stdin.write_all(b"/usage\r/quit\r").await?;
-    drop(stdin);
-    let output = tokio::time::timeout(Duration::from_secs(12), child.wait_with_output())
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Cursor usage PTY has no stdout".to_owned()))?;
+    let mut output = Vec::new();
+    read_until(&mut stdout, &mut output, Duration::from_secs(10), |text| {
+        text.contains("Ready")
+    })
+    .await
+    .map_err(|error| ExecutorError::Other(format!("Cursor did not become ready: {error}")))?;
+    stdin
+        .write_all(b"/usage\r")
         .await
-        .map_err(|_| ExecutorError::Other("Cursor /usage timed out".to_owned()))??;
-    parse_cursor_usage(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|error| ExecutorError::Other(format!("failed to query Cursor usage: {error}")))?;
+    sleep(Duration::from_millis(500)).await;
+    stdin
+        .write_all(b"\r")
+        .await
+        .map_err(|error| ExecutorError::Other(format!("failed to open Cursor usage: {error}")))?;
+    read_until(&mut stdout, &mut output, Duration::from_secs(20), |text| {
+        text.contains("Monthly plan and on-demand usage") && text.contains("View in dashboard")
+    })
+    .await
+    .map_err(|error| ExecutorError::Other(format!("Cursor /usage did not load: {error}")))?;
+    stdin
+        .write_all(b"\x1b")
+        .await
+        .map_err(|error| ExecutorError::Other(format!("failed to close Cursor usage: {error}")))?;
+    sleep(Duration::from_millis(250)).await;
+    stdin
+        .write_all(b"/quit\r")
+        .await
+        .map_err(|error| ExecutorError::Other(format!("failed to stop Cursor usage probe: {error}")))?;
+    sleep(Duration::from_millis(250)).await;
+    stdin
+        .write_all(b"\r")
+        .await
+        .map_err(|error| ExecutorError::Other(format!("failed to stop Cursor usage probe: {error}")))?;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(3), stdout.read_to_end(&mut output)).await;
+    timeout(Duration::from_secs(5), child.wait())
+        .await
+        .map_err(|_| ExecutorError::Other("Cursor /usage timed out".to_owned()))?
+        .map_err(|error| ExecutorError::Other(format!("Cursor /usage failed: {error}")))?;
+    parse_cursor_usage(&String::from_utf8_lossy(&output))
+}
+
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn read_until<R, F>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    duration: Duration,
+    predicate: F,
+) -> std::result::Result<(), &'static str>
+where
+    R: AsyncRead + Unpin,
+    F: Fn(&str) -> bool,
+{
+    let deadline = Instant::now() + duration;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if predicate(&strip_ansi(&String::from_utf8_lossy(output))) {
+            return Ok(());
+        }
+        let read = timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            reader.read(&mut chunk),
+        )
+        .await
+        .map_err(|_| "timed out")?
+        .map_err(|_| "terminal output could not be read")?;
+        if read == 0 {
+            return Err("process exited early");
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn parse_cursor_usage(output: &str) -> Result<Value, ExecutorError> {
+    parse_cursor_usage_panel(output).or_else(|_| parse_cursor_usage_pools(output))
+}
+
+fn parse_cursor_usage_panel(output: &str) -> Result<Value, ExecutorError> {
+    let text = strip_ansi(output);
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    let usage_start = lines
+        .iter()
+        .rposition(|line| line.contains("Monthly plan and on-demand usage"))
+        .map(|index| index.saturating_sub(1))
+        .ok_or_else(|| {
+            ExecutorError::Other("Cursor /usage returned no usage summary".to_owned())
+        })?;
+    let usage = lines[usage_start..]
+        .iter()
+        .copied()
+        .take_while(|line| !line.contains("View in dashboard"))
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("usage")
+                || lower.contains("included")
+                || lower.contains("auto")
+                || lower.contains("api")
+                || lower.contains("on-demand")
+                || lower.contains("reset")
+        })
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if usage.is_empty() {
+        return Err(ExecutorError::Other(
+            "Cursor /usage returned no recognizable quota pools".to_owned(),
+        ));
+    }
+    let header = usage.iter().find(|line| line.starts_with("Usage"));
+    let plan = header
+        .and_then(|line| line.split('•').nth(1))
+        .and_then(|tail| {
+            tail.split_once("Resets")
+                .map(|(plan, _)| plan.trim().to_owned())
+        });
+    let resets_at = header.and_then(|line| {
+        line.split_once("Resets")
+            .map(|(_, reset)| reset.trim().to_owned())
+    });
+    let percentage = |category: &str| {
+        usage
+            .iter()
+            .find(|line| line.starts_with(category))
+            .and_then(|line| line.split_whitespace().find(|part| part.ends_with('%')))
+            .and_then(|part| part.trim_end_matches('%').parse::<u8>().ok())
+    };
+    let on_demand_enabled = usage
+        .iter()
+        .find(|line| line.starts_with("On-Demand"))
+        .map(|line| !line.to_ascii_lowercase().contains("disabled"));
+    Ok(serde_json::json!({
+        "plan": plan,
+        "resets_at": resets_at,
+        "categories": {
+            "included": percentage("Included"),
+            "auto": percentage("Auto"),
+            "api": percentage("API"),
+        },
+        "on_demand_enabled": on_demand_enabled,
+        "pools": usage,
+        "raw_kind": "cursor_interactive_usage"
+    }))
+}
+
+fn parse_cursor_usage_pools(output: &str) -> Result<Value, ExecutorError> {
     let text = strip_ansi(output);
     let pools = text
         .lines()
@@ -780,7 +972,7 @@ mod tests {
             ..CursorConfig::default()
         };
 
-        let cmd = CursorAdapter::build_command(&config, "hello");
+        let cmd = CursorAdapter::build_command(&config);
         assert_eq!(cmd.as_std().get_program(), "cursor-agent");
         let args: Vec<_> = cmd
             .as_std()
@@ -799,9 +991,24 @@ mod tests {
                 "gpt-5",
                 "--resume",
                 "session-123",
-                "hello",
             ]
         );
+    }
+
+    #[test]
+    fn large_prompt_is_written_to_workspace_file_not_argv() {
+        let dir = std::env::temp_dir().join(format!("forge-cursor-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp worktree");
+        let worktree = dir.to_string_lossy().into_owned();
+        let prompt = "x".repeat(400_000);
+        let pointer =
+            CursorAdapter::write_workspace_prompt(&worktree, "exec-1", &prompt).expect("write");
+        assert!(pointer.contains(".forge/cursor-prompt-exec-1.md"));
+        assert!(pointer.len() < 300);
+        let written =
+            std::fs::read_to_string(dir.join(".forge/cursor-prompt-exec-1.md")).expect("read");
+        assert_eq!(written.len(), 400_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -811,7 +1018,7 @@ mod tests {
             command_overrides: CommandOverrides::default(),
             ..CursorConfig::default()
         };
-        let cmd = CursorAdapter::build_command(&config, "hello");
+        let cmd = CursorAdapter::build_command(&config);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -825,7 +1032,7 @@ mod tests {
             command_overrides: CommandOverrides::default(),
             ..CursorConfig::default()
         };
-        let cmd = CursorAdapter::build_command(&config, "hello");
+        let cmd = CursorAdapter::build_command(&config);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -927,5 +1134,32 @@ mod tests {
             ])
         );
         assert_eq!(usage["raw_kind"], "cursor_interactive_usage");
+    }
+
+    #[test]
+    fn parses_the_final_cursor_usage_panel() {
+        let output = "Tip: Use /plan to plan execution\n\
+            Usage • Pro Resets Sep 30\n\
+            Monthly plan and on-demand usage\n\
+            Category Current Usage\n\
+            Included 11% used\n\
+            Auto 11% used\n\
+            API 0% used\n\
+            On-Demand Disabled\n\
+            View in dashboard: cursor.com/dashboard\n";
+        let parsed = parse_cursor_usage(output).unwrap();
+        let pools = parsed["pools"].as_array().unwrap();
+
+        assert!(pools.iter().any(|line| line == "Usage • Pro Resets Sep 30"));
+        assert!(pools.iter().any(|line| line == "Included 11% used"));
+        assert!(!pools
+            .iter()
+            .any(|line| line.as_str().is_some_and(|line| line.contains("Tip:"))));
+        assert_eq!(parsed["plan"], "Pro");
+        assert_eq!(parsed["resets_at"], "Sep 30");
+        assert_eq!(parsed["categories"]["included"], 11);
+        assert_eq!(parsed["categories"]["auto"], 11);
+        assert_eq!(parsed["categories"]["api"], 0);
+        assert_eq!(parsed["on_demand_enabled"], false);
     }
 }

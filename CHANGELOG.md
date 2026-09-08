@@ -25,8 +25,36 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   no way to change their model at all from `/agents`; only the removed
   launch-dialog checkbox could touch it).
 
+### Fixed
+
+- Agent quota now updates while a Codex or Cursor run is in progress. Codex
+  `account/rateLimits/updated` events and periodic Cursor `/usage` probes are
+  written to the same account key as `GET /agents/{id}/usage` (the agent's
+  pinned daemon, not an auto-resolved one), and the Agents / execution usage
+  views refetch that snapshot.
+- Retrying a task after reassigning its coder (for example when the previous
+  agent hit quota) uses the new principal. Resume/re-execute no longer mint a
+  WorkspaceLease for the exhausted agent and then fail with
+  `role 'coder' is assigned to a different principal`.
+- Cursor no longer puts the full agent prompt on `cursor-agent` argv. Large
+  plan/diff reviews are written to `.forge/cursor-prompt-<execution>.md` in the
+  worktree so the process is not killed with E2BIG (F-018).
+- WorkspaceLease matching no longer fails a live execution only because
+  `task.version` changed after the lease was issued (F-018).
+
 ### Added
 
+- Tasks can opt into an optional plan review before coding. The toggle lives on
+  Task create (including board quick create) and Task Overview (off by default)
+  and reuses the existing Reviewer role in a new session. Planner and reviewer
+  iterate on plan revisions with comments; a reviewer pass waits for a human
+  before coding. Findings return to the planner.
+- Harness agents in Agent Settings can set a CLI command other than the adapter
+  default (`config_json.base_command_override`) and, for Codex, a Codex home
+  (`config_json.env.CODEX_HOME`) so a second login has its own quota snapshot.
+  Refresh quota uses that home. A CLI command that is a bash alias (for example
+  `codex2='CODEX_HOME=$HOME/.codex-plus2 codex'`) is expanded via interactive
+  bash so the real binary runs with that environment.
 - Durable, immutable Task plan revisions survive Workspace cleanup, expose the
   full Markdown and revision digest through `GET /api/v1/tasks/{id}/plan`, and
   bind review evidence to the exact plan and git head.

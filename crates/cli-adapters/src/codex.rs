@@ -223,7 +223,9 @@ impl CodexAdapter {
 pub async fn query_account_usage(config: &CodexConfig) -> Result<Value, ExecutorError> {
     let mut command = CodexAdapter::build_command(config);
     command.stderr(Stdio::null());
-    let mut child = command.spawn()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| map_codex_spawn_error(config, error))?;
     let stdin = child
         .stdin
         .take()
@@ -348,7 +350,9 @@ impl CodingExecutorAdapter for CodexAdapter {
         let config = Self::resolve_config(&ctx);
         let mut command = Self::build_command(&config);
         command.current_dir(&ctx.worktree_path);
-        let mut child = command.group_spawn()?;
+        let mut child = command
+            .group_spawn()
+            .map_err(|error| map_codex_spawn_error(&config, error))?;
 
         let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
@@ -864,6 +868,26 @@ fn signal_child(child: &mut AsyncGroupChild) {
     {
         let _ = child.start_kill();
     }
+}
+
+fn map_codex_spawn_error(config: &CodexConfig, error: std::io::Error) -> ExecutorError {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return error.into();
+    }
+    if let Some(program) = config
+        .command_overrides
+        .base_command_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|program| !program.is_empty())
+    {
+        return ExecutorError::Other(format!(
+            "CLI command `{program}` was not found. Forge cannot run shell aliases from .bashrc; use a wrapper on PATH, or clear CLI command and set Codex home (CODEX_HOME) for the other account."
+        ));
+    }
+    ExecutorError::Other(
+        "Codex CLI was not found. Install npx or set a CLI command on this agent.".to_owned(),
+    )
 }
 
 fn dirs_path(name: &str) -> PathBuf {
@@ -1490,5 +1514,24 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
         assert!(logs.contains("Child review complete"));
         assert!(logs.contains("Root plan ready"));
         assert!(!logs.contains("codex_protocol_error"));
+    }
+
+    #[tokio::test]
+    async fn usage_probe_explains_missing_cli_override() {
+        let error = query_account_usage(&CodexConfig {
+            command_overrides: CommandOverrides {
+                base_command_override: Some("/no/such/codex2-binary".to_owned()),
+                ..CommandOverrides::default()
+            },
+            ..CodexConfig::default()
+        })
+        .await
+        .expect_err("missing binary");
+        let message = error.to_string();
+        assert!(
+            message.contains("CLI command `/no/such/codex2-binary` was not found"),
+            "{message}"
+        );
+        assert!(!message.contains("io error:"), "{message}");
     }
 }

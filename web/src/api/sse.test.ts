@@ -26,6 +26,36 @@ describe('routeSsePayload', () => {
     expect(dispatch).not.toHaveBeenCalled()
   })
 
+  it('invalidates agent usage when an execution log reports rate limits', () => {
+    const { queryClient, invalidateQueries, dispatch } = createMocks()
+    routeSsePayload(
+      {
+        event_type: 'execution.log',
+        entity_id: 'exec-1',
+        task_id: 'task-1',
+        timestamp: '2026-05-05T00:00:00Z',
+        logs: [
+          {
+            kind: 'session_info',
+            payload: {
+              method: 'account/rateLimits/updated',
+              params: { planType: 'plus', primary: { usedPercent: 21 } },
+            },
+          },
+        ],
+      },
+      queryClient,
+      { dispatch },
+    )
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(invalidateQueries).toHaveBeenCalledTimes(1)
+    const predicate = invalidateQueries.mock.calls[0]?.[0]?.predicate as
+      | ((query: { queryKey: unknown[] }) => boolean)
+      | undefined
+    expect(predicate?.({ queryKey: ['federated-agents', 'agent-1', 'usage'] })).toBe(true)
+    expect(predicate?.({ queryKey: ['federated-agents'] })).toBe(false)
+  })
+
   it('invalidates execution/task/agents for execution terminal and start events', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(

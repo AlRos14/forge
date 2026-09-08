@@ -98,7 +98,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
-| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
+| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation. Optional `task_state_config.plan_review` (`true`) opts into independent plan review before coding. |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
 | GET    | `/api/v1/tasks/{id}/plan` | Get the current captured plan and immutable revision summaries; reads the persisted artifact, never a caller-supplied filesystem path |
@@ -168,7 +168,11 @@ snapshots normalize the interactive `/usage` panel into `plan`, `resets_at`,
 diagnostics. Cursor refresh waits for the CLI readiness and completed usage
 panel markers, so slower startup or quota fetches do not depend on fixed sleeps.
 Codex `account/rateLimits/updated` events captured during a run are stored as
-`{ "rateLimits": … }` and linked to that execution (`account_usage` on
+`{ "rateLimits": … }` on the same account key as `GET /api/v1/agents/{id}/usage`
+(agent config plus a pinned `daemon_id`, not an auto-resolved daemon) as they
+arrive. Cursor has no equivalent stream event, so Forge probes `cursor-agent`
+`/usage` when you refresh and also on a short interval while a Cursor execution
+is running. Those snapshots are linked to the execution (`account_usage` on
 `GET /api/v1/executions/{id}`). USD `cost_usd` is only present when a harness
 reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | GET    | `/api/v1/agents/{id}/sessions` | List safe scope-bound session status/capability snapshots |
@@ -282,7 +286,13 @@ spawned executor's environment only (for example `OPENAI_API_KEY`); the stored
 execution snapshot, events, and logs never contain the key. OAuth entries
 cannot drive a CLI harness. Harness agents without an entry keep their
 CLI-managed login, and `GET /api/v1/providers` surfaces those CLI runtimes with
-authentication availability, host, and usage.
+authentication availability, host, and usage. Optional `config_json.base_command_override`
+selects a different executable than the adapter default (PATH name, symlink, or
+wrapper). Codex still receives `app-server` after that program. A bash alias is
+expanded to its env assignments and binary. Optional
+`config_json.env.CODEX_HOME` selects a second Codex login directory; usage
+snapshots are keyed by that value and by CLI override so agents do not share the
+default `~/.codex` quota pool.
 
 OpenAI Platform API keys remain stable. ChatGPT browser/device login and its
 direct Responses adapter are experimental. xAI API keys remain stable while

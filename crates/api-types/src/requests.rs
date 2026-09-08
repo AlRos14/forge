@@ -24,6 +24,10 @@ pub struct CreateTaskRequest {
     pub merge_config: Option<Value>,
     #[serde(default)]
     pub role_assignments: Option<Vec<InitialRoleAssignment>>,
+    /// Merged with `review_config` into persisted `task_state_config`.
+    /// `{"plan_review": true}` opts into independent plan review before coding.
+    #[serde(default)]
+    pub task_state_config: Option<Value>,
     /// Immutable Charter/baseline/milestone provenance for Charter-backed
     /// implementation Tasks. Discovery/planning Tasks may omit it.
     #[serde(default)]

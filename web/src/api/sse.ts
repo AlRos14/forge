@@ -73,6 +73,22 @@ function invalidateMissionControl(queryClient: QueryClient): void {
   void queryClient.invalidateQueries({ queryKey: ['mission-control'] })
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function logPayloadHasAccountUsage(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  const payload = isRecord(value.payload) ? value.payload : value
+  return payload.method === 'account/rateLimits/updated'
+}
+
+function executionLogHasAccountUsage(payload: SsePayload): boolean {
+  if (logPayloadHasAccountUsage(payload.log)) return true
+  if (Array.isArray(payload.logs) && payload.logs.some(logPayloadHasAccountUsage)) return true
+  return logPayloadHasAccountUsage(payload)
+}
+
 export function routeSsePayload(
   payload: SsePayload,
   queryClient: QueryClient,
@@ -81,7 +97,14 @@ export function routeSsePayload(
   const eventType = payload.event_type
 
   // Live stream events are consumed by dedicated UI listeners.
-  if (eventType === 'execution.log') return
+  if (eventType === 'execution.log') {
+    if (executionLogHasAccountUsage(payload)) {
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] === 'federated-agents' && query.queryKey[2] === 'usage',
+      })
+    }
+    return
+  }
   if (eventType === 'agent_chat.message_delta') return
 
   // Resync/reconciliation events.

@@ -299,6 +299,12 @@ export function getStateColors(
       text: 'text-orange-700 dark:text-orange-300',
       accent: 'border-l-orange-400',
     },
+    plan_review: {
+      dot: 'bg-violet-300',
+      bg: 'bg-violet-50 dark:bg-violet-500/10',
+      text: 'text-violet-700 dark:text-violet-300',
+      accent: 'border-l-violet-300',
+    },
     in_progress: {
       dot: 'bg-orange-500',
       bg: 'bg-orange-50 dark:bg-orange-500/10',

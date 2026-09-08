@@ -33,6 +33,13 @@ import {
 } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
+import { HarnessLaunchFields } from './HarnessCliCommandField'
+import {
+  cliCommandFromConfig,
+  configWithHarnessLaunch,
+  configsEqual,
+  envStringFromConfig,
+} from './harness-command'
 import {
   DEFAULT_CEILING,
   DEFAULT_PROJECT_PERMISSION_CEILING,
@@ -74,6 +81,8 @@ export function ChangeModelDialog({
   const [model, setModel] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
   const [permissionPolicy, setPermissionPolicy] = useState('')
+  const [cliCommand, setCliCommand] = useState('')
+  const [codexHome, setCodexHome] = useState('')
   const [profileId, setProfileId] = useState('')
   const [error, setError] = useState<string>()
 
@@ -105,6 +114,8 @@ export function ChangeModelDialog({
     setModel(agent.model ?? '')
     setReasoningEffort(agent.reasoning_effort ?? '')
     setPermissionPolicy(agent.permission_policy ?? '')
+    setCliCommand(cliCommandFromConfig(agent.config_json))
+    setCodexHome(envStringFromConfig(agent.config_json, 'CODEX_HOME'))
     setProfileId(otherProfiles[0]?.id ?? '')
     setError(undefined)
     // Reset only when the target agent identity changes.
@@ -179,10 +190,16 @@ export function ChangeModelDialog({
     setError(undefined)
     try {
       let currentVersion = agent.version
+      const nextConfig = configWithHarnessLaunch(agent.config_json, {
+        command: cliCommand,
+        envPatch: agent.executor_type === 'codex' ? { CODEX_HOME: codexHome } : undefined,
+      })
+      const commandChanged = !canPublish && !configsEqual(nextConfig, agent.config_json ?? {})
       const metadataChanged =
         !binding &&
         (name.trim() !== agent.name ||
-          (description.trim() ? description.trim() : null) !== agent.description)
+          (description.trim() ? description.trim() : null) !== agent.description ||
+          commandChanged)
 
       if (canPublish && metadataChanged) {
         const updated = await updateAgent.mutateAsync({
@@ -208,6 +225,7 @@ export function ChangeModelDialog({
             body: {
               name: name.trim(),
               description: description.trim() ? description.trim() : null,
+              config_json: nextConfig,
               version: currentVersion,
             },
           })
@@ -240,6 +258,7 @@ export function ChangeModelDialog({
             model: model.trim(),
             reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
             permission_policy: permissionPolicy.trim() ? permissionPolicy.trim() : null,
+            config_json: nextConfig,
             version: currentVersion,
           },
         })
@@ -297,6 +316,16 @@ export function ChangeModelDialog({
                   />
                 </div>
               </div>
+            ) : null}
+            {!binding && !canPublish ? (
+              <HarnessLaunchFields
+                idPrefix="edit-agent"
+                executorType={agent?.executor_type ?? ''}
+                cliCommand={cliCommand}
+                onCliCommandChange={setCliCommand}
+                codexHome={codexHome}
+                onCodexHomeChange={setCodexHome}
+              />
             ) : null}
             <div className="flex gap-1.5 rounded-md border border-border-subtle bg-muted/30 p-1" role="tablist" aria-label="Change model mode">
               <button

@@ -101,9 +101,19 @@ async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
     assert!(logs.iter().any(|log| {
         log.from_state == default_states::TODO && log.to_state == default_states::PLANNING
     }));
-    assert!(logs.iter().any(|log| {
-        log.from_state == default_states::PLANNING && log.to_state == default_states::IN_PROGRESS
-    }));
+    assert!(
+        logs.iter().any(|log| {
+            log.from_state == default_states::PLANNING
+                && log.to_state == default_states::IN_PROGRESS
+        }) || (logs.iter().any(|log| {
+            log.from_state == default_states::PLANNING
+                && log.to_state == default_states::PLAN_REVIEW
+        }) && logs.iter().any(|log| {
+            log.from_state == default_states::PLAN_REVIEW
+                && log.to_state == default_states::IN_PROGRESS
+        })),
+        "planning should cascade to in_progress, optionally via plan_review"
+    );
 
     let drained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
     let moved_events = drained
@@ -124,8 +134,9 @@ async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
             && matches!(
                 &event.context,
                 EventContext::TaskStatusChanged { old_status, new_status, .. }
-                    if old_status == default_states::PLANNING
-                        && new_status == default_states::IN_PROGRESS
+                    if new_status == default_states::IN_PROGRESS
+                        && (old_status == default_states::PLANNING
+                            || old_status == default_states::PLAN_REVIEW)
             )
     }));
 }

@@ -329,9 +329,18 @@ impl TaskService {
             }
         }
 
+        let role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role)
+            .unwrap_or(crate::workflow::default_roles::WORKER);
+        let assigned_agent = self.assigned_agent_for_role(&task.id, role).await?;
         let executions = self.task_executions(&task.id).await?;
         if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
+            execution.status != ExecutionStatus::Running
+                && execution.agent_session_id.is_some()
+                && (assigned_agent.is_none() || execution.agent_id == assigned_agent)
         }) {
             let launched = self
                 .follow_up_execution(
@@ -339,7 +348,9 @@ impl TaskService {
                     context.clone().unwrap_or_else(|| {
                         "Resume work from the latest worker session.".to_owned()
                     }),
-                    execution.agent_id.clone(),
+                    assigned_agent
+                        .clone()
+                        .or_else(|| execution.agent_id.clone()),
                     None,
                 )
                 .await?;
@@ -348,7 +359,9 @@ impl TaskService {
         }
 
         if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
+            execution.status != ExecutionStatus::Running
+                && execution.agent_id.is_some()
+                && (assigned_agent.is_none() || execution.agent_id == assigned_agent)
         }) {
             let launched = self
                 .re_execute_execution_with_context(execution.id.clone(), context.clone())
@@ -358,12 +371,6 @@ impl TaskService {
         }
 
         let agent_id = self.action_agent_id(task, workflow).await?;
-        let role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-            .unwrap_or(crate::workflow::default_roles::WORKER);
         let _launched = self
             .dispatch_initial_role_execution(
                 &task.id,
@@ -382,26 +389,20 @@ impl TaskService {
         task: &Task,
         workflow: &api_types::WorkflowDefinition,
     ) -> Result<String> {
-        if task.assignee_type.as_deref() == Some("agent") {
-            if let Some(agent_id) = task.assignee_id.as_deref() {
-                return Ok(agent_id.to_owned());
-            }
-        }
-
         if let Some(role) = workflow
             .states
             .iter()
             .find(|state| state.name == task.status)
             .and_then(crate::workflow::effective_role)
         {
-            if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?
-            {
-                if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                    if let Some(agent_id) = assignment.assignee_id {
-                        return Ok(agent_id);
-                    }
-                }
+            if let Some(agent_id) = self.assigned_agent_for_role(&task.id, role).await? {
+                return Ok(agent_id);
+            }
+        }
+
+        if task.assignee_type.as_deref() == Some("agent") {
+            if let Some(agent_id) = task.assignee_id.as_deref() {
+                return Ok(agent_id.to_owned());
             }
         }
 

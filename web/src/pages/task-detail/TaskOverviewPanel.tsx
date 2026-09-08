@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanDocument } from '@/components/plan-document'
+import { PlanReviewCheckbox } from '@/components/plan-review-checkbox'
 import { TaskDecisionRequests } from '@/components/task-decision-requests'
 import {
   type AssigneeSelection,
@@ -111,6 +112,7 @@ interface TaskOverviewPanelProps {
     mergeFix: number | undefined,
     execution: number | undefined,
   ) => void
+  onSavePlanReview: (enabled: boolean) => void
 }
 
 export function TaskOverviewPanel({
@@ -162,6 +164,7 @@ export function TaskOverviewPanel({
   onStopExecution,
   onReExecuteExecution,
   onSaveRetryBudgets,
+  onSavePlanReview,
 }: TaskOverviewPanelProps) {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
@@ -751,6 +754,11 @@ export function TaskOverviewPanel({
               className="rounded-md border p-3"
               contentClassName="space-y-3"
             >
+              <PlanReviewCheckbox
+                checked={readTaskStateConfig(task).plan_review === true}
+                disabled={updatePending || terminal}
+                onChange={onSavePlanReview}
+              />
               <div>
                 <p className="text-sm font-medium">Retry budgets</p>
                 <p className="text-xs text-muted-foreground">

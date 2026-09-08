@@ -603,19 +603,28 @@ impl TaskService {
             if updated.role == crate::workflow::default_roles::PLANNER
                 && task.status == crate::workflow::default_states::PLANNING
             {
-                if let Err(error) = execution::set_planning_awaiting_review_metadata(
-                    &self.db,
-                    &task,
-                    Some(&updated.id),
-                    true,
-                )
-                .await
+                let awaiting_reason =
+                    match execution::persist_planner_result(&self.db, &task, &updated).await {
+                        Ok(reason) => reason,
+                        Err(error) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                execution_id = %updated.id,
+                                %error,
+                                "planner result protocol failed"
+                            );
+                            "planner_protocol_error"
+                        }
+                    };
+                if let Err(error) =
+                    execution::conclude_planner_ready(self, &task, &updated.id, awaiting_reason)
+                        .await
                 {
                     tracing::warn!(
                         task_id = %task.id,
                         execution_id = %updated.id,
                         %error,
-                        "failed to mark planning awaiting review"
+                        "failed to conclude planner ready"
                     );
                 }
             }

@@ -18,6 +18,7 @@ export function BoardView({
   quickCreateDescription,
   quickCreateDescriptionRef,
   createPending,
+  quickCreatePlanReview,
   agentPickerTaskId,
   agents,
   agentNamesById,
@@ -26,6 +27,7 @@ export function BoardView({
   onToggleQuickCreate,
   onQuickCreateTitleChange,
   onQuickCreateDescriptionChange,
+  onQuickCreatePlanReviewChange,
   onSubmitQuickCreate,
   onCancelQuickCreate,
   onAssignAgent,
@@ -51,6 +53,7 @@ export function BoardView({
   quickCreateDescription: string
   quickCreateDescriptionRef: RefObject<HTMLTextAreaElement>
   createPending: boolean
+  quickCreatePlanReview: boolean
   agentPickerTaskId?: string
   agents: Agent[]
   agentNamesById: Map<string, string>
@@ -59,6 +62,7 @@ export function BoardView({
   onToggleQuickCreate: () => void
   onQuickCreateTitleChange: (title: string) => void
   onQuickCreateDescriptionChange: (description: string) => void
+  onQuickCreatePlanReviewChange: (enabled: boolean) => void
   onSubmitQuickCreate: () => void
   onCancelQuickCreate: () => void
   onAssignAgent: (task: Task, agentId: string) => void
@@ -94,6 +98,7 @@ export function BoardView({
               quickCreateDescription={quickCreateDescription}
               quickCreateDescriptionRef={quickCreateDescriptionRef}
               createPending={createPending}
+              quickCreatePlanReview={quickCreatePlanReview}
               agentPickerTaskId={agentPickerTaskId}
               agents={agents}
               agentNamesById={agentNamesById}
@@ -102,6 +107,7 @@ export function BoardView({
               onToggleQuickCreate={onToggleQuickCreate}
               onQuickCreateTitleChange={onQuickCreateTitleChange}
               onQuickCreateDescriptionChange={onQuickCreateDescriptionChange}
+              onQuickCreatePlanReviewChange={onQuickCreatePlanReviewChange}
               onSubmitQuickCreate={onSubmitQuickCreate}
               onCancelQuickCreate={onCancelQuickCreate}
               onAssignAgent={onAssignAgent}

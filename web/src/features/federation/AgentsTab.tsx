@@ -28,6 +28,8 @@ import type { FederatedAgent } from '@/features/federation/types'
 import type { CliRuntimeEntryResponse, ProviderEntryResponse } from '@/types/generated'
 import { EmptyPanel, ErrorPanel, LoadingPanel, StateBadge, StatusDot } from '@/features/federation/components'
 import { AgentDetailPanel } from './AgentDetailPanel'
+import { HarnessLaunchFields } from './HarnessCliCommandField'
+import { configWithHarnessLaunch } from './harness-command'
 import { DEFAULT_CEILING, humanize, runtimeDisplayNames, runtimeOptionsForEntry } from './format'
 
 type WizardRuntime = { runtime: string; support_level: string; reason: string | null }
@@ -60,6 +62,8 @@ export function NewAgentDialog({
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null)
   const [permissionPolicy, setPermissionPolicy] = useState<string | null>(null)
   const [systemPrompt, setSystemPrompt] = useState('')
+  const [cliCommand, setCliCommand] = useState('')
+  const [codexHome, setCodexHome] = useState('')
   const [error, setError] = useState<string>()
   const inFlight = useRef(false)
 
@@ -74,6 +78,8 @@ export function NewAgentDialog({
     setReasoningEffort(null)
     setPermissionPolicy(null)
     setSystemPrompt('')
+    setCliCommand('')
+    setCodexHome('')
     setError(undefined)
   }, [open, preselectedEntryId])
 
@@ -88,6 +94,7 @@ export function NewAgentDialog({
     ? capabilities.data?.items.find((item) => item.provider === selectedEntry.provider)
     : undefined
   const step: 1 | 2 | 3 = !selectedEntry && !cliKind ? 1 : !runtime ? 2 : 3
+  const harnessRuntime = runtime && runtime !== 'direct' ? runtime : null
   const discovered = useDiscoveredOptions(null, runtime === 'direct' ? null : runtime)
   const reasoningOptionsForModel = useMemo(
     () => getReasoningOptionsForModel(discovered.data, model),
@@ -132,6 +139,13 @@ export function NewAgentDialog({
           tool_policy: DEFAULT_CEILING,
         })
       } else {
+        const config_json = configWithHarnessLaunch(
+          {},
+          {
+            command: cliCommand,
+            envPatch: runtime === 'codex' ? { CODEX_HOME: codexHome } : undefined,
+          },
+        )
         await registerHarness.mutateAsync({
           name: name.trim(),
           description: description.trim() ? description.trim() : null,
@@ -140,6 +154,7 @@ export function NewAgentDialog({
           reasoning_effort: reasoningEffort,
           permission_policy: permissionPolicy,
           credential_id: selectedEntry?.id ?? null,
+          ...(Object.keys(config_json).length > 0 ? { config_json } : {}),
         })
       }
       onClose()
@@ -343,6 +358,16 @@ export function NewAgentDialog({
                   policies={discovered.data?.permissionPolicies}
                   value={permissionPolicy}
                   onChange={setPermissionPolicy}
+                />
+              ) : null}
+              {harnessRuntime ? (
+                <HarnessLaunchFields
+                  idPrefix="agent"
+                  executorType={harnessRuntime}
+                  cliCommand={cliCommand}
+                  onCliCommandChange={setCliCommand}
+                  codexHome={codexHome}
+                  onCodexHomeChange={setCodexHome}
                 />
               ) : null}
               <div className="space-y-2 sm:col-span-2">

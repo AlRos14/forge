@@ -416,7 +416,7 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
     let approved = service
         .transition(
             task.id.clone(),
-            crate::workflow::default_states::IN_PROGRESS.to_owned(),
+            crate::workflow::default_states::PLAN_REVIEW.to_owned(),
             task.version,
         )
         .await
@@ -424,6 +424,107 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
     let metadata = approved.task.metadata().expect("metadata parses");
     assert!(metadata.extra.get("awaiting_human").is_none());
     assert!(metadata.extra.get("awaiting_human_reason").is_none());
+    assert_eq!(
+        approved.task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+}
+
+#[tokio::test]
+async fn planner_completion_enters_plan_review_when_task_opts_in() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::new(PlannerReadyExecutor))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        crate::workflow::default_states::PLANNING.to_owned(),
+    )
+    .await;
+    let task = TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: Some(Some(r#"{"plan_review":true}"#.to_owned())),
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("plan review flag writes");
+    service
+        .reassign_role(
+            role_assignment_input(
+                &task.id,
+                crate::workflow::default_roles::REVIEWER,
+                Some(agent_id.clone()),
+                None,
+            ),
+            false,
+            false,
+        )
+        .await
+        .expect("reviewer assignment succeeds");
+
+    let execution = service
+        .dispatch_initial_role_execution(
+            &task.id,
+            &agent_id,
+            crate::workflow::default_roles::PLANNER,
+            "plan the task".to_owned(),
+        )
+        .await
+        .expect("planner dispatch succeeds");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let current = ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .expect("execution loads")
+                .expect("execution exists");
+            if current.status == ExecutionStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner execution completes");
+    let task = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("task loads")
+                .expect("task exists");
+            if task.status == crate::workflow::default_states::PLAN_REVIEW {
+                break task;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner completion enters plan_review");
+    assert_eq!(task.status, crate::workflow::default_states::PLAN_REVIEW);
+    assert!(!service
+        .is_awaiting_human(task.id.clone())
+        .await
+        .expect("awaiting human resolves"));
 }
 
 #[tokio::test]

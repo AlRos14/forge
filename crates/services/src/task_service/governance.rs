@@ -1034,7 +1034,9 @@ impl TaskService {
         if lease.status != "active"
             || lease.project_id != task.project_id
             || lease.task_id != task.id
-            || lease.task_version != task.version
+            // Bind the lease to this execution, not Task.version. Comments,
+            // assignments, or planner metadata can bump the Task between issue
+            // and require (F-018).
             || lease.execution_id != execution_id
             || lease.operation_idempotency_key != execution_id
             || lease.repository_binding_id != repo_id

@@ -112,6 +112,7 @@ export function BoardPage({ projectId }: { projectId: string }) {
           quickCreateDescription={board.quickCreateDescription}
           quickCreateDescriptionRef={board.quickCreateDescriptionRef}
           createPending={board.createTask.isPending}
+          quickCreatePlanReview={board.quickCreatePlanReview}
           agentPickerTaskId={board.agentPickerTaskId}
           agents={board.agentsQuery.data?.items ?? []}
           agentNamesById={board.agentNamesById}
@@ -120,6 +121,7 @@ export function BoardPage({ projectId }: { projectId: string }) {
           onToggleQuickCreate={() => board.setQuickCreateOpen((open) => !open)}
           onQuickCreateTitleChange={board.setQuickCreateTitle}
           onQuickCreateDescriptionChange={board.setQuickCreateDescription}
+          onQuickCreatePlanReviewChange={board.setQuickCreatePlanReview}
           onSubmitQuickCreate={board.submitQuickCreate}
           onCancelQuickCreate={board.cancelQuickCreate}
           onAssignAgent={board.assignAgent}

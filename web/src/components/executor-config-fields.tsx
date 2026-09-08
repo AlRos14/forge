@@ -231,7 +231,7 @@ export function CommandOverridesFields({ cfg, onChange }: ExecFieldProps) {
         <Input
           value={getStr(cfg, 'base_command_override')}
           onChange={(e) => onChange('base_command_override', e.target.value || undefined)}
-          placeholder="/custom/path/to/cli"
+          placeholder="codex2 or /custom/path/to/cli"
         />
       </ConfigField>
       <ConfigField label="Additional Params" className="col-span-2" hint="Comma-separated">

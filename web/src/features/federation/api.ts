@@ -79,6 +79,7 @@ export function registerHarnessAgent(input: {
   reasoning_effort?: string | null
   permission_policy?: string | null
   credential_id?: string | null
+  config_json?: Record<string, unknown>
 }): Promise<FederatedAgent> {
   return apiFetch<FederatedAgent>('/agents', {
     method: 'POST',

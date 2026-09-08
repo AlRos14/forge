@@ -64,7 +64,9 @@ pub async fn load_agent_dispatch_context(
         Ok(None) => task.plan.clone(),
         Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
     };
-    let review_evidence = if role == crate::workflow::default_roles::REVIEWER {
+    let review_evidence = if role == crate::workflow::default_roles::REVIEWER
+        && state_name != crate::workflow::default_states::PLAN_REVIEW
+    {
         match crate::DiffService::new(Arc::clone(&db))
             .task_diff(task_id)
             .await

@@ -4,7 +4,8 @@ use db::{
 };
 
 use crate::workflow::{
-    default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
+    default_states, effective_role, engine::WorkflowEngine, task_requests_plan_review, HookAction,
+    HookContext, HookResult,
 };
 
 use super::common::{block_task, get_role_assignment, task, workspace_id};
@@ -54,13 +55,21 @@ impl HookAction for AutoCascadeOnUnassignedRole {
         let target = ctx
             .workflow
             .outgoing_trigger_targets(&ctx.to_state)
-            .filter(|(trigger, _)| !trigger.system_only())
-            .find_map(|(_, to)| {
+            .find(|(trigger, _)| *trigger == api_types::WorkflowTrigger::Accept)
+            .map(|(_, to)| to)
+            .or_else(|| {
                 ctx.workflow
-                    .states
-                    .iter()
-                    .find(|state| state.name == to && state.kind == api_types::StateKind::Active)
-                    .map(|state| state.name.clone())
+                    .outgoing_trigger_targets(&ctx.to_state)
+                    .filter(|(trigger, _)| !trigger.system_only())
+                    .find_map(|(_, to)| {
+                        ctx.workflow
+                            .states
+                            .iter()
+                            .find(|state| {
+                                state.name == to && state.kind == api_types::StateKind::Active
+                            })
+                            .map(|state| state.name.clone())
+                    })
             });
 
         match target {
@@ -71,6 +80,42 @@ impl HookAction for AutoCascadeOnUnassignedRole {
             None => HookResult::Skipped {
                 reason: format!("no active transition for unassigned {role_name} role"),
             },
+        }
+    }
+}
+
+/// Skip the optional plan-review gate unless the Task opted in.
+pub struct AutoCascadeUnlessPlanReview;
+
+#[async_trait]
+impl HookAction for AutoCascadeUnlessPlanReview {
+    async fn execute(&self, ctx: &HookContext) -> HookResult {
+        let task = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        if task_requests_plan_review(task.task_state_config.as_deref()) {
+            let assignment =
+                match get_role_assignment(ctx, crate::workflow::default_roles::REVIEWER).await {
+                    Ok(assignment) => assignment,
+                    Err(reason) => return HookResult::Failed { reason },
+                };
+            if assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.assignee_id.is_some())
+            {
+                return HookResult::Skipped {
+                    reason: "plan review requested".to_string(),
+                };
+            }
+            return HookResult::Cascade {
+                to: default_states::IN_PROGRESS.to_string(),
+                reason: "plan review skipped: no reviewer assigned".to_string(),
+            };
+        }
+        HookResult::Cascade {
+            to: default_states::IN_PROGRESS.to_string(),
+            reason: "plan review skipped".to_string(),
         }
     }
 }
@@ -349,13 +394,26 @@ impl HookAction for RequireUpstreamRolesCompleted {
             }
         };
 
-        for gate in ctx.workflow.states.iter().filter(|state| {
-            state.kind == api_types::StateKind::Gate
-                && ctx
-                    .workflow
-                    .outgoing_trigger_targets(&state.name)
-                    .any(|(_, to)| to == ctx.to_state)
-        }) {
+        let mut ancestor = ctx.to_state.clone();
+        let mut seen = std::collections::HashSet::new();
+        let mut gates = Vec::new();
+        while seen.insert(ancestor.clone()) {
+            let Some(gate) = ctx.workflow.states.iter().find(|state| {
+                state.kind == api_types::StateKind::Gate
+                    && ctx
+                        .workflow
+                        .outgoing_trigger_targets(&state.name)
+                        .any(|(trigger, to)| {
+                            trigger == api_types::WorkflowTrigger::Accept && to == ancestor
+                        })
+            }) else {
+                break;
+            };
+            gates.push(gate);
+            ancestor = gate.name.clone();
+        }
+
+        for gate in gates {
             let Some(role) = effective_role(gate) else {
                 continue;
             };

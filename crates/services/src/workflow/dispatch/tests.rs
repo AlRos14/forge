@@ -518,6 +518,67 @@ fn planner_prompt_includes_current_plan_latest_rejection_and_comments() {
 }
 
 #[test]
+fn planner_prompt_includes_plan_review_findings_for_revision() {
+    let mut ctx = fake_context(default_roles::PLANNER);
+    ctx.state_name = default_states::PLANNING.to_owned();
+    ctx.plan = Some("# Plan v1\n\n- Implement the happy path.".to_owned());
+    ctx.transition_log = vec![db::TransitionLog {
+        id: "transition-plan-review".to_owned(),
+        task_id: ctx.task.id.clone(),
+        from_state: default_states::PLAN_REVIEW.to_owned(),
+        to_state: default_states::PLANNING.to_owned(),
+        trigger_name: Some("reject".to_owned()),
+        triggered_by: "system:workflow".to_owned(),
+        trigger_reason: "plan review failed".to_owned(),
+        hook_results_json: None,
+        rejection: true,
+        created_at: "2026-04-17T00:01:00Z".to_owned(),
+    }];
+    ctx.comments = vec![db::TaskComment {
+        id: "comment-review".to_owned(),
+        task_id: ctx.task.id.clone(),
+        author_type: db::CommentAuthorType::Agent,
+        author_id: Some("reviewer-1".to_owned()),
+        author_name: "Reviewer".to_owned(),
+        content: "Split the provider boundary into its own phase.".to_owned(),
+        created_at: "2026-04-17T00:02:00Z".to_owned(),
+        updated_at: "2026-04-17T00:02:00Z".to_owned(),
+    }];
+
+    let prompt = PlannerPromptBuilder.build(&ctx);
+
+    assert!(prompt.user.contains("This is a planning revision."));
+    assert!(prompt
+        .user
+        .contains("Plan-review findings from the last reviewer pass"));
+    assert!(prompt.user.contains("plan review failed"));
+    assert!(prompt
+        .user
+        .contains("Reviewer: Split the provider boundary into its own phase."));
+}
+
+#[test]
+fn plan_review_prompt_asks_for_planner_comments_and_human_after_pass() {
+    let mut ctx = fake_context(default_roles::REVIEWER);
+    ctx.state_name = default_states::PLAN_REVIEW.to_owned();
+    ctx.plan = Some("# Plan v1\n".to_owned());
+
+    let prompt = ReviewerPromptBuilder.build(&ctx);
+
+    assert!(prompt.system.contains("Fail returns to the planner"));
+    assert!(prompt
+        .system
+        .contains("Pass waits for a human before coding"));
+    assert!(prompt
+        .user
+        .contains("reviews the current plan revision only"));
+    assert!(prompt
+        .user
+        .contains("change you want in the next plan revision"));
+    assert!(!prompt.system.contains("sent to the coder agent"));
+}
+
+#[test]
 fn generic_prompt_dumps_core_context_for_unknown_role() {
     let mut ctx = fake_context("security_engineer");
     ctx.state_name = "security_review".to_string();

@@ -114,6 +114,7 @@ impl TaskArgs {
                     review_config: None,
                     merge_config: None,
                     role_assignments: None,
+                    task_state_config: None,
                     governance: None,
                 };
                 let task: TaskResponse = client

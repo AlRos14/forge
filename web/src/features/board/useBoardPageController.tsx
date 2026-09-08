@@ -12,6 +12,7 @@ import type { TaskCardMenuRenderer } from '@/components/kanban-task-card'
 import { taskStatusTransitions } from '@/components/task-controls'
 import { DropdownMenuItem } from '@/components/ui/dropdown-menu'
 import { toastApiError } from '@/lib/api-error'
+import { taskStateConfigWithPlanReview } from '@/components/plan-review-checkbox'
 import {
   type ColumnGroup,
   deriveColumns,
@@ -103,6 +104,7 @@ export function useBoardPageController(projectId: string) {
   const [quickCreateOpen, setQuickCreateOpen] = useState(false)
   const [quickCreateTitle, setQuickCreateTitle] = useState('')
   const [quickCreateDescription, setQuickCreateDescription] = useState('')
+  const [quickCreatePlanReview, setQuickCreatePlanReview] = useState(false)
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [selectedTaskId, setSelectedTaskId] = useState<string>()
   const [showMobileFilters, setShowMobileFilters] = useState(false)
@@ -325,12 +327,19 @@ export function useBoardPageController(projectId: string) {
     const description = quickCreateDescription.trim()
     if (!title || !description || createTask.isPending) return
     createTask.mutate(
-      { title, description, task_type: 'implementation', priority: 0 },
+      {
+        title,
+        description,
+        task_type: 'implementation',
+        priority: 0,
+        task_state_config: taskStateConfigWithPlanReview(quickCreatePlanReview),
+      },
       {
         onError: (error) => toastApiError(error, 'Task creation failed'),
         onSuccess: () => {
           setQuickCreateTitle('')
           setQuickCreateDescription('')
+          setQuickCreatePlanReview(false)
           setQuickCreateOpen(false)
         },
       },
@@ -339,6 +348,7 @@ export function useBoardPageController(projectId: string) {
   const cancelQuickCreate = () => {
     setQuickCreateTitle('')
     setQuickCreateDescription('')
+    setQuickCreatePlanReview(false)
     setQuickCreateOpen(false)
   }
   const handleLoadMore = () => {
@@ -380,6 +390,7 @@ export function useBoardPageController(projectId: string) {
     quickCreateDescription,
     quickCreateDescriptionRef,
     quickCreateOpen,
+    quickCreatePlanReview,
     quickCreateTitle,
     renderTaskMenuItems,
     searchInputRef,
@@ -389,6 +400,7 @@ export function useBoardPageController(projectId: string) {
     setCreateDialogOpen,
     setQuickCreateDescription,
     setQuickCreateOpen,
+    setQuickCreatePlanReview,
     setQuickCreateTitle,
     setShowMobileFilters,
     setUrlFilters,

@@ -161,7 +161,7 @@ pub async fn refresh_agent_usage(
     require_agent_visible(&agent, &user, &id)?;
     let usage = match agent.executor_type.as_str() {
         "codex" => Some(services::account_usage::refresh_codex_usage(&agent.config_json).await?),
-        "cursor" => Some(services::account_usage::refresh_cursor_usage().await?),
+        "cursor" => Some(services::account_usage::refresh_cursor_usage(&agent.config_json).await?),
         _ => None,
     };
     if let Some(usage) = usage {
@@ -190,6 +190,7 @@ async fn agent_usage_response(
         .ok_or_else(|| ApiError::not_found("agent", id.to_owned()))?;
     require_agent_visible(&agent, user, id)?;
     let account_key = usage_account_key(&agent);
+    let shared_account = usage_is_shared(&agent, &account_key);
     let row = sqlx::query(
         "SELECT source, usage_json, captured_at, stale_after FROM account_usage_snapshot
          WHERE account_key = ? ORDER BY captured_at DESC LIMIT 1",
@@ -202,7 +203,7 @@ async fn agent_usage_response(
             available: false,
             executor_type: agent.executor_type,
             account_key,
-            shared_account: agent.daemon_id.is_none(),
+            shared_account,
             source: None,
             usage: None,
             captured_at: None,
@@ -215,7 +216,7 @@ async fn agent_usage_response(
         available: true,
         executor_type: agent.executor_type,
         account_key,
-        shared_account: agent.daemon_id.is_none(),
+        shared_account,
         source: Some(row.get("source")),
         usage: serde_json::from_str::<Value>(&row.get::<String, _>("usage_json")).ok(),
         captured_at: Some(row.get("captured_at")),
@@ -235,6 +236,10 @@ fn usage_account_key(agent: &Agent) -> String {
         key.push_str(daemon_id);
     }
     key
+}
+
+fn usage_is_shared(agent: &Agent, account_key: &str) -> bool {
+    agent.daemon_id.is_none() && account_key == agent.executor_type
 }
 
 pub async fn list_agent_tasks(

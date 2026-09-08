@@ -98,6 +98,22 @@ pub fn default_workflow() -> WorkflowDefinition {
             },
         ),
         state(
+            default_states::PLAN_REVIEW,
+            StateKind::Gate,
+            "In Progress",
+            "Plan review",
+            Some(default_roles::REVIEWER),
+            CanonicalPhase::Working,
+            StateHooks {
+                on_enter: vec![hook("dispatch_role_agent")],
+                after_enter: vec![
+                    hook("auto_cascade_unless_plan_review"),
+                    hook("auto_cascade_on_unassigned_role"),
+                ],
+                ..StateHooks::default()
+            },
+        ),
+        state(
             default_states::IN_PROGRESS,
             StateKind::Active,
             "In Progress",
@@ -223,7 +239,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             state.triggers.insert(
                 WorkflowTrigger::Accept,
                 WorkflowTriggerDefinition {
-                    to: default_states::IN_PROGRESS.to_string(),
+                    to: default_states::PLAN_REVIEW.to_string(),
                     dispatch: None,
                 },
             );
@@ -232,6 +248,55 @@ pub fn default_workflow() -> WorkflowDefinition {
                 WorkflowTriggerDefinition {
                     to: default_states::PLANNING.to_string(),
                     dispatch: None,
+                },
+            );
+        }
+        if state.name == default_states::PLAN_REVIEW {
+            state.dispatch = Some(WorkflowDispatch {
+                builder: Some("reviewer.default.v2".to_string()),
+                execution_policy: Some(WorkflowExecutionPolicy::NewExecution),
+                prompt: Some(WorkflowPromptConfig {
+                    user_prefix: Some(
+                        "This is an optional plan review before implementation. Critique this plan revision only. Write comments and change requests the planner can apply. Do not expect a code diff. Fail returns to the planner for the next revision. Pass waits for a human before coding."
+                            .to_string(),
+                    ),
+                    user_append: None,
+                    system_prefix: None,
+                    system_append: None,
+                }),
+            });
+            state.gate_config = Some(GateConfig {
+                reject_target: Some(default_states::PLANNING.to_string()),
+                max_rejections: Some(2),
+                approve_label: Some("Accept plan review".to_string()),
+                reject_label: Some("Return to planner".to_string()),
+                requires_user_approval: Some(false),
+                optional_when_unassigned: Some(true),
+            });
+            state.triggers.insert(
+                WorkflowTrigger::Accept,
+                WorkflowTriggerDefinition {
+                    to: default_states::IN_PROGRESS.to_string(),
+                    dispatch: None,
+                },
+            );
+            state.triggers.insert(
+                WorkflowTrigger::Reject,
+                WorkflowTriggerDefinition {
+                    to: default_states::PLANNING.to_string(),
+                    dispatch: Some(WorkflowDispatch {
+                        builder: Some("planner.default.v2".to_string()),
+                        execution_policy: Some(WorkflowExecutionPolicy::NewExecution),
+                        prompt: Some(WorkflowPromptConfig {
+                            user_prefix: Some(
+                                "Revise the plan using the plan-review findings. Do not implement."
+                                    .to_string(),
+                            ),
+                            user_append: None,
+                            system_prefix: None,
+                            system_append: None,
+                        }),
+                    }),
                 },
             );
         }
@@ -575,12 +640,43 @@ mod tests {
     }
 
     #[test]
+    fn planning_accept_enters_optional_plan_review_before_coding() {
+        let workflow = default_workflow();
+        let plan_review = workflow
+            .states
+            .iter()
+            .find(|state| state.name == default_states::PLAN_REVIEW)
+            .expect("plan_review state");
+        assert_eq!(plan_review.role.as_deref(), Some(default_roles::REVIEWER));
+        assert_eq!(
+            workflow
+                .outgoing_trigger_targets(default_states::PLANNING)
+                .find(|(trigger, _)| *trigger == WorkflowTrigger::Accept)
+                .map(|(_, target)| target),
+            Some(default_states::PLAN_REVIEW.to_string())
+        );
+        assert_eq!(
+            workflow
+                .outgoing_trigger_targets(default_states::PLAN_REVIEW)
+                .find(|(trigger, _)| *trigger == WorkflowTrigger::Reject)
+                .map(|(_, target)| target),
+            Some(default_states::PLANNING.to_string())
+        );
+        assert!(plan_review
+            .hooks
+            .after_enter
+            .iter()
+            .any(|hook| hook.action == "auto_cascade_unless_plan_review"));
+    }
+
+    #[test]
     fn every_default_state_has_its_decided_canonical_phase() {
         let workflow = default_workflow();
         let expected = [
             (default_states::BACKLOG, CanonicalPhase::Backlog),
             (default_states::TODO, CanonicalPhase::Ready),
             (default_states::PLANNING, CanonicalPhase::Working),
+            (default_states::PLAN_REVIEW, CanonicalPhase::Working),
             (default_states::IN_PROGRESS, CanonicalPhase::Working),
             (default_states::REVIEW, CanonicalPhase::Review),
             (default_states::MERGING, CanonicalPhase::Review),

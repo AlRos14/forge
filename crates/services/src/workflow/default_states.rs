@@ -1,6 +1,7 @@
 pub const BACKLOG: &str = "backlog";
 pub const TODO: &str = "todo";
 pub const PLANNING: &str = "planning";
+pub const PLAN_REVIEW: &str = "plan_review";
 pub const IN_PROGRESS: &str = "in_progress";
 pub const REVIEW: &str = "review";
 pub const MERGING: &str = "merging";

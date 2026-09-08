@@ -452,12 +452,16 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
     let transition_logs = TransitionLogRepo::list_by_task(&*db, task_id)
         .await
         .expect("transition logs load");
-    assert!(transition_logs.iter().any(|log| {
-        log.from_state == default_states::PLANNING
-            && log.to_state == default_states::IN_PROGRESS
-            && log.trigger_reason == "gate skipped: no planner role assigned"
-            && !log.rejection
-    }));
+    assert!(
+        transition_logs.iter().any(|log| {
+            log.from_state == default_states::PLANNING
+                && (log.to_state == default_states::IN_PROGRESS
+                    || log.to_state == default_states::PLAN_REVIEW)
+                && log.trigger_reason == "gate skipped: no planner role assigned"
+                && !log.rejection
+        }),
+        "planning should cascade toward implementation when no planner is assigned"
+    );
 }
 
 #[tokio::test]

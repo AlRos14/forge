@@ -47,11 +47,10 @@ pub(super) fn auto_cascades_on_unassigned_role(state: &api_types::StateDefinitio
     {
         return false;
     }
-    state
-        .hooks
-        .after_enter
-        .iter()
-        .any(|hook| hook.action == "auto_cascade_on_unassigned_role")
+    state.hooks.after_enter.iter().any(|hook| {
+        hook.action == "auto_cascade_on_unassigned_role"
+            || hook.action == "auto_cascade_unless_plan_review"
+    })
 }
 
 pub(super) fn role_assignment_unassigned(assignment: Option<&db::TaskRoleAssignment>) -> bool {

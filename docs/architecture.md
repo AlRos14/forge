@@ -183,7 +183,9 @@ reviewer lease class. Its operation idempotency key is the exact execution
 attempt ID: claim inserts the execution and lease in one transaction, and each
 retry/follow-up creates a fresh child execution with its own lease. A matching
 role assignment is authoritative for that execution role (for example, an
-independent reviewer may differ from the Task's primary worker). On a
+independent reviewer may differ from the Task's primary worker). Retry,
+re-execute, and follow-up resolve the agent from that assignment, not from
+the previous execution, so a quota-driven coder swap can continue. On a
 `legacy_unverified` Project only, an explicit manual execution selection is the
 assignment boundary when neither the role nor Task has an assignee; an existing
 applicable assignment still must match. Charter-backed Projects always require
@@ -391,6 +393,16 @@ shown only when the adapter advertises it, and permission choices are filtered
 to that adapter's supported policies. Reasoning effort and execution policy
 are independent persisted defaults. Agent name and description are mutable
 identity metadata; changing them does not publish a profile or alter a binding.
+  Harness agents may also set `config_json.base_command_override` from Agent
+  Settings (a PATH binary, symlink, or wrapper). That replaces the adapter's
+  default program (for Codex, pinned `npx @openai/codex@…`) and still appends
+  adapter args such as `app-server`. A simple name that is a bash alias is
+  expanded via interactive bash (env assignments plus the real binary, including
+  nvm PATH). A second Codex account can also be selected with
+  `config_json.env.CODEX_HOME`; usage snapshots are keyed by home and CLI
+  override (and a pinned `agent.daemon_id` only) so Refresh quota, live Codex
+  `account/rateLimits/updated` events, and Cursor `/usage` probes during a run
+  share one pool, not an auto-resolved daemon suffix.
 
 Credential handles distinguish static `api_key` payloads from renewable
 `oauth_bundle` payloads and carry optimistic versions. Native adapters acquire
@@ -1004,8 +1016,8 @@ candidate route instead of a single adapter:
   Claude Code stderr and `is_error` result events); assistant output text is
   never an input, and unclassifiable failures stay generic (no fallback).
 - **Cooldowns** — an in-memory, process-lifetime registry keyed by
-  `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile,
-  else the executor family). Exhausted accounts are skipped until
+  `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile
+  plus `CODEX_HOME` / CLI override, else the executor family). Exhausted accounts are skipped until
   `retry_after` (default 15 min); all candidates cooling fails fast without
   spawning. Candidate identity (`CandidateKey`) is separate: kind +
   discriminators + a stable hash of the session-stripped config.

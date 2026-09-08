@@ -385,20 +385,42 @@ pub fn candidate_key(kind: &ExecutorKind, config: &Value) -> String {
 /// Identity of the quota pool a candidate consumes. Candidates sharing an
 /// account key share cooldowns. For Smith the pool is the provider (Smith
 /// rotates that provider's credentials natively); for Codex it is the
-/// profile; other executors have one machine-level account.
+/// profile plus optional `CODEX_HOME` / CLI override; other executors have
+/// one machine-level account.
 pub fn account_key(kind: &ExecutorKind, config: &Value) -> String {
     let discriminator = match kind {
-        ExecutorKind::Smith => config
-            .get("provider")
-            .and_then(Value::as_str)
-            .or_else(|| config.get("profile").and_then(Value::as_str)),
-        ExecutorKind::Codex => config.get("profile").and_then(Value::as_str),
+        ExecutorKind::Smith => {
+            nonempty_str(config.get("provider")).or_else(|| nonempty_str(config.get("profile")))
+        }
+        ExecutorKind::Codex => {
+            let mut parts = Vec::new();
+            if let Some(profile) = nonempty_str(config.get("profile")) {
+                parts.push(format!("profile={profile}"));
+            }
+            if let Some(home) =
+                nonempty_str(config.get("env").and_then(|env| env.get("CODEX_HOME")))
+            {
+                parts.push(format!("home={home}"));
+            }
+            if let Some(cmd) = nonempty_str(config.get("base_command_override")) {
+                parts.push(format!("cmd={cmd}"));
+            }
+            (!parts.is_empty()).then(|| parts.join(","))
+        }
         _ => None,
     };
     match discriminator {
         Some(value) => format!("{kind}:{value}"),
         None => kind.to_string(),
     }
+}
+
+fn nonempty_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// FNV-1a over a canonical (key-sorted, session-stripped) rendering of the
@@ -740,6 +762,35 @@ mod tests {
                 &serde_json::json!({"model": "opus"})
             ),
             "claude_code"
+        );
+    }
+
+    #[test]
+    fn account_key_separates_codex_homes_and_cli_overrides() {
+        assert_eq!(
+            account_key(&ExecutorKind::Codex, &serde_json::json!({})),
+            "codex"
+        );
+        assert_eq!(
+            account_key(
+                &ExecutorKind::Codex,
+                &serde_json::json!({"env": {"CODEX_HOME": "~/.codex2"}})
+            ),
+            "codex:home=~/.codex2"
+        );
+        assert_eq!(
+            account_key(
+                &ExecutorKind::Codex,
+                &serde_json::json!({"base_command_override": "codex2"})
+            ),
+            "codex:cmd=codex2"
+        );
+        assert_ne!(
+            account_key(
+                &ExecutorKind::Codex,
+                &serde_json::json!({"env": {"CODEX_HOME": "~/.codex2"}})
+            ),
+            account_key(&ExecutorKind::Codex, &serde_json::json!({}))
         );
     }
 

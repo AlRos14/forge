@@ -43,6 +43,14 @@ impl PromptBuilder for ReviewerPromptBuilder {
             .and_then(|value| value.as_str());
 
         let mut user = format!("Review task: {}\n", ctx.task.title);
+        let plan_review = ctx.state_name == crate::workflow::default_states::PLAN_REVIEW;
+        if plan_review {
+            user.push_str(
+                "\nThis run reviews the current plan revision only. Do not audit implementation or require a git diff.\n\
+Write a short critique the planner can act on: what is wrong or missing, why it matters, and the change you want in the next plan revision.\n\
+Use fail when the planner should revise. Use pass only when the plan is ready for a human to approve before coding.\n",
+            );
+        }
 
         user.push_str(&format!("Task ID: {}\n", ctx.task.id));
         user.push_str(&format!("Status: {}\n", ctx.task.status));
@@ -131,10 +139,18 @@ impl PromptBuilder for ReviewerPromptBuilder {
         user.push_str(VERDICT_INSTRUCTION);
         user.push('\n');
 
-        AgentPrompt {
-            system: format!(
+        let system = if plan_review {
+            format!(
+                "You are the reviewer for this plan, in a new session. You do not implement. Critique the plan and leave comments the planner can use for the next revision. Fail returns to the planner. Pass waits for a human before coding.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{VERDICT_INSTRUCTION}"
+            )
+        } else {
+            format!(
                 "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{VERDICT_INSTRUCTION}"
-            ),
+            )
+        };
+
+        AgentPrompt {
+            system,
             user,
             tools: default_tool_names(default_roles::REVIEWER),
         }

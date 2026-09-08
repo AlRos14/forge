@@ -350,6 +350,25 @@ export function TaskDetailPage({
     )
   }
 
+  const onSavePlanReview = (enabled: boolean) => {
+    if (!task) return
+    const nextConfig: Record<string, unknown> = { ...readTaskStateConfig(task) }
+    if (enabled) nextConfig.plan_review = true
+    else delete nextConfig.plan_review
+    const body: UpdateTaskRequestWithStateConfig = {
+      version: task.version,
+      task_state_config: nextConfig,
+    }
+    updateTask.mutate(
+      { taskId: task.id, body },
+      {
+        onSuccess: () =>
+          toast.success(enabled ? 'Plan review enabled' : 'Plan review disabled'),
+        onError: (error) => toast.error(getApiErrorMessage(error, 'Plan review update failed')),
+      },
+    )
+  }
+
   const onStatusChange = (status: string, reason?: string) => {
     if (!task || status === task.status) return
     transitionTask.mutate(
@@ -626,6 +645,7 @@ export function TaskDetailPage({
               onStopExecution={(executionId) => stopExecution.mutate(executionId)}
               onReExecuteExecution={(executionId) => reExecuteExecution.mutate(executionId)}
               onSaveRetryBudgets={onSaveRetryBudgets}
+              onSavePlanReview={onSavePlanReview}
             />
           )}
 

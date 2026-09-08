@@ -10,6 +10,7 @@ import { isInitialKind } from '@/lib/workflow-utils'
 import type { Agent, Task } from '@/types/generated'
 import type { ColumnGroup } from '@/lib/workflow-utils'
 import { KanbanTaskCard } from './kanban-task-card'
+import { PlanReviewCheckbox } from '@/components/plan-review-checkbox'
 
 export function KanbanColumn({
   column,
@@ -24,6 +25,7 @@ export function KanbanColumn({
   quickCreateDescription,
   quickCreateDescriptionRef,
   createPending,
+  quickCreatePlanReview,
   agentPickerTaskId,
   agents,
   agentNamesById,
@@ -32,6 +34,7 @@ export function KanbanColumn({
   onToggleQuickCreate,
   onQuickCreateTitleChange,
   onQuickCreateDescriptionChange,
+  onQuickCreatePlanReviewChange,
   onSubmitQuickCreate,
   onCancelQuickCreate,
   onAssignAgent,
@@ -53,6 +56,7 @@ export function KanbanColumn({
   quickCreateDescription: string
   quickCreateDescriptionRef: RefObject<HTMLTextAreaElement>
   createPending: boolean
+  quickCreatePlanReview: boolean
   agentPickerTaskId?: string
   agents: Agent[]
   agentNamesById: Map<string, string>
@@ -61,6 +65,7 @@ export function KanbanColumn({
   onToggleQuickCreate: () => void
   onQuickCreateTitleChange: (title: string) => void
   onQuickCreateDescriptionChange: (description: string) => void
+  onQuickCreatePlanReviewChange: (enabled: boolean) => void
   onSubmitQuickCreate: () => void
   onCancelQuickCreate: () => void
   onAssignAgent: (task: Task, agentId: string) => void
@@ -158,6 +163,12 @@ export function KanbanColumn({
                     onCancelQuickCreate()
                   }
                 }}
+              />
+              <PlanReviewCheckbox
+                compact
+                checked={quickCreatePlanReview}
+                disabled={createPending}
+                onChange={onQuickCreatePlanReviewChange}
               />
               <div className="flex items-center gap-1">
                 <Button

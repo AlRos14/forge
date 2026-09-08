@@ -76,6 +76,16 @@ pub fn effective_role(state: &StateDefinition) -> Option<&str> {
     None
 }
 
+pub(crate) fn task_requests_plan_review(task_state_config: Option<&str>) -> bool {
+    let Some(raw) = task_state_config else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.get("plan_review").and_then(|flag| flag.as_bool()))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind};

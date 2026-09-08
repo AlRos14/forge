@@ -438,7 +438,47 @@ describe('FederatedAgentsPage', () => {
           reasoning_effort: 'high',
           permission_policy: 'supervised',
           version: 3,
+          config_json: {},
         },
+      }),
+    )
+  })
+
+  it('persists a custom harness CLI command on create and edit', async () => {
+    renderPage()
+    fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
+    const wizard = within(screen.getByRole('dialog'))
+    fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
+    fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))
+    fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Codex work' } })
+    fireEvent.change(wizard.getByLabelText('Codex home'), { target: { value: '~/.codex2' } })
+    fireEvent.change(wizard.getByLabelText('CLI command'), { target: { value: 'codex2' } })
+    fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
+    await vi.waitFor(() =>
+      expect(registerHarnessAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'Codex work',
+          executor_type: 'codex',
+          config_json: {
+            base_command_override: 'codex2',
+            env: { CODEX_HOME: '~/.codex2' },
+          },
+        }),
+      ),
+    )
+
+    fireEvent.click(screen.getByText('Codex Runner'))
+    fireEvent.click(screen.getByRole('button', { name: /edit agent…/i }))
+    const editor = within(screen.getByRole('dialog'))
+    fireEvent.change(editor.getByLabelText('Codex home'), { target: { value: '~/.codex2' } })
+    fireEvent.change(editor.getByLabelText('CLI command'), { target: { value: '' } })
+    fireEvent.click(editor.getByRole('button', { name: /save changes/i }))
+    await vi.waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith({
+        agentId: 'agent-2',
+        body: expect.objectContaining({
+          config_json: { env: { CODEX_HOME: '~/.codex2' } },
+        }),
       }),
     )
   })

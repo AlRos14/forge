@@ -845,6 +845,7 @@ export interface CreateTaskRequest {
   review_config?: ReviewConfig | null
   merge_config?: Record<string, unknown> | null
   role_assignments?: InitialRoleAssignment[] | null
+  task_state_config?: Record<string, unknown> | null
 }
 
 export interface UpdateTaskRequest {

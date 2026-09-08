@@ -78,6 +78,43 @@ impl TaskService {
         }
     }
 
+    /// Current agent assigned to this execution role. Worker aliases
+    /// (`coder` / `executor` / `worker`) share one assignment.
+    pub(crate) async fn assigned_agent_for_role(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> Result<Option<String>> {
+        for role_name in role_assignment_lookup_names(role) {
+            let Some(assignment) =
+                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?
+            else {
+                continue;
+            };
+            if assignment.assignee_type == Some(AssigneeKind::Agent) {
+                if let Some(agent_id) = assignment.assignee_id {
+                    return Ok(Some(agent_id));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Role assignment wins over a previous execution's agent. After a
+    /// quota-driven reassignment, retry must mint a lease for the new
+    /// principal — not the exhausted one.
+    pub(crate) async fn resolve_role_agent_id(
+        &self,
+        task_id: &str,
+        role: &str,
+        fallback: Option<String>,
+    ) -> Result<Option<String>> {
+        if let Some(assigned) = self.assigned_agent_for_role(task_id, role).await? {
+            return Ok(Some(assigned));
+        }
+        Ok(fallback)
+    }
+
     pub async fn coder_assignment(&self, task_id: &str) -> Result<Option<TaskRoleAssignment>> {
         validate_required("task_id", task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
@@ -569,6 +606,15 @@ pub(crate) struct RoleSweepEvent {
     pub(crate) role_name: String,
     pub(crate) previous_assignment: TaskRoleAssignment,
     pub(crate) new_assignment: TaskRoleAssignment,
+}
+
+fn role_assignment_lookup_names(role: &str) -> Vec<&str> {
+    match role.trim() {
+        "coder" | "executor" | "worker" | "task-worker" => {
+            vec!["coder", "executor", "worker", "task-worker"]
+        }
+        other => vec![other],
+    }
 }
 
 fn same_assignment(

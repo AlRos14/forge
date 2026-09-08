@@ -290,6 +290,9 @@ pub(super) async fn build_executor_config_snapshot(
         "config": normalized_config,
         "capabilities": capabilities,
         "resolved_daemon_id": resolved_daemon_id,
+        // GET /agents/{id}/usage keys by agent.daemon_id, not the auto-resolved
+        // daemon. Persist the same pin so live snapshots land on that key.
+        "agent_daemon_id": agent.daemon_id,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),
     });
