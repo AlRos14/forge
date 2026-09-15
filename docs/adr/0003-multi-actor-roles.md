@@ -10,8 +10,10 @@ co-planners, and cooperating orchestrators.
 ## Decision
 
 TaskRole owns a coordination mode and a set of RoleMembership records. An
-Actor may belong to several roles on one Task. Execution records the role
-actually performed.
+Actor may belong to several roles on one Task. RoleMembership records
+participation only; it has no WorkUnit, path, concrete scope, or current
+assignment field. WorkUnit allocation and historical attempts belong to
+WorkUnit and Execution. Execution records the role actually performed.
 
 ## Consequences
 

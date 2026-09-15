@@ -17,7 +17,6 @@ RoleMembership
   task_role_id
   actor_ref
   status
-  scope or work-unit references
   created_at
   ended_at
 ~~~
@@ -25,6 +24,12 @@ RoleMembership
 A TaskRole contains zero or more memberships. The initial role vocabulary is
 planner, implementer, reviewer, and orchestrator. Persistence may support
 future role names without hard-coding role-specific classes.
+
+RoleMembership records participation in a TaskRole only. It does not contain a
+WorkUnit, path, concrete scope, or assignment reference. Allocation belongs to
+WorkUnit and Execution: an implementer may remain a member while moving
+between WorkUnits, and changing that allocation never rewrites membership
+history.
 
 The same Actor can belong to several roles on one Task. Each Execution records
 the concrete Role, so an Actor acting as orchestrator and later reviewer has

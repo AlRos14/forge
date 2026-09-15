@@ -36,12 +36,17 @@ The same purpose can run under different permissions, and the same role can
 perform different purposes. The platform must not use a plan purpose as a
 permission mode.
 
+Purpose `validate` is for Actor-driven validation cognition, such as
+investigation, reproduction, or interpretation. Deterministic commands and
+trusted checks use a core-controlled ValidationRun instead; they do not need a
+Human, Agent, HarnessSession, or fake System Actor.
+
 ## Immutability and lineage
 
-Actor, Role, Purpose, Agent, HarnessProfile, capabilities, Workspace, and
-HarnessSession references become immutable after the Execution starts. Parent
-Execution records causality and rework lineage. It does not imply that a child
-shares a session or authority.
+Actor, Role, Purpose, Agent, HarnessProfileRevision, capabilities, Workspace,
+and HarnessSession references become immutable after the Execution starts.
+Parent Execution records causality and rework lineage. It does not imply that
+a child shares a session or authority.
 
 Outputs are generic Artifact and Evidence references. Execution status records
 operational lifecycle; a reviewer verdict or validation result is not hidden

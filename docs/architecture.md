@@ -61,6 +61,7 @@ Project
     │   ├── Purpose
     │   ├── HarnessSession?
     │   └── Workspace?
+    ├── ValidationRun*
     ├── Artifact*
     ├── Gate*
     ├── Evidence*
@@ -73,10 +74,12 @@ Project
 Actor
 ├── Human
 └── Agent
+    ├── Harness identity
+    ├── Credential/account context?
     └── HarnessProfile
-        ├── Harness
-        ├── Model
-        └── Configuration
+        └── HarnessProfileRevision
+            ├── Model
+            └── Configuration
 ~~~
 
 Every durable record is scoped to the owning account and, where applicable,
@@ -89,17 +92,21 @@ An Actor is the universal participant abstraction. The initial kinds are Human
 and Agent. Both can plan, implement, review, orchestrate, communicate, create
 artifacts, and occupy several roles at once.
 
-An Agent is a persistent AI Actor bound to a specific HarnessProfile. The
+An Agent is a persistent AI Actor bound to a stable harness identity. The
 harness is part of the Agent's identity because it changes tools, interaction
 loop, context handling, editing strategy, approvals, planning, sessions, model
 steering, and reasoning environment. Two records such as GPT-5.6 Sol in Codex
 and GPT-5.6 Sol in Cursor are therefore different Agents even if their model
-labels match.
+labels match. An identity-bearing credential or account context is also part
+of the Agent identity when it changes which native account performs work.
 
-Changing an Agent's harness must not silently mutate its identity. Create
-another Agent when the harness changes. Profile/model evolution may be
-versioned, but each Execution snapshots the exact configuration and
-capabilities used. See [actors.md](concepts/actors.md) and
+A `HarnessProfileRevision` tunes future runs: model, reasoning effort,
+approval policy, sandbox settings, and non-identity harness arguments. A
+compatible configuration change may create a new profile revision on the same
+Agent. Changing the harness, account, or another identity-bearing property
+creates another Agent rather than silently mutating identity. Each Execution
+snapshots the exact effective profile, account context, and capabilities used.
+See [actors.md](concepts/actors.md) and
 [agents-and-harnesses.md](concepts/agents-and-harnesses.md).
 
 The platform exposes capability support dimensionally. A capability is
@@ -115,6 +122,10 @@ reviewer, and orchestrator, but persistence must not hard-code behavior solely
 from a string.
 
 A TaskRole has a coordination policy and zero or more RoleMembership records.
+Membership records participation only. They do not own a WorkUnit, path,
+concrete scope, or current assignment. WorkUnit allocation and historical
+attempts belong to WorkUnit and Execution, so an Actor can remain a member
+while moving between WorkUnits without rewriting membership history.
 The policies are:
 
 | Mode | Meaning | Typical use |
@@ -154,6 +165,22 @@ Execution.
 
 See [executions.md](concepts/executions.md) and
 [sessions.md](concepts/sessions.md).
+
+## Deterministic validation runs
+
+Core-controlled checks are not Actor cognition and do not require an Actor,
+Agent, HarnessSession, or fake System Actor. They are represented by a
+`ValidationRun` that records the Task/WorkUnit or related Execution context,
+check or command identity, bounded environment/configuration summary,
+workspace and commit identity, lifecycle timestamps, status, exit code, and a
+log/output reference. A ValidationRun produces Evidence and may produce a
+generic validation-report Artifact.
+
+An Actor may still perform cognitive validation work—such as investigating a
+failed test, reproducing a bug, or interpreting security output—through an
+ordinary Execution with purpose `validate` or `investigate`. That Execution
+does not turn deterministic checks into Actor-owned work. Validation and
+review remain independent Gate inputs.
 
 ## Planning and WorkUnits
 
@@ -230,9 +257,11 @@ See [orchestration.md](concepts/orchestration.md).
 
 ## Review, validation, and gates
 
-Validation is deterministic evidence: tests, typechecks, lint, builds,
-security scanners, and required commands. Review is cognitive judgment by a
-reviewer Actor. Neither implies the other.
+Validation is deterministic evidence from ValidationRuns: tests, typechecks,
+lint, builds, security scanners, and required commands. Actor-driven
+validation is ordinary cognitive work recorded as an Execution. Review is
+cognitive judgment by a reviewer Actor. Neither validation form implies that
+review passed, and review never implies that a deterministic check ran.
 
 A reviewer inspects work, evidence, and criteria, then produces a generic
 review Artifact with findings and a verdict. A reviewer does not become an
@@ -386,8 +415,10 @@ reviewer, and orchestrator actions use the same domain records as Agent work.
 The UI shows Agent harness identity clearly; it does not collapse same-model
 Agents across harnesses.
 
-This PR 0 does not rewrite the product README, public API reference, CLI
-surface, or branding. Those remain explicitly staged for later PRs.
+This PR 0 does not change the product runtime, public API, CLI surface, or
+branding. It corrects current API-reference text where necessary so it does
+not describe unimplemented behavior; new public domain surfaces remain staged
+for later PRs.
 
 ## Migration sequence
 

@@ -9,9 +9,10 @@ fragile bidirectional synchronization.
 
 ## Decision
 
-WorkUnit is executable scope with dependencies and assignment context. A plan
-is an Artifact. A WorkUnit may reference a plan without becoming its
-representation.
+WorkUnit is executable scope with dependencies and allocation/assignment
+context. RoleMembership remains only TaskRole participation and does not own
+that scope. A plan is an Artifact. A WorkUnit may reference a plan without
+becoming its representation.
 
 ## Consequences
 

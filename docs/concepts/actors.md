@@ -32,12 +32,14 @@ collaboration model are not.
 
 ## Agent
 
-An Agent is a persistent AI Actor bound to one HarnessProfile. Harness identity
-is part of the Agent's identity. A model label alone is insufficient to
-identify an Agent.
+An Agent is a persistent AI Actor bound to a stable harness identity. When
+credential or account context is identity-bearing, it is part of the Agent
+identity as well. A model label alone is insufficient to identify an Agent.
 
-Agent configuration changes are versioned or create a new Agent. Existing
-Executions keep their configuration and capability snapshots. A later profile
+Compatible configuration changes create a new HarnessProfileRevision on the
+same Agent; changing the harness, account, or another identity-bearing
+execution context creates another Agent. Existing Executions keep their exact
+configuration, account context, and capability snapshots. A later profile
 change never rewrites historical work.
 
 ## Actor lifecycle

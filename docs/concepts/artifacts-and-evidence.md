@@ -28,12 +28,15 @@ is never a bearer capability and must be checked against the owning scope.
 ## Evidence
 
 Evidence is a typed observation used by a Gate, projection, or audit. It
-records what was observed, by which Actor or deterministic process, from which
-Execution/Workspace/commit, when, and with what digest or log reference.
+records what was observed, by which Actor, ValidationRun, or other
+deterministic process, from which Execution/Workspace/commit when applicable,
+when, and with what digest or log reference.
 
 Validation results, review findings, integration conflicts, capability
 observations, and usage snapshots can all be Evidence without requiring
-bespoke persistence for each output category.
+bespoke persistence for each output category. A deterministic ValidationRun
+is the producer for automated checks; it is not an Actor and does not need a
+HarnessSession.
 
 Evidence is not an approval. A model statement, Artifact, or green UI
 projection cannot satisfy a Human Gate unless the Gate records the required

@@ -11,7 +11,8 @@ is already implemented.
 PR 0 changes documentation only:
 
 * it defines the independent Actor, Agent, Harness, Role, Execution,
-  HarnessSession, WorkUnit, Artifact, Evidence, Gate, and collaboration model;
+  ValidationRun, HarnessSession, WorkUnit, Artifact, Evidence, Gate, and
+  collaboration model;
 * it records the distinction between orchestration, cognition, and deterministic
   authority;
 * it documents the migration order, compatibility rules, ADRs, and current
@@ -69,11 +70,15 @@ differ; domain authority does not.
 
 ### INV-003 — Agent is harness-bound
 
-An Agent is a persistent AI Actor bound to a specific HarnessProfile. Harness
-identity materially affects tools, interaction, context, editing, approvals,
-planning, sessions, steering, and reasoning. Changing the harness creates
-another Agent rather than silently mutating identity. Exact execution
-configuration is snapshotted.
+An Agent is a persistent AI Actor bound to a stable harness identity and an
+effective HarnessProfileRevision. Harness identity materially affects tools,
+interaction, context, editing, approvals, planning, sessions, steering, and
+reasoning. An identity-bearing credential or account context is part of the
+Agent identity when it changes which native account performs work. Changing
+the harness, account, or another identity-bearing property creates another
+Agent rather than silently mutating identity. Compatible run configuration may
+create a new profile revision on the same Agent. Exact execution
+configuration, account context, and capabilities are snapshotted.
 
 ### INV-004 — Agent is not Role
 
@@ -216,8 +221,16 @@ investigation, API contract, and test report.
 
 ### INV-028 — Validation and Review are different
 
-Validation is deterministic evidence. Review is cognitive judgment. Each may
-be a Gate, and neither implies the other.
+Deterministic validation is a core-controlled `ValidationRun`, not an Actor
+Execution. A ValidationRun records the check/command identity, bounded
+environment/configuration summary, workspace/commit identity, timestamps,
+status, exit code, and log/output reference. It does not require a Human,
+Agent, HarnessSession, or fake System Actor and produces Evidence plus an
+optional generic validation-report Artifact. A Human or Agent may perform
+cognitive validation through an ordinary Execution with purpose `validate` or
+`investigate`. Review is cognitive judgment recorded by a reviewer Execution.
+CI passing does not imply review passing, and review passing does not imply a
+ValidationRun ran. Both may be Gates.
 
 ### INV-029 — Review feedback is collaboration
 
@@ -319,6 +332,7 @@ fallback is authorized by PR 0.
 | PR | Additive contract | Legacy readers/writers that remain temporarily | Required cleanup |
 | --- | --- | --- | --- |
 | 0 | Documentation, invariants, ADRs, audit | All current paths | None; review and merge before PR 1 |
+| 0A | Operational reconciliation: execution log rotation/storage, Cursor large-prompt transport, explicit launch/env configuration, usage/quota observations, WorkspaceLease revision independence, and salvage classification for legacy PR #2 and local commits | Existing singular sessions, workflow cognition, special planning/review paths | Review/merge before PR 1; explicit sessions and role migration remain in PRs 1/2 |
 | 1 | ActorRef, TaskRole, RoleMembership, coordination mode | Singular task_role_assignment | New membership authority; remove old role path in PR 13 |
 | 2 | ExecutionPurpose and HarnessSession | execution.agent_session_id and inferred resume paths | Explicit session authority; remove compatibility in PR 13 |
 | 3 | HarnessAdapter and dimensional capabilities | TaskExecutor/CodingExecutorAdapter facade | All harness calls route through adapter; remove facade when consumers finish |
@@ -343,7 +357,9 @@ that is documented and reviewed.
 
 The PR 0 documents answer these questions:
 
-* An Agent is a persistent AI Actor bound to a specific HarnessProfile.
+* An Agent is a persistent AI Actor bound to a stable harness identity and an
+  effective HarnessProfileRevision; identity-bearing account context is part
+  of that identity when applicable.
 * Codex Sol and Cursor Sol are different Agents because the harness changes
   tools, context, approvals, planning, sessions, and execution semantics.
 * A Human can implement, plan, review, or orchestrate through ordinary

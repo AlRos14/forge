@@ -2,7 +2,8 @@
 
 ## Harness-bound identity
 
-An Agent is an AI Actor plus a specific HarnessProfile. The harness materially
+An Agent is an AI Actor plus a stable harness identity and an effective
+HarnessProfileRevision. The harness materially
 changes:
 
 * available tools and execution protocol;
@@ -16,12 +17,25 @@ Therefore GPT-5.6 Sol in Codex and GPT-5.6 Sol in Cursor are distinct Agent
 records. Reusing the same display name or model identifier must not collapse
 them.
 
-## HarnessProfile
+## Agent identity and profile revisions
 
-A HarnessProfile is a versioned execution configuration containing at least:
+An Agent identity includes the stable harness identity and, when credentials
+are identity-bearing, an explicit credential/account context or reference. A
+profile revision tunes future runs without silently rewriting that identity.
+The conceptual shape is:
 
 ~~~text
-HarnessProfile
+Agent
+  harness identity
+  credential/account context?
+  active HarnessProfileRevision
+~~~
+
+`HarnessProfileRevision` is a versioned execution configuration containing at
+least:
+
+~~~text
+HarnessProfileRevision
   harness_kind
   model or model profile
   provider configuration reference
@@ -36,6 +50,14 @@ snapshots the effective profile and relevant configuration at start.
 
 Changing the harness of an existing Agent creates another Agent. A compatible
 profile revision can evolve future Executions without rewriting history.
+Changing the Agent's credential/account identity creates another Agent when
+that context materially changes which native account is used. Changing model,
+reasoning effort, approval policy, sandbox settings, or other non-identity
+harness arguments may create a new profile revision on the same Agent.
+
+The final persistence shape is owned by PR 1/2. Regardless of representation,
+each Execution snapshots the exact effective profile, credential context, and
+capabilities used; later profile revisions never rewrite historical Executions.
 
 ## HarnessAdapter
 

@@ -5,19 +5,26 @@ truth.
 
 ## Validation
 
-Validation is deterministic evidence from commands or trusted checks:
+Deterministic validation is represented by a core-controlled `ValidationRun`,
+not by an Actor Execution. A ValidationRun does not require a Human, Agent,
+HarnessSession, or fake System Actor. It records:
 
-* tests;
-* typecheck;
-* lint;
-* build;
-* security scanner;
-* required project command.
+* the command or check identity;
+* bounded environment and configuration summary;
+* workspace and commit identity;
+* start and finish times;
+* status and exit code;
+* a log or output reference.
 
-A validation Execution records exact command, environment/configuration
-summary, start and finish, exit code, output tail or log reference, commit or
-workspace identity, and status. It produces Evidence and normally a generic
-validation-report Artifact.
+The run produces Evidence and may produce a generic validation-report
+Artifact. Typical checks include tests, typecheck, lint, build, security
+scanners, and required repository commands.
+
+An Actor may perform validation-related cognitive work through an ordinary
+Execution with purpose `validate` or `investigate`: for example, reproducing a
+failure, investigating its cause, or interpreting scanner output. That is
+distinct from the deterministic ValidationRun and may itself produce an
+Artifact or Evidence.
 
 Passing validation does not imply review passed. Validation may run without a
 review and review may be required even when no validation command exists.

@@ -7,7 +7,8 @@ operation. It does not contain model cognition.
 
 A Gate may require:
 
-* validation Evidence or a named command;
+* validation Evidence from a ValidationRun or an Actor-driven validation
+  Execution, or a named command that Forge materializes as a ValidationRun;
 * one or more reviewer Artifacts and verdicts;
 * a Human action;
 * a Proposal Decision;

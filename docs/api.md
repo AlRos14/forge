@@ -225,9 +225,8 @@ reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | POST   | `/api/v1/executions/{id}/follow-up` | Continue an execution session manually; completion does not advance the task workflow |
-| POST   | `/api/v1/executions/{id}/resume` | Resume a blocked workflow execution with the current workflow role; completion may advance the task |
 | POST   | `/api/v1/executions/{id}/re-execute` | Start a new execution for the current workflow role and current role assignment, without session continuity |
-| GET    | `/api/v1/executions/{id}/logs` | Get the continuous execution log across active and compressed segments |
+| GET    | `/api/v1/executions/{id}/logs` | Read the current execution JSONL log with sequence pagination or a bounded tail |
 | GET    | `/api/v1/workspaces/{id}/diff` | Get workspace diff |
 | GET    | `/api/v1/notifications` | List notifications (paginated, filterable by `project_id`, `read`) |
 | GET    | `/api/v1/notifications/unread-count` | Unread notification count |
@@ -1643,38 +1642,24 @@ metadata, not by agent-private transcript storage. See
 [execution-logs.md](execution-logs.md) for the adapter-specific details and
 log schema.
 
-### Execution log storage and pagination
+### Execution log pagination
 
-`GET /api/v1/executions/{id}/logs` reads the complete logical log across rotated
-segments. Responses keep `items`, `has_more`, and `next_sequence`; use
-`from_sequence` and `limit` to page through history, including compressed events.
-`tail` reads the newest entries with optional preceding turn context, bounded to
-1,000 entries. Earlier entries remain available through sequence pagination.
-Live `execution.log` events continue across rotations with continuous sequences.
+`GET /api/v1/executions/{id}/logs` reads the execution's current JSONL log.
+Responses contain `items`, `has_more`, and `next_sequence`; use
+`from_sequence` and `limit` to page through the available entries. `tail`
+returns a bounded newest-entry view. The current PR0 implementation does not
+promise rotated-segment history or a complete export from `logs_path`; lossless
+rotation and cross-segment reads are operational work owned by PR0A.
 
-The on-disk `logs_path` identifies the active JSONL segment. Closed segments are
-losslessly compressed under `<logs_path>.d/`; reading only the active file is not
-a full export. The 10 MiB threshold rotates storage rather than truncating output.
-Forge preserves historical logs and does not automatically delete old segments.
+### Manual continuation and re-execution
 
-### Workflow resume versus manual continuation
+`POST /api/v1/executions/{id}/follow-up` is the manual continuation path. It
+preserves the parent session when supported, uses the interactive role, and
+does not advance the task workflow when it completes.
 
-`POST /api/v1/executions/{id}/resume` accepts:
-
-```json
-{
-  "task_version": 16,
-  "context": "optional operator context"
-}
-```
-
-The request requires the task's current version and an available recovery
-session. Forge clears the blocking annotation, creates a child execution using
-the role required by the task's current workflow state, and resumes the
-session context from the target execution. A successful completion participates
-in the normal workflow cascade.
-
-`POST /api/v1/executions/{id}/follow-up` remains the manual continuation path.
-It preserves the session but uses the `interactive` role and therefore does not
-advance the workflow when it completes. Clients should use the task's
-`execution_actions` response to choose between these actions.
+`POST /api/v1/executions/{id}/re-execute` starts a new execution for the
+current legacy workflow role and role assignment without session continuity;
+completion may participate in the existing workflow cascade. These endpoints
+describe the transitional execution surface that remains until the explicit
+HarnessSession, Actor, and lifecycle migrations. They are not the target
+identity mechanism.
