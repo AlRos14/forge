@@ -224,7 +224,10 @@ reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | POST   | `/api/v1/actions/{id}/execute-task` | Create the authoritative Task through TaskService and audit the outcome |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
-| GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
+| POST   | `/api/v1/executions/{id}/follow-up` | Continue an execution session manually; completion does not advance the task workflow |
+| POST   | `/api/v1/executions/{id}/resume` | Resume a blocked workflow execution with the current workflow role; completion may advance the task |
+| POST   | `/api/v1/executions/{id}/re-execute` | Start a new execution for the current workflow role and current role assignment, without session continuity |
+| GET    | `/api/v1/executions/{id}/logs` | Get the continuous execution log across active and compressed segments |
 | GET    | `/api/v1/workspaces/{id}/diff` | Get workspace diff |
 | GET    | `/api/v1/notifications` | List notifications (paginated, filterable by `project_id`, `read`) |
 | GET    | `/api/v1/notifications/unread-count` | Unread notification count |
@@ -465,7 +468,8 @@ different CLI); a task interrupted because every candidate is unavailable
 carries the `executor_unavailable` failure kind and does not consume its
 execution retry budget. Duplicate candidates and unknown executor types are
 rejected at dispatch time; an empty `{}` candidate config is valid. See
-[architecture.md](architecture.md#executor-fallback-chains).
+[agents and harnesses](concepts/agents-and-harnesses.md) for the target
+harness-bound identity and explicit failover contract.
 
 ## Main and Project Agent bindings
 
@@ -1177,8 +1181,8 @@ existing daemon transport when the task is directly assigned to an agent with
 `daemon_id`, or when the current workflow state's effective role assignment
 points to an agent with `daemon_id`. Tasks without an agent daemon use the
 embedded server PTY path. See the
-[task terminal architecture](architecture.md#task-terminal-sessions) for the
-full design rationale.
+[workspace isolation and WorkUnits](concepts/work-units.md#isolation) for the
+target isolation contract.
 
 | Method | Direction | Params | Result |
 |--------|-----------|--------|--------|
@@ -1638,3 +1642,39 @@ Execution chat history is backed by Forge JSONL logs plus execution prompt
 metadata, not by agent-private transcript storage. See
 [execution-logs.md](execution-logs.md) for the adapter-specific details and
 log schema.
+
+### Execution log storage and pagination
+
+`GET /api/v1/executions/{id}/logs` reads the complete logical log across rotated
+segments. Responses keep `items`, `has_more`, and `next_sequence`; use
+`from_sequence` and `limit` to page through history, including compressed events.
+`tail` reads the newest entries with optional preceding turn context, bounded to
+1,000 entries. Earlier entries remain available through sequence pagination.
+Live `execution.log` events continue across rotations with continuous sequences.
+
+The on-disk `logs_path` identifies the active JSONL segment. Closed segments are
+losslessly compressed under `<logs_path>.d/`; reading only the active file is not
+a full export. The 10 MiB threshold rotates storage rather than truncating output.
+Forge preserves historical logs and does not automatically delete old segments.
+
+### Workflow resume versus manual continuation
+
+`POST /api/v1/executions/{id}/resume` accepts:
+
+```json
+{
+  "task_version": 16,
+  "context": "optional operator context"
+}
+```
+
+The request requires the task's current version and an available recovery
+session. Forge clears the blocking annotation, creates a child execution using
+the role required by the task's current workflow state, and resumes the
+session context from the target execution. A successful completion participates
+in the normal workflow cascade.
+
+`POST /api/v1/executions/{id}/follow-up` remains the manual continuation path.
+It preserves the session but uses the `interactive` role and therefore does not
+advance the workflow when it completes. Clients should use the task's
+`execution_actions` response to choose between these actions.

@@ -3,7 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 The user-facing entry point is [README.md](README.md). Deeper material is split across `docs/`:
-- [docs/architecture.md](docs/architecture.md) — crate graph, state machine, workflow engine, DB.
+- [docs/architecture.md](docs/architecture.md) — target Actor/harness orchestration architecture and preserved infrastructure.
+- [docs/migration/architecture-v2.md](docs/migration/architecture-v2.md) — PR-by-PR migration contract, invariants, and current dependency audit.
 - [docs/api.md](docs/api.md) — REST surface, pagination, MCP tools.
 - [docs/getting-started.md](docs/getting-started.md) — install, configuration, end-to-end walkthrough.
 - [docs/cli.md](docs/cli.md) — `forge-ctl` reference.
@@ -76,9 +77,9 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 
 ## When working on this repo
 
-- **Read `docs/architecture.md` before changing service wiring, the workflow engine, or the task state machine.** That doc is the source of truth for the lifecycle, hook ordering, role assignment, and retry-budget rules.
+- **Read `docs/architecture.md` and `docs/migration/architecture-v2.md` before changing domain wiring, execution, workflow, role assignment, or task lifecycle.** The target Actor/harness contract is authoritative; the current workflow and singular-assignee paths are transitional until their named migration PRs.
 - **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Update all four in one change.
-- **State-machine changes** must keep `crates/api/tests/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
+- **Lifecycle changes** must keep `crates/api/tests/happy_path.rs` green, name the touched invariants, and update the target lifecycle/Gate documentation. Do not encode actor cognition as an exclusive Task state.
 - **Migrations** are numbered `V{NNN}__{name}.sql`. Add a new file; don't edit historical migrations even during beta — users have running databases.
 - **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
 - **Concurrency**: tasks and agents use a `version` column. Updates require `WHERE version = ?` and increment on success. Version mismatch → `DbError::VersionConflict` → HTTP 409.
@@ -86,26 +87,27 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 
 ## Architecture summary (reference only)
 
-The full version lives in [docs/architecture.md](docs/architecture.md). Quick orientation:
+The target model lives in [docs/architecture.md](docs/architecture.md), with
+the ordered migration contract in
+[docs/migration/architecture-v2.md](docs/migration/architecture-v2.md).
 
 ```
 forge-cli → api → services → db
-                → events      ↑
-          → mcp-server -------┘
-          → executors → workspace → git
+                → events
+          → mcp-server → same domain primitives
+          → HarnessAdapter → cli-adapters → forge-daemon
+          → workspace → git
           → config
-          → api-types (shared, zero internal deps)
+          → api-types
 ```
 
-- **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.
-- **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, hands them to `AppState::new()` which builds `TaskService` / `AgentService` internally. `AppState` is `Clone` (all fields `Arc`) and used as Axum state.
-- **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
-- **Workflow engine** — `crates/services/src/workflow/engine.rs` is the new data-driven path; `TaskService.transition()` still uses the legacy `TaskStatus`/`transition_allowed` path. Treat the engine as a parallel code path until that split is removed. Default workflow lives in `default_workflow.rs`.
-- **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.
-- **Review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc` commands in the worktree; empty steps auto-pass.
-- **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.
-- **Workspace** — file-based locking via `.forge.lock`; path validation prevents traversal escapes.
-- **Config precedence** — CLI flags > env vars > config file > defaults. Default bind `127.0.0.1:8080`.
+- **Domain boundary** — Humans and harness-bound Agents are peer Actors; Roles are Task-scoped memberships; Executions record one Actor, Role, and Purpose.
+- **Cognition boundary** — harnesses own model loops and native capabilities; Forge owns work, authority, collaboration, evidence, and lifecycle.
+- **Isolation** — concurrent mutating WorkUnits use separate branches/worktrees and explicit leases; integration is deterministic and locked.
+- **Persistence** — SQLite repositories and numbered migrations remain the current infrastructure; replacement schema is additive until PR 13.
+- **Events** — durable domain records are authoritative; the events crate and SSE are delivery/projection mechanisms.
+- **Current transition** — the repository still contains legacy workflow, review, singular-assignee, Main/Project Agent, and agent-host paths. Do not delete or redesign them outside their named migration PR.
+- **Infrastructure** — the existing repository traits, AppState, MCP server, workspace path guards, config precedence, and local bind defaults remain useful implementation details while the domain migrates.
 
 ## Database
 

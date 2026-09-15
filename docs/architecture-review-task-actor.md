@@ -1,5 +1,12 @@
 # Task Component Architecture Review — The Actor Model Problem
 
+> Historical audit note: this document records findings against the former
+> architecture. The PR 0 target contract in
+> [docs/architecture.md](architecture.md) and
+> [docs/migration/architecture-v2.md](migration/architecture-v2.md) is now the
+> source of truth. Recommendations below are evidence for migration planning,
+> not current architectural authority.
+
 **Scope:** `crates/services/src/task_service/`, `crates/services/src/workflow/engine/`, and the two transition entry points (`crates/api/src/routes/tasks/`, `crates/mcp-server/src/tools/`).
 
 **Goal:** Refactor the task component to serve both human users and AI agents well.
@@ -371,7 +378,7 @@ Update `docs/architecture.md` "Workflow engine (in progress)" section: remove th
 - **Phase 4 verification:** add a service-level test asserting `AgentOnly` hooks fire for `Actor::Agent` and `Actor::System` paths but **not** vice-versa; enumerate the audited `AgentOnly` hooks as cases.
 - **No data migration:** `transition_log.triggered_by` stays TEXT; historical rows keep their existing strings. The column is append-only audit data. `Actor` is an in-memory type; only newly written rows get the corrected strings from Phase 3.
 - **Public surface:** `TransitionTaskRequest.source` (`TransitionSource` enum) is unchanged; the actor is derived server-side from the auth principal / MCP caller. The MCP tool `forge_transition_task` gains agent identity plumbing but its JSON-RPC signature is stable.
-- **Breaking change handling (per beta policy):** Phase 4 is the breaking step. Single `### Breaking` changelog entry, no `_v2`, no deprecation alias. State-machine changes must keep the `docs/architecture.md#task-state-machine` table accurate.
+- **Breaking change handling (per beta policy):** Phase 4 is the breaking step. Single `### Breaking` changelog entry, no `_v2`, no deprecation alias. Lifecycle changes must keep the target lifecycle and Gate documentation accurate.
 
 ---
 
