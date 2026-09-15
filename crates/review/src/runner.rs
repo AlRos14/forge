@@ -7,7 +7,7 @@ use db::{
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
     resolve_config_value, AdapterExecutor, AdapterRegistry, ExecutionContext, ExecutionOutcome,
-    ExecutionOverrides, LogEntry, LogKind, LogStream, LogWriter, TaskExecutor,
+    ExecutionOverrides, LogKind, LogStream, LogWriter, TaskExecutor,
 };
 use serde_json::{json, Value};
 use std::{path::PathBuf, process::ExitStatus, sync::Arc};
@@ -226,6 +226,9 @@ impl ReviewRunner {
         )
         .await?;
 
+        if let Err(error) = LogWriter::compact(std::path::Path::new(&req.logs_path)).await {
+            tracing::warn!(%error, "failed to compress review log; plain log retained");
+        }
         self.publish_review_event(&task_id, &review, outcome.clone(), failed_step_index);
 
         Ok((review, outcome))
@@ -528,6 +531,9 @@ impl ReviewRunner {
             )));
         }
 
+        if let Err(error) = LogWriter::compact(std::path::Path::new(&auditor_logs_path)).await {
+            tracing::warn!(%error, "failed to compress auditor log; plain log retained");
+        }
         let final_message = last_assistant_message(&auditor_logs_path).await?;
         Ok(Some(match auditor::parse_verdict(&final_message) {
             AuditorVerdict::Passed => AuditorRunResult {
@@ -776,27 +782,27 @@ fn auditor_logs_path(reviewer_logs_path: &str, auditor_execution_id: &str) -> St
 }
 
 async fn last_assistant_message(logs_path: &str) -> Result<String, ReviewError> {
-    let contents = match tokio::fs::read_to_string(logs_path).await {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut message = String::new();
-    for line in contents.lines() {
-        let Ok(entry) = serde_json::from_str::<LogEntry>(line) else {
-            continue;
-        };
-        if entry.kind == LogKind::Assistant {
-            append_assistant_log_text(&entry.payload, &mut message);
-        } else if entry.kind == LogKind::SessionInfo
-            && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
-        {
-            if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                message.push_str(result);
+    match executors::LogReader::fold(
+        std::path::Path::new(logs_path),
+        String::new(),
+        |message, entry| {
+            if entry.kind == LogKind::Assistant {
+                append_assistant_log_text(&entry.payload, message);
+            } else if entry.kind == LogKind::SessionInfo
+                && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
+            {
+                if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
+                    message.push_str(result);
+                }
             }
-        }
+        },
+    )
+    .await
+    {
+        Ok(message) => Ok(message),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
     }
-    Ok(message)
 }
 
 fn append_assistant_log_text(payload: &Value, message: &mut String) {

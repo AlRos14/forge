@@ -46,7 +46,7 @@ mod common;
 pub(crate) mod config;
 mod create;
 mod create_subtasks;
-mod execution;
+pub(crate) mod execution;
 mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
@@ -418,6 +418,7 @@ impl TaskService {
     pub(crate) async fn complete_remote_execution(
         &self,
         notification: api_types::ExecutionTerminalNotification,
+        host_identity: Option<&str>,
     ) -> Result<Execution> {
         validate_required("execution_id", &notification.execution_id)?;
         let current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
@@ -541,11 +542,12 @@ impl TaskService {
         }
 
         if let Some(account_usage) = notification.account_usage.as_ref() {
-            if let Err(error) = execution::persist_account_usage_snapshot(
+            if let Err(error) = execution::persist_account_usage_snapshot_with_host(
                 &self.db,
                 current_execution.executor_config_snapshot_json.as_deref(),
                 &updated.id,
                 account_usage,
+                host_identity,
             )
             .await
             {

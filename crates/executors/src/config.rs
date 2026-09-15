@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use crate::{ExecutionOverrides, ExecutorError, ExecutorKind};
 
@@ -382,23 +383,91 @@ pub fn candidate_key(kind: &ExecutorKind, config: &Value) -> String {
     )
 }
 
-/// Identity of the quota pool a candidate consumes. Candidates sharing an
-/// account key share cooldowns. For Smith the pool is the provider (Smith
-/// rotates that provider's credentials natively); for Codex it is the
-/// profile; other executors have one machine-level account.
+/// Identity of the quota pool a candidate consumes inside one executor host.
+/// Candidates sharing an account key share cooldowns. For Smith the pool is
+/// the provider (Smith rotates that provider's credentials natively); for
+/// Codex it is the lexical credential context; other executors have one
+/// machine-level account. An executable override is deliberately not an
+/// account identity: two wrappers may launch the same account, and the
+/// wrapper may change without changing the credentials behind it.
+///
+/// This function is intentionally host-neutral. Callers that persist usage
+/// observations must use [`account_key_for_context`] so host-local credentials
+/// on different daemons cannot be merged accidentally.
 pub fn account_key(kind: &ExecutorKind, config: &Value) -> String {
     let discriminator = match kind {
-        ExecutorKind::Smith => config
-            .get("provider")
-            .and_then(Value::as_str)
-            .or_else(|| config.get("profile").and_then(Value::as_str)),
-        ExecutorKind::Codex => config.get("profile").and_then(Value::as_str),
+        ExecutorKind::Smith => {
+            nonempty_str(config.get("provider")).or_else(|| nonempty_str(config.get("profile")))
+        }
+        ExecutorKind::Codex => {
+            let home =
+                nonempty_str(config.get("env").and_then(|env| env.get("CODEX_HOME"))).map(|home| {
+                    format!(
+                        "home={}",
+                        normalize_account_path(Path::new(&home)).to_string_lossy()
+                    )
+                });
+            home.or_else(|| {
+                nonempty_str(config.get("profile")).map(|profile| format!("profile={profile}"))
+            })
+        }
         _ => None,
     };
     match discriminator {
         Some(value) => format!("{kind}:{value}"),
         None => kind.to_string(),
     }
+}
+
+/// Build the account key used for a usage observation when credentials are
+/// host-local. `host_identity` is supplied by the execution environment (for
+/// example a daemon id or the local server marker), never resolved through the
+/// server filesystem.
+pub fn account_key_for_context(
+    kind: &ExecutorKind,
+    config: &Value,
+    host_identity: &str,
+    credential_ref: Option<&str>,
+) -> String {
+    if let Some(credential_ref) = credential_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("{kind}:credential={credential_ref}");
+    }
+    let base = account_key(kind, config);
+    let host = host_identity.trim();
+    if host.is_empty() {
+        return base;
+    }
+    match base.split_once(':') {
+        Some((kind_name, discriminator)) => format!("{kind_name}@{host}:{discriminator}"),
+        None => format!("{base}@{host}"),
+    }
+}
+
+fn nonempty_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_account_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 /// FNV-1a over a canonical (key-sorted, session-stripped) rendering of the
@@ -740,6 +809,120 @@ mod tests {
                 &serde_json::json!({"model": "opus"})
             ),
             "claude_code"
+        );
+    }
+
+    #[test]
+    fn account_key_uses_canonical_codex_home_not_executable_override() {
+        let with_home = serde_json::json!({
+            "env": { "CODEX_HOME": "/tmp/forge-codex-account/../forge-codex-account" },
+            "base_command_override": "/home/user/bin/codex-work"
+        });
+        let equivalent_home = serde_json::json!({
+            "env": { "CODEX_HOME": "/tmp/forge-codex-account" },
+            "base_command_override": "/home/user/bin/another-codex-wrapper"
+        });
+
+        assert_eq!(
+            account_key(&ExecutorKind::Codex, &with_home),
+            "codex:home=/tmp/forge-codex-account"
+        );
+        assert_eq!(
+            account_key(&ExecutorKind::Codex, &with_home),
+            account_key(&ExecutorKind::Codex, &equivalent_home)
+        );
+    }
+
+    #[test]
+    fn account_key_separates_different_homes_with_the_same_wrapper() {
+        let first = serde_json::json!({
+            "env": { "CODEX_HOME": "/tmp/forge-codex-first" },
+            "base_command_override": "/home/user/bin/codex-work"
+        });
+        let second = serde_json::json!({
+            "env": { "CODEX_HOME": "/tmp/forge-codex-second" },
+            "base_command_override": "/home/user/bin/codex-work"
+        });
+
+        assert_ne!(
+            account_key_for_context(&ExecutorKind::Codex, &first, "daemon-a", None),
+            account_key_for_context(&ExecutorKind::Codex, &second, "daemon-a", None)
+        );
+    }
+
+    #[test]
+    fn account_key_separates_host_local_credentials() {
+        let config = serde_json::json!({
+            "env": { "CODEX_HOME": "/home/alex/.codex/../.codex" },
+            "base_command_override": "/home/alex/bin/codex-wrapper"
+        });
+        assert_eq!(
+            account_key_for_context(&ExecutorKind::Codex, &config, "daemon-a", None),
+            "codex@daemon-a:home=/home/alex/.codex"
+        );
+        assert_ne!(
+            account_key_for_context(&ExecutorKind::Codex, &config, "daemon-a", None),
+            account_key_for_context(&ExecutorKind::Codex, &config, "daemon-b", None)
+        );
+    }
+
+    #[test]
+    fn account_key_does_not_resolve_remote_paths_through_server_filesystem() {
+        let config = serde_json::json!({
+            "env": { "CODEX_HOME": "~/.codex/../.codex" }
+        });
+        let key = account_key_for_context(&ExecutorKind::Codex, &config, "daemon-a", None);
+        assert!(key.contains("home=~/.codex"));
+        assert!(!key.contains(&std::env::var("HOME").unwrap_or_default()));
+    }
+
+    #[test]
+    fn explicit_credential_reference_can_prove_cross_host_sharing() {
+        let config = serde_json::json!({
+            "env": { "CODEX_HOME": "/different/on/every/host" }
+        });
+        assert_eq!(
+            account_key_for_context(
+                &ExecutorKind::Codex,
+                &config,
+                "daemon-a",
+                Some("credential-1")
+            ),
+            account_key_for_context(
+                &ExecutorKind::Codex,
+                &config,
+                "daemon-b",
+                Some("credential-1")
+            )
+        );
+        assert_ne!(
+            account_key_for_context(
+                &ExecutorKind::Codex,
+                &config,
+                "daemon-a",
+                Some("credential-1")
+            ),
+            account_key_for_context(
+                &ExecutorKind::Codex,
+                &config,
+                "daemon-a",
+                Some("credential-2")
+            )
+        );
+    }
+
+    #[test]
+    fn account_key_falls_back_to_profile_without_codex_home() {
+        assert_eq!(
+            account_key(
+                &ExecutorKind::Codex,
+                &serde_json::json!({ "profile": "work" })
+            ),
+            "codex:profile=work"
+        );
+        assert_eq!(
+            account_key(&ExecutorKind::Codex, &serde_json::json!({})),
+            "codex"
         );
     }
 

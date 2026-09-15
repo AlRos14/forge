@@ -6,6 +6,7 @@ pub mod config;
 pub mod effective_policy;
 pub mod log_reader;
 pub mod log_schema;
+mod log_storage;
 pub mod log_writer;
 pub mod shell;
 
@@ -16,11 +17,12 @@ pub use adapter::{
 };
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
-    account_key, build_ordered_fallback_routing, candidate_key, deserialize_config,
-    merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig, CommandOverrides,
-    CursorConfig, EmbeddedConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig, NullConfig,
-    OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig, SmithConfig,
-    FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
+    account_key, account_key_for_context, build_ordered_fallback_routing, candidate_key,
+    deserialize_config, merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig,
+    CommandOverrides, CursorConfig, EmbeddedConfig, ExecutorCandidate, ExecutorRouting,
+    GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome,
+    ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1,
+    ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
@@ -292,11 +294,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_truncation() {
+    async fn log_rotation_preserves_every_entry() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("truncated.jsonl");
 
-        // Very small max to trigger truncation quickly
+        // Very small segment size to exercise many rotations.
         let mut writer = LogWriter::new(&log_path, "exec-2".to_string(), 500);
 
         for i in 0..100 {
@@ -310,13 +312,11 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(writer.is_truncated());
-        assert!(writer.sequence() < 100); // Should have stopped early
-
-        // Last entry should be truncated
-        let result = LogReader::tail(&log_path, 1).await.unwrap();
-        assert_eq!(result.entries.len(), 1);
-        assert!(result.entries[0].truncated);
+        assert_eq!(writer.sequence(), 100);
+        let result = LogReader::read(&log_path, 0, 101).await.unwrap();
+        assert_eq!(result.entries.len(), 100);
+        assert!(result.entries.iter().all(|entry| !entry.truncated));
+        assert_eq!(result.entries.last().unwrap().sequence, 99);
     }
 
     #[tokio::test]

@@ -27,6 +27,35 @@ matching user-message event that also appears in the agent stream. This mirrors
 Vibe Kanban's approach: product-level execution metadata is the stable source for
 turn prompts, while logs remain the source for agent output and tool activity.
 
+## Logical storage and recovery
+
+The active JSONL file and its retained compressed segments are one logical
+execution log. Rotation seals complete segments under the base path's `.d`
+directory and preserves their monotonically increasing sequence numbers; no
+segment is evicted. A gzip segment is published atomically, and an interrupted
+compression may leave either the complete plain segment or the complete gzip
+segment readable. Incomplete `.tmp` files are ignored or retried during
+recovery and do not hide readable history.
+
+`execution.logs_path` points at the active base file. It is not a complete
+historical export once rotation has occurred. API pagination is sequence-based
+across the active and compressed segments, while `tail` is bounded to at most
+1,000 entries. Relocation publishes the destination before removing the source
+and is protected by process-local path locks plus service execution ownership;
+those locks do not claim cross-process synchronization.
+
+Storage errors are kept separate from execution activity. Daemon notifications
+are authenticated before activity timestamps or usage observations are updated,
+and a failure to persist a log does not make a still-running execution appear
+inactive. Fallback executor attempts reuse the same logical log sequence rather
+than starting a second sequence.
+
+Usage observations follow the same execution-log transport for local and daemon
+execution. Codex `account/rateLimits/updated` is a native `provider_event`;
+Cursor `/usage` is a bounded, cancellable `cursor_poll` performed where the
+Cursor account exists. Every persisted observation is tied to its execution,
+account context, source, and host/daemon provenance.
+
 ## Adapter Sources
 
 Adapters differ in where user-visible chat messages come from.

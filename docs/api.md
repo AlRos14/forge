@@ -159,18 +159,6 @@ database for historical provenance.
 | GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
 | POST   | `/api/v1/agents/{id}/profiles/connect` | Create/select a new native profile revision referencing an existing provider entry (`credential_id`) |
 | POST   | `/api/v1/agents/{id}/profiles/{profile_id}/select` | Select an immutable profile using the identity version |
-
-Agent usage is stored as the provider's JSON payload. Codex snapshots include
-the primary and secondary rate-limit windows returned by the app server. Cursor
-snapshots normalize the interactive `/usage` panel into `plan`, `resets_at`,
-`categories` (`included`, `auto`, and `api` percentages), and
-`on_demand_enabled`; `pools` retains the recognized terminal lines for
-diagnostics. Cursor refresh waits for the CLI readiness and completed usage
-panel markers, so slower startup or quota fetches do not depend on fixed sleeps.
-Codex `account/rateLimits/updated` events captured during a run are stored as
-`{ "rateLimits": … }` and linked to that execution (`account_usage` on
-`GET /api/v1/executions/{id}`). USD `cost_usd` is only present when a harness
-reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | GET    | `/api/v1/agents/{id}/sessions` | List safe scope-bound session status/capability snapshots |
 | POST   | `/api/v1/agents/{id}/sessions` | Create or resume an explicitly scoped session |
 | POST   | `/api/v1/agents/{id}/effective-permissions` | Inspect the fail-closed permission intersection for one canonical scope |
@@ -234,6 +222,30 @@ reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | PATCH  | `/api/v1/notifications/{id}/read` | Mark one notification read |
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
+
+Agent usage is stored as the provider's JSON payload. Codex snapshots include
+the primary and secondary rate-limit windows returned by the app server. Cursor
+snapshots normalize the interactive `/usage` panel into `plan`, `resets_at`,
+`categories` (`included`, `auto`, and `api` percentages), and
+`on_demand_enabled`; `pools` retains the recognized terminal lines for
+diagnostics. Cursor refresh waits for the CLI readiness and completed usage
+panel markers, so slower startup or quota fetches do not depend on fixed sleeps.
+Codex `account/rateLimits/updated` events captured during a run are stored as
+`{ "rateLimits": … }` and linked to that execution (`account_usage` on
+`GET /api/v1/executions/{id}`). USD `cost_usd` is only present when a harness
+reports on-demand API billing; subscription Codex/Cursor runs leave it null.
+Cursor execution observations are labeled `cursor_poll` because `/usage` is a
+bounded interactive probe, not a native streaming event. Manual refreshes are
+`manual_refresh`. Account keys include the harness kind and the host that owns
+host-local credentials; a lexical `CODEX_HOME` value is not canonicalized
+through the server filesystem, and an executable or wrapper path is not an
+account identity. An explicit credential reference is required to prove that a
+credential context is shared across hosts. Daemon executions persist native
+Codex observations and daemon-side Cursor polls through the same usage path as
+local executions. A server-side refresh does not probe a daemon-bound or
+unresolved remote CLI. Cursor's large control prompt is stored transiently in
+a private runtime directory outside the Git worktree and is removed after the
+execution attempt, so it cannot enter task diffs or commits.
 
 ## Agent identities, bindings, and chats
 
@@ -1644,12 +1656,17 @@ log schema.
 
 ### Execution log pagination
 
-`GET /api/v1/executions/{id}/logs` reads the execution's current JSONL log.
-Responses contain `items`, `has_more`, and `next_sequence`; use
-`from_sequence` and `limit` to page through the available entries. `tail`
-returns a bounded newest-entry view. The current PR0 implementation does not
-promise rotated-segment history or a complete export from `logs_path`; lossless
-rotation and cross-segment reads are operational work owned by PR0A.
+`GET /api/v1/executions/{id}/logs` reads the execution's logical JSONL log
+across its active file and retained compressed segments. Responses contain
+`items`, `has_more`, and `next_sequence`; use `from_sequence` and `limit` to
+page through the available entries. `tail` returns a bounded newest-entry view
+and is capped at 1,000 entries. The execution's `logs_path` identifies the
+active base path, not a complete historical export; use this API for the full
+logical sequence. Rotation and relocation are serialized by process-local path
+locks and the service's execution ownership, not by a cross-process lock
+claim. Daemon activity and usage notifications are authorized before they can
+update activity or persist observations; storage failure does not make an
+execution appear inactive.
 
 ### Manual continuation and re-execution
 

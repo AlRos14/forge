@@ -281,6 +281,10 @@ pub(super) async fn build_executor_config_snapshot(
         // profile/store boundary and are never copied into public execution
         // snapshot JSON.
         "profile_id": agent.profile_id,
+        // This opaque durable reference is not a credential. It allows usage
+        // accounting to prove that host-local observations share a logical
+        // account without exposing provider secrets.
+        "credential_ref": agent.credential_ref,
         "provider": agent.provider,
         "executor_type": agent.executor_type,
         "model": agent.model,
@@ -289,6 +293,10 @@ pub(super) async fn build_executor_config_snapshot(
         "permission_policy": agent.permission_policy,
         "config": normalized_config,
         "capabilities": capabilities,
+        // Keep both the Agent's explicit daemon binding and the daemon chosen
+        // for this Execution. The resolved daemon is routing, not Agent
+        // identity, but it is factual host provenance for host-local usage.
+        "agent_daemon_id": agent.daemon_id,
         "resolved_daemon_id": resolved_daemon_id,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),

@@ -9,22 +9,51 @@ use executors::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::{Duration, SystemTime};
+use tempfile::{Builder as TempfileBuilder, NamedTempFile, TempDir};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 500;
 const STATUS_TIMEOUT_SECONDS: u64 = 2;
 const LIST_MODELS_TIMEOUT_SECONDS: u64 = 10;
+const MAX_DIRECT_PROMPT_BYTES: usize = 32 * 1024;
+const CONTROL_DIR_PREFIX: &str = "forge-cursor-control-";
+const STALE_CONTROL_DIR_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct CursorAdapter {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
     usage_cache: Arc<AsyncMutex<Option<(std::time::Instant, Value)>>>,
+}
+
+struct RuntimePromptFile {
+    file: NamedTempFile,
+    root: TempDir,
+}
+
+impl RuntimePromptFile {
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    fn workspace_root(&self) -> &Path {
+        self.root.path()
+    }
+
+    fn instruction(&self) -> String {
+        format!(
+            "Follow the instructions in the external file `{}` exactly. Do not commit, edit, or delete that control file.",
+            self.path().display()
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -50,14 +79,14 @@ impl CursorAdapter {
         }
     }
 
-    async fn cached_account_usage(&self) -> Option<Value> {
+    async fn cached_account_usage(&self, config: &CursorConfig) -> Option<Value> {
         let cached = self.usage_cache.lock().await.clone();
         if let Some((captured, value)) = cached.as_ref()
             && captured.elapsed() < Duration::from_secs(300)
         {
             return Some(value.clone());
         }
-        match query_cursor_usage().await {
+        match query_account_usage(config).await {
             Ok(value) => {
                 *self.usage_cache.lock().await = Some((std::time::Instant::now(), value.clone()));
                 Some(value)
@@ -70,7 +99,67 @@ impl CursorAdapter {
         serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
     }
 
-    fn build_command(config: &CursorConfig, prompt: &str) -> tokio::process::Command {
+    fn write_runtime_prompt(
+        worktree_path: &str,
+        execution_id: &str,
+        prompt: &str,
+    ) -> Result<RuntimePromptFile, ExecutorError> {
+        let worktree = fs::canonicalize(worktree_path).map_err(|error| {
+            ExecutorError::Other(format!("failed to resolve Cursor worktree: {error}"))
+        })?;
+        let safe_execution_id = execution_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+
+        let control_parent = std::env::temp_dir();
+        cleanup_stale_control_dirs_at(&control_parent, SystemTime::now()).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to clean stale Cursor control files: {error}"
+            ))
+        })?;
+        let root = TempfileBuilder::new()
+            .prefix(&format!("{CONTROL_DIR_PREFIX}{safe_execution_id}-"))
+            .tempdir_in(&control_parent)
+            .map_err(|error| {
+                ExecutorError::Other(format!(
+                    "failed to create Cursor runtime directory: {error}"
+                ))
+            })?;
+        let control_root = fs::canonicalize(root.path()).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to resolve Cursor runtime directory: {error}"
+            ))
+        })?;
+        if control_root.starts_with(&worktree) || worktree.starts_with(&control_root) {
+            return Err(ExecutorError::Other(
+                "Cursor control storage overlaps the repository worktree".to_owned(),
+            ));
+        }
+
+        let mut file = NamedTempFile::new_in(root.path()).map_err(|error| {
+            ExecutorError::Other(format!("failed to create Cursor runtime prompt: {error}"))
+        })?;
+        file.write_all(prompt.as_bytes()).map_err(|error| {
+            ExecutorError::Other(format!("failed to write Cursor runtime prompt: {error}"))
+        })?;
+        file.as_file_mut().flush().map_err(|error| {
+            ExecutorError::Other(format!("failed to flush Cursor runtime prompt: {error}"))
+        })?;
+        set_private_runtime_permissions(&root, &file)?;
+        Ok(RuntimePromptFile { file, root })
+    }
+
+    fn build_command(
+        config: &CursorConfig,
+        additional_workspace: Option<&Path>,
+    ) -> tokio::process::Command {
         let mut adapter_args = vec![
             "-p".to_owned(),
             "--output-format".to_owned(),
@@ -91,13 +180,17 @@ impl CursorAdapter {
             adapter_args.push(session_id.clone());
         }
 
+        if let Some(additional_workspace) = additional_workspace {
+            adapter_args.push("--add-dir".to_owned());
+            adapter_args.push(additional_workspace.to_string_lossy().into_owned());
+        }
+
         let builder = crate::command::CommandBuilder::new("cursor-agent")
             .adapter_args(adapter_args)
             .overrides(&config.command_overrides);
 
         let mut cmd = builder.build();
-        cmd.arg(prompt)
-            .kill_on_drop(true)
+        cmd.kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("NO_COLOR", "1");
@@ -123,6 +216,55 @@ impl CursorAdapter {
             .remove(execution_id);
         Ok(())
     }
+}
+
+fn cleanup_stale_control_dirs_at(parent: &Path, now: SystemTime) -> std::io::Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(CONTROL_DIR_PREFIX) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let modified = entry.metadata()?.modified().unwrap_or(now);
+        let stale = now
+            .duration_since(modified)
+            .unwrap_or_default()
+            .gt(&STALE_CONTROL_DIR_TTL);
+        if stale {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn set_private_runtime_permissions(
+    root: &TempDir,
+    file: &NamedTempFile,
+) -> Result<(), ExecutorError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to protect Cursor runtime directory: {error}"
+            ))
+        })?;
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).map_err(|error| {
+            ExecutorError::Other(format!("failed to protect Cursor runtime prompt: {error}"))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, file);
+    }
+    Ok(())
 }
 
 impl Default for CursorAdapter {
@@ -162,7 +304,27 @@ impl CodingExecutorAdapter for CursorAdapter {
             ctx.description.clone()
         };
 
-        let mut command = Self::build_command(&config, &prompt);
+        let runtime_prompt = if prompt.len() > MAX_DIRECT_PROMPT_BYTES {
+            Some(Self::write_runtime_prompt(
+                &ctx.worktree_path,
+                &ctx.execution_id,
+                &prompt,
+            )?)
+        } else {
+            None
+        };
+        let mut command = Self::build_command(
+            &config,
+            runtime_prompt
+                .as_ref()
+                .map(RuntimePromptFile::workspace_root),
+        );
+        command.arg(
+            runtime_prompt
+                .as_ref()
+                .map(RuntimePromptFile::instruction)
+                .unwrap_or_else(|| prompt.clone()),
+        );
         command.current_dir(&ctx.worktree_path);
         let mut child = command.group_spawn()?;
 
@@ -284,7 +446,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 .ok(),
         };
 
-        let account_usage = self.cached_account_usage().await;
+        let account_usage = self.cached_account_usage(&config).await;
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,
             after_sha,
@@ -316,27 +478,258 @@ impl CodingExecutorAdapter for CursorAdapter {
     }
 }
 
-async fn query_cursor_usage() -> Result<Value, ExecutorError> {
-    let mut child = tokio::process::Command::new("script")
-        .args(["-qec", "cursor-agent", "/dev/null"])
+/// Read Cursor quota through its native interactive `/usage` command without
+/// starting a model turn. The result is explicitly a polling observation; it
+/// is not advertised as a native streaming capability.
+pub async fn query_account_usage(config: &CursorConfig) -> Result<Value, ExecutorError> {
+    query_account_usage_with_cancel(config, CancellationToken::new()).await
+}
+
+/// Cancellable form used by the bounded live-usage probe around an active
+/// execution. Every wait has a deadline, and cancellation drops a
+/// `kill_on_drop` child so a probe cannot survive its execution.
+pub async fn query_account_usage_with_cancel(
+    config: &CursorConfig,
+    cancel: CancellationToken,
+) -> Result<Value, ExecutorError> {
+    let builder =
+        crate::command::CommandBuilder::new("cursor-agent").overrides(&config.command_overrides);
+    let program = builder
+        .resolve_executable()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            config
+                .command_overrides
+                .base_command_override
+                .clone()
+                .unwrap_or_else(|| "cursor-agent".to_owned())
+        });
+    let extra_args = config
+        .command_overrides
+        .additional_params
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|arg| sh_single_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let shell = if extra_args.is_empty() {
+        format!("stty cols 100 rows 40; exec {}", sh_single_quote(&program))
+    } else {
+        format!(
+            "stty cols 100 rows 40; exec {} {extra_args}",
+            sh_single_quote(&program)
+        )
+    };
+    let mut command = tokio::process::Command::new("script");
+    command
+        .args(["-qec", &shell, "/dev/null"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env("NO_COLOR", "1")
-        .spawn()?;
+        .kill_on_drop(true);
+    if let Some(env) = &config.command_overrides.env {
+        for (key, value) in env {
+            command.env(key, value);
+        }
+    }
+    let mut child = command.spawn()?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| ExecutorError::Other("Cursor usage PTY has no stdin".to_owned()))?;
-    stdin.write_all(b"/usage\r/quit\r").await?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutorError::Other("Cursor usage PTY has no stdout".to_owned()))?;
+    let mut output = Vec::new();
+    read_until(
+        &mut stdout,
+        &mut output,
+        Duration::from_secs(10),
+        |text| text.contains("Ready"),
+        &cancel,
+    )
+    .await
+    .map_err(|error| ExecutorError::Other(format!("Cursor did not become ready: {error}")))?;
+    write_or_cancel(&mut stdin, b"/usage\r", &cancel).await?;
+    sleep_or_cancel(Duration::from_millis(500), &cancel).await?;
+    write_or_cancel(&mut stdin, b"\r", &cancel).await?;
+    read_until(
+        &mut stdout,
+        &mut output,
+        Duration::from_secs(20),
+        |text| {
+            text.contains("Monthly plan and on-demand usage") && text.contains("View in dashboard")
+        },
+        &cancel,
+    )
+    .await
+    .map_err(|error| ExecutorError::Other(format!("Cursor /usage did not load: {error}")))?;
+    write_or_cancel(&mut stdin, b"\x1b", &cancel).await?;
+    sleep_or_cancel(Duration::from_millis(250), &cancel).await?;
+    write_or_cancel(&mut stdin, b"/quit\r", &cancel).await?;
+    sleep_or_cancel(Duration::from_millis(250), &cancel).await?;
+    write_or_cancel(&mut stdin, b"\r", &cancel).await?;
     drop(stdin);
-    let output = tokio::time::timeout(Duration::from_secs(12), child.wait_with_output())
-        .await
-        .map_err(|_| ExecutorError::Other("Cursor /usage timed out".to_owned()))??;
-    parse_cursor_usage(&String::from_utf8_lossy(&output.stdout))
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(ExecutorError::Other("Cursor usage probe cancelled".to_owned()));
+        }
+        result = timeout(Duration::from_secs(3), stdout.read_to_end(&mut output)) => {
+            result
+                .map_err(|_| ExecutorError::Other("Cursor /usage output timed out".to_owned()))??;
+        }
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(ExecutorError::Other("Cursor usage probe cancelled".to_owned()));
+        }
+        result = timeout(Duration::from_secs(5), child.wait()) => {
+            result
+                .map_err(|_| ExecutorError::Other("Cursor /usage timed out".to_owned()))??;
+        }
+    }
+    parse_cursor_usage(&String::from_utf8_lossy(&output))
+}
+
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn write_or_cancel<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> Result<(), ExecutorError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::select! {
+        _ = cancel.cancelled() => Err(ExecutorError::Other("Cursor usage probe cancelled".to_owned())),
+        result = writer.write_all(bytes) => result.map_err(ExecutorError::from),
+    }
+}
+
+async fn sleep_or_cancel(
+    duration: Duration,
+    cancel: &CancellationToken,
+) -> Result<(), ExecutorError> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(ExecutorError::Other("Cursor usage probe cancelled".to_owned())),
+        _ = sleep(duration) => Ok(()),
+    }
+}
+
+async fn read_until<R, F>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    duration: Duration,
+    predicate: F,
+    cancel: &CancellationToken,
+) -> std::result::Result<(), &'static str>
+where
+    R: AsyncRead + Unpin,
+    F: Fn(&str) -> bool,
+{
+    let deadline = Instant::now() + duration;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if cancel.is_cancelled() {
+            return Err("cancelled");
+        }
+        if predicate(&strip_ansi(&String::from_utf8_lossy(output))) {
+            return Ok(());
+        }
+        let read = tokio::select! {
+            _ = cancel.cancelled() => return Err("cancelled"),
+            result = timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                reader.read(&mut chunk),
+            ) => result
+                .map_err(|_| "timed out")?
+                .map_err(|_| "terminal output could not be read")?,
+        };
+        if read == 0 {
+            return Err("process exited early");
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn parse_cursor_usage(output: &str) -> Result<Value, ExecutorError> {
+    parse_cursor_usage_panel(output).or_else(|_| parse_cursor_usage_pools(output))
+}
+
+fn parse_cursor_usage_panel(output: &str) -> Result<Value, ExecutorError> {
+    let text = strip_ansi(output);
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    let usage_start = lines
+        .iter()
+        .rposition(|line| line.contains("Monthly plan and on-demand usage"))
+        .map(|index| index.saturating_sub(1))
+        .ok_or_else(|| {
+            ExecutorError::Other("Cursor /usage returned no usage summary".to_owned())
+        })?;
+    let pools = lines[usage_start..]
+        .iter()
+        .copied()
+        .take_while(|line| !line.contains("View in dashboard"))
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("usage")
+                || lower.contains("included")
+                || lower.contains("auto")
+                || lower.contains("api")
+                || lower.contains("on-demand")
+                || lower.contains("reset")
+        })
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if pools.is_empty() {
+        return Err(ExecutorError::Other(
+            "Cursor /usage returned no recognizable quota pools".to_owned(),
+        ));
+    }
+    let header = pools.iter().find(|line| line.starts_with("Usage"));
+    let plan = header
+        .and_then(|line| line.split('•').nth(1))
+        .and_then(|tail| {
+            tail.split_once("Resets")
+                .map(|(plan, _)| plan.trim().to_owned())
+        });
+    let resets_at = header.and_then(|line| {
+        line.split_once("Resets")
+            .map(|(_, reset)| reset.trim().to_owned())
+    });
+    let percentage = |category: &str| {
+        pools
+            .iter()
+            .find(|line| line.starts_with(category))
+            .and_then(|line| line.split_whitespace().find(|part| part.ends_with('%')))
+            .and_then(|part| part.trim_end_matches('%').parse::<u8>().ok())
+    };
+    let on_demand_enabled = pools
+        .iter()
+        .find(|line| line.starts_with("On-Demand"))
+        .map(|line| !line.to_ascii_lowercase().contains("disabled"));
+    Ok(serde_json::json!({
+        "plan": plan,
+        "resets_at": resets_at,
+        "categories": {
+            "included": percentage("Included"),
+            "auto": percentage("Auto"),
+            "api": percentage("API"),
+        },
+        "on_demand_enabled": on_demand_enabled,
+        "pools": pools,
+        "raw_kind": "cursor_interactive_usage"
+    }))
+}
+
+fn parse_cursor_usage_pools(output: &str) -> Result<Value, ExecutorError> {
     let text = strip_ansi(output);
     let pools = text
         .lines()
@@ -780,7 +1173,7 @@ mod tests {
             ..CursorConfig::default()
         };
 
-        let cmd = CursorAdapter::build_command(&config, "hello");
+        let cmd = CursorAdapter::build_command(&config, None);
         assert_eq!(cmd.as_std().get_program(), "cursor-agent");
         let args: Vec<_> = cmd
             .as_std()
@@ -799,9 +1192,168 @@ mod tests {
                 "gpt-5",
                 "--resume",
                 "session-123",
-                "hello",
             ]
         );
+    }
+
+    #[test]
+    fn small_prompt_stays_in_argv_without_runtime_storage() {
+        let worktree = tempfile::tempdir().expect("temp worktree");
+        let prompt = "small prompt";
+        assert!(prompt.len() <= MAX_DIRECT_PROMPT_BYTES);
+        let command = CursorAdapter::build_command(&CursorConfig::default(), None);
+        assert!(!command.as_std().get_args().any(|arg| arg == "--add-dir"));
+        assert!(!worktree.path().join(".forge").exists());
+    }
+
+    #[test]
+    fn large_prompt_is_external_private_consumable_and_cleaned_without_worktree_changes() {
+        let worktree = tempfile::tempdir().expect("temp worktree");
+        let prompt = "x".repeat(400_000);
+        let runtime = CursorAdapter::write_runtime_prompt(
+            worktree.path().to_str().expect("worktree path"),
+            "exec-1",
+            &prompt,
+        )
+        .expect("write runtime prompt");
+        let pointer = runtime.instruction();
+
+        assert!(pointer.len() < 500);
+        assert!(!runtime.path().starts_with(worktree.path()));
+        assert!(!runtime.workspace_root().starts_with(worktree.path()));
+        assert_eq!(
+            std::fs::read_to_string(runtime.path()).expect("read prompt"),
+            prompt
+        );
+        assert!(runtime.path().exists());
+        let command =
+            CursorAdapter::build_command(&CursorConfig::default(), Some(runtime.workspace_root()));
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let add_dir = args
+            .iter()
+            .position(|arg| arg == "--add-dir")
+            .expect("large prompt grants Cursor access to its private directory");
+        let expected_root = runtime.workspace_root().display().to_string();
+        assert_eq!(
+            args.get(add_dir + 1).map(String::as_str),
+            Some(expected_root.as_str())
+        );
+
+        let mut fixture = std::process::Command::new("sh");
+        fixture.args([
+            "-c",
+            "test -r \"$1\" && test \"$(wc -c < \"$1\")\" -eq \"$2\"",
+            "cursor-prompt-fixture",
+        ]);
+        fixture.arg(runtime.path()).arg(prompt.len().to_string());
+        assert!(fixture.status().expect("prompt fixture runs").success());
+
+        drop(runtime);
+        assert!(!worktree.path().join(".forge").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_prompt_runtime_storage_is_private_and_randomized() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worktree = tempfile::tempdir().expect("temp worktree");
+        let first = CursorAdapter::write_runtime_prompt(
+            worktree.path().to_str().expect("worktree path"),
+            "same-execution",
+            "first",
+        )
+        .expect("first runtime prompt");
+        let second = CursorAdapter::write_runtime_prompt(
+            worktree.path().to_str().expect("worktree path"),
+            "same-execution",
+            "second",
+        )
+        .expect("second runtime prompt");
+
+        assert_eq!(
+            first.root.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            first
+                .file
+                .as_file()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_ne!(first.root.path(), second.root.path());
+        assert_ne!(first.path(), second.path());
+    }
+
+    #[tokio::test]
+    async fn large_prompt_runtime_storage_is_removed_when_launch_fails() {
+        let worktree = tempfile::tempdir().expect("temp worktree");
+        let execution_id = format!(
+            "launch-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let prefix = format!("{CONTROL_DIR_PREFIX}{execution_id}-");
+        let missing_program = worktree.path().join("missing-cursor-agent");
+        let adapter = CursorAdapter::new();
+
+        let result = adapter
+            .execute(ExecutionContext {
+                task_id: "task-1".to_owned(),
+                execution_id,
+                worktree_path: worktree.path().display().to_string(),
+                description: "x".repeat(MAX_DIRECT_PROMPT_BYTES + 1),
+                agent_config: serde_json::json!({
+                    "base_command_override": missing_program.display().to_string()
+                }),
+                logs_path: worktree
+                    .path()
+                    .join("execution.jsonl")
+                    .display()
+                    .to_string(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        let leftovers = fs::read_dir(std::env::temp_dir())
+            .expect("runtime directory readable")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+        assert!(!leftovers, "launch failure left a Cursor control directory");
+    }
+
+    #[test]
+    fn stale_runtime_directories_are_removed_but_recent_directories_survive() {
+        let parent = tempfile::tempdir().expect("control parent");
+        let stale = parent.path().join(format!("{CONTROL_DIR_PREFIX}stale"));
+        let recent = parent.path().join(format!("{CONTROL_DIR_PREFIX}recent"));
+        std::fs::create_dir(&stale).expect("stale dir");
+        std::fs::create_dir(&recent).expect("recent dir");
+        let now = SystemTime::now();
+        let old = now - STALE_CONTROL_DIR_TTL - Duration::from_secs(1);
+        std::fs::File::open(&stale)
+            .expect("open stale dir")
+            .set_modified(old)
+            .expect("age stale dir");
+
+        cleanup_stale_control_dirs_at(parent.path(), now).expect("cleanup runs");
+        assert!(!stale.exists());
+        assert!(recent.exists());
     }
 
     #[test]
@@ -811,7 +1363,7 @@ mod tests {
             command_overrides: CommandOverrides::default(),
             ..CursorConfig::default()
         };
-        let cmd = CursorAdapter::build_command(&config, "hello");
+        let cmd = CursorAdapter::build_command(&config, None);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -825,7 +1377,7 @@ mod tests {
             command_overrides: CommandOverrides::default(),
             ..CursorConfig::default()
         };
-        let cmd = CursorAdapter::build_command(&config, "hello");
+        let cmd = CursorAdapter::build_command(&config, None);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()

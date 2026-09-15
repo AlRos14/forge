@@ -746,14 +746,31 @@ impl TaskService {
             ));
         };
         let canonical_role = canonical_workspace_lease_role(role)?;
-        let principal_id = principal_id
-            .or(task.assignee_id.as_deref())
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "WorkspaceLease requires an assigned Task Worker or reviewer",
-                )
-            })?;
+        let role_assignment = sqlx::query(
+            "SELECT assignee_type, assignee_id
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&task.id)
+        .bind(role.trim())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let explicit_assignee_id = role_assignment
+            .as_ref()
+            .map(|row| row.try_get::<Option<String>, _>("assignee_id"))
+            .transpose()?
+            .flatten();
+        let principal_id = match (principal_id, explicit_assignee_id.as_deref()) {
+            (Some(principal_id), _) => Some(principal_id.to_owned()),
+            (None, Some(assignee_id)) => Some(assignee_id.to_owned()),
+            (None, None) if role_assignment.is_none() => task.assignee_id.clone(),
+            (None, None) => None,
+        }
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "WorkspaceLease requires an assigned Task Worker or reviewer",
+            )
+        })?;
         let orchestration_binding_count: i64 = sqlx::query_scalar(
             "SELECT
                 (SELECT COUNT(*) FROM project_agent_binding
@@ -762,8 +779,8 @@ impl TaskService {
                  WHERE identity_id = ? AND state = 'active')",
         )
         .bind(&task.project_id)
-        .bind(principal_id)
-        .bind(principal_id)
+        .bind(&principal_id)
+        .bind(&principal_id)
         .fetch_one(&mut **transaction)
         .await?;
         if orchestration_binding_count > 0 {
@@ -795,19 +812,11 @@ impl TaskService {
                 "workspace repository does not match the Task repository binding",
             ));
         }
-        let role_assignment = sqlx::query(
-            "SELECT assignee_type, assignee_id
-             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-        )
-        .bind(&task.id)
-        .bind(role.trim())
-        .fetch_optional(&mut **transaction)
-        .await?;
         if let Some(assignment) = role_assignment {
             let assignment_type: Option<String> = assignment.get("assignee_type");
             let assignment_id: Option<String> = assignment.get("assignee_id");
             if assignment_type.as_deref() != Some("agent")
-                || assignment_id.as_deref() != Some(principal_id)
+                || assignment_id.as_deref() != Some(principal_id.as_str())
             {
                 return Err(ServiceError::conflict(format!(
                     "role '{}' is assigned to a different principal",
@@ -816,7 +825,7 @@ impl TaskService {
             }
         } else if (charter_backed || has_task_assignment)
             && (assigned_type.as_deref() != Some("agent")
-                || assigned_id.as_deref() != Some(principal_id))
+                || assigned_id.as_deref() != Some(principal_id.as_str()))
         {
             return Err(ServiceError::invalid_operation(
                 "WorkspaceLease requires the lease subject to be the assigned Task Worker/reviewer",
@@ -1031,10 +1040,14 @@ impl TaskService {
                     "invalid WorkspaceLease capability set: {error}"
                 ))
             })?;
+        // `task_version` records the revision admitted when the lease was
+        // issued. Task edits such as comments or descriptions are not
+        // authority changes and must not revoke a running execution. The
+        // assignment, repository, capability, lifecycle, and execution
+        // bindings below remain fail-closed authority checks.
         if lease.status != "active"
             || lease.project_id != task.project_id
             || lease.task_id != task.id
-            || lease.task_version != task.version
             || lease.execution_id != execution_id
             || lease.operation_idempotency_key != execution_id
             || lease.repository_binding_id != repo_id
@@ -1118,15 +1131,20 @@ impl TaskService {
         role: &str,
         principal_id: Option<&str>,
     ) -> Result<String> {
-        let principal_id = principal_id
-            .or(task.assignee_id.as_deref())
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "WorkspaceLease requires an assigned Task Worker or reviewer",
-                )
-            })?;
-        self.ensure_repository_worker_identity(&task.project_id, principal_id)
+        let role_assignment =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role.trim()).await?;
+        let principal_id = match (principal_id, role_assignment.as_ref()) {
+            (Some(principal_id), _) => Some(principal_id.to_owned()),
+            (None, Some(assignment)) => assignment.assignee_id.clone(),
+            (None, None) => task.assignee_id.clone(),
+        }
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "WorkspaceLease requires an assigned Task Worker or reviewer",
+            )
+        })?;
+        self.ensure_repository_worker_identity(&task.project_id, &principal_id)
             .await?;
         let charter_backed: i64 = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -1138,29 +1156,27 @@ impl TaskService {
         .bind(&task.project_id)
         .fetch_one(self.db.pool())
         .await?;
-        if let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role.trim()).await?
-        {
+        if let Some(assignment) = role_assignment {
             if assignment.assignee_type != Some(db::AssigneeKind::Agent)
-                || assignment.assignee_id.as_deref() != Some(principal_id)
+                || assignment.assignee_id.as_deref() != Some(principal_id.as_str())
             {
                 return Err(ServiceError::conflict(format!(
                     "role '{}' is assigned to a different principal",
                     role.trim()
                 )));
             }
-            return Ok(principal_id.to_owned());
+            return Ok(principal_id);
         }
         let has_task_assignment = task.assignee_type.is_some() || task.assignee_id.is_some();
         if (charter_backed == 1 || has_task_assignment)
             && (task.assignee_type.as_deref() != Some("agent")
-                || task.assignee_id.as_deref() != Some(principal_id))
+                || task.assignee_id.as_deref() != Some(principal_id.as_str()))
         {
             return Err(ServiceError::invalid_operation(
                 "WorkspaceLease requires the lease subject to be the assigned Task Worker/reviewer",
             ));
         }
-        Ok(principal_id.to_owned())
+        Ok(principal_id)
     }
 
     pub(super) async fn revoke_active_workspace_lease_for_execution(

@@ -48,7 +48,7 @@ The Plan PR0 audit was performed against the actual clean local checkout:
 | Relation | local main is three commits ahead of origin/main |
 | Prior audit reference | 41b4febe21cb18e247985d4a8bb2c0c4eb5716c3 |
 | Local commits since that reference | 71f478b log rotation, 509205a workflow resume, 3d291dd current-role re-execution |
-| Migration head | V085__account_usage_execution_id.sql |
+| Migration head at the Plan PR0 baseline | V085__account_usage_execution_id.sql |
 | Workspace state | clean before Plan PR0 edits |
 
 The local commits since the prior audit improve execution logs and recovery.
@@ -320,9 +320,11 @@ must repeat the search at its own HEAD.
 | Workspace and Git isolation | workspace, git, daemon, workspace lease records, execution launch/recovery, and integration paths | Preserve and extend in Plan PR5; no replacement that permits shared writable trees |
 | Events and projections | domain_event, events EventBus, SSE routes, attention/mission projections, execution/task event consumers | Plan PRs 4, 6, 9, and 12 update the vocabulary; durable events remain authoritative |
 
-The current migration head is V085. Plan PR0 adds no migration and edits no
-historical migration. The table above is an audit record, not permission to
-drop any listed table.
+The Plan PR0 baseline migration head was V085. Plan PR0A adds V086 for
+authority-aware workspace-lease renewal and V087 for the additive
+`cursor_poll` usage source; it edits no historical migration. The table above
+is an audit record, not permission to drop any listed table. The Plan PR0A
+reconciliation ledger is in [migration/pr-0a.md](pr-0a.md).
 
 ## Compatibility policy for the migration
 

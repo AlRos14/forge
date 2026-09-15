@@ -77,6 +77,63 @@ async fn execution_logs_are_read_from_stored_logs_path() {
     assert_eq!(error.code, "execution.logs_unavailable");
 }
 
+#[tokio::test]
+async fn rotated_compressed_logs_remain_one_paginated_execution_stream() {
+    let root = TestDir::new("forge-rotated-log-workspaces");
+    let harness = test_app(root.path()).await;
+    let path = root.path().join("execution.jsonl");
+    let execution_id = seed_execution(&harness.state.db, Some(path.clone())).await;
+    let mut writer = LogWriter::new(&path, execution_id.clone(), 500);
+    for i in 0..12 {
+        writer
+            .write(
+                LogKind::Assistant,
+                LogStream::Main,
+                json!({"text": format!("message {i}")}),
+            )
+            .await
+            .unwrap();
+    }
+    LogWriter::compact(&path).await.unwrap();
+    for start in [0, 4, 8] {
+        let body: Value = json_empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/executions/{execution_id}/logs?from_sequence={start}&limit=4"),
+            StatusCode::OK,
+        )
+        .await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 4);
+        for (offset, item) in items.iter().enumerate() {
+            assert_eq!(item["sequence"], start + offset);
+            assert_eq!(
+                item["payload"]["text"],
+                format!("message {}", start + offset)
+            );
+        }
+        assert_eq!(body["next_sequence"], start + 4);
+        assert_eq!(body["has_more"], start < 8);
+    }
+    writer
+        .write(
+            LogKind::Assistant,
+            LogStream::Main,
+            json!({"text": "live continuation"}),
+        )
+        .await
+        .unwrap();
+    let body: Value = json_empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{execution_id}/logs?tail=3"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(body["items"][0]["sequence"], 10);
+    assert_eq!(body["items"][2]["payload"]["text"], "live continuation");
+}
+
 struct TestHarness {
     app: Router,
     state: Arc<AppState>,

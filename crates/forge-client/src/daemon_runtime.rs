@@ -23,6 +23,7 @@ use executors::{
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     daemon_fs,
@@ -301,6 +302,8 @@ async fn run_execution_task(
     active_executions: ActiveExecutionTracker,
 ) {
     let _active_guard = active_executions.track(ctx.execution_id.clone());
+    let cursor_usage_probe =
+        spawn_cursor_usage_probe(&ctx.agent_config, &ctx.execution_id, outbound.clone());
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     ctx.log_sender = Some(log_tx);
     let log_outbound = outbound.clone();
@@ -328,7 +331,11 @@ async fn run_execution_task(
     };
     let result = match read_only_head {
         Ok(read_only_head) => {
+            let logs_path = PathBuf::from(&ctx.logs_path);
             let execution_result = executor.execute(ctx).await;
+            if let Err(error) = executors::LogWriter::compact(&logs_path).await {
+                tracing::warn!(%error, "failed to compress daemon execution log; plain log retained");
+            }
             let restore_result = match (read_only_path.as_deref(), read_only_head.as_deref()) {
                 (Some(path), Some(head)) => {
                     git::restore_worktree(path, head).await.map_err(|error| {
@@ -352,6 +359,9 @@ async fn run_execution_task(
         }
         Err(error) => Err(error),
     };
+    if let Some(probe) = cursor_usage_probe {
+        probe.stop().await;
+    }
     // The executor owns the only log sender in ctx, so completion should close the
     // channel and let the forwarder drain. If an executor holds a sender clone or
     // emits a very large trailing burst, the timeout favors terminal notification
@@ -385,6 +395,79 @@ async fn run_execution_task(
         },
     };
     emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification);
+}
+
+struct CursorUsageProbe {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CursorUsageProbe {
+    async fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+}
+
+fn spawn_cursor_usage_probe(
+    agent_config: &Value,
+    execution_id: &str,
+    outbound: mpsc::UnboundedSender<DaemonFrame>,
+) -> Option<CursorUsageProbe> {
+    if agent_config.get("executor_type").and_then(Value::as_str) != Some("cursor") {
+        return None;
+    }
+    let config = serde_json::from_value::<executors::CursorConfig>(
+        agent_config.get("config").cloned().unwrap_or(Value::Null),
+    )
+    .ok()?;
+    let execution_id = execution_id.to_owned();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            if task_cancel.is_cancelled() {
+                break;
+            }
+            match cli_adapters::cursor::query_account_usage_with_cancel(
+                &config,
+                task_cancel.clone(),
+            )
+            .await
+            {
+                Ok(usage) => emit_execution_log(
+                    &outbound,
+                    LogEntry {
+                        schema_version: 1,
+                        sequence: 0,
+                        timestamp: rfc3339_now(),
+                        execution_id: execution_id.clone(),
+                        kind: executors::LogKind::SessionInfo,
+                        stream: executors::LogStream::Heartbeat,
+                        payload: serde_json::json!({
+                            "method": "forge/cursor/usage",
+                            "params": usage,
+                            "source": "cursor_poll"
+                        }),
+                        truncated: false,
+                    },
+                ),
+                Err(error) if !task_cancel.is_cancelled() => {
+                    tracing::debug!(
+                        execution_id = %execution_id,
+                        %error,
+                        "remote Cursor usage poll did not produce an observation"
+                    );
+                }
+                Err(_) => break,
+            }
+            tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(45)) => {}
+            }
+        }
+    });
+    Some(CursorUsageProbe { cancel, task })
 }
 
 fn terminal_notification_from_result(

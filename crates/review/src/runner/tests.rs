@@ -5,6 +5,7 @@ use db::{
     CreateRepo, CreateTask, CreateWorkspace, DaemonRepo, DaemonStatus, ProjectRepo, RepoRepo,
     TaskRepo, UpdateProject, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
 };
+use executors::LogEntry;
 use serde_json::{json, Value};
 use std::path::Path;
 use tempfile::TempDir;
@@ -326,6 +327,9 @@ async fn write_jsonl_log(path: &Path, entries: Vec<(LogKind, Value)>) {
     tokio::fs::write(path, format!("{}\n", lines.join("\n")))
         .await
         .expect("log writes");
+    LogWriter::compact(path)
+        .await
+        .expect("review logs compress");
 }
 
 #[tokio::test]
@@ -508,7 +512,9 @@ async fn codex_auditor_snapshot_starts_without_producer_thread() {
         .expect("snapshot builds");
     let snapshot: Value = serde_json::from_str(&snapshot).expect("snapshot parses");
 
-    assert!(snapshot["config"].get("resume_thread_id").is_none());
+    assert!(snapshot["config"]
+        .get("resume_thread_id")
+        .is_none_or(Value::is_null));
 }
 
 #[tokio::test]

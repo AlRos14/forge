@@ -159,9 +159,19 @@ pub async fn refresh_agent_usage(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
+
+    // A server-side refresh is only valid when the account context is local
+    // to this process. A daemon-bound or scheduler-routed CLI Agent owns its
+    // credentials on another host; probing this server's CLI would report a
+    // different account while looking like a successful refresh.
+    let can_probe_local_account = agent.daemon_id.is_none() && agent.backend_kind == "native";
+    if !can_probe_local_account {
+        return agent_usage_response(&state, &user, &id).await.map(Json);
+    }
+
     let usage = match agent.executor_type.as_str() {
         "codex" => Some(services::account_usage::refresh_codex_usage(&agent.config_json).await?),
-        "cursor" => Some(services::account_usage::refresh_cursor_usage().await?),
+        "cursor" => Some(services::account_usage::refresh_cursor_usage(&agent.config_json).await?),
         _ => None,
     };
     if let Some(usage) = usage {
@@ -190,6 +200,7 @@ async fn agent_usage_response(
         .ok_or_else(|| ApiError::not_found("agent", id.to_owned()))?;
     require_agent_visible(&agent, user, id)?;
     let account_key = usage_account_key(&agent);
+    let shared_account = usage_is_shared(&agent);
     let row = sqlx::query(
         "SELECT source, usage_json, captured_at, stale_after FROM account_usage_snapshot
          WHERE account_key = ? ORDER BY captured_at DESC LIMIT 1",
@@ -202,7 +213,7 @@ async fn agent_usage_response(
             available: false,
             executor_type: agent.executor_type,
             account_key,
-            shared_account: agent.daemon_id.is_none(),
+            shared_account,
             source: None,
             usage: None,
             captured_at: None,
@@ -215,7 +226,7 @@ async fn agent_usage_response(
         available: true,
         executor_type: agent.executor_type,
         account_key,
-        shared_account: agent.daemon_id.is_none(),
+        shared_account,
         source: Some(row.get("source")),
         usage: serde_json::from_str::<Value>(&row.get::<String, _>("usage_json")).ok(),
         captured_at: Some(row.get("captured_at")),
@@ -226,15 +237,36 @@ async fn agent_usage_response(
 
 fn usage_account_key(agent: &Agent) -> String {
     let config: Value = serde_json::from_str(&agent.config_json).unwrap_or(Value::Null);
-    let kind = agent.executor_type.parse::<ExecutorKind>();
-    let mut key = kind
-        .map(|kind| executors::account_key(&kind, &config))
-        .unwrap_or_else(|_| agent.executor_type.clone());
-    if let Some(daemon_id) = agent.daemon_id.as_deref() {
-        key.push('@');
-        key.push_str(daemon_id);
-    }
-    key
+    let host_identity = agent.daemon_id.as_deref().unwrap_or_else(|| {
+        if agent.backend_kind == "native" {
+            "server-local"
+        } else {
+            // An unpinned CLI Agent may be routed to any connected daemon.
+            // Do not merge those host-local accounts in an agent summary.
+            "unresolved-daemon"
+        }
+    });
+    agent
+        .executor_type
+        .parse::<ExecutorKind>()
+        .map(|kind| {
+            executors::account_key_for_context(
+                &kind,
+                &config,
+                host_identity,
+                agent.credential_ref.as_deref(),
+            )
+        })
+        .unwrap_or_else(|_| format!("{}@{host_identity}", agent.executor_type))
+}
+
+fn usage_is_shared(agent: &Agent) -> bool {
+    // Only an explicit durable credential reference proves sharing. A missing
+    // daemon binding is scheduler routing uncertainty, not shared credentials.
+    agent
+        .credential_ref
+        .as_deref()
+        .is_some_and(|reference| !reference.trim().is_empty())
 }
 
 pub async fn list_agent_tasks(
