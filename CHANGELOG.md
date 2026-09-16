@@ -15,6 +15,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   polling. Host-local quota identity includes the daemon/host that owns the
   credentials, while an explicit credential reference is required to prove
   cross-host sharing; wrapper paths are not account identity.
+- `GET /api/v1/agents/{id}/usage` now returns nullable `account_key` and a
+  `daemon_id` provenance field. Unpinned remote Agents resolve the newest
+  execution-linked observation instead of using a synthetic shared account
+  pool.
 
 - Task types now describe purpose and capability: `implementation`, `planning`,
   `discovery`, `review`, and `validation`. Hierarchy is represented only by

@@ -141,7 +141,7 @@ database for historical provenance.
 | GET    | `/api/v1/agents/{id}` | Get an agent identity with selected-profile fields |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
-| GET    | `/api/v1/agents/{id}/usage` | Get the latest account-scoped harness usage snapshot, including freshness |
+| GET    | `/api/v1/agents/{id}/usage` | Get the latest account-scoped harness usage snapshot, including freshness and the producing daemon when known |
 | POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh usage when the harness exposes a no-model probe (Codex `account/rateLimits/read`; Cursor `/usage`) |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
@@ -242,10 +242,17 @@ through the server filesystem, and an executable or wrapper path is not an
 account identity. An explicit credential reference is required to prove that a
 credential context is shared across hosts. Daemon executions persist native
 Codex observations and daemon-side Cursor polls through the same usage path as
-local executions. A server-side refresh does not probe a daemon-bound or
-unresolved remote CLI. Cursor's large control prompt is stored transiently in
-a private runtime directory outside the Git worktree and is removed after the
-execution attempt, so it cannot enter task diffs or commits.
+local executions. Pinned/local Agents query their exact account key. An
+unpinned remote CLI Agent does not receive a synthetic `unresolved-daemon`
+pool; its usage endpoint returns the newest observation linked to one of that
+Agent's Executions, including the actual `account_key` and `daemon_id`. Daemon
+notifications for such an execution are accepted only from the resolved daemon
+recorded in its immutable execution snapshot. If no such observation exists,
+both fields are `null` and `available` is `false`. A server-side refresh does
+not probe a daemon-bound or unresolved remote CLI.
+Cursor's large control prompt is stored transiently in a private runtime
+directory outside the Git worktree and is removed after the execution attempt,
+so it cannot enter task diffs or commits.
 
 ## Agent identities, bindings, and chats
 
