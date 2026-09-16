@@ -1,6 +1,6 @@
 # ADR 0004: First-class HarnessSession
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -20,5 +20,5 @@ that it is unavailable or unsupported.
 
 ## Migration
 
-PR 2 backfills only sessions that are sufficiently identifiable and marks
-unknown historical semantics unknown. PR 13 removes legacy inference.
+Plan PR2 backfills only sessions that are sufficiently identifiable and marks
+unknown historical semantics unknown. Plan PR13 removes legacy inference.

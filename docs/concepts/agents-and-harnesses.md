@@ -55,7 +55,7 @@ that context materially changes which native account is used. Changing model,
 reasoning effort, approval policy, sandbox settings, or other non-identity
 harness arguments may create a new profile revision on the same Agent.
 
-The final persistence shape is owned by PR 1/2. Regardless of representation,
+The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of representation,
 each Execution snapshots the exact effective profile, credential context, and
 capabilities used; later profile revisions never rewrite historical Executions.
 

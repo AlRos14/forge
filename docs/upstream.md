@@ -5,7 +5,7 @@ Forge originated as a fork of
 part of the project's history and attribution. The project retains its
 original MIT licensing obligations and does not remove upstream credit.
 
-The architectural decision recorded in PR 0 is now explicit:
+The architectural decision recorded in Plan PR0 is now explicit:
 
 * this repository is independently maintained;
 * architectural compatibility with ForgeAILab/forge is no longer a goal;

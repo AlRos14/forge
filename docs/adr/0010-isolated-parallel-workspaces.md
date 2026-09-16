@@ -1,6 +1,6 @@
 # ADR 0010: Isolated parallel implementation workspaces
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -20,5 +20,6 @@ are visible outcomes rather than hidden Git accidents.
 
 ## Migration
 
-PR 5 extends the existing workspace and git infrastructure. PR 15 proves
-three-way concurrency, dependency blocking, integration, and conflict cases.
+Plan PR5 extends the existing workspace and git infrastructure. Plan PR15
+proves three-way concurrency, dependency blocking, integration, and conflict
+cases.

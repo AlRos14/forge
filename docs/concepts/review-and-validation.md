@@ -17,8 +17,9 @@ HarnessSession, or fake System Actor. It records:
 * a log or output reference.
 
 The run produces Evidence and may produce a generic validation-report
-Artifact. Typical checks include tests, typecheck, lint, build, security
-scanners, and required repository commands.
+Artifact whose producer is `ValidationRun(run_id)`. Typical checks include
+tests, typecheck, lint, build, security scanners, and required repository
+commands. It is never attributed to a fake Actor or to an Actor Execution.
 
 An Actor may perform validation-related cognitive work through an ordinary
 Execution with purpose `validate` or `investigate`: for example, reproducing a

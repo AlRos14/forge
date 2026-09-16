@@ -1,6 +1,6 @@
 # ADR 0009: Event-driven orchestrator wakeups
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -20,5 +20,5 @@ generating supervisory loop. Wake causes and resulting actions are auditable.
 
 ## Migration
 
-PR 6 adds the wake mechanism and multi-orchestrator policy. PR 9 removes
-workflow branches that attempt to encode cognitive decisions.
+Plan PR6 adds the wake mechanism and multi-orchestrator policy. Plan PR9
+removes workflow branches that attempt to encode cognitive decisions.

@@ -8,14 +8,24 @@ Artifact is the generic durable output primitive:
 Artifact
   id
   task_id
-  producing_actor
-  producing_execution?
+  producer
   kind
   content or external/path reference
   metadata
   digest?
   created_at
+
+ArtifactProducer
+  Execution(execution_id)
+  ValidationRun(validation_run_id)
 ~~~
+
+An Artifact produced by an Actor is attributed through its `Execution`; the
+Actor is derived from that Execution rather than duplicated on the Artifact.
+A deterministic validation report is attributed through its `ValidationRun`
+and therefore has no Actor, HarnessSession, or synthetic System Actor. The
+producer alternatives are mutually exclusive and preserve auditable
+provenance without creating two competing producer truths.
 
 Initial kinds include plan, review report, validation report, diff, patch,
 summary, design document, investigation, API contract, and test report. The
@@ -28,7 +38,7 @@ is never a bearer capability and must be checked against the owning scope.
 ## Evidence
 
 Evidence is a typed observation used by a Gate, projection, or audit. It
-records what was observed, by which Actor, ValidationRun, or other
+records what was observed, by which Actor Execution, ValidationRun, or other
 deterministic process, from which Execution/Workspace/commit when applicable,
 when, and with what digest or log reference.
 

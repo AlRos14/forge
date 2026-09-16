@@ -1,6 +1,6 @@
 # ADR 0008: Small durable collaboration vocabulary
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -19,5 +19,5 @@ visible domain records without hidden prompt rewriting.
 
 ## Migration
 
-PR 4 adds the primitives and redacted events. PRs 6 and 8 use them for
-orchestration and review feedback.
+Plan PR4 adds the primitives and redacted events. Plan PRs 6 and 8 use them
+for orchestration and review feedback.

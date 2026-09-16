@@ -1,6 +1,6 @@
 # ADR 0011: Deterministic policy versus cognitive orchestration
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -22,5 +22,5 @@ silently emulated.
 
 ## Migration
 
-PRs 3, 6, 8, and 9 move capability, orchestration, review, and lifecycle
+Plan PRs 3, 6, 8, and 9 move capability, orchestration, review, and lifecycle
 decisions to the correct boundary.

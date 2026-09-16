@@ -7,14 +7,14 @@ workflow-as-cognition model.
 
 Forge originated as a fork of [ForgeAILab/forge](upstream.md). The origin,
 license, and attribution remain important; architectural compatibility with
-upstream does not. The migration is intentionally incremental. At PR 0 the
+upstream does not. The migration is intentionally incremental. At Plan PR0 the
 Rust, SQLite, REST, MCP, CLI, and web implementations still contain the
-previous model. They remain operational until a later migration PR moves their
+previous model. They remain operational until a later Plan PR moves their
 readers and writers. This document describes the target contract, not a claim
 that every target primitive already exists.
 
 The migration register, invariant definitions, current dependency audit, and
-PR boundaries live in [migration/architecture-v2.md](migration/architecture-v2.md).
+Plan PR boundaries live in [migration/architecture-v2.md](migration/architecture-v2.md).
 The focused domain references are in [concepts/](concepts/).
 
 ## North star
@@ -282,8 +282,20 @@ See [review-and-validation.md](concepts/review-and-validation.md) and
 Artifact is the generic durable output primitive. Initial kinds include plan,
 review report, validation report, diff, patch, summary, design document,
 investigation, API contract, and test report. Artifacts can be content or an
-external/path reference with metadata, digest, producer Actor, producing
-Execution, Task, and timestamps.
+external/path reference with metadata, digest, Task, and timestamps. Their
+producer is an explicit mutually exclusive `ArtifactProducer`:
+
+~~~text
+ArtifactProducer
+  Execution(execution_id)          # Actor is derived from the Execution
+  ValidationRun(validation_run_id) # deterministic, Actor-free producer
+~~~
+
+An Execution-produced Artifact derives its Actor, Role, Purpose, harness and
+configuration provenance from that Execution. A deterministic validation
+Artifact derives provenance from its ValidationRun and never requires an
+Actor, HarnessSession, or fake System Actor. This avoids duplicating
+`producing_actor` as a second source of truth.
 
 Evidence is a typed, auditable observation used by a Gate or lifecycle
 projection. Deterministic validation can produce Evidence and a validation
@@ -344,7 +356,7 @@ be evolved behind this contract.
 
 ## Persistence and migration rules
 
-The replacement is additive until the final cleanup PR:
+The replacement is additive until the final cleanup Plan PR:
 
 1. Add replacement schema and types.
 2. Write the replacement representation.
@@ -355,7 +367,7 @@ The replacement is additive until the final cleanup PR:
 7. Drop legacy schema only after migration fixtures prove preservation.
 
 Any compatibility reader must name the authoritative source, its bounded
-lifetime, the dual-write direction if applicable, and the PR that removes it.
+lifetime, the dual-write direction if applicable, and the Plan PR that removes it.
 Historical uncertainty is preserved as unknown; migrations do not invent
 harness semantics, role intent, or approvals.
 
@@ -400,7 +412,7 @@ forge-cli → api → services → db
 ~~~
 
 agent-host and any embedded cognition runtime are not in the target graph.
-They remain in the current build until the later removal PR.
+They remain in the current build until Plan PR10 removes them.
 
 ## Public surfaces
 
@@ -408,42 +420,42 @@ REST, MCP, CLI, SSE, and the web UI expose the same Actor/Role/Execution/
 WorkUnit/Artifact/Evidence/Collaboration model. They must not introduce
 different authority or orchestration concepts. A public contract change is
 updated in the route, api-types, generated TypeScript, and docs/api.md in one
-implementation PR.
+implementation Repo PR for the owning Plan PR.
 
 The UI may make Human work more ergonomic, but Human planner, implementer,
 reviewer, and orchestrator actions use the same domain records as Agent work.
 The UI shows Agent harness identity clearly; it does not collapse same-model
 Agents across harnesses.
 
-This PR 0 does not change the product runtime, public API, CLI surface, or
+Plan PR0 does not change the product runtime, public API, CLI surface, or
 branding. It corrects current API-reference text where necessary so it does
 not describe unimplemented behavior; new public domain surfaces remain staged
-for later PRs.
+for later Plan PRs.
 
 ## Migration sequence
 
-The migration is one reviewed PR at a time:
+The migration is one reviewed Plan PR at a time:
 
-| PR | Contract |
+| Plan PR | Contract |
 | --- | --- |
-| 0 | Freeze this architecture, invariant register, ADRs, upstream attribution, and migration ledger |
-| 1 | Actor references and multi-actor TaskRole memberships |
-| 2 | ExecutionPurpose and first-class HarnessSession |
-| 3 | Capability-driven HarnessAdapter |
-| 4 | Generic Artifacts and collaboration primitives |
-| 5 | WorkUnits and isolated parallel implementation |
-| 6 | Event-driven, multi-actor orchestration |
-| 7 | Harness-native planning Executions and plan Artifacts |
-| 8 | Review Executions plus deterministic validation Evidence |
-| 9 | Aggregate Task lifecycle and simplified gates/scheduler |
-| 10 | Removal of agent-host and embedded cognition |
-| 11 | Retirement of Main Agent/Project Agent/Project OS verticals |
-| 12 | REST, MCP, CLI, web, and event surface alignment |
-| 13 | Legacy persistence and compatibility cleanup |
-| 14 | Final product rename and documentation rewrite |
-| 15 | Reference scenarios, reliability hardening, and acceptance |
+| Plan PR0 | Freeze this architecture, invariant register, ADRs, upstream attribution, and migration ledger |
+| Plan PR1 | Actor references and multi-actor TaskRole memberships |
+| Plan PR2 | ExecutionPurpose and first-class HarnessSession |
+| Plan PR3 | Capability-driven HarnessAdapter |
+| Plan PR4 | Generic Artifacts and collaboration primitives |
+| Plan PR5 | WorkUnits and isolated parallel implementation |
+| Plan PR6 | Event-driven, multi-actor orchestration |
+| Plan PR7 | Harness-native planning Executions and plan Artifacts |
+| Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence |
+| Plan PR9 | Aggregate Task lifecycle and simplified gates/scheduler |
+| Plan PR10 | Removal of agent-host and embedded cognition |
+| Plan PR11 | Retirement of Main Agent/Project Agent/Project OS verticals |
+| Plan PR12 | REST, MCP, CLI, web, and event surface alignment |
+| Plan PR13 | Legacy persistence and compatibility cleanup |
+| Plan PR14 | Final product rename and documentation rewrite |
+| Plan PR15 | Reference scenarios, reliability hardening, and acceptance |
 
-No later PR is implied by a PR 0 document. Each PR begins from the actual
+No later Plan PR is implied by a Plan PR0 document. Each Plan PR begins from the actual
 current main, re-runs dependency searches, identifies affected invariants,
 and stops after its own validation and review.
 

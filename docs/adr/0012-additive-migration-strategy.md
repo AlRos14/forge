@@ -1,6 +1,6 @@
 # ADR 0012: Additive, reviewed migration
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -10,8 +10,8 @@ history and make authority gaps unreviewable.
 
 ## Decision
 
-Migrate in ordered PRs: add replacement schema, write it, read it, stop old
-writes, stop old reads, remove APIs/UI, then drop legacy schema. Every PR
+Migrate in ordered Plan PRs: add replacement schema, write it, read it, stop old
+writes, stop old reads, remove APIs/UI, then drop legacy schema. Every Plan PR
 starts from current main, repeats dependency searches, documents invariants,
 updates architecture docs, validates its touched paths, and stops.
 
@@ -24,5 +24,5 @@ user-owned data and audit history survive.
 ## Migration
 
 The complete order and removal ledger are in
-[architecture-v2.md](../migration/architecture-v2.md). PR 0 changes no
+[architecture-v2.md](../migration/architecture-v2.md). Plan PR0 changes no
 runtime or persistence.

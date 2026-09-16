@@ -1,6 +1,6 @@
 # ADR 0005: Harness-native planning
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -21,5 +21,5 @@ engine.
 
 ## Migration
 
-PRs 2, 3, and 7 separate purpose from permission, expose capability truth, and
-remove canonical planner retry/checklist machinery.
+Plan PRs 2, 3, and 7 separate purpose from permission, expose capability
+truth, and remove canonical planner retry/checklist machinery.

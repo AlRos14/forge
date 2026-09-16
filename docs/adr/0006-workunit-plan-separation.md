@@ -1,6 +1,6 @@
 # ADR 0006: WorkUnit is not plan truth
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -21,5 +21,5 @@ orchestrator can derive work without maintaining a plan state machine.
 
 ## Migration
 
-PR 5 adds WorkUnits and a dependency DAG. PR 7 removes old plan authority
-after plan Artifacts are authoritative.
+Plan PR5 adds WorkUnits and a dependency DAG. Plan PR7 removes old plan
+authority after plan Artifacts are authoritative.

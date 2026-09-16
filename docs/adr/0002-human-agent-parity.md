@@ -1,6 +1,6 @@
 # ADR 0002: Human and Agent actor parity
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -21,5 +21,5 @@ does not grant or deny authority merely from Actor kind.
 
 ## Migration
 
-PR 1 persists Human ActorRefs in all initial roles. PRs 7, 8, and 12 replace
-special planner/reviewer human paths and UI states.
+Plan PR1 persists Human ActorRefs in all initial roles. Plan PRs 7, 8, and 12
+replace special planner/reviewer human paths and UI states.

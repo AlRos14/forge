@@ -1,6 +1,6 @@
 # ADR 0001: Harness-bound Agent identity
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -29,5 +29,6 @@ Executions remain auditable.
 
 ## Migration
 
-PRs 1–3 add ActorRef, profile identity rules, HarnessSession, and the adapter
-capability boundary before old executor identity fields are removed in PR 13.
+Plan PRs 1–3 add ActorRef, profile identity rules, HarnessSession, and the
+adapter capability boundary before old executor identity fields are removed
+in Plan PR13.

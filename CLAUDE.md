@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The user-facing entry point is [README.md](README.md). Deeper material is split across `docs/`:
 - [docs/architecture.md](docs/architecture.md) — target Actor/harness orchestration architecture and preserved infrastructure.
-- [docs/migration/architecture-v2.md](docs/migration/architecture-v2.md) — PR-by-PR migration contract, invariants, and current dependency audit.
+- [docs/migration/architecture-v2.md](docs/migration/architecture-v2.md) — Plan PR-by-Plan PR migration contract, invariants, and current dependency audit.
 - [docs/api.md](docs/api.md) — REST surface, pagination, MCP tools.
 - [docs/getting-started.md](docs/getting-started.md) — install, configuration, end-to-end walkthrough.
 - [docs/cli.md](docs/cli.md) — `forge-ctl` reference.
@@ -77,7 +77,7 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 
 ## When working on this repo
 
-- **Read `docs/architecture.md` and `docs/migration/architecture-v2.md` before changing domain wiring, execution, workflow, role assignment, or task lifecycle.** The target Actor/harness contract is authoritative; the current workflow and singular-assignee paths are transitional until their named migration PRs.
+- **Read `docs/architecture.md` and `docs/migration/architecture-v2.md` before changing domain wiring, execution, workflow, role assignment, or task lifecycle.** The target Actor/harness contract is authoritative; the current workflow and singular-assignee paths are transitional until their named Plan PRs.
 - **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Update all four in one change.
 - **Lifecycle changes** must keep `crates/api/tests/happy_path.rs` green, name the touched invariants, and update the target lifecycle/Gate documentation. Do not encode actor cognition as an exclusive Task state.
 - **Migrations** are numbered `V{NNN}__{name}.sql`. Add a new file; don't edit historical migrations even during beta — users have running databases.
@@ -104,9 +104,9 @@ forge-cli → api → services → db
 - **Domain boundary** — Humans and harness-bound Agents are peer Actors; Roles are Task-scoped memberships; Executions record one Actor, Role, and Purpose.
 - **Cognition boundary** — harnesses own model loops and native capabilities; Forge owns work, authority, collaboration, evidence, and lifecycle.
 - **Isolation** — concurrent mutating WorkUnits use separate branches/worktrees and explicit leases; integration is deterministic and locked.
-- **Persistence** — SQLite repositories and numbered migrations remain the current infrastructure; replacement schema is additive until PR 13.
+- **Persistence** — SQLite repositories and numbered migrations remain the current infrastructure; replacement schema is additive until Plan PR13.
 - **Events** — durable domain records are authoritative; the events crate and SSE are delivery/projection mechanisms.
-- **Current transition** — the repository still contains legacy workflow, review, singular-assignee, Main/Project Agent, and agent-host paths. Do not delete or redesign them outside their named migration PR.
+- **Current transition** — the repository still contains legacy workflow, review, singular-assignee, Main/Project Agent, and agent-host paths. Do not delete or redesign them outside their named Plan PR.
 - **Infrastructure** — the existing repository traits, AppState, MCP server, workspace path guards, config precedence, and local bind defaults remain useful implementation details while the domain migrates.
 
 ## Database

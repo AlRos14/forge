@@ -1,6 +1,6 @@
 # ADR 0007: Reviewer and orchestrator are distinct responsibilities
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -20,5 +20,5 @@ Orchestrators cannot pass or fail implementation merely by observing it.
 
 ## Migration
 
-PR 6 adds the orchestrator role. PR 8 replaces the special review runtime with
-review Executions and generic Artifacts.
+Plan PR6 adds the orchestrator role. Plan PR8 replaces the special review
+runtime with review Executions and generic Artifacts.

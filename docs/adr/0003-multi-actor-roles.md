@@ -1,6 +1,6 @@
 # ADR 0003: Multi-actor Task roles
 
-Status: Accepted in PR 0
+Status: Accepted in Plan PR0
 
 ## Context
 
@@ -22,5 +22,5 @@ Policies remain explicit and small; role names do not instantiate behavior.
 
 ## Migration
 
-PR 1 adds the membership schema and authoritative reads. Singular role
-writers/readers remain only as bounded migration paths until PR 13.
+Plan PR1 adds the membership schema and authoritative reads. Singular role
+writers/readers remain only as bounded migration paths until Plan PR13.
