@@ -116,7 +116,13 @@ export function AgentDetailPanel({
             <div>
               <h3 id="agent-usage-heading" className="text-sm font-semibold">Account usage</h3>
               <p className="mt-1 text-xs text-muted-foreground">
-                {usageQuery.data?.shared_account ? 'Shared by agents using the same harness account.' : 'Scoped to this daemon account.'}
+                {usageQuery.data?.shared_account
+                  ? 'Shared by agents using the same explicit credential context.'
+                  : usageQuery.data?.daemon_id
+                    ? `Observed on daemon ${usageQuery.data.daemon_id}.`
+                    : agent.daemon_id
+                      ? 'Scoped to this pinned daemon account.'
+                      : 'No shared daemon account is assumed for this Agent.'}
               </p>
             </div>
             <Button

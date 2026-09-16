@@ -1337,6 +1337,70 @@ mod tests {
         assert!(!leftovers, "launch failure left a Cursor control directory");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn large_prompt_adapter_fixture_can_read_external_runtime_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worktree = tempfile::tempdir().expect("temp worktree");
+        let marker_dir = tempfile::tempdir().expect("marker directory");
+        let marker = marker_dir.path().join("prompt.txt");
+        let fake_cursor = worktree.path().join("fake-cursor-agent");
+        std::fs::write(
+            &fake_cursor,
+            format!(
+                "#!/bin/sh\nlast=\"\"\nfor arg in \"$@\"; do last=\"$arg\"; done\npath=$(printf '%s' \"$last\" | tr '\\`' '\\n' | sed -n '2p')\ntest -n \"$path\" && test -r \"$path\" || exit 23\ncat \"$path\" > \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}}'\n",
+                marker.display()
+            ),
+        )
+        .expect("fake Cursor writes");
+        std::fs::set_permissions(&fake_cursor, std::fs::Permissions::from_mode(0o700))
+            .expect("fake Cursor is executable");
+
+        let execution_id = format!(
+            "fixture-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let prefix = format!("{CONTROL_DIR_PREFIX}{execution_id}-");
+        let prompt = "large prompt ".repeat(40_000);
+        let result = CursorAdapter::new()
+            .execute(ExecutionContext {
+                task_id: "task-1".to_owned(),
+                execution_id,
+                worktree_path: worktree.path().display().to_string(),
+                description: prompt.clone(),
+                agent_config: serde_json::json!({
+                    "base_command_override": fake_cursor.display().to_string()
+                }),
+                logs_path: worktree
+                    .path()
+                    .join("execution.jsonl")
+                    .display()
+                    .to_string(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await
+            .expect("Cursor fixture executes");
+
+        assert_eq!(result.status, ExecutionOutcome::Completed);
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("fixture reads prompt"),
+            prompt
+        );
+        assert!(!worktree.path().join(".forge").exists());
+        let leftovers = fs::read_dir(std::env::temp_dir())
+            .expect("runtime directory readable")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+        assert!(!leftovers, "adapter left a Cursor control directory");
+    }
+
     #[test]
     fn stale_runtime_directories_are_removed_but_recent_directories_survive() {
         let parent = tempfile::tempdir().expect("control parent");

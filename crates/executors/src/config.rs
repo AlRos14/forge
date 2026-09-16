@@ -389,7 +389,10 @@ pub fn candidate_key(kind: &ExecutorKind, config: &Value) -> String {
 /// Codex it is the lexical credential context; other executors have one
 /// machine-level account. An executable override is deliberately not an
 /// account identity: two wrappers may launch the same account, and the
-/// wrapper may change without changing the credentials behind it.
+/// wrapper may change without changing the credentials behind it. Absolute
+/// CODEX_HOME values are normalized lexically without filesystem access;
+/// relative and `~` values remain opaque because their meaning belongs to the
+/// execution host.
 ///
 /// This function is intentionally host-neutral. Callers that persist usage
 /// observations must use [`account_key_for_context`] so host-local credentials
@@ -400,13 +403,8 @@ pub fn account_key(kind: &ExecutorKind, config: &Value) -> String {
             nonempty_str(config.get("provider")).or_else(|| nonempty_str(config.get("profile")))
         }
         ExecutorKind::Codex => {
-            let home =
-                nonempty_str(config.get("env").and_then(|env| env.get("CODEX_HOME"))).map(|home| {
-                    format!(
-                        "home={}",
-                        normalize_account_path(Path::new(&home)).to_string_lossy()
-                    )
-                });
+            let home = nonempty_str(config.get("env").and_then(|env| env.get("CODEX_HOME")))
+                .map(|home| format!("home={}", normalize_account_path(Path::new(&home))));
             home.or_else(|| {
                 nonempty_str(config.get("profile")).map(|profile| format!("profile={profile}"))
             })
@@ -454,7 +452,14 @@ fn nonempty_str(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn normalize_account_path(path: &Path) -> PathBuf {
+fn normalize_account_path(path: &Path) -> String {
+    // CODEX_HOME is interpreted by the process that actually launches Codex.
+    // The server cannot safely expand a relative or `~` path for a remote
+    // daemon, so preserve non-absolute values as opaque lexical context.
+    if !path.is_absolute() {
+        return format!("relative:{}", path.to_string_lossy());
+    }
+
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -467,7 +472,7 @@ fn normalize_account_path(path: &Path) -> PathBuf {
             }
         }
     }
-    normalized
+    normalized.to_string_lossy().into_owned()
 }
 
 /// FNV-1a over a canonical (key-sorted, session-stripped) rendering of the
@@ -813,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn account_key_uses_canonical_codex_home_not_executable_override() {
+    fn account_key_lexically_normalizes_absolute_codex_home_not_wrapper() {
         let with_home = serde_json::json!({
             "env": { "CODEX_HOME": "/tmp/forge-codex-account/../forge-codex-account" },
             "base_command_override": "/home/user/bin/codex-work"
@@ -872,8 +877,33 @@ mod tests {
             "env": { "CODEX_HOME": "~/.codex/../.codex" }
         });
         let key = account_key_for_context(&ExecutorKind::Codex, &config, "daemon-a", None);
-        assert!(key.contains("home=~/.codex"));
+        assert!(key.contains("home=relative:~/.codex/../.codex"));
         assert!(!key.contains(&std::env::var("HOME").unwrap_or_default()));
+    }
+
+    #[test]
+    fn account_key_preserves_relative_codex_home_semantics() {
+        let parent = serde_json::json!({
+            "env": { "CODEX_HOME": "../account" }
+        });
+        let child = serde_json::json!({
+            "env": { "CODEX_HOME": "account" }
+        });
+        let traversal = serde_json::json!({
+            "env": { "CODEX_HOME": "foo/../../bar" }
+        });
+        let collapsed = serde_json::json!({
+            "env": { "CODEX_HOME": "bar" }
+        });
+
+        assert_ne!(
+            account_key(&ExecutorKind::Codex, &parent),
+            account_key(&ExecutorKind::Codex, &child)
+        );
+        assert_ne!(
+            account_key(&ExecutorKind::Codex, &traversal),
+            account_key(&ExecutorKind::Codex, &collapsed)
+        );
     }
 
     #[test]

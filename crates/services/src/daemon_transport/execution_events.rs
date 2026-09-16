@@ -11,7 +11,7 @@ use db::{
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{LogKind, LogStream, LogWriter};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
@@ -146,15 +146,30 @@ impl ServerExecutionEventSink {
             return Ok(None);
         };
 
-        if agent.daemon_id.as_deref() == Some(daemon_id)
-            || (agent.daemon_id.is_none() && self.is_embedded_daemon_sender(daemon_id).await?)
-        {
+        let resolved_daemon_id = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .get("resolved_daemon_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+            });
+        let daemon_owns_execution = agent.daemon_id.as_deref() == Some(daemon_id)
+            || (agent.daemon_id.is_none() && resolved_daemon_id.as_deref() == Some(daemon_id))
+            || (agent.daemon_id.is_none()
+                && resolved_daemon_id.is_none()
+                && self.is_embedded_daemon_sender(daemon_id).await?);
+        if daemon_owns_execution {
             return Ok(Some(execution));
         }
 
         tracing::warn!(
             sending_daemon = %daemon_id,
             expected_daemon = ?agent.daemon_id,
+            resolved_daemon = ?resolved_daemon_id,
             execution_id = %execution_id,
             "rejecting execution notification: daemon does not own this execution"
         );

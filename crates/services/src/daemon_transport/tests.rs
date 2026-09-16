@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject,
     CreateRepo, CreateTask, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo,
-    RepoRepo, TaskRepo, UpsertDaemon, WorkMode,
+    RepoRepo, TaskRepo, UpdateAgent, UpsertDaemon, WorkMode,
 };
 use events::EventBus;
 use serde::Deserialize;
@@ -444,7 +444,7 @@ async fn execution_log_from_owner_updates_last_activity_at() {
 }
 
 #[tokio::test]
-async fn owner_usage_logs_are_persisted_once_with_daemon_provenance() {
+async fn unpinned_remote_usage_logs_use_execution_daemon_provenance() {
     let db = sqlite_db().await;
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = std::env::temp_dir().join(format!(
@@ -453,7 +453,37 @@ async fn owner_usage_logs_are_persisted_once_with_daemon_provenance() {
     ));
     std::fs::create_dir_all(&workspace_root).expect("workspace root creates");
     let owner_daemon_id = seed_daemon(&db, "owner-machine-usage").await;
-    let (_agent_id, execution) = seed_running_execution(&db, &owner_daemon_id).await;
+    let (agent_id, execution) = seed_running_execution(&db, &owner_daemon_id).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    AgentRepo::update(
+        &*db,
+        UpdateAgent {
+            id: agent.id,
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(None),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("agent is unpinned");
     sqlx::query(
         "UPDATE execution
          SET executor_config_snapshot_json = ?
@@ -463,7 +493,8 @@ async fn owner_usage_logs_are_persisted_once_with_daemon_provenance() {
         json!({
             "executor_type": "codex",
             "config": { "env": { "CODEX_HOME": "~/.codex" } },
-            "resolved_daemon_id": "scheduler-route"
+            "agent_daemon_id": null,
+            "resolved_daemon_id": owner_daemon_id
         })
         .to_string(),
     )
@@ -511,7 +542,7 @@ async fn owner_usage_logs_are_persisted_once_with_daemon_provenance() {
             assert_eq!(row[0].get::<String, _>("source"), "provider_event");
             assert_eq!(
                 row[0].get::<String, _>("account_key"),
-                format!("codex@{owner_daemon_id}:home=~/.codex")
+                format!("codex@{owner_daemon_id}:home=relative:~/.codex")
             );
             assert_eq!(row[0].get::<String, _>("daemon_id"), owner_daemon_id);
             assert_eq!(row[0].get::<String, _>("execution_id"), execution.id);
@@ -533,7 +564,7 @@ async fn owner_usage_logs_are_persisted_once_with_daemon_provenance() {
         json!({
             "executor_type": "cursor",
             "config": {},
-            "resolved_daemon_id": "scheduler-route"
+            "resolved_daemon_id": owner_daemon_id
         })
         .to_string(),
     )

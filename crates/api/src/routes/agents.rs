@@ -174,8 +174,7 @@ pub async fn refresh_agent_usage(
         "cursor" => Some(services::account_usage::refresh_cursor_usage(&agent.config_json).await?),
         _ => None,
     };
-    if let Some(usage) = usage {
-        let account_key = usage_account_key(&agent);
+    if let (Some(usage), Some(account_key)) = (usage, usage_account_key(&agent)) {
         let captured_at = now_rfc3339();
         let stale_after = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
         sqlx::query(
@@ -201,18 +200,42 @@ async fn agent_usage_response(
     require_agent_visible(&agent, user, id)?;
     let account_key = usage_account_key(&agent);
     let shared_account = usage_is_shared(&agent);
-    let row = sqlx::query(
-        "SELECT source, usage_json, captured_at, stale_after FROM account_usage_snapshot
-         WHERE account_key = ? ORDER BY captured_at DESC LIMIT 1",
-    )
-    .bind(&account_key)
-    .fetch_optional(state.db.pool())
-    .await?;
+    // A pinned/local/explicit-credential Agent has an exact account key. An
+    // unpinned remote CLI Agent does not: its scheduler-selected daemon is a
+    // factual property of each Execution, not of the Agent. Resolve that case
+    // through execution-linked observations so daemon-local pools remain
+    // separate and the response reports the actual host that produced it.
+    let row = if let Some(account_key) = account_key.as_deref() {
+        sqlx::query(
+            "SELECT account_key, daemon_id, source, usage_json, captured_at, stale_after
+             FROM account_usage_snapshot
+             WHERE account_key = ? AND executor_type = ?
+             ORDER BY captured_at DESC LIMIT 1",
+        )
+        .bind(account_key)
+        .bind(&agent.executor_type)
+        .fetch_optional(state.db.pool())
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT snapshot.account_key, snapshot.daemon_id, snapshot.source,
+                    snapshot.usage_json, snapshot.captured_at, snapshot.stale_after
+             FROM account_usage_snapshot AS snapshot
+             JOIN execution ON execution.id = snapshot.execution_id
+             WHERE execution.agent_id = ? AND snapshot.executor_type = ?
+             ORDER BY snapshot.captured_at DESC LIMIT 1",
+        )
+        .bind(&agent.id)
+        .bind(&agent.executor_type)
+        .fetch_optional(state.db.pool())
+        .await?
+    };
     let Some(row) = row else {
         return Ok(api_types::AgentUsageResponse {
             available: false,
             executor_type: agent.executor_type,
             account_key,
+            daemon_id: None,
             shared_account,
             source: None,
             usage: None,
@@ -225,7 +248,8 @@ async fn agent_usage_response(
     Ok(api_types::AgentUsageResponse {
         available: true,
         executor_type: agent.executor_type,
-        account_key,
+        account_key: Some(row.get("account_key")),
+        daemon_id: row.get("daemon_id"),
         shared_account,
         source: Some(row.get("source")),
         usage: serde_json::from_str::<Value>(&row.get::<String, _>("usage_json")).ok(),
@@ -235,29 +259,33 @@ async fn agent_usage_response(
     })
 }
 
-fn usage_account_key(agent: &Agent) -> String {
+fn usage_account_key(agent: &Agent) -> Option<String> {
     let config: Value = serde_json::from_str(&agent.config_json).unwrap_or(Value::Null);
-    let host_identity = agent.daemon_id.as_deref().unwrap_or_else(|| {
-        if agent.backend_kind == "native" {
-            "server-local"
-        } else {
-            // An unpinned CLI Agent may be routed to any connected daemon.
-            // Do not merge those host-local accounts in an agent summary.
-            "unresolved-daemon"
-        }
-    });
-    agent
-        .executor_type
-        .parse::<ExecutorKind>()
-        .map(|kind| {
-            executors::account_key_for_context(
-                &kind,
-                &config,
-                host_identity,
-                agent.credential_ref.as_deref(),
-            )
-        })
-        .unwrap_or_else(|_| format!("{}@{host_identity}", agent.executor_type))
+    let explicit_credential = agent
+        .credential_ref
+        .as_deref()
+        .filter(|reference| !reference.trim().is_empty());
+    if agent.daemon_id.is_none() && agent.backend_kind != "native" && explicit_credential.is_none()
+    {
+        // The scheduler may choose any connected daemon. No single account
+        // pool can be inferred from the Agent record alone.
+        return None;
+    }
+    let host_identity = agent.daemon_id.as_deref().unwrap_or("server-local");
+    Some(
+        agent
+            .executor_type
+            .parse::<ExecutorKind>()
+            .map(|kind| {
+                executors::account_key_for_context(
+                    &kind,
+                    &config,
+                    host_identity,
+                    explicit_credential,
+                )
+            })
+            .unwrap_or_else(|_| format!("{}@{host_identity}", agent.executor_type)),
+    )
 }
 
 fn usage_is_shared(agent: &Agent) -> bool {

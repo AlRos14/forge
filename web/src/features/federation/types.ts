@@ -67,7 +67,8 @@ export interface FederatedAgent {
 export interface AgentUsage {
   available: boolean
   executor_type: string
-  account_key: string
+  account_key: string | null
+  daemon_id: string | null
   shared_account: boolean
   source: string | null
   usage: JsonObject | null
