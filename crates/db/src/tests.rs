@@ -1406,10 +1406,18 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
         "Long-running repository task",
     )
     .await;
+    sqlx::query(
+        "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
+    )
+    .bind(&agent_id)
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("seed the legacy task fallback assignment");
     let task = TaskRepo::get_by_id(&db, &task_id, true)
         .await
-        .expect("task lookup")
-        .expect("task exists");
+        .expect("task lookup after assignment")
+        .expect("task exists after assignment");
     let now = chrono::Utc::now();
     let execution = ExecutionRepo::create(
         &db,
@@ -1487,13 +1495,15 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     assert_eq!(renewed[0].expires_at, renewed_expiry);
     assert_eq!(renewed[0].version, lease.version + 1);
 
-    sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
-        .bind(&renewed[0].task_id)
-        .execute(db.pool())
-        .await
-        .expect("make the lease's Task version stale");
+    sqlx::query(
+        "UPDATE task SET description = 'harmless metadata edit', version = version + 1 WHERE id = ?",
+    )
+    .bind(&renewed[0].task_id)
+    .execute(db.pool())
+    .await
+    .expect("make a harmless Task revision");
     let retry_now = now + chrono::Duration::seconds(1);
-    let rejected = WorkspaceLeaseRepo::renew_active(
+    let renewed_after_task_edit = WorkspaceLeaseRepo::renew_active(
         &db,
         &retry_now.to_rfc3339(),
         &(now + chrono::Duration::minutes(20)).to_rfc3339(),
@@ -1501,8 +1511,44 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
         10,
     )
     .await
-    .expect("stale lease is skipped instead of poisoning the heartbeat pass");
+    .expect("harmless Task edit does not invalidate the lease");
+    assert_eq!(renewed_after_task_edit.len(), 1);
+
+    sqlx::query(
+        "UPDATE task_role_assignment SET assignee_id = 'reassigned-agent' WHERE task_id = ? AND role_name = 'coder'",
+    )
+    .bind(&renewed[0].task_id)
+    .execute(db.pool())
+    .await
+    .expect("reassign the role membership");
+    let rejected = WorkspaceLeaseRepo::renew_active(
+        &db,
+        &(now + chrono::Duration::seconds(2)).to_rfc3339(),
+        &(now + chrono::Duration::minutes(35)).to_rfc3339(),
+        &(now + chrono::Duration::minutes(45)).to_rfc3339(),
+        10,
+    )
+    .await
+    .expect("authority change is skipped instead of poisoning the heartbeat pass");
     assert!(rejected.is_empty());
+
+    // Removing the explicit role row restores the legacy task-level fallback;
+    // the fallback is considered only when no explicit assignment exists.
+    sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'")
+        .bind(&renewed[0].task_id)
+        .execute(db.pool())
+        .await
+        .expect("remove explicit role assignment");
+    let fallback_renewal = WorkspaceLeaseRepo::renew_active(
+        &db,
+        &(now + chrono::Duration::seconds(3)).to_rfc3339(),
+        &(now + chrono::Duration::minutes(50)).to_rfc3339(),
+        &(now + chrono::Duration::minutes(55)).to_rfc3339(),
+        10,
+    )
+    .await
+    .expect("legacy fallback renewal succeeds when no role assignment exists");
+    assert_eq!(fallback_renewal.len(), 1);
 }
 
 #[tokio::test]

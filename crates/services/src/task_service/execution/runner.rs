@@ -272,11 +272,13 @@ impl TaskService {
         let cancellation_executor = self.task_executor.clone();
         let sse_execution_id = execution_id.clone();
         let sse_task_id = task.id.clone();
+        let live_usage_snapshot = execution.executor_config_snapshot_json.clone();
         let log_max_turns = max_turns;
         let log_max_turns_exceeded = Arc::clone(&max_turns_exceeded);
         let log_assistant_turn_count = Arc::clone(&assistant_turn_count);
         tokio::spawn(async move {
             let mut last_db_update: Option<std::time::Instant> = None;
+            let mut last_usage_persist: Option<std::time::Instant> = None;
             let mut assistant_turn_count = 0_u32;
             let mut pending_batch: Vec<executors::LogEntry> = Vec::new();
             let mut flush_deadline: Option<tokio::time::Instant> = None;
@@ -332,7 +334,7 @@ impl TaskService {
                     .unwrap_or(true)
                 {
                     if let Err(error) = ExecutionRepo::update_last_activity_at(
-                        &*activity_db,
+                        activity_db.as_ref(),
                         &sse_execution_id,
                         &entry.timestamp,
                     )
@@ -345,6 +347,28 @@ impl TaskService {
                         );
                     }
                     last_db_update = Some(std::time::Instant::now());
+                }
+                if let Some(account_usage) = super::account_usage_from_log_entry(&entry) {
+                    let should_persist = last_usage_persist
+                        .map(|instant| instant.elapsed() >= Duration::from_secs(5))
+                        .unwrap_or(true);
+                    if should_persist {
+                        if let Err(error) = super::persist_account_usage_snapshot(
+                            activity_db.as_ref(),
+                            live_usage_snapshot.as_deref(),
+                            &sse_execution_id,
+                            &account_usage,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                execution_id = %sse_execution_id,
+                                %error,
+                                "failed to persist live account usage snapshot"
+                            );
+                        }
+                        last_usage_persist = Some(std::time::Instant::now());
+                    }
                 }
                 if entry.kind == executors::LogKind::Assistant {
                     assistant_turn_count = assistant_turn_count.saturating_add(1);
@@ -391,6 +415,11 @@ impl TaskService {
         } else {
             None
         };
+        let cursor_usage_probe = super::spawn_cursor_usage_probe(
+            Arc::clone(&self.db),
+            execution.executor_config_snapshot_json.clone(),
+            execution_id.clone(),
+        );
         let execution_result = executor
             .execute(ExecutionContext {
                 task_id: task.id.clone(),
@@ -404,6 +433,12 @@ impl TaskService {
                 log_sender: Some(log_tx),
             })
             .await;
+        if let Some(probe) = cursor_usage_probe {
+            probe.stop().await;
+        }
+        if let Err(error) = executors::LogWriter::compact(std::path::Path::new(&logs_path)).await {
+            tracing::warn!(%execution_id, %error, "failed to compress final execution log segment; plain log retained");
+        }
         let restore_result = if let Some(head) = read_only_head.as_deref() {
             git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
                 .await
@@ -968,29 +1003,14 @@ impl TaskService {
             return Ok(durable_path);
         }
 
-        let stored = std::path::Path::new(stored_path);
-        if !stored.exists() {
-            return Ok(durable_path);
-        }
-
-        let durable = std::path::Path::new(&durable_path);
-        if let Some(parent) = durable.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ServiceError::invalid_operation(format!("failed to create log directory: {error}"))
-            })?;
-        }
-        if !durable.exists() {
-            std::fs::rename(stored, durable)
-                .or_else(|_| {
-                    std::fs::copy(stored, durable)?;
-                    std::fs::remove_file(stored)
-                })
-                .map_err(|error| {
-                    ServiceError::invalid_operation(format!(
-                        "failed to move execution log: {error}"
-                    ))
-                })?;
-        }
+        executors::LogWriter::relocate(
+            std::path::Path::new(stored_path),
+            std::path::Path::new(&durable_path),
+        )
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!("failed to move execution log: {error}"))
+        })?;
 
         Ok(durable_path)
     }

@@ -442,6 +442,14 @@ impl TaskExecutor for FallbackExecutor {
                 let mut candidate_ctx = ctx.clone();
                 candidate_ctx.agent_config = candidate.config.clone();
                 let attempt = adapter.execute(candidate_ctx).await;
+                writer = crate::LogWriter::new(
+                    std::path::Path::new(&ctx.logs_path),
+                    ctx.execution_id.clone(),
+                    crate::log_writer::DEFAULT_MAX_OUTPUT_BYTES,
+                );
+                if let Some(sender) = ctx.log_sender.clone() {
+                    writer.set_log_sender(sender);
+                }
 
                 match attempt {
                     Ok(mut result) => {

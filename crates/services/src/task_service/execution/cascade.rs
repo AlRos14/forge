@@ -1658,36 +1658,36 @@ fn review_rejections_since_boundary(entries: &[db::TransitionLog]) -> i64 {
 
 async fn reviewer_final_message(execution: &Execution) -> Result<String> {
     if let Some(logs_path) = execution.logs_path.as_deref() {
-        let contents = match tokio::fs::read_to_string(logs_path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        let (message, stdout_lines) = match executors::LogReader::fold(
+            std::path::Path::new(logs_path),
+            (String::new(), String::new()),
+            |(message, stdout_lines), entry| {
+                if entry.kind == executors::LogKind::Assistant {
+                    append_reviewer_log_text(&entry.payload, message);
+                } else if entry.kind == executors::LogKind::SessionInfo
+                    && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
+                {
+                    if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
+                        message.push_str(result);
+                    }
+                } else if entry.kind == executors::LogKind::Stdout {
+                    if let Some(line) = entry.payload.get("line").and_then(Value::as_str) {
+                        stdout_lines.push_str(line);
+                        stdout_lines.push('\n');
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(error) => {
                 return Err(ServiceError::invalid_operation(format!(
                     "failed to read reviewer logs: {error}"
-                )));
+                )))
             }
         };
-        let mut message = String::new();
-        let mut stdout_lines = String::new();
-        for line in contents.lines() {
-            let Ok(entry) = serde_json::from_str::<executors::LogEntry>(line) else {
-                continue;
-            };
-            if entry.kind == executors::LogKind::Assistant {
-                append_reviewer_log_text(&entry.payload, &mut message);
-            } else if entry.kind == executors::LogKind::SessionInfo
-                && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
-            {
-                if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                    message.push_str(result);
-                }
-            } else if entry.kind == executors::LogKind::Stdout {
-                if let Some(line) = entry.payload.get("line").and_then(Value::as_str) {
-                    stdout_lines.push_str(line);
-                    stdout_lines.push('\n');
-                }
-            }
-        }
         if !message.trim().is_empty() {
             return Ok(message);
         }

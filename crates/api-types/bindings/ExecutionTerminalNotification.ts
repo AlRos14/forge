@@ -4,7 +4,7 @@ import type { RemoteResolvedCandidate } from "./RemoteResolvedCandidate";
 import type { RemoteRouteAttempt } from "./RemoteRouteAttempt";
 import type { RemoteTokenUsage } from "./RemoteTokenUsage";
 
-export type ExecutionTerminalNotification = { execution_id: string, exit_code: number | null, signal: string | null, error: string | null, ts: string, status: string | null, agent_session_id: string | null, summary: string | null, after_sha: string | null, usage: RemoteTokenUsage | null, 
+export type ExecutionTerminalNotification = { execution_id: string, exit_code: number | null, signal: string | null, error: string | null, ts: string, status: string | null, agent_session_id: string | null, summary: string | null, after_sha: string | null, usage: RemoteTokenUsage | null, account_usage: unknown,
 /**
  * Structured failure disposition. Absent on older daemons — the server
  * then falls back to generic executor-failed handling.

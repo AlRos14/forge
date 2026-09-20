@@ -114,11 +114,122 @@ pub(super) fn normalize_account_usage(executor_type: &str, account_usage: &Value
     account_usage.clone()
 }
 
-pub(super) async fn persist_account_usage_snapshot(
+pub(crate) fn account_usage_from_log_entry(entry: &executors::LogEntry) -> Option<Value> {
+    account_usage_from_payload(&entry.payload)
+}
+
+pub(crate) fn account_usage_from_payload(payload: &Value) -> Option<Value> {
+    matches!(
+        payload.get("method").and_then(Value::as_str),
+        Some("account/rateLimits/updated" | "forge/cursor/usage")
+    )
+    .then(|| payload.get("params").cloned())
+    .flatten()
+}
+
+pub(crate) fn account_usage_source_from_payload(payload: &Value) -> Option<&'static str> {
+    match payload.get("method").and_then(Value::as_str) {
+        Some("account/rateLimits/updated") => Some("provider_event"),
+        Some("forge/cursor/usage") => Some("cursor_poll"),
+        _ => None,
+    }
+}
+
+fn snapshot_usage_account_key(value: &Value) -> Option<(String, Option<String>)> {
+    snapshot_usage_account_key_for_host(value, None)
+}
+
+fn snapshot_usage_account_key_for_host(
+    value: &Value,
+    host_identity_override: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let executor_type = value.get("executor_type").and_then(Value::as_str)?;
+    let kind = executor_type.parse::<ExecutorKind>().ok()?;
+    let config = value.get("config").unwrap_or(&Value::Null);
+    let daemon_id = host_identity_override
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("resolved_daemon_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(ToOwned::to_owned)
+        });
+    let host_identity = daemon_id.as_deref().unwrap_or("server-local");
+    let credential_ref = value
+        .get("credential_ref")
+        .and_then(Value::as_str)
+        .filter(|reference| !reference.trim().is_empty());
+    let account_key =
+        executors::account_key_for_context(&kind, config, host_identity, credential_ref);
+    Some((account_key, daemon_id))
+}
+
+fn account_usage_source(value: &Value) -> &'static str {
+    if value.get("executor_type").and_then(Value::as_str) == Some("cursor") {
+        "cursor_poll"
+    } else {
+        "provider_event"
+    }
+}
+
+pub(crate) async fn persist_account_usage_snapshot(
     db: &SqliteDb,
     snapshot: Option<&str>,
     execution_id: &str,
     account_usage: &Value,
+) -> Result<()> {
+    persist_account_usage_snapshot_with_host(db, snapshot, execution_id, account_usage, None).await
+}
+
+pub(crate) async fn persist_account_usage_snapshot_with_host(
+    db: &SqliteDb,
+    snapshot: Option<&str>,
+    execution_id: &str,
+    account_usage: &Value,
+    host_identity: Option<&str>,
+) -> Result<()> {
+    let source = snapshot
+        .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+        .map(|value| account_usage_source(&value))
+        .unwrap_or("provider_event");
+    persist_account_usage_snapshot_with_source_and_host(
+        db,
+        snapshot,
+        execution_id,
+        account_usage,
+        source,
+        host_identity,
+    )
+    .await
+}
+
+pub(crate) async fn persist_account_usage_snapshot_with_source(
+    db: &SqliteDb,
+    snapshot: Option<&str>,
+    execution_id: &str,
+    account_usage: &Value,
+    source: &str,
+) -> Result<()> {
+    persist_account_usage_snapshot_with_source_and_host(
+        db,
+        snapshot,
+        execution_id,
+        account_usage,
+        source,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn persist_account_usage_snapshot_with_source_and_host(
+    db: &SqliteDb,
+    snapshot: Option<&str>,
+    execution_id: &str,
+    account_usage: &Value,
+    source: &str,
+    host_identity: Option<&str>,
 ) -> Result<()> {
     let Some(snapshot) = snapshot else {
         return Ok(());
@@ -131,28 +242,25 @@ pub(super) async fn persist_account_usage_snapshot(
     let Some(executor_type) = value.get("executor_type").and_then(Value::as_str) else {
         return Ok(());
     };
-    let kind = executor_type
-        .parse::<ExecutorKind>()
-        .map_err(ServiceError::invalid_operation)?;
-    let config = value.get("config").unwrap_or(&Value::Null);
-    let mut account_key = executors::account_key(&kind, config);
-    let daemon_id = value.get("resolved_daemon_id").and_then(Value::as_str);
-    if let Some(daemon_id) = daemon_id {
-        account_key.push('@');
-        account_key.push_str(daemon_id);
-    }
+    let Some((account_key, daemon_id)) = (match host_identity {
+        Some(host_identity) => snapshot_usage_account_key_for_host(&value, Some(host_identity)),
+        None => snapshot_usage_account_key(&value),
+    }) else {
+        return Ok(());
+    };
     let usage_json = normalize_account_usage(executor_type, account_usage);
     let captured_at = now_rfc3339();
     let stale_after = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
     sqlx::query(
         "INSERT INTO account_usage_snapshot
          (id, account_key, executor_type, daemon_id, source, usage_json, captured_at, stale_after, execution_id)
-         VALUES (?, ?, ?, ?, 'provider_event', ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(new_uuid_v4())
     .bind(account_key)
     .bind(executor_type)
-    .bind(daemon_id)
+    .bind(daemon_id.as_deref())
+    .bind(source)
     .bind(usage_json.to_string())
     .bind(captured_at)
     .bind(stale_after)
@@ -160,6 +268,101 @@ pub(super) async fn persist_account_usage_snapshot(
     .execute(db.pool())
     .await?;
     Ok(())
+}
+
+pub(super) struct CursorUsageProbe {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CursorUsageProbe {
+    pub(super) async fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+}
+
+pub(super) fn spawn_cursor_usage_probe(
+    db: Arc<SqliteDb>,
+    snapshot: Option<String>,
+    execution_id: String,
+) -> Option<CursorUsageProbe> {
+    let is_cursor = snapshot.as_deref().and_then(|snapshot| {
+        serde_json::from_str::<Value>(snapshot)
+            .ok()?
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .map(|executor_type| executor_type == "cursor")
+    }) == Some(true);
+    if !is_cursor {
+        return None;
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            if task_cancel.is_cancelled() {
+                break;
+            }
+            persist_cursor_account_usage_probe(
+                &db,
+                snapshot.as_deref(),
+                &execution_id,
+                task_cancel.clone(),
+            )
+            .await;
+            tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(45)) => {}
+            }
+        }
+    });
+    Some(CursorUsageProbe { cancel, task })
+}
+
+async fn persist_cursor_account_usage_probe(
+    db: &SqliteDb,
+    snapshot: Option<&str>,
+    execution_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(snapshot) else {
+        return;
+    };
+    let config = serde_json::from_value::<executors::CursorConfig>(
+        value.get("config").cloned().unwrap_or(Value::Null),
+    )
+    .unwrap_or_default();
+    match cli_adapters::cursor::query_account_usage_with_cancel(&config, cancel.clone()).await {
+        Ok(usage) => {
+            if let Err(error) = persist_account_usage_snapshot_with_source(
+                db,
+                Some(snapshot),
+                execution_id,
+                &usage,
+                "cursor_poll",
+            )
+            .await
+            {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    %error,
+                    "failed to persist Cursor account usage snapshot"
+                );
+            }
+        }
+        Err(error) if !cancel.is_cancelled() => {
+            tracing::warn!(
+                execution_id = %execution_id,
+                %error,
+                "failed to probe Cursor account usage"
+            );
+        }
+        Err(_) => {}
+    }
 }
 
 pub(super) async fn set_planning_awaiting_review_metadata(
@@ -300,7 +503,11 @@ pub(super) async fn persist_planner_result(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_account_usage;
+    use super::{
+        account_usage_from_log_entry, account_usage_source_from_payload, normalize_account_usage,
+        snapshot_usage_account_key,
+    };
+    use executors::{LogEntry, LogKind, LogStream};
     use serde_json::json;
 
     #[test]
@@ -323,5 +530,109 @@ mod tests {
         });
         assert_eq!(normalize_account_usage("cursor", &cursor), cursor);
         assert_eq!(normalize_account_usage("codex", &wrapped), wrapped);
+    }
+
+    #[test]
+    fn usage_account_key_uses_resolved_daemon_and_wrapper_independent_context() {
+        let snapshot = json!({
+            "executor_type": "codex",
+            "config": { "base_command_override": "codex-work" },
+            "resolved_daemon_id": "daemon-auto",
+            "agent_daemon_id": null
+        });
+        assert_eq!(
+            snapshot_usage_account_key(&snapshot),
+            Some((
+                "codex@daemon-auto".to_owned(),
+                Some("daemon-auto".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn usage_account_key_records_resolved_host_for_pinned_agent() {
+        let snapshot = json!({
+            "executor_type": "codex",
+            "config": { "env": { "CODEX_HOME": "/tmp/codex-plus2" } },
+            "resolved_daemon_id": "daemon-auto",
+            "agent_daemon_id": "daemon-pinned"
+        });
+        assert_eq!(
+            snapshot_usage_account_key(&snapshot),
+            Some((
+                "codex@daemon-auto:home=/tmp/codex-plus2".to_owned(),
+                Some("daemon-auto".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn usage_account_key_uses_explicit_credential_reference_across_hosts() {
+        let mut snapshot = json!({
+            "executor_type": "codex",
+            "config": { "env": { "CODEX_HOME": "/tmp/codex-plus2" } },
+            "resolved_daemon_id": "daemon-a",
+            "credential_ref": "credential-1"
+        });
+        let first = snapshot_usage_account_key(&snapshot);
+        snapshot["resolved_daemon_id"] = json!("daemon-b");
+        assert_eq!(
+            first.as_ref().map(|value| &value.0),
+            snapshot_usage_account_key(&snapshot)
+                .as_ref()
+                .map(|value| &value.0)
+        );
+        assert_eq!(
+            first,
+            Some((
+                "codex:credential=credential-1".to_owned(),
+                Some("daemon-a".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn extracts_native_codex_rate_limit_events_from_logs() {
+        let entry = LogEntry {
+            schema_version: 1,
+            sequence: 3,
+            timestamp: "2026-09-07T00:00:00Z".to_owned(),
+            execution_id: "exec".to_owned(),
+            kind: LogKind::SessionInfo,
+            stream: LogStream::Main,
+            payload: json!({
+                "method": "account/rateLimits/updated",
+                "params": { "planType": "plus", "primary": { "usedPercent": 21 } }
+            }),
+            truncated: false,
+        };
+        assert_eq!(
+            account_usage_from_log_entry(&entry),
+            Some(json!({ "planType": "plus", "primary": { "usedPercent": 21 } }))
+        );
+        assert_eq!(
+            account_usage_from_log_entry(&LogEntry {
+                payload: json!({ "method": "turn/completed" }),
+                ..entry
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn classifies_remote_cursor_usage_as_explicit_polling() {
+        let payload = json!({
+            "method": "forge/cursor/usage",
+            "params": { "plan": "Pro" },
+            "source": "cursor_poll"
+        });
+        assert_eq!(
+            account_usage_source_from_payload(&payload),
+            Some("cursor_poll")
+        );
+        assert_eq!(
+            super::account_usage_from_payload(&payload),
+            Some(json!({ "plan": "Pro" }))
+        );
     }
 }

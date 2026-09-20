@@ -8,6 +8,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Execution log storage is now lossless across rotated gzip segments; clients
+  must read the logical sequence through the execution-log API rather than
+  assuming `logs_path` is one complete file.
+- Account usage provenance distinguishes native Codex events from Cursor
+  polling. Host-local quota identity includes the daemon/host that owns the
+  credentials, while an explicit credential reference is required to prove
+  cross-host sharing; wrapper paths are not account identity.
+- `GET /api/v1/agents/{id}/usage` now returns nullable `account_key` and a
+  `daemon_id` provenance field. Unpinned remote Agents resolve the newest
+  execution-linked observation instead of using a synthetic shared account
+  pool. The response also reports `manual_refresh_supported`; remote or
+  daemon-bound CLI refresh requests now return `409 usage_refresh_unsupported`
+  instead of silently returning an old snapshot.
+
 - Task types now describe purpose and capability: `implementation`, `planning`,
   `discovery`, `review`, and `validation`. Hierarchy is represented only by
   `parent_task_id`; existing `task` and `sub_task` rows migrate to
@@ -91,6 +105,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   gates, not a second plan authority in the overview.
 
 ### Fixed
+
+- Large Cursor control prompts no longer pass through OS process arguments or
+  the tracked worktree. Small prompts retain direct transport; large prompts
+  use private randomized runtime files exposed through Cursor `--add-dir`,
+  with Unix 0700/0600 permissions, RAII cleanup, and bounded stale cleanup.
+- Daemon Codex rate-limit events and daemon-side Cursor quota polls now use the
+  same execution-scoped usage persistence path as local execution. Observations
+  retain execution, source, account, and host/daemon provenance.
+- Workspace lease renewal no longer rejects a running execution solely because
+  an unrelated Task description/metadata revision changed; authority-changing
+  assignment (with explicit role-assignment precedence), repository,
+  capability, lifecycle, and revocation checks remain enforced.
+- Rotated execution-log segments retain one sequence across restart and
+  relocation; incomplete compression files cannot hide readable history, and
+  log tails are capped at 1,000 entries.
 
 - Planner reruns now receive the latest canonical plan, rejected-plan feedback,
   and Task comments. Non-review `max_rejections` now permits that many revision

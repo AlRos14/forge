@@ -1808,6 +1808,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotated_logs_keep_execution_alive_but_silence_still_stalls() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) = seed_agent_with_daemon(
+            &db,
+            &crate::embedded_daemon::embedded_machine_id(),
+            AgentStatus::Idle,
+        )
+        .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut writer = executors::LogWriter::new(
+            dir.path().join("execution.jsonl"),
+            execution.id.clone(),
+            500,
+        );
+        writer.set_log_sender(tx);
+        writer
+            .write(
+                executors::LogKind::Assistant,
+                executors::LogStream::Main,
+                json!({"text": "long output ".repeat(100)}),
+            )
+            .await
+            .unwrap();
+        rx.recv().await.unwrap();
+        ExecutionRepo::update_last_activity_at(&*db, &execution.id, "1970-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        writer
+            .write(
+                executors::LogKind::SessionInfo,
+                executors::LogStream::Heartbeat,
+                json!({"type": "codex_turn_heartbeat"}),
+            )
+            .await
+            .unwrap();
+        let heartbeat = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(heartbeat.stream, executors::LogStream::Heartbeat);
+        ExecutionRepo::update_last_activity_at(&*db, &execution.id, &heartbeat.timestamp)
+            .await
+            .unwrap();
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), event_bus);
+        assert_eq!(monitor.check_stalled_executions().await.unwrap(), 0);
+        ExecutionRepo::update_last_activity_at(&*db, &execution.id, "1970-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        assert_eq!(monitor.check_stalled_executions().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn heartbeat_monitor_marks_stalled_executions_and_schedules_retry() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));

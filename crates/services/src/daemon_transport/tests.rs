@@ -4,11 +4,12 @@ use async_trait::async_trait;
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject,
     CreateRepo, CreateTask, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo,
-    RepoRepo, TaskRepo, UpsertDaemon, WorkMode,
+    RepoRepo, TaskRepo, UpdateAgent, UpsertDaemon, WorkMode,
 };
 use events::EventBus;
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::Row;
 
 use super::{
     DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler,
@@ -437,6 +438,187 @@ async fn execution_log_from_owner_updates_last_activity_at() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "execution last_activity_at was not updated"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn unpinned_remote_usage_logs_use_execution_daemon_provenance() {
+    let db = sqlite_db().await;
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = std::env::temp_dir().join(format!(
+        "forge-daemon-transport-usage-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("workspace root creates");
+    let owner_daemon_id = seed_daemon(&db, "owner-machine-usage").await;
+    let (agent_id, execution) = seed_running_execution(&db, &owner_daemon_id).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    AgentRepo::update(
+        &*db,
+        UpdateAgent {
+            id: agent.id,
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(None),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("agent is unpinned");
+    sqlx::query(
+        "UPDATE execution
+         SET executor_config_snapshot_json = ?
+         WHERE id = ?",
+    )
+    .bind(
+        json!({
+            "executor_type": "codex",
+            "config": { "env": { "CODEX_HOME": "~/.codex" } },
+            "agent_daemon_id": null,
+            "resolved_daemon_id": owner_daemon_id
+        })
+        .to_string(),
+    )
+    .bind(&execution.id)
+    .execute(db.pool())
+    .await
+    .expect("execution snapshot updates");
+    let sink = execution_event_sink(Arc::clone(&db), Arc::clone(&event_bus), workspace_root);
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::clone(&event_bus),
+        sink as Arc<dyn DaemonExecutionEventHandler>,
+    ));
+    register_daemon_connection(&registry, &owner_daemon_id);
+
+    registry.dispatch_incoming(
+        &owner_daemon_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_EXECUTION_LOG.to_owned(),
+            params: json!({
+                "execution_id": execution.id,
+                "seq": 1,
+                "stream": "stdout",
+                "line": "rate limits",
+                "ts": now_rfc3339(),
+                "kind": "session_info",
+                "payload": {
+                    "method": "account/rateLimits/updated",
+                    "params": { "planType": "plus", "primary": { "usedPercent": 21 } }
+                }
+            }),
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let row = sqlx::query(
+            "SELECT source, account_key, daemon_id, execution_id
+             FROM account_usage_snapshot WHERE execution_id = ?",
+        )
+        .bind(&execution.id)
+        .fetch_all(db.pool())
+        .await
+        .expect("usage rows query");
+        if row.len() == 1 {
+            assert_eq!(row[0].get::<String, _>("source"), "provider_event");
+            assert_eq!(
+                row[0].get::<String, _>("account_key"),
+                format!("codex@{owner_daemon_id}:home=relative:~/.codex")
+            );
+            assert_eq!(row[0].get::<String, _>("daemon_id"), owner_daemon_id);
+            assert_eq!(row[0].get::<String, _>("execution_id"), execution.id);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "usage observation missing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    sqlx::query(
+        "UPDATE execution
+         SET executor_config_snapshot_json = ?
+         WHERE id = ?",
+    )
+    .bind(
+        json!({
+            "executor_type": "cursor",
+            "config": {},
+            "resolved_daemon_id": owner_daemon_id
+        })
+        .to_string(),
+    )
+    .bind(&execution.id)
+    .execute(db.pool())
+    .await
+    .expect("cursor execution snapshot updates");
+    registry.dispatch_incoming(
+        &owner_daemon_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_EXECUTION_LOG.to_owned(),
+            params: json!({
+                "execution_id": execution.id,
+                "seq": 2,
+                "stream": "heartbeat",
+                "line": "cursor usage",
+                "ts": now_rfc3339(),
+                "kind": "session_info",
+                "log_stream": "heartbeat",
+                "payload": {
+                    "method": "forge/cursor/usage",
+                    "params": { "plan": "pro", "categories": { "included": 19 } },
+                    "source": "cursor_poll"
+                }
+            }),
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = sqlx::query(
+            "SELECT source, account_key, daemon_id, execution_id
+             FROM account_usage_snapshot WHERE execution_id = ? ORDER BY captured_at",
+        )
+        .bind(&execution.id)
+        .fetch_all(db.pool())
+        .await
+        .expect("cursor usage rows query");
+        if rows.len() == 2 {
+            let cursor = rows
+                .iter()
+                .find(|row| row.get::<String, _>("source") == "cursor_poll")
+                .expect("cursor poll row");
+            assert_eq!(
+                cursor.get::<String, _>("account_key"),
+                format!("cursor@{owner_daemon_id}")
+            );
+            assert_eq!(cursor.get::<String, _>("daemon_id"), owner_daemon_id);
+            assert_eq!(cursor.get::<String, _>("execution_id"), execution.id);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cursor usage observation missing"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

@@ -11,12 +11,13 @@ use db::{
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{LogKind, LogStream, LogWriter};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    daemon_transport::DaemonExecutionEventHandler, task_service::logs::execution_logs_path, Result,
-    ServiceError, TaskService,
+    daemon_transport::DaemonExecutionEventHandler,
+    task_service::{execution, logs::execution_logs_path},
+    Result, ServiceError, TaskService,
 };
 
 const REMOTE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -145,15 +146,30 @@ impl ServerExecutionEventSink {
             return Ok(None);
         };
 
-        if agent.daemon_id.as_deref() == Some(daemon_id)
-            || (agent.daemon_id.is_none() && self.is_embedded_daemon_sender(daemon_id).await?)
-        {
+        let resolved_daemon_id = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .get("resolved_daemon_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+            });
+        let daemon_owns_execution = agent.daemon_id.as_deref() == Some(daemon_id)
+            || (agent.daemon_id.is_none() && resolved_daemon_id.as_deref() == Some(daemon_id))
+            || (agent.daemon_id.is_none()
+                && resolved_daemon_id.is_none()
+                && self.is_embedded_daemon_sender(daemon_id).await?);
+        if daemon_owns_execution {
             return Ok(Some(execution));
         }
 
         tracing::warn!(
             sending_daemon = %daemon_id,
             expected_daemon = ?agent.daemon_id,
+            resolved_daemon = ?resolved_daemon_id,
             execution_id = %execution_id,
             "rejecting execution notification: daemon does not own this execution"
         );
@@ -183,6 +199,13 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
             return Ok(());
         };
 
+        // A storage error must not masquerade as an inactive remote executor.
+        ExecutionRepo::update_last_activity_at(
+            &*self.db,
+            &notification.execution_id,
+            &event_timestamp(),
+        )
+        .await?;
         let writer = self.writer_for(&notification, &execution).await?;
         let kind = notification
             .kind
@@ -204,6 +227,26 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
                 "stream": notification.stream,
             })
         });
+        if let Some(account_usage) = execution::account_usage_from_payload(&payload) {
+            let source =
+                execution::account_usage_source_from_payload(&payload).unwrap_or("provider_event");
+            if let Err(error) = execution::persist_account_usage_snapshot_with_source_and_host(
+                &self.db,
+                execution.executor_config_snapshot_json.as_deref(),
+                &notification.execution_id,
+                &account_usage,
+                source,
+                Some(daemon_id),
+            )
+            .await
+            {
+                tracing::warn!(
+                    execution_id = %notification.execution_id,
+                    %error,
+                    "failed to persist daemon account usage observation"
+                );
+            }
+        }
         writer
             .lock()
             .await
@@ -214,8 +257,7 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
             })?;
 
         let execution_id = notification.execution_id.clone();
-        ExecutionRepo::update_last_activity_at(&*self.db, &execution_id, &event_timestamp())
-            .await?;
+
         let log = json!({
             "schema_version": 1,
             "sequence": notification.seq,
@@ -252,14 +294,19 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
             return Ok(());
         }
 
-        self.writers.lock().await.remove(&notification.execution_id);
+        if let Some(writer) = self.writers.lock().await.remove(&notification.execution_id) {
+            let writer = writer.lock().await;
+            if let Err(error) = LogWriter::compact(writer.path()).await {
+                tracing::warn!(execution_id = %notification.execution_id, %error, "failed to compress final execution log segment; plain log retained");
+            }
+        }
         let Some(task_service) = lock(&self.task_service).as_ref().and_then(Weak::upgrade) else {
             return Err(ServiceError::invalid_operation(
                 "task service is unavailable for daemon terminal notification",
             ));
         };
         let execution = task_service
-            .complete_remote_execution(notification.clone())
+            .complete_remote_execution(notification.clone(), Some(daemon_id))
             .await?;
         if execution.status != ExecutionStatus::Running {
             task_service

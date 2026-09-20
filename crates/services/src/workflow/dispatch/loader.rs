@@ -5,7 +5,7 @@ use db::{
     ExecutionRepo, ExecutionStatus, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo,
     TaskRepo, TransitionLogRepo,
 };
-use executors::{LogEntry, LogKind};
+use executors::LogKind;
 use serde_json::Value;
 
 use crate::workflow::dispatch::EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD;
@@ -223,29 +223,12 @@ async fn reviewer_final_message(execution: &db::Execution) -> Result<Option<Stri
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned));
     };
-    let contents = match tokio::fs::read_to_string(logs_path).await {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            tracing::warn!(
-                execution_id = %execution.id,
-                logs_path,
-                %error,
-                "failed to read reviewer execution log"
-            );
-            String::new()
-        }
-    };
-
-    let mut message = String::new();
-    let mut stdout_lines = String::new();
-    for line in contents.lines() {
-        let Ok(entry) = serde_json::from_str::<LogEntry>(line) else {
-            continue;
-        };
-        match entry.kind {
+    let (message, stdout_lines) = match executors::LogReader::fold(
+        std::path::Path::new(logs_path),
+        (String::new(), String::new()),
+        |(message, stdout_lines), entry| match entry.kind {
             LogKind::Assistant | LogKind::AssistantDelta => {
-                append_log_text(&entry.payload, &mut message);
+                append_log_text(&entry.payload, message);
             }
             LogKind::SessionInfo
                 if entry.payload.get("subtype").and_then(Value::as_str) == Some("success") =>
@@ -261,8 +244,18 @@ async fn reviewer_final_message(execution: &db::Execution) -> Result<Option<Stri
                 }
             }
             _ => {}
+        },
+    )
+    .await
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(execution_id = %execution.id, logs_path, %error, "failed to read reviewer execution log");
+            }
+            Default::default()
         }
-    }
+    };
 
     let feedback = if !message.trim().is_empty() {
         message
