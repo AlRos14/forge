@@ -1,8 +1,7 @@
 # Plan PR0A — Reconcile pre-migration operational fixes
 
-Status: implementation branch for Repo PR #4 review; dependent on Plan PR0 / Repo PR #3
-(`docs/independent-orchestration-pr0`). Plan PR1 remains blocked until Plan PR0 and
-Plan PR0A are reviewed and merged.
+Status: completed and merged. Plan PR0 / Repo PR #3 and Plan PR0A / Repo PR #4
+are closed; Plan PR1 is ready to begin.
 
 ## Scope
 
@@ -99,10 +98,10 @@ INV-017, INV-030, INV-033, and INV-034.
   the resolved daemon is factual provenance and participates in quota identity
   when credentials are host-local. An explicit durable credential reference is
   the only transitional proof that the same account is shared across hosts.
-  Native Codex events and Cursor polling use distinct sources. Manual refresh is
-  supported only for local/native Codex or Cursor contexts; remote and
-  daemon-bound CLI refresh requests return `409 usage_refresh_unsupported`
-  rather than replaying a previous snapshot.
+  Native Codex events and Cursor polling use distinct sources. The current
+  Agent usage surface does not model a server-local Codex/Cursor CLI account;
+  manual refresh therefore returns `409 usage_refresh_unsupported` rather than
+  probing an unrelated server credential context.
   Daemon notifications for an unpinned remote Agent are accepted only from the
   scheduler-resolved daemon recorded in that Execution snapshot; other daemon
   senders are rejected before activity or usage persistence.
@@ -211,5 +210,4 @@ Validation performed on this branch:
   blocked before execution because `web/node_modules` is absent (`eslint`,
   `tsc`, and `vitest` were not found); no package installation was performed.
 
-Next dependency: Plan PR0A / Repo PR #4 must be reviewed and merged after
-Plan PR0 / Repo PR #3, before Plan PR1 begins.
+Next dependency: Plan PR1 — Actor + multi-actor TaskRole / RoleMembership.

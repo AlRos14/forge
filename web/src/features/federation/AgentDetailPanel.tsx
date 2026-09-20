@@ -117,7 +117,7 @@ export function AgentDetailPanel({
               <h3 id="agent-usage-heading" className="text-sm font-semibold">Account usage</h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 {usageQuery.data?.manual_refresh_supported === false
-                  ? 'Manual refresh is unavailable; usage is refreshed from observations on the execution host.'
+                  ? 'Manual refresh is unavailable for this Agent; usage updates come from its owning runtime observation path.'
                   : usageQuery.data?.shared_account
                   ? 'Shared by agents using the same explicit credential context.'
                   : usageQuery.data?.daemon_id

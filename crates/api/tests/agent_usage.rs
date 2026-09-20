@@ -124,7 +124,7 @@ async fn unpinned_remote_agent_usage_uses_the_actual_execution_observation() {
 }
 
 #[tokio::test]
-async fn remote_agent_usage_refresh_is_explicitly_unsupported() {
+async fn cli_agent_usage_refresh_is_explicitly_unsupported() {
     let workspace = common::TestDir::new("agent-usage-refresh-workspace");
     let harness = common::test_app(workspace.path(), "agent-usage-refresh").await;
     let app = &harness.app;
