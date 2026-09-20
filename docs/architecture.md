@@ -1,1039 +1,477 @@
 # Architecture
 
-Forge is a Rust workspace plus a React/TypeScript frontend. This doc explains
-the crate layout, the agent/scope model, the task state machine, the database,
-and durable events. For runtime configuration see [getting-started.md](getting-started.md);
-for the HTTP surface see [api.md](api.md).
+This document is the architectural source of truth for the independent
+orchestration system Forge is becoming. It deliberately supersedes the
+previous Main Agent, Project Agent, embedded cognition, singular-assignee, and
+workflow-as-cognition model.
 
-The product model is one global Main Agent and exactly one Project Agent for
-each operational Project, each with one durable Agent Chat. Forward-only
-`V071+` migrations preserve historical collaboration data while the public
-runtime uses the singular binding, chat, and handoff model described below.
+Forge originated as a fork of [ForgeAILab/forge](upstream.md). The origin,
+license, and attribution remain important; architectural compatibility with
+upstream does not. The migration is intentionally incremental. At Plan PR0 the
+Rust, SQLite, REST, MCP, CLI, and web implementations still contain the
+previous model. They remain operational until a later Plan PR moves their
+readers and writers. This document describes the target contract, not a claim
+that every target primitive already exists.
 
-## Crate layout
+The migration register, invariant definitions, current dependency audit, and
+Plan PR boundaries live in [migration/architecture-v2.md](migration/architecture-v2.md).
+The focused domain references are in [concepts/](concepts/).
 
-```
-crates/
-├── forge-cli/     # Binary entrypoint, server startup, CLI commands
-├── forge-client/  # forge-ctl CLI client
-├── forge-daemon/  # Local daemon detection and reporting
-├── api/           # Axum REST endpoints, SSE, middleware
-├── api-types/     # Shared request/response types (zero internal deps)
-├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
-├── db/            # SQLite schema, migrations, repository implementations
-├── services/      # Business logic (task state machine, workflow engine)
-├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
-├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
-├── workspace/     # Git worktree lifecycle, locking, path guardrails
-├── git/           # Low-level git operations
-├── review/        # CI runner, auditor orchestration
-├── events/        # In-memory event bus (tokio broadcast)
-├── mcp-server/    # MCP JSON-RPC tools for agent integration
-└── config/        # Configuration loading, defaults
-```
+## North star
 
-### Dependency flow
+> The orchestrator owns work. The harness owns cognition.
 
-```
+Forge is a local-first work orchestration platform in which humans and AI
+agents are peer actors. The platform owns durable work, authority,
+collaboration, workspaces, evidence, and lifecycle. A harness owns its native
+model interaction loop, tools, context handling, planning behavior, steering
+semantics, and session protocol.
+
+Forge coordinates at work boundaries. It must not become a second model runtime,
+a canonical planning engine, or a reviewer disguised as an orchestrator.
+
+## Responsibility boundaries
+
+| Responsibility | Owner |
+| --- | --- |
+| Actor identity, task scope, roles, memberships, executions, work units, gates, evidence, and durable collaboration | Forge core |
+| Deterministic authorization, leases, workspace isolation, merge policy, required checks, credential boundaries, and idempotency | Forge core |
+| Model cognition, native planning/review modes, context loop, harness tools, model steering, and harness session semantics | Harness and HarnessAdapter |
+| Human decisions and human work performed through the control plane | Human Actor using the same domain primitives |
+| Git operations, worktree creation, locking, and integration mechanics | git and workspace infrastructure |
+| Process discovery, daemon transport, provider invocation, and usage observation | forge-daemon, cli-adapters, and harness adapters |
+
+The boundary is semantic, not merely a crate boundary. A helper remains
+platform-owned when it enforces authority or records durable state. A helper is
+harness-owned when it decides how a model reasons or how a native harness
+conducts its interaction loop.
+
+## Domain model
+
+~~~text
+Project
+├── Repo*
+└── Task*
+    ├── TaskRole*
+    │   └── RoleMembership*
+    ├── WorkUnit*
+    ├── Execution*
+    │   ├── Actor
+    │   ├── Role
+    │   ├── Purpose
+    │   ├── HarnessSession?
+    │   └── Workspace?
+    ├── ValidationRun*
+    ├── Artifact*
+    ├── Gate*
+    ├── Evidence*
+    └── Collaboration
+        ├── Message*
+        ├── Handoff*
+        ├── Proposal*
+        └── Decision*
+
+Actor
+├── Human
+└── Agent
+    ├── Harness identity
+    ├── Credential/account context?
+    └── HarnessProfile
+        └── HarnessProfileRevision
+            ├── Model
+            └── Configuration
+~~~
+
+Every durable record is scoped to the owning account and, where applicable,
+Project and Task. Opaque IDs are references that still require authorization;
+they are never authority by themselves.
+
+## Actors, Agents, and harnesses
+
+An Actor is the universal participant abstraction. The initial kinds are Human
+and Agent. Both can plan, implement, review, orchestrate, communicate, create
+artifacts, and occupy several roles at once.
+
+An Agent is a persistent AI Actor bound to a stable harness identity. The
+harness is part of the Agent's identity because it changes tools, interaction
+loop, context handling, editing strategy, approvals, planning, sessions, model
+steering, and reasoning environment. Two records such as GPT-5.6 Sol in Codex
+and GPT-5.6 Sol in Cursor are therefore different Agents even if their model
+labels match. An identity-bearing credential or account context is also part
+of the Agent identity when it changes which native account performs work.
+
+A `HarnessProfileRevision` tunes future runs: model, reasoning effort,
+approval policy, sandbox settings, and non-identity harness arguments. A
+compatible configuration change may create a new profile revision on the same
+Agent. Changing the harness, account, or another identity-bearing property
+creates another Agent rather than silently mutating identity. Each Execution
+snapshots the exact effective profile, account context, and capabilities used.
+See [actors.md](concepts/actors.md) and
+[agents-and-harnesses.md](concepts/agents-and-harnesses.md).
+
+The platform exposes capability support dimensionally. A capability is
+native, emulated, or unsupported where that distinction matters. Unknown
+support is not support. The core never advertises a read-only sandbox, prompt
+convention, or fallback process as native harness planning or steering.
+
+## Roles and memberships
+
+Roles describe responsibility for one Task; they do not classify Actors and do
+not create Agent subclasses. Initial role names are planner, implementer,
+reviewer, and orchestrator, but persistence must not hard-code behavior solely
+from a string.
+
+A TaskRole has a coordination policy and zero or more RoleMembership records.
+Membership records participation only. They do not own a WorkUnit, path,
+concrete scope, or current assignment. WorkUnit allocation and historical
+attempts belong to WorkUnit and Execution, so an Actor can remain a member
+while moving between WorkUnits without rewriting membership history.
+The policies are:
+
+| Mode | Meaning | Typical use |
+| --- | --- | --- |
+| partitioned | Members work on distinct scopes | Multiple implementers |
+| collaborative | Members share state and coordinate decisions | Multiple orchestrators |
+| independent | Members deliberately evaluate without influencing one another | Multiple reviewers or competing planners |
+
+The same Actor may occupy planner and orchestrator, or orchestrator and
+reviewer. Each Execution records the role under which the Actor acted. Human
+membership is ordinary domain data, not a special approval callback.
+
+See [roles.md](concepts/roles.md).
+
+## Executions
+
+An Execution is the atomic historical work record. It has exactly one Actor,
+one Role, one Purpose, and one Task. A WorkUnit, HarnessSession, Workspace,
+parent Execution, configuration snapshot, capability snapshot, usage, output,
+status, and timestamps are associated explicitly where applicable.
+
+Initial purposes are:
+
+~~~text
+plan | implement | review | validate | investigate | orchestrate | general
+~~~
+
+Purpose answers why the Execution exists. Permission and sandbox policy answer
+what it may do. They are separate dimensions. plan is never a permission
+level.
+
+Execution identity-bearing fields become immutable once work starts. Parent
+lineage records causal relationship; it does not imply session reuse. A Human
+Execution has no fake HarnessSession. An Agent Execution may have an explicit
+HarnessSession, but a session is never guessed from a role name or latest
+Execution.
+
+See [executions.md](concepts/executions.md) and
+[sessions.md](concepts/sessions.md).
+
+## Deterministic validation runs
+
+Core-controlled checks are not Actor cognition and do not require an Actor,
+Agent, HarnessSession, or fake System Actor. They are represented by a
+`ValidationRun` that records the Task/WorkUnit or related Execution context,
+check or command identity, bounded environment/configuration summary,
+workspace and commit identity, lifecycle timestamps, status, exit code, and a
+log/output reference. A ValidationRun produces Evidence and may produce a
+generic validation-report Artifact.
+
+An Actor may still perform cognitive validation work—such as investigating a
+failed test, reproducing a bug, or interpreting security output—through an
+ordinary Execution with purpose `validate` or `investigate`. That Execution
+does not turn deterministic checks into Actor-owned work. Validation and
+review remain independent Gate inputs.
+
+## Planning and WorkUnits
+
+Planning is an ordinary Execution with purpose plan. A planner Actor uses
+the native planning capability of its harness, or a Human uses the planning
+surface. The result is persisted as a generic Artifact of kind plan.
+
+There is no canonical Forge plan engine. Forge may render, index, validate
+references to, and authorize access to a plan Artifact, but it does not
+continuously synchronize a second internal plan truth. Multiple plans may
+coexist. Choosing one is an explicit Gate, Decision, or orchestration action.
+
+A WorkUnit is a concrete executable scope. It may be created manually, by an
+orchestrator, from a plan Artifact, from an issue, or from another WorkUnit.
+It is not the plan and does not require bidirectional plan synchronization.
+WorkUnit dependencies form a bounded DAG and make scheduling constraints
+explicit. See [work-units.md](concepts/work-units.md).
+
+## Harness sessions
+
+HarnessSession is a first-class durable entity for Agent continuity. It records
+the owning Agent, harness kind, external session identifier, profile and
+capability snapshots, optional workspace scope, lifecycle, and timestamps.
+Executions attach to a session explicitly.
+
+Rework targets the exact Actor and, when possible, resumes the exact
+HarnessSession. A review Execution may be related to an implementation
+Execution without sharing its session. Restart/recovery operates on persisted
+session metadata rather than reconstructing identity from role labels.
+
+The platform must never silently emulate a harness-native capability. If live
+steering is unsupported, the intent is queued for a future turn or materialized
+through a policy-controlled stop/resume operation, and the result says so.
+
+## Collaboration
+
+The initial durable collaboration vocabulary is intentionally small:
+
+* Message — communication between Actors, Roles, or a Task scope.
+* Handoff — a transfer or request of work or responsibility.
+* Proposal — a proposed consequential action.
+* Decision — the resolution of a Proposal.
+
+These records may reference a WorkUnit, Execution, Artifact, or Gate, but they
+do not become a second authority hierarchy or a social messaging product.
+Reviewer feedback becomes a ReviewReport Artifact plus a Handoff or Message,
+not hidden prompt rewriting. Two orchestrators coordinate through the same
+primitives. See [collaboration.md](concepts/collaboration.md).
+
+## Orchestration
+
+An orchestrator directs work. It inspects current state, allocates WorkUnits,
+requests and routes Executions, manages dependencies, communicates, steers
+where supported, asks for human decisions, and coordinates other
+orchestrators. It does not inherently produce the authoritative review
+verdict, and its tools do not grant arbitrary database mutation or direct
+repository write access.
+
+If the same Actor must implement and orchestrate, Forge creates separate
+Executions under the two roles. An orchestrator operates at work boundaries,
+not individual tool calls inside an autonomous implementation harness.
+
+Orchestrator Executions are event-driven. A task-scoped Agent orchestrator
+awakens on meaningful events, inspects incremental state, acts if needed, and
+returns idle. It does not consume model tokens continuously while workers run.
+Several orchestrators may be active under a collaborative policy.
+
+Operations are classified as observational, soft/reversible, or
+operational/disruptive. Stop, cancel, reassign, discard, invalidate, merge,
+and override actions may require a Proposal and Decision according to the
+TaskRole policy. Consensus is not globally hard-coded; the policy is explicit.
+
+See [orchestration.md](concepts/orchestration.md).
+
+## Review, validation, and gates
+
+Validation is deterministic evidence from ValidationRuns: tests, typechecks,
+lint, builds, security scanners, and required commands. Actor-driven
+validation is ordinary cognitive work recorded as an Execution. Review is
+cognitive judgment by a reviewer Actor. Neither validation form implies that
+review passed, and review never implies that a deterministic check ran.
+
+A reviewer inspects work, evidence, and criteria, then produces a generic
+review Artifact with findings and a verdict. A reviewer does not become an
+orchestrator merely because it noticed a defect. An orchestrator routes that
+defect; a formal review requires a separate reviewer Execution.
+
+Gates express deterministic constraints such as required validation, required
+reviewers, human authorization, merge readiness, or a policy decision. A Gate
+can require several independent, partitioned, or collaborative reviewers.
+Review failure produces rework collaboration and may resume the original
+implementer's exact session.
+
+See [review-and-validation.md](concepts/review-and-validation.md) and
+[gates.md](concepts/gates.md).
+
+## Artifacts and evidence
+
+Artifact is the generic durable output primitive. Initial kinds include plan,
+review report, validation report, diff, patch, summary, design document,
+investigation, API contract, and test report. Artifacts can be content or an
+external/path reference with metadata, digest, Task, and timestamps. Their
+producer is an explicit mutually exclusive `ArtifactProducer`:
+
+~~~text
+ArtifactProducer
+  Execution(execution_id)          # Actor is derived from the Execution
+  ValidationRun(validation_run_id) # deterministic, Actor-free producer
+~~~
+
+An Execution-produced Artifact derives its Actor, Role, Purpose, harness and
+configuration provenance from that Execution. A deterministic validation
+Artifact derives provenance from its ValidationRun and never requires an
+Actor, HarnessSession, or fake System Actor. This avoids duplicating
+`producing_actor` as a second source of truth.
+
+Evidence is a typed, auditable observation used by a Gate or lifecycle
+projection. Deterministic validation can produce Evidence and a validation
+Artifact. A cognitive reviewer can produce a review Artifact that references
+Evidence. Bespoke artifact subsystems require a later domain justification.
+
+See [artifacts-and-evidence.md](concepts/artifacts-and-evidence.md).
+
+## Task lifecycle and authority
+
+Task state describes aggregate work lifecycle, not which cognitive role owns
+the turn. The target default vocabulary is:
+
+~~~text
+backlog → ready → active → blocked → ready_to_merge → merging → done
+                                                     ↘ cancelled
+~~~
+
+The exact enum can evolve during the migration, but states must not mean
+planner thinking, coder thinking, or reviewer thinking. Planning, implementing,
+reviewing, validating, and orchestrating may overlap. UI activity such as
+Planning, three Implementers active, Reviewing, or Waiting for Human is a
+derived projection.
+
+The scheduler starts eligible requested Executions while respecting dependency
+edges, Actor capacity, WorkUnit scope, workspace leases, Gates, Task lifecycle,
+and Decision policy. Cognitive questions such as whether to investigate,
+replan, reassign, or ask another reviewer belong to Actors and explicit policy,
+not a growing Rust branch tree.
+
+Deterministic authority remains in the core. Models cannot reason around
+workspace leases, security policy, human gates, merge constraints, credentials,
+or destructive-action policy.
+
+## Workspace isolation and integration
+
+Concurrent mutating Executions never receive uncontrolled write authority over
+the same working tree. The target topology is:
+
+~~~text
+Task integration branch/workspace
+├── WorkUnit A branch/worktree
+├── WorkUnit B branch/worktree
+└── WorkUnit C branch/worktree
+~~~
+
+Each mutating parallel Execution gets an isolated branch/worktree and an
+explicit lease. Integration into the Task branch is deterministic, locked,
+observable, and separate from work-unit completion. Merge conflicts and failed
+integration are explicit operational state and Evidence, never hidden Git
+accidents.
+
+The scope text on a WorkUnit is coordination context. It is not a filesystem
+security boundary unless an actual path-level authority is implemented.
+
+The existing workspace and git crates are preserved as infrastructure and will
+be evolved behind this contract.
+
+## Persistence and migration rules
+
+The replacement is additive until the final cleanup Plan PR:
+
+1. Add replacement schema and types.
+2. Write the replacement representation.
+3. Read the replacement representation.
+4. Stop legacy writes.
+5. Stop legacy reads.
+6. Remove legacy APIs and UI.
+7. Drop legacy schema only after migration fixtures prove preservation.
+
+Any compatibility reader must name the authoritative source, its bounded
+lifetime, the dual-write direction if applicable, and the Plan PR that removes it.
+Historical uncertainty is preserved as unknown; migrations do not invent
+harness semantics, role intent, or approvals.
+
+All migrations are numbered and preserve user data. Historical migrations are
+immutable. SQLite row mapping, repository traits, services, API types,
+generated TypeScript, routes, MCP tools, CLI commands, event consumers, and
+documentation move together when a public contract changes.
+
+## Crate responsibilities
+
+The target responsibility map is:
+
+| Crate | Target responsibility | Migration direction |
+| --- | --- | --- |
+| forge-daemon | Process discovery, daemon transport, harness process lifecycle, usage observation | Preserve and evolve |
+| cli-adapters | Harness-specific adapter implementations and protocol translation | Preserve implementation, move behind HarnessAdapter |
+| workspace | Worktree creation, leases, path safety, cleanup | Preserve and extend for WorkUnits |
+| git | Low-level Git operations and deterministic integration | Preserve |
+| config | Configuration precedence and local data paths | Preserve |
+| api-types | Shared public request/response/domain types | Thin and align to new domain |
+| db | Additive persistence, repositories, migrations, row mapping | Thin around new primitives |
+| services | Deterministic orchestration domain, scheduling, authority, projections | Replace cognitive workflow branches with small domain services |
+| api | Thin REST/SSE boundary and authentication/authorization mapping | Thin |
+| forge-client | Operational CLI client | Rebuild public commands later |
+| mcp-server | MCP projection of the same domain primitives | Thin, no second domain |
+| events | Durable-event projection and live delivery | Preserve, update event vocabulary |
+| executors | Transitional execution/logging facade | Replace with adapter-facing execution boundary |
+| review | Transitional special review runtime | Reduce to validation utilities, then remove if no longer meaningful |
+| agent-host | Forge-owned cognition/runtime layer | Remove after credential/process infrastructure is extracted |
+| forge-cli | Startup and composition root | Thin after retired services/workers are removed |
+
+Target dependency flow:
+
+~~~text
 forge-cli → api → services → db
-                → events      ↑
-                → agent-host → agent-runtime
-          → mcp-server -------┘
-          → executors (log schema, shell executor)
+                → events
+          → mcp-server ─────┘
+          → HarnessAdapter → cli-adapters → forge-daemon
           → workspace → git
           → config
-          → api-types (shared request/response types, zero internal deps)
-```
-
-## Architectural patterns
-
-### Repository trait pattern
-
-The `db` crate defines async traits (`TaskRepo`, `AgentRepo`, …) in
-`repository.rs` and implements them all on a single `SqliteDb` struct in
-`sqlite.rs`. Services and routes call trait methods as
-`TaskRepo::create(&*state.db, ...)`.
-
-### Error propagation chain
-
-`DbError` (db) → `ServiceError` (services) → `ApiError` (api). The api crate's
-`errors.rs` maps domain errors to HTTP status codes. All errors render as
-`ErrorResponse { code, message, details, request_id }`.
-
-### AppState wiring
-
-`forge-cli/main.rs` passes
-`Arc<SqliteDb>`, `Arc<EventBus>`, the Forge agent host/backends, and background
-workers to `AppState`. The revised `AppState` constructs the Task,
-identity/profile, Main/Project Agent Chat, embedded-session, memory,
-commitment, and Attention-facing services. `AppState` is `Clone` (shared fields
-are `Arc`) and used as Axum state.
-
-### Identity, profiles, and explicit authority
-
-`agent_identity` is the stable account-owned product identity. A connected
-identity may remain unbound, serve as the account's Main Agent, or serve as a
-Project Agent through explicit bindings. Runtime and model configuration lives
-in immutable `agent_profile` revisions; selecting a profile updates only the
-identity's versioned pointer. CLI profiles preserve the existing executor path,
-while native profiles select the Forge-hosted Agent Runtime backend. Credentials
-are write-only protected values referenced by opaque handles, never profile
-fields.
-
-`MainAgentBinding` is the account's single active global assistant binding.
-`ProjectAgentBinding` is the single active manager binding for each operational
-Project. Binding cardinality is unconditional: a Task Worker or reviewer
-assignment cannot satisfy a Project Agent binding, and there is no
-role/`is_primary` combination to resolve. Connection health never grants
-Project, Task, or filesystem access; an identity appears in the chat switcher
-only when it is explicitly bound as Main or Project Agent.
-
-Every persistent agent session binds to one canonical scope:
-
-| Scope | Authority source | Filesystem |
-| --- | --- | --- |
-| Main Agent Chat | active Main Agent binding and account policy | denied |
-| Project Agent Chat | active Project Agent binding and Project policy | denied |
-| Task | admitted assignment, workflow role, and Task Workspace | role-bounded Task Workspace only |
-
-Effective permissions are a fail-closed intersection of the account, selected
-profile, canonical scope, tool, approval, and applicable binding or
-Task-assignment layers. Opaque record IDs are references, not capabilities.
-
-### Main and Project Agent Chats
-
-An account has one global Main Agent Chat (visible in setup state even before a
-binding is selected), and each operational Project has one Project Agent Chat.
-Chat ownership is account/Project-scoped rather than tied
-to a replaceable identity, so binding replacement preserves message, handoff,
-memory, and session provenance. Connected but unbound identities do not create
-additional chats. There are no participants, addressing rules, responder
-policies, arbitrary threads, or bounded multi-agent rounds.
-
-Creating an operational Project creates its Project Agent binding and Project
-Agent Chat atomically. A migrated Project with no single safe binding is
-explicitly `agent_setup_required` and keeps its Project/Task data readable, but
-cannot admit Project Agent turns until the user resolves the identity.
-
-User-message or handoff admission atomically appends the guarded immutable
-message, its durable domain event, and one queued turn job. A turn exposes the
-finite states `queued`, `leased`, `retry_wait`, `succeeded`, `failed`, or
-`cancelled`. Database-backed leases, optimistic versions, finite retry budgets,
-and idempotency keys prevent duplicate turns and silent success after a failed
-response commit. Authorized non-terminal turns may be cancelled with their
-current optimistic version and an idempotency key; stale or terminal
-cancellation attempts are rejected. Progressive output is transient; success or failure appends
-one immutable canonical assistant outcome with provenance, usage, duration,
-correlation, and causation metadata.
-
-The chat worker selects the session backend from the bound identity's profile.
-A native profile uses the embedded host and an Agent Chat-scoped continuity
-timeline; a safely migrated CLI profile may use an explicit constrained chat
-backend and must advertise its actual limitations. Main and Project chats have
-deny-all filesystem access. Project Agent Task actions go through the existing
-`TaskService` and workflow; repository mutation remains limited to admitted
-Task Worker/reviewer executions in their Task Workspaces.
-
-Main Agent tools cover discovery, configured web search, Project lifecycle,
-bounded portfolio summaries, and explicit handoff. Main Agent sessions cannot
-create, edit, assign, transition, review, merge, or deliver Tasks. A Project
-Agent may manage Tasks only in its bound Project. A handoff is an immutable,
-bounded, provenance-linked publication from the Main Chat to the target Project
-Chat and schedules at most one target turn; it never copies credentials,
-private memory, hidden global history, or Main Agent authority.
-
-### Project truth, authority, and release evidence
-
-The singular chats are interaction surfaces, not a mutable source of truth.
-Forge stores consequential Project state as immutable, addressable revisions and
-derives read models from those records. Authority is scoped by domain:
-
-| Domain | Authoritative record | Owner / final authority |
-| --- | --- | --- |
-| Project identity and scope | approved `ProjectCharterRevision` | User approves; Main Agent recommends before handoff; Project Agent proposes amendments afterward |
-| Execution intent | approved Project Documents and one active execution baseline | Project Agent proposes; user approves the baseline and material changes |
-| Consequential choices | effective `DecisionRecord` (`active`, `superseded`, or `invalidated`) | Authorized principal recorded on the decision; candidate/editor records are not effective decisions |
-| Work state | Task, validation, review, and event records | Task/workflow services, assigned workers, reviewers, and authorized users under existing policy |
-| Outcome and release | milestone definition, `ReadinessSnapshot`, and immutable `Mxxx-rN` release manifest | Project Agent proposes; Forge evaluates; user alone releases |
-| Context and continuity | authorized `ContextManifest`, LCM timeline, and scoped memory references | Forge authorizes sources; Runtime stores continuity; neither chat nor memory can promote authority |
-
-The Main Agent owns global discovery and portfolio routing only. It can draft a
-Genesis Charter and publish one bounded handoff, but it cannot manage a Project
-or revise its Charter after attachment. The Project Agent owns planning and
-orchestration for exactly one Project, but cannot edit a repository, self-review,
-self-attest, self-waive, or release. Only a scheduler-issued Task
-`WorkspaceLease` grants repository authority to an assigned worker or reviewer.
-Model output, Agent Profile text, chat prose, web pages, repository text, and
-memory are data; none can widen a permission ceiling or satisfy an approval.
-
-`WorkspaceLease` is an internal scheduler record, not a public API or chat
-capability. The V076 `workspace_lease` table persists the Project/Task plus
-exact Task version and execution attempt, logical repository binding, resolved
-base ref, role, capability JSON, assigned principal, capability-profile
-revision/digest, issuing principal, issue/expiry timestamps, status, and
-optimistic version. Its database guards require the same Project, Task version,
-repository binding, assigned principal, running execution, approved-baseline
-gate (or the explicit pre-baseline read-only discovery/planning predicate), and
-profile revision/digest; one active lease is allowed per Task and identity
-fields are immutable. Active Main Agent and Project Agent identities are
-ineligible for leases even if a caller tries to assign them a Task role.
-Custom workflow execution-role names are retained for assignment matching and
-canonicalized to `worker`; only the dedicated `reviewer` role receives the
-reviewer lease class. Its operation idempotency key is the exact execution
-attempt ID: claim inserts the execution and lease in one transaction, and each
-retry/follow-up creates a fresh child execution with its own lease. A matching
-role assignment is authoritative for that execution role (for example, an
-independent reviewer may differ from the Task's primary worker). On a
-`legacy_unverified` Project only, an explicit manual execution selection is the
-assignment boundary when neither the role nor Task has an assignee; an existing
-applicable assignment still must match. Charter-backed Projects always require
-the exact Task Worker/reviewer role or Task assignment.
-`WorkspaceLeaseRepo` provides CAS renewal/revoke and bounded expiry operations.
-The heartbeat renews an active lease before its deadline only while the exact
-execution is still running and its Task, assignment, governance, repository,
-and capability bindings remain valid. Renewal changes only `expires_at`,
-`updated_at`, and the optimistic version; all authority fields stay immutable.
-
-The scheduler delivers authority through the internal execution channel by
-creating the running execution and lease together; the executor acknowledges
-that delivery by verifying the exact active lease immediately before provider
-start and before execution work. A missing, expired, revoked, reassigned, or
-superseded lease fails closed. Heartbeat/recovery expiry cancels and terminalizes
-the running attempt only after a valid running lease can no longer be renewed,
-and records reconciliation; all terminal, failed,
-cancelled, daemon-disconnected, and stalled paths revoke the grant. A retry
-gets a new execution identity and lease. The claim path canonicalizes executor,
-worker, and task-worker aliases to persisted `worker`, while reviewers remain
-`reviewer`. No route, MCP tool, chat context, filesystem path, handle, or bearer
-token exposes the row.
-
-#### Charter, Documents, Decisions, and effective state
-
-Every Main Agent Chat turn carries a server-owned operating instruction.
-Outside an active Product Genesis session, the account baseline skill
-`forge.main.baseline/v1` is in force: it tells the model it is Forge's Main
-Agent, hands it the bounded portfolio projection, and restates the no-Task/
-no-repository/no-credential boundary. The baseline is compiled into the server
-(its content digest is pinned by a test, not a seeded row) and is recorded in
-the turn's context manifest like the seeded skills.
-
-Product Genesis uses the server-owned `forge.main.project-discovery/v2` skill
-only while its Genesis session is `discovering` or `ready_for_project`. It asks
-no more than two consequential questions per turn and keeps facts, explicit
-user decisions, research findings, assumptions, hypotheses, and open decisions
-distinct. A Charter is append-only: each revision records typed content,
-rendered approval view, base revision, provenance, canonical content digest, and
-rendered-view digest. An approval receipt is principal-bound, single-use, and
-has only `active`, `consumed`, or `revoked` lifecycle. `CreateProjectFromCharterApproval`
-consumes that exact receipt and atomically attaches the Charter to one Project.
-
-Project Documents are Forge-owned, revisioned artifacts rather than arbitrary
-repository files. Their kinds are exactly `research`, `delivery_brief`,
-`product_spec`, `design`, `architecture`, and `execution_plan`. They can be
-rendered, diffed, and exported; a repository copy is a derived Task deliverable
-and never becomes implicit Project truth. The Project Agent operating contract
-is `forge.project.orchestration/v1`; profile instructions may shape tone or
-expertise but cannot override it.
-
-The Decision Log is append-only. An effective `DecisionRecord` is only
-`active`, `superseded`, or `invalidated`; draft, proposal, approval, and
-rejection are editor workflow records outside that effective state set. Forge
-does not use a global “latest record wins” hierarchy. It computes a typed
-`EffectiveProjectState` by domain, names the governing Charter/baseline/
-Documents/Decisions/Tasks/checks/milestones/releases, and records a visible
-canonical conflict plus `reconciliation_required` reason when authoritative
-records disagree. It blocks only the affected execution or readiness path.
-
-When Task creation omits an explicit governance envelope, Forge derives one
-from the Project's current Charter. Before baseline activation, ordinary
-implementation Tasks are retained as non-runnable instead of being rejected;
-baseline activation promotes matching Tasks. `planning`, `discovery`, `review`,
-and `validation` Tasks additionally have an explicit pre-baseline lane: they may be claimed only
-with the read-only repository capability and low risk, and both service and
-transactional admission enforce that same predicate.
-
-#### Milestones, readiness, and immutable releases
-
-Milestone definition revisions use only `draft`, `proposed`, `approved`, and
-`superseded`. The milestone instance lifecycle uses only `planned`, `active`,
-`ready_for_release`, `released`, and `cancelled`; blockers, stale results, and
-`reconciliation_required` remain typed projections while an unreleased
-milestone is `active`. Multiple milestones may be active, and the Project keeps
-an explicit `primary_milestone_id` whenever at least one milestone is `active`;
-planned or `ready_for_release` milestones do not require that pointer, and it
-is cleared when the last active milestone leaves that state. The primary is
-never inferred from recency or Task counts. Compact Project creation supplies
-`M001` (shown as `M1 — Deliver outcome`) when no other definition is present.
-
-Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
-It records the exact input manifest, source versions, evidence attachment
-IDs/digests, policy references, result (`ready`, `blocked`, `failed`, or
-`stale`), and readiness digest. A ready snapshot moves an unreleased active
-milestone to `ready_for_release`; non-ready results leave it active with typed
-reasons. Readiness creates no release pins. A user release request must name
-the exact snapshot ID and digest; Forge re-authorizes and recomputes that
-digest inside one transaction before creating the immutable `Mxxx-rN` manifest,
-release-scoped evidence pins, lifecycle transition, and events. `released` is
-terminal; later corrections append the next release revision and never mutate
-history. Forge release is an internal frozen evidence snapshot, not a merge,
-tag, deployment, or external publication.
-
-A Project Agent readiness action invokes the same `MilestoneRuntime`
-evaluation as the authenticated REST route and returns the committed snapshot;
-it is not a request event awaiting an absent consumer. A Project Agent release
-candidate remains non-authoritative: Forge validates the exact ready snapshot
-and milestone version, records the candidate, and raises human attention for
-the user-only release decision.
-
-#### Shared media and evidence lifecycle
-
-Task media and Project evidence can share one Project-authorized binary asset.
-The forward migration adds ownership, attachment, evidence, and release-pin
-metadata around existing rows; it preserves every existing asset ID, Task
-media ID, Task URL, storage key, metadata, and file byte in place. It neither
-moves nor duplicates bytes and makes no on-disk layout-break claim. The existing
-Task media routes continue to authorize through the active Task attachment.
-Attaching the same asset to a milestone creates metadata only and does not add
-it to another Task's list. Deleting a Task or Task attachment makes its Task
-URL unavailable under the existing policy; a release pin keeps the same bytes
-retained for the stable authorized Project evidence URL while the asset remains
-available.
-
-Evidence attachment metadata uses exactly `available`, `quarantined`,
-`redacted`, or `purged`. The public remove operation marks an attachment
-`purged`; readiness excludes unavailable evidence, and the Project media route
-serves bytes only while the shared asset is `available` and authorized. A
-cleanup worker re-checks active Task/Project attachments and immutable release
-pins under a lease immediately before deleting bytes, so restart and Task-delete
-races cannot remove still-referenced evidence. Release pins remain immutable.
-Cleanup isolates failures per asset and per phase, so one poisoned upload or
-filesystem entry cannot stop unrelated reconciliation or garbage collection.
-Successful recovery of a purged asset is checkpointed, allowing later rows to
-advance through the bounded sweep instead of repeatedly occupying its first
-page.
-V076 and the internal shared-media repository persist an audited redaction or
-purge tombstone, retain the permitted checksum/audit metadata, and project a
-pinned release's evidence as `evidence_unavailable` without rewriting its
-manifest. Authorized Project owners/admins invoke `POST
-/api/v1/projects/{id}/media/{asset_id}/redact` or `POST
-/api/v1/projects/{id}/media/{asset_id}/purge` with a
-`ProjectMediaTombstoneRequest` carrying the asset version, idempotency key,
-explicit user authorization (`project.media.redact` or `project.media.purge`),
-and a bounded reason. Redaction blocks serving through the Project media route
-while retaining bytes; the legacy Task media route keeps its existing behavior
-while the Task attachment remains active. Purge records the same immutable
-audit data, removes bytes, and both dispositions overlay every affected release
-pin as `evidence_unavailable`; after purge neither former URL serves the bytes.
-Neither route rewrites the immutable release manifest, and neither accepts a
-storage key or raw bytes.
-
-#### Context, memory, and recovery invariants
-
-Main context contains only the active Genesis Charter state and bounded
-portfolio projections. Project Agent context contains the current approved
-Charter, the active approved baseline, relevant approved Document revisions,
-compatible effective Decisions, authoritative Task/validation projections,
-active milestone/readiness state, and immutable release history. Every source
-is revision-addressed in a `ContextManifest` with authorization, digest,
-inclusion reason, and token disposition. Semantic memory and LCM summaries may
-point to canonical artifact IDs/revisions and identify stale references, but
-never contain a separately editable copy of Project truth. A newer approved
-artifact or server state always outranks chat, summaries, memory, or model
-output; cross-Project sources are rejected before retrieval and counting.
-
-Genesis Project creation, binding, Project Chat, Charter attachment, handoff
-message/turn, events, `handed_off` transition, and receipt consumption are one
-database transaction. A failure leaves Genesis `ready_for_project`, the exact
-approval receipt `active`, and no partial Project or handoff; retry with the
-same idempotency key returns the original committed result if one exists. A
-release or media-pin failure leaves the milestone `ready_for_release` with no
-partial manifest or pin. Migration failures leave legacy media references and
-bytes usable; physical cleanup is a separate guarded operation. These recovery
-rules make replay safe without inventing approval or silently substituting a
-name, Charter revision, artifact, or evidence asset.
-
-Project deletion is a transactionally guarded teardown. It removes the
-Project-owned immutable graph in dependency order and then the Project itself;
-the database permits those deletes only while the exact Project deletion guard
-is active. Direct attempts to mutate or delete an individual immutable Charter,
-milestone, readiness, release, decision, baseline, lease, or evidence record
-remain rejected.
-
-### Direct Agent Runtime host and LCM
-
-Agent Settings at `/agents` is the single account-owned surface, organized as
-three tabs over one model: `Providers` (configured provider entries — multiple
-entries per provider type — plus CLI runtimes discovered on daemons), `Agents`
-(the roster of direct and harness agents, each referencing one authentication
-source), and `Bindings` (the Main Agent binding, the optional Project Agent
-binding via a `?project=` deep link, and the read-only chat-scope list; `?tab=`
-deep-links any tab). Provider setup is driven by a server-owned capability
-catalog that also declares runtime compatibility per credential method; agent
-creation re-validates that matrix. Browser and device login create finite,
-account-owned authorization operations; only bounded public state is returned,
-while callback state, PKCE verifiers, device codes, token bundles, and client
-secrets are encrypted beside the existing protected runtime state. A completed
-authorization publishes a provider entry only. Connection, agent creation, and
-binding are deliberately separate transactions.
-
-Harness agents may reference a provider entry (`credential_ref` on the active
-profile). At dispatch, `TaskService` asks `EmbeddedAgentService` to inject the
-entry's API key into the in-memory executor snapshot as the provider's
-environment variable; the stored snapshot, events, and logs never carry the
-key, and OAuth bundles are refused for harness injection. Harness agents
-without an entry keep their CLI-managed login and are surfaced from daemon CLI
-discovery.
-
-The create and edit flows for harness agents both consume the executor's
-`discovered-options` response. Model ids remain open to custom values, while
-reasoning and execution-policy selectors are capability-driven: a control is
-shown only when the adapter advertises it, and permission choices are filtered
-to that adapter's supported policies. Reasoning effort and execution policy
-are independent persisted defaults. Agent name and description are mutable
-identity metadata; changing them does not publish a profile or alter a binding.
-
-Credential handles distinguish static `api_key` payloads from renewable
-`oauth_bundle` payloads and carry optimistic versions. Native adapters acquire
-short-lived leases through Agent Runtime's `ProviderCredentialSource` rather
-than receiving plaintext configuration. Expiring bundles refresh under a
-per-credential single-flight lock and rotate ciphertext plus the handle version
-in one transaction. Exact-revision invalidation prevents an older rejected
-request from invalidating a newer lease. Provider errors, events, public rows,
-and Debug output remain redacted.
-
-The Project Agent route is an Agent Workspace: one durable conversation beside
-a typed Project-record rail on desktop and a Conversation/Project segmented
-view on compact screens. The rail calls the existing Project, Task, artifact,
-Decision, and milestone services and surfaces saved/conflict/error receipts.
-It does not widen authority. Main and Project Agent sessions still use
-`WorkspaceAccess::Deny`, receive no repository path or shell, and can cause
-repository work only by creating/admitting a Task through the workflow.
-
-`forge-agent-host` composes Agent Runtime directly at immutable revision
-`a7075b1d2dd1cee05db63bc480ff46b0f97ec239`. It owns provider construction,
-protected credential/checkpoint/session stores, interaction handling, runtime
-events, content guards, usage mapping, cancellation/steering capabilities,
-typed tools, and scope-derived workspaces. Forge does not depend on the sibling
-TUI and does not add a Smith-native backend; Smith remains an existing CLI Task
-executor/profile.
-
-Lossless Context Memory continuity is keyed by `(identity_id, scope_type,
-scope_id)`, never by a replaceable runtime session. Main/Project Agent Chats
-use their own canonical timelines and native Task work uses a Task timeline.
-SQLite implements the Agent
-Runtime LCM reader/writer contracts with host-minted view authority on every
-operation, immutable admitted entries, transactional DAG compare-and-swap,
-operation fingerprints, and restart recovery. Session rotation follows the
-same authorized timeline; histories from different canonical scopes cannot be
-opened or merged by possessing a timeline/node ID.
-
-Forge selects and authorizes domain context; Agent Runtime alone budgets and
-serializes final model context. `context_manifest` records the offered source
-IDs/revisions and selection reasons, links the runtime run-manifest fingerprint,
-and records included/summarized/omitted dispositions without duplicating token
-planning. Protected bodies never enter either manifest. Authorized manifest
-inspection compares pointer-backed Project references with the current
-canonical Charter, Document, baseline, milestone, Project, and binding
-revisions and reports stale references as a read-time overlay; it never rewrites
-the immutable manifest or LCM history.
-
-### HTTP shell and web assets
-
-The API router also serves the built React application with an SPA fallback.
-Hashed JavaScript and CSS assets receive immutable one-year cache headers and
-eligible responses are Brotli/gzip compressed; HTML navigation responses remain
-uncached so deployments pick up the current asset graph. The production client
-keeps route screens and editor-backed dialogs behind dynamic import boundaries.
-
-### Durable events and the in-process event bus
-
-Agent-critical mutations commit a monotonic `domain_event` row in the same
-SQLite transaction as their authoritative state. Events carry canonical scope,
-actor, correlation/causation, bounded reaction depth, and dedupe identity.
-Consumers claim durable cursors/leases and checkpoint only after idempotent
-projection, so lag and restart replay cannot duplicate chat turn jobs,
-Attention rows, actions, memory indexing, or commitment reconciliation.
-The `agent-coordination-outcomes` consumer is started by `forge-cli`; it turns
-terminal Task transition events into one task-outcome inbox item and, for a
-scope-validated originating commitment, one delivery evidence/lifecycle
-projection.  Its event-derived dedupe keys make a crash between projection
-and receipt checkpoint safe to replay.
-
-The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
-`/api/v1/events` still drives live clients. For durable events it is a
-post-commit delivery/cache-invalidation projection, not authoritative history
-and never sufficient by itself to wake an agent.
-
-### Scoped semantic memory and context provenance
-
-The append-only memory layer continues to index execution summaries, reviews,
-comments, failure-bearing transitions, and finalized Agent Chat messages. Every row
-now carries canonical scope, visibility, owner identity, authority, provenance,
-publication/supersession links, validity, and source event. Publication creates
-a new wider-visible record; retraction, dispute, expiry, and supersession are
-append-only lifecycle assertions rather than body edits.
-
-Search and get apply authorization inside the SQL candidate query before FTS
-matching, snippets, counts, cursor construction, or ranking. Inaccessible rows
-therefore cannot be inferred from response differences. MCP responses retain
-the context-not-instructions guardrail; repository/memory text cannot grant
-tools, permissions, approvals, or a broader scope.
-
-`ForgeMemorySource` is constructed with immutable identity and canonical-scope
-bindings and returns already-authorized, ranked, bounded Agent Runtime memory
-records. It suppresses raw chat-derived memories already represented in the
-active LCM/recent history. LCM summaries remain derived episodic continuity,
-not verified semantic facts.
-
-### Commitments, Attention, and Mission Control
-
-Inbox items, commitments, and typed action/proposal envelopes are durable
-coordination records. Commitment completion requires authorized evidence;
-profile or session replacement does not erase an obligation. Mutating agent
-actions carry scope, payload hash, dedupe, correlation/causation, requested
-permission, and an `allowed`, `approval_required`, or `denied` policy result.
-Protected actions cannot be self-approved. Task proposals enter the existing
-Task service/workflow and do not become authoritative work before persistence.
-
-Attention is a deterministic, rebuildable projection of human input,
-validation/review state, stalls, health, budget thresholds, and overdue
-commitments. Any model wake occurs only after deterministic admission with
-budget, cooldown, batching, dedupe, incident lease, self-event suppression,
-and reaction-depth limits.
-
-Mission Control and Agent detail are bounded read models over authoritative
-Task/identity/session/commitment/event state. They show needs-attention,
-review-ready and active work, embedded-agent health/current scope/focus,
-commitments, recent outcomes, and capacity; they do not introduce a second
-mutable Task or Agent truth.
-
-### Daemon command transport
-
-Linked daemons keep a WebSocket command stream open at
-`/api/v1/daemons/{id}/connect`. The API server routes filesystem requests
-(`fs.list`, `fs.branches`) and daemon-owned managed executions
-(`execution.start`, `execution.cancel`) over that stream. The daemon validates
-paths against its advertised workspace root, runs the local CLI adapter, streams
-execution logs back as `execution.log` notifications, and reports final status
-through `execution.terminal`.
-
-Managed execution dispatch currently assumes the server-created task worktree
-exists at the same absolute path on the daemon host. That covers local daemons
-and containers or hosts with a shared workspace mount. A daemon on a separate
-filesystem can still browse paths under its own `--workspace-root`, but
-`execution.start` rejects server-only worktree paths until Forge has a remote
-workspace sync or git handoff path.
-
-### Daemon lifecycle and execution recovery
-
-Remote daemons periodically report local CLI availability and, when connected
-over the command stream, their currently running managed execution ids via
-`POST /api/v1/daemons/{id}/report` (`active_execution_ids`). The server uses
-that snapshot to reconcile orphaned server-side `running` executions owned by
-the daemon: any execution older than 60 seconds that is missing from the report
-is failed with `stop_reason = daemon_disconnected` and manual recovery only.
-
-Separately, the server `HeartbeatMonitor` (10s tick) watches remote executions
-whose owning daemon has no live WebSocket connection. After a 120s grace period
-from the first observed disconnect, it fails the execution with
-`daemon_disconnected`, publishes `execution.daemon_disconnected`, and emits the
-same `reconciliation.event` used for stalled executions so tasks enter the
-blocked/recovery UX. Embedded-server executions are excluded from the
-disconnect check; only embedded-owned stalled executions are cancelled via the
-in-process executor.
-
-If a remote execution keeps running but stops emitting activity, the existing
-stall detector still fails it after `execution_stall_timeout` (default 300s)
-with `stop_reason = execution_stalled`.
-
-### Task terminal sessions
-
-Task terminal sessions are a separate API and daemon path for interactive shell
-access to an existing task worktree. They do not layer onto
-`TaskService.transition()` or the workflow engine. Creating a terminal does not
-claim, transition, reset, or launch the task.
-
-The browser connects only to the API server in v1. REST calls create sessions
-and issue short-lived attach tokens; the browser then upgrades to
-`/api/v1/terminals/{id}/ws?attach_token=...`. There is no direct
-browser-to-daemon connection. For daemon-owned workspaces, the API server
-proxies terminal operations over the existing daemon transport:
-`terminal.start`, `terminal.input`, `terminal.resize`, and
-`terminal.terminate` requests flow to the daemon, while `terminal.output` and
-`terminal.exited` notifications flow back to the server. Embedded server mode
-uses the same service path and also runs a local PTY-backed process; it does
-not use plain stdin/stdout pipes.
-
-Process ownership lives on the daemon side for daemon-owned workspaces and on
-the API server for embedded workspaces. The API treats a task as daemon-owned
-when the task is directly assigned to an agent with `daemon_id`, or when the
-current workflow state's effective role assignment points to an agent with
-`daemon_id`; otherwise it uses embedded server process handling. Both runtimes
-allocate a PTY, start the shell in the server-authorized worktree, forward input
-and output, apply resizes, and terminate the process. Daemon-side starts
-additionally reject workspace paths that escape the daemon workspace root.
-
-The API server persists lifecycle metadata in `task_terminal_session`, including
-task, workspace, daemon, dimensions, status, timestamps, creator, and exit
-metadata. Attach tokens are stored only in memory and are single-use. Reconnect
-scrollback is an in-memory bounded ring buffer per running session, capped by
-`terminal.reconnect_scrollback_bytes`, and is dropped once all browser clients
-detach from that session; full terminal transcripts are not persisted in v1.
-
-Terminal sessions and managed Forge executions cannot run concurrently in the
-same workspace. Terminal creation is blocked while a managed execution is
-active, and managed execution startup must reject or defer while a terminal is
-active for that workspace.
-
-Cleanup is time- and ownership-bound. The default idle timeout is 30 minutes
-(`terminal.idle_timeout_secs = 1800`) and the default absolute lifetime is
-8 hours (`terminal.max_lifetime_secs = 28800`). Workspace cleanup terminates
-running sessions before removing the worktree. If a daemon disconnects beyond
-the heartbeat cleanup threshold, the daemon kills the terminals it owns and the
-server records the sessions as exited, timed out, orphaned, or cleanup
-terminated when it observes the terminal lifecycle event.
-
-## Task state machine
-
-Task hierarchy and purpose are independent. `parent_task_id` alone represents
-hierarchy. The semantic `task_type` values are `implementation`, `planning`,
-`discovery`, `review`, and `validation`. On the built-in workflow,
-implementation retains planning, coding, independent review, merge, and done;
-planning/discovery run a read-only worker followed by human acceptance;
-review/validation use a fresh read-only evaluator followed by human acceptance
-and never enter merge. A custom Project workflow remains authoritative, while
-the semantic type still enforces the read/write capability ceiling.
-
-Plans are append-only `task_plan_revision` records. Forge captures
-`planner_ready` and `final` snapshots; the final capture occurs synchronously
-before Workspace cleanup. The checklist is a projection of canonical Markdown,
-not a second authority. Task Overview renders the full canonical Markdown plan;
-checklist projections remain operational signals for execution progress and
-workflow gates. A planning-gate rejection keeps the user's reason in the
-transition log, and the next eligible planner prompt receives that feedback,
-the latest canonical plan, and Task comments as revision context. Reviewer runs
-bind immutable evidence to the plan digest,
-base/head SHA, full diff, CI result records, reviewer execution, and
-fresh-session provenance. Structured `needs_human` results pause rather than
-consuming coder retry budget.
-
-```
-todo ──────────────► in_progress ──────► review ──────► merging ──────► done
- │                      │                  │              │
- └──► cancelled ◄───────┴──────────────────┴──────────────┘
-                                           │
-                                      merge_failed ──► blocked
-```
-
-All non-terminal states can transition to `cancelled`. Terminal states: `done`,
-`cancelled`. The default workflow lives in
-`crates/services/src/workflow/default_workflow.rs` with sequence
-`backlog → todo → planning → in_progress → review → merging → done` and
-`merge_failed`, `blocked`, `cancelled` as auxiliary/failure/terminal states.
-
-The built-in `autonomous_v1` preset lives in
-`crates/services/src/workflow/default_autonomous_workflow.rs`. It is a
-single-worker graph: `backlog → ready → working → review → merging → done`,
-with `merge_failed` returning to worker execution and `cancelled` as the
-terminal cancellation target. `working` and `merge_failed` explicitly use the
-`worker` role; `review` has no reviewer role and requires human approval.
-Entering review runs the before-work hooks and CI steps as blocking guards.
-Review rejection and merge repair resume the latest worker thread. The worker
-plans internally, implements, self-tests, repairs failures, and reports
-verification evidence, so the preset has no planning state or plan-checklist
-gate.
-
-### Workflow engine (in progress)
-
-Flexible workflow work is partially implemented. `WorkflowEngine` in
-`crates/services/src/workflow/engine/mod.rs` is the new data-driven path;
-`TaskService.transition()` still uses the legacy `TaskStatus`/`transition_allowed`
-path. Treat the engine as a parallel code path until the split is removed.
-
-Workflows are project-defined JSON in `project.workflow_definition`. Empty
-string or `"{}"` resolves at runtime to the built-in `DefaultWorkflow`.
-`WorkflowCache` caches resolved definitions per project and invalidates on
-workflow updates.
-
-The applicable `WorkflowDefinition` is resolved **exactly once** per transition
-entry via `WorkflowEngine::resolve_workflow_for_task`, keyed on whether the task
-is a root or subtask, whether its **current** state belongs to the inherited
-subtask workflow, and the acting party (`triggered_by`). The result is passed
-into wrapper pre-checks, `WorkflowEngine::transition` / `transition_inner`,
-and `HookContext` so hook actions, cascades, and advance steps consume the same
-definition — no downstream layer re-resolves for that transition. Each nested
-transition entry (for example a system cascade step) calls the same function at
-its own entry, which is correct because resolution keys on current-state
-membership, not on who started the original user move.
-
-| Task | Current state | Actor | Applicable workflow |
-| --- | --- | --- | --- |
-| Root | any | any | Project |
-| Subtask | Not in inherited subtask workflow (e.g. `review`, `merging`) | any | Project |
-| Subtask | In shared subtask-workflow state (e.g. `in_progress`) | User (`user:*`) | Project |
-| Subtask | In shared subtask-workflow state | Agent or system | Inherited subtask workflow |
-
-This aligns validation with the frontend, which presents target states from the
-project workflow for all tasks. Automatic subtask lifecycle in subtask-workflow
-states is unchanged. All undefined-state rejections — in the engine, hook
-actions, cascades, recovery helpers, and prompt preview — flow through
-`WorkflowEngine::undefined_state_message`, which enumerates the workflow's
-defined states.
-
-`StateKind` classifies states:
-
-- **`backlog`** — parking lot; agent claims rejected.
-- **`initial`** — exactly one per workflow; validation rejects zero or multiple.
-- **`active`** — work state; may declare a role such as `coder`.
-- **`gate`** — validation/processing state; `gate_config.max_rejections`
-  enables retry-budget checks.
-- **`terminal`** — absorbing state; outbound transitions and non-terminal
-  cancellation targets are rejected.
-- **`custom`** — no built-in behavior beyond graph validation.
-
-`WorkflowEngine::transition` lifecycle for `A → B`:
-
-1. Load task, check optimistic version, validate that `A` and `B` are defined
-   states in the applicable workflow (undefined current or target rejects with
-   an error enumerating defined state names), then validate the graph edge or
-   implicit cancellation path.
-2. Run filtered `A.before_exit` guards unless `B` is the cancellation target;
-   `FailurePolicy::Block` failures return `GuardRejection` (HTTP 412).
-3. Update `task.status`, increment `version`, write `transition_log`, publish
-   `task.status_changed`.
-4. Run filtered `A.on_exit`, filtered `B.on_enter`, then effective
-   `B.after_enter` hooks. Gate states with `max_rejections` get
-   `check_retry_budget` prepended unless already present.
-5. Backfill `transition_log.hook_results_json`.
-6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
-   transition with `triggered_by = "system"`; cascade depth is limited to 3.
-
-Board moves use the same engine through `TaskService::move_task` and its board
-persistence seam. A project owns a monotonic `board_revision`, advanced by
-database triggers for board-affecting task inserts, deletes, status/position
-updates, archives, and soft deletes. The public move command compares both the
-task version and board revision after acquiring the SQLite write lock, validates
-the destination workflow column and adjacent neighbor IDs, and writes status
-plus board position once in a single transaction. Tight numeric gaps are
-renormalized inside that transaction, so revisions are monotonic but not
-gapless.
-
-Same-column moves use the repository transaction directly and skip status
-hooks. Cross-column moves run `before_exit`/`before_enter` guards before the
-write, then reuse engine audit, `on_exit`, `on_enter`, `after_enter`, dispatch,
-and cascade behavior from the committed task. The direct persistence step
-increments the task version exactly once; a later cascade is a separate normal
-transition and can increment it again. Rejected guards write no task, move
-operation, or transition log.
-
-`task_move_operation` stores normalized request identity, processing/direct
-commit state, and the completed logical result. A same-ID/same-request retry
-replays the result; different reuse conflicts. An incomplete record makes the
-existing post-commit crash gap detectable, while board/task refetch remains the
-recovery source of truth. Each newly committed direct move publishes exactly
-one `task.moved` event after commit. Status-changing move events feed lifecycle,
-project-hook, notification, and operation-status consumers in place of a second
-direct `task.status_changed`; any synchronous cascade emits its own normal
-transition event.
-
-**User routing override:** When a user actor's move would be rejected solely
-because (a) no trigger edge connects the states or (b) the matching trigger is
-system-only (`Fail`/`Retry`), and `B` is a defined state in the applicable
-workflow, the engine completes the transition via a user-routing-override arm
-inside `transition_inner`: `before_exit`/`before_enter`
-content guards still run and may block; `on_enter`/`after_enter` hooks run
-normally; `task.status_changed` is published unconditionally; agent dispatch fires
-only when a role/agent is assigned. Override transitions are audited as
-`triggered_by = "user:override:<source>"` (e.g. `user:override:api`). This is
-separate from `manual_override_transition`, a system-triggered primitive with
-`skip_before_exit=true` used by `TaskService::advance_to_next_state`.
-
-Hook audience filtering is uniform across phases. `HookAudience::All` always
-runs. `AgentOnly` runs when `triggered_by` starts with `"agent:"` or equals
-`"system"`; `UserOnly` runs only when it starts with `"user:"`. Non-matching
-hooks are skipped without a hook-result entry.
-
-Human-triggered transitions are treated as project-management actions. The
-dependency gate does not block `user:*` card moves, including board drag
-transitions, so users can reorder and reclassify work like they would in Jira.
-Users may route a task to any defined workflow state via the override path when
-strict routing would reject (see resolution rule above). Any user-initiated
-transition that changes the task's state cancels in-flight executions with
-`StopReason::UserCancelled`; same-state moves leave running executions
-untouched. Parking an agent-assigned task in an Initial- or Backlog-kind state
-retains role assignments but does not launch an executor from the move itself
-— the task re-enters agent flow only through the normal scheduling path when it
-later reaches a dispatchable state. AI execution remains gated separately:
-initial role dispatch and interactive launch both run dependency checks before
-creating an execution.
-
-Cancellation is implicit from any non-terminal state to
-`workflow.cancellation_state` (or terminal `"cancelled"` if unset), even
-without an explicit edge. Project `before_exit` guards are bypassed for this
-path; `on_exit` and cancellation-state `on_enter` hooks still run.
-
-### Roles and assignments
-
-Roles are declared by workflow (`roles[]`) and states can require a role
-(`state.role`). Per-task assignments live in `task_role_assignment` keyed by
-`(task_id, role_name)` with either a stable agent identity or user. Claiming
-auto-assigns the claimed state's role to the claiming identity when no
-assignment exists; a conflicting pre-assignment returns HTTP 409. Replacing or
-selecting a new profile therefore does not rewrite Task ownership/history.
-
-CLI profiles continue through the existing executor/daemon path. A compatible
-native profile enters work through the same claim, assignment, workflow,
-Workspace, validation, review, and delivery services; it does not get an
-alternate repository-mutation route. Only the admitted Task session derives
-the role-bounded Workspace/tools and Task LCM timeline. Other simultaneous
-sessions for that identity retain their own denied Main/Project Agent Chat
-workspaces.
-
-Repository claims preflight the selected identity before creating a Task
-branch or worktree: an active Main or Project Agent identity is rejected even
-if it also has a Task assignment. Forge admits at most one running
-repository-capable execution for a Task, including retries and interactive
-follow-ups, and rejects a second attempt before changing Task state. If a
-process stops after creating the deterministic Task branch but before the
-worktree record is committed, the next valid claim recovers that branch into a
-new worktree instead of failing or creating an alternate branch.
-
-`assignee` is an engine-reserved role name. Active states without explicit
-`state.role` implicitly bind `assignee`. This fallback applies only to Active
-states; Gate, Initial, Backlog, Terminal, and Custom states without roles bind
-no role. `state.role = Some("assignee")` on a non-Active state is rejected
-during validation. `DefaultWorkflow` is unchanged and uses declared `planner`,
-`coder`, and `reviewer` roles.
-
-### Retry budgets
-
-Audit-log derived. Gate states may set `gate_config.max_rejections`;
-`check_retry_budget` counts `transition_log` rows with `from_state = gate` and
-`rejection = true`. Non-review gates allow that many rejected revisions and
-cascade to `blocked` when a later rejection exceeds the configured limit;
-review gates retain their dedicated attempt-budget semantics. Generic
-user-triggered gate-to-active bounces are logged with `rejection = false` and
-do not consume budget. Role dispatch consults the same persisted count before
-creating an execution or WorkspaceLease, so an exhausted gate is blocked by
-the authoritative hook without launching a doomed attempt. Reset Retry Window
-on a non-review gate re-enters that gate so dispatch can start a fresh
-revision run; it does not leave the Task idle in the same state.
-
-### Crash recovery
-
-`CrashRecovery` runs at server startup; `HeartbeatMonitor` applies the same
-recovery primitive on agent timeout. Both annotate a task with a
-`recovery_required` `error_annotation` only when they actually cancelled at
-least one running execution for that task, and publish `task.recovered` only in
-that case. Tasks whose assignee is a user are excluded from crash-recovery
-selection — agent-oriented recovery is not meaningful for human-driven tasks.
-
-After the orphan pass, startup runs a sweep that clears stale
-`recovery_required` annotations when `blocked_execution_id` is missing, refers
-to a nonexistent execution, or refers to an execution that is not in a stopped
-state awaiting user recovery. The sweep is idempotent and only ever clears
-annotations.
-
-### Failure classification
-
-Interruption kinds are a closed vocabulary: `FailureKind` in `api-types`
-(serialized snake_case, TS-exported). It is the only classification signal —
-`InterruptionMetadata.kind`, `TaskBlockingAnnotation.type`, and the
-`task.blocked`/`task.failed` event payloads all carry it, producers
-(`block_task`, `fail_task`, annotation writers) take the enum rather than
-strings, and recovery/exception derivation branches exclusively on its
-predicates (`is_retry_exhausted_metadata`, `is_budget_exhausted_annotation`,
-`is_merge_recoverable`, …). Reason/message prose carries no classification
-weight anywhere. Legacy database rows were normalized once by migration
-`V056__normalize_failure_kinds`; kinds that migration could not map
-deserialize to a read-only `Unknown` variant that renders info-only with no
-recovery actions. Producers must never construct `Unknown`. The web client
-likewise derives no failure semantics from workflow state names — gate
-reject/bounce targets come only from explicit `reject`/`fail` trigger edges or
-`gate_config.reject_target`.
-
-Hard failures and recovery states surface to the user as notifications:
-`task.failed` when `fail_task` sets `failed_json` (which also clears any stale
-blocking annotation), and `task.recovery_required` when crash recovery or an
-agent heartbeat timeout annotates a task for manual recovery.
-Graceful-shutdown recoveries auto-resume at the next startup and are not
-notified. In the derived `workflow_exception` summary, a hard failure
-supersedes any blocking annotation — `recover_task` only accepts
-`reset_to_initial`/`cancel_task` once `failed_json` is set, so only those
-actions are offered. The web UI renders one actionable recovery surface,
-`WorkflowExceptionPanel`, on both the task page and the board modal;
-`TaskBlockingBanner` is an informational fallback for interruption states
-without recovery actions.
-
-`transition_log` is the audit source of truth for state changes. The API
-exposes it via `GET /api/v1/tasks/{id}/transitions`.
-
-### Files of interest
-
-- `crates/services/src/workflow/engine/mod.rs` — lifecycle
-- `crates/services/src/workflow/actions/` — curated hook actions
-- `crates/services/src/workflow/default_workflow.rs` — built-in graph
-- `crates/services/src/workflow/validation.rs` — workflow graph validation
-- `crates/services/src/workflow/cache.rs` — per-project resolved definitions
-- `crates/services/src/workflow/registry.rs` — action name resolution
-- `crates/db/migrations/V009__workflow_engine.sql` — `project.workflow_definition`,
-  `task_role_assignment`, `transition_log`
-
-## Happy path
-
-The canonical end-to-end flow is captured by `crates/api/tests/happy_path.rs`.
-It boots the in-process Axum router with an embedded daemon and a real temp
-git repo, drives a task through `todo → in_progress → review → merging → done`,
-and asserts:
-
-- The merge SHA lands on the default branch.
-- The worktree is removed.
-- One `review` row with `status=passed` is persisted.
-- The expected event sequence appears on the bus.
-
-Any refactor that breaks this test likely needs a spec realignment before
-merging. Claiming a task auto-dispatches the executor via `tokio::spawn` in
-`api::routes::tasks::claim_task` — there is no separate "dispatch" endpoint.
-
-## Concurrency control
-
-Tasks and agents use optimistic concurrency via a `version` column. Updates
-require `WHERE version = ?` and increment on success. Version mismatch →
-`DbError::VersionConflict` → HTTP 409.
-
-## Database
-
-SQLite with WAL mode. Schema in
-`crates/db/migrations/V001__initial_schema.sql`. Migrations are numbered
-`V{NNN}__{name}.sql` and tracked in `_migration` table. All primary keys are
-app-generated UUID v4; all timestamps are app-generated RFC3339.
-
-Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
-`busy_timeout=5000` per connection.
-
-The revised schema adds `account_main_agent_binding`,
-`project_agent_binding`, `agent_chat`, immutable `agent_chat_message`, bounded
-`agent_chat_turn_job`, and immutable `agent_handoff` records to the existing
-identity/profile, session, LCM, memory, commitment, event, Attention, Task,
-execution, review, and terminal tables. It enforces one active Main binding per
-account, one active Project binding per operational Project, one global chat per
-account, and one Project chat per Project. Historical collaboration tables are
-migration inputs rather than public product concepts.
-
-Migrations V059–V070 remain immutable history. V071 or later performs the
-forward-only correction: it creates the singular binding/chat records and
-migrates legacy Conversation and pre-release collaboration messages,
-metadata, instruction provenance, sessions, LCM/memory references, protected
-content audit links, and turn jobs without changing message IDs or bodies.
-When multiple source threads map to one chat, ordering is deterministic by
-original timestamp, source ID, and source sequence, with source provenance
-preserved. A binding is inferred only from one safe eligible responder;
-ambiguous or invalid cases become explicit `agent_setup_required` state, and a
-primary Worker is never promoted. Expired or ambiguous leases become finite
-retry/terminal states rather than remaining silently leased. Historical
-migration files are never edited. V075 quarantines the retired Room and
-Project-agent-membership tables under `legacy_*`, remaps Room-scoped semantic
-memory to the owning Agent Chat, and adds database guards that reject new Room
-context, LCM, memory-binding, or manifest authority. Historical source IDs and
-sequences remain available only as provenance.
-
-The Charter, Project artifact, milestone, release, and shared-media metadata
-for this change are added by the forward-only
-`V076__project_charter_milestones_media.sql` migration. It leaves V001–V075
-immutable, preserves existing media identifiers/storage keys/file bytes, and
-does not move or duplicate files. Any later migration must be independently
-numbered and is outside this change's contract.
-
-For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
-database.
-
-## Frontend
-
-React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
-`@` path alias → `web/src/`. API client at `web/src/api/client.ts` calls
-`/api/v1/*` endpoints. Types in `web/src/types/generated/api.ts` must match
-`api-types` crate responses.
-
-## Crate notes
-
-- **db** — Enum serialization uses `Display`/`FromStr` (in `models.rs`) for
-  SQLite TEXT columns. Row mapping is manual via `sqlx::Row::get()`, not
-  compile-time checked macros.
-- **agent-host** — Direct Agent Runtime composition, protected credentials and
-  checkpoints, capability-aware native/CLI Agent Chat backends, content guards,
-  and scope-derived workspace adapters.
-- **services** — `TaskService.transition()` handles side effects (event
-  emission, counter increments, `ReviewRunner` on `→ review`, `MergeService`
-  on `review → merging`, `WorkspaceCleanupScheduler` on `→ done` /
-  `→ cancelled`). Background tasks: `CrashRecovery` at startup (orphan
-  execution recovery and stale-annotation sweep), `HeartbeatMonitor`,
-  `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
-  projection, and `WorkspaceCleanupScheduler`.
-- **review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc`
-  commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
-  execution sharing the executor's workspace. Depends only on `db`, `events`,
-  `executors` — not on `api` or `services`.
-- **api** — Routes include projects, Tasks, Main/Project Agent bindings and
-  chats, embedded agents/sessions, memory/context, commitments/actions, Mission Control,
-  terminals, repos, executions, events, daemons, CLIs, and executor types.
-  Error module is `errors.rs` (plural). Middleware adds request IDs and CORS.
-  `claim_task` auto-dispatches the executor.
-- **executors** — `LogWriter` appends JSONL with schema version + sequence
-  numbers. `ShellExecutor` spawns child processes with heartbeat supervision.
-
-### Executor fallback chains
-
-Both execution paths (embedded `AppState.task_executor` and the remote
-daemon runtime) dispatch through `FallbackExecutor`, which walks an ordered
-candidate route instead of a single adapter:
-
-- **Authoring** — an agent's `config_json` may carry
-  `fallbacks: [{executor_type, config}]`. The snapshot builder extracts it
-  *before* typed-config normalization (which drops unknown fields),
-  normalizes each candidate under its own `ExecutorKind`, and writes a
-  first-class `routing` block
-  (`{policy: "ordered_fallback_v1", candidates, selected_candidate_key,
-  attempts}`) on the execution snapshot. Snapshots without `routing` behave
-  exactly as single-candidate executions.
-- **Fallback trigger** — only structured availability errors advance the
-  chain: `ExecutorError::UsageExhausted { retry_after, usage }` and
-  `ExecutorError::Unavailable`, plus a failed per-candidate availability
-  precheck (`check_candidate_availability`, defaulting to the family-level
-  check). Real task failures terminate the chain immediately. Adapters
-  classify only structured signals (Smith stream events / result statuses,
-  Claude Code stderr and `is_error` result events); assistant output text is
-  never an input, and unclassifiable failures stay generic (no fallback).
-- **Cooldowns** — an in-memory, process-lifetime registry keyed by
-  `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile,
-  else the executor family). Exhausted accounts are skipped until
-  `retry_after` (default 15 min); all candidates cooling fails fast without
-  spawning. Candidate identity (`CandidateKey`) is separate: kind +
-  discriminators + a stable hash of the session-stripped config.
-- **Terminal disposition** — the chain reports `Ok(ExecutionResult)` with
-  `failure_class` (`TaskFailed` | `ExecutorUnavailable`), `retry_after`,
-  `resolved_candidate`, and `route_attempts`. The daemon protocol carries
-  the same fields additively on `ExecutionTerminalNotification`
-  (`failure_class`, `retry_at`, `resolved_candidate`, `route_attempts`);
-  notifications without them degrade to generic executor-failed handling.
-  The service layer maps `ExecutorUnavailable` to
-  `FailureKind::ExecutorUnavailable` from these fields only — never prose.
-- **Availability recovery** — `executor_unavailable` bypasses the execution
-  retry budget entirely. Transient exhaustion (retry time known) schedules a
-  deferred dispatch at the structured `retry_at` plus deterministic jitter;
-  permanent unavailability (auth/install failure everywhere) blocks the task
-  for manual reconfiguration with no automatic redispatch.
-- **Sticky selection and resume** — the winner's resolved config is written
-  back to the execution snapshot (top-level `executor_type`/`config`, plus
-  `routing.selected_candidate_key` and per-candidate `attempts` for
-  provenance). Follow-ups resume via candidate identity: the parent's
-  winning candidate is promoted to the front of a fresh route only when the
-  exact `CandidateKey` is still present; any candidate switch starts a fresh
-  session (`resume_session_id` never crosses accounts — executor-family
-  equality is not sufficient).
-- **mcp-server** — JSON-RPC dispatch over `POST /mcp` with its own `McpState`.
-  Does not depend on the `api` crate.
-- **workspace** — File-based locking via `.forge.lock`. Path validation
-  prevents traversal escapes.
-- **config** — `ForgeConfig` with precedence: CLI flags > env vars > config
-  file > defaults. Default bind uses loopback with an OS-selected port, then
-  persists the selected port under the Forge data directory.
+          → api-types
+~~~
+
+agent-host and any embedded cognition runtime are not in the target graph.
+They remain in the current build until Plan PR10 removes them.
+
+## Public surfaces
+
+REST, MCP, CLI, SSE, and the web UI expose the same Actor/Role/Execution/
+WorkUnit/Artifact/Evidence/Collaboration model. They must not introduce
+different authority or orchestration concepts. A public contract change is
+updated in the route, api-types, generated TypeScript, and docs/api.md in one
+implementation Repo PR for the owning Plan PR.
+
+The UI may make Human work more ergonomic, but Human planner, implementer,
+reviewer, and orchestrator actions use the same domain records as Agent work.
+The UI shows Agent harness identity clearly; it does not collapse same-model
+Agents across harnesses.
+
+Plan PR0 does not change the product runtime, public API, CLI surface, or
+branding. It corrects current API-reference text where necessary so it does
+not describe unimplemented behavior; new public domain surfaces remain staged
+for later Plan PRs.
+
+## Migration sequence
+
+The migration is one reviewed Plan PR at a time:
+
+| Plan PR | Contract |
+| --- | --- |
+| Plan PR0 | Freeze this architecture, invariant register, ADRs, upstream attribution, and migration ledger |
+| Plan PR1 | Actor references and multi-actor TaskRole memberships |
+| Plan PR2 | ExecutionPurpose and first-class HarnessSession |
+| Plan PR3 | Capability-driven HarnessAdapter |
+| Plan PR4 | Generic Artifacts and collaboration primitives |
+| Plan PR5 | WorkUnits and isolated parallel implementation |
+| Plan PR6 | Event-driven, multi-actor orchestration |
+| Plan PR7 | Harness-native planning Executions and plan Artifacts |
+| Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence |
+| Plan PR9 | Aggregate Task lifecycle and simplified gates/scheduler |
+| Plan PR10 | Removal of agent-host and embedded cognition |
+| Plan PR11 | Retirement of Main Agent/Project Agent/Project OS verticals |
+| Plan PR12 | REST, MCP, CLI, web, and event surface alignment |
+| Plan PR13 | Legacy persistence and compatibility cleanup |
+| Plan PR14 | Final product rename and documentation rewrite |
+| Plan PR15 | Reference scenarios, reliability hardening, and acceptance |
+
+No later Plan PR is implied by a Plan PR0 document. Each Plan PR begins from the actual
+current main, re-runs dependency searches, identifies affected invariants,
+and stops after its own validation and review.
+
+## Related documents
+
+* [Architecture v2 migration contract](migration/architecture-v2.md)
+* [Actors](concepts/actors.md)
+* [Agents and harnesses](concepts/agents-and-harnesses.md)
+* [Roles](concepts/roles.md)
+* [Executions](concepts/executions.md)
+* [Harness sessions](concepts/sessions.md)
+* [WorkUnits](concepts/work-units.md)
+* [Collaboration](concepts/collaboration.md)
+* [Orchestration](concepts/orchestration.md)
+* [Review and validation](concepts/review-and-validation.md)
+* [Artifacts and evidence](concepts/artifacts-and-evidence.md)
+* [Gates](concepts/gates.md)
+* [Upstream relationship](upstream.md)
+* [Architecture decision records](adr/)

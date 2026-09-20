@@ -117,11 +117,11 @@ Deeper dive → [docs/architecture.md](docs/architecture.md).
 | Doc | What's in it |
 |---|---|
 | [Getting started](docs/getting-started.md) | Install, first project, agents, end-to-end task walkthrough. |
-| [Architecture](docs/architecture.md) | Authority model, Project truth, milestones/evidence, crate graph, task state machine, database, event bus. |
+| [Architecture](docs/architecture.md) | Actors, harness-bound agents, multi-actor roles, executions, WorkUnits, collaboration, isolation, and migration boundaries. |
 | [API reference](docs/api.md) | Charter/Project/Document/Milestone/Release REST endpoints, media retention, pagination, MCP tools, SSE. |
 | [forge-ctl CLI](docs/cli.md) | Subcommands, daemon link, scripted runs. |
 | [Execution logs](docs/execution-logs.md) | JSONL log schema and chat-history reconstruction. |
-| [Downstream relationship](docs/downstream.md) | Operational-fork policy, intentional divergences, and upstream integration guidance. |
+| [Upstream relationship](docs/upstream.md) | Independent-maintenance policy, attribution, and selective upstream integration guidance. |
 | [Changelog](CHANGELOG.md) | Per-release changes and breaking notes. |
 
 ## Status

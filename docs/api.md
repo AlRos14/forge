@@ -224,7 +224,9 @@ reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 | POST   | `/api/v1/actions/{id}/execute-task` | Create the authoritative Task through TaskService and audit the outcome |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
-| GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
+| POST   | `/api/v1/executions/{id}/follow-up` | Continue an execution session manually; completion does not advance the task workflow |
+| POST   | `/api/v1/executions/{id}/re-execute` | Start a new execution for the current workflow role and current role assignment, without session continuity |
+| GET    | `/api/v1/executions/{id}/logs` | Read the current execution JSONL log with sequence pagination or a bounded tail |
 | GET    | `/api/v1/workspaces/{id}/diff` | Get workspace diff |
 | GET    | `/api/v1/notifications` | List notifications (paginated, filterable by `project_id`, `read`) |
 | GET    | `/api/v1/notifications/unread-count` | Unread notification count |
@@ -465,7 +467,8 @@ different CLI); a task interrupted because every candidate is unavailable
 carries the `executor_unavailable` failure kind and does not consume its
 execution retry budget. Duplicate candidates and unknown executor types are
 rejected at dispatch time; an empty `{}` candidate config is valid. See
-[architecture.md](architecture.md#executor-fallback-chains).
+[agents and harnesses](concepts/agents-and-harnesses.md) for the target
+harness-bound identity and explicit failover contract.
 
 ## Main and Project Agent bindings
 
@@ -1177,8 +1180,8 @@ existing daemon transport when the task is directly assigned to an agent with
 `daemon_id`, or when the current workflow state's effective role assignment
 points to an agent with `daemon_id`. Tasks without an agent daemon use the
 embedded server PTY path. See the
-[task terminal architecture](architecture.md#task-terminal-sessions) for the
-full design rationale.
+[workspace isolation and WorkUnits](concepts/work-units.md#isolation) for the
+target isolation contract.
 
 | Method | Direction | Params | Result |
 |--------|-----------|--------|--------|
@@ -1638,3 +1641,25 @@ Execution chat history is backed by Forge JSONL logs plus execution prompt
 metadata, not by agent-private transcript storage. See
 [execution-logs.md](execution-logs.md) for the adapter-specific details and
 log schema.
+
+### Execution log pagination
+
+`GET /api/v1/executions/{id}/logs` reads the execution's current JSONL log.
+Responses contain `items`, `has_more`, and `next_sequence`; use
+`from_sequence` and `limit` to page through the available entries. `tail`
+returns a bounded newest-entry view. The current PR0 implementation does not
+promise rotated-segment history or a complete export from `logs_path`; lossless
+rotation and cross-segment reads are operational work owned by PR0A.
+
+### Manual continuation and re-execution
+
+`POST /api/v1/executions/{id}/follow-up` is the manual continuation path. It
+preserves the parent session when supported, uses the interactive role, and
+does not advance the task workflow when it completes.
+
+`POST /api/v1/executions/{id}/re-execute` starts a new execution for the
+current legacy workflow role and role assignment without session continuity;
+completion may participate in the existing workflow cascade. These endpoints
+describe the transitional execution surface that remains until the explicit
+HarnessSession, Actor, and lifecycle migrations. They are not the target
+identity mechanism.
