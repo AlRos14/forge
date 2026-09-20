@@ -12,7 +12,8 @@ account_key: string | null,
  */
 daemon_id: string | null,
 /**
- * Whether the server can perform a direct no-model usage probe for this
- * Agent. Remote CLI Agents receive usage from their execution host.
+ * Whether this Agent usage surface supports an explicit manual refresh.
+ * The current runtime model reports false: CLI usage is observed on its
+ * execution host, while native provider usage has its own provider-entry path.
  */
 manual_refresh_supported: boolean, shared_account: boolean, source: string | null, usage: Record<string, unknown> | null, captured_at: string | null, stale: boolean, message: string | null, };

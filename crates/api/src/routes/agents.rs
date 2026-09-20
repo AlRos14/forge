@@ -160,35 +160,14 @@ pub async fn refresh_agent_usage(
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
 
-    // A server-side refresh is only valid when the account context is local
-    // to this process. A daemon-bound or scheduler-routed CLI Agent owns its
-    // credentials on another host; probing this server's CLI would report a
-    // different account while looking like a successful refresh.
-    if !manual_refresh_supported(&agent) {
-        return Err(ApiError::conflict_with_code(
-            "usage_refresh_unsupported",
-            "Manual usage refresh is unavailable for this remote Agent; usage is refreshed from observations on its execution host",
-        ));
-    }
-
-    let usage = match agent.executor_type.as_str() {
-        "codex" => Some(services::account_usage::refresh_codex_usage(&agent.config_json).await?),
-        "cursor" => Some(services::account_usage::refresh_cursor_usage(&agent.config_json).await?),
-        _ => None,
-    };
-    if let (Some(usage), Some(account_key)) = (usage, usage_account_key(&agent)) {
-        let captured_at = now_rfc3339();
-        let stale_after = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
-        sqlx::query(
-            "INSERT INTO account_usage_snapshot
-             (id, account_key, executor_type, daemon_id, source, usage_json, captured_at, stale_after)
-             VALUES (?, ?, ?, ?, 'manual_refresh', ?, ?, ?)",
-        ).bind(new_uuid_v4()).bind(account_key).bind(&agent.executor_type)
-            .bind(agent.daemon_id.as_deref())
-            .bind(usage.to_string()).bind(captured_at).bind(stale_after)
-            .execute(state.db.pool()).await?;
-    }
-    agent_usage_response(&state, &user, &id).await.map(Json)
+    // The current domain has no server-local Codex/Cursor CLI Agent. CLI
+    // harness usage belongs to the daemon that executes it; native Agents use
+    // the embedded/provider-entry usage path instead. Keep this compatibility
+    // endpoint explicit rather than probing an unrelated server account.
+    Err(ApiError::conflict_with_code(
+        "usage_refresh_unsupported",
+        "Manual Agent usage refresh is unavailable in the current runtime model; CLI usage is refreshed from execution-host observations and native provider usage is exposed through provider entries",
+    ))
 }
 
 async fn agent_usage_response(
@@ -201,7 +180,7 @@ async fn agent_usage_response(
         .ok_or_else(|| ApiError::not_found("agent", id.to_owned()))?;
     require_agent_visible(&agent, user, id)?;
     let account_key = usage_account_key(&agent);
-    let manual_refresh_supported = manual_refresh_supported(&agent);
+    let manual_refresh_supported = false;
     let shared_account = usage_is_shared(&agent);
     // A pinned/local/explicit-credential Agent has an exact account key. An
     // unpinned remote CLI Agent does not: its scheduler-selected daemon is a
@@ -264,22 +243,6 @@ async fn agent_usage_response(
     })
 }
 
-fn manual_refresh_supported(agent: &Agent) -> bool {
-    manual_refresh_supported_for(
-        &agent.backend_kind,
-        &agent.executor_type,
-        agent.daemon_id.as_deref(),
-    )
-}
-
-fn manual_refresh_supported_for(
-    backend_kind: &str,
-    executor_type: &str,
-    daemon_id: Option<&str>,
-) -> bool {
-    backend_kind == "native" && daemon_id.is_none() && matches!(executor_type, "codex" | "cursor")
-}
-
 fn usage_account_key(agent: &Agent) -> Option<String> {
     let config: Value = serde_json::from_str(&agent.config_json).unwrap_or(Value::Null);
     let explicit_credential = agent
@@ -316,28 +279,6 @@ fn usage_is_shared(agent: &Agent) -> bool {
         .credential_ref
         .as_deref()
         .is_some_and(|reference| !reference.trim().is_empty())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::manual_refresh_supported_for;
-
-    #[test]
-    fn manual_refresh_is_only_supported_for_local_native_harnesses() {
-        assert!(manual_refresh_supported_for("native", "codex", None));
-        assert!(manual_refresh_supported_for("native", "cursor", None));
-        assert!(!manual_refresh_supported_for("cli", "codex", None));
-        assert!(!manual_refresh_supported_for(
-            "cli",
-            "cursor",
-            Some("daemon-1")
-        ));
-        assert!(!manual_refresh_supported_for(
-            "native",
-            "codex",
-            Some("daemon-1")
-        ));
-    }
 }
 
 pub async fn list_agent_tasks(

@@ -142,7 +142,7 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 | GET    | `/api/v1/agents/{id}/usage` | Get the latest account-scoped harness usage snapshot, including freshness and the producing daemon when known |
-| POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh local/native usage when the harness exposes a no-model probe; remote/daemon-bound CLI Agents return `409 usage_refresh_unsupported` |
+| POST   | `/api/v1/agents/{id}/usage/refresh` | Compatibility endpoint; the current runtime model returns `409 usage_refresh_unsupported` because CLI usage belongs to the execution host and native provider usage uses the provider-entry usage surface |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -235,12 +235,11 @@ Codex `account/rateLimits/updated` events captured during a run are stored as
 `GET /api/v1/executions/{id}`). USD `cost_usd` is only present when a harness
 reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 Cursor execution observations are labeled `cursor_poll` because `/usage` is a
-bounded interactive probe, not a native streaming event. Manual refreshes are
-`manual_refresh` and are supported only for local/native Codex or Cursor
-contexts. Remote/daemon-bound CLI Agents expose
-`manual_refresh_supported: false`; their refresh endpoint returns
-`409 usage_refresh_unsupported`, and usage is refreshed from observations on
-the execution host. Cursor's bounded in-process usage cache is keyed by the
+bounded interactive probe, not a native streaming event. The current Agent
+usage surface reports `manual_refresh_supported: false` and
+`POST /usage/refresh` returns `409 usage_refresh_unsupported`: CLI usage belongs
+to the daemon that executes it, while native embedded/provider usage is exposed
+through the provider-entry usage surface. Cursor's bounded in-process usage cache is keyed by the
 effective executable, arguments, and environment; a probe failure never falls
 back to another configuration's observation. Account keys include the harness
 kind and the host that owns host-local credentials; a lexical `CODEX_HOME` value
