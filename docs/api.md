@@ -142,7 +142,7 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 | GET    | `/api/v1/agents/{id}/usage` | Get the latest account-scoped harness usage snapshot, including freshness and the producing daemon when known |
-| POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh usage when the harness exposes a no-model probe (Codex `account/rateLimits/read`; Cursor `/usage`) |
+| POST   | `/api/v1/agents/{id}/usage/refresh` | Refresh local/native usage when the harness exposes a no-model probe; remote/daemon-bound CLI Agents return `409 usage_refresh_unsupported` |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -236,20 +236,26 @@ Codex `account/rateLimits/updated` events captured during a run are stored as
 reports on-demand API billing; subscription Codex/Cursor runs leave it null.
 Cursor execution observations are labeled `cursor_poll` because `/usage` is a
 bounded interactive probe, not a native streaming event. Manual refreshes are
-`manual_refresh`. Account keys include the harness kind and the host that owns
-host-local credentials; a lexical `CODEX_HOME` value is not canonicalized
-through the server filesystem, and an executable or wrapper path is not an
-account identity. An explicit credential reference is required to prove that a
-credential context is shared across hosts. Daemon executions persist native
-Codex observations and daemon-side Cursor polls through the same usage path as
-local executions. Pinned/local Agents query their exact account key. An
-unpinned remote CLI Agent does not receive a synthetic `unresolved-daemon`
-pool; its usage endpoint returns the newest observation linked to one of that
-Agent's Executions, including the actual `account_key` and `daemon_id`. Daemon
-notifications for such an execution are accepted only from the resolved daemon
-recorded in its immutable execution snapshot. If no such observation exists,
-both fields are `null` and `available` is `false`. A server-side refresh does
-not probe a daemon-bound or unresolved remote CLI.
+`manual_refresh` and are supported only for local/native Codex or Cursor
+contexts. Remote/daemon-bound CLI Agents expose
+`manual_refresh_supported: false`; their refresh endpoint returns
+`409 usage_refresh_unsupported`, and usage is refreshed from observations on
+the execution host. Cursor's bounded in-process usage cache is keyed by the
+effective executable, arguments, and environment; a probe failure never falls
+back to another configuration's observation. Account keys include the harness
+kind and the host that owns host-local credentials; a lexical `CODEX_HOME` value
+is not canonicalized through the server filesystem, and an executable or
+wrapper path is not an account identity. An explicit credential reference is
+required to prove that a credential context is shared across hosts. Daemon
+executions persist native Codex observations and daemon-side Cursor polls
+through the same usage path as local executions. Pinned/local Agents query
+their exact account key. An unpinned remote CLI Agent does not receive a
+synthetic `unresolved-daemon` pool; its usage endpoint returns the newest
+observation linked to one of that Agent's Executions, including the actual
+`account_key` and `daemon_id`. Daemon notifications for such an execution are
+accepted only from the resolved daemon recorded in its immutable execution
+snapshot. If no such observation exists, both fields are `null` and
+`available` is `false`.
 Cursor's large control prompt is stored transiently in a private runtime
 directory outside the Git worktree and is removed after the execution attempt,
 so it cannot enter task diffs or commits.

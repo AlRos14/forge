@@ -116,7 +116,9 @@ export function AgentDetailPanel({
             <div>
               <h3 id="agent-usage-heading" className="text-sm font-semibold">Account usage</h3>
               <p className="mt-1 text-xs text-muted-foreground">
-                {usageQuery.data?.shared_account
+                {usageQuery.data?.manual_refresh_supported === false
+                  ? 'Manual refresh is unavailable; usage is refreshed from observations on the execution host.'
+                  : usageQuery.data?.shared_account
                   ? 'Shared by agents using the same explicit credential context.'
                   : usageQuery.data?.daemon_id
                     ? `Observed on daemon ${usageQuery.data.daemon_id}.`
@@ -125,16 +127,18 @@ export function AgentDetailPanel({
                       : 'No shared daemon account is assumed for this Agent.'}
               </p>
             </div>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={refreshUsage.isPending}
-              onClick={() => refreshUsage.mutate(undefined, {
-                onError: (error) => toastApiError(error, 'Account usage refresh failed'),
-              })}
-            >
-              {refreshUsage.isPending ? 'Refreshing…' : 'Refresh'}
-            </Button>
+            {usageQuery.data?.manual_refresh_supported ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={refreshUsage.isPending}
+                onClick={() => refreshUsage.mutate(undefined, {
+                  onError: (error) => toastApiError(error, 'Account usage refresh failed'),
+                })}
+              >
+                {refreshUsage.isPending ? 'Refreshing…' : 'Refresh'}
+              </Button>
+            ) : null}
           </div>
           {usageQuery.isLoading ? <p className="mt-3 text-xs text-muted-foreground">Checking usage…</p> : null}
           {usageQuery.data?.available && usageQuery.data.usage ? (

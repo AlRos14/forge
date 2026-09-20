@@ -16,6 +16,10 @@ This Plan PR reconciles operational work that was present after the Plan PR0 aud
   discovery;
 * keep Codex native rate-limit events and bounded, cancellable Cursor quota
   polling observable with execution/account provenance;
+* isolate the shared Cursor adapter's short usage cache by effective query
+  configuration, without cross-configuration stale fallback;
+* make remote/daemon-bound manual usage refresh explicitly unsupported instead
+  of reporting an old observation as a successful refresh;
 * make WorkspaceLease renewal independent of harmless Task revisions while
   retaining fail-closed authority checks;
 * record the reconciliation decisions for the other local commits and legacy
@@ -43,7 +47,9 @@ INV-017, INV-030, INV-033, and INV-034.
 * Native Codex rate-limit events are persisted as provider events. Cursor
   `/usage` observations are persisted as `cursor_poll`, making polling
   explicitly non-native. Remote executions use the daemon-side observation
-  path rather than probing the server's account.
+  path rather than probing the server's account. Cursor adapter cache entries
+  are keyed by effective executable, arguments, and environment; failed
+  probes never reuse another configuration's value.
 * Lease authority remains deterministic and continues to check execution,
   principal, assignment, repository, capability, lifecycle, governance, and
   revocation. The issued Task revision remains historical provenance, not a
@@ -56,7 +62,7 @@ INV-017, INV-030, INV-033, and INV-034.
 | --- | --- | --- |
 | Legacy Repo PR #2: Cursor large-prompt transport | Adapted. Prompts at or below 32 KiB remain direct argv input. Larger prompts are written to a private randomized directory under the system runtime directory, exposed through Cursor's `--add-dir` capability, and passed by a short instruction. Unix permissions are 0700/0600; RAII cleanup handles normal completion and launch failure, while a 24-hour stale-directory sweep handles hard-crash leftovers. Tests prove the worktree receives no control file or diff entry, an adapter fixture proves the configured Cursor process can read the external file, and an authenticated one-turn smoke run passed in a disposable workspace. | Plan PR3 will move this launch behavior behind `HarnessAdapter`; the current Cursor CLI smoke probe confirmed `--add-dir` and no documented prompt-file/stdin option. |
 | Legacy Repo PR #2: executable/environment overrides | Kept in the existing explicit `CommandOverrides` contract. A raw executable path, wrapper, and environment map are reproducible inputs. Interactive shell alias parsing was not ported. | Plan PR3 owns the adapter boundary. |
-| Legacy Repo PR #2: account usage/live quota | Adapted. Codex consumes native `account/rateLimits/updated`; Cursor uses bounded, cancellable PTY polling with the explicit `cursor_poll` source. Local and daemon execution share the server-side extraction/persistence boundary; daemon Cursor polling runs where the CLI/account exists. Each observation records execution, source, account key, and host/daemon provenance. Unpinned remote Agent usage resolves the newest execution-linked observation and returns its actual account/daemon instead of inventing a shared pool. | Plan PR3 will expose dimensional adapter capability/usage metadata. |
+| Legacy Repo PR #2: account usage/live quota | Adapted. Codex consumes native `account/rateLimits/updated`; Cursor uses bounded, cancellable PTY polling with the explicit `cursor_poll` source. Local and daemon execution share the server-side extraction/persistence boundary; daemon Cursor polling runs where the CLI/account exists. Each observation records execution, source, account key, and host/daemon provenance. Unpinned remote Agent usage resolves the newest execution-linked observation and returns its actual account/daemon instead of inventing a shared pool. The Cursor adapter cache is configuration-keyed and cannot cross-fallback on probe failure. | Plan PR3 will expose dimensional adapter capability/usage metadata. |
 | Legacy Repo PR #2: WorkspaceLease false invalidation | Adapted in V086 and the service verifier. Task revision is retained for audit, while harmless description/metadata revisions do not revoke authority. Explicit role assignment takes precedence over a stale task fallback; repository, capability, lifecycle, governance, and revocation changes still fail closed. | Plan PR5 will bind final lease authority to the new Actor/WorkUnit/workspace model. |
 | Legacy Repo PR #2: quota reassignment/session continuation | Not ported. Singular-role and inferred-session behavior would violate Plan PR1/Plan PR2. The requirement is carried forward: a reassigned execution must use the new Actor and an explicitly selected compatible session, never the previous Actor's latest session. | Plan PR1 and Plan PR2; acceptance hardening in Plan PR15. |
 | Legacy Repo PR #2: optional plan-review state machine | Discarded. No `PLAN_REVIEW`, planner/reviewer loop, plan-review retry, or coupled UI/API was added. | Plan PR7 provides plan Executions, Artifacts, and optional Gates/Decisions. |
@@ -93,8 +99,10 @@ INV-017, INV-030, INV-033, and INV-034.
   the resolved daemon is factual provenance and participates in quota identity
   when credentials are host-local. An explicit durable credential reference is
   the only transitional proof that the same account is shared across hosts.
-  Native Codex events and Cursor polling use distinct sources. A server-side
-  agent refresh does not probe a daemon-bound or unresolved remote CLI.
+  Native Codex events and Cursor polling use distinct sources. Manual refresh is
+  supported only for local/native Codex or Cursor contexts; remote and
+  daemon-bound CLI refresh requests return `409 usage_refresh_unsupported`
+  rather than replaying a previous snapshot.
   Daemon notifications for an unpinned remote Agent are accepted only from the
   scheduler-resolved daemon recorded in that Execution snapshot; other daemon
   senders are rejected before activity or usage persistence.

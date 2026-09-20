@@ -164,9 +164,11 @@ pub async fn refresh_agent_usage(
     // to this process. A daemon-bound or scheduler-routed CLI Agent owns its
     // credentials on another host; probing this server's CLI would report a
     // different account while looking like a successful refresh.
-    let can_probe_local_account = agent.daemon_id.is_none() && agent.backend_kind == "native";
-    if !can_probe_local_account {
-        return agent_usage_response(&state, &user, &id).await.map(Json);
+    if !manual_refresh_supported(&agent) {
+        return Err(ApiError::conflict_with_code(
+            "usage_refresh_unsupported",
+            "Manual usage refresh is unavailable for this remote Agent; usage is refreshed from observations on its execution host",
+        ));
     }
 
     let usage = match agent.executor_type.as_str() {
@@ -199,6 +201,7 @@ async fn agent_usage_response(
         .ok_or_else(|| ApiError::not_found("agent", id.to_owned()))?;
     require_agent_visible(&agent, user, id)?;
     let account_key = usage_account_key(&agent);
+    let manual_refresh_supported = manual_refresh_supported(&agent);
     let shared_account = usage_is_shared(&agent);
     // A pinned/local/explicit-credential Agent has an exact account key. An
     // unpinned remote CLI Agent does not: its scheduler-selected daemon is a
@@ -236,6 +239,7 @@ async fn agent_usage_response(
             executor_type: agent.executor_type,
             account_key,
             daemon_id: None,
+            manual_refresh_supported,
             shared_account,
             source: None,
             usage: None,
@@ -250,6 +254,7 @@ async fn agent_usage_response(
         executor_type: agent.executor_type,
         account_key: Some(row.get("account_key")),
         daemon_id: row.get("daemon_id"),
+        manual_refresh_supported,
         shared_account,
         source: Some(row.get("source")),
         usage: serde_json::from_str::<Value>(&row.get::<String, _>("usage_json")).ok(),
@@ -257,6 +262,22 @@ async fn agent_usage_response(
         stale: stale_after < now_rfc3339(),
         message: None,
     })
+}
+
+fn manual_refresh_supported(agent: &Agent) -> bool {
+    manual_refresh_supported_for(
+        &agent.backend_kind,
+        &agent.executor_type,
+        agent.daemon_id.as_deref(),
+    )
+}
+
+fn manual_refresh_supported_for(
+    backend_kind: &str,
+    executor_type: &str,
+    daemon_id: Option<&str>,
+) -> bool {
+    backend_kind == "native" && daemon_id.is_none() && matches!(executor_type, "codex" | "cursor")
 }
 
 fn usage_account_key(agent: &Agent) -> Option<String> {
@@ -295,6 +316,28 @@ fn usage_is_shared(agent: &Agent) -> bool {
         .credential_ref
         .as_deref()
         .is_some_and(|reference| !reference.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manual_refresh_supported_for;
+
+    #[test]
+    fn manual_refresh_is_only_supported_for_local_native_harnesses() {
+        assert!(manual_refresh_supported_for("native", "codex", None));
+        assert!(manual_refresh_supported_for("native", "cursor", None));
+        assert!(!manual_refresh_supported_for("cli", "codex", None));
+        assert!(!manual_refresh_supported_for(
+            "cli",
+            "cursor",
+            Some("daemon-1")
+        ));
+        assert!(!manual_refresh_supported_for(
+            "native",
+            "codex",
+            Some("daemon-1")
+        ));
+    }
 }
 
 pub async fn list_agent_tasks(

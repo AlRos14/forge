@@ -10,4 +10,9 @@ account_key: string | null,
 /**
  * Host/daemon that produced the returned observation, when known.
  */
-daemon_id: string | null, shared_account: boolean, source: string | null, usage: Record<string, unknown> | null, captured_at: string | null, stale: boolean, message: string | null, };
+daemon_id: string | null,
+/**
+ * Whether the server can perform a direct no-model usage probe for this
+ * Agent. Remote CLI Agents receive usage from their execution host.
+ */
+manual_refresh_supported: boolean, shared_account: boolean, source: string | null, usage: Record<string, unknown> | null, captured_at: string | null, stale: boolean, message: string | null, };

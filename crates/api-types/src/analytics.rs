@@ -12,6 +12,9 @@ pub struct AgentUsageResponse {
     pub account_key: Option<String>,
     /// Host/daemon that produced the returned observation, when known.
     pub daemon_id: Option<String>,
+    /// Whether the server can perform a direct no-model usage probe for this
+    /// Agent. Remote CLI Agents receive usage from their execution host.
+    pub manual_refresh_supported: bool,
     pub shared_account: bool,
     pub source: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]

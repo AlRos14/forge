@@ -8,8 +8,10 @@ use executors::{
     ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
@@ -28,10 +30,61 @@ const LIST_MODELS_TIMEOUT_SECONDS: u64 = 10;
 const MAX_DIRECT_PROMPT_BYTES: usize = 32 * 1024;
 const CONTROL_DIR_PREFIX: &str = "forge-cursor-control-";
 const STALE_CONTROL_DIR_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const USAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 pub struct CursorAdapter {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
-    usage_cache: Arc<AsyncMutex<Option<(std::time::Instant, Value)>>>,
+    usage_cache: Arc<AsyncMutex<HashMap<CursorUsageContextKey, CachedAccountUsage>>>,
+}
+
+/// Cache identity for a Cursor `/usage` probe. This is deliberately an
+/// effective query-configuration key, not the durable domain account key.
+/// Keeping the configured and resolved executable, arguments, and environment
+/// in the key prevents one adapter instance from reusing an observation from
+/// another wrapper or credential context.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct CursorUsageContextKey {
+    configured_program: Option<String>,
+    resolved_program: String,
+    additional_params: Vec<String>,
+    environment_digest: [u8; 32],
+}
+
+impl CursorUsageContextKey {
+    fn from_config(config: &CursorConfig) -> Self {
+        let mut environment = config
+            .command_overrides
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        environment.sort_unstable();
+        let mut environment_hasher = Sha256::new();
+        for (key, value) in environment {
+            environment_hasher.update(key.as_bytes());
+            environment_hasher.update([0]);
+            environment_hasher.update(value.as_bytes());
+            environment_hasher.update([0]);
+        }
+
+        Self {
+            configured_program: config.command_overrides.base_command_override.clone(),
+            resolved_program: resolve_usage_program(config),
+            additional_params: config
+                .command_overrides
+                .additional_params
+                .clone()
+                .unwrap_or_default(),
+            environment_digest: environment_hasher.finalize().into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedAccountUsage {
+    captured_at: std::time::Instant,
+    value: Value,
 }
 
 struct RuntimePromptFile {
@@ -75,24 +128,17 @@ impl CursorAdapter {
     pub fn new() -> Self {
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
-            usage_cache: Arc::new(AsyncMutex::new(None)),
+            usage_cache: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     async fn cached_account_usage(&self, config: &CursorConfig) -> Option<Value> {
-        let cached = self.usage_cache.lock().await.clone();
-        if let Some((captured, value)) = cached.as_ref()
-            && captured.elapsed() < Duration::from_secs(300)
-        {
-            return Some(value.clone());
-        }
-        match query_account_usage(config).await {
-            Ok(value) => {
-                *self.usage_cache.lock().await = Some((std::time::Instant::now(), value.clone()));
-                Some(value)
-            }
-            Err(_) => cached.map(|(_, value)| value),
-        }
+        cached_usage_lookup(
+            &self.usage_cache,
+            CursorUsageContextKey::from_config(config),
+            || query_account_usage(config),
+        )
+        .await
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> CursorConfig {
@@ -216,6 +262,32 @@ impl CursorAdapter {
             .remove(execution_id);
         Ok(())
     }
+}
+
+async fn cached_usage_lookup<F, Fut>(
+    cache: &AsyncMutex<HashMap<CursorUsageContextKey, CachedAccountUsage>>,
+    key: CursorUsageContextKey,
+    query: F,
+) -> Option<Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Value, ExecutorError>>,
+{
+    if let Some(cached) = cache.lock().await.get(&key).cloned()
+        && cached.captured_at.elapsed() < USAGE_CACHE_TTL
+    {
+        return Some(cached.value);
+    }
+
+    let value = query().await.ok()?;
+    cache.lock().await.insert(
+        key,
+        CachedAccountUsage {
+            captured_at: std::time::Instant::now(),
+            value: value.clone(),
+        },
+    );
+    Some(value)
 }
 
 fn cleanup_stale_control_dirs_at(parent: &Path, now: SystemTime) -> std::io::Result<()> {
@@ -485,16 +557,10 @@ pub async fn query_account_usage(config: &CursorConfig) -> Result<Value, Executo
     query_account_usage_with_cancel(config, CancellationToken::new()).await
 }
 
-/// Cancellable form used by the bounded live-usage probe around an active
-/// execution. Every wait has a deadline, and cancellation drops a
-/// `kill_on_drop` child so a probe cannot survive its execution.
-pub async fn query_account_usage_with_cancel(
-    config: &CursorConfig,
-    cancel: CancellationToken,
-) -> Result<Value, ExecutorError> {
+fn resolve_usage_program(config: &CursorConfig) -> String {
     let builder =
         crate::command::CommandBuilder::new("cursor-agent").overrides(&config.command_overrides);
-    let program = builder
+    builder
         .resolve_executable()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| {
@@ -503,7 +569,17 @@ pub async fn query_account_usage_with_cancel(
                 .base_command_override
                 .clone()
                 .unwrap_or_else(|| "cursor-agent".to_owned())
-        });
+        })
+}
+
+/// Cancellable form used by the bounded live-usage probe around an active
+/// execution. Every wait has a deadline, and cancellation drops a
+/// `kill_on_drop` child so a probe cannot survive its execution.
+pub async fn query_account_usage_with_cancel(
+    config: &CursorConfig,
+    cancel: CancellationToken,
+) -> Result<Value, ExecutorError> {
+    let program = resolve_usage_program(config);
     let extra_args = config
         .command_overrides
         .additional_params
@@ -1204,6 +1280,114 @@ mod tests {
         let command = CursorAdapter::build_command(&CursorConfig::default(), None);
         assert!(!command.as_std().get_args().any(|arg| arg == "--add-dir"));
         assert!(!worktree.path().join(".forge").exists());
+    }
+
+    #[tokio::test]
+    async fn cursor_usage_cache_isolated_by_effective_configuration() {
+        let cache = Arc::new(AsyncMutex::new(HashMap::new()));
+        let config_a = CursorConfig {
+            command_overrides: CommandOverrides {
+                base_command_override: Some("/opt/cursor-account-a".to_owned()),
+                env: Some(HashMap::from([(
+                    "CURSOR_PROFILE".to_owned(),
+                    "account-a".to_owned(),
+                )])),
+                ..CommandOverrides::default()
+            },
+            ..CursorConfig::default()
+        };
+        let config_b = CursorConfig {
+            command_overrides: CommandOverrides {
+                base_command_override: Some("/opt/cursor-account-b".to_owned()),
+                env: Some(HashMap::from([(
+                    "CURSOR_PROFILE".to_owned(),
+                    "account-b".to_owned(),
+                )])),
+                ..CommandOverrides::default()
+            },
+            ..CursorConfig::default()
+        };
+
+        let usage_a = cached_usage_lookup(
+            &cache,
+            CursorUsageContextKey::from_config(&config_a),
+            || async { Ok(serde_json::json!({ "account": "a" })) },
+        )
+        .await;
+        let usage_b = cached_usage_lookup(
+            &cache,
+            CursorUsageContextKey::from_config(&config_b),
+            || async { Ok(serde_json::json!({ "account": "b" })) },
+        )
+        .await;
+
+        assert_eq!(usage_a, Some(serde_json::json!({ "account": "a" })));
+        assert_eq!(usage_b, Some(serde_json::json!({ "account": "b" })));
+    }
+
+    #[tokio::test]
+    async fn cursor_usage_probe_failure_does_not_fall_back_to_another_configuration() {
+        let cache = Arc::new(AsyncMutex::new(HashMap::new()));
+        let config_a = CursorConfig {
+            command_overrides: CommandOverrides {
+                base_command_override: Some("/opt/cursor-account-a".to_owned()),
+                ..CommandOverrides::default()
+            },
+            ..CursorConfig::default()
+        };
+        let config_b = CursorConfig {
+            command_overrides: CommandOverrides {
+                base_command_override: Some("/opt/cursor-account-b".to_owned()),
+                ..CommandOverrides::default()
+            },
+            ..CursorConfig::default()
+        };
+
+        let _ = cached_usage_lookup(
+            &cache,
+            CursorUsageContextKey::from_config(&config_a),
+            || async { Ok(serde_json::json!({ "account": "a" })) },
+        )
+        .await;
+        let usage_b = cached_usage_lookup(
+            &cache,
+            CursorUsageContextKey::from_config(&config_b),
+            || async { Err(ExecutorError::Other("probe failed".to_owned())) },
+        )
+        .await;
+
+        assert_eq!(usage_b, None);
+    }
+
+    #[tokio::test]
+    async fn cursor_usage_cache_reuses_only_the_same_configuration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(AsyncMutex::new(HashMap::new()));
+        let config = CursorConfig::default();
+        let key = CursorUsageContextKey::from_config(&config);
+        let probes = Arc::new(AtomicUsize::new(0));
+
+        let first = cached_usage_lookup(&cache, key.clone(), {
+            let probes = Arc::clone(&probes);
+            move || async move {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "account": "a" }))
+            }
+        })
+        .await;
+        let second = cached_usage_lookup(&cache, key, {
+            let probes = Arc::clone(&probes);
+            move || async move {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "account": "unexpected" }))
+            }
+        })
+        .await;
+
+        assert_eq!(first, Some(serde_json::json!({ "account": "a" })));
+        assert_eq!(second, first);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

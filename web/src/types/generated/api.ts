@@ -1641,6 +1641,7 @@ export interface AgentUsageResponse {
   executor_type: string
   account_key: string | null
   daemon_id: string | null
+  manual_refresh_supported: boolean
   shared_account: boolean
   source: string | null
   usage: Record<string, unknown> | null

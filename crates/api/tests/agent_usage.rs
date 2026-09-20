@@ -2,7 +2,9 @@
 
 mod common;
 
-use api_types::{AgentResponse, AgentUsageResponse, TaskResponse};
+use api_types::{
+    AgentResponse, AgentUsageResponse, DaemonRegisterResponse, ErrorResponse, TaskResponse,
+};
 use axum::http::Method;
 use db::{CreateExecution, ExecutionRepo, ExecutionStatus};
 use serde_json::json;
@@ -117,5 +119,73 @@ async fn unpinned_remote_agent_usage_uses_the_actual_execution_observation() {
     );
     assert_eq!(usage.daemon_id.as_deref(), Some("daemon-7"));
     assert_eq!(usage.source.as_deref(), Some("provider_event"));
+    assert!(!usage.manual_refresh_supported);
     assert!(!usage.shared_account);
+}
+
+#[tokio::test]
+async fn remote_agent_usage_refresh_is_explicitly_unsupported() {
+    let workspace = common::TestDir::new("agent-usage-refresh-workspace");
+    let harness = common::test_app(workspace.path(), "agent-usage-refresh").await;
+    let app = &harness.app;
+
+    let unpinned: AgentResponse = common::json_request(
+        app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({
+            "name": "unpinned-refresh",
+            "executor_type": "codex",
+            "config_json": { "env": { "CODEX_HOME": "/home/alex/.codex" } }
+        }),
+        axum::http::StatusCode::OK,
+    )
+    .await;
+    let unpinned_error: ErrorResponse = common::empty_request_with_bearer(
+        app,
+        Method::POST,
+        &format!("/api/v1/agents/{}/usage/refresh", unpinned.id),
+        &common::test_jwt(),
+        axum::http::StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(unpinned_error.code, "usage_refresh_unsupported");
+
+    let registration: DaemonRegisterResponse = common::json_request(
+        app,
+        Method::POST,
+        "/api/v1/daemons/register",
+        json!({
+            "machine_id": services::embedded_daemon::embedded_machine_id(),
+            "hostname": "agent-usage-refresh-host",
+            "os": "linux",
+            "arch": "x86_64",
+            "agent_version": "test"
+        }),
+        axum::http::StatusCode::OK,
+    )
+    .await;
+    let pinned: AgentResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/agents",
+        &common::admin_jwt(),
+        json!({
+            "name": "pinned-refresh",
+            "executor_type": "codex",
+            "daemon_id": registration.daemon_id,
+            "config_json": { "env": { "CODEX_HOME": "/home/alex/.codex" } }
+        }),
+        axum::http::StatusCode::OK,
+    )
+    .await;
+    let pinned_error: ErrorResponse = common::empty_request_with_bearer(
+        app,
+        Method::POST,
+        &format!("/api/v1/agents/{}/usage/refresh", pinned.id),
+        &common::test_jwt(),
+        axum::http::StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(pinned_error.code, "usage_refresh_unsupported");
 }
