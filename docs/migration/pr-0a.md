@@ -93,15 +93,16 @@ INV-017, INV-030, INV-033, and INV-034.
 * Old writers: adapter terminal results, daemon execution notifications, and
   agent refresh routes wrote `account_usage_snapshot`; execution snapshots
   sometimes omitted the host that owned the CLI credentials.
-* New writers: the same paths write a host-aware account key. An explicit Agent
-  daemon binding and the scheduler-resolved daemon are recorded separately;
-  the resolved daemon is factual provenance and participates in quota identity
-  when credentials are host-local. An explicit durable credential reference is
-  the only transitional proof that the same account is shared across hosts.
-  Native Codex events and Cursor polling use distinct sources. The current
-  Agent usage surface does not model a server-local Codex/Cursor CLI account;
-  manual refresh therefore returns `409 usage_refresh_unsupported` rather than
-  probing an unrelated server credential context.
+* New writers: execution/daemon observation paths write a host-aware account
+  key. An explicit Agent daemon binding and the scheduler-resolved daemon are
+  recorded separately; the resolved daemon is factual provenance and
+  participates in quota identity when credentials are host-local. An explicit
+  durable credential reference is the only transitional proof that the same
+  account is shared across hosts. Native Codex events and Cursor polling use
+  distinct sources. The compatibility Agent refresh route no longer writes
+  snapshots: the current model does not contain a server-local Codex/Cursor CLI
+  account, so it returns `409 usage_refresh_unsupported` rather than probing an
+  unrelated server credential context.
   Daemon notifications for an unpinned remote Agent are accepted only from the
   scheduler-resolved daemon recorded in that Execution snapshot; other daemon
   senders are rejected before activity or usage persistence.
