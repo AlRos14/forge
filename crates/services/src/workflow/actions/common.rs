@@ -3,8 +3,9 @@ use std::sync::Arc;
 use db::{
     new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
     ExecutionRepo, PageRequest, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskCommentRepo,
-    TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLog,
-    TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    ActorKind, RoleMembershipStatus, TaskMetadata, TaskRepo, TaskRoleAssignment,
+    TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo,
+    UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
@@ -26,6 +27,47 @@ pub(super) async fn get_role_assignment(
     ctx: &HookContext,
     role: &str,
 ) -> Result<Option<TaskRoleAssignment>, String> {
+    if let Some(canonical_role) = db::canonical_task_role_name(role) {
+        if let Some(members) = crate::task_service::current_role_memberships_authoritative(
+            &ctx.db,
+            &ctx.task_id,
+            &canonical_role,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            // The pre-WorkUnit executor has one launch slot. Select a concrete
+            // active Agent deterministically when present; a Human is selected
+            // only when no Agent can be launched. Eligibility still comes from
+            // the complete membership set, never from the legacy projection.
+            let member = members
+                .into_iter()
+                .filter(|member| member.status == RoleMembershipStatus::Active)
+                .min_by_key(|member| {
+                    (
+                        if member.actor_kind == ActorKind::Agent {
+                            0
+                        } else {
+                            1
+                        },
+                        member.created_at.clone(),
+                        member.id.clone(),
+                    )
+                });
+            return Ok(member.map(|member| TaskRoleAssignment {
+                id: member.id,
+                task_id: ctx.task_id.clone(),
+                role_name: role.to_owned(),
+                assignee_type: Some(match member.actor_kind {
+                    ActorKind::Agent => db::AssigneeKind::Agent,
+                    ActorKind::Human => db::AssigneeKind::User,
+                }),
+                assignee_id: Some(member.actor_id),
+                created_at: member.created_at,
+                updated_at: member.updated_at,
+            }));
+        }
+    }
     match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role).await {
         Ok(assignment) => Ok(assignment),
         Err(DbError::NotFound) => Ok(None),

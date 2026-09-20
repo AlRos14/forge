@@ -1882,6 +1882,214 @@ enum_strings!(AssigneeKind {
     User => "user",
 });
 
+/// The two persisted Actor identities that may participate in a TaskRole.
+/// This is intentionally separate from `api_types::Actor`, whose `System`
+/// variant records the source of a transition rather than a durable
+/// participant identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ActorRef {
+    Human(String),
+    Agent(String),
+}
+
+impl ActorRef {
+    pub fn kind(&self) -> ActorKind {
+        match self {
+            Self::Human(_) => ActorKind::Human,
+            Self::Agent(_) => ActorKind::Agent,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Human(id) | Self::Agent(id) => id,
+        }
+    }
+}
+
+/// Translate transitional workflow labels at the TaskRole boundary.  The
+/// workflow engine may continue to use its existing labels during PR1; only
+/// the persisted replacement model uses the target responsibility vocabulary.
+pub fn canonical_task_role_name(role: &str) -> Option<String> {
+    let normalized = role.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    match normalized.as_str() {
+        "coder" | "worker" | "assignee" | "executor" => Some("implementer".to_owned()),
+        "planner" => Some("planner".to_owned()),
+        "reviewer" => Some("reviewer".to_owned()),
+        "orchestrator" => Some("orchestrator".to_owned()),
+        "interactive" | "merge_fixer" | "system" => None,
+        custom => Some(custom.to_owned()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    Human,
+    Agent,
+}
+
+impl fmt::Display for ActorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+        })
+    }
+}
+
+impl FromStr for ActorKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "human" => Ok(Self::Human),
+            "agent" => Ok(Self::Agent),
+            other => Err(format!("unknown actor kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationMode {
+    Partitioned,
+    Collaborative,
+    Independent,
+}
+
+impl fmt::Display for CoordinationMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Partitioned => "partitioned",
+            Self::Collaborative => "collaborative",
+            Self::Independent => "independent",
+        })
+    }
+}
+
+impl FromStr for CoordinationMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "partitioned" => Ok(Self::Partitioned),
+            "collaborative" => Ok(Self::Collaborative),
+            "independent" => Ok(Self::Independent),
+            other => Err(format!("unknown coordination mode: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleMembershipStatus {
+    Active,
+    Suspended,
+    Ended,
+}
+
+impl fmt::Display for RoleMembershipStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Ended => "ended",
+        })
+    }
+}
+
+impl FromStr for RoleMembershipStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "suspended" => Ok(Self::Suspended),
+            "ended" => Ok(Self::Ended),
+            other => Err(format!("unknown role membership status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRole {
+    pub id: String,
+    pub task_id: String,
+    pub role: String,
+    pub coordination_mode: Option<CoordinationMode>,
+    pub policy_json: String,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTaskRole {
+    pub id: String,
+    pub task_id: String,
+    pub role: String,
+    pub coordination_mode: Option<CoordinationMode>,
+    pub policy_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateTaskRole {
+    pub id: String,
+    pub expected_version: i64,
+    pub coordination_mode: Option<Option<CoordinationMode>>,
+    pub policy_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMembership {
+    pub id: String,
+    pub task_role_id: String,
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+    pub status: RoleMembershipStatus,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub ended_at: Option<String>,
+}
+
+impl RoleMembership {
+    pub fn actor_ref(&self) -> ActorRef {
+        match self.actor_kind {
+            ActorKind::Human => ActorRef::Human(self.actor_id.clone()),
+            ActorKind::Agent => ActorRef::Agent(self.actor_id.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRoleMembership {
+    pub id: String,
+    pub task_role_id: String,
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+    pub status: RoleMembershipStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateRoleMembership {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: RoleMembershipStatus,
+    pub updated_at: String,
+    pub ended_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRoleAssignment {
     pub id: String,

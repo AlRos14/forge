@@ -1071,7 +1071,6 @@ impl AttentionService {
             "identity_id",
             "agent_id",
             "responder_identity_id",
-            "assignee_id",
         ] {
             let Some(identity_id) = payload.get(key).and_then(Value::as_str) else {
                 continue;
@@ -1088,9 +1087,28 @@ impl AttentionService {
         }
         if event.entity_type == "task" || event.scope_type == "task" {
             return Ok(sqlx::query_scalar::<_, String>(
-                "SELECT assignee_id FROM task
-                 WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
+                "SELECT actor_id
+                 FROM (
+                     SELECT rm.actor_id AS actor_id, 0 AS priority
+                     FROM task_role tr
+                     JOIN role_membership rm ON rm.task_role_id = tr.id
+                     WHERE tr.task_id = ?
+                       AND rm.actor_kind = 'agent'
+                       AND rm.status = 'active'
+                     UNION ALL
+                     SELECT task.assignee_id AS actor_id, 1 AS priority
+                     FROM task
+                     WHERE task.id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_role tr WHERE tr.task_id = task.id
+                       )
+                       AND task.assignee_type = 'agent'
+                       AND task.assignee_id IS NOT NULL
+                 )
+                 ORDER BY priority, actor_id
+                 LIMIT 1",
             )
+            .bind(&event.entity_id)
             .bind(&event.entity_id)
             .fetch_optional(self.db.pool())
             .await?);
@@ -1152,9 +1170,27 @@ impl AttentionService {
             "task" => {
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM task
-                 WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?",
+                     WHERE id = ? AND (
+                         EXISTS (
+                             SELECT 1
+                             FROM task_role tr
+                             JOIN role_membership rm ON rm.task_role_id = tr.id
+                             WHERE tr.task_id = task.id
+                               AND rm.actor_kind = 'agent'
+                               AND rm.actor_id = ?
+                               AND rm.status = 'active'
+                         )
+                         OR (
+                             NOT EXISTS (
+                                 SELECT 1 FROM task_role tr WHERE tr.task_id = task.id
+                             )
+                             AND assignee_type = 'agent'
+                             AND assignee_id = ?
+                         )
+                     )",
                 )
                 .bind(scope_id)
+                .bind(identity_id)
                 .bind(identity_id)
                 .fetch_one(self.db.pool())
                 .await?
@@ -1496,9 +1532,26 @@ impl AttentionService {
         let task_id = sqlx::query_scalar::<_, String>(
             "SELECT task_id
              FROM (
-                 SELECT t.id AS task_id, t.updated_at
+                SELECT t.id AS task_id, t.updated_at
                  FROM task t
-                 WHERE t.assignee_id = ?
+                 WHERE (
+                     EXISTS (
+                         SELECT 1
+                         FROM task_role tr
+                         JOIN role_membership rm ON rm.task_role_id = tr.id
+                         WHERE tr.task_id = t.id
+                           AND rm.actor_kind = 'agent'
+                           AND rm.actor_id = ?
+                           AND rm.status = 'active'
+                     )
+                     OR (
+                         NOT EXISTS (
+                             SELECT 1 FROM task_role tr WHERE tr.task_id = t.id
+                         )
+                         AND t.assignee_type = 'agent'
+                         AND t.assignee_id = ?
+                     )
+                 )
                    AND t.status = 'in_progress'
                    AND t.deleted_at IS NULL
                  UNION
@@ -1512,6 +1565,7 @@ impl AttentionService {
              ORDER BY updated_at DESC, task_id DESC
              LIMIT 1",
         )
+        .bind(identity_id)
         .bind(identity_id)
         .bind(identity_id)
         .fetch_optional(self.db.pool())

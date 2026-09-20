@@ -608,6 +608,7 @@ async fn reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
+    let human_id = seed_human_user(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
@@ -622,7 +623,7 @@ async fn reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo() {
 
     service
         .reassign_role(
-            role_assignment_input(&task.id, "coder", None, Some("human".to_owned())),
+            role_assignment_input(&task.id, "coder", None, Some(human_id.clone())),
             false,
             false,
         )
@@ -649,7 +650,7 @@ async fn reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo() {
         } => {
             let new_assignment = new_assignment.expect("new assignment exists");
             assert_eq!(new_assignment.assignee_type.as_deref(), Some("user"));
-            assert_eq!(new_assignment.assignee_id.as_deref(), Some("human"));
+            assert_eq!(new_assignment.assignee_id.as_deref(), Some(human_id.as_str()));
             assert!(triggered_cancellation);
             assert!(transitioned_to_todo);
         }

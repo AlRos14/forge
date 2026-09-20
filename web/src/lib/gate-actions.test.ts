@@ -81,6 +81,7 @@ function task(
         updated_at: '',
       },
     ],
+    task_roles: [],
     remaining_retries: {},
     version: 1,
     created_at: '',

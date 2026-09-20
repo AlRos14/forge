@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use db::{
-    TaskDependencyRepo, TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo, WorkspaceRepo,
-};
+use db::{TaskDependencyRepo, TransitionLog, TransitionLogRepo, WorkspaceRepo};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
@@ -360,17 +358,14 @@ impl HookAction for RequireUpstreamRolesCompleted {
                 continue;
             };
 
-            let assignment =
-                match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
-                    .await
-                {
-                    Ok(assignment) => assignment,
-                    Err(error) => {
-                        return HookResult::Skipped {
-                            reason: format!("role assignment unavailable: {error}"),
-                        };
-                    }
-                };
+            let assignment = match get_role_assignment(ctx, role).await {
+                Ok(assignment) => assignment,
+                Err(error) => {
+                    return HookResult::Skipped {
+                        reason: format!("role assignment unavailable: {error}"),
+                    };
+                }
+            };
 
             if assignment.is_some() && !transition_logs.iter().any(|log| log.to_state == gate.name)
             {

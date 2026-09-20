@@ -1984,6 +1984,50 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait TaskRoleRepo: Send + Sync {
+    async fn create(
+        &self,
+        input: CreateTaskRole,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn get_by_task_and_role(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> std::result::Result<Option<TaskRole>, crate::DbError>;
+    async fn get_by_id(&self, id: &str) -> std::result::Result<Option<TaskRole>, crate::DbError>;
+    async fn list_by_task(&self, task_id: &str)
+        -> std::result::Result<Vec<TaskRole>, crate::DbError>;
+    async fn update(
+        &self,
+        input: UpdateTaskRole,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+}
+
+#[async_trait]
+pub trait RoleMembershipRepo: Send + Sync {
+    async fn add(
+        &self,
+        input: CreateRoleMembership,
+    ) -> std::result::Result<RoleMembership, crate::DbError>;
+    async fn get(&self, id: &str)
+        -> std::result::Result<Option<RoleMembership>, crate::DbError>;
+    async fn list_by_role(
+        &self,
+        task_role_id: &str,
+        include_ended: bool,
+    ) -> std::result::Result<Vec<RoleMembership>, crate::DbError>;
+    async fn list_by_task(
+        &self,
+        task_id: &str,
+        include_ended: bool,
+    ) -> std::result::Result<Vec<(TaskRole, RoleMembership)>, crate::DbError>;
+    async fn update(
+        &self,
+        input: UpdateRoleMembership,
+    ) -> std::result::Result<RoleMembership, crate::DbError>;
+}
+
+#[async_trait]
 pub trait TransitionLogRepo: Send + Sync {
     async fn insert(
         &self,

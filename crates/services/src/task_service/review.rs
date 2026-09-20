@@ -248,17 +248,33 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
         let review_config = review_config_from_json(task.task_state_config.as_deref())?;
-        let reviewer_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-            &*self.db,
+        let reviewer_agent_id = match crate::task_service::current_role_memberships_authoritative(
+            &self.db,
             &task.id,
             crate::workflow::default_roles::REVIEWER,
         )
-        .await?;
-        let reviewer_agent_id = reviewer_assignment.and_then(|assignment| {
-            (assignment.assignee_type == Some(db::AssigneeKind::Agent))
-                .then_some(assignment.assignee_id)
-                .flatten()
-        });
+        .await?
+        {
+            Some(memberships) => memberships
+                .into_iter()
+                .filter(|membership| {
+                    membership.actor_kind == db::ActorKind::Agent
+                        && membership.status == db::RoleMembershipStatus::Active
+                })
+                .min_by_key(|membership| (membership.created_at.clone(), membership.id.clone()))
+                .map(|membership| membership.actor_id),
+            None => TaskRoleAssignmentRepo::get_by_task_and_role(
+                &*self.db,
+                &task.id,
+                crate::workflow::default_roles::REVIEWER,
+            )
+            .await?
+            .and_then(|assignment| {
+                (assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                    .then_some(assignment.assignee_id)
+                    .flatten()
+            }),
+        };
         let logs_path = execution_logs_path(
             &self.workspace_root,
             &task.project_id,

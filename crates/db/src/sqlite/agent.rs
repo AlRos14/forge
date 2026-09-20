@@ -446,10 +446,28 @@ impl AgentRepo for SqliteDb {
                 (
                     SELECT COUNT(DISTINCT task.id)
                     FROM task
-                    JOIN task_role_assignment ON task_role_assignment.task_id = task.id
                     JOIN project ON project.id = task.project_id
-                    WHERE task_role_assignment.assignee_type = 'agent'
-                      AND task_role_assignment.assignee_id = ?
+                    WHERE (
+                        EXISTS (
+                        SELECT 1
+                        FROM task_role
+                        JOIN role_membership
+                          ON role_membership.task_role_id = task_role.id
+                        WHERE task_role.task_id = task.id
+                          AND role_membership.actor_kind = 'agent'
+                          AND role_membership.actor_id = ?
+                          AND role_membership.status = 'active'
+                        )
+                        OR (
+                        NOT EXISTS (SELECT 1 FROM task_role WHERE task_role.task_id = task.id)
+                        AND EXISTS (
+                            SELECT 1 FROM task_role_assignment
+                            WHERE task_role_assignment.task_id = task.id
+                              AND task_role_assignment.assignee_type = 'agent'
+                              AND task_role_assignment.assignee_id = ?
+                        )
+                        )
+                    )
                       AND task.deleted_at IS NULL
                       AND (
                           EXISTS (
@@ -489,6 +507,7 @@ impl AgentRepo for SqliteDb {
                       AND status IN ('leased', 'running')
                 )",
         )
+        .bind(agent_id)
         .bind(agent_id)
         .bind(agent_id)
         .fetch_one(&self.pool)

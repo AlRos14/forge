@@ -48,9 +48,47 @@ impl TaskService {
             });
         }
 
+        // The compatibility row is optional for roles created directly by
+        // the new membership API.  Track every affected Task, not only Tasks
+        // that happen to have a legacy singleton row, so a surviving member
+        // can still rebuild the task-level implementer projection.
+        let affected_task_rows = sqlx::query(
+            "SELECT task_id
+             FROM task_role tr
+             JOIN role_membership rm ON rm.task_role_id = tr.id
+             WHERE rm.actor_kind = 'agent' AND rm.actor_id = ?
+               AND rm.status IN ('active', 'suspended')
+             UNION
+             SELECT task_id FROM task_role_assignment
+             WHERE assignee_type = 'agent' AND assignee_id = ?
+             UNION
+             SELECT id AS task_id FROM task
+             WHERE assignee_type = 'agent' AND assignee_id = ?
+             ORDER BY task_id",
+        )
+        .bind(agent_id)
+        .bind(agent_id)
+        .bind(agent_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let affected_task_ids = affected_task_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("task_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         sqlx::query(
             "UPDATE task_role_assignment SET assignee_id = NULL, updated_at = ? WHERE assignee_type = 'agent' AND assignee_id = ?",
         )
+        .bind(now_rfc3339())
+        .bind(agent_id)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE role_membership
+             SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
+             WHERE actor_kind = 'agent' AND actor_id = ? AND status IN ('active', 'suspended')",
+        )
+        .bind(now_rfc3339())
         .bind(now_rfc3339())
         .bind(agent_id)
         .execute(&mut **transaction)
@@ -62,6 +100,118 @@ impl TaskService {
         .bind(agent_id)
         .execute(&mut **transaction)
         .await?;
+
+        // Rebuild every affected singleton projection from the surviving
+        // membership set.  A removed Agent must not leave the compatibility
+        // row pointing at the deleted identity or hide another active member.
+        for task_id in &affected_task_ids {
+            let legacy_rows = sqlx::query(
+                "SELECT id, role_name
+                 FROM task_role_assignment
+                 WHERE task_id = ?",
+            )
+            .bind(task_id)
+            .fetch_all(&mut **transaction)
+            .await?;
+            for legacy_row in legacy_rows {
+                let legacy_id: String = legacy_row.try_get("id")?;
+                let role_name: String = legacy_row.try_get("role_name")?;
+                let Some(canonical_role) = db::canonical_task_role_name(&role_name) else {
+                    continue;
+                };
+                let member = sqlx::query(
+                    "SELECT rm.actor_kind, rm.actor_id
+                     FROM task_role tr
+                     JOIN role_membership rm ON rm.task_role_id = tr.id
+                     WHERE tr.task_id = ? AND tr.role = ? AND rm.status = 'active'
+                     ORDER BY CASE rm.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
+                              rm.created_at, rm.id
+                     LIMIT 1",
+                )
+                .bind(task_id)
+                .bind(&canonical_role)
+                .fetch_optional(&mut **transaction)
+                .await?;
+                let (assignee_type, assignee_id) = member
+                    .map(|row| {
+                        let actor_kind: String = row.get("actor_kind");
+                        let actor_id: String = row.get("actor_id");
+                        (
+                            Some(if actor_kind == "agent" { "agent" } else { "user" }),
+                            Some(actor_id),
+                        )
+                    })
+                    // Preserve the existing agent-deletion compatibility
+                    // shape (`agent` with a cleared id).  The new
+                    // RoleMembership authority is already ended, so this
+                    // placeholder cannot authorize execution or workspace
+                    // access.
+                    .unwrap_or((Some("agent"), None));
+                if canonical_role == "implementer" {
+                    sqlx::query(
+                        "UPDATE task
+                         SET assignee_type = ?, assignee_id = ?, updated_at = ?
+                         WHERE id = ?",
+                    )
+                    .bind(assignee_type)
+                    .bind(assignee_id.as_deref())
+                    .bind(now_rfc3339())
+                    .bind(task_id)
+                    .execute(&mut **transaction)
+                    .await?;
+                }
+                sqlx::query(
+                    "UPDATE task_role_assignment
+                     SET assignee_type = ?, assignee_id = ?, updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(assignee_type)
+                .bind(assignee_id)
+                    .bind(now_rfc3339())
+                    .bind(legacy_id)
+                    .execute(&mut **transaction)
+                    .await?;
+            }
+
+            // Rebuild the task-level compatibility projection even when the
+            // role has no legacy row.  This is the common path for a
+            // TaskRole created through the additive API with multiple
+            // members.
+            let implementer_member = sqlx::query(
+                "SELECT rm.actor_kind, rm.actor_id
+                 FROM task_role tr
+                 JOIN role_membership rm ON rm.task_role_id = tr.id
+                 WHERE tr.task_id = ? AND tr.role = 'implementer'
+                   AND rm.status = 'active'
+                 ORDER BY CASE rm.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
+                          rm.created_at, rm.id
+                 LIMIT 1",
+            )
+            .bind(task_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            let (assignee_type, assignee_id) = implementer_member
+                .map(|row| {
+                    let actor_kind: String = row.get("actor_kind");
+                    let actor_id: String = row.get("actor_id");
+                    (
+                        if actor_kind == "agent" { "agent" } else { "user" },
+                        Some(actor_id),
+                    )
+                })
+                .unwrap_or(("agent", None));
+            sqlx::query(
+                "UPDATE task
+                 SET assignee_type = ?, assignee_id = ?, updated_at = ?
+                 WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NULL",
+            )
+            .bind(assignee_type)
+            .bind(assignee_id)
+            .bind(now_rfc3339())
+            .bind(task_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
 
         Ok(events)
     }
@@ -86,9 +236,43 @@ impl TaskService {
         let Some(role_name) = self.active_work_role(&task).await? else {
             return Ok(None);
         };
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, &role_name)
-            .await
-            .map_err(Into::into)
+        match crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            task_id,
+            &role_name,
+        )
+        .await?
+        {
+            Some(memberships) => Ok(memberships
+                .into_iter()
+                .filter(|membership| membership.status == db::RoleMembershipStatus::Active)
+                .min_by_key(|membership| {
+                    (
+                        if membership.actor_kind == db::ActorKind::Agent {
+                            0
+                        } else {
+                            1
+                        },
+                        membership.created_at.clone(),
+                        membership.id.clone(),
+                    )
+                })
+                .map(|membership| TaskRoleAssignment {
+                    id: membership.id,
+                    task_id: task_id.to_owned(),
+                    role_name,
+                    assignee_type: Some(match membership.actor_kind {
+                        db::ActorKind::Agent => AssigneeKind::Agent,
+                        db::ActorKind::Human => AssigneeKind::User,
+                    }),
+                    assignee_id: Some(membership.actor_id),
+                    created_at: membership.created_at,
+                    updated_at: membership.updated_at,
+                })),
+            None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, &role_name)
+                .await
+                .map_err(Into::into),
+        }
     }
 
     pub async fn reassign_role(
@@ -202,6 +386,21 @@ impl TaskService {
         let previous =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
         let Some(previous) = previous else {
+            // A TaskRole created through the new membership API may not have
+            // acquired a legacy singleton row yet.  Do not let the old route
+            // silently leave that authoritative membership alive; the bounded
+            // compatibility writer will end the current set (and reject a
+            // plural set) in the same way as it does when a projection exists.
+            if crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                task_id,
+                role_name,
+            )
+            .await?
+            .is_some()
+            {
+                TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
+            }
             return Ok(());
         };
 
@@ -313,6 +512,19 @@ impl TaskService {
         role_name: &str,
         _incoming: Option<&CreateTaskRoleAssignment>,
     ) -> Result<RoleGuardAction> {
+        if let Some(memberships) = crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            &task.id,
+            role_name,
+        )
+        .await?
+        {
+            if memberships.len() > 1 {
+                return Err(ServiceError::conflict(
+                    "legacy singleton role reassignment cannot replace multiple current memberships",
+                ));
+            }
+        }
         if role_name != "coder" {
             return Ok(RoleGuardAction::Continue);
         }

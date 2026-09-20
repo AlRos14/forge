@@ -101,6 +101,11 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
+| GET    | `/api/v1/tasks/{id}/task-roles` | Get TaskRole records and current membership/history |
+| POST   | `/api/v1/tasks/{id}/task-roles` | Create a TaskRole with an explicit coordination mode |
+| PATCH  | `/api/v1/tasks/{id}/task-roles/{role}` | Update TaskRole policy/mode with an expected version |
+| POST   | `/api/v1/tasks/{id}/task-roles/{role}/members` | Add a Human or Agent membership |
+| PATCH  | `/api/v1/tasks/{id}/task-roles/{role}/members/{membership_id}` | Suspend, resume, or end a membership with an expected version |
 | GET    | `/api/v1/tasks/{id}/plan` | Get the current captured plan and immutable revision summaries; reads the persisted artifact, never a caller-supplied filesystem path |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
@@ -706,6 +711,20 @@ names, and state kind, with unknown states defaulting to `working`.
 response-build time from the project's resolved workflow and the task's current
 `status`; it is not persisted. The value is one of `backlog`, `ready`,
 `working`, `review`, or `done`. Cancelled workflow states map to `done`.
+
+Task responses also include `task_roles`, the current multi-actor TaskRole
+projection. Each role contains zero or more `members`; a member's `actor_ref`
+is either `{ "kind": "human", "id": "..." }` or
+`{ "kind": "agent", "id": "..." }`. The legacy `role_assignments` field and
+`/roles` routes remain bounded compatibility projections while the migration is
+completed. They are not eligibility authority once a TaskRole exists.
+
+TaskRole mutation uses optimistic concurrency. Create requests must specify one
+of `partitioned`, `collaborative`, or `independent`; membership updates accept
+`active`, `suspended`, or `ended`. Ending a membership preserves its historical
+record and does not affect other members. A membership does not grant a
+workspace, terminal, or lease: those still require the concrete execution and
+existing workspace-authority checks.
 
 ## Agent execution options
 

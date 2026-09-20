@@ -206,6 +206,37 @@ export interface TaskRoleAssignmentResponse {
   updated_at: string
 }
 
+export type ActorRef =
+  | { kind: 'human'; id: string }
+  | { kind: 'agent'; id: string }
+
+export type CoordinationMode = 'partitioned' | 'collaborative' | 'independent'
+
+export type RoleMembershipStatus = 'active' | 'suspended' | 'ended'
+
+export interface RoleMembershipResponse {
+  id: string
+  task_role_id: string
+  actor_ref: ActorRef
+  status: RoleMembershipStatus
+  version: number
+  created_at: string
+  updated_at: string
+  ended_at: string | null
+}
+
+export interface TaskRoleResponse {
+  id: string
+  task_id: string
+  role: string
+  coordination_mode: CoordinationMode | null
+  policy: Record<string, unknown>
+  version: number
+  members: RoleMembershipResponse[]
+  created_at: string
+  updated_at: string
+}
+
 export interface RetryBudgets {
   review?: number | null
   merge_fix?: number | null
@@ -555,6 +586,7 @@ export interface Task {
   board_position: number
   subtask_order?: number | null
   role_assignments: TaskRoleAssignmentResponse[]
+  task_roles: TaskRoleResponse[]
   remaining_retries: Record<string, number>
   execution_actions?: ExecutionAction[]
   pr_summary?: PrSummary | null

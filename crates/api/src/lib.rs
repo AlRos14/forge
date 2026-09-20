@@ -590,6 +590,23 @@ pub fn api_router(state: AppState) -> Router {
             put(routes::tasks::assign_task_role).delete(routes::tasks::remove_task_role),
         )
         .route(
+            "/api/v1/tasks/{id}/task-roles",
+            get(routes::tasks::list_task_role_model)
+                .post(routes::tasks::create_task_role_model),
+        )
+        .route(
+            "/api/v1/tasks/{id}/task-roles/{role}",
+            patch(routes::tasks::update_task_role_model),
+        )
+        .route(
+            "/api/v1/tasks/{id}/task-roles/{role}/members",
+            post(routes::tasks::add_task_role_member),
+        )
+        .route(
+            "/api/v1/tasks/{id}/task-roles/{role}/members/{membership_id}",
+            patch(routes::tasks::update_task_role_member),
+        )
+        .route(
             "/api/v1/tasks/{id}/review",
             post(routes::tasks::trigger_review),
         )

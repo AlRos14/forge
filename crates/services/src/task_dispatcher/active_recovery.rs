@@ -111,10 +111,24 @@ impl TaskDispatcher {
             return Ok(false);
         };
         if state.kind == StateKind::Gate && helpers::auto_cascades_on_unassigned_role(state) {
-            let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                    .await?;
-            if helpers::role_assignment_unassigned(assignment.as_ref()) {
+            let role_unassigned = match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                role_name,
+            )
+            .await?
+            {
+                Some(memberships) => !memberships
+                    .iter()
+                    .any(|membership| membership.status == db::RoleMembershipStatus::Active),
+                None => {
+                    let assignment =
+                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
+                            .await?;
+                    helpers::role_assignment_unassigned(assignment.as_ref())
+                }
+            };
+            if role_unassigned {
                 let Some(target) = self.resolve_initial_schedule_target(workflow, task).await?
                 else {
                     return Ok(false);
@@ -125,15 +139,26 @@ impl TaskDispatcher {
         if helpers::latest_stopped_execution_blocks_dispatch(&self.db, &task.id, role_name).await? {
             return Ok(false);
         }
-        let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name).await?
-        else {
-            return Ok(false);
+        let agent_id = match crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            &task.id,
+            role_name,
+        )
+        .await?
+        {
+            Some(memberships) => memberships
+                .into_iter()
+                .find(|membership| {
+                    membership.actor_kind == db::ActorKind::Agent
+                        && membership.status == db::RoleMembershipStatus::Active
+                })
+                .map(|membership| membership.actor_id),
+            None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
+                .await?
+                .filter(|assignment| assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                .and_then(|assignment| assignment.assignee_id),
         };
-        if assignment.assignee_type != Some(db::AssigneeKind::Agent) {
-            return Ok(false);
-        }
-        let Some(agent_id) = assignment.assignee_id.as_deref() else {
+        let Some(agent_id) = agent_id else {
             return Ok(false);
         };
         if helpers::has_running_execution_for_roles(
@@ -157,9 +182,9 @@ impl TaskDispatcher {
             return Ok(false);
         }
 
-        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
         match compute_effective_status(&self.db, &agent).await? {
             EffectiveStatus::Error
             | EffectiveStatus::Paused

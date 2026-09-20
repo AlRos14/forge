@@ -122,6 +122,7 @@ describe('task interruption annotations', () => {
       priority: 0,
       board_position: 0,
       role_assignments: [],
+      task_roles: [],
       remaining_retries: {},
       blocked: null,
       failed: null,

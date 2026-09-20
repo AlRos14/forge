@@ -73,18 +73,39 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let role_assignment = match execution.role.as_str() {
-            "executor" | crate::workflow::default_roles::CODER => {
-                self.coder_assignment(&task.id).await?
+        let canonical_role = db::canonical_task_role_name(&execution.role)
+            .unwrap_or_else(|| execution.role.clone());
+        let role_authorized = match current_role_memberships_authoritative(
+            &self.db,
+            &task.id,
+            &canonical_role,
+        )
+        .await?
+        {
+            Some(memberships) => memberships.iter().any(|membership| {
+                membership.status == db::RoleMembershipStatus::Active
+                    && membership.actor_kind == db::ActorKind::Agent
+                    && membership.actor_id == agent.id
+            }),
+            None => {
+                let role_assignment = match execution.role.as_str() {
+                    "executor" | crate::workflow::default_roles::CODER => {
+                        self.coder_assignment(&task.id).await?
+                    }
+                    role => {
+                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+                            .await?
+                    }
+                };
+                matches!(
+                    role_assignment.as_ref(),
+                    Some(assignment)
+                        if assignment.assignee_type == Some(AssigneeKind::Agent)
+                            && assignment.assignee_id.as_deref() == Some(&agent.id)
+                )
             }
-            role => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?,
         };
-        if !matches!(
-            role_assignment.as_ref(),
-            Some(assignment)
-                if assignment.assignee_type == Some(AssigneeKind::Agent)
-                    && assignment.assignee_id.as_deref() == Some(&agent.id)
-        ) {
+        if !role_authorized {
             return Ok(false);
         }
         Ok(running_count <= agent.max_concurrent_tasks)

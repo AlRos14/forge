@@ -165,15 +165,29 @@ async fn target_role_agent_id(ctx: &HookContext) -> Option<String> {
         .iter()
         .find(|state| state.name == ctx.to_state)?;
     let role = effective_role(state)?;
-    db::TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
+    match crate::task_service::current_role_memberships_authoritative(&ctx.db, &ctx.task_id, role)
         .await
         .ok()
         .flatten()
-        .and_then(|assignment| {
-            (assignment.assignee_type == Some(db::AssigneeKind::Agent))
-                .then_some(assignment.assignee_id)
-                .flatten()
-        })
+    {
+        Some(memberships) => memberships
+            .into_iter()
+            .filter(|membership| {
+                membership.actor_kind == db::ActorKind::Agent
+                    && membership.status == db::RoleMembershipStatus::Active
+            })
+            .min_by_key(|membership| (membership.created_at.clone(), membership.id.clone()))
+            .map(|membership| membership.actor_id),
+        None => db::TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|assignment| {
+                (assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                    .then_some(assignment.assignee_id)
+                    .flatten()
+            }),
+    }
 }
 
 async fn annotate_before_work_hook_block(
