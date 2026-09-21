@@ -255,14 +255,9 @@ impl TaskService {
         )
         .await?
         {
-            Some(memberships) => memberships
-                .into_iter()
-                .filter(|membership| {
-                    membership.actor_kind == db::ActorKind::Agent
-                        && membership.status == db::RoleMembershipStatus::Active
-                })
-                .min_by_key(|membership| (membership.created_at.clone(), membership.id.clone()))
-                .map(|membership| membership.actor_id),
+            Some(memberships) => {
+                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+            }
             None => TaskRoleAssignmentRepo::get_by_task_and_role(
                 &*self.db,
                 &task.id,

@@ -192,18 +192,15 @@ impl TaskService {
 
         if let Some(assignments) = validated_assignments {
             for (role_name, assignee_type, assignee_id) in assignments {
-                TaskRoleAssignmentRepo::assign(
-                    &*self.db,
-                    CreateTaskRoleAssignment {
-                        id: new_uuid_v4(),
-                        task_id: task.id.clone(),
-                        role_name,
-                        assignee_type: Some(assignee_type),
-                        assignee_id: Some(assignee_id),
-                        created_at: now.clone(),
-                        updated_at: now.clone(),
-                    },
-                )
+                self.assign_role_membership(CreateTaskRoleAssignment {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    role_name,
+                    assignee_type: Some(assignee_type),
+                    assignee_id: Some(assignee_id),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
                 .await?;
             }
         }
@@ -403,18 +400,15 @@ impl TaskService {
                 .map_err(ServiceError::invalid_operation)?;
 
             let now = now_rfc3339();
-            TaskRoleAssignmentRepo::assign(
-                &*self.db,
-                CreateTaskRoleAssignment {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    role_name: role_name.clone(),
-                    assignee_type: Some(assignee_type),
-                    assignee_id: Some(assignee_id),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-            )
+            self.assign_role_membership(CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: role_name.clone(),
+                assignee_type: Some(assignee_type),
+                assignee_id: Some(assignee_id),
+                created_at: now.clone(),
+                updated_at: now,
+            })
             .await?;
             covered_roles.insert(role_name);
         }

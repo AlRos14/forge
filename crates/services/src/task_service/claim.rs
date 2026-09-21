@@ -56,6 +56,11 @@ impl TaskService {
                     let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+                    self.validate_actor_for_task(
+                        &task,
+                        &api_types::ActorRef::Agent(agent_id.clone()),
+                    )
+                    .await?;
                     if agent.paused {
                         return Err(ServiceError::AgentPaused {
                             agent_id: agent.id.clone(),
@@ -72,6 +77,11 @@ impl TaskService {
                 }
                 Assignee::User(user_handle) => {
                     validate_required("user_handle", &user_handle)?;
+                    self.validate_actor_for_task(
+                        &task,
+                        &api_types::ActorRef::Human(user_handle.clone()),
+                    )
+                    .await?;
                     (
                         "user".to_owned(),
                         None,

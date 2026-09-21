@@ -137,13 +137,9 @@ impl TaskDispatcher {
             .await?
             {
                 Some(memberships) => {
-                    if let Some(agent_id) = memberships
-                        .iter()
-                        .find(|membership| {
-                            membership.actor_kind == db::ActorKind::Agent
-                                && membership.status == db::RoleMembershipStatus::Active
-                        })
-                        .map(|membership| membership.actor_id.clone())
+                    if let Some(agent_id) =
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
+                            .await?
                     {
                         // Existing dispatch remains the bounded compatibility
                         // selector until WorkUnit/orchestrator scheduling: the

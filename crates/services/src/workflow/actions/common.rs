@@ -75,6 +75,75 @@ pub(super) async fn get_role_assignment(
     }
 }
 
+/// Resolve an Agent for a workflow launch. Unlike the display-oriented
+/// compatibility object above, this path must skip paused, unavailable, or
+/// full Agents and continue through the authoritative membership set.
+pub(super) async fn get_usable_agent_assignment(
+    ctx: &HookContext,
+    role: &str,
+) -> Result<Option<TaskRoleAssignment>, String> {
+    if let Some(canonical_role) = db::canonical_task_role_name(role) {
+        if let Some(memberships) = crate::task_service::current_role_memberships_authoritative(
+            &ctx.db,
+            &ctx.task_id,
+            &canonical_role,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            let Some(agent_id) =
+                crate::task_service::select_usable_agent_id(&ctx.db, &memberships)
+                    .await
+                    .map_err(|error| error.to_string())?
+            else {
+                if memberships.iter().any(|member| {
+                    member.status == RoleMembershipStatus::Active
+                        && member.actor_kind == ActorKind::Agent
+                }) {
+                    return Ok(None);
+                }
+                return Ok(memberships
+                    .into_iter()
+                    .filter(|member| {
+                        member.status == RoleMembershipStatus::Active
+                            && member.actor_kind == ActorKind::Human
+                    })
+                    .min_by_key(|member| (member.created_at.clone(), member.id.clone()))
+                    .map(|member| TaskRoleAssignment {
+                        id: member.id,
+                        task_id: ctx.task_id.clone(),
+                        role_name: role.to_owned(),
+                        assignee_type: Some(db::AssigneeKind::User),
+                        assignee_id: Some(member.actor_id),
+                        created_at: member.created_at,
+                        updated_at: member.updated_at,
+                    }));
+            };
+            return Ok(memberships
+                .into_iter()
+                .find(|member| {
+                    member.status == RoleMembershipStatus::Active
+                        && member.actor_kind == ActorKind::Agent
+                        && member.actor_id == agent_id
+                })
+                .map(|member| TaskRoleAssignment {
+                    id: member.id,
+                    task_id: ctx.task_id.clone(),
+                    role_name: role.to_owned(),
+                    assignee_type: Some(db::AssigneeKind::Agent),
+                    assignee_id: Some(member.actor_id),
+                    created_at: member.created_at,
+                    updated_at: member.updated_at,
+                }));
+        }
+    }
+    match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role).await {
+        Ok(assignment) => Ok(assignment),
+        Err(DbError::NotFound) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {
     let mut roles = vec![role];
     if role == crate::workflow::default_roles::CODER {

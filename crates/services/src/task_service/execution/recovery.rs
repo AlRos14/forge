@@ -607,22 +607,44 @@ impl TaskService {
         let role_name = crate::workflow::effective_role(state).ok_or_else(|| {
             ServiceError::invalid_operation(format!("state {} has no executable role", task.status))
         })?;
-        let assignment =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
+        let agent_id = match crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            &task.id,
+            role_name,
+        )
+        .await?
+        {
+            Some(memberships) => crate::task_service::select_usable_agent_id(&self.db, &memberships)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "role {role_name} has no usable Agent membership"
+                    ))
+                })?,
+            None => {
+                let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
+                    &*self.db,
+                    &task.id,
+                    role_name,
+                )
                 .await?
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
                         "task has no assignment for role {role_name}"
                     ))
                 })?;
-        if assignment.assignee_type != Some(AssigneeKind::Agent) {
-            return Err(ServiceError::invalid_operation(format!(
-                "role {role_name} is not assigned to an agent"
-            )));
-        }
-        let agent_id = assignment.assignee_id.ok_or_else(|| {
-            ServiceError::invalid_operation(format!("role {role_name} has no assigned agent"))
-        })?;
+                if assignment.assignee_type != Some(AssigneeKind::Agent) {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "role {role_name} is not assigned to an agent"
+                    )));
+                }
+                assignment.assignee_id.ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "role {role_name} has no assigned agent"
+                    ))
+                })?
+            }
+        };
         let page = ExecutionRepo::list_by_task_and_role(
             &*self.db,
             &task.id,
@@ -904,7 +926,7 @@ impl TaskService {
             .await?
         {
             let result = self
-                .follow_up_execution(execution.id, message, execution.agent_id, None)
+                .follow_up_execution(execution.id, message, None, None)
                 .await?;
             self.publish(ForgeEvent {
                 event_type: "task.recovery_action".to_owned(),
@@ -1217,13 +1239,67 @@ impl TaskService {
         annotation: Option<&api_types::TaskBlockingAnnotation>,
     ) -> Result<String> {
         if let Some(role_name) = self.current_effective_role_name(task).await? {
-            if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &role_name)
-                    .await?
+            match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                &role_name,
+            )
+            .await?
             {
-                if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                    if let Some(agent_id) = assignment.assignee_id {
+                Some(memberships) => {
+                    if let Some(execution_id) = annotation.and_then(|annotation| {
+                        annotation
+                            .blocked_execution_id
+                            .as_deref()
+                            .map(str::to_owned)
+                    }) {
+                        if let Some(execution) =
+                            ExecutionRepo::get_by_id(&*self.db, &execution_id).await?
+                        {
+                            let execution_agent_is_usable = match execution.agent_id.as_deref() {
+                                Some(agent_id) => {
+                                    crate::task_service::is_usable_active_agent(
+                                        &self.db,
+                                        &memberships,
+                                        agent_id,
+                                    )
+                                    .await?
+                                }
+                                None => false,
+                            };
+                            if execution_agent_is_usable {
+                                let agent_id = execution
+                                    .agent_id
+                                    .as_deref()
+                                    .expect("usable execution implies an Agent");
+                                return Ok(agent_id.to_owned());
+                            }
+                        }
+                    }
+                    if let Some(agent_id) =
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
+                            .await?
+                    {
                         return Ok(agent_id);
+                    }
+                    return Err(ServiceError::invalid_operation(
+                        "open_interactive has no usable Agent membership for the current TaskRole",
+                    ));
+                }
+                None => {
+                    if let Some(assignment) =
+                        TaskRoleAssignmentRepo::get_by_task_and_role(
+                            &*self.db,
+                            &task.id,
+                            &role_name,
+                        )
+                        .await?
+                    {
+                        if assignment.assignee_type == Some(AssigneeKind::Agent) {
+                            if let Some(agent_id) = assignment.assignee_id {
+                                return Ok(agent_id);
+                            }
+                        }
                     }
                 }
             }

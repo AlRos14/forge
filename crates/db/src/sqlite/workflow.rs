@@ -76,14 +76,27 @@ impl TaskRoleAssignmentRepo for SqliteDb {
             .await
             .map_err(map_workflow_sqlx_error)?
                 != 0,
-            (Some(AssigneeKind::User), Some(actor_id)) => sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM user WHERE id = ?)",
-            )
-            .bind(actor_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(map_workflow_sqlx_error)?
-                != 0,
+            (Some(AssigneeKind::User), Some(actor_id)) if actor_id != "human" => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM user u
+                        JOIN task t ON t.id = ?
+                        JOIN project p ON p.id = t.project_id
+                        WHERE u.id = ?
+                          AND (p.owner_id = u.id OR EXISTS(
+                              SELECT 1 FROM project_member pm
+                              WHERE pm.project_id = p.id AND pm.user_id = u.id
+                          ))
+                    )",
+                )
+                .bind(&input.task_id)
+                .bind(actor_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(map_workflow_sqlx_error)?
+                    != 0
+            }
             (None, None) => true,
             _ => false,
         };
@@ -126,27 +139,13 @@ impl TaskRoleAssignmentRepo for SqliteDb {
                 .fetch_optional(&mut *transaction)
                 .await
                 .map_err(map_workflow_sqlx_error)?;
-                let task_role_id = if let Some(task_role_id) = task_role_id {
-                    task_role_id
-                } else {
-                    let task_role_id = new_uuid_v4();
-                    sqlx::query(
-                        "INSERT INTO task_role
-                            (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at)
-                         VALUES (?, ?, ?, NULL, '{}', 1, ?, ?)",
-                    )
-                    .bind(&task_role_id)
-                    .bind(&input.task_id)
-                    .bind(&role)
-                    .bind(&input.created_at)
-                    .bind(&input.updated_at)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(map_workflow_sqlx_error)?;
-                    task_role_id
-                };
-
-                let current_member_count: i64 = sqlx::query_scalar(
+                // A low-level compatibility call must not create the
+                // replacement model implicitly. Service-level assignment
+                // paths create the TaskRole and membership; fixtures and
+                // pre-V088 data may continue to use this bounded legacy
+                // writer until a replacement row already exists.
+                if let Some(task_role_id) = task_role_id {
+                    let current_member_count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM role_membership
                      WHERE task_role_id = ? AND status IN ('active', 'suspended')",
                 )
@@ -154,43 +153,77 @@ impl TaskRoleAssignmentRepo for SqliteDb {
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(map_workflow_sqlx_error)?;
-                if current_member_count > 1 {
+
+                let same_active = match (
+                    input.assignee_type.as_ref(),
+                    input.assignee_id.as_deref(),
+                ) {
+                    (Some(assignee_type), Some(assignee_id)) => {
+                        let actor_kind = match assignee_type {
+                            AssigneeKind::Agent => "agent",
+                            AssigneeKind::User => "human",
+                        };
+                        sqlx::query_scalar::<_, i64>(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM role_membership
+                                WHERE task_role_id = ?
+                                  AND actor_kind = ?
+                                  AND actor_id = ?
+                                  AND status = 'active'
+                            )",
+                        )
+                        .bind(&task_role_id)
+                        .bind(actor_kind)
+                        .bind(assignee_id)
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(map_workflow_sqlx_error)?
+                            != 0
+                    }
+                    _ => false,
+                };
+                if current_member_count > 1 && !same_active {
                     return Err(DbError::VersionConflict);
                 }
 
-                sqlx::query(
-                    "UPDATE role_membership
-                     SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
-                     WHERE task_role_id = ? AND status IN ('active', 'suspended')",
-                )
-                .bind(&input.updated_at)
-                .bind(&input.updated_at)
-                .bind(&task_role_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(map_workflow_sqlx_error)?;
-
-                if let (Some(assignee_type), Some(assignee_id)) =
-                    (input.assignee_type.as_ref(), input.assignee_id.as_deref())
-                {
-                    let actor_kind = match assignee_type {
-                        AssigneeKind::Agent => "agent",
-                        AssigneeKind::User => "human",
-                    };
+                if !same_active {
                     sqlx::query(
-                        "INSERT INTO role_membership
-                            (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
-                         VALUES (?, ?, ?, ?, 'active', 1, ?, ?, NULL)",
+                        "UPDATE role_membership
+                         SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
+                         WHERE task_role_id = ? AND status IN ('active', 'suspended')",
                     )
-                    .bind(new_uuid_v4())
-                    .bind(&task_role_id)
-                    .bind(actor_kind)
-                    .bind(assignee_id)
-                    .bind(&input.created_at)
                     .bind(&input.updated_at)
+                    .bind(&input.updated_at)
+                    .bind(&task_role_id)
                     .execute(&mut *transaction)
                     .await
                     .map_err(map_workflow_sqlx_error)?;
+                }
+
+                if !same_active {
+                    if let (Some(assignee_type), Some(assignee_id)) = (
+                        input.assignee_type.as_ref(),
+                        input.assignee_id.as_deref(),
+                    ) {
+                        let actor_kind = match assignee_type {
+                            AssigneeKind::Agent => "agent",
+                            AssigneeKind::User => "human",
+                        };
+                        sqlx::query(
+                            "INSERT INTO role_membership
+                                (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
+                             VALUES (?, ?, ?, ?, 'active', 1, ?, ?, NULL)",
+                        )
+                        .bind(new_uuid_v4())
+                        .bind(&task_role_id)
+                        .bind(actor_kind)
+                        .bind(assignee_id)
+                        .bind(&input.created_at)
+                        .bind(&input.updated_at)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(map_workflow_sqlx_error)?;
+                    }
                 }
 
                 if role == "implementer" {
@@ -247,6 +280,7 @@ impl TaskRoleAssignmentRepo for SqliteDb {
                             .map_err(map_workflow_sqlx_error)?;
                         }
                     }
+                }
                 }
             }
         }

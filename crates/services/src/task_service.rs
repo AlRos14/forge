@@ -64,7 +64,10 @@ pub(crate) mod workspace;
 pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
 pub use execution::subtasks::build_first_turn_prompt_from_context;
-pub(crate) use memberships::current_role_memberships_authoritative;
+pub(crate) use memberships::{
+    active_agent_membership, current_role_memberships_authoritative, is_usable_active_agent,
+    select_usable_agent_id,
+};
 pub use subtask::{is_root_task, is_subtask, root_for};
 
 #[cfg(test)]

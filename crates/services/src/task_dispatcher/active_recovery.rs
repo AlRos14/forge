@@ -146,13 +146,9 @@ impl TaskDispatcher {
         )
         .await?
         {
-            Some(memberships) => memberships
-                .into_iter()
-                .find(|membership| {
-                    membership.actor_kind == db::ActorKind::Agent
-                        && membership.status == db::RoleMembershipStatus::Active
-                })
-                .map(|membership| membership.actor_id),
+            Some(memberships) => {
+                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+            }
             None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
                 .await?
                 .filter(|assignment| assignment.assignee_type == Some(db::AssigneeKind::Agent))

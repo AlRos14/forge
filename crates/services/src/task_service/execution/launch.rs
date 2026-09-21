@@ -27,6 +27,8 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        self.ensure_agent_membership_for_role(task_id, role, agent_id)
+            .await?;
         self.ensure_task_runnable(&task).await?;
         self.ensure_no_running_repository_execution(&task).await?;
         self.check_dependency_gate(&task, agent_id).await?;
@@ -149,6 +151,15 @@ impl TaskService {
             _ => task,
         };
         self.ensure_task_runnable(&task).await?;
+        if let Some(role) = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role)
+        {
+            self.ensure_agent_membership_for_role(&task.id, role, &agent_id)
+                .await?;
+        }
         self.check_dependency_gate(&task, &agent_id).await?;
         self.ensure_no_running_interactive_execution(&task.id)
             .await?;
@@ -500,12 +511,72 @@ impl TaskService {
             )));
         }
 
-        let agent_id = parent_execution.agent_id.clone().ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "parent execution {} missing agent_id",
-                parent_execution.id
-            ))
-        })?;
+        let agent_id = match db::canonical_task_role_name(&parent_execution.role) {
+            Some(role) => match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                &role,
+            )
+            .await?
+            {
+                Some(memberships) => {
+                    let parent_is_usable = match parent_execution.agent_id.as_deref() {
+                        Some(parent_agent_id) => {
+                            crate::task_service::is_usable_active_agent(
+                                &self.db,
+                                &memberships,
+                                parent_agent_id,
+                            )
+                            .await?
+                        }
+                        None => false,
+                    };
+                    if parent_is_usable {
+                        let parent_agent_id = parent_execution
+                            .agent_id
+                            .as_deref()
+                            .expect("parent_is_usable implies a parent Agent");
+                        parent_agent_id.to_owned()
+                    } else {
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
+                            .await?
+                            .ok_or_else(|| {
+                                ServiceError::invalid_operation(format!(
+                                    "no usable Agent is available for re-execute role {role}"
+                                ))
+                            })?
+                    }
+                }
+                None => {
+                    if let Some(parent_agent_id) = parent_execution.agent_id.clone() {
+                        parent_agent_id
+                    } else {
+                        TaskRoleAssignmentRepo::get_by_task_and_role(
+                            &*self.db,
+                            &task.id,
+                            &parent_execution.role,
+                        )
+                        .await?
+                        .filter(|assignment| {
+                            assignment.assignee_type == Some(AssigneeKind::Agent)
+                        })
+                        .and_then(|assignment| assignment.assignee_id)
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(format!(
+                                "parent execution {} missing agent_id",
+                                parent_execution.id
+                            ))
+                        })?
+                    }
+                }
+            },
+            None => parent_execution.agent_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "parent execution {} missing agent_id",
+                    parent_execution.id
+                ))
+            })?,
+        };
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;

@@ -399,14 +399,8 @@ impl TaskService {
             {
                 Some(memberships) => {
                     authoritative_role_seen = true;
-                    if let Some(agent_id) = memberships
-                        .into_iter()
-                        .filter(|membership| {
-                            membership.actor_kind == db::ActorKind::Agent
-                                && membership.status == db::RoleMembershipStatus::Active
-                        })
-                        .min_by_key(|membership| (membership.created_at.clone(), membership.id.clone()))
-                        .map(|membership| membership.actor_id)
+                    if let Some(agent_id) =
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
                     {
                         return Ok(agent_id);
                     }
@@ -447,14 +441,8 @@ impl TaskService {
             {
                 Some(memberships) => {
                     authoritative_role_seen = true;
-                    if let Some(agent_id) = memberships
-                        .into_iter()
-                        .filter(|membership| {
-                            membership.actor_kind == db::ActorKind::Agent
-                                && membership.status == db::RoleMembershipStatus::Active
-                        })
-                        .min_by_key(|membership| (membership.created_at.clone(), membership.id.clone()))
-                        .map(|membership| membership.actor_id)
+                    if let Some(agent_id) =
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
                     {
                         return Ok(agent_id);
                     }

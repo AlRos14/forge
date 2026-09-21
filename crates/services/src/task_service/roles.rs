@@ -290,17 +290,45 @@ impl TaskService {
             &input.role_name,
         )
         .await?;
-        if same_assignment(previous.as_ref(), Some(&input)) {
-            return TaskRoleAssignmentRepo::assign(&*self.db, input)
-                .await
-                .map_err(Into::into);
+        let authoritative = crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            &input.task_id,
+            &input.role_name,
+        )
+        .await?;
+        let same_active = authoritative.as_ref().is_some_and(|memberships| {
+            input
+                .assignee_type
+                .as_ref()
+                .zip(input.assignee_id.as_ref())
+                .is_some_and(|(assignee_type, assignee_id)| {
+                    let actor_kind = match assignee_type {
+                        AssigneeKind::Agent => db::ActorKind::Agent,
+                        AssigneeKind::User => db::ActorKind::Human,
+                    };
+                    memberships.iter().any(|membership| {
+                        membership.status == db::RoleMembershipStatus::Active
+                            && membership.actor_kind == actor_kind
+                            && membership.actor_id == assignee_id.as_str()
+                    })
+                })
+        });
+        if same_active
+            || (authoritative.is_none() && same_assignment(previous.as_ref(), Some(&input)))
+        {
+            if authoritative.is_some() {
+                return self.assign_role_membership(input).await;
+            }
+            return previous.ok_or_else(|| {
+                ServiceError::not_found("task_role_assignment", input.role_name.clone())
+            });
         }
 
         let is_coder_role =
             self.active_work_role(&task).await?.as_deref() == Some(input.role_name.as_str());
 
         if !is_coder_role {
-            let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
+            let assignment = self.assign_role_assignment(input).await?;
             self.publish_role_reassigned(
                 &assignment.task_id,
                 &assignment.role_name,
@@ -315,7 +343,7 @@ impl TaskService {
             .active_execution_for_role(&task, &input.role_name)
             .await?;
         let Some(active_execution) = active_execution else {
-            let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
+            let assignment = self.assign_role_assignment(input).await?;
             TaskRepo::set_review_passed_at(&*self.db, &assignment.task_id, None, &now_rfc3339())
                 .await?;
             self.publish_role_reassigned(
@@ -337,7 +365,7 @@ impl TaskService {
         )
         .await?;
 
-        let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
+        let assignment = self.assign_role_assignment(input).await?;
         TaskRepo::set_review_passed_at(&*self.db, &assignment.task_id, None, &now_rfc3339())
             .await?;
 
@@ -519,7 +547,24 @@ impl TaskService {
         )
         .await?
         {
-            if memberships.len() > 1 {
+            let incoming_is_same_active = _incoming.is_some_and(|incoming| {
+                incoming
+                    .assignee_type
+                    .as_ref()
+                    .zip(incoming.assignee_id.as_ref())
+                    .is_some_and(|(assignee_type, assignee_id)| {
+                        let actor_kind = match assignee_type {
+                            AssigneeKind::Agent => db::ActorKind::Agent,
+                            AssigneeKind::User => db::ActorKind::Human,
+                        };
+                        memberships.iter().any(|membership| {
+                            membership.status == db::RoleMembershipStatus::Active
+                                && membership.actor_kind == actor_kind
+                                && membership.actor_id == assignee_id.as_str()
+                        })
+                    })
+            });
+            if memberships.len() > 1 && !incoming_is_same_active {
                 return Err(ServiceError::conflict(
                     "legacy singleton role reassignment cannot replace multiple current memberships",
                 ));
@@ -548,6 +593,19 @@ impl TaskService {
         }
 
         Ok(RoleGuardAction::Continue)
+    }
+
+    async fn assign_role_assignment(
+        &self,
+        input: CreateTaskRoleAssignment,
+    ) -> Result<TaskRoleAssignment> {
+        if db::canonical_task_role_name(&input.role_name).is_some() {
+            self.assign_role_membership(input).await
+        } else {
+            TaskRoleAssignmentRepo::assign(&*self.db, input)
+                .await
+                .map_err(Into::into)
+        }
     }
 
     async fn active_work_role(&self, task: &Task) -> Result<Option<String>> {
