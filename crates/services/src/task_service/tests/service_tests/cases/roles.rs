@@ -708,6 +708,131 @@ async fn actor_validation_requires_project_human_and_rejects_sentinel() {
 }
 
 #[tokio::test]
+async fn agent_validation_requires_project_scope_but_not_runtime_status() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let project_owner = seed_human_user(&db).await;
+    let outside_owner = seed_human_user(&db).await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&project_owner)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project owner updates");
+
+    let outside_agent = seed_agent(&db).await;
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&outside_owner)
+    .bind(&outside_agent)
+    .execute(db.pool())
+    .await
+    .expect("outside Agent scope updates");
+
+    let bound_agent = seed_agent(&db).await;
+    let bound_agent_record = AgentRepo::get_by_id(&*db, &bound_agent)
+        .await
+        .expect("bound Agent loads")
+        .expect("bound Agent exists");
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&outside_owner)
+    .bind(&bound_agent)
+    .execute(db.pool())
+    .await
+    .expect("bound Agent scope updates");
+    let setup_binding = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
+        .await
+        .expect("project binding loads")
+        .expect("project setup binding exists");
+    ProjectAgentBindingRepo::replace_project_binding(
+        &*db,
+        ReplaceProjectAgentBinding {
+            project_id: project_id.clone(),
+            expected_version: setup_binding.version,
+            replacement: CreateProjectAgentBinding {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                identity_id: Some(bound_agent.clone()),
+                profile_id: Some(bound_agent_record.profile_id),
+                state: "active".to_owned(),
+                autonomy_policy_json: "{}".to_owned(),
+                permission_ceiling_json: "{}".to_owned(),
+                subscriptions_json: "[]".to_owned(),
+                wake_budget: 0,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            replacement_reason: Some("test Task membership scope".to_owned()),
+        },
+    )
+    .await
+    .expect("project Agent binding activates");
+
+    let global_agent = seed_agent(&db).await;
+    let paused_agent = seed_agent(&db).await;
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(&paused_agent)
+        .execute(db.pool())
+        .await
+        .expect("Agent pauses");
+
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    for role in ["planner", "implementer", "reviewer", "orchestrator"] {
+        service
+            .create_task_role(
+                &task.id,
+                role,
+                CoordinationMode::Collaborative,
+                "{}".to_owned(),
+            )
+            .await
+            .expect("TaskRole creates");
+    }
+
+    assert!(service
+        .add_task_role_member(
+            &task.id,
+            "planner",
+            ActorRef::Agent(outside_agent),
+        )
+        .await
+        .is_err());
+    service
+        .add_task_role_member(
+            &task.id,
+            "implementer",
+            ActorRef::Agent(global_agent),
+        )
+        .await
+        .expect("global Agent membership succeeds");
+    service
+        .add_task_role_member(
+            &task.id,
+            "reviewer",
+            ActorRef::Agent(bound_agent),
+        )
+        .await
+        .expect("project-bound Agent membership succeeds");
+    service
+        .add_task_role_member(
+            &task.id,
+            "orchestrator",
+            ActorRef::Agent(paused_agent),
+        )
+        .await
+        .expect("paused but valid Agent membership succeeds");
+}
+
+#[tokio::test]
 async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));

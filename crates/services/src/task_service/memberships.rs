@@ -2,8 +2,8 @@ use super::*;
 use api_types::ActorRef;
 use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, AssigneeKind, CoordinationMode,
-    CreateTaskRole, CreateTaskRoleAssignment, ProjectMemberRepo, ProjectRepo, RoleMembership,
-    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo,
+    CreateTaskRole, CreateTaskRoleAssignment, ProjectAgentBindingRepo, ProjectMemberRepo,
+    ProjectRepo, RoleMembership, RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo,
     TaskRoleAssignment, UpdateTaskRole, UserRepo,
 };
 use sqlx::{Row, Sqlite, Transaction};
@@ -432,9 +432,14 @@ impl TaskService {
                         "the human sentinel is not an Actor identity",
                     ));
                 }
-                AgentRepo::get_by_id(&*self.db, agent_id)
+                let agent = AgentRepo::get_by_id(&*self.db, agent_id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+                if !self.agent_is_valid_for_project(&project, &agent).await? {
+                    return Err(ServiceError::invalid_operation(
+                        "agent is not valid for the task project",
+                    ));
+                }
             }
             ActorRef::Human(user_id) => {
                 if user_id == "human" {
@@ -457,6 +462,29 @@ impl TaskService {
             }
         }
         Ok(())
+    }
+
+    async fn agent_is_valid_for_project(
+        &self,
+        project: &db::Project,
+        agent: &db::Agent,
+    ) -> Result<bool> {
+        let same_account = match (agent.owner_id.as_deref(), project.owner_id.as_deref()) {
+            (Some(agent_owner), Some(project_owner)) => agent_owner == project_owner,
+            _ => false,
+        };
+        if agent.visibility == "global" || (agent.visibility == "account" && same_account) {
+            return Ok(true);
+        }
+
+        let binding = ProjectAgentBindingRepo::get_active_project_binding(
+            &*self.db,
+            &project.id,
+        )
+        .await?;
+        Ok(binding.as_ref().is_some_and(|binding| {
+            binding.state == "active" && binding.identity_id.as_deref() == Some(agent.id.as_str())
+        }))
     }
 
     pub(crate) async fn ensure_agent_membership_for_role(
