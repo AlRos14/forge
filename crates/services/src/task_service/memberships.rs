@@ -185,9 +185,20 @@ impl TaskService {
         {
             // The pre-existing project-settings sentinel means "manual Human"
             // rather than a real user identity. Keep it in the bounded legacy
-            // path; it must never become ActorRef::Human("human"). If a
-            // replacement TaskRole already exists, the compatibility writer
-            // rejects the write instead of creating an invalid membership.
+            // path; it must never become ActorRef::Human("human"). A
+            // replacement TaskRole cannot accept the sentinel because it would
+            // otherwise bypass authoritative Actor validation.
+            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
+            if current_role_memberships_authoritative(&self.db, &task.id, &canonical_role)
+                .await?
+                .is_some()
+            {
+                return Err(ServiceError::invalid_operation(
+                    "the human sentinel cannot be assigned to a replacement TaskRole",
+                ));
+            }
             return TaskRoleAssignmentRepo::assign(&*self.db, input)
                 .await
                 .map_err(Into::into);
@@ -425,6 +436,14 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        self.validate_actor_for_project(&project, actor_ref).await
+    }
+
+    pub(crate) async fn validate_actor_for_project(
+        &self,
+        project: &db::Project,
+        actor_ref: &ActorRef,
+    ) -> Result<()> {
         match actor_ref {
             ActorRef::Agent(agent_id) => {
                 if agent_id == "human" {
@@ -451,7 +470,7 @@ impl TaskService {
                     .await?
                     .ok_or_else(|| ServiceError::not_found("user", user_id.clone()))?;
                 if project.owner_id.as_deref() != Some(user_id)
-                    && ProjectMemberRepo::get_member(&*self.db, &task.project_id, user_id)
+                    && ProjectMemberRepo::get_member(&*self.db, &project.id, user_id)
                         .await?
                         .is_none()
                 {
@@ -469,11 +488,18 @@ impl TaskService {
         project: &db::Project,
         agent: &db::Agent,
     ) -> Result<bool> {
-        let same_account = match (agent.owner_id.as_deref(), project.owner_id.as_deref()) {
-            (Some(agent_owner), Some(project_owner)) => agent_owner == project_owner,
-            _ => false,
+        let account_owner_is_project_actor = match agent.owner_id.as_deref() {
+            Some(agent_owner) if project.owner_id.as_deref() == Some(agent_owner) => true,
+            Some(agent_owner) => {
+                ProjectMemberRepo::get_member(&*self.db, &project.id, agent_owner)
+                    .await?
+                    .is_some()
+            }
+            None => false,
         };
-        if agent.visibility == "global" || (agent.visibility == "account" && same_account) {
+        if agent.visibility == "global"
+            || (agent.visibility == "account" && account_owner_is_project_actor)
+        {
             return Ok(true);
         }
 
@@ -697,6 +723,57 @@ pub(crate) async fn select_usable_agent_id(
     Ok(None)
 }
 
+/// Return whether an Agent can receive repository workspace authority. This
+/// is deliberately narrower than TaskRole membership validity: active Main
+/// and Project Agent bindings identify orchestration identities that may
+/// participate in a role but cannot receive a WorkspaceLease.
+pub(crate) async fn repository_worker_identity_is_eligible(
+    db: &db::SqliteDb,
+    project_id: &str,
+    principal_id: &str,
+) -> Result<bool> {
+    let orchestration_binding_count: i64 = sqlx::query_scalar(
+        "SELECT
+            (SELECT COUNT(*) FROM project_agent_binding
+             WHERE project_id = ? AND identity_id = ? AND state = 'active')
+          + (SELECT COUNT(*) FROM account_main_agent_binding
+             WHERE identity_id = ? AND state = 'active')",
+    )
+    .bind(project_id)
+    .bind(principal_id)
+    .bind(principal_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(orchestration_binding_count == 0)
+}
+
+/// Select a deterministic Agent that is both runtime-usable and capable of
+/// receiving repository workspace authority. The generic selector remains
+/// available for non-repository contexts.
+pub(crate) async fn select_usable_repository_agent_id(
+    db: &db::SqliteDb,
+    project_id: &str,
+    memberships: &[RoleMembership],
+) -> Result<Option<String>> {
+    for membership in memberships {
+        if membership.status != RoleMembershipStatus::Active
+            || membership.actor_kind != ActorKind::Agent
+        {
+            continue;
+        }
+        let Some(agent) = AgentRepo::get_by_id(db, &membership.actor_id).await? else {
+            continue;
+        };
+        if compute_effective_status(db, &agent).await? != EffectiveStatus::Active {
+            continue;
+        }
+        if repository_worker_identity_is_eligible(db, project_id, &agent.id).await? {
+            return Ok(Some(agent.id));
+        }
+    }
+    Ok(None)
+}
+
 /// Check whether a specific lineage Agent is still both eligible and usable.
 /// This preserves lineage preference without allowing a paused, unavailable,
 /// or full Agent to hide a later usable membership.
@@ -712,6 +789,18 @@ pub(crate) async fn is_usable_active_agent(
         return Ok(false);
     };
     Ok(compute_effective_status(db, &agent).await? == EffectiveStatus::Active)
+}
+
+pub(crate) async fn is_usable_repository_agent(
+    db: &db::SqliteDb,
+    project_id: &str,
+    memberships: &[RoleMembership],
+    agent_id: &str,
+) -> Result<bool> {
+    if !is_usable_active_agent(db, memberships, agent_id).await? {
+        return Ok(false);
+    }
+    repository_worker_identity_is_eligible(db, project_id, agent_id).await
 }
 
 pub(crate) fn active_agent_membership<'a>(

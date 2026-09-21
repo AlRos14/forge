@@ -147,7 +147,12 @@ impl TaskDispatcher {
         .await?
         {
             Some(memberships) => {
-                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                crate::task_service::select_usable_repository_agent_id(
+                    &self.db,
+                    &task.project_id,
+                    &memberships,
+                )
+                .await?
             }
             None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
                 .await?

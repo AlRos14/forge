@@ -614,13 +614,23 @@ impl TaskService {
         )
         .await?
         {
-            Some(memberships) => crate::task_service::select_usable_agent_id(&self.db, &memberships)
-                .await?
-                .ok_or_else(|| {
+            Some(memberships) => {
+                let selected = if task.repo_id.is_some() {
+                    crate::task_service::select_usable_repository_agent_id(
+                        &self.db,
+                        &task.project_id,
+                        &memberships,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                };
+                selected.ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
                         "role {role_name} has no usable Agent membership"
                     ))
-                })?,
+                })?
+            }
             None => {
                 let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
                     &*self.db,
@@ -1258,12 +1268,22 @@ impl TaskService {
                         {
                             let execution_agent_is_usable = match execution.agent_id.as_deref() {
                                 Some(agent_id) => {
-                                    crate::task_service::is_usable_active_agent(
-                                        &self.db,
-                                        &memberships,
-                                        agent_id,
-                                    )
-                                    .await?
+                                    if task.repo_id.is_some() {
+                                        crate::task_service::is_usable_repository_agent(
+                                            &self.db,
+                                            &task.project_id,
+                                            &memberships,
+                                            agent_id,
+                                        )
+                                        .await?
+                                    } else {
+                                        crate::task_service::is_usable_active_agent(
+                                            &self.db,
+                                            &memberships,
+                                            agent_id,
+                                        )
+                                        .await?
+                                    }
                                 }
                                 None => false,
                             };
@@ -1276,10 +1296,17 @@ impl TaskService {
                             }
                         }
                     }
-                    if let Some(agent_id) =
-                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
-                            .await?
-                    {
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
+                    } else {
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                    };
+                    if let Some(agent_id) = selected {
                         return Ok(agent_id);
                     }
                     return Err(ServiceError::invalid_operation(

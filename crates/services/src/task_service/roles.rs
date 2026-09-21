@@ -284,6 +284,12 @@ impl TaskService {
         let task = self.validate_reassignable_task(&input.task_id).await?;
         self.enforce_mode_specific_role_guards(&task, &input.role_name, Some(&input))
             .await?;
+        self.preflight_legacy_singleton_role_mutation(
+            &task,
+            &input.role_name,
+            Some(&input),
+        )
+        .await?;
         let previous = TaskRoleAssignmentRepo::get_by_task_and_role(
             &*self.db,
             &input.task_id,
@@ -411,6 +417,8 @@ impl TaskService {
         let task = self.validate_reassignable_task(task_id).await?;
         self.enforce_mode_specific_role_guards(&task, role_name, None)
             .await?;
+        self.preflight_legacy_singleton_role_mutation(&task, role_name, None)
+            .await?;
         let previous =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
         let Some(previous) = previous else {
@@ -523,6 +531,62 @@ impl TaskService {
             )));
         }
         Ok(task)
+    }
+
+    async fn preflight_legacy_singleton_role_mutation(
+        &self,
+        task: &Task,
+        role_name: &str,
+        incoming: Option<&CreateTaskRoleAssignment>,
+    ) -> Result<()> {
+        let authoritative = crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            &task.id,
+            role_name,
+        )
+        .await?;
+        if let Some(memberships) = authoritative.as_ref() {
+            let incoming_is_same_active = incoming.is_some_and(|input| {
+                legacy_assignment_actor_ref(input)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|actor_ref| {
+                        let (actor_kind, actor_id) = match actor_ref {
+                            ActorRef::Agent(id) => (db::ActorKind::Agent, id),
+                            ActorRef::Human(id) => (db::ActorKind::Human, id),
+                        };
+                        memberships.iter().any(|membership| {
+                            membership.status == db::RoleMembershipStatus::Active
+                                && membership.actor_kind == actor_kind
+                                && membership.actor_id == actor_id
+                        })
+                    })
+            });
+            if memberships.len() > 1 && !incoming_is_same_active {
+                return Err(ServiceError::conflict(
+                    "legacy singleton role mutation cannot replace multiple current memberships",
+                ));
+            }
+        }
+
+        if let Some(input) = incoming {
+            if db::canonical_task_role_name(role_name).is_some() {
+                if input.assignee_type.as_ref() == Some(&AssigneeKind::User)
+                    && input.assignee_id.as_deref() == Some("human")
+                {
+                    if authoritative.is_some() {
+                        return Err(ServiceError::invalid_operation(
+                            "the human sentinel cannot be assigned to a replacement TaskRole",
+                        ));
+                    }
+                    return Ok(());
+                }
+                if let Some(actor_ref) = legacy_assignment_actor_ref(input)? {
+                    self.validate_actor_for_task(task, &actor_ref).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn workflow_for_task(&self, task: &Task) -> Result<api_types::WorkflowDefinition> {
@@ -819,6 +883,20 @@ impl TaskService {
                 transitioned_to_todo: flags.transitioned_to_todo,
             },
         });
+    }
+}
+
+fn legacy_assignment_actor_ref(
+    input: &CreateTaskRoleAssignment,
+) -> Result<Option<ActorRef>> {
+    match (input.assignee_type.as_ref(), input.assignee_id.as_deref()) {
+        (Some(AssigneeKind::Agent), Some(id)) => Ok(Some(ActorRef::Agent(id.to_owned()))),
+        (Some(AssigneeKind::User), Some("human")) => Ok(None),
+        (Some(AssigneeKind::User), Some(id)) => Ok(Some(ActorRef::Human(id.to_owned()))),
+        (None, None) => Ok(None),
+        _ => Err(ServiceError::invalid_operation(
+            "role assignment actor type and id must be provided together",
+        )),
     }
 }
 

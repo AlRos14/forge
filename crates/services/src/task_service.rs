@@ -66,7 +66,8 @@ pub use create_subtasks::NewSubtaskInput;
 pub use execution::subtasks::build_first_turn_prompt_from_context;
 pub(crate) use memberships::{
     active_agent_membership, current_role_memberships_authoritative, is_usable_active_agent,
-    select_usable_agent_id,
+    is_usable_repository_agent, repository_worker_identity_is_eligible, select_usable_agent_id,
+    select_usable_repository_agent_id,
 };
 pub use subtask::{is_root_task, is_subtask, root_for};
 

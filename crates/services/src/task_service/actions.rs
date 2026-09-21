@@ -399,9 +399,17 @@ impl TaskService {
             {
                 Some(memberships) => {
                     authoritative_role_seen = true;
-                    if let Some(agent_id) =
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
+                    } else {
                         crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
-                    {
+                    };
+                    if let Some(agent_id) = selected {
                         return Ok(agent_id);
                     }
                 }
@@ -441,9 +449,17 @@ impl TaskService {
             {
                 Some(memberships) => {
                     authoritative_role_seen = true;
-                    if let Some(agent_id) =
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
+                    } else {
                         crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
-                    {
+                    };
+                    if let Some(agent_id) = selected {
                         return Ok(agent_id);
                     }
                 }

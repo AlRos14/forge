@@ -59,19 +59,13 @@ impl TaskService {
         project_id: &str,
         principal_id: &str,
     ) -> Result<()> {
-        let orchestration_binding_count: i64 = sqlx::query_scalar(
-            "SELECT
-                (SELECT COUNT(*) FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active')
-              + (SELECT COUNT(*) FROM account_main_agent_binding
-                 WHERE identity_id = ? AND state = 'active')",
+        if !crate::task_service::repository_worker_identity_is_eligible(
+            &self.db,
+            project_id,
+            principal_id,
         )
-        .bind(project_id)
-        .bind(principal_id)
-        .bind(principal_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        if orchestration_binding_count > 0 {
+        .await?
+        {
             return Err(ServiceError::invalid_operation(
                 "Main and Project Agent identities cannot receive repository WorkspaceLeases",
             ));

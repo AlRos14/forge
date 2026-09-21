@@ -123,10 +123,15 @@ TaskRole exists.
 
 ## Historical preservation
 
-Historical Executions retain their concrete Agent or Human ownership.
-Membership changes do not rewrite completed or existing Execution principals.
-Current `execution.agent_id` and transitional session fields remain historical
-and compatibility inputs until their named later migration.
+Historical Executions retain their existing persisted principal representation
+and are never reinterpreted from current RoleMembership state.
+
+Existing Agent-backed Executions preserve `execution.agent_id`. Human
+RoleMembership is first-class in Plan PR1, while Execution persistence remains
+transitional and does not yet carry the final ActorRef principal
+representation. The existing `execution.agent_session_id` remains transitional
+until its named later migration. Membership changes do not rewrite completed
+or existing Execution principals.
 
 ## Workspace authority
 
@@ -145,12 +150,13 @@ existing User who is either the Project owner or a Project member. The literal
 
 TaskService applies one Project-scoped Agent validity rule before authoritative
 membership creation. An existing Agent is valid for a Task's Project when it
-is global, when it is account-visible and its `owner_id` matches the Project
-owner, or when it has the current active `project_agent_binding` for that
-Project. This is identity/scope validity only: paused, busy, offline, and
-other runtime states remain separate scheduler usability questions. Requester
-authorization remains at the API/service boundary that has requester context;
-it is not part of this Actor validity predicate.
+is global, when it is account-visible and its `owner_id` is the Project owner
+or an active/current Project member, or when it has the current active
+`project_agent_binding` for that Project. This is identity/scope validity
+only: paused, busy, offline, and other runtime states remain separate
+scheduler usability questions. Requester authorization remains at the
+API/service boundary that has requester context; it is not part of this Actor
+validity predicate.
 
 ## Migration
 
@@ -174,7 +180,9 @@ The following remain intentional migration debt rather than Plan PR1 failures:
 ## Exact future ownership
 
 * Plan PR2 owns `ExecutionPurpose`, `HarnessSession`, and explicit
-  execution/session continuity.
+  execution/session continuity. It must reconcile the target
+  `Execution.actor_ref` model without rewriting historical principal identity
+  from current RoleMembership state.
 * Plan PR5 owns `WorkUnit` and concrete isolated parallel allocation.
 * Plan PR12 owns the final target REST, API, MCP, CLI, and UI surfaces.
 * Plan PR13 owns removal of singular-assignment compatibility, remaining old
@@ -187,12 +195,17 @@ The final closure pass deliberately did not run Cargo, Rust compiler,
 rust-analyzer, frontend, lint, or runtime validation because of the explicit
 compute-budget decision.
 
-Focused regression coverage was added for Project-scoped Agent validity:
+Focused regression coverage was added for the final authority-cutover
+counterexamples:
 
 * an account-scoped Agent outside the Task Project is rejected;
+* an account-scoped Agent owned by a current Project member is accepted;
 * a global Agent is accepted;
 * an Agent with an active Project binding is accepted;
-* a paused but Project-valid Agent is accepted as membership.
+* a paused but Project-valid Agent is accepted as membership;
+* an orchestration-only Agent is skipped by repository candidate selection;
+* invalid explicit and default Actors fail before Task persistence;
+* invalid or multi-member legacy mutations preserve running Executions.
 
 The existing Plan PR1 authority-cutover regression tests remain in the branch
 and were not executed in this pass. Focused tests were added for review; no

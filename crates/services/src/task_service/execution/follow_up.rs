@@ -168,17 +168,39 @@ fn dispatch_role_follow_up_impl(
                         "Agent {agent_id} is not an active member of follow-up role {role}"
                     )));
                 }
+                if task.repo_id.is_some()
+                    && !crate::task_service::repository_worker_identity_is_eligible(
+                        &service.db,
+                        &task.project_id,
+                        &agent_id,
+                    )
+                    .await?
+                {
+                    return Err(ServiceError::conflict(format!(
+                        "Agent {agent_id} cannot receive repository workspace authority"
+                    )));
+                }
             }
             agent_id
         } else if let Some(memberships) = authoritative_memberships.as_ref() {
             let parent_is_usable = match lineage_parent.agent_id.as_deref() {
                 Some(parent_agent_id) => {
-                    crate::task_service::is_usable_active_agent(
-                        &service.db,
-                        memberships,
-                        parent_agent_id,
-                    )
-                    .await?
+                    if task.repo_id.is_some() {
+                        crate::task_service::is_usable_repository_agent(
+                            &service.db,
+                            &task.project_id,
+                            memberships,
+                            parent_agent_id,
+                        )
+                        .await?
+                    } else {
+                        crate::task_service::is_usable_active_agent(
+                            &service.db,
+                            memberships,
+                            parent_agent_id,
+                        )
+                        .await?
+                    }
                 }
                 None => false,
             };
@@ -189,13 +211,21 @@ fn dispatch_role_follow_up_impl(
                     .expect("parent_is_usable implies a lineage Agent");
                 parent_agent_id.to_owned()
             } else {
-                crate::task_service::select_usable_agent_id(&service.db, memberships)
+                let selected = if task.repo_id.is_some() {
+                    crate::task_service::select_usable_repository_agent_id(
+                        &service.db,
+                        &task.project_id,
+                        memberships,
+                    )
                     .await?
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(format!(
-                            "no usable Agent is available for follow-up role {role}"
-                        ))
-                    })?
+                } else {
+                    crate::task_service::select_usable_agent_id(&service.db, memberships).await?
+                };
+                selected.ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "no usable Agent is available for follow-up role {role}"
+                    ))
+                })?
             }
         } else {
             assigned_agent_for_follow_up(&service, &task_id, &role)

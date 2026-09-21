@@ -256,7 +256,16 @@ impl TaskService {
         .await?
         {
             Some(memberships) => {
-                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                if task.repo_id.is_some() {
+                    crate::task_service::select_usable_repository_agent_id(
+                        &self.db,
+                        &task.project_id,
+                        &memberships,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                }
             }
             None => TaskRoleAssignmentRepo::get_by_task_and_role(
                 &*self.db,

@@ -522,12 +522,22 @@ impl TaskService {
                 Some(memberships) => {
                     let parent_is_usable = match parent_execution.agent_id.as_deref() {
                         Some(parent_agent_id) => {
-                            crate::task_service::is_usable_active_agent(
-                                &self.db,
-                                &memberships,
-                                parent_agent_id,
-                            )
-                            .await?
+                            if task.repo_id.is_some() {
+                                crate::task_service::is_usable_repository_agent(
+                                    &self.db,
+                                    &task.project_id,
+                                    &memberships,
+                                    parent_agent_id,
+                                )
+                                .await?
+                            } else {
+                                crate::task_service::is_usable_active_agent(
+                                    &self.db,
+                                    &memberships,
+                                    parent_agent_id,
+                                )
+                                .await?
+                            }
                         }
                         None => false,
                     };
@@ -538,13 +548,25 @@ impl TaskService {
                             .expect("parent_is_usable implies a parent Agent");
                         parent_agent_id.to_owned()
                     } else {
-                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
+                        let selected = if task.repo_id.is_some() {
+                            crate::task_service::select_usable_repository_agent_id(
+                                &self.db,
+                                &task.project_id,
+                                &memberships,
+                            )
                             .await?
-                            .ok_or_else(|| {
-                                ServiceError::invalid_operation(format!(
-                                    "no usable Agent is available for re-execute role {role}"
-                                ))
-                            })?
+                        } else {
+                            crate::task_service::select_usable_agent_id(
+                                &self.db,
+                                &memberships,
+                            )
+                            .await?
+                        };
+                        selected.ok_or_else(|| {
+                            ServiceError::invalid_operation(format!(
+                                "no usable Agent is available for re-execute role {role}"
+                            ))
+                        })?
                     }
                 }
                 None => {

@@ -91,10 +91,24 @@ pub(super) async fn get_usable_agent_assignment(
         .await
         .map_err(|error| error.to_string())?
         {
-            let Some(agent_id) =
+            let repository_required = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some_and(|task| task.repo_id.is_some());
+            let selected = if repository_required {
+                crate::task_service::select_usable_repository_agent_id(
+                    &ctx.db,
+                    &ctx.project_id,
+                    &memberships,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            } else {
                 crate::task_service::select_usable_agent_id(&ctx.db, &memberships)
                     .await
                     .map_err(|error| error.to_string())?
+            };
+            let Some(agent_id) = selected
             else {
                 if memberships.iter().any(|member| {
                     member.status == RoleMembershipStatus::Active

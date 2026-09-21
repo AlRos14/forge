@@ -542,6 +542,37 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let agent_a_record = AgentRepo::get_by_id(&*db, &agent_a)
+        .await
+        .expect("orchestration Agent loads")
+        .expect("orchestration Agent exists");
+    let setup_binding = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
+        .await
+        .expect("project binding loads")
+        .expect("project setup binding exists");
+    ProjectAgentBindingRepo::replace_project_binding(
+        &*db,
+        ReplaceProjectAgentBinding {
+            project_id: project_id.clone(),
+            expected_version: setup_binding.version,
+            replacement: CreateProjectAgentBinding {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                identity_id: Some(agent_a.clone()),
+                profile_id: Some(agent_a_record.profile_id),
+                state: "active".to_owned(),
+                autonomy_policy_json: "{}".to_owned(),
+                permission_ceiling_json: "{}".to_owned(),
+                subscriptions_json: "[]".to_owned(),
+                wake_budget: 0,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            replacement_reason: Some("repository selector test orchestration identity".to_owned()),
+        },
+    )
+    .await
+    .expect("Project Agent binding activates");
     let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     service
         .create_task_role(
@@ -578,6 +609,23 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
         .await
         .expect("usable Agent selection succeeds");
     assert_eq!(selected.as_deref(), Some(agent_b.as_str()));
+    sqlx::query("UPDATE agent_identity SET paused = 0 WHERE id = ?")
+        .bind(&agent_a)
+        .execute(db.pool())
+        .await
+        .expect("orchestration Agent resumes");
+    let generic_selected = crate::task_service::select_usable_agent_id(&db, &memberships)
+        .await
+        .expect("generic Agent selection succeeds");
+    assert_eq!(generic_selected.as_deref(), Some(agent_a.as_str()));
+    let repository_selected = crate::task_service::select_usable_repository_agent_id(
+        &db,
+        &project_id,
+        &memberships,
+    )
+    .await
+    .expect("repository Agent selection succeeds");
+    assert_eq!(repository_selected.as_deref(), Some(agent_b.as_str()));
 }
 
 #[tokio::test]
@@ -714,6 +762,7 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let project_owner = seed_human_user(&db).await;
+    let project_member = seed_human_user(&db).await;
     let outside_owner = seed_human_user(&db).await;
     sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
         .bind(&project_owner)
@@ -721,6 +770,19 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
         .execute(db.pool())
         .await
         .expect("project owner updates");
+    ProjectMemberRepo::add_member(
+        &*db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: project_member.clone(),
+            role: "member".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("project member creates");
 
     let outside_agent = seed_agent(&db).await;
     sqlx::query(
@@ -733,6 +795,18 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     .execute(db.pool())
     .await
     .expect("outside Agent scope updates");
+
+    let member_agent = seed_agent(&db).await;
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&project_member)
+    .bind(&member_agent)
+    .execute(db.pool())
+    .await
+    .expect("project member Agent scope updates");
 
     let bound_agent = seed_agent(&db).await;
     let bound_agent_record = AgentRepo::get_by_id(&*db, &bound_agent)
@@ -809,6 +883,14 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     service
         .add_task_role_member(
             &task.id,
+            "planner",
+            ActorRef::Agent(member_agent),
+        )
+        .await
+        .expect("Project member account Agent membership succeeds");
+    service
+        .add_task_role_member(
+            &task.id,
             "implementer",
             ActorRef::Agent(global_agent),
         )
@@ -833,6 +915,130 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
 }
 
 #[tokio::test]
+async fn task_creation_rejects_invalid_explicit_actor_before_task_insert() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let project_owner = seed_human_user(&db).await;
+    let outsider = seed_human_user(&db).await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&project_owner)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project owner updates");
+    let invalid_agent = seed_agent(&db).await;
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&outsider)
+    .bind(&invalid_agent)
+    .execute(db.pool())
+    .await
+    .expect("outsider Agent scope updates");
+
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task count loads");
+    let result = service
+        .create_task(
+            project_id.clone(),
+            "reject invalid explicit Actor",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![api_types::InitialRoleAssignment {
+                role_name: "coder".to_owned(),
+                assignee_type: api_types::assignee::AssigneeKind::Agent,
+                assignee_id: Some(invalid_agent),
+            }]),
+        )
+        .await;
+    assert!(result.is_err());
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task count loads");
+    assert_eq!(after, before, "invalid explicit Actor must not persist a Task");
+}
+
+#[tokio::test]
+async fn task_creation_rejects_invalid_project_default_before_task_insert() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let project_owner = seed_human_user(&db).await;
+    let outsider = seed_human_user(&db).await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&project_owner)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project owner updates");
+    let invalid_agent = seed_agent(&db).await;
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&outsider)
+    .bind(&invalid_agent)
+    .execute(db.pool())
+    .await
+    .expect("outsider Agent scope updates");
+    let settings = serde_json::json!({
+        "default_role_assignments": [{
+            "role_name": "coder",
+            "assignee_type": "agent",
+            "assignee_id": invalid_agent
+        }]
+    });
+    sqlx::query("UPDATE project SET settings = ?, updated_at = ? WHERE id = ?")
+        .bind(settings.to_string())
+        .bind(now_rfc3339())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project defaults update");
+
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task count loads");
+    let result = service
+        .create_task(
+            project_id.clone(),
+            "reject invalid default Actor",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.is_err());
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task count loads");
+    assert_eq!(after, before, "invalid default Actor must not persist a Task");
+}
+
+#[tokio::test]
 async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
@@ -841,10 +1047,11 @@ async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let agent_c = seed_agent_with_executor_type(&db, "cursor", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task =
+        seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a), None),
+            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
             false,
             false,
         )
@@ -865,6 +1072,8 @@ async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
         .await
         .expect("second membership creates");
 
+    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_a), None).await;
+
     let reassignment = service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_c), None),
@@ -873,8 +1082,64 @@ async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
         )
         .await;
     assert!(matches!(reassignment, Err(ServiceError::Conflict(_))));
+    let execution_after_reassign = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(execution_after_reassign.status, ExecutionStatus::Running);
     let removal = service.remove_role(&task.id, "coder", false, false).await;
     assert!(matches!(removal, Err(ServiceError::Conflict(_))));
+    let execution_after_remove = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(execution_after_remove.status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
+async fn invalid_legacy_reassignment_preserves_running_execution() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let valid_agent = seed_agent(&db).await;
+    let outsider = seed_human_user(&db).await;
+    let invalid_agent = seed_agent(&db).await;
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&outsider)
+    .bind(&invalid_agent)
+    .execute(db.pool())
+    .await
+    .expect("outsider Agent scope updates");
+    let task =
+        seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(valid_agent.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial singleton assignment succeeds");
+    let execution = seed_running_coder_execution(&db, &task.id, Some(valid_agent), None).await;
+
+    let result = service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(invalid_agent), None),
+            false,
+            false,
+        )
+        .await;
+    assert!(result.is_err());
+    let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(execution_after.status, ExecutionStatus::Running);
 }
 
 #[tokio::test]
