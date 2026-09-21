@@ -1202,16 +1202,43 @@ async fn action_scope_access(
             let direct_assignee_id: Option<String> = task.try_get("assignee_id")?;
             let status: String = task.try_get("status")?;
             let assignments = sqlx::query(
-                "SELECT role_name FROM task_role_assignment
-                 WHERE task_id = ? AND assignee_type = 'agent' AND assignee_id = ?",
+                "SELECT task_role.role AS role_name
+                 FROM task_role
+                 JOIN role_membership ON role_membership.task_role_id = task_role.id
+                 WHERE task_role.task_id = ?
+                   AND role_membership.actor_kind = 'agent'
+                   AND role_membership.actor_id = ?
+                   AND role_membership.status = 'active'
+                 UNION ALL
+                 SELECT legacy.role_name
+                 FROM task_role_assignment AS legacy
+                 WHERE legacy.task_id = ?
+                   AND legacy.assignee_type = 'agent'
+                   AND legacy.assignee_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_role
+                       WHERE task_role.task_id = legacy.task_id
+                   )",
             )
+            .bind(scope_id)
+            .bind(actor_identity_id)
             .bind(scope_id)
             .bind(actor_identity_id)
             .fetch_all(db.pool())
             .await?;
-            let assigned = direct_assignee_type.as_deref() == Some("agent")
-                && direct_assignee_id.as_deref() == Some(actor_identity_id)
-                || !assignments.is_empty();
+            let assigned = if !assignments.is_empty() {
+                true
+            } else {
+                let has_task_roles: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM task_role WHERE task_id = ?)",
+                )
+                .bind(scope_id)
+                .fetch_one(db.pool())
+                .await?;
+                has_task_roles == 0
+                    && direct_assignee_type.as_deref() == Some("agent")
+                    && direct_assignee_id.as_deref() == Some(actor_identity_id)
+            };
             if !assigned {
                 return Ok(Some(
                     "actor identity is not assigned to the requested Task".to_owned(),
@@ -1361,15 +1388,36 @@ async fn authorize_action_approver(
             sqlx::query_scalar::<_, i64>(
                 "SELECT (
                     EXISTS (
+                        SELECT 1
+                        FROM task_role
+                        JOIN role_membership ON role_membership.task_role_id = task_role.id
+                        WHERE task_role.task_id = ?
+                          AND role_membership.actor_kind = 'agent'
+                          AND role_membership.actor_id = ?
+                          AND role_membership.status = 'active'
+                    )
+                    OR EXISTS (
                         SELECT 1 FROM task
-                        WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?
+                        WHERE task.id = ?
+                          AND task.assignee_type = 'agent'
+                          AND task.assignee_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM task_role
+                              WHERE task_role.task_id = task.id
+                          )
                     )
                     OR EXISTS (
                         SELECT 1 FROM task_role_assignment
                         WHERE task_id = ? AND assignee_type = 'agent' AND assignee_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM task_role
+                              WHERE task_role.task_id = task_role_assignment.task_id
+                          )
                     )
                 )",
             )
+            .bind(&action.scope_id)
+            .bind(approver_identity_id)
             .bind(&action.scope_id)
             .bind(approver_identity_id)
             .bind(&action.scope_id)

@@ -20,7 +20,7 @@ use db::{
     ExecutionUsageRepo, PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus,
     SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo,
     TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
-    TaskStatus, TransitionLogRepo, UpsertExecutionUsage, Workspace, WorkspaceLeaseRepo,
+    TaskStatus, TransitionLogRepo, UpsertExecutionUsage, UserRepo, Workspace, WorkspaceLeaseRepo,
     WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
@@ -50,6 +50,7 @@ pub(crate) mod execution;
 mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
+mod memberships;
 mod move_task;
 mod reorder_subtasks;
 mod review;
@@ -63,6 +64,11 @@ pub(crate) mod workspace;
 pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
 pub use execution::subtasks::build_first_turn_prompt_from_context;
+pub(crate) use memberships::{
+    active_agent_membership, current_role_memberships_authoritative, is_usable_active_agent,
+    is_usable_repository_agent, repository_worker_identity_is_eligible, select_usable_agent_id,
+    select_usable_repository_agent_id,
+};
 pub use subtask::{is_root_task, is_subtask, root_for};
 
 #[cfg(test)]

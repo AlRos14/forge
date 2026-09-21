@@ -23,7 +23,10 @@ RoleMembership
 
 A TaskRole contains zero or more memberships. The initial role vocabulary is
 planner, implementer, reviewer, and orchestrator. Persistence may support
-future role names without hard-coding role-specific classes.
+future role names without hard-coding role-specific classes. During the
+singular-assignment migration, `coder`, `worker`, `assignee`, and `executor`
+are normalized to `implementer`; `interactive`, `merge_fixer`, and `system`
+remain execution labels rather than becoming TaskRoles.
 
 RoleMembership records participation in a TaskRole only. It does not contain a
 WorkUnit, path, concrete scope, or assignment reference. Allocation belongs to
@@ -44,12 +47,34 @@ two distinguishable historical records.
 Coordination mode is data on the TaskRole. It is not inferred from a role name
 or from the number of memberships.
 
+Legacy singleton TaskRoles created by the additive migration may have a null
+coordination mode while they have zero or one current member. That value is a
+transitional absence of a multi-member coordination decision, not a fourth
+mode. Before a second current membership is added, the caller must set one of
+the three modes above; newly created TaskRoles require it immediately.
+
 ## Membership operations
 
-Adding, ending, replacing, and suspending membership use optimistic
-concurrency and preserve history. Removing one membership cannot remove other
-memberships for the same Actor or role. Membership changes do not rewrite
-completed Executions.
+Membership status is `active`, `suspended`, or `ended`. Adding, ending,
+replacing, and suspending membership use optimistic concurrency and preserve
+history. Removing one membership cannot remove other memberships for the same
+Actor or role. Membership changes do not rewrite completed Executions.
+
+Legacy singleton assignment writes may update a deterministic compatibility
+projection, but `RoleMembership` is the current eligibility authority once its
+TaskRole exists. The old `task.assignee_*` and `task_role_assignment` values
+must never select scheduling candidates, concrete Execution Actors,
+follow-up/re-execute Actors, or workspace/terminal authority in that case. A
+compatibility representative is never an allocation, execution, or
+workspace-authority decision. The authoritative membership mutation and any
+required compatibility projection commit together; membership and task events
+are emitted only after that transaction succeeds.
+
+An Execution keeps the concrete historical Actor that performed it. Workspace
+authority remains scoped to that concrete Execution and its matching
+WorkspaceLease; adding another Actor to the same TaskRole does not grant that
+Actor access to the existing workspace, lease, terminal, or repository write
+scope.
 
 Role policy can constrain capacity, independence, approval, or disruptive
 actions. It must remain a small deterministic policy representation rather than

@@ -291,6 +291,7 @@ function taskDefaults() {
     parent_task_id: null,
     assignee_type: null,
     assignee_id: null,
+    task_roles: [],
     subtask_order: null,
     board_position: 50,
     awaiting_human: false,

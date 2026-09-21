@@ -129,35 +129,79 @@ impl TaskDispatcher {
             let Some(role_name) = crate::workflow::effective_role(target_state) else {
                 return Ok(None);
             };
-            let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                    .await?;
-            match assignment {
-                Some(assignment)
-                    if assignment.assignee_type == Some(db::AssigneeKind::Agent)
-                        && assignment.assignee_id.is_some() =>
-                {
-                    return Ok(Some(InitialScheduleTarget {
-                        transition_to,
-                        agent_id: assignment.assignee_id.expect("checked by match guard"),
-                    }));
+            match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                role_name,
+            )
+            .await?
+            {
+                Some(memberships) => {
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
+                    } else {
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                    };
+                    if let Some(agent_id) = selected
+                    {
+                        // Existing dispatch remains the bounded compatibility
+                        // selector until WorkUnit/orchestrator scheduling: the
+                        // stable membership order supplies a deterministic
+                        // candidate without making the representative the
+                        // source of eligibility.
+                        return Ok(Some(InitialScheduleTarget {
+                            transition_to,
+                            agent_id,
+                        }));
+                    }
+                    if !memberships
+                        .iter()
+                        .any(|membership| membership.status == db::RoleMembershipStatus::Active)
+                        && helpers::auto_cascades_on_unassigned_role(target_state)
+                    {
+                        cursor_state = target_state.name.clone();
+                        target_kinds = vec![StateKind::Active];
+                    } else {
+                        return Ok(None);
+                    }
                 }
-                Some(assignment) if assignment.assignee_type == Some(db::AssigneeKind::User) => {
-                    return Ok(None);
+                None => {
+                    let assignment =
+                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
+                            .await?;
+                    match assignment {
+                        Some(assignment)
+                            if assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                                && assignment.assignee_id.is_some() =>
+                        {
+                            return Ok(Some(InitialScheduleTarget {
+                                transition_to,
+                                agent_id: assignment.assignee_id.expect("checked by match guard"),
+                            }));
+                        }
+                        Some(assignment) if assignment.assignee_type == Some(db::AssigneeKind::User) => {
+                            return Ok(None);
+                        }
+                        Some(assignment)
+                            if helpers::role_assignment_unassigned(Some(&assignment))
+                                && helpers::auto_cascades_on_unassigned_role(target_state) =>
+                        {
+                            cursor_state = target_state.name.clone();
+                            target_kinds = vec![StateKind::Active];
+                        }
+                        Some(_) => return Ok(None),
+                        None if helpers::auto_cascades_on_unassigned_role(target_state) => {
+                            cursor_state = target_state.name.clone();
+                            target_kinds = vec![StateKind::Active];
+                        }
+                        None => return Ok(None),
+                    }
                 }
-                Some(assignment)
-                    if helpers::role_assignment_unassigned(Some(&assignment))
-                        && helpers::auto_cascades_on_unassigned_role(target_state) =>
-                {
-                    cursor_state = target_state.name.clone();
-                    target_kinds = vec![StateKind::Active];
-                }
-                Some(_) => return Ok(None),
-                None if helpers::auto_cascades_on_unassigned_role(target_state) => {
-                    cursor_state = target_state.name.clone();
-                    target_kinds = vec![StateKind::Active];
-                }
-                None => return Ok(None),
             }
         }
     }

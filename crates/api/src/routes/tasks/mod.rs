@@ -1,12 +1,14 @@
 use api_types::{
-    AddDependencyRequest, ApproveGateRequest, AssignRoleRequest, AuthorType, CanonicalPhase,
+    AddDependencyRequest, AddRoleMembershipRequest, ApproveGateRequest, AssignRoleRequest,
+    AuthorType, CanonicalPhase,
     ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope,
     HookResultEntry, LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest,
     MoveTaskResponse, PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest,
     RejectGateRequest, RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig,
-    ReviewDecisionResponse, StateKind, TaskAction, TaskActionRequest, TaskDependency,
-    TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TasksResponse, TransitionLogEntry,
-    TransitionSource, TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest,
+    CreateTaskRoleRequest, ReviewDecisionResponse, RoleMembershipResponse, StateKind, TaskAction,
+    TaskActionRequest, TaskDependency, TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse,
+    TaskRoleResponse, TasksResponse, TransitionLogEntry, TransitionSource, TransitionTaskRequest,
+    TransitionTaskResponse, UpdateRoleMembershipRequest, UpdateTaskRequest, UpdateTaskRoleRequest,
     WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
 };
 use axum::{
@@ -74,8 +76,9 @@ pub use plans::get_task_plan;
 pub use prompt_preview::prompt_preview;
 pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
 pub use roles::{
-    assign_task_role, list_task_roles, remove_task_role, RoleResetRequest,
-    TaskRoleAssignmentListResponse,
+    add_task_role_member, assign_task_role, create_task_role_model, list_task_role_model,
+    list_task_roles, remove_task_role, update_task_role_member, update_task_role_model,
+    RoleResetRequest, TaskRoleAssignmentListResponse,
 };
 pub use transitions::{list_transitions, transition_task, TransitionLogListResponse};
 pub use workspace::{get_task_diff, get_task_workspace, reset_task_workspace};

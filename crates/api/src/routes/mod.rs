@@ -2,14 +2,16 @@ use std::{collections::HashMap, str::FromStr};
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, StateKind, StepResultEntry,
-    StepResultResponse, Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
-    TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
+    ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, RoleMembershipResponse,
+    RoleMembershipStatus, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
+    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleResponse, TaskRoleAssignmentResponse,
+    TaskType, WorkspaceResponse,
 };
 use db::{
-    Agent, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review, SortBy,
-    SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, Workspace,
-    WorkspaceRepo,
+    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
+    Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo, SortBy, SortOrder,
+    Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo,
+    Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -276,6 +278,33 @@ async fn task_response_inner(
         .cloned()
         .map(task_role_assignment_response)
         .collect();
+    let task_roles = task_roles_response(db, &task.id, false).await?;
+    let compatibility_assignee = task_roles
+        .iter()
+        .find(|role| role.role == "implementer")
+        .map(|role| {
+            role.members
+                .iter()
+                .filter(|member| member.status == RoleMembershipStatus::Active)
+                .min_by_key(|member| {
+                    (
+                        match &member.actor_ref {
+                            api_types::ActorRef::Agent(_) => 0_u8,
+                            api_types::ActorRef::Human(_) => 1_u8,
+                        },
+                        member.created_at.clone(),
+                        member.id.clone(),
+                    )
+                })
+                .map(|member| match &member.actor_ref {
+                    api_types::ActorRef::Agent(id) => (Some("agent".to_owned()), Some(id.clone())),
+                    api_types::ActorRef::Human(id) => (Some("user".to_owned()), Some(id.clone())),
+                })
+        });
+    let (assignee_type, assignee_id) = match compatibility_assignee {
+        Some(assignee) => assignee.unwrap_or((None, None)),
+        None => (task.assignee_type.clone(), task.assignee_id.clone()),
+    };
 
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
@@ -379,8 +408,8 @@ async fn task_response_inner(
         project_id: task.project_id,
         repo_id: task.repo_id,
         parent_task_id: task.parent_task_id.clone(),
-        assignee_type: task.assignee_type,
-        assignee_id: task.assignee_id,
+        assignee_type,
+        assignee_id,
         title: task.title,
         description: task.description,
         task_type: parse_task_type(&task.task_type),
@@ -391,6 +420,7 @@ async fn task_response_inner(
         board_position: task.board_position,
         subtask_order: task.subtask_order,
         role_assignments,
+        task_roles,
         remaining_retries,
         execution_actions,
         error_annotation,
@@ -615,6 +645,61 @@ pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRole
         assignee_id: assignment.assignee_id,
         created_at: assignment.created_at,
         updated_at: assignment.updated_at,
+    }
+}
+
+pub async fn task_roles_response(
+    db: &db::SqliteDb,
+    task_id: &str,
+    include_ended: bool,
+) -> ApiResult<Vec<TaskRoleResponse>> {
+    let roles = TaskRoleRepo::list_by_task(db, task_id).await?;
+    let mut response = Vec::with_capacity(roles.len());
+    for role in roles {
+        let members = RoleMembershipRepo::list_by_role(db, &role.id, include_ended).await?;
+        let policy = serde_json::from_str(&role.policy_json).map_err(|error| {
+            ApiError::internal(format!("invalid persisted TaskRole policy: {error}"))
+        })?;
+        response.push(TaskRoleResponse {
+            id: role.id,
+            task_id: role.task_id,
+            role: role.role,
+            coordination_mode: role.coordination_mode.map(|mode| match mode {
+                DbCoordinationMode::Partitioned => api_types::CoordinationMode::Partitioned,
+                DbCoordinationMode::Collaborative => api_types::CoordinationMode::Collaborative,
+                DbCoordinationMode::Independent => api_types::CoordinationMode::Independent,
+            }),
+            policy,
+            version: role.version,
+            members: members
+                .into_iter()
+                .map(role_membership_response)
+                .collect(),
+            created_at: role.created_at,
+            updated_at: role.updated_at,
+        });
+    }
+    Ok(response)
+}
+
+pub(crate) fn role_membership_response(member: RoleMembership) -> RoleMembershipResponse {
+    let actor_ref = match member.actor_kind {
+        ActorKind::Human => api_types::ActorRef::Human(member.actor_id),
+        ActorKind::Agent => api_types::ActorRef::Agent(member.actor_id),
+    };
+    RoleMembershipResponse {
+        id: member.id,
+        task_role_id: member.task_role_id,
+        actor_ref,
+        status: match member.status {
+            db::RoleMembershipStatus::Active => RoleMembershipStatus::Active,
+            db::RoleMembershipStatus::Suspended => RoleMembershipStatus::Suspended,
+            db::RoleMembershipStatus::Ended => RoleMembershipStatus::Ended,
+        },
+        version: member.version,
+        created_at: member.created_at,
+        updated_at: member.updated_at,
+        ended_at: member.ended_at,
     }
 }
 

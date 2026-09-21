@@ -153,15 +153,91 @@ fn dispatch_role_follow_up_impl(
             latest_terminal_execution_for_follow_up_role(&service.db, &task_id, &role).await?
         };
         let lineage_parent = role_parent.as_ref().unwrap_or(&supplied_parent_execution);
-        let agent_id = agent_override
-            .or(assigned_agent_for_follow_up(&service, &task_id, &role).await?)
-            .or_else(|| lineage_parent.agent_id.clone())
-            .or_else(|| supplied_parent_execution.agent_id.clone())
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "no assigned agent available for follow-up role {role}"
-                ))
-            })?;
+        let authoritative_memberships =
+            crate::task_service::current_role_memberships_authoritative(
+                &service.db,
+                &task_id,
+                &role,
+            )
+            .await?;
+        let agent_id = if let Some(agent_id) = agent_override {
+            if let Some(memberships) = authoritative_memberships.as_ref() {
+                if crate::task_service::active_agent_membership(memberships, &agent_id).is_none()
+                {
+                    return Err(ServiceError::conflict(format!(
+                        "Agent {agent_id} is not an active member of follow-up role {role}"
+                    )));
+                }
+                if task.repo_id.is_some()
+                    && !crate::task_service::repository_worker_identity_is_eligible(
+                        &service.db,
+                        &task.project_id,
+                        &agent_id,
+                    )
+                    .await?
+                {
+                    return Err(ServiceError::conflict(format!(
+                        "Agent {agent_id} cannot receive repository workspace authority"
+                    )));
+                }
+            }
+            agent_id
+        } else if let Some(memberships) = authoritative_memberships.as_ref() {
+            let parent_is_usable = match lineage_parent.agent_id.as_deref() {
+                Some(parent_agent_id) => {
+                    if task.repo_id.is_some() {
+                        crate::task_service::is_usable_repository_agent(
+                            &service.db,
+                            &task.project_id,
+                            memberships,
+                            parent_agent_id,
+                        )
+                        .await?
+                    } else {
+                        crate::task_service::is_usable_active_agent(
+                            &service.db,
+                            memberships,
+                            parent_agent_id,
+                        )
+                        .await?
+                    }
+                }
+                None => false,
+            };
+            if parent_is_usable {
+                let parent_agent_id = lineage_parent
+                    .agent_id
+                    .as_deref()
+                    .expect("parent_is_usable implies a lineage Agent");
+                parent_agent_id.to_owned()
+            } else {
+                let selected = if task.repo_id.is_some() {
+                    crate::task_service::select_usable_repository_agent_id(
+                        &service.db,
+                        &task.project_id,
+                        memberships,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::select_usable_agent_id(&service.db, memberships).await?
+                };
+                selected.ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "no usable Agent is available for follow-up role {role}"
+                    ))
+                })?
+            }
+        } else {
+            assigned_agent_for_follow_up(&service, &task_id, &role)
+                .await?
+                .or_else(|| lineage_parent.agent_id.clone())
+                .or_else(|| supplied_parent_execution.agent_id.clone())
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "no assigned agent available for follow-up role {role}"
+                    ))
+                })?
+        };
         let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;

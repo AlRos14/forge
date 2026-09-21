@@ -75,10 +75,42 @@ impl TaskRepo for SqliteDb {
             where_parts.push("status IN (__STATUSES__)");
         }
         if !query.agent_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
+            where_parts.push("id IN (
+                SELECT task_role.task_id
+                FROM task_role
+                JOIN role_membership ON role_membership.task_role_id = task_role.id
+                WHERE role_membership.actor_kind = 'agent'
+                  AND role_membership.status = 'active'
+                  AND role_membership.actor_id IN (__AGENTS__)
+                UNION
+                SELECT legacy.task_id
+                FROM task_role_assignment AS legacy
+                WHERE legacy.assignee_type = 'agent'
+                  AND legacy.assignee_id IN (__AGENTS__)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_role
+                      WHERE task_role.task_id = legacy.task_id
+                  )
+            )");
         }
         if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
+            where_parts.push("id IN (
+                SELECT task_role.task_id
+                FROM task_role
+                JOIN role_membership ON role_membership.task_role_id = task_role.id
+                WHERE (__ASSIGNEE_TYPE_FILTER_MEMBERSHIP__)
+                  AND (__ASSIGNEE_ID_FILTER_MEMBERSHIP__)
+                  AND role_membership.status IN ('active', 'suspended')
+                UNION
+                SELECT legacy.task_id
+                FROM task_role_assignment AS legacy
+                WHERE (__ASSIGNEE_TYPE_FILTER_LEGACY__)
+                  AND (__ASSIGNEE_ID_FILTER_LEGACY__)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_role
+                      WHERE task_role.task_id = legacy.task_id
+                  )
+            )");
         }
         if query.priority.is_some() {
             where_parts.push("priority = ?");
@@ -96,22 +128,34 @@ impl TaskRepo for SqliteDb {
         let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
         let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
         let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
-        let assignee_type_filter = if query.assignee_types.is_empty() {
+        let assignee_type_filter_legacy = if query.assignee_types.is_empty() {
             "1 = 1".to_owned()
         } else {
             format!("assignee_type IN ({assignee_type_placeholders})")
         };
-        let assignee_id_filter = if query.assignee_ids.is_empty() {
+        let assignee_type_filter_membership = if query.assignee_types.is_empty() {
+            "1 = 1".to_owned()
+        } else {
+            format!("CASE role_membership.actor_kind WHEN 'human' THEN 'user' ELSE 'agent' END IN ({assignee_type_placeholders})")
+        };
+        let assignee_id_filter_legacy = if query.assignee_ids.is_empty() {
             "1 = 1".to_owned()
         } else {
             format!("assignee_id IN ({assignee_id_placeholders})")
+        };
+        let assignee_id_filter_membership = if query.assignee_ids.is_empty() {
+            "1 = 1".to_owned()
+        } else {
+            format!("role_membership.actor_id IN ({assignee_id_placeholders})")
         };
         let where_sql = where_parts
             .join(" AND ")
             .replace("__STATUSES__", &status_placeholders)
             .replace("__AGENTS__", &agent_placeholders)
-            .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
-            .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
+            .replace("__ASSIGNEE_TYPE_FILTER_MEMBERSHIP__", &assignee_type_filter_membership)
+            .replace("__ASSIGNEE_ID_FILTER_MEMBERSHIP__", &assignee_id_filter_membership)
+            .replace("__ASSIGNEE_TYPE_FILTER_LEGACY__", &assignee_type_filter_legacy)
+            .replace("__ASSIGNEE_ID_FILTER_LEGACY__", &assignee_id_filter_legacy);
         let sql = format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
             where_sql,
@@ -124,8 +168,17 @@ impl TaskRepo for SqliteDb {
         for agent_id in &query.agent_ids {
             q = q.bind(agent_id);
         }
+        for agent_id in &query.agent_ids {
+            q = q.bind(agent_id);
+        }
         for assignee_type in &query.assignee_types {
             q = q.bind(assignee_type);
+        }
+        for assignee_type in &query.assignee_types {
+            q = q.bind(assignee_type);
+        }
+        for assignee_id in &query.assignee_ids {
+            q = q.bind(assignee_id);
         }
         for assignee_id in &query.assignee_ids {
             q = q.bind(assignee_id);
@@ -151,8 +204,17 @@ impl TaskRepo for SqliteDb {
             for agent_id in &query.agent_ids {
                 q = q.bind(agent_id);
             }
+            for agent_id in &query.agent_ids {
+                q = q.bind(agent_id);
+            }
             for assignee_type in &query.assignee_types {
                 q = q.bind(assignee_type);
+            }
+            for assignee_type in &query.assignee_types {
+                q = q.bind(assignee_type);
+            }
+            for assignee_id in &query.assignee_ids {
+                q = q.bind(assignee_id);
             }
             for assignee_id in &query.assignee_ids {
                 q = q.bind(assignee_id);
@@ -572,9 +634,27 @@ impl TaskRepo for SqliteDb {
                     "SELECT
                         (
                             SELECT COUNT(DISTINCT task.id) FROM task
-                            JOIN task_role_assignment ON task_role_assignment.task_id = task.id
-                            WHERE task_role_assignment.assignee_type = 'agent'
-                              AND task_role_assignment.assignee_id = ?
+                            WHERE (
+                                EXISTS (
+                                SELECT 1
+                                FROM task_role
+                                JOIN role_membership
+                                  ON role_membership.task_role_id = task_role.id
+                                WHERE task_role.task_id = task.id
+                                  AND role_membership.actor_kind = 'agent'
+                                  AND role_membership.actor_id = ?
+                                  AND role_membership.status = 'active'
+                                )
+                                OR (
+                                NOT EXISTS (SELECT 1 FROM task_role WHERE task_role.task_id = task.id)
+                                AND EXISTS (
+                                    SELECT 1 FROM task_role_assignment
+                                    WHERE task_role_assignment.task_id = task.id
+                                      AND task_role_assignment.assignee_type = 'agent'
+                                      AND task_role_assignment.assignee_id = ?
+                                )
+                                )
+                            )
                               AND task.id != ?
                               AND task.deleted_at IS NULL
                               AND task.status IN ({placeholders})
@@ -586,6 +666,7 @@ impl TaskRepo for SqliteDb {
                         )"
                 );
                 let mut query = sqlx::query_scalar::<_, i64>(&sql)
+                    .bind(agent_id)
                     .bind(agent_id)
                     .bind(&input.task_id);
                 for status in &input.capacity_statuses {
@@ -639,7 +720,20 @@ impl TaskRepo for SqliteDb {
         let previous_status = task.status.clone();
         let target_status = input.status.clone();
         task.status = target_status;
-        if input.assignee_id.is_some() {
+        // After V088 the task-level assignee is only the bounded projection of
+        // the implementer TaskRole.  A status/recovery caller may still pass
+        // the legacy "clear assignee" signal, but it must not erase that
+        // projection while an authoritative replacement role exists.
+        let has_authoritative_implementer: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_role
+                 WHERE task_id = ? AND role = 'implementer'
+             )",
+        )
+        .bind(&task.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if input.assignee_id.is_some() && has_authoritative_implementer == 0 {
             task.assignee_type = None;
             task.assignee_id = None;
         }

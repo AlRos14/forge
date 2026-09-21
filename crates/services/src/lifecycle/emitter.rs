@@ -3,7 +3,7 @@ use std::{path::Path, path::PathBuf, sync::Arc};
 use api_types::{LifecycleHookDef, LifecycleHooks, ProjectSettings, StateKind, WorkflowDefinition};
 use db::{
     Execution, ExecutionRepo, PageRequest, ProjectRepo, RepoRepo, SortBy, SortOrder, Task,
-    TaskRepo, TransitionLogRepo, WorkspaceRepo,
+    TaskRepo, TaskRoleRepo, TransitionLogRepo, WorkspaceRepo,
 };
 use events::{EventContext, ForgeEvent};
 use tokio::sync::broadcast;
@@ -130,7 +130,7 @@ impl LifecycleEventEmitter {
                 Some(project_id),
                 api_types::LifecycleEvent::BeforeWork,
                 Some(old_status.to_owned()),
-                task.assignee_id.clone(),
+                None,
                 None,
             )
             .await?;
@@ -144,7 +144,7 @@ impl LifecycleEventEmitter {
                 Some(project_id),
                 api_types::LifecycleEvent::OnTaskCancel,
                 Some(old_status.to_owned()),
-                task.assignee_id.clone(),
+                None,
                 None,
             )
             .await?;
@@ -157,7 +157,7 @@ impl LifecycleEventEmitter {
                 Some(project_id),
                 api_types::LifecycleEvent::OnTaskDone,
                 Some(old_status.to_owned()),
-                task.assignee_id.clone(),
+                None,
                 None,
             )
             .await?;
@@ -171,7 +171,7 @@ impl LifecycleEventEmitter {
                 Some(project_id),
                 api_types::LifecycleEvent::OnWorkStop,
                 Some(old_status.to_owned()),
-                task.assignee_id.clone(),
+                None,
                 None,
             )
             .await?;
@@ -206,9 +206,26 @@ impl LifecycleEventEmitter {
             .map_err(|error| format!("failed to resolve execution for task {task_id}: {error}"))?;
         let resolved_execution_id =
             execution_id.or_else(|| execution.as_ref().map(|item| item.id.clone()));
-        let resolved_agent_id = agent_id
-            .or_else(|| execution.as_ref().and_then(|item| item.agent_id.clone()))
-            .or_else(|| task.assignee_id.clone());
+        let resolved_agent_id = if agent_id.is_some() {
+            agent_id
+        } else if let Some(execution_agent_id) = execution
+            .as_ref()
+            .and_then(|item| item.agent_id.clone())
+        {
+            Some(execution_agent_id)
+        } else if task.assignee_type.as_deref() == Some("agent")
+            && TaskRoleRepo::list_by_task(&*self.db, &task.id)
+            .await
+            .map_err(|error| format!("failed to inspect TaskRole for task {}: {error}", task.id))?
+            .is_empty()
+        {
+            task.assignee_id.clone()
+        } else {
+            // A replacement TaskRole exists, so the task-level value is only
+            // a compatibility projection and cannot identify this lifecycle
+            // event's historical Agent.
+            None
+        };
         let previous_status = match previous_status {
             Some(previous_status) => previous_status,
             None => self

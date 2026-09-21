@@ -18,7 +18,8 @@ use db::{
     AgentActionExecution, AgentActionListQuery, AgentActionStatus, AgentCommitment,
     AgentCommitmentEvidence, AgentCommitmentListQuery, AgentCommitmentStatus, AgentInboxItem,
     AgentInboxListQuery, AgentInboxStatus, AgentQuestion, AgentQuestionListQuery,
-    AgentQuestionStatus, AgentRepo, ProjectAgentBindingRepo, TaskRepo, TaskRoleAssignmentRepo,
+    AgentQuestionStatus, AgentRepo, ProjectAgentBindingRepo, RoleMembershipRepo, TaskRepo,
+    TaskRoleRepo,
 };
 use serde_json::Value;
 use services::{
@@ -773,19 +774,37 @@ async fn require_identity_scope(
                 .ok_or_else(|| ApiError::not_found("task", scope_id.to_owned()))?;
             crate::routes::project_agents::require_project_member(state, &task.project_id, user_id)
                 .await?;
-            let assigned_directly = task.assignee_type.as_deref() == Some("agent")
-                && task.assignee_id.as_deref() == Some(identity_id);
-            let assigned_role = TaskRoleAssignmentRepo::list_by_task(&*state.db, scope_id)
+            let task_roles = TaskRoleRepo::list_by_task(&*state.db, scope_id).await?;
+            let assigned_role = RoleMembershipRepo::list_by_task(&*state.db, scope_id, false)
+                .await?
+                .into_iter()
+                .any(|(_, membership)| {
+                    membership.actor_kind == db::ActorKind::Agent
+                        && membership.actor_id == identity_id
+                        && membership.status == db::RoleMembershipStatus::Active
+                });
+            // The singular direct/role rows are usable only for a task that
+            // has not acquired any replacement TaskRole row. Once the new
+            // model exists, an empty membership set is authoritative and must
+            // not be bypassed by a stale compatibility projection.
+            let assigned_legacy = if task_roles.is_empty() {
+                let assigned_directly = task.assignee_type.as_deref() == Some("agent")
+                    && task.assignee_id.as_deref() == Some(identity_id);
+                let assigned_role = db::TaskRoleAssignmentRepo::list_by_task(
+                    &*state.db,
+                    scope_id,
+                )
                 .await?
                 .into_iter()
                 .any(|assignment| {
-                    assignment
-                        .assignee_type
-                        .as_ref()
-                        .is_some_and(|kind| kind.to_string() == "agent")
+                    assignment.assignee_type == Some(db::AssigneeKind::Agent)
                         && assignment.assignee_id.as_deref() == Some(identity_id)
                 });
-            if !assigned_directly && !assigned_role {
+                assigned_directly || assigned_role
+            } else {
+                false
+            };
+            if !assigned_role && !assigned_legacy {
                 return Err(ApiError::not_found("task_assignment", scope_id.to_owned()));
             }
         }

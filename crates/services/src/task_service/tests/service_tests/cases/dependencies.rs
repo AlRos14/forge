@@ -244,6 +244,13 @@ async fn test_user_claim_bypasses_capacity_check() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let human_id = seed_human_user(&db).await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&human_id)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project owner updates");
     let task = service
         .create_task(
             project_id,
@@ -262,7 +269,7 @@ async fn test_user_claim_bypasses_capacity_check() {
     let claimed = service
         .claim_task(
             task.id,
-            Assignee::User("alice@example.com".to_owned()),
+            Assignee::User(human_id),
             None,
         )
         .await

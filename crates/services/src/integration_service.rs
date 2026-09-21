@@ -7,7 +7,7 @@ use crate::{
 use db::{
     new_uuid_v4, now_rfc3339, AssigneeKind, CreateProjectIntegration, CreateTaskExternalLink,
     CreateTaskRoleAssignment, ExternalLinkRepo, IntegrationPlatform, IntegrationRepo,
-    ProjectIntegration, ProjectRepo, SqliteDb, TaskRoleAssignmentRepo, UpdateProjectIntegration,
+    ProjectIntegration, ProjectRepo, SqliteDb, UpdateProjectIntegration,
 };
 use events::EventBus;
 use std::{str::FromStr, sync::Arc};
@@ -152,7 +152,7 @@ impl IntegrationService {
             )
             .await?;
 
-            assign_default_coder(&self.db, &task.id, integration).await?;
+            assign_default_coder(&self.task_service, &task.id, integration).await?;
             imported += 1;
         }
 
@@ -284,7 +284,7 @@ fn validate_assignee(assignee_type: Option<&str>, assignee_id: Option<&str>) -> 
 }
 
 async fn assign_default_coder(
-    db: &SqliteDb,
+    task_service: &TaskService,
     task_id: &str,
     integration: &ProjectIntegration,
 ) -> Result<()> {
@@ -297,9 +297,8 @@ async fn assign_default_coder(
     let assignee_type =
         AssigneeKind::from_str(assignee_type).map_err(ServiceError::invalid_operation)?;
     let now = now_rfc3339();
-    TaskRoleAssignmentRepo::assign(
-        db,
-        CreateTaskRoleAssignment {
+    task_service
+        .assign_role_membership(CreateTaskRoleAssignment {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
             role_name: "coder".to_owned(),
@@ -307,8 +306,7 @@ async fn assign_default_coder(
             assignee_id: Some(assignee_id.to_owned()),
             created_at: now.clone(),
             updated_at: now,
-        },
-    )
+        })
     .await?;
     Ok(())
 }

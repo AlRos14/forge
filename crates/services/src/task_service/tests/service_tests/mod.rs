@@ -10,7 +10,8 @@ use api_types::{
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent,
-    CreateProjectAgentBinding, CreateTask, DaemonRepo, DaemonStatus, ProjectAgentBindingRepo,
+    CreateProjectAgentBinding, CreateProjectMember, CreateTask, DaemonRepo, DaemonStatus,
+    ProjectAgentBindingRepo, ProjectMemberRepo,
     ReplaceProjectAgentBinding, UpdateProject, UpsertDaemon,
 };
 use executors::{ExecutionResult, ExecutorError};
@@ -376,6 +377,26 @@ async fn seed_task_with_status(
     )
     .await
     .expect("task creates")
+}
+
+async fn seed_human_user(db: &SqliteDb) -> String {
+    let id = new_uuid_v4();
+    let now = now_rfc3339();
+    db::UserRepo::create_user(
+        db,
+        &db::User {
+            id: id.clone(),
+            email: format!("human-{id}@example.com"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Test Human".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("human user creates");
+    id
 }
 
 async fn seed_subtask_with_status(

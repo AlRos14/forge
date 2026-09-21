@@ -20,8 +20,8 @@ use crate::{
 
 use super::common::{
     ensure_review_awaiting_human, ensure_review_record_for_dispatch, execution_guard_roles,
-    follow_up_trigger, get_role_assignment, has_running_execution_for_roles, latest_review,
-    review_is_ci_only, task,
+    follow_up_trigger, get_role_assignment, get_usable_agent_assignment,
+    has_running_execution_for_roles, latest_review, review_is_ci_only, task,
 };
 use super::gates::non_review_gate_retry_budget;
 
@@ -74,7 +74,7 @@ impl HookAction for DispatchRoleAgent {
         // would leave the parent stranded in `in_progress` after a review failure
         // — see `finish_current_turn_and_begin_next` for the per-turn handoff.
 
-        let assignment = match get_role_assignment(ctx, role_name).await {
+        let assignment = match get_usable_agent_assignment(ctx, role_name).await {
             Ok(assignment) => assignment,
             Err(reason) => return HookResult::Failed { reason },
         };

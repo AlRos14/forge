@@ -175,7 +175,10 @@ impl AppState {
         let effective_config = effective_config_for_workspace(workspace_root.clone());
         let embedded_agent_service =
             Arc::new(EmbeddedAgentService::new(Arc::clone(&db), &jwt_secret));
-        let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&db)));
+        let agent_chat_service = Arc::new(services::AgentChatService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        ));
         let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
         let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
         let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
@@ -269,6 +272,7 @@ impl AppState {
             Arc::clone(&db),
             Arc::clone(&embedded_agent_service),
             Arc::clone(&task_executor),
+            Arc::clone(&event_bus),
         ));
         let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
         let oauth_service = Arc::new(services::OAuthService::new(

@@ -382,11 +382,7 @@ impl TaskService {
         task: &Task,
         workflow: &api_types::WorkflowDefinition,
     ) -> Result<String> {
-        if task.assignee_type.as_deref() == Some("agent") {
-            if let Some(agent_id) = task.assignee_id.as_deref() {
-                return Ok(agent_id.to_owned());
-            }
-        }
+        let mut authoritative_role_seen = false;
 
         if let Some(role) = workflow
             .states
@@ -394,12 +390,39 @@ impl TaskService {
             .find(|state| state.name == task.status)
             .and_then(crate::workflow::effective_role)
         {
-            if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?
+            match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                role,
+            )
+            .await?
             {
-                if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                    if let Some(agent_id) = assignment.assignee_id {
+                Some(memberships) => {
+                    authoritative_role_seen = true;
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
+                    } else {
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                    };
+                    if let Some(agent_id) = selected {
                         return Ok(agent_id);
+                    }
+                }
+                None => {
+                    if let Some(assignment) =
+                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+                            .await?
+                    {
+                        if assignment.assignee_type == Some(AssigneeKind::Agent) {
+                            if let Some(agent_id) = assignment.assignee_id {
+                                return Ok(agent_id);
+                            }
+                        }
                     }
                 }
             }
@@ -417,15 +440,59 @@ impl TaskService {
             })
             .next();
         if let Some(role) = first_work_role {
-            if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?
+            match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                role,
+            )
+            .await?
             {
-                if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                    if let Some(agent_id) = assignment.assignee_id {
+                Some(memberships) => {
+                    authoritative_role_seen = true;
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
+                    } else {
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+                    };
+                    if let Some(agent_id) = selected {
                         return Ok(agent_id);
                     }
                 }
+                None => {
+                    if let Some(assignment) =
+                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+                            .await?
+                    {
+                        if assignment.assignee_type == Some(AssigneeKind::Agent) {
+                            if let Some(agent_id) = assignment.assignee_id {
+                                return Ok(agent_id);
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        // Once any candidate workflow role has a replacement TaskRole row, an
+        // empty active-Agent set is authoritative.  Do not fall through to a
+        // stale task fallback, historical execution, or an arbitrary default
+        // Agent and thereby turn eligibility into an implicit assignment.
+        if authoritative_role_seen {
+            return Err(ServiceError::invalid_operation(
+                "no active Agent membership is available for the current TaskRole",
+            ));
+        }
+
+        if !authoritative_role_seen
+            && task.assignee_type.as_deref() == Some("agent")
+            && task.assignee_id.is_some()
+        {
+            return Ok(task.assignee_id.clone().expect("checked above"));
         }
 
         if let Some(execution) = self

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use api_types::ProjectSettings;
 use async_trait::async_trait;
-use db::{now_rfc3339, RepoRepo, WorkspaceRepo};
+use db::{now_rfc3339, ExecutionRepo, RepoRepo, WorkspaceRepo};
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::json;
 
@@ -165,15 +165,32 @@ async fn target_role_agent_id(ctx: &HookContext) -> Option<String> {
         .iter()
         .find(|state| state.name == ctx.to_state)?;
     let role = effective_role(state)?;
-    db::TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
+    if let Some(execution_id) = ctx.execution_id.as_deref() {
+        if let Ok(Some(execution)) = ExecutionRepo::get_by_id(&*ctx.db, execution_id).await {
+            if let Some(agent_id) = execution.agent_id {
+                return Some(agent_id);
+            }
+        }
+    }
+    match crate::task_service::current_role_memberships_authoritative(&ctx.db, &ctx.task_id, role)
         .await
         .ok()
         .flatten()
-        .and_then(|assignment| {
-            (assignment.assignee_type == Some(db::AssigneeKind::Agent))
-                .then_some(assignment.assignee_id)
-                .flatten()
-        })
+    {
+        Some(memberships) => crate::task_service::select_usable_agent_id(&ctx.db, &memberships)
+            .await
+            .ok()
+            .flatten(),
+        None => db::TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|assignment| {
+                (assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                    .then_some(assignment.assignee_id)
+                    .flatten()
+            }),
+    }
 }
 
 async fn annotate_before_work_hook_block(

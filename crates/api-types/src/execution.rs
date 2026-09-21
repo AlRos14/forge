@@ -5,7 +5,7 @@ use ts_rs::TS;
 use crate::{
     AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionRole,
     ExecutionStatus, InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy,
-    StopReason, TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType,
+    StopReason, TaskAnnotation, TaskRoleAssignmentResponse, TaskRoleResponse, TaskStatus, TaskType,
     WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
 };
 
@@ -49,6 +49,8 @@ pub struct TaskResponse {
     pub subtask_order: Option<i64>,
     #[serde(default)]
     pub role_assignments: Vec<TaskRoleAssignmentResponse>,
+    #[serde(default)]
+    pub task_roles: Vec<TaskRoleResponse>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
     pub remaining_retries: std::collections::HashMap<String, i64>,

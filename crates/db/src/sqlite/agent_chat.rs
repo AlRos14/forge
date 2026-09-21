@@ -208,6 +208,18 @@ impl ProjectAgentBindingRepo for SqliteDb {
         input: ReplaceProjectAgentBinding,
     ) -> Result<ProjectAgentBinding> {
         let mut transaction = self.pool.begin().await?;
+        let replacement = self
+            .replace_project_binding_in_tx(&mut transaction, input)
+            .await?;
+        transaction.commit().await?;
+        Ok(replacement)
+    }
+
+    async fn replace_project_binding_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: ReplaceProjectAgentBinding,
+    ) -> Result<ProjectAgentBinding> {
         let current = sqlx::query(
             "UPDATE project_agent_binding
              SET state = 'replaced', replaced_by_binding_id = NULL,
@@ -220,7 +232,7 @@ impl ProjectAgentBindingRepo for SqliteDb {
         .bind(&input.replacement.updated_at)
         .bind(&input.project_id)
         .bind(input.expected_version)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?
         .ok_or(DbError::VersionConflict)
         .and_then(map_project_agent_binding)?;
@@ -244,7 +256,7 @@ impl ProjectAgentBindingRepo for SqliteDb {
         .bind(current.version)
         .bind(&input.replacement.created_at)
         .bind(&input.replacement.updated_at)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(map_binding_write_error)?;
         sqlx::query(
@@ -254,12 +266,14 @@ impl ProjectAgentBindingRepo for SqliteDb {
         )
         .bind(&input.replacement.id)
         .bind(&current.id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
-        transaction.commit().await?;
-
-        self.get_project_binding(&input.replacement.id)
+        sqlx::query("SELECT * FROM project_agent_binding WHERE id = ?")
+            .bind(&input.replacement.id)
+            .fetch_optional(&mut **transaction)
             .await?
+            .map(map_project_agent_binding)
+            .transpose()?
             .ok_or(DbError::NotFound)
     }
 }

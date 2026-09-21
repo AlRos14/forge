@@ -59,19 +59,13 @@ impl TaskService {
         project_id: &str,
         principal_id: &str,
     ) -> Result<()> {
-        let orchestration_binding_count: i64 = sqlx::query_scalar(
-            "SELECT
-                (SELECT COUNT(*) FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active')
-              + (SELECT COUNT(*) FROM account_main_agent_binding
-                 WHERE identity_id = ? AND state = 'active')",
+        if !crate::task_service::repository_worker_identity_is_eligible(
+            &self.db,
+            project_id,
+            principal_id,
         )
-        .bind(project_id)
-        .bind(principal_id)
-        .bind(principal_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        if orchestration_binding_count > 0 {
+        .await?
+        {
             return Err(ServiceError::invalid_operation(
                 "Main and Project Agent identities cannot receive repository WorkspaceLeases",
             ));
@@ -746,31 +740,87 @@ impl TaskService {
             ));
         };
         let canonical_role = canonical_workspace_lease_role(role)?;
-        let role_assignment = sqlx::query(
-            "SELECT assignee_type, assignee_id
-             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        let target_role = db::canonical_task_role_name(role.trim()).ok_or_else(|| {
+            ServiceError::invalid_operation("WorkspaceLease role is not a TaskRole")
+        })?;
+        let task_role_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM task_role WHERE task_id = ? AND role = ?",
         )
         .bind(&task.id)
-        .bind(role.trim())
+        .bind(&target_role)
         .fetch_optional(&mut **transaction)
         .await?;
-        let explicit_assignee_id = role_assignment
-            .as_ref()
-            .map(|row| row.try_get::<Option<String>, _>("assignee_id"))
-            .transpose()?
-            .flatten();
-        let principal_id = match (principal_id, explicit_assignee_id.as_deref()) {
-            (Some(principal_id), _) => Some(principal_id.to_owned()),
-            (None, Some(assignee_id)) => Some(assignee_id.to_owned()),
-            (None, None) if role_assignment.is_none() => task.assignee_id.clone(),
-            (None, None) => None,
-        }
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "WorkspaceLease requires an assigned Task Worker or reviewer",
+        let principal_id = if let Some(task_role_id) = task_role_id.as_deref() {
+            let members = sqlx::query(
+                "SELECT actor_kind, actor_id, status
+                 FROM role_membership
+                 WHERE task_role_id = ? AND status IN ('active', 'suspended')
+                 ORDER BY created_at, id",
             )
-        })?;
+            .bind(task_role_id)
+            .fetch_all(&mut **transaction)
+            .await?;
+            if let Some(principal_id) = principal_id.filter(|id| !id.trim().is_empty()) {
+                let admitted = members.iter().any(|member| {
+                    member.get::<String, _>("actor_kind") == "agent"
+                        && member.get::<String, _>("actor_id") == principal_id
+                        && member.get::<String, _>("status") == "active"
+                });
+                if !admitted {
+                    return Err(ServiceError::conflict(format!(
+                        "role '{}' membership does not authorize this WorkspaceLease principal",
+                        role.trim()
+                    )));
+                }
+                principal_id.to_owned()
+            } else {
+                let agents = members
+                    .iter()
+                    .filter(|member| {
+                        member.get::<String, _>("actor_kind") == "agent"
+                            && member.get::<String, _>("status") == "active"
+                    })
+                    .map(|member| member.get::<String, _>("actor_id"))
+                    .collect::<Vec<_>>();
+                if agents.len() != 1 {
+                    return Err(ServiceError::invalid_operation(
+                        "WorkspaceLease requires one concrete active Agent membership",
+                    ));
+                }
+                agents[0].clone()
+            }
+        } else {
+            // Bounded compatibility for a database/fixture created before
+            // V088. Once a TaskRole row exists, this legacy path is never
+            // consulted.
+            let role_assignment = sqlx::query(
+                "SELECT assignee_type, assignee_id
+                 FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+            )
+            .bind(&task.id)
+            .bind(role.trim())
+            .fetch_optional(&mut **transaction)
+            .await?;
+            let explicit_assignee_id = role_assignment
+                .as_ref()
+                .map(|row| row.try_get::<Option<String>, _>("assignee_id"))
+                .transpose()?
+                .flatten();
+            match (principal_id, explicit_assignee_id.as_deref()) {
+                (Some(principal_id), _) => principal_id.to_owned(),
+                (None, Some(assignee_id)) => assignee_id.to_owned(),
+                (None, None) if role_assignment.is_none() => task.assignee_id.clone().ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "WorkspaceLease requires an assigned Task Worker or reviewer",
+                    )
+                })?,
+                (None, None) => {
+                    return Err(ServiceError::invalid_operation(
+                        "WorkspaceLease requires an assigned Task Worker or reviewer",
+                    ));
+                }
+            }
+        };
         let orchestration_binding_count: i64 = sqlx::query_scalar(
             "SELECT
                 (SELECT COUNT(*) FROM project_agent_binding
@@ -812,18 +862,27 @@ impl TaskService {
                 "workspace repository does not match the Task repository binding",
             ));
         }
-        if let Some(assignment) = role_assignment {
-            let assignment_type: Option<String> = assignment.get("assignee_type");
-            let assignment_id: Option<String> = assignment.get("assignee_id");
-            if assignment_type.as_deref() != Some("agent")
-                || assignment_id.as_deref() != Some(principal_id.as_str())
-            {
-                return Err(ServiceError::conflict(format!(
-                    "role '{}' is assigned to a different principal",
-                    role.trim()
-                )));
+        if let Some(task_role_id) = task_role_id.as_deref() {
+            let member_is_active: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM role_membership
+                    WHERE task_role_id = ?
+                      AND actor_kind = 'agent'
+                      AND actor_id = ?
+                      AND status = 'active'
+                )",
+            )
+            .bind(task_role_id)
+            .bind(principal_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if member_is_active == 0 {
+                return Err(ServiceError::conflict(
+                    "WorkspaceLease principal is no longer an active TaskRole member",
+                ));
             }
-        } else if (charter_backed || has_task_assignment)
+        }
+        if task_role_id.is_none() && (charter_backed || has_task_assignment)
             && (assigned_type.as_deref() != Some("agent")
                 || assigned_id.as_deref() != Some(principal_id.as_str()))
         {
@@ -1131,6 +1190,62 @@ impl TaskService {
         role: &str,
         principal_id: Option<&str>,
     ) -> Result<String> {
+        let target_role = db::canonical_task_role_name(role.trim()).ok_or_else(|| {
+            ServiceError::invalid_operation("WorkspaceLease role is not a TaskRole")
+        })?;
+        let task_role_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM task_role WHERE task_id = ? AND role = ?",
+        )
+        .bind(&task.id)
+        .bind(&target_role)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some(task_role_id) = task_role_id {
+            let members = sqlx::query(
+                "SELECT actor_kind, actor_id, status
+                 FROM role_membership
+                 WHERE task_role_id = ? AND status IN ('active', 'suspended')
+                 ORDER BY created_at, id",
+            )
+            .bind(task_role_id)
+            .fetch_all(self.db.pool())
+            .await?;
+            let principal_id = if let Some(principal_id) = principal_id.filter(|id| !id.trim().is_empty()) {
+                let admitted = members.iter().any(|member| {
+                    member.get::<String, _>("actor_kind") == "agent"
+                        && member.get::<String, _>("actor_id") == principal_id
+                        && member.get::<String, _>("status") == "active"
+                });
+                if !admitted {
+                    return Err(ServiceError::conflict(format!(
+                        "role '{}' membership does not authorize this WorkspaceLease principal",
+                        role.trim()
+                    )));
+                }
+                principal_id.to_owned()
+            } else {
+                let agents = members
+                    .iter()
+                    .filter(|member| {
+                        member.get::<String, _>("actor_kind") == "agent"
+                            && member.get::<String, _>("status") == "active"
+                    })
+                    .map(|member| member.get::<String, _>("actor_id"))
+                    .collect::<Vec<_>>();
+                if agents.len() != 1 {
+                    return Err(ServiceError::invalid_operation(
+                        "WorkspaceLease requires one concrete active Agent membership",
+                    ));
+                }
+                agents[0].clone()
+            };
+            self.ensure_repository_worker_identity(&task.project_id, &principal_id)
+                .await?;
+            return Ok(principal_id);
+        }
+
+        // Bounded compatibility for pre-V088 rows. New TaskRole records never
+        // fall through to this singleton authority.
         let role_assignment =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role.trim()).await?;
         let principal_id = match (principal_id, role_assignment.as_ref()) {

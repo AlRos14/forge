@@ -23,6 +23,7 @@ use db::{
     CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
 use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
+use events::EventBus;
 use forge_agent_host::RuntimeContextManifestLink;
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
@@ -2706,18 +2707,23 @@ impl AgentChatTurnWorker {
         db: Arc<SqliteDb>,
         embedded_agents: Arc<EmbeddedAgentService>,
         cli_executor: Arc<dyn TaskExecutor>,
+        event_bus: Arc<EventBus>,
     ) -> Self {
         let runner = Arc::new(FederatedAgentChatTurnRunner::new(
             Arc::clone(&db),
             embedded_agents,
             cli_executor,
         ));
-        Self::with_runner(db, runner)
+        Self::with_runner(db, runner, event_bus)
     }
 
-    pub fn with_runner(db: Arc<SqliteDb>, runner: Arc<dyn AgentChatTurnRunner>) -> Self {
+    pub fn with_runner(
+        db: Arc<SqliteDb>,
+        runner: Arc<dyn AgentChatTurnRunner>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
         Self {
-            chat_service: Arc::new(AgentChatService::new(Arc::clone(&db))),
+            chat_service: Arc::new(AgentChatService::new(Arc::clone(&db), event_bus)),
             db,
             runner,
             lease_owner: format!("agent-chat-worker:{}", db::new_uuid_v4()),

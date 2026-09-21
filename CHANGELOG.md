@@ -8,6 +8,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Task responses now include the additive `task_roles` multi-actor
+  participation projection, and new `/task-roles` REST routes expose
+  TaskRole/membership writes with optimistic concurrency. The legacy singular
+  assignment fields remain compatibility-only during the additive migration.
 - Execution log storage is now lossless across rotated gzip segments; clients
   must read the logical sequence through the execution-log API rather than
   assuming `logs_path` is one complete file.

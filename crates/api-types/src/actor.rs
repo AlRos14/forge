@@ -3,6 +3,18 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::RecoveryAction;
+use ts_rs::TS;
+
+/// A durable participant identity.  This is deliberately narrower than the
+/// transition-audit `Actor` below: system components can trigger transitions,
+/// but only Humans and persistent Agents are TaskRole members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ActorRef {
+    Human(String),
+    Agent(String),
+}
 
 /// The typed actor responsible for a task transition.
 ///

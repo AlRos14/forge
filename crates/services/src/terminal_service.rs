@@ -23,10 +23,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use config::TerminalConfig;
 use db::{
-    new_uuid_v4, now_rfc3339, AgentRepo, AssigneeKind, CreateTerminalSession, ProjectRepo,
-    SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, TerminalSession, TerminalSessionRepo,
-    TerminalSessionStatus as DbTerminalSessionStatus, UpdateTerminalSessionStatus, Workspace,
-    WorkspaceRepo, WorkspaceStatus,
+    new_uuid_v4, now_rfc3339, AgentRepo, AssigneeKind, CreateTerminalSession, ExecutionRepo,
+    ProjectRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, TaskRoleRepo, TerminalSession,
+    TerminalSessionRepo, TerminalSessionStatus as DbTerminalSessionStatus,
+    UpdateTerminalSessionStatus, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -805,8 +805,24 @@ impl TerminalService {
         task: &Task,
         _workspace: &Workspace,
     ) -> Result<Option<String>, ServiceError> {
-        if task.assignee_type.as_deref() == Some("agent") {
-            return self.agent_daemon_id(task.assignee_id.as_deref()).await;
+        // A live lease/execution is the concrete workspace authority.  A
+        // membership is never used to grant terminal or embedded workspace
+        // access.  Legacy daemon routing remains available only for tasks
+        // which have not acquired a replacement TaskRole yet.
+        if let Some(lease) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await?
+        {
+            if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &lease.execution_id).await?
+            {
+                return self.agent_daemon_id(execution.agent_id.as_deref()).await;
+            }
+            return Err(ServiceError::TerminalWorkspaceNotReady);
+        }
+
+        if !TaskRoleRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::TerminalWorkspaceNotReady);
         }
 
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
@@ -825,17 +841,22 @@ impl TerminalService {
         else {
             return Ok(None);
         };
-        let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name).await?
+        if task.assignee_type.as_deref() == Some("agent") {
+            return self.agent_daemon_id(task.assignee_id.as_deref()).await;
+        }
+        let Some(assignment) = TaskRoleAssignmentRepo::get_by_task_and_role(
+            &*self.db,
+            &task.id,
+            role_name,
+        )
+        .await?
         else {
             return Ok(None);
         };
         if assignment.assignee_type != Some(AssigneeKind::Agent) {
             return Ok(None);
         }
-
-        self.agent_daemon_id(assignment.assignee_id.as_deref())
-            .await
+        self.agent_daemon_id(assignment.assignee_id.as_deref()).await
     }
 
     async fn agent_daemon_id(

@@ -9,11 +9,11 @@ use config::PublicSearchConfig;
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, Agent, AgentChatRepo,
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
-    AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo, AgentStatus, AssigneeKind,
+    AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo, AgentStatus,
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
     CredentialHandle, CredentialHandleRepo, ExecutionRepo, ExecutionStatus, PageRequest,
     ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RotateAgentSession,
-    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
+    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo,
     UpdateAgentSession, UpsertAgentConnectionHealth,
 };
 use forge_agent_host::{
@@ -1284,23 +1284,52 @@ impl EmbeddedAgentService {
                     ));
                 }
                 // The default Forge workflow calls its implementation role
-                // `coder`, while the embedded authority contract calls the
-                // same write-capable scope a `worker`. Resolve the durable
-                // assignment here without granting anything to an unassigned
-                // identity; reviewers remain an exact role match.
-                let _assignment = TaskRoleAssignmentRepo::list_by_task(&*self.db, task_id)
-                    .await?
-                    .into_iter()
-                    .find(|assignment| {
-                        assignment.assignee_type == Some(AssigneeKind::Agent)
-                            && assignment.assignee_id.as_deref() == Some(identity.id.as_str())
-                            && (assignment.role_name == role.as_str()
-                                || (role == "worker"
-                                    && matches!(assignment.role_name.as_str(), "worker" | "coder")))
-                    })
-                    .ok_or_else(|| {
-                        ServiceError::not_found("task_role_assignment", task_id.clone())
-                    })?;
+                // `coder`, while the target TaskRole calls it `implementer`.
+                // Once a TaskRole exists, only current membership admits this
+                // scope; the old row is consulted only for pre-V088 data.
+                let membership_role = if role == "worker" { "implementer" } else { role.as_str() };
+                match crate::task_service::current_role_memberships_authoritative(
+                    &self.db,
+                    task_id,
+                    membership_role,
+                )
+                .await?
+                {
+                    Some(memberships) => {
+                        if !memberships.iter().any(|membership| {
+                            membership.actor_kind == db::ActorKind::Agent
+                                && membership.actor_id == identity.id
+                                && membership.status == db::RoleMembershipStatus::Active
+                        }) {
+                            return Err(ServiceError::not_found(
+                                "role_membership",
+                                task_id.clone(),
+                            ));
+                        }
+                    }
+                    None => {
+                        let assigned = sqlx::query_scalar::<_, i64>(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM task_role_assignment
+                                WHERE task_id = ? AND assignee_type = 'agent'
+                                  AND assignee_id = ?
+                                  AND (role_name = ? OR (? = 'worker' AND role_name IN ('worker', 'coder')))
+                            )",
+                        )
+                        .bind(task_id)
+                        .bind(&identity.id)
+                        .bind(role)
+                        .bind(role)
+                        .fetch_one(self.db.pool())
+                        .await?;
+                        if assigned == 0 {
+                            return Err(ServiceError::not_found(
+                                "task_role_assignment",
+                                task_id.clone(),
+                            ));
+                        }
+                    }
+                }
                 let access = if role == "reviewer" {
                     WorkspaceAccess::TaskRead
                 } else {
@@ -1337,9 +1366,27 @@ impl EmbeddedAgentService {
                             )
                         }
                 });
-                let claim_admitted = role != "worker"
-                    || (task.assignee_type.as_deref() == Some("agent")
-                        && task.assignee_id.as_deref() == Some(identity.id.as_str()));
+                let claim_admitted = if role != "worker" {
+                    true
+                } else {
+                    match crate::task_service::current_role_memberships_authoritative(
+                        &self.db,
+                        task_id,
+                        "implementer",
+                    )
+                    .await?
+                    {
+                        Some(memberships) => memberships.iter().any(|membership| {
+                            membership.actor_kind == db::ActorKind::Agent
+                                && membership.actor_id == identity.id
+                                && membership.status == db::RoleMembershipStatus::Active
+                        }),
+                        None => {
+                            task.assignee_type.as_deref() == Some("agent")
+                                && task.assignee_id.as_deref() == Some(identity.id.as_str())
+                        }
+                    }
+                };
                 if !claim_admitted || !active_execution {
                     return Err(ServiceError::not_found(
                         "active_task_execution",

@@ -1,4 +1,5 @@
 use super::super::*;
+use db::{RoleMembershipRepo, TaskRoleRepo};
 
 #[tokio::test]
 async fn orchestration_identity_claim_fails_before_workspace_or_branch_creation() {
@@ -402,6 +403,73 @@ async fn claim_rejects_conflicting_implicit_assignee_assignment() {
         Err(error) => panic!("expected conflict, got {error:?}"),
         Ok(_) => panic!("expected conflict, got successful claim"),
     }
+    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(task_after.status, "todo");
+}
+
+#[tokio::test]
+async fn claim_rejects_suspended_authoritative_membership() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    update_project_workflow(&db, &project_id, &implicit_assignee_workflow()).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Suspended claim",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    service
+        .assign_role_membership(role_assignment_input(
+            &task.id,
+            default_roles::ASSIGNEE,
+            Some(agent_id.clone()),
+            None,
+        ))
+        .await
+        .expect("assignee role preassigns");
+    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("TaskRole loads")
+        .expect("TaskRole exists");
+    let membership = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
+        .await
+        .expect("membership loads")
+        .into_iter()
+        .next()
+        .expect("membership exists");
+    let suspended = service
+        .update_task_role_member(
+            &task.id,
+            &membership.id,
+            membership.version,
+            db::RoleMembershipStatus::Suspended,
+        )
+        .await
+        .expect("membership suspends");
+    assert_eq!(suspended.status, db::RoleMembershipStatus::Suspended);
+
+    let result = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::Conflict(message)) if message.contains("membership is suspended")
+    ));
     let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")

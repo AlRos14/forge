@@ -1,19 +1,24 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CreateProjectMember, ProjectMember, ProjectMemberRepo, SqliteDb,
+    new_uuid_v4, now_rfc3339, CreateProjectMember, ProjectMember, ProjectMemberRepo, ProjectRepo,
+    SqliteDb,
 };
+use api_types::ActorRef;
+use events::EventBus;
+use sqlx::Row;
 
-use crate::{Result, ServiceError};
+use crate::{project_actor_scope, Result, ServiceError};
 
 #[derive(Clone)]
 pub struct ProjectMemberService {
     db: Arc<SqliteDb>,
+    event_bus: Arc<EventBus>,
 }
 
 impl ProjectMemberService {
-    pub fn new(db: Arc<SqliteDb>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self { db, event_bus }
     }
 
     pub async fn list_members(
@@ -122,7 +127,42 @@ impl ProjectMemberService {
                 return Err(ServiceError::Conflict("last_owner".to_owned()));
             }
         }
-        ProjectMemberRepo::remove_member(&*self.db, project_id, target_user_id).await?;
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let now = now_rfc3339();
+        let mut transaction = self.db.pool().begin().await?;
+        ProjectMemberRepo::remove_member_in_tx(
+            &*self.db,
+            &mut transaction,
+            project_id,
+            target_user_id,
+        )
+        .await?;
+
+        let account_agents = sqlx::query(
+            "SELECT id FROM agent_current WHERE visibility = 'account' AND owner_id = ? ORDER BY id",
+        )
+        .bind(target_user_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut affected_actors = vec![ActorRef::Human(target_user_id.to_owned())];
+        affected_actors.extend(
+            account_agents
+                .into_iter()
+                .map(|row| row.try_get::<String, _>("id").map(ActorRef::Agent))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+        let effects = project_actor_scope::reconcile_project_actor_memberships_in_tx(
+            &mut transaction,
+            project_id,
+            project.owner_id.as_deref(),
+            &affected_actors,
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        project_actor_scope::publish_scope_revocation_events(&self.event_bus, &effects);
         Ok(())
     }
 
@@ -161,11 +201,15 @@ fn is_admin_or_owner(role: &str) -> bool {
 mod tests {
     use super::*;
     use db::{create_sqlite_pool, run_migrations, SqliteDb};
+    use events::EventBus;
 
     async fn test_service() -> ProjectMemberService {
         let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
         run_migrations(&pool).await.unwrap();
-        ProjectMemberService::new(Arc::new(SqliteDb::new(pool)))
+        ProjectMemberService::new(
+            Arc::new(SqliteDb::new(pool)),
+            Arc::new(EventBus::new(16)),
+        )
     }
 
     async fn seed_user(db: &SqliteDb, user_id: &str, email: &str) {

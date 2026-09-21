@@ -1514,13 +1514,26 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     .expect("harmless Task edit does not invalidate the lease");
     assert_eq!(renewed_after_task_edit.len(), 1);
 
-    sqlx::query(
-        "UPDATE task_role_assignment SET assignee_id = 'reassigned-agent' WHERE task_id = ? AND role_name = 'coder'",
+    let task_role_id: String = sqlx::query_scalar(
+        "SELECT id FROM task_role WHERE task_id = ? AND role = 'implementer'",
     )
     .bind(&renewed[0].task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("replacement TaskRole exists");
+    let ended_at = now.to_rfc3339();
+    sqlx::query(
+        "UPDATE role_membership
+         SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
+         WHERE task_role_id = ? AND actor_kind = 'agent' AND actor_id = ? AND status = 'active'",
+    )
+    .bind(&ended_at)
+    .bind(&ended_at)
+    .bind(&task_role_id)
+    .bind(&agent_id)
     .execute(db.pool())
     .await
-    .expect("reassign the role membership");
+    .expect("end the authoritative role membership");
     let rejected = WorkspaceLeaseRepo::renew_active(
         &db,
         &(now + chrono::Duration::seconds(2)).to_rfc3339(),
@@ -1532,8 +1545,9 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     .expect("authority change is skipped instead of poisoning the heartbeat pass");
     assert!(rejected.is_empty());
 
-    // Removing the explicit role row restores the legacy task-level fallback;
-    // the fallback is considered only when no explicit assignment exists.
+    // Removing the stale singleton projection does not restore authority: the
+    // replacement TaskRole remains authoritative even when it has no current
+    // eligible Agent membership.
     sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'")
         .bind(&renewed[0].task_id)
         .execute(db.pool())
@@ -1547,8 +1561,8 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
         10,
     )
     .await
-    .expect("legacy fallback renewal succeeds when no role assignment exists");
-    assert_eq!(fallback_renewal.len(), 1);
+    .expect("ended membership keeps the heartbeat fail-closed");
+    assert!(fallback_renewal.is_empty());
 }
 
 #[tokio::test]

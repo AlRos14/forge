@@ -188,15 +188,26 @@ impl TaskService {
             .and_then(|state| state.gate_config.as_ref())
             .is_some_and(|gate_config| gate_config.optional_when_unassigned())
         {
-            let planner_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-                &*self.db,
+            let planner_assigned = match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
                 &task.id,
                 crate::workflow::default_roles::PLANNER,
             )
-            .await?;
-            let planner_assigned = planner_assignment.as_ref().is_some_and(|assignment| {
-                assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
-            });
+            .await?
+            {
+                Some(memberships) => memberships
+                    .iter()
+                    .any(|membership| membership.status == db::RoleMembershipStatus::Active),
+                None => TaskRoleAssignmentRepo::get_by_task_and_role(
+                    &*self.db,
+                    &task.id,
+                    crate::workflow::default_roles::PLANNER,
+                )
+                .await?
+                .is_some_and(|assignment| {
+                    assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
+                }),
+            };
             if !planner_assigned {
                 return Ok(());
             }
@@ -299,13 +310,28 @@ impl TaskService {
             let Some(role_name) = state.role.as_deref() else {
                 return Ok(false);
             };
-            let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
-                    .await?;
-            return Ok(assignment.as_ref().is_some_and(|assignment| {
-                assignment.assignee_type == Some(AssigneeKind::User)
-                    && assignment.assignee_id.is_some()
-            }));
+            return Ok(match crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task_id,
+                role_name,
+            )
+            .await?
+            {
+                Some(memberships) => memberships.iter().any(|membership| {
+                    membership.actor_kind == db::ActorKind::Human
+                        && membership.status == db::RoleMembershipStatus::Active
+                }),
+                None => TaskRoleAssignmentRepo::get_by_task_and_role(
+                    &*self.db,
+                    &task_id,
+                    role_name,
+                )
+                .await?
+                .is_some_and(|assignment| {
+                    assignment.assignee_type == Some(AssigneeKind::User)
+                        && assignment.assignee_id.is_some()
+                }),
+            });
         }
         if state.kind != api_types::StateKind::Gate {
             return Ok(false);
@@ -332,12 +358,26 @@ impl TaskService {
                 let Some(role_name) = state.role.as_deref() else {
                     return Ok(false);
                 };
-                let assignment =
-                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
-                        .await?;
-                let assigned = assignment.as_ref().is_some_and(|assignment| {
-                    assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
-                });
+                let assigned = match crate::task_service::current_role_memberships_authoritative(
+                    &self.db,
+                    &task_id,
+                    role_name,
+                )
+                .await?
+                {
+                    Some(memberships) => memberships
+                        .iter()
+                        .any(|membership| membership.status == db::RoleMembershipStatus::Active),
+                    None => TaskRoleAssignmentRepo::get_by_task_and_role(
+                        &*self.db,
+                        &task_id,
+                        role_name,
+                    )
+                    .await?
+                    .is_some_and(|assignment| {
+                        assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
+                    }),
+                };
                 if !assigned {
                     return Ok(false);
                 }
@@ -349,18 +389,22 @@ impl TaskService {
             return Ok(false);
         };
 
-        let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task_id).await?;
-        let Some(assignment) = role_assignments
-            .iter()
-            .find(|assignment| assignment.role_name == role_name)
-        else {
-            return Ok(false);
+        let has_human_reviewer = match crate::task_service::current_role_memberships_authoritative(
+            &self.db,
+            &task_id,
+            role_name,
+        )
+        .await?
+        {
+            Some(memberships) => memberships.iter().any(|membership| {
+                membership.actor_kind == db::ActorKind::Human
+                    && membership.status == db::RoleMembershipStatus::Active
+            }),
+            None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
+                .await?
+                .is_some_and(|assignment| assignment.assignee_type == Some(AssigneeKind::User)),
         };
-        if assignment.assignee_type != Some(AssigneeKind::User) {
-            return Ok(false);
-        }
-
-        Ok(!has_decision_since_entry)
+        Ok(has_human_reviewer && !has_decision_since_entry)
     }
 
     pub async fn executor_attempt_count(&self, task_id: &str) -> Result<i64> {

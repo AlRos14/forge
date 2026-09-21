@@ -1,8 +1,9 @@
 use crate::Result;
 use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, CreateProject,
-    CreateRepo, CreateTask, DaemonRepo, DaemonStatus, PageRequest, Project, ProjectRepo, Repo,
-    RepoRepo, SortBy, SortOrder, SqliteDb, TaskRepo, UpdateDaemonReport, UpdateTask, UpsertDaemon,
+    CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, PageRequest,
+    Project, ProjectRepo, Repo, RepoRepo, SortBy, SortOrder, SqliteDb, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateTask, UpsertDaemon,
 };
 
 struct DemoTask {
@@ -312,16 +313,11 @@ async fn install_demo_tasks(
                 repo_id: Some(repo_id.to_owned()),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: if is_active {
-                    Some("agent".to_owned())
-                } else {
-                    None
-                },
-                assignee_id: if is_active {
-                    Some(agent_id.to_owned())
-                } else {
-                    None
-                },
+                // Demo data uses the same membership writer as normal Task
+                // creation.  The task-level fields are a projection, not an
+                // independent assignment source.
+                assignee_type: None,
+                assignee_id: None,
                 title: demo_task.title.to_owned(),
                 description: Some(demo_task.description.to_owned()),
                 task_type: "implementation".to_owned(),
@@ -336,6 +332,22 @@ async fn install_demo_tasks(
             },
         )
         .await?;
+
+        if is_active {
+            TaskRoleAssignmentRepo::assign(
+                db,
+                CreateTaskRoleAssignment {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    role_name: "coder".to_owned(),
+                    assignee_type: Some(db::AssigneeKind::Agent),
+                    assignee_id: Some(agent_id.to_owned()),
+                    created_at: now.to_owned(),
+                    updated_at: now.to_owned(),
+                },
+            )
+            .await?;
+        }
 
         if let Some(annotation) = demo_task.error_annotation {
             TaskRepo::update(

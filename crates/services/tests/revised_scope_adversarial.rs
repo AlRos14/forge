@@ -7,6 +7,7 @@ use db::{
     ProjectMemberRepo, ProjectRepo, SqliteDb, TaskRepo,
 };
 use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
+use events::EventBus;
 use serde_json::json;
 use services::{
     AgentChatService, CoordinationToolProvider, SendAgentChatMessageInput, SetMainAgentBindingInput,
@@ -158,7 +159,7 @@ async fn main_identity(db: &Arc<SqliteDb>, identity_id: &str) -> String {
     )
     .await
     .expect("Main identity creates");
-    let chat_service = AgentChatService::new(Arc::clone(db));
+    let chat_service = AgentChatService::new(Arc::clone(db), Arc::new(EventBus::new(16)));
     let chat = chat_service
         .ensure_main_chat("user-1")
         .await
@@ -547,11 +548,11 @@ async fn project_chat_never_infers_worker_as_binding() {
             .expect("project always has one singular binding");
     assert_eq!(binding.state, "agent_setup_required");
     assert_eq!(binding.identity_id, None);
-    let chat = AgentChatService::new(Arc::clone(&db))
+    let chat = AgentChatService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .ensure_project_chat("project-worker-primary")
         .await
         .expect("Project Chat creates");
-    let service = AgentChatService::new(Arc::clone(&db));
+    let service = AgentChatService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let error = service
         .send_message(SendAgentChatMessageInput {
             actor_user_id: "user-1".to_owned(),

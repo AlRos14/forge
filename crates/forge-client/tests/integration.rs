@@ -565,6 +565,7 @@ fn task_response(
         board_position: 0.0,
         subtask_order: None,
         role_assignments: Vec::new(),
+        task_roles: Vec::new(),
         remaining_retries: HashMap::new(),
         execution_actions: Vec::new(),
         error_annotation: None,

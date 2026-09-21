@@ -1,4 +1,6 @@
 use super::super::*;
+use api_types::ActorRef;
+use db::{CoordinationMode, TaskRoleRepo};
 
 #[tokio::test]
 async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
@@ -1277,6 +1279,199 @@ async fn follow_up_execution_creates_interactive_child() {
 }
 
 #[tokio::test]
+async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_task_executor(Arc::new(NoDiffExecutor))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial role assignment succeeds");
+    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("TaskRole loads")
+        .expect("TaskRole exists");
+    service
+        .update_task_role(
+            &task.id,
+            "implementer",
+            role.version,
+            Some(CoordinationMode::Collaborative),
+            None,
+        )
+        .await
+        .expect("coordination mode updates");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
+        .await
+        .expect("second membership creates");
+    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
+    let now = now_rfc3339();
+    let parent_execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_b.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("parent execution".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"codex","config":{}}"#.to_owned(),
+            ),
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("parent execution creates");
+
+    let follow_up = service
+        .dispatch_role_follow_up(
+            &task.id,
+            "coder",
+            parent_execution.id.clone(),
+            "continue current work".to_owned(),
+            "test",
+        )
+        .await
+        .expect("role follow-up succeeds");
+
+    assert_eq!(follow_up.agent_id.as_deref(), Some(agent_b.as_str()));
+    let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
+        .await
+        .expect("historical parent loads")
+        .expect("historical parent exists");
+    assert_eq!(historical_parent.agent_id.as_deref(), Some(agent_b.as_str()));
+}
+
+#[tokio::test]
+async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_task_executor(Arc::new(NoDiffExecutor))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial role assignment succeeds");
+    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("TaskRole loads")
+        .expect("TaskRole exists");
+    service
+        .update_task_role(
+            &task.id,
+            "implementer",
+            role.version,
+            Some(CoordinationMode::Collaborative),
+            None,
+        )
+        .await
+        .expect("coordination mode updates");
+    let membership_b = service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
+        .await
+        .expect("second membership creates");
+    service
+        .update_task_role_member(
+            &task.id,
+            &membership_b.id,
+            membership_b.version,
+            db::RoleMembershipStatus::Suspended,
+        )
+        .await
+        .expect("lineage membership suspends");
+    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
+    let now = now_rfc3339();
+    let parent_execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_b.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("parent execution".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"codex","config":{}}"#.to_owned(),
+            ),
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("parent execution creates");
+
+    let follow_up = service
+        .dispatch_role_follow_up(
+            &task.id,
+            "coder",
+            parent_execution.id.clone(),
+            "continue with the current eligible Agent".to_owned(),
+            "test",
+        )
+        .await
+        .expect("role follow-up succeeds");
+
+    assert_eq!(follow_up.agent_id.as_deref(), Some(agent_a.as_str()));
+    let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
+        .await
+        .expect("historical parent loads")
+        .expect("historical parent exists");
+    assert_eq!(historical_parent.agent_id.as_deref(), Some(agent_b.as_str()));
+}
+
+#[tokio::test]
 async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -1818,20 +2013,52 @@ async fn follow_up_execution_rejects_executor_mismatch() {
 }
 
 #[tokio::test]
-async fn re_execute_cancelled_execution_dispatches_fresh() {
+async fn re_execute_uses_current_membership_not_legacy_projection() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .reassign_role(
+            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial role assignment succeeds");
+    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("TaskRole loads")
+        .expect("TaskRole exists");
+    service
+        .update_task_role(
+            &task.id,
+            "implementer",
+            role.version,
+            Some(CoordinationMode::Collaborative),
+            None,
+        )
+        .await
+        .expect("coordination mode updates");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
+        .await
+        .expect("second membership creates");
+    let projection = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "coder")
+        .await
+        .expect("legacy projection loads")
+        .expect("legacy projection exists");
+    assert_eq!(projection.assignee_id.as_deref(), Some(agent_a.as_str()));
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            agent_id: Some(agent_id),
+            agent_id: Some(agent_b.clone()),
             role: "coder".to_owned(),
             status: ExecutionStatus::Cancelled,
             stop_reason: None,
@@ -1865,8 +2092,14 @@ async fn re_execute_cancelled_execution_dispatches_fresh() {
 
     assert_eq!(result.execution.role, "coder".to_owned());
     assert_eq!(result.execution.status, ExecutionStatus::Running);
+    assert_eq!(result.execution.agent_id.as_deref(), Some(agent_b.as_str()));
     assert_eq!(result.execution.parent_execution_id, None);
     assert_eq!(result.execution.agent_session_id, None);
+    let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
+        .await
+        .expect("historical parent loads")
+        .expect("historical parent exists");
+    assert_eq!(historical_parent.agent_id.as_deref(), Some(agent_b.as_str()));
 }
 
 #[tokio::test]

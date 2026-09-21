@@ -1,4 +1,5 @@
 use super::*;
+use api_types::ActorRef;
 
 impl TaskService {
     #[allow(clippy::too_many_arguments)]
@@ -103,9 +104,9 @@ impl TaskService {
         let prepared_governance = self
             .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, governance)
             .await?;
+        let workflow_roles: std::collections::HashSet<&str> =
+            workflow.roles.iter().map(|r| r.name.as_str()).collect();
         let validated_assignments = if let Some(ref assignments) = role_assignments {
-            let workflow_roles: std::collections::HashSet<&str> =
-                workflow.roles.iter().map(|r| r.name.as_str()).collect();
             let mut validated = Vec::with_capacity(assignments.len());
             for assignment in assignments {
                 if !workflow_roles.contains(assignment.role_name.as_str()) {
@@ -133,6 +134,37 @@ impl TaskService {
             Some(validated)
         } else {
             None
+        };
+        if let Some(assignments) = validated_assignments.as_deref() {
+            for (_, assignee_type, assignee_id) in assignments {
+                if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
+                    self.validate_actor_for_project(&project, &actor_ref).await?;
+                }
+            }
+        }
+        let explicit_roles = validated_assignments
+            .as_ref()
+            .map(|assignments| {
+                assignments
+                    .iter()
+                    .map(|(role_name, _, _)| role_name.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let default_assignments = if is_root {
+            let assignments = project_default_role_assignments(
+                &project,
+                &workflow_roles,
+                &explicit_roles,
+            )?;
+            for (_, assignee_type, assignee_id) in &assignments {
+                if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
+                    self.validate_actor_for_project(&project, &actor_ref).await?;
+                }
+            }
+            assignments
+        } else {
+            Vec::new()
         };
 
         let metadata_json = if is_subtask {
@@ -192,25 +224,21 @@ impl TaskService {
 
         if let Some(assignments) = validated_assignments {
             for (role_name, assignee_type, assignee_id) in assignments {
-                TaskRoleAssignmentRepo::assign(
-                    &*self.db,
-                    CreateTaskRoleAssignment {
-                        id: new_uuid_v4(),
-                        task_id: task.id.clone(),
-                        role_name,
-                        assignee_type: Some(assignee_type),
-                        assignee_id: Some(assignee_id),
-                        created_at: now.clone(),
-                        updated_at: now.clone(),
-                    },
-                )
+                self.assign_role_membership(CreateTaskRoleAssignment {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    role_name,
+                    assignee_type: Some(assignee_type),
+                    assignee_id: Some(assignee_id),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
                 .await?;
             }
         }
 
-        if is_root {
-            self.assign_project_default_roles(&task).await?;
-        }
+        self.assign_project_default_roles(&task, default_assignments)
+            .await?;
 
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),
@@ -338,87 +366,78 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task.id))
     }
 
-    async fn assign_project_default_roles(&self, task: &Task) -> Result<()> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let settings =
-            serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid project settings: {error}"))
-            })?;
-        if settings.default_role_assignments.is_empty() {
-            return Ok(());
-        }
-
-        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let workflow_roles = workflow
-            .roles
-            .iter()
-            .map(|role| role.name.as_str())
-            .collect::<HashSet<_>>();
-        let mut covered_roles = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
-            .await?
-            .into_iter()
-            .map(|assignment| assignment.role_name)
-            .collect::<HashSet<_>>();
-
-        for assignment in settings.default_role_assignments {
-            let role_name = assignment.role_name;
-            if !workflow_roles.contains(role_name.as_str()) || covered_roles.contains(&role_name) {
-                continue;
-            }
-
-            let assignee_type = assignment.assignee_type;
-            let assignee_id = match assignee_type.as_str() {
-                "agent" => {
-                    let Some(assignee_id) = assignment
-                        .assignee_id
-                        .filter(|assignee_id| !assignee_id.trim().is_empty())
-                    else {
-                        return Err(ServiceError::invalid_operation(format!(
-                            "default role assignment for role '{role_name}' requires assignee_id"
-                        )));
-                    };
-                    assignee_id
-                }
-                "user" => {
-                    let Some(assignee_id) = assignment
-                        .assignee_id
-                        .filter(|assignee_id| !assignee_id.trim().is_empty())
-                    else {
-                        return Err(ServiceError::invalid_operation(format!(
-                            "default role assignment for role '{role_name}' requires assignee_id"
-                        )));
-                    };
-                    assignee_id
-                }
-                _ => {
-                    return Err(ServiceError::invalid_operation(format!(
-                        "default role assignment for role '{role_name}' must use assignee_type 'agent' or 'user'"
-                    )));
-                }
-            };
-            let assignee_type = assignee_type
-                .parse::<AssigneeKind>()
-                .map_err(ServiceError::invalid_operation)?;
-
+    async fn assign_project_default_roles(
+        &self,
+        task: &Task,
+        assignments: Vec<(String, AssigneeKind, String)>,
+    ) -> Result<()> {
+        for (role_name, assignee_type, assignee_id) in assignments {
             let now = now_rfc3339();
-            TaskRoleAssignmentRepo::assign(
-                &*self.db,
-                CreateTaskRoleAssignment {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    role_name: role_name.clone(),
-                    assignee_type: Some(assignee_type),
-                    assignee_id: Some(assignee_id),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-            )
+            self.assign_role_membership(CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: role_name.clone(),
+                assignee_type: Some(assignee_type),
+                assignee_id: Some(assignee_id),
+                created_at: now.clone(),
+                updated_at: now,
+            })
             .await?;
-            covered_roles.insert(role_name);
         }
 
         Ok(())
+    }
+}
+
+fn project_default_role_assignments(
+    project: &db::Project,
+    workflow_roles: &HashSet<&str>,
+    covered_roles: &HashSet<String>,
+) -> Result<Vec<(String, AssigneeKind, String)>> {
+    let settings = serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid project settings: {error}"))
+    })?;
+    let mut covered_roles = covered_roles.clone();
+    let mut result = Vec::new();
+    for assignment in settings.default_role_assignments {
+        let role_name = assignment.role_name;
+        if !workflow_roles.contains(role_name.as_str()) || covered_roles.contains(&role_name) {
+            continue;
+        }
+        if !matches!(assignment.assignee_type.as_str(), "agent" | "user") {
+            return Err(ServiceError::invalid_operation(format!(
+                "default role assignment for role '{role_name}' must use assignee_type 'agent' or 'user'"
+            )));
+        }
+        let assignee_id = assignment
+            .assignee_id
+            .filter(|assignee_id| !assignee_id.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "default role assignment for role '{role_name}' requires assignee_id"
+                ))
+            })?;
+        let assignee_type = assignment
+            .assignee_type
+            .parse::<AssigneeKind>()
+            .map_err(ServiceError::invalid_operation)?;
+        result.push((role_name.clone(), assignee_type, assignee_id));
+        covered_roles.insert(role_name);
+    }
+    Ok(result)
+}
+
+fn actor_ref_for_assignment(
+    assignee_type: &AssigneeKind,
+    assignee_id: &str,
+) -> Option<ActorRef> {
+    match assignee_type {
+        AssigneeKind::Agent => Some(ActorRef::Agent(assignee_id.to_owned())),
+        AssigneeKind::User if assignee_id != "human" => {
+            Some(ActorRef::Human(assignee_id.to_owned()))
+        }
+        // The pre-existing "human" project-settings sentinel is a bounded
+        // legacy/manual path, not a persisted ActorRef.
+        AssigneeKind::User => None,
     }
 }

@@ -11,7 +11,8 @@ use std::{
 // Keep this module's source revisioned when adding a migration: include_dir's
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
-// migration after the initial build).
+// migration after the initial build). V088 adds the additive TaskRole and
+// RoleMembership migration.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

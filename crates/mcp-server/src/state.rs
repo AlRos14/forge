@@ -26,7 +26,10 @@ impl AppState {
         task_service: Arc<TaskService>,
         agent_service: Arc<AgentService>,
     ) -> Self {
-        let agent_chat_service = Arc::new(AgentChatService::new(Arc::clone(&db)));
+        let agent_chat_service = Arc::new(AgentChatService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        ));
         Self {
             db,
             task_service,

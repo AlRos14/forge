@@ -290,6 +290,15 @@ fn export_typescript() {
     SaveWorkflowTemplateRequest::export().expect("export SaveWorkflowTemplateRequest");
     UpdateProjectWorkflowRequest::export().expect("export UpdateProjectWorkflowRequest");
     TaskRoleAssignmentResponse::export().expect("export TaskRoleAssignmentResponse");
+    ActorRef::export().expect("export ActorRef");
+    CoordinationMode::export().expect("export CoordinationMode");
+    RoleMembershipStatus::export().expect("export RoleMembershipStatus");
+    RoleMembershipResponse::export().expect("export RoleMembershipResponse");
+    TaskRoleResponse::export().expect("export TaskRoleResponse");
+    CreateTaskRoleRequest::export().expect("export CreateTaskRoleRequest");
+    UpdateTaskRoleRequest::export().expect("export UpdateTaskRoleRequest");
+    AddRoleMembershipRequest::export().expect("export AddRoleMembershipRequest");
+    UpdateRoleMembershipRequest::export().expect("export UpdateRoleMembershipRequest");
     AssignRoleRequest::export().expect("export AssignRoleRequest");
     assignee::AssigneeKind::export().expect("export AssigneeKind");
     DefaultRoleAssignment::export().expect("export DefaultRoleAssignment");

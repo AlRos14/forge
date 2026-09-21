@@ -35,12 +35,14 @@ use crate::{
     SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo,
     SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task, TaskComment,
     TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo,
-    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
+    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
+    TerminalSessionStatus,
     TransferAgentCommitment, UpdateAgent, UpdateAgentAction, UpdateAgentChat,
     UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
     UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
-    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
-    UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth, UpsertDaemon,
+    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo,
+    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
+    UpsertAttentionConsumerHealth, UpsertDaemon,
     UpsertExecutionUsage, Workspace, WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo,
     WorkspaceStatus,
 };
@@ -79,6 +81,7 @@ mod project_hook_run;
 mod project_member;
 mod provider_authorization;
 mod repo;
+mod role;
 mod review;
 mod runtime;
 mod shared_media;
@@ -159,10 +162,10 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
         (SortBy::Status, SortOrder::Asc) => "status ASC, id ASC",
         (SortBy::Status, SortOrder::Desc) => "status DESC, id DESC",
         (SortBy::Agent, SortOrder::Asc) => {
-            "(SELECT assignee_id FROM task_role_assignment WHERE task_id = task.id AND role_name = 'coder' ORDER BY assignee_id ASC LIMIT 1) ASC, id ASC"
+            "CASE WHEN EXISTS (SELECT 1 FROM task_role WHERE task_id = task.id AND role = 'implementer') THEN (SELECT rm.actor_id FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active' ORDER BY rm.actor_id ASC, rm.created_at ASC, rm.id ASC LIMIT 1) ELSE (SELECT assignee_id FROM task_role_assignment WHERE task_id = task.id AND role_name = 'coder' ORDER BY assignee_id ASC LIMIT 1) END ASC, id ASC"
         }
         (SortBy::Agent, SortOrder::Desc) => {
-            "(SELECT assignee_id FROM task_role_assignment WHERE task_id = task.id AND role_name = 'coder' ORDER BY assignee_id DESC LIMIT 1) DESC, id DESC"
+            "CASE WHEN EXISTS (SELECT 1 FROM task_role WHERE task_id = task.id AND role = 'implementer') THEN (SELECT rm.actor_id FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active' ORDER BY rm.actor_id DESC, rm.created_at DESC, rm.id DESC LIMIT 1) ELSE (SELECT assignee_id FROM task_role_assignment WHERE task_id = task.id AND role_name = 'coder' ORDER BY assignee_id DESC LIMIT 1) END DESC, id DESC"
         }
         (SortBy::TaskType, SortOrder::Asc) => "task_type ASC, id ASC",
         (SortBy::TaskType, SortOrder::Desc) => "task_type DESC, id DESC",
