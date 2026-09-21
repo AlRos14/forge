@@ -6,6 +6,7 @@ use db::{
     ProjectMemberRepo, ProjectRepo, SqliteDb,
 };
 use services::embedded_agent_service::RequestedCanonicalScope;
+use events::EventBus;
 use services::{
     AgentChatService, EmbeddedAgentService, SetMainAgentBindingInput, SetProjectAgentBindingInput,
 };
@@ -155,7 +156,7 @@ async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
 async fn main_chat_is_not_task_capable_even_with_broad_identity_policy() {
     let db = sqlite_db().await;
     let (identity_id, profile_id) = identity(&db).await;
-    let chats = AgentChatService::new(Arc::clone(&db));
+    let chats = AgentChatService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     chats
         .set_main_binding(SetMainAgentBindingInput {
             actor_user_id: "user-1".to_owned(),
@@ -221,7 +222,7 @@ async fn project_chat_gets_task_management_only_after_charter_setup_for_its_owni
     )
     .await
     .expect("Project member");
-    let chats = AgentChatService::new(Arc::clone(&db));
+    let chats = AgentChatService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     chats
         .set_project_binding(SetProjectAgentBindingInput {
             actor_user_id: "user-1".to_owned(),

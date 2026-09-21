@@ -19,6 +19,7 @@ use db::{
     ReplaceProjectAgentBinding, SqliteDb, UpdateAgentChat,
 };
 use api_types::ActorRef;
+use events::EventBus;
 use serde_json::json;
 use sqlx::Row;
 
@@ -124,6 +125,7 @@ pub struct AgentChatHandoffOutcome {
 #[derive(Clone)]
 pub struct AgentChatService<D> {
     db: Arc<D>,
+    event_bus: Arc<EventBus>,
 }
 
 impl<D> std::fmt::Debug for AgentChatService<D> {
@@ -135,8 +137,8 @@ impl<D> std::fmt::Debug for AgentChatService<D> {
 }
 
 impl<D> AgentChatService<D> {
-    pub fn new(db: Arc<D>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<D>, event_bus: Arc<EventBus>) -> Self {
+        Self { db, event_bus }
     }
 }
 
@@ -897,7 +899,7 @@ impl AgentChatService<SqliteDb> {
                     },
                 )
                 .await?;
-                if let Some(identity_id) = previous_identity_id.flatten() {
+                let effects = if let Some(identity_id) = previous_identity_id.flatten() {
                     project_actor_scope::reconcile_project_actor_memberships_in_tx(
                         &mut transaction,
                         &project_id,
@@ -905,9 +907,12 @@ impl AgentChatService<SqliteDb> {
                         &[ActorRef::Agent(identity_id)],
                         &now,
                     )
-                    .await?;
-                }
+                    .await?
+                } else {
+                    Vec::new()
+                };
                 transaction.commit().await?;
+                project_actor_scope::publish_scope_revocation_events(&self.event_bus, &effects);
                 binding
             }
             (Some(_), Some(_)) => return Err(ServiceError::Db(db::DbError::VersionConflict)),

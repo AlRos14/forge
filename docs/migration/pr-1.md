@@ -102,8 +102,10 @@ ordered by membership creation and id, is a compatibility display value only.
 
 Authoritative membership mutation and required compatibility projection
 synchronization commit in one database transaction. A failed projection or
-compatibility update rolls back the membership change. Task and membership
-events are emitted only after commit succeeds.
+compatibility update rolls back the membership change. Scope-revocation sweeps
+return deduplicated affected Task effects, and their `task.updated` events are
+published only after the Project-scope transaction commits successfully. Task
+and membership events are never emitted for a rolled-back sweep.
 
 The transition is protected by:
 
@@ -219,7 +221,8 @@ counterexamples:
 * invalid or multi-member legacy mutations preserve running Executions.
 * Project member removal and Project Agent binding replacement end only
   memberships that lose all valid Project scope, preserve alternate validity,
-  rebuild projections, and leave unrelated Projects untouched.
+  rebuild projections, leave unrelated Projects untouched, and publish
+  post-commit `task.updated` effects for affected Tasks.
 
 The existing Plan PR1 authority-cutover regression tests remain in the branch
 and were not executed in this pass. Focused tests were added for review; no

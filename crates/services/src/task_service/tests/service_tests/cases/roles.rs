@@ -1885,7 +1885,8 @@ async fn reassign_same_coder_noop_preserves_review_passed_at() {
 #[tokio::test]
 async fn project_member_removal_ends_human_membership_and_preserves_history() {
     let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let owner_id = seed_human_user(&db).await;
     let member_id = seed_human_user(&db).await;
@@ -1904,11 +1905,21 @@ async fn project_member_removal_ends_human_membership_and_preserves_history() {
         )
         .await
         .expect("Human membership creates");
+    let mut events = event_bus.subscribe();
 
-    ProjectMemberService::new(Arc::clone(&db))
+    ProjectMemberService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .remove_member(&project_id, &owner_id, &member_id)
         .await
         .expect("Project member removal succeeds");
+
+    let event = events.recv().await.expect("scope revocation event emits");
+    assert_eq!(event.event_type, "task.updated");
+    assert_eq!(event.entity_id, task.id);
+    match event.context {
+        EventContext::TaskUpdated { project_id: emitted } => assert_eq!(emitted, project_id),
+        other => panic!("unexpected scope revocation event context: {other:?}"),
+    }
+    assert!(events.try_recv().is_err());
 
     let history = RoleMembershipRepo::list_by_role(&*db, &role.id, true)
         .await
@@ -1949,7 +1960,7 @@ async fn project_member_removal_ends_owned_account_agent_membership() {
         .await
         .expect("account Agent membership creates");
 
-    ProjectMemberService::new(Arc::clone(&db))
+    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_id, &owner_id, &member_id)
         .await
         .expect("Project member removal succeeds");
@@ -2013,7 +2024,7 @@ async fn project_member_removal_rebuilds_projection_from_surviving_member() {
         .expect("legacy projection exists");
     assert_eq!(projection.assignee_id.as_deref(), Some(removed_agent.as_str()));
 
-    ProjectMemberService::new(Arc::clone(&db))
+    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_id, &owner_id, &member_id)
         .await
         .expect("Project member removal succeeds");
@@ -2062,7 +2073,7 @@ async fn project_member_removal_preserves_agent_with_active_binding() {
         .await
         .expect("binding-backed Agent membership creates");
 
-    ProjectMemberService::new(Arc::clone(&db))
+    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_id, &owner_id, &member_id)
         .await
         .expect("Project member removal succeeds");
@@ -2115,7 +2126,7 @@ async fn project_agent_binding_replacement_ends_binding_only_membership() {
         .expect("replacement Agent loads")
         .expect("replacement Agent exists");
 
-    AgentChatService::new(Arc::clone(&db))
+    AgentChatService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .set_project_binding(SetProjectAgentBindingInput {
             actor_user_id: owner_id.clone(),
             project_id: project_id.clone(),
@@ -2143,7 +2154,8 @@ async fn project_agent_binding_replacement_ends_binding_only_membership() {
 #[tokio::test]
 async fn project_agent_binding_replacement_preserves_independently_valid_agent() {
     let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let owner_id = seed_human_user(&db).await;
     configure_project_scope(&db, &project_id, &owner_id, &[]).await;
@@ -2179,7 +2191,8 @@ async fn project_agent_binding_replacement_preserves_independently_valid_agent()
         .expect("replacement Agent loads")
         .expect("replacement Agent exists");
 
-    AgentChatService::new(Arc::clone(&db))
+    let mut events = event_bus.subscribe();
+    AgentChatService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .set_project_binding(SetProjectAgentBindingInput {
             actor_user_id: owner_id,
             project_id: project_id.clone(),
@@ -2195,6 +2208,7 @@ async fn project_agent_binding_replacement_preserves_independently_valid_agent()
         })
         .await
         .expect("Project Agent binding replacement succeeds");
+    assert!(events.try_recv().is_err());
 
     let current_members = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
         .await
@@ -2246,7 +2260,7 @@ async fn project_scope_revocation_isolated_to_affected_project() {
         .await
         .expect("Project 2 membership creates");
 
-    ProjectMemberService::new(Arc::clone(&db))
+    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_one, &owner_id, &member_id)
         .await
         .expect("Project 1 member removal succeeds");
@@ -2287,7 +2301,7 @@ async fn ended_scope_membership_is_not_selected_for_new_work() {
         .await
         .expect("Agent membership creates");
 
-    ProjectMemberService::new(Arc::clone(&db))
+    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_id, &owner_id, &member_id)
         .await
         .expect("Project member removal succeeds");

@@ -5,6 +5,7 @@ use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, AgentRepo, ProjectAgentBindingRepo,
     ProjectMemberRepo, SqliteDb, UserRepo,
 };
+use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use sqlx::{Row, Sqlite, Transaction};
 
 use crate::Result;
@@ -150,6 +151,29 @@ fn agent_is_valid_from_sources(
         || has_active_binding
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeRevocationEffect {
+    pub project_id: String,
+    pub task_id: String,
+}
+
+/// Publish task projections after the transaction that produced them commits.
+pub(crate) fn publish_scope_revocation_events(
+    event_bus: &EventBus,
+    effects: &[ScopeRevocationEffect],
+) {
+    for effect in effects {
+        event_bus.publish(ForgeEvent {
+            event_type: "task.updated".to_owned(),
+            entity_id: effect.task_id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskUpdated {
+                project_id: effect.project_id.clone(),
+            },
+        });
+    }
+}
+
 /// End current memberships for actors whose Project scope disappeared and
 /// rebuild the existing singular compatibility projection from survivors.
 /// The caller owns the transaction and decides when to commit/publish.
@@ -159,8 +183,10 @@ pub(crate) async fn reconcile_project_actor_memberships_in_tx(
     project_owner_id: Option<&str>,
     actors: &[ActorRef],
     now: &str,
-) -> Result<()> {
+) -> Result<Vec<ScopeRevocationEffect>> {
     let mut seen = HashSet::new();
+    let mut affected_task_ids = HashSet::new();
+    let mut effects = Vec::new();
     for actor in actors {
         let key = match actor {
             ActorRef::Human(id) => ("human", id.as_str()),
@@ -200,6 +226,12 @@ pub(crate) async fn reconcile_project_actor_memberships_in_tx(
             let task_id: String = role.try_get("task_id")?;
             let task_role_id: String = role.try_get("task_role_id")?;
             let canonical_role: String = role.try_get("role")?;
+            if affected_task_ids.insert(task_id.clone()) {
+                effects.push(ScopeRevocationEffect {
+                    project_id: project_id.to_owned(),
+                    task_id: task_id.clone(),
+                });
+            }
             sqlx::query(
                 "UPDATE role_membership
                  SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
@@ -224,7 +256,7 @@ pub(crate) async fn reconcile_project_actor_memberships_in_tx(
             .await?;
         }
     }
-    Ok(())
+    Ok(effects)
 }
 
 /// The single compatibility projection algorithm used by membership writes

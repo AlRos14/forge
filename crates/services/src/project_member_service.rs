@@ -5,6 +5,7 @@ use db::{
     SqliteDb,
 };
 use api_types::ActorRef;
+use events::EventBus;
 use sqlx::Row;
 
 use crate::{project_actor_scope, Result, ServiceError};
@@ -12,11 +13,12 @@ use crate::{project_actor_scope, Result, ServiceError};
 #[derive(Clone)]
 pub struct ProjectMemberService {
     db: Arc<SqliteDb>,
+    event_bus: Arc<EventBus>,
 }
 
 impl ProjectMemberService {
-    pub fn new(db: Arc<SqliteDb>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self { db, event_bus }
     }
 
     pub async fn list_members(
@@ -151,7 +153,7 @@ impl ProjectMemberService {
                 .map(|row| row.try_get::<String, _>("id").map(ActorRef::Agent))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         );
-        project_actor_scope::reconcile_project_actor_memberships_in_tx(
+        let effects = project_actor_scope::reconcile_project_actor_memberships_in_tx(
             &mut transaction,
             project_id,
             project.owner_id.as_deref(),
@@ -160,6 +162,7 @@ impl ProjectMemberService {
         )
         .await?;
         transaction.commit().await?;
+        project_actor_scope::publish_scope_revocation_events(&self.event_bus, &effects);
         Ok(())
     }
 
@@ -198,11 +201,15 @@ fn is_admin_or_owner(role: &str) -> bool {
 mod tests {
     use super::*;
     use db::{create_sqlite_pool, run_migrations, SqliteDb};
+    use events::EventBus;
 
     async fn test_service() -> ProjectMemberService {
         let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
         run_migrations(&pool).await.unwrap();
-        ProjectMemberService::new(Arc::new(SqliteDb::new(pool)))
+        ProjectMemberService::new(
+            Arc::new(SqliteDb::new(pool)),
+            Arc::new(EventBus::new(16)),
+        )
     }
 
     async fn seed_user(db: &SqliteDb, user_id: &str, email: &str) {

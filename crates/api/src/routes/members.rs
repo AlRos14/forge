@@ -51,7 +51,7 @@ pub async fn list_members(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<Vec<ProjectMemberResponse>>> {
-    let service = ProjectMemberService::new(state.db.clone());
+    let service = ProjectMemberService::new(state.db.clone(), state.event_bus.clone());
     let members = service
         .list_members(&project_id, &user.user_id)
         .await
@@ -92,7 +92,7 @@ pub async fn add_member(
         .await?
         .ok_or_else(|| ApiError::not_found("user", &body.user_id))?;
 
-    let service = ProjectMemberService::new(state.db.clone());
+    let service = ProjectMemberService::new(state.db.clone(), state.event_bus.clone());
     let member = service
         .add_member(&project_id, &user.user_id, &body.user_id, &body.role)
         .await
@@ -142,7 +142,7 @@ pub async fn update_member_role(
         )));
     }
 
-    let service = ProjectMemberService::new(state.db.clone());
+    let service = ProjectMemberService::new(state.db.clone(), state.event_bus.clone());
     let member = service
         .update_role(&project_id, &user.user_id, &user_id, &body.role)
         .await
@@ -168,7 +168,7 @@ pub async fn remove_member(
     user: AuthenticatedUser,
     Path((project_id, user_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let service = ProjectMemberService::new(state.db.clone());
+    let service = ProjectMemberService::new(state.db.clone(), state.event_bus.clone());
     service
         .remove_member(&project_id, &user.user_id, &user_id)
         .await
