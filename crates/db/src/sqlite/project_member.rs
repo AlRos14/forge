@@ -80,10 +80,23 @@ impl ProjectMemberRepo for SqliteDb {
     }
 
     async fn remove_member(&self, project_id: &str, user_id: &str) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        self.remove_member_in_tx(&mut transaction, project_id, user_id)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn remove_member_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
         let result = sqlx::query("DELETE FROM project_member WHERE project_id = ? AND user_id = ?")
             .bind(project_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut **transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);

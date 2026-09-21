@@ -45,6 +45,7 @@ pub mod plan_artifact;
 pub mod pr_service;
 pub mod product_genesis;
 pub mod project_agent_actions;
+pub(crate) mod project_actor_scope;
 pub mod project_creation;
 pub mod project_documents;
 pub mod project_hooks;

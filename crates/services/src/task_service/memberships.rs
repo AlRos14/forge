@@ -2,13 +2,13 @@ use super::*;
 use api_types::ActorRef;
 use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, AssigneeKind, CoordinationMode,
-    CreateTaskRole, CreateTaskRoleAssignment, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectRepo, RoleMembership, RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo,
-    TaskRoleAssignment, UpdateTaskRole, UserRepo,
+    CreateTaskRole, CreateTaskRoleAssignment, ProjectRepo, RoleMembership, RoleMembershipRepo,
+    RoleMembershipStatus, TaskRole, TaskRoleRepo, TaskRoleAssignment, UpdateTaskRole, UserRepo,
 };
 use sqlx::{Row, Sqlite, Transaction};
 
 use crate::agent_service::{compute_effective_status, EffectiveStatus};
+use crate::project_actor_scope;
 
 impl TaskService {
     /// Load every TaskRole, including roles that currently have no members.
@@ -451,10 +451,16 @@ impl TaskService {
                         "the human sentinel is not an Actor identity",
                     ));
                 }
-                let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                let _agent = AgentRepo::get_by_id(&*self.db, agent_id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-                if !self.agent_is_valid_for_project(&project, &agent).await? {
+                if !project_actor_scope::actor_is_valid_for_project(
+                    &self.db,
+                    project,
+                    actor_ref,
+                )
+                .await?
+                {
                     return Err(ServiceError::invalid_operation(
                         "agent is not valid for the task project",
                     ));
@@ -469,10 +475,12 @@ impl TaskService {
                 UserRepo::get_user_by_id(&*self.db, user_id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("user", user_id.clone()))?;
-                if project.owner_id.as_deref() != Some(user_id)
-                    && ProjectMemberRepo::get_member(&*self.db, &project.id, user_id)
-                        .await?
-                        .is_none()
+                if !project_actor_scope::actor_is_valid_for_project(
+                    &self.db,
+                    project,
+                    actor_ref,
+                )
+                .await?
                 {
                     return Err(ServiceError::invalid_operation(
                         "human actor must be a project member",
@@ -481,36 +489,6 @@ impl TaskService {
             }
         }
         Ok(())
-    }
-
-    async fn agent_is_valid_for_project(
-        &self,
-        project: &db::Project,
-        agent: &db::Agent,
-    ) -> Result<bool> {
-        let account_owner_is_project_actor = match agent.owner_id.as_deref() {
-            Some(agent_owner) if project.owner_id.as_deref() == Some(agent_owner) => true,
-            Some(agent_owner) => {
-                ProjectMemberRepo::get_member(&*self.db, &project.id, agent_owner)
-                    .await?
-                    .is_some()
-            }
-            None => false,
-        };
-        if agent.visibility == "global"
-            || (agent.visibility == "account" && account_owner_is_project_actor)
-        {
-            return Ok(true);
-        }
-
-        let binding = ProjectAgentBindingRepo::get_active_project_binding(
-            &*self.db,
-            &project.id,
-        )
-        .await?;
-        Ok(binding.as_ref().is_some_and(|binding| {
-            binding.state == "active" && binding.identity_id.as_deref() == Some(agent.id.as_str())
-        }))
     }
 
     pub(crate) async fn ensure_agent_membership_for_role(
@@ -543,117 +521,15 @@ impl TaskService {
         fallback_role: Option<&str>,
         preferred_projection_role: Option<&str>,
     ) -> Result<()> {
-        let member = sqlx::query(
-            "SELECT actor_kind, actor_id, created_at
-             FROM role_membership
-             WHERE task_role_id = ? AND status = 'active'
-             ORDER BY CASE actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
-                      created_at, id
-             LIMIT 1",
+        project_actor_scope::sync_legacy_role_projection_in_tx(
+            transaction,
+            &task.id,
+            task_role_id,
+            canonical_role,
+            fallback_role,
+            preferred_projection_role,
         )
-        .bind(task_role_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        let mut projection_roles = sqlx::query(
-            "SELECT role_name
-             FROM task_role_assignment
-             WHERE task_id = ?
-             ORDER BY role_name",
-        )
-        .bind(&task.id)
-        .fetch_all(&mut **transaction)
-        .await?
-        .into_iter()
-        .filter_map(|row| {
-            let role_name: String = row.try_get("role_name").ok()?;
-            (canonical_task_role_name(&role_name).as_deref() == Some(canonical_role))
-                .then_some(role_name)
-        })
-        .collect::<Vec<_>>();
-        if projection_roles.is_empty() {
-            if let Some(preferred) = preferred_projection_role {
-                if canonical_task_role_name(preferred).as_deref() == Some(canonical_role) {
-                    projection_roles.push(preferred.to_owned());
-                }
-            }
-        }
-        if projection_roles.is_empty() {
-            if let Some(role) = fallback_role {
-                projection_roles.push(role.to_owned());
-            }
-        }
-        // The task-level assignee is also a compatibility projection for the
-        // canonical implementation role. Keep it synchronized even when a
-        // workflow does not expose a legacy role label for this TaskRole.
-        if projection_roles.is_empty() && canonical_role != "implementer" {
-            return Ok(());
-        }
-
-        let Some(member) = member else {
-            if canonical_role == "implementer" {
-                sqlx::query(
-                    "UPDATE task
-                     SET assignee_type = NULL, assignee_id = NULL, updated_at = ?
-                     WHERE id = ?",
-                )
-                .bind(now_rfc3339())
-                .bind(&task.id)
-                .execute(&mut **transaction)
-                .await?;
-            }
-            for projection_role in projection_roles {
-                sqlx::query(
-                    "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-                )
-                .bind(&task.id)
-                .bind(projection_role)
-                .execute(&mut **transaction)
-                .await?;
-            }
-            return Ok(());
-        };
-        let actor_kind: String = member.try_get("actor_kind")?;
-        let actor_id: String = member.try_get("actor_id")?;
-        let member_created_at: String = member.try_get("created_at")?;
-        let assignee_type = if actor_kind == "agent" { "agent" } else { "user" };
-        let now = now_rfc3339();
-        if canonical_role == "implementer" {
-            sqlx::query(
-                "UPDATE task
-                 SET assignee_type = ?, assignee_id = ?, updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(assignee_type)
-            .bind(&actor_id)
-            .bind(&now)
-            .bind(&task.id)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        if projection_roles.is_empty() {
-            return Ok(());
-        }
-        for projection_role in projection_roles {
-            sqlx::query(
-                "INSERT INTO task_role_assignment
-                    (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(task_id, role_name) DO UPDATE SET
-                    assignee_type = excluded.assignee_type,
-                    assignee_id = excluded.assignee_id,
-                    updated_at = excluded.updated_at",
-            )
-            .bind(new_uuid_v4())
-            .bind(&task.id)
-            .bind(projection_role)
-            .bind(assignee_type)
-            .bind(&actor_id)
-            .bind(&member_created_at)
-            .bind(&now)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        Ok(())
+        .await
     }
 
     async fn workflow_role_for_canonical(

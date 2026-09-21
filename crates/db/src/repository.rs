@@ -675,6 +675,11 @@ pub trait ProjectAgentBindingRepo: Send + Sync {
         &self,
         input: ReplaceProjectAgentBinding,
     ) -> Result<ProjectAgentBinding>;
+    async fn replace_project_binding_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: ReplaceProjectAgentBinding,
+    ) -> Result<ProjectAgentBinding>;
 }
 
 #[async_trait]
@@ -2265,6 +2270,12 @@ pub trait ProjectMemberRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<ProjectMember>;
     async fn remove_member(&self, project_id: &str, user_id: &str) -> Result<()>;
+    async fn remove_member_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

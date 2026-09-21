@@ -141,6 +141,10 @@ the existing deterministic admission, renewal, recovery, terminal, and
 governance checks. Adding another member to a role does not transfer a
 workspace, lease, terminal, or repository write scope.
 
+Scope revocation removes the Actor from new eligibility and admission; it does
+not rewrite or cancel an existing Execution. Existing Execution and lease
+lifecycle rules continue to govern already-running work.
+
 ## Human / Agent validity
 
 Human and Agent are peer ActorRef kinds. A Human membership requires an
@@ -157,6 +161,13 @@ only: paused, busy, offline, and other runtime states remain separate
 scheduler usability questions. Requester authorization remains at the
 API/service boundary that has requester context; it is not part of this Actor
 validity predicate.
+
+Project-scoped Actor validity is live rather than creation-time-only. When a
+Human membership, account-Agent ownership scope, or Project Agent binding is
+revoked, current TaskRole memberships that no longer have another valid Project
+scope are ended transactionally and legacy compatibility projections are
+rebuilt from surviving active memberships. Historical membership and
+Execution records are preserved.
 
 ## Migration
 
@@ -206,6 +217,9 @@ counterexamples:
 * an orchestration-only Agent is skipped by repository candidate selection;
 * invalid explicit and default Actors fail before Task persistence;
 * invalid or multi-member legacy mutations preserve running Executions.
+* Project member removal and Project Agent binding replacement end only
+  memberships that lose all valid Project scope, preserve alternate validity,
+  rebuild projections, and leave unrelated Projects untouched.
 
 The existing Plan PR1 authority-cutover regression tests remain in the branch
 and were not executed in this pass. Focused tests were added for review; no

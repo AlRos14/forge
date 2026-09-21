@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CreateProjectMember, ProjectMember, ProjectMemberRepo, SqliteDb,
+    new_uuid_v4, now_rfc3339, CreateProjectMember, ProjectMember, ProjectMemberRepo, ProjectRepo,
+    SqliteDb,
 };
+use api_types::ActorRef;
+use sqlx::Row;
 
-use crate::{Result, ServiceError};
+use crate::{project_actor_scope, Result, ServiceError};
 
 #[derive(Clone)]
 pub struct ProjectMemberService {
@@ -122,7 +125,41 @@ impl ProjectMemberService {
                 return Err(ServiceError::Conflict("last_owner".to_owned()));
             }
         }
-        ProjectMemberRepo::remove_member(&*self.db, project_id, target_user_id).await?;
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let now = now_rfc3339();
+        let mut transaction = self.db.pool().begin().await?;
+        ProjectMemberRepo::remove_member_in_tx(
+            &*self.db,
+            &mut transaction,
+            project_id,
+            target_user_id,
+        )
+        .await?;
+
+        let account_agents = sqlx::query(
+            "SELECT id FROM agent_current WHERE visibility = 'account' AND owner_id = ? ORDER BY id",
+        )
+        .bind(target_user_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut affected_actors = vec![ActorRef::Human(target_user_id.to_owned())];
+        affected_actors.extend(
+            account_agents
+                .into_iter()
+                .map(|row| row.try_get::<String, _>("id").map(ActorRef::Agent))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+        project_actor_scope::reconcile_project_actor_memberships_in_tx(
+            &mut transaction,
+            project_id,
+            project.owner_id.as_deref(),
+            &affected_actors,
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 

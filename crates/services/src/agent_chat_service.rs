@@ -15,15 +15,17 @@ use db::{
     AgentProfileRepo, AgentRepo, CancelAgentChatTurn, CompleteAgentChatTurn,
     CreateAccountMainAgentBinding, CreateAgentChat, CreateAgentChatMessage, CreateAgentChatTurnJob,
     CreateAgentHandoff, CreateProjectAgentBinding, FailAgentChatTurn, ProjectAgentBinding,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceAccountMainAgentBinding,
-    ReplaceProjectAgentBinding, UpdateAgentChat,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, ReplaceAccountMainAgentBinding,
+    ReplaceProjectAgentBinding, SqliteDb, UpdateAgentChat,
 };
+use api_types::ActorRef;
 use serde_json::json;
+use sqlx::Row;
 
 use crate::{
     agent_chat_policy::{guard_agent_chat_content, AgentChatOperation, AgentChatScope},
     agent_chat_turn_policy::{bounded_error, failure_after_claim},
-    Result, ServiceError,
+    project_actor_scope, Result, ServiceError,
 };
 
 const MAIN_CHAT_KIND: &str = "account_main";
@@ -298,75 +300,6 @@ where
             (None, Some(_)) => Err(ServiceError::Db(db::DbError::VersionConflict)),
         }?;
         self.mark_main_chat_ready(&account_id).await?;
-        Ok(binding)
-    }
-
-    pub async fn set_project_binding(
-        &self,
-        input: SetProjectAgentBindingInput,
-    ) -> Result<ProjectAgentBinding> {
-        self.require_project_member(&input.actor_user_id, &input.project_id)
-            .await?;
-        self.ensure_project_chat(&input.project_id).await?;
-        let project_id = input.project_id.clone();
-        let activate = input.state == ACTIVE_BINDING_STATE;
-        if input.state == ACTIVE_BINDING_STATE {
-            let (Some(identity_id), Some(profile_id)) =
-                (input.identity_id.as_deref(), input.profile_id.as_deref())
-            else {
-                return Err(ServiceError::invalid_operation(
-                    "active Project Agent binding requires an identity and profile",
-                ));
-            };
-            self.require_owned_profile(&input.actor_user_id, identity_id, profile_id)
-                .await?;
-        }
-        let now = now_rfc3339();
-        let replacement = CreateProjectAgentBinding {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            identity_id: input.identity_id,
-            profile_id: input.profile_id,
-            state: input.state,
-            autonomy_policy_json: input.autonomy_policy_json,
-            permission_ceiling_json: input.permission_ceiling_json,
-            subscriptions_json: input.subscriptions_json,
-            wake_budget: input.wake_budget,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        let binding = match (
-            ProjectAgentBindingRepo::get_active_project_binding(&*self.db, &input.project_id)
-                .await?,
-            input.expected_version,
-        ) {
-            (Some(current), Some(expected)) if current.version == expected => {
-                Ok(ProjectAgentBindingRepo::replace_project_binding(
-                    &*self.db,
-                    ReplaceProjectAgentBinding {
-                        project_id: project_id.clone(),
-                        expected_version: expected,
-                        replacement,
-                        replacement_reason: input.replacement_reason,
-                    },
-                )
-                .await?)
-            }
-            (Some(_), Some(_)) => Err(ServiceError::Db(db::DbError::VersionConflict)),
-            (Some(_), None) => Err(ServiceError::Conflict(
-                "Project Agent binding already exists; expected_version is required for replacement"
-                    .to_owned(),
-            )),
-            (None, None) => Ok(ProjectAgentBindingRepo::create_project_binding(
-                &*self.db,
-                replacement,
-            )
-            .await?),
-            (None, Some(_)) => Err(ServiceError::Db(db::DbError::VersionConflict)),
-        }?;
-        if activate {
-            self.mark_project_chat_ready(&project_id).await?;
-        }
         Ok(binding)
     }
 
@@ -891,6 +824,108 @@ where
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
         Ok(())
+    }
+}
+
+impl AgentChatService<SqliteDb> {
+    pub async fn set_project_binding(
+        &self,
+        input: SetProjectAgentBindingInput,
+    ) -> Result<ProjectAgentBinding> {
+        self.require_project_member(&input.actor_user_id, &input.project_id)
+            .await?;
+        self.ensure_project_chat(&input.project_id).await?;
+        let project_id = input.project_id.clone();
+        let project = ProjectRepo::get_by_id(&*self.db, &project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
+        let activate = input.state == ACTIVE_BINDING_STATE;
+        if activate {
+            let (Some(identity_id), Some(profile_id)) =
+                (input.identity_id.as_deref(), input.profile_id.as_deref())
+            else {
+                return Err(ServiceError::invalid_operation(
+                    "active Project Agent binding requires an identity and profile",
+                ));
+            };
+            self.require_owned_profile(&input.actor_user_id, identity_id, profile_id)
+                .await?;
+        }
+        let now = now_rfc3339();
+        let replacement = CreateProjectAgentBinding {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            identity_id: input.identity_id,
+            profile_id: input.profile_id,
+            state: input.state,
+            autonomy_policy_json: input.autonomy_policy_json,
+            permission_ceiling_json: input.permission_ceiling_json,
+            subscriptions_json: input.subscriptions_json,
+            wake_budget: input.wake_budget,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let current = ProjectAgentBindingRepo::get_active_project_binding(
+            &*self.db,
+            &project_id,
+        )
+        .await?;
+        let binding = match (current, input.expected_version) {
+            (Some(current), Some(expected)) if current.version == expected => {
+                let mut transaction = self.db.pool().begin().await?;
+                let previous_identity_id = sqlx::query(
+                    "SELECT identity_id
+                     FROM project_agent_binding
+                     WHERE project_id = ?
+                       AND state IN ('active', 'agent_setup_required')
+                       AND version = ?",
+                )
+                .bind(&project_id)
+                .bind(expected)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .map(|row| row.try_get::<Option<String>, _>("identity_id"))
+                .transpose()?;
+                let binding = ProjectAgentBindingRepo::replace_project_binding_in_tx(
+                    &*self.db,
+                    &mut transaction,
+                    ReplaceProjectAgentBinding {
+                        project_id: project_id.clone(),
+                        expected_version: expected,
+                        replacement,
+                        replacement_reason: input.replacement_reason,
+                    },
+                )
+                .await?;
+                if let Some(identity_id) = previous_identity_id.flatten() {
+                    project_actor_scope::reconcile_project_actor_memberships_in_tx(
+                        &mut transaction,
+                        &project_id,
+                        project.owner_id.as_deref(),
+                        &[ActorRef::Agent(identity_id)],
+                        &now,
+                    )
+                    .await?;
+                }
+                transaction.commit().await?;
+                binding
+            }
+            (Some(_), Some(_)) => return Err(ServiceError::Db(db::DbError::VersionConflict)),
+            (Some(_), None) => {
+                return Err(ServiceError::Conflict(
+                    "Project Agent binding already exists; expected_version is required for replacement"
+                        .to_owned(),
+                ));
+            }
+            (None, None) => {
+                ProjectAgentBindingRepo::create_project_binding(&*self.db, replacement).await?
+            }
+            (None, Some(_)) => return Err(ServiceError::Db(db::DbError::VersionConflict)),
+        };
+        if activate {
+            self.mark_project_chat_ready(&project_id).await?;
+        }
+        Ok(binding)
     }
 }
 
