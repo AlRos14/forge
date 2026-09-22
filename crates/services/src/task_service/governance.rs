@@ -809,11 +809,13 @@ impl TaskService {
             match (principal_id, explicit_assignee_id.as_deref()) {
                 (Some(principal_id), _) => principal_id.to_owned(),
                 (None, Some(assignee_id)) => assignee_id.to_owned(),
-                (None, None) if role_assignment.is_none() => task.assignee_id.clone().ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "WorkspaceLease requires an assigned Task Worker or reviewer",
-                    )
-                })?,
+                (None, None) if role_assignment.is_none() => {
+                    task.assignee_id.clone().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "WorkspaceLease requires an assigned Task Worker or reviewer",
+                        )
+                    })?
+                }
                 (None, None) => {
                     return Err(ServiceError::invalid_operation(
                         "WorkspaceLease requires an assigned Task Worker or reviewer",
@@ -873,7 +875,7 @@ impl TaskService {
                 )",
             )
             .bind(task_role_id)
-            .bind(principal_id)
+            .bind(&principal_id)
             .fetch_one(&mut **transaction)
             .await?;
             if member_is_active == 0 {
@@ -882,7 +884,8 @@ impl TaskService {
                 ));
             }
         }
-        if task_role_id.is_none() && (charter_backed || has_task_assignment)
+        if task_role_id.is_none()
+            && (charter_backed || has_task_assignment)
             && (assigned_type.as_deref() != Some("agent")
                 || assigned_id.as_deref() != Some(principal_id.as_str()))
         {
@@ -1210,35 +1213,36 @@ impl TaskService {
             .bind(task_role_id)
             .fetch_all(self.db.pool())
             .await?;
-            let principal_id = if let Some(principal_id) = principal_id.filter(|id| !id.trim().is_empty()) {
-                let admitted = members.iter().any(|member| {
-                    member.get::<String, _>("actor_kind") == "agent"
-                        && member.get::<String, _>("actor_id") == principal_id
-                        && member.get::<String, _>("status") == "active"
-                });
-                if !admitted {
-                    return Err(ServiceError::conflict(format!(
-                        "role '{}' membership does not authorize this WorkspaceLease principal",
-                        role.trim()
-                    )));
-                }
-                principal_id.to_owned()
-            } else {
-                let agents = members
-                    .iter()
-                    .filter(|member| {
+            let principal_id =
+                if let Some(principal_id) = principal_id.filter(|id| !id.trim().is_empty()) {
+                    let admitted = members.iter().any(|member| {
                         member.get::<String, _>("actor_kind") == "agent"
+                            && member.get::<String, _>("actor_id") == principal_id
                             && member.get::<String, _>("status") == "active"
-                    })
-                    .map(|member| member.get::<String, _>("actor_id"))
-                    .collect::<Vec<_>>();
-                if agents.len() != 1 {
-                    return Err(ServiceError::invalid_operation(
-                        "WorkspaceLease requires one concrete active Agent membership",
-                    ));
-                }
-                agents[0].clone()
-            };
+                    });
+                    if !admitted {
+                        return Err(ServiceError::conflict(format!(
+                            "role '{}' membership does not authorize this WorkspaceLease principal",
+                            role.trim()
+                        )));
+                    }
+                    principal_id.to_owned()
+                } else {
+                    let agents = members
+                        .iter()
+                        .filter(|member| {
+                            member.get::<String, _>("actor_kind") == "agent"
+                                && member.get::<String, _>("status") == "active"
+                        })
+                        .map(|member| member.get::<String, _>("actor_id"))
+                        .collect::<Vec<_>>();
+                    if agents.len() != 1 {
+                        return Err(ServiceError::invalid_operation(
+                            "WorkspaceLease requires one concrete active Agent membership",
+                        ));
+                    }
+                    agents[0].clone()
+                };
             self.ensure_repository_worker_identity(&task.project_id, &principal_id)
                 .await?;
             return Ok(principal_id);

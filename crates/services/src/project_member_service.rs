@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use api_types::ActorRef;
 use db::{
     new_uuid_v4, now_rfc3339, CreateProjectMember, ProjectMember, ProjectMemberRepo, ProjectRepo,
     SqliteDb,
 };
-use api_types::ActorRef;
 use events::EventBus;
 use sqlx::Row;
 
@@ -206,10 +206,7 @@ mod tests {
     async fn test_service() -> ProjectMemberService {
         let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
         run_migrations(&pool).await.unwrap();
-        ProjectMemberService::new(
-            Arc::new(SqliteDb::new(pool)),
-            Arc::new(EventBus::new(16)),
-        )
+        ProjectMemberService::new(Arc::new(SqliteDb::new(pool)), Arc::new(EventBus::new(16)))
     }
 
     async fn seed_user(db: &SqliteDb, user_id: &str, email: &str) {

@@ -809,9 +809,9 @@ impl TerminalService {
         // membership is never used to grant terminal or embedded workspace
         // access.  Legacy daemon routing remains available only for tasks
         // which have not acquired a replacement TaskRole yet.
-        if let Some(lease) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await?
-        {
-            if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &lease.execution_id).await?
+        if let Some(lease) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await? {
+            if let Some(execution) =
+                ExecutionRepo::get_by_id(&*self.db, &lease.execution_id).await?
             {
                 return self.agent_daemon_id(execution.agent_id.as_deref()).await;
             }
@@ -844,19 +844,16 @@ impl TerminalService {
         if task.assignee_type.as_deref() == Some("agent") {
             return self.agent_daemon_id(task.assignee_id.as_deref()).await;
         }
-        let Some(assignment) = TaskRoleAssignmentRepo::get_by_task_and_role(
-            &*self.db,
-            &task.id,
-            role_name,
-        )
-        .await?
+        let Some(assignment) =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name).await?
         else {
             return Ok(None);
         };
         if assignment.assignee_type != Some(AssigneeKind::Agent) {
             return Ok(None);
         }
-        self.agent_daemon_id(assignment.assignee_id.as_deref()).await
+        self.agent_daemon_id(assignment.assignee_id.as_deref())
+            .await
     }
 
     async fn agent_daemon_id(

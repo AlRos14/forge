@@ -1067,11 +1067,7 @@ impl AttentionService {
             return Ok(Some(identity_id));
         }
         let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
-        for key in [
-            "identity_id",
-            "agent_id",
-            "responder_identity_id",
-        ] {
+        for key in ["identity_id", "agent_id", "responder_identity_id"] {
             let Some(identity_id) = payload.get(key).and_then(Value::as_str) else {
                 continue;
             };

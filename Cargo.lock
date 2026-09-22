@@ -1956,6 +1956,7 @@ dependencies = [
  "serde",
  "serde_json",
  "services",
+ "sqlx",
  "tokio",
  "uuid",
 ]

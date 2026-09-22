@@ -47,6 +47,7 @@ impl TaskService {
             parent_execution_id,
             prompt,
             trigger.to_owned(),
+            ExecutionPurpose::Implement,
             None,
         )
         .await
@@ -59,6 +60,7 @@ impl TaskService {
         parent_execution_id: String,
         prompt: String,
         trigger: &str,
+        purpose: ExecutionPurpose,
     ) -> Result<Execution> {
         dispatch_role_follow_up_impl(
             self.clone(),
@@ -67,6 +69,7 @@ impl TaskService {
             parent_execution_id,
             prompt,
             trigger.to_owned(),
+            purpose,
             None,
         )
         .await
@@ -80,6 +83,7 @@ impl TaskService {
         agent_id: String,
         prompt: String,
         trigger: &str,
+        purpose: ExecutionPurpose,
     ) -> Result<Execution> {
         dispatch_role_follow_up_impl(
             self.clone(),
@@ -88,6 +92,7 @@ impl TaskService {
             parent_execution_id,
             prompt,
             trigger.to_owned(),
+            purpose,
             Some(agent_id),
         )
         .await
@@ -133,6 +138,7 @@ fn dispatch_role_follow_up_impl(
     parent_execution_id: String,
     prompt: String,
     trigger: String,
+    purpose: ExecutionPurpose,
     agent_override: Option<String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Execution>> + Send>> {
     Box::pin(async move {
@@ -147,12 +153,25 @@ fn dispatch_role_follow_up_impl(
         let task = TaskRepo::get_by_id(&*service.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let role_parent = if execution_role_matches(&supplied_parent_execution, &role) {
-            Some(supplied_parent_execution.clone())
+        // Continuity may come from the supplied causal Execution or its
+        // explicit causal parent. Never substitute the latest Execution for a
+        // role: recency is not session authority.
+        let mut lineage_parent = if execution_role_matches(&supplied_parent_execution, &role) {
+            supplied_parent_execution.clone()
+        } else if let Some(parent_id) = supplied_parent_execution.parent_execution_id.as_deref() {
+            ExecutionRepo::get_by_id(&*service.db, parent_id)
+                .await?
+                .unwrap_or_else(|| supplied_parent_execution.clone())
         } else {
-            latest_terminal_execution_for_follow_up_role(&service.db, &task_id, &role).await?
+            supplied_parent_execution.clone()
         };
-        let lineage_parent = role_parent.as_ref().unwrap_or(&supplied_parent_execution);
+        // Follow-up continuity is scoped by the Task's current workspace, not
+        // only by the lineage snapshot. If the workspace was replaced after
+        // the parent ran, the explicit session must fail the compatibility
+        // check and the child must start without inheriting it.
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*service.db, &task_id)
+            .await?
+            .map(|workspace| workspace.id);
         let authoritative_memberships =
             crate::task_service::current_role_memberships_authoritative(
                 &service.db,
@@ -162,8 +181,7 @@ fn dispatch_role_follow_up_impl(
             .await?;
         let agent_id = if let Some(agent_id) = agent_override {
             if let Some(memberships) = authoritative_memberships.as_ref() {
-                if crate::task_service::active_agent_membership(memberships, &agent_id).is_none()
-                {
+                if crate::task_service::active_agent_membership(memberships, &agent_id).is_none() {
                     return Err(ServiceError::conflict(format!(
                         "Agent {agent_id} is not an active member of follow-up role {role}"
                     )));
@@ -183,50 +201,25 @@ fn dispatch_role_follow_up_impl(
             }
             agent_id
         } else if let Some(memberships) = authoritative_memberships.as_ref() {
-            let parent_is_usable = match lineage_parent.agent_id.as_deref() {
-                Some(parent_agent_id) => {
-                    if task.repo_id.is_some() {
-                        crate::task_service::is_usable_repository_agent(
-                            &service.db,
-                            &task.project_id,
-                            memberships,
-                            parent_agent_id,
-                        )
-                        .await?
-                    } else {
-                        crate::task_service::is_usable_active_agent(
-                            &service.db,
-                            memberships,
-                            parent_agent_id,
-                        )
-                        .await?
-                    }
-                }
-                None => false,
-            };
-            if parent_is_usable {
-                let parent_agent_id = lineage_parent
-                    .agent_id
-                    .as_deref()
-                    .expect("parent_is_usable implies a lineage Agent");
-                parent_agent_id.to_owned()
+            // Actor selection is authoritative and happens before continuity.
+            // A usable lineage Agent is not automatically the current role's
+            // selected Actor; a membership change must therefore be able to
+            // force a fresh Agent-owned session.
+            let selected = if task.repo_id.is_some() {
+                crate::task_service::select_usable_repository_agent_id(
+                    &service.db,
+                    &task.project_id,
+                    memberships,
+                )
+                .await?
             } else {
-                let selected = if task.repo_id.is_some() {
-                    crate::task_service::select_usable_repository_agent_id(
-                        &service.db,
-                        &task.project_id,
-                        memberships,
-                    )
-                    .await?
-                } else {
-                    crate::task_service::select_usable_agent_id(&service.db, memberships).await?
-                };
-                selected.ok_or_else(|| {
-                    ServiceError::invalid_operation(format!(
-                        "no usable Agent is available for follow-up role {role}"
-                    ))
-                })?
-            }
+                crate::task_service::select_usable_agent_id(&service.db, memberships).await?
+            };
+            selected.ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "no usable Agent is available for follow-up role {role}"
+                ))
+            })?
         } else {
             assigned_agent_for_follow_up(&service, &task_id, &role)
                 .await?
@@ -241,30 +234,66 @@ fn dispatch_role_follow_up_impl(
         let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        let executor_config_snapshot_json = if role_parent.is_some()
-            && lineage_parent.agent_id.as_deref() == Some(agent_id.as_str())
-            && lineage_parent.agent_session_id.is_some()
-        {
-            let agent_session_id = lineage_parent
-                .agent_session_id
-                .as_deref()
-                .expect("checked agent_session_id exists");
-            let snapshot_json = lineage_parent
-                .executor_config_snapshot_json
-                .as_deref()
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(format!(
-                        "parent execution {} missing executor config snapshot",
-                        lineage_parent.id
-                    ))
-                })?;
-            Some(executor_snapshot_with_resume_thread(
-                snapshot_json,
-                agent_session_id,
-            )?)
+        // Actor selection is authoritative and precedes continuity. A
+        // legacy agent_session_id without an explicit HarnessSession never
+        // causes a new follow-up to inherit a thread.
+        let same_actor = matches!(
+            lineage_parent.actor_ref(),
+            Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &agent_id
+        );
+        if same_actor && lineage_parent.harness_session_id.is_none() {
+            if let Some(external_session_id) = resumable_external_session(
+                &service.db,
+                &lineage_parent,
+                Some(&agent_id),
+                current_workspace_id.as_deref(),
+            )
+            .await?
+            {
+                if let Some(reconciled) = materialize_historical_harness_session(
+                    &service.db,
+                    &lineage_parent,
+                    &external_session_id,
+                )
+                .await?
+                {
+                    lineage_parent = reconciled;
+                }
+            }
+        }
+        let reusable_session = if same_actor {
+            reusable_harness_session_for_agent(
+                &service.db,
+                &lineage_parent,
+                &agent_id,
+                current_workspace_id.as_deref(),
+            )
+            .await?
         } else {
-            build_executor_config_snapshot(&service.db, &task, &agent, None).await?
+            None
         };
+        let reusable_external_session = reusable_session
+            .as_ref()
+            .filter(|session| matches!(&session.status, db::HarnessSessionStatus::Active))
+            .and_then(|session| session.external_session_id.clone());
+        let executor_config_snapshot_json =
+            if let Some(agent_session_id) = reusable_external_session.as_deref() {
+                let snapshot_json = lineage_parent
+                    .executor_config_snapshot_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(format!(
+                            "parent execution {} missing executor config snapshot",
+                            lineage_parent.id
+                        ))
+                    })?;
+                Some(executor_snapshot_with_resume_thread(
+                    snapshot_json,
+                    agent_session_id,
+                )?)
+            } else {
+                build_executor_config_snapshot(&service.db, &task, &agent, None).await?
+            };
         let execution_id = new_uuid_v4();
         let logs_path = execution_logs_path(
             &service.workspace_root,
@@ -320,14 +349,23 @@ fn dispatch_role_follow_up_impl(
                 CreateExecution {
                     id: execution_id.clone(),
                     task_id: task_id.clone(),
-                    agent_id: Some(agent_id),
+                    agent_id: Some(agent_id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+                    purpose: Some(purpose),
+                    harness_session_id: reusable_session.as_ref().and_then(|session| {
+                        reusable_external_session
+                            .as_ref()
+                            .map(|_| session.id.clone())
+                    }),
                     role: role.clone(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    parent_execution_id: Some(lineage_parent.id.clone()),
+                    parent_execution_id: Some(supplied_parent_execution.id.clone()),
+                    // The generic HarnessSession is the authority. The DB
+                    // layer projects its external id to the legacy field.
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -337,7 +375,7 @@ fn dispatch_role_follow_up_impl(
                     after_sha: None,
                     error: None,
                     executor_config_snapshot_json,
-                    workspace_id: lineage_parent.workspace_id.clone(),
+                    workspace_id: current_workspace_id.clone(),
                     created_at: now.clone(),
                     updated_at: now,
                 },
@@ -349,7 +387,7 @@ fn dispatch_role_follow_up_impl(
             task_id = %task_id,
             role = %role,
             execution_id = %execution.id,
-            parent_execution_id = %lineage_parent.id,
+            parent_execution_id = %supplied_parent_execution.id,
             trigger = %trigger,
             "role follow-up dispatched"
         );
@@ -360,7 +398,7 @@ fn dispatch_role_follow_up_impl(
             timestamp: event_timestamp(),
             context: EventContext::FollowUpDispatched {
                 task_id: task_id.clone(),
-                parent_execution_id: lineage_parent.id.clone(),
+                parent_execution_id: supplied_parent_execution.id.clone(),
                 execution_id: execution.id.clone(),
                 trigger: trigger.clone(),
             },
@@ -384,44 +422,6 @@ async fn assigned_agent_for_follow_up(
             .then_some(assignment.assignee_id)
             .flatten()
     }))
-}
-
-async fn latest_terminal_execution_for_follow_up_role(
-    db: &SqliteDb,
-    task_id: &str,
-    role: &str,
-) -> Result<Option<Execution>> {
-    if let Some(execution) = latest_terminal_execution_for_exact_role(db, task_id, role).await? {
-        return Ok(Some(execution));
-    }
-    if role == crate::workflow::default_roles::CODER {
-        return latest_terminal_execution_for_exact_role(db, task_id, "executor").await;
-    }
-    Ok(None)
-}
-
-async fn latest_terminal_execution_for_exact_role(
-    db: &SqliteDb,
-    task_id: &str,
-    role: &str,
-) -> Result<Option<Execution>> {
-    let page = ExecutionRepo::list_by_task_and_role(
-        db,
-        task_id,
-        role,
-        PageRequest {
-            cursor: None,
-            limit: 20,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    Ok(page
-        .items
-        .into_iter()
-        .find(|execution| execution.status != ExecutionStatus::Running))
 }
 
 fn execution_role_matches(execution: &Execution, role: &str) -> bool {

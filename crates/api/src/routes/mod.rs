@@ -1,17 +1,20 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
     ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, RoleMembershipResponse,
     RoleMembershipStatus, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleResponse, TaskRoleAssignmentResponse,
-    TaskType, WorkspaceResponse,
+    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse,
+    TaskRoleResponse, TaskType, WorkspaceResponse,
 };
 use db::{
-    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
-    Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo, SortBy, SortOrder,
-    Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo,
-    Workspace, WorkspaceRepo,
+    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution,
+    Page, PageRequest, Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo,
+    SortBy, SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo,
+    TransitionLogRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +22,7 @@ use services::workflow::engine::WorkflowEngine;
 use services::{
     plan_artifact::{latest_plan_for_task, read_plan_for_workspace, PlanArtifactError},
     task_diagnostics::{derive_workflow_exception, derive_workflow_health},
-    task_service::action_resolver::resolve_execution_actions,
+    task_service::action_resolver::resolve_execution_actions_with_session_state,
 };
 use sqlx::Row;
 
@@ -334,6 +337,7 @@ async fn task_response_inner(
         );
     }
     let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
+    let current_workspace_id = workspace_model.as_ref().map(|workspace| workspace.id.clone());
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
             Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
@@ -354,10 +358,52 @@ async fn task_response_inner(
         (None, None)
     };
     let workspace = workspace_model.map(workspace_response);
-    let error_annotation = task.error_annotation.as_deref().map(|s| {
+    let mut error_annotation = task.error_annotation.as_deref().map(|s| {
         serde_json::from_str::<TaskAnnotation>(s)
             .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
     });
+    let mut diagnostic_task = task.clone();
+    if let Some(TaskAnnotation::Blocking(annotation)) = error_annotation.as_mut() {
+        if annotation
+            .recovery_actions
+            .contains(&api_types::RecoveryAction::ResumeSession)
+        {
+            let resumable = annotation_session_is_resumable(
+                db,
+                annotation,
+                latest_execution.as_ref(),
+                current_workspace_id.as_deref(),
+            )
+            .await?;
+            filter_resume_session_action(annotation, resumable);
+            if !resumable {
+                diagnostic_task.error_annotation = Some(
+                    serde_json::to_string(&TaskAnnotation::Blocking(annotation.clone()))
+                        .map_err(|error| ApiError::internal(error.to_string()))?,
+                );
+            }
+        }
+    }
+    let mut blocked_metadata_annotation = blocked_metadata_annotation(&task);
+    if let Some(annotation) = blocked_metadata_annotation.as_mut() {
+        if annotation
+            .recovery_actions
+            .contains(&api_types::RecoveryAction::ResumeSession)
+        {
+            let resumable = annotation_session_is_resumable(
+                db,
+                annotation,
+                latest_execution.as_ref(),
+                current_workspace_id.as_deref(),
+            )
+            .await?;
+            filter_resume_session_action(annotation, resumable);
+        }
+    }
+    let error_blocking_annotation = match error_annotation.as_ref() {
+        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
+        _ => None,
+    };
     let execution_actions = if include_actions {
         let executions = db::ExecutionRepo::list_by_task(
             db,
@@ -372,20 +418,39 @@ async fn task_response_inner(
         )
         .await?
         .items;
-        let blocked_metadata_annotation = blocked_metadata_annotation(&task);
-        let error_blocking_annotation = match error_annotation.as_ref() {
-            Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-            _ => None,
-        };
         let blocking_annotation = blocked_metadata_annotation
             .as_ref()
             .or(error_blocking_annotation);
-        resolve_execution_actions(&task, &workflow, &executions, blocking_annotation)
+        let mut resumable_execution_ids = HashSet::new();
+        for execution in &executions {
+            let expected_agent_id = match execution.actor_ref() {
+                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+                _ => None,
+            };
+            if services::task_service::resumable_external_session(
+                db,
+                execution,
+                expected_agent_id.as_deref(),
+                current_workspace_id.as_deref(),
+            )
+            .await?
+            .is_some()
+            {
+                resumable_execution_ids.insert(execution.id.clone());
+            }
+        }
+        resolve_execution_actions_with_session_state(
+            &task,
+            &workflow,
+            &executions,
+            blocking_annotation,
+            Some(&resumable_execution_ids),
+        )
     } else {
         Vec::new()
     };
     let workflow_exception = derive_workflow_exception(
-        &task,
+        &diagnostic_task,
         &workflow,
         latest_review.as_ref(),
         latest_execution.as_ref(),
@@ -495,6 +560,48 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
         hook: metadata.get("hook").cloned(),
         recovery_actions,
     })
+}
+
+async fn annotation_session_is_resumable(
+    db: &db::SqliteDb,
+    annotation: &TaskBlockingAnnotation,
+    latest_execution: Option<&Execution>,
+    workspace_id: Option<&str>,
+) -> ApiResult<bool> {
+    let execution_id = annotation
+        .blocked_execution_id
+        .as_deref()
+        .or_else(|| latest_execution.map(|execution| execution.id.as_str()));
+    let Some(execution_id) = execution_id else {
+        return Ok(false);
+    };
+    let execution = match latest_execution.filter(|execution| execution.id == execution_id) {
+        Some(execution) => execution.clone(),
+        None => match db::ExecutionRepo::get_by_id(db, execution_id).await? {
+            Some(execution) => execution,
+            None => return Ok(false),
+        },
+    };
+    let expected_agent_id = match execution.actor_ref() {
+        Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+        _ => None,
+    };
+    Ok(services::task_service::resumable_external_session(
+        db,
+        &execution,
+        expected_agent_id.as_deref(),
+        workspace_id,
+    )
+    .await?
+    .is_some())
+}
+
+fn filter_resume_session_action(annotation: &mut TaskBlockingAnnotation, resumable: bool) {
+    if !resumable {
+        annotation
+            .recovery_actions
+            .retain(|action| *action != api_types::RecoveryAction::ResumeSession);
+    }
 }
 
 async fn task_execution_observability(
@@ -671,10 +778,7 @@ pub async fn task_roles_response(
             }),
             policy,
             version: role.version,
-            members: members
-                .into_iter()
-                .map(role_membership_response)
-                .collect(),
+            members: members.into_iter().map(role_membership_response).collect(),
             created_at: role.created_at,
             updated_at: role.updated_at,
         });
@@ -778,14 +882,21 @@ pub fn workspace_response(workspace: Workspace) -> WorkspaceResponse {
 }
 
 pub fn execution_response(execution: Execution) -> ExecutionResponse {
+    let actor_ref = execution.actor_ref().map(|actor| match actor {
+        db::ActorRef::Human(id) => api_types::ActorRef::Human(id),
+        db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id),
+    });
     ExecutionResponse {
         id: execution.id,
         task_id: execution.task_id,
+        actor_ref,
         agent_id: execution.agent_id,
         role: execution.role,
+        purpose: execution.purpose.map(|purpose| purpose.to_string()),
         status: execution_status_response(execution.status),
         parent_execution_id: execution.parent_execution_id,
         agent_session_id: execution.agent_session_id,
+        harness_session_id: execution.harness_session_id,
         prompt: execution.prompt,
         summary: execution.summary,
         logs_path: execution.logs_path,
@@ -1129,8 +1240,35 @@ fn execution_status_response(value: db::ExecutionStatus) -> api_types::Execution
 }
 
 #[cfg(test)]
-mod idempotency_tests {
-    use super::{client_idempotency_key, scoped_idempotency_key};
+mod route_projection_tests {
+    use super::{
+        client_idempotency_key, filter_resume_session_action, scoped_idempotency_key,
+    };
+
+    #[test]
+    fn stale_resume_session_recovery_hint_is_removed_from_response_projection() {
+        let mut annotation = api_types::TaskBlockingAnnotation {
+            annotation_type: api_types::FailureKind::ExecutorFailed,
+            blocking_reason: "executor failed".to_owned(),
+            blocked_by: None,
+            blocked_at: None,
+            blocked_execution_id: Some("ambiguous-execution".to_owned()),
+            artifact: None,
+            message: None,
+            hook: None,
+            recovery_actions: vec![
+                api_types::RecoveryAction::ResumeSession,
+                api_types::RecoveryAction::Reexecute,
+            ],
+        };
+
+        filter_resume_session_action(&mut annotation, false);
+
+        assert_eq!(
+            annotation.recovery_actions,
+            vec![api_types::RecoveryAction::Reexecute]
+        );
+    }
 
     #[test]
     fn idempotency_storage_keys_are_project_and_principal_scoped() {

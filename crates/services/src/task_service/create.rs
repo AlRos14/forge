@@ -138,7 +138,8 @@ impl TaskService {
         if let Some(assignments) = validated_assignments.as_deref() {
             for (_, assignee_type, assignee_id) in assignments {
                 if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
-                    self.validate_actor_for_project(&project, &actor_ref).await?;
+                    self.validate_actor_for_project(&project, &actor_ref)
+                        .await?;
                 }
             }
         }
@@ -152,14 +153,12 @@ impl TaskService {
             })
             .unwrap_or_default();
         let default_assignments = if is_root {
-            let assignments = project_default_role_assignments(
-                &project,
-                &workflow_roles,
-                &explicit_roles,
-            )?;
+            let assignments =
+                project_default_role_assignments(&project, &workflow_roles, &explicit_roles)?;
             for (_, assignee_type, assignee_id) in &assignments {
                 if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
-                    self.validate_actor_for_project(&project, &actor_ref).await?;
+                    self.validate_actor_for_project(&project, &actor_ref)
+                        .await?;
                 }
             }
             assignments
@@ -427,10 +426,7 @@ fn project_default_role_assignments(
     Ok(result)
 }
 
-fn actor_ref_for_assignment(
-    assignee_type: &AssigneeKind,
-    assignee_id: &str,
-) -> Option<ActorRef> {
+fn actor_ref_for_assignment(assignee_type: &AssigneeKind, assignee_id: &str) -> Option<ActorRef> {
     match assignee_type {
         AssigneeKind::Agent => Some(ActorRef::Agent(assignee_id.to_owned())),
         AssigneeKind::User if assignee_id != "human" => {

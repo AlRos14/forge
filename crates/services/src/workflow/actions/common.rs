@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
-    ExecutionRepo, PageRequest, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskCommentRepo,
-    ActorKind, RoleMembershipStatus, TaskMetadata, TaskRepo, TaskRoleAssignment,
-    TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo,
-    UpdateTask, WorkspaceRepo,
+    new_uuid_v4, now_rfc3339, ActorKind, CommentAuthorType, CreateTaskComment, DbError, Execution,
+    ExecutionRepo, PageRequest, ReviewRepo, ReviewStatus, RoleMembershipStatus, SortBy, SortOrder,
+    TaskCommentRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
+    TransitionLog, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
@@ -108,8 +107,7 @@ pub(super) async fn get_usable_agent_assignment(
                     .await
                     .map_err(|error| error.to_string())?
             };
-            let Some(agent_id) = selected
-            else {
+            let Some(agent_id) = selected else {
                 if memberships.iter().any(|member| {
                     member.status == RoleMembershipStatus::Active
                         && member.actor_kind == ActorKind::Agent

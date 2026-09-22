@@ -4,7 +4,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatRepo, AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo,
     AgentStatus, AssigneeKind, CreateAgent, CreateAgentIdentity, CreateAgentProfile,
-    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask,
+    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask, ExecutionPurpose,
     CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus,
     PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, SortBy,
     SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
@@ -250,6 +250,9 @@ async fn seed_execution(state: &AppState, task_id: String) -> String {
             id: execution_id.clone(),
             task_id,
             agent_id: None,
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -274,6 +277,97 @@ async fn seed_execution(state: &AppState, task_id: String) -> String {
     .await
     .expect("execution creates");
     execution_id
+}
+
+async fn seed_task_with_legacy_resume_hint(
+    state: &AppState,
+    ambiguous_history: bool,
+) -> Task {
+    let task = seed_task(state).await;
+    let agent = seed_agent(state, "Legacy resume agent").await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &*state.db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent.id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+            purpose: Some(ExecutionPurpose::Implement),
+            harness_session_id: None,
+            role: "implementer".to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("legacy execution creates");
+    sqlx::query("UPDATE execution SET agent_session_id = ? WHERE id = ?")
+        .bind("legacy-external-thread")
+        .bind(&execution_id)
+        .execute(state.db.pool())
+        .await
+        .expect("legacy external session is recorded");
+
+    let annotation = json!({
+        "type": "executor_failed",
+        "blocking_reason": "execution stopped",
+        "blocked_execution_id": execution_id,
+        "recovery_actions": ["resume_session"]
+    })
+    .to_string();
+    TaskRepo::update(
+        &*state.db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(annotation)),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("resume hint persists");
+
+    if ambiguous_history {
+        sqlx::query(
+            "INSERT INTO execution_session_migration_issue
+                 (id, execution_id, issue_kind, details_json, created_at)
+             VALUES (?, ?, 'historical_session_ambiguous', '{}', ?)",
+        )
+        .bind(new_uuid_v4())
+        .bind(&execution_id)
+        .bind(now)
+        .execute(state.db.pool())
+        .await
+        .expect("ambiguous historical evidence records");
+    }
+    task
 }
 
 async fn seed_agent_registration_deps(state: &AppState) -> (String, String) {
@@ -514,6 +608,119 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+    });
+}
+
+#[test]
+fn mcp_execution_output_exposes_pr2_authority_fields() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let agent = seed_agent(&state, "PR2 output agent").await;
+        let now = now_rfc3339();
+        ExecutionRepo::create(
+            &*state.db,
+            CreateExecution {
+                id: "pr2-mcp-execution".to_owned(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent.id.clone()),
+                actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+                purpose: Some(ExecutionPurpose::Investigate),
+                harness_session_id: None,
+                role: "implementer".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+
+        let page = call_tool(
+            &state,
+            "forge_list_executions",
+            json!({"task_id": task.id}),
+        )
+        .await;
+        let execution = &page["data"][0];
+        assert_eq!(
+            execution["actor_ref"],
+            json!({"kind": "agent", "id": agent.id})
+        );
+        assert_eq!(execution["purpose"], "investigate");
+        assert!(execution["harness_session_id"].is_null());
+    });
+}
+
+#[test]
+fn mcp_task_projection_hides_resume_for_ambiguous_legacy_session() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task_with_legacy_resume_hint(&state, true).await;
+
+        let result = call_tool(
+            &state,
+            "forge_get_task",
+            json!({"task_id": task.id.clone()}),
+        )
+        .await;
+
+        assert!(!result["error_annotation"]["recovery_actions"]
+            .as_array()
+            .expect("recovery actions")
+            .contains(&json!("resume_session")));
+        let persisted = TaskRepo::get_by_id(&*state.db, &task.id, false)
+            .await
+            .expect("task lookup succeeds")
+            .expect("task remains persisted");
+        let persisted_annotation: Value = serde_json::from_str(
+            persisted.error_annotation.as_deref().expect("annotation persists"),
+        )
+        .expect("persisted annotation is valid JSON");
+        assert!(persisted_annotation["recovery_actions"]
+            .as_array()
+            .expect("persisted recovery actions")
+            .contains(&json!("resume_session")));
+    });
+}
+
+#[test]
+fn mcp_task_projection_keeps_resume_for_unambiguous_legacy_session() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task_with_legacy_resume_hint(&state, false).await;
+
+        let result = call_tool(
+            &state,
+            "forge_list_tasks",
+            json!({"project_id": task.project_id}),
+        )
+        .await;
+        let listed_task = result["data"]
+            .as_array()
+            .expect("task page")
+            .iter()
+            .find(|item| item["id"] == task.id)
+            .expect("task appears in list");
+        assert!(listed_task["error_annotation"]["recovery_actions"]
+            .as_array()
+            .expect("recovery actions")
+            .contains(&json!("resume_session")));
     });
 }
 

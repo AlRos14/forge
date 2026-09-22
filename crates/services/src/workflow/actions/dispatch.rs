@@ -223,6 +223,10 @@ impl HookAction for DispatchRoleAgent {
                             parent_execution_id,
                             prompt.user,
                             trigger,
+                            crate::task_service::execution::execution_purpose_for_task_type(
+                                &current_task.task_type,
+                                role_name,
+                            ),
                         )
                         .await
                     {
@@ -326,6 +330,10 @@ impl HookAction for DispatchRoleAgent {
                         &ctx.task_id,
                         &agent.id,
                         role_name,
+                        crate::task_service::execution::execution_purpose_for_task_type(
+                            &current_task.task_type,
+                            role_name,
+                        ),
                         prompt.user,
                         Some(dispatch_metadata),
                     )

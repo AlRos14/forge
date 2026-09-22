@@ -857,7 +857,10 @@ pub struct Execution {
     pub id: String,
     pub task_id: String,
     pub agent_id: Option<String>,
+    pub actor_kind: Option<ActorKind>,
+    pub actor_id: Option<String>,
     pub role: String,
+    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub stop_reason: Option<StopReason>,
     pub stopped_by: Option<String>,
@@ -865,6 +868,7 @@ pub struct Execution {
     pub stopped_at: Option<String>,
     pub parent_execution_id: Option<String>,
     pub agent_session_id: Option<String>,
+    pub harness_session_id: Option<String>,
     pub agent_message_id: Option<String>,
     pub last_activity_at: Option<String>,
     pub prompt: Option<String>,
@@ -877,6 +881,58 @@ pub struct Execution {
     pub workspace_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessSession {
+    pub id: String,
+    pub agent_id: String,
+    pub harness_kind: String,
+    pub external_session_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub profile_snapshot_json: String,
+    pub capabilities_snapshot_json: String,
+    pub workspace_id: Option<String>,
+    pub status: HarnessSessionStatus,
+    pub predecessor_session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateHarnessSession {
+    pub id: String,
+    pub agent_id: String,
+    pub harness_kind: String,
+    pub external_session_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub profile_snapshot_json: String,
+    pub capabilities_snapshot_json: String,
+    pub workspace_id: Option<String>,
+    pub status: HarnessSessionStatus,
+    pub predecessor_session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateHarnessSession {
+    pub id: String,
+    pub status: Option<HarnessSessionStatus>,
+    pub last_activity_at: Option<Option<String>>,
+    pub updated_at: String,
+}
+
+impl Execution {
+    pub fn actor_ref(&self) -> Option<ActorRef> {
+        match (self.actor_kind, self.actor_id.as_deref()) {
+            (Some(ActorKind::Human), Some(id)) => Some(ActorRef::Human(id.to_owned())),
+            (Some(ActorKind::Agent), Some(id)) => Some(ActorRef::Agent(id.to_owned())),
+            _ => None,
+        }
+    }
 }
 
 pub type ExecutionRole = String;
@@ -1335,6 +1391,25 @@ pub enum ExecutionStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPurpose {
+    Plan,
+    Implement,
+    Review,
+    Validate,
+    Investigate,
+    Orchestrate,
+    General,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessSessionStatus {
+    Pending,
+    Active,
+    Ended,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     UserCancelled,
     TaskCancelled,
@@ -1759,6 +1834,23 @@ enum_strings!(ExecutionStatus {
     Completed => "completed",
     Failed => "failed",
     Cancelled => "cancelled",
+});
+
+enum_strings!(ExecutionPurpose {
+    Plan => "plan",
+    Implement => "implement",
+    Review => "review",
+    Validate => "validate",
+    Investigate => "investigate",
+    Orchestrate => "orchestrate",
+    General => "general",
+});
+
+enum_strings!(HarnessSessionStatus {
+    Pending => "pending",
+    Active => "active",
+    Ended => "ended",
+    Failed => "failed",
 });
 
 enum_strings!(AgentChatMessageAuthorType {

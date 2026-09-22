@@ -605,6 +605,10 @@ pub trait RuntimeRepo: Send + Sync {
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
+    /// Return whether migration evidence explicitly marks this historical
+    /// Execution's external session identity as contradictory.  This is a
+    /// fail-closed compatibility check; it is not a generic session lookup.
+    async fn has_historical_session_ambiguity(&self, execution_id: &str) -> Result<bool>;
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats>;
     async fn list_by_task(&self, task_id: &str, page: PageRequest) -> Result<Page<Execution>>;
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>>;
@@ -626,6 +630,28 @@ pub trait ExecutionRepo: Send + Sync {
         exclude_ids: &[String],
     ) -> Result<Vec<Execution>>;
     async fn get_logs_path(&self, id: &str) -> Result<Option<String>>;
+    /// Persist an external harness session identity and its legacy projection
+    /// together. The generic HarnessSession is authoritative; the execution
+    /// column is updated only as a compatibility projection.
+    async fn record_harness_session_result(
+        &self,
+        execution_id: &str,
+        external_session_id: &str,
+        updated_at: &str,
+    ) -> Result<Execution>;
+}
+
+#[async_trait]
+pub trait HarnessSessionRepo: Send + Sync {
+    async fn create(&self, input: CreateHarnessSession) -> Result<HarnessSession>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<HarnessSession>>;
+    async fn find_reusable(
+        &self,
+        agent_id: &str,
+        harness_kind: &str,
+        external_session_id: &str,
+    ) -> Result<Option<HarnessSession>>;
+    async fn update(&self, input: UpdateHarnessSession) -> Result<HarnessSession>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1683,7 +1709,14 @@ pub struct CreateExecution {
     pub id: String,
     pub task_id: String,
     pub agent_id: Option<String>,
+    /// New writers must provide the concrete historical Actor. `None` is
+    /// retained only for bounded legacy/test fixture creation and is never a
+    /// valid new service-level principal.
+    pub actor_ref: Option<ActorRef>,
     pub role: String,
+    /// New writers must state the semantic reason for the run. `None` is
+    /// retained for historical compatibility rows until PR13 cleanup.
+    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub stop_reason: Option<StopReason>,
     pub stopped_by: Option<String>,
@@ -1691,6 +1724,7 @@ pub struct CreateExecution {
     pub stopped_at: Option<String>,
     pub parent_execution_id: Option<String>,
     pub agent_session_id: Option<String>,
+    pub harness_session_id: Option<String>,
     pub agent_message_id: Option<String>,
     pub last_activity_at: Option<String>,
     pub summary: Option<String>,
@@ -1712,6 +1746,11 @@ pub struct UpdateExecution {
     pub stopped_by: Option<Option<String>>,
     pub resume_policy: Option<Option<ResumePolicy>>,
     pub stopped_at: Option<Option<String>>,
+    /// Legacy-shaped input retained for callers that receive an
+    /// ExecutionResult. `Some(Some(id))` is an external harness identity and
+    /// is routed through the generic HarnessSession authority by the
+    /// repository; `Some(None)` only clears a historical row with no generic
+    /// session reference.
     pub agent_session_id: Option<Option<String>>,
     pub agent_message_id: Option<Option<String>>,
     pub last_activity_at: Option<Option<String>>,
@@ -1990,22 +2029,18 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
 
 #[async_trait]
 pub trait TaskRoleRepo: Send + Sync {
-    async fn create(
-        &self,
-        input: CreateTaskRole,
-    ) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create(&self, input: CreateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
     async fn get_by_task_and_role(
         &self,
         task_id: &str,
         role: &str,
     ) -> std::result::Result<Option<TaskRole>, crate::DbError>;
     async fn get_by_id(&self, id: &str) -> std::result::Result<Option<TaskRole>, crate::DbError>;
-    async fn list_by_task(&self, task_id: &str)
-        -> std::result::Result<Vec<TaskRole>, crate::DbError>;
-    async fn update(
+    async fn list_by_task(
         &self,
-        input: UpdateTaskRole,
-    ) -> std::result::Result<TaskRole, crate::DbError>;
+        task_id: &str,
+    ) -> std::result::Result<Vec<TaskRole>, crate::DbError>;
+    async fn update(&self, input: UpdateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
 }
 
 #[async_trait]
@@ -2014,8 +2049,7 @@ pub trait RoleMembershipRepo: Send + Sync {
         &self,
         input: CreateRoleMembership,
     ) -> std::result::Result<RoleMembership, crate::DbError>;
-    async fn get(&self, id: &str)
-        -> std::result::Result<Option<RoleMembership>, crate::DbError>;
+    async fn get(&self, id: &str) -> std::result::Result<Option<RoleMembership>, crate::DbError>;
     async fn list_by_role(
         &self,
         task_role_id: &str,

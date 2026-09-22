@@ -1617,6 +1617,11 @@ Task IDs are only references that Forge authorizes.
 | `forge_get_agent_handoff` | Inspect one handoff and its delivery outcome |
 | `forge_create_agent_handoff` | Publish a bounded, deduplicated Main-to-Project handoff |
 
+Task response recovery annotations are preserved as stored, but `ResumeSession`
+is removed from the REST or MCP response projection unless the shared session
+resumability authority confirms continuity for the resolved Execution. This
+filtering does not rewrite the Task's persisted diagnostic history.
+
 Disable the endpoint with `forge --no-mcp` if you don't want it.
 
 `forge_create_task` accepts the optional `type` field (`implementation`, `planning`,
@@ -1702,12 +1707,28 @@ execution appear inactive.
 ### Manual continuation and re-execution
 
 `POST /api/v1/executions/{id}/follow-up` is the manual continuation path. It
-preserves the parent session when supported, uses the interactive role, and
-does not advance the task workflow when it completes.
+creates a new Execution with the interactive role and preserves the parent's
+HarnessSession only when the selected Agent, explicit session, and workspace
+constraints all match. It never infers continuity from a role or latest
+execution, and it does not advance the task workflow when it completes.
 
 `POST /api/v1/executions/{id}/re-execute` starts a new execution for the
 current legacy workflow role and role assignment without session continuity;
-completion may participate in the existing workflow cascade. These endpoints
-describe the transitional execution surface that remains until the explicit
-HarnessSession, Actor, and lifecycle migrations. They are not the target
-identity mechanism.
+the new row records the source Execution in `parent_execution_id`, while the
+source history remains unchanged. Completion may participate in the existing
+workflow cascade. These endpoints
+retain the legacy `agent_id` and `agent_session_id` response fields while the
+additive PR2 fields are authoritative:
+
+~~~json
+{
+  "actor_ref": {"kind": "agent", "id": "..."},
+  "purpose": "implement",
+  "harness_session_id": "forge-session-id"
+}
+~~~
+
+`harness_session_id` is Forge's durable record id. The legacy
+`agent_session_id`, when present, is the one-way projection of the external
+harness-native session id stored by that record. A Human Execution returns a
+real human `actor_ref`, `agent_id: null`, and `harness_session_id: null`.

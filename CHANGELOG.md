@@ -8,6 +8,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Execution responses now expose additive `actor_ref`, `purpose`, and
+  `harness_session_id` fields. New Executions persist a real Human or Agent
+  principal and an explicit purpose; legacy `agent_id` and `agent_session_id`
+  remain compatibility projections during the migration.
+- Session follow-up and recovery now require an explicit reusable
+  HarnessSession for new rows. Role/latest-execution inference is no longer a
+  session authority; existing embedded `agent_session` runtime surfaces remain
+  separate until their named migration.
+- REST and MCP Task responses suppress stale `ResumeSession` recovery hints
+  when the shared Execution/session authority cannot confirm reusable
+  continuity; stored annotations remain unchanged.
 - Task responses now include the additive `task_roles` multi-actor
   participation projection, and new `/task-roles` REST routes expose
   TaskRole/membership writes with optimistic concurrency. The legacy singular

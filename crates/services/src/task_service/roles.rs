@@ -137,7 +137,11 @@ impl TaskService {
                         let actor_kind: String = row.get("actor_kind");
                         let actor_id: String = row.get("actor_id");
                         (
-                            Some(if actor_kind == "agent" { "agent" } else { "user" }),
+                            Some(if actor_kind == "agent" {
+                                "agent"
+                            } else {
+                                "user"
+                            }),
                             Some(actor_id),
                         )
                     })
@@ -167,10 +171,10 @@ impl TaskService {
                 )
                 .bind(assignee_type)
                 .bind(assignee_id)
-                    .bind(now_rfc3339())
-                    .bind(legacy_id)
-                    .execute(&mut **transaction)
-                    .await?;
+                .bind(now_rfc3339())
+                .bind(legacy_id)
+                .execute(&mut **transaction)
+                .await?;
             }
 
             // Rebuild the task-level compatibility projection even when the
@@ -195,7 +199,11 @@ impl TaskService {
                     let actor_kind: String = row.get("actor_kind");
                     let actor_id: String = row.get("actor_id");
                     (
-                        if actor_kind == "agent" { "agent" } else { "user" },
+                        if actor_kind == "agent" {
+                            "agent"
+                        } else {
+                            "user"
+                        },
                         Some(actor_id),
                     )
                 })
@@ -237,9 +245,7 @@ impl TaskService {
             return Ok(None);
         };
         match crate::task_service::current_role_memberships_authoritative(
-            &self.db,
-            task_id,
-            &role_name,
+            &self.db, task_id, &role_name,
         )
         .await?
         {
@@ -284,12 +290,8 @@ impl TaskService {
         let task = self.validate_reassignable_task(&input.task_id).await?;
         self.enforce_mode_specific_role_guards(&task, &input.role_name, Some(&input))
             .await?;
-        self.preflight_legacy_singleton_role_mutation(
-            &task,
-            &input.role_name,
-            Some(&input),
-        )
-        .await?;
+        self.preflight_legacy_singleton_role_mutation(&task, &input.role_name, Some(&input))
+            .await?;
         let previous = TaskRoleAssignmentRepo::get_by_task_and_role(
             &*self.db,
             &input.task_id,
@@ -428,9 +430,7 @@ impl TaskService {
             // compatibility writer will end the current set (and reject a
             // plural set) in the same way as it does when a projection exists.
             if crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                task_id,
-                role_name,
+                &self.db, task_id, role_name,
             )
             .await?
             .is_some()
@@ -540,9 +540,7 @@ impl TaskService {
         incoming: Option<&CreateTaskRoleAssignment>,
     ) -> Result<()> {
         let authoritative = crate::task_service::current_role_memberships_authoritative(
-            &self.db,
-            &task.id,
-            role_name,
+            &self.db, &task.id, role_name,
         )
         .await?;
         if let Some(memberships) = authoritative.as_ref() {
@@ -605,9 +603,7 @@ impl TaskService {
         _incoming: Option<&CreateTaskRoleAssignment>,
     ) -> Result<RoleGuardAction> {
         if let Some(memberships) = crate::task_service::current_role_memberships_authoritative(
-            &self.db,
-            &task.id,
-            role_name,
+            &self.db, &task.id, role_name,
         )
         .await?
         {
@@ -729,6 +725,11 @@ impl TaskService {
             _ => reason.to_owned(),
         };
         let preserve_resume_context = resume_policy == db::ResumePolicy::Manual;
+        // An explicit generic HarnessSession remains resumable even when the
+        // cancellation was not manual. Preserve the execution snapshot so a
+        // later recovery can reconstruct the same harness invocation.
+        let preserve_harness_context =
+            preserve_resume_context || execution.harness_session_id.is_some();
         if self.daemon_connections.is_some() || self.task_executor.is_some() {
             if let Err(error) = self.cancel_execution_with_provider(execution, reason).await {
                 if matches!(error, ServiceError::DaemonUnavailable { .. }) {
@@ -751,9 +752,11 @@ impl TaskService {
                 resume_policy: Some(Some(resume_policy)),
                 stopped_at: Some(Some(now_rfc3339())),
                 // Manual user stops retain the session and executor snapshot so the
-                // task façade can resume the same worker thread. Lifecycle and task
-                // cancellation paths still clear those fields.
-                agent_session_id: (!preserve_resume_context).then_some(None),
+                // task façade can resume the same worker thread. An explicit generic
+                // HarnessSession also retains both across lifecycle cancellation;
+                // the repository keeps its legacy projection aligned while the
+                // HarnessSession remains authoritative.
+                agent_session_id: (!preserve_harness_context).then_some(None),
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -761,7 +764,7 @@ impl TaskService {
                 before_sha: None,
                 after_sha: None,
                 error: Some(Some(reason.to_owned())),
-                executor_config_snapshot_json: (!preserve_resume_context).then_some(None),
+                executor_config_snapshot_json: (!preserve_harness_context).then_some(None),
                 updated_at: now_rfc3339(),
             },
         )
@@ -886,9 +889,7 @@ impl TaskService {
     }
 }
 
-fn legacy_assignment_actor_ref(
-    input: &CreateTaskRoleAssignment,
-) -> Result<Option<ActorRef>> {
+fn legacy_assignment_actor_ref(input: &CreateTaskRoleAssignment) -> Result<Option<ActorRef>> {
     match (input.assignee_type.as_ref(), input.assignee_id.as_deref()) {
         (Some(AssigneeKind::Agent), Some(id)) => Ok(Some(ActorRef::Agent(id.to_owned()))),
         (Some(AssigneeKind::User), Some("human")) => Ok(None),

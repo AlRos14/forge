@@ -110,12 +110,12 @@ pub(super) fn executor_snapshot_with_resume_thread(
         if let Some(dispatch_obj) = dispatch.as_object_mut() {
             dispatch_obj.insert(
                 "execution_policy".to_owned(),
-                Value::String("resume_latest_target_role_thread".to_owned()),
+                Value::String("explicit_harness_session".to_owned()),
             );
         }
         obj.insert(
             "dispatch_metadata".to_owned(),
-            json!({ "execution_policy": "resume_latest_target_role_thread" }),
+            json!({ "execution_policy": "explicit_harness_session" }),
         );
     }
     serde_json::to_string(&snapshot).map_err(|error| {
@@ -427,6 +427,8 @@ pub(super) async fn create_failed_execution_record(
     agent: &Agent,
     workspace: &Workspace,
     execution_id: &str,
+    role: &str,
+    purpose: ExecutionPurpose,
     error: String,
 ) -> Result<()> {
     let now = now_rfc3339();
@@ -436,7 +438,10 @@ pub(super) async fn create_failed_execution_record(
             id: execution_id.to_owned(),
             task_id: task_id.to_owned(),
             agent_id: Some(agent.id.clone()),
-            role: "executor".to_owned(),
+            actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+            purpose: Some(purpose),
+            harness_session_id: None,
+            role: role.to_owned(),
             status: ExecutionStatus::Failed,
             stop_reason: None,
             stopped_by: None,

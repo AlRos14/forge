@@ -11,17 +11,17 @@ use crate::{
 };
 use ::review::{ReviewRequest, ReviewRunner};
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
-use api_types::{Actor, ProjectSettings, UserActionSource};
+use api_types::{Actor, ActorRef, ProjectSettings, UserActionSource};
 use cli_adapters::codex::protocol::RESUME_THREAD_ID_CONFIG_KEY;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
     CommentAuthorType, CreateExecution, CreateTask, CreateTaskComment, CreateTaskRoleAssignment,
-    CreateWorkspace, CreateWorkspaceLease, DbError, Execution, ExecutionRepo, ExecutionStatus,
-    ExecutionUsageRepo, PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus,
-    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo,
-    TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
-    TaskStatus, TransitionLogRepo, UpsertExecutionUsage, UserRepo, Workspace, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    CreateWorkspace, CreateWorkspaceLease, DbError, Execution, ExecutionPurpose, ExecutionRepo,
+    ExecutionStatus, ExecutionUsageRepo, HarnessSession, HarnessSessionRepo, HarnessSessionStatus,
+    PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy,
+    SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata,
+    TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
+    UpsertExecutionUsage, UserRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -47,6 +47,7 @@ pub(crate) mod config;
 mod create;
 mod create_subtasks;
 pub(crate) mod execution;
+pub use execution::resumable_external_session;
 mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;

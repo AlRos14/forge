@@ -2,6 +2,7 @@ use api_types::{
     ExecutionAction, ExecutionActionKind, ExecutionStatus, RecoveryAction, StateKind,
     TaskBlockingAnnotation, WorkflowDefinition,
 };
+use std::collections::HashSet;
 
 const INTERACTIVE_ROLE: &str = "interactive";
 
@@ -10,6 +11,25 @@ pub fn resolve_execution_actions(
     workflow: &WorkflowDefinition,
     executions: &[db::Execution],
     blocking_annotation: Option<&TaskBlockingAnnotation>,
+) -> Vec<ExecutionAction> {
+    resolve_execution_actions_with_session_state(
+        task,
+        workflow,
+        executions,
+        blocking_annotation,
+        None,
+    )
+}
+
+/// Resolve actions with the set of Executions whose continuity was validated
+/// by the common resumability authority. This includes exact active generic
+/// sessions and only safe, unambiguous historical compatibility fallbacks.
+pub fn resolve_execution_actions_with_session_state(
+    task: &db::Task,
+    workflow: &WorkflowDefinition,
+    executions: &[db::Execution],
+    blocking_annotation: Option<&TaskBlockingAnnotation>,
+    resumable_execution_ids: Option<&HashSet<String>>,
 ) -> Vec<ExecutionAction> {
     let is_terminal = workflow.state_kind(&task.status) == Some(StateKind::Terminal);
     let current_state = workflow
@@ -40,7 +60,7 @@ pub fn resolve_execution_actions(
         .iter()
         .filter(|execution| {
             execution_status(execution) != ExecutionStatus::Running
-                && execution.agent_session_id.is_some()
+                && has_resumable_session(execution, resumable_execution_ids)
         })
         .max_by(|left, right| left.created_at.cmp(&right.created_at));
 
@@ -57,9 +77,9 @@ pub fn resolve_execution_actions(
             .contains(&RecoveryAction::ResumeSession)
     });
     let has_recovery_session = has_resume_recovery_action
-        && blocked_execution
-            .and_then(|execution| execution.agent_session_id.as_ref())
-            .is_some();
+        && blocked_execution.is_some_and(|execution| {
+            has_resumable_session(execution, resumable_execution_ids)
+        });
     let blocked_role_matches = effective_role
         .zip(blocked_execution.map(|execution| execution.role.as_str()))
         .is_some_and(|(role, blocked_role)| role == blocked_role);
@@ -191,6 +211,13 @@ pub fn resolve_execution_actions(
     ]
 }
 
+fn has_resumable_session(
+    execution: &db::Execution,
+    resumable_execution_ids: Option<&HashSet<String>>,
+) -> bool {
+    resumable_execution_ids.is_some_and(|ids| ids.contains(&execution.id))
+}
+
 fn no_resumable_session_reason(role: Option<&str>) -> String {
     format!(
         "No resumable {} session available",
@@ -233,6 +260,98 @@ fn retry_budget_exhausted_reason(annotation: &TaskBlockingAnnotation) -> Option<
             retry_budget_gate(annotation)
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn execution(
+        id: &str,
+        actor_ref: Option<db::ActorRef>,
+        harness_session_id: Option<&str>,
+        agent_session_id: Option<&str>,
+    ) -> db::Execution {
+        let (actor_kind, actor_id) = match actor_ref {
+            Some(db::ActorRef::Agent(id)) => (Some(db::ActorKind::Agent), Some(id)),
+            Some(db::ActorRef::Human(id)) => (Some(db::ActorKind::Human), Some(id)),
+            None => (None, None),
+        };
+        db::Execution {
+            id: id.to_owned(),
+            task_id: "task".to_owned(),
+            agent_id: actor_id.clone(),
+            actor_kind,
+            actor_id,
+            role: "coder".to_owned(),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            status: db::ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: agent_session_id.map(str::to_owned),
+            harness_session_id: harness_session_id.map(str::to_owned),
+            agent_message_id: None,
+            last_activity_at: None,
+            prompt: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn explicit_harness_state_controls_resumability() {
+        let pending = execution(
+            "pending",
+            Some(db::ActorRef::Agent("a".to_owned())),
+            Some("hs"),
+            None,
+        );
+        assert!(!has_resumable_session(&pending, Some(&HashSet::new())));
+
+        let active = execution(
+            "active",
+            Some(db::ActorRef::Agent("a".to_owned())),
+            Some("hs"),
+            Some("legacy"),
+        );
+        let active_ids = HashSet::from(["hs".to_owned()]);
+        assert!(has_resumable_session(&active, Some(&active_ids)));
+
+        let agent_legacy = execution(
+            "agent-legacy",
+            Some(db::ActorRef::Agent("a".to_owned())),
+            None,
+            Some("legacy"),
+        );
+        assert!(!has_resumable_session(&agent_legacy, None));
+
+        let mut historical = execution("historical", None, None, Some("legacy"));
+        historical.agent_id = Some("a".to_owned());
+        let checked_historical_ids = HashSet::from([historical.id.clone()]);
+        assert!(has_resumable_session(
+            &historical,
+            Some(&checked_historical_ids)
+        ));
+        assert!(!has_resumable_session(&historical, Some(&HashSet::new())));
+
+        let agentless = execution("agentless", None, None, Some("legacy"));
+        assert!(!has_resumable_session(&agentless, None));
+
+        let mut workspace_scoped = execution("workspace", None, None, Some("legacy"));
+        workspace_scoped.agent_id = Some("a".to_owned());
+        workspace_scoped.workspace_id = Some("workspace-1".to_owned());
+        assert!(!has_resumable_session(&workspace_scoped, None));
+    }
 }
 
 fn retry_budget_gate(annotation: &TaskBlockingAnnotation) -> String {

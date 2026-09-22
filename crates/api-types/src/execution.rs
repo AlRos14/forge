@@ -3,7 +3,7 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionRole,
+    ActorRef, AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionRole,
     ExecutionStatus, InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy,
     StopReason, TaskAnnotation, TaskRoleAssignmentResponse, TaskRoleResponse, TaskStatus, TaskType,
     WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
@@ -250,11 +250,14 @@ pub struct TaskUsageSummaryResponse {
 pub struct ExecutionResponse {
     pub id: String,
     pub task_id: String,
+    pub actor_ref: Option<ActorRef>,
     pub agent_id: Option<String>,
     pub role: ExecutionRole,
+    pub purpose: Option<String>,
     pub status: ExecutionStatus,
     pub parent_execution_id: Option<String>,
     pub agent_session_id: Option<String>,
+    pub harness_session_id: Option<String>,
     pub prompt: Option<String>,
     pub summary: Option<String>,
     pub logs_path: Option<String>,

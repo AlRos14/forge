@@ -20,5 +20,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 uuid = "1"
 
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+
 [lints]
 workspace = true

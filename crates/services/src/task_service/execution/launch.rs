@@ -1,4 +1,5 @@
 use super::*;
+use db::WorkspaceRepo;
 
 impl TaskService {
     pub async fn dispatch_initial_role_execution(
@@ -6,10 +7,13 @@ impl TaskService {
         task_id: &str,
         agent_id: &str,
         role: &str,
+        purpose: ExecutionPurpose,
         prompt: String,
     ) -> Result<Execution> {
-        self.dispatch_initial_role_execution_with_metadata(task_id, agent_id, role, prompt, None)
-            .await
+        self.dispatch_initial_role_execution_with_metadata(
+            task_id, agent_id, role, purpose, prompt, None,
+        )
+        .await
     }
 
     pub async fn dispatch_initial_role_execution_with_metadata(
@@ -17,6 +21,7 @@ impl TaskService {
         task_id: &str,
         agent_id: &str,
         role: &str,
+        purpose: ExecutionPurpose,
         prompt: String,
         dispatch_metadata: Option<Value>,
     ) -> Result<Execution> {
@@ -60,6 +65,9 @@ impl TaskService {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(agent.id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+                    purpose: Some(purpose),
+                    harness_session_id: None,
                     role: role.to_owned(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
@@ -187,6 +195,9 @@ impl TaskService {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(agent.id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+                    purpose: Some(ExecutionPurpose::General),
+                    harness_session_id: None,
                     role: "interactive".to_owned(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
@@ -247,7 +258,7 @@ impl TaskService {
         let parent_execution_id = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
 
-        let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+        let mut parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.clone()))?;
         if !matches!(
@@ -259,13 +270,6 @@ impl TaskService {
                 parent_execution.status
             )));
         }
-        let parent_agent_session_id =
-            parent_execution.agent_session_id.clone().ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "parent execution has no resumable session (agent_session_id is null)",
-                )
-            })?;
-
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
@@ -297,13 +301,65 @@ impl TaskService {
             _ => task,
         };
 
-        let resolved_agent_id = agent_id
-            .or_else(|| parent_execution.agent_id.clone())
-            .ok_or_else(|| {
+        let authoritative_memberships = if let Some(role) =
+            db::canonical_task_role_name(&parent_execution.role)
+        {
+            crate::task_service::current_role_memberships_authoritative(&self.db, &task.id, &role)
+                .await?
+        } else {
+            None
+        };
+        let resolved_agent_id = if let Some(requested_agent_id) = agent_id {
+            if let Some(memberships) = authoritative_memberships.as_ref() {
+                if crate::task_service::active_agent_membership(memberships, &requested_agent_id)
+                    .is_none()
+                {
+                    return Err(ServiceError::conflict(format!(
+                        "Agent {requested_agent_id} is not an active member of follow-up role {}",
+                        parent_execution.role
+                    )));
+                }
+                if task.repo_id.is_some()
+                    && !crate::task_service::repository_worker_identity_is_eligible(
+                        &self.db,
+                        &task.project_id,
+                        &requested_agent_id,
+                    )
+                    .await?
+                {
+                    return Err(ServiceError::conflict(format!(
+                        "Agent {requested_agent_id} cannot receive repository workspace authority"
+                    )));
+                }
+            }
+            requested_agent_id
+        } else if let Some(memberships) = authoritative_memberships.as_ref() {
+            // Select the current role Actor before checking whether lineage
+            // continuity is reusable. Parent eligibility alone is not Actor
+            // selection and must not preserve a previous Agent's session.
+            let selected_agent = if task.repo_id.is_some() {
+                crate::task_service::select_usable_repository_agent_id(
+                    &self.db,
+                    &task.project_id,
+                    memberships,
+                )
+                .await?
+            } else {
+                crate::task_service::select_usable_agent_id(&self.db, memberships).await?
+            };
+            selected_agent.ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "no usable Agent is available for follow-up role {}",
+                    parent_execution.role
+                ))
+            })?
+        } else {
+            parent_execution.agent_id.clone().ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "follow-up requires agent_id either in request or parent execution",
                 )
-            })?;
+            })?
+        };
         let agent = AgentRepo::get_by_id(&*self.db, &resolved_agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", resolved_agent_id.clone()))?;
@@ -361,9 +417,49 @@ impl TaskService {
                 self.repo_cache_locks.clone(),
             )
             .await?;
+        let parent_actor_matches = matches!(
+            parent_execution.actor_ref(),
+            Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &resolved_agent_id
+        );
+        if parent_actor_matches && parent_execution.harness_session_id.is_none() {
+            if let Some(external_session_id) = resumable_external_session(
+                &self.db,
+                &parent_execution,
+                Some(&resolved_agent_id),
+                Some(&workspace.id),
+            )
+            .await?
+            {
+                if let Some(reconciled) = materialize_historical_harness_session(
+                    &self.db,
+                    &parent_execution,
+                    &external_session_id,
+                )
+                .await?
+                {
+                    parent_execution = reconciled;
+                }
+            }
+        }
+        let reusable_session = if parent_actor_matches {
+            reusable_harness_session_for_agent(
+                &self.db,
+                &parent_execution,
+                &resolved_agent_id,
+                Some(&workspace.id),
+            )
+            .await?
+        } else {
+            None
+        };
+        let reusable_external_session = reusable_session
+            .as_ref()
+            .filter(|session| matches!(&session.status, db::HarnessSessionStatus::Active))
+            .and_then(|session| session.external_session_id.clone());
         let mut executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
-        if let (Some(snapshot_json), Some(parent_snapshot_json)) = (
+        if let (Some(session_id), Some(snapshot_json), Some(parent_snapshot_json)) = (
+            reusable_external_session.as_deref(),
             executor_config_snapshot_json.as_deref(),
             parent_execution.executor_config_snapshot_json.as_deref(),
         ) {
@@ -375,7 +471,7 @@ impl TaskService {
                 crate::task_service::config::executor_snapshot_with_sticky_resume(
                     snapshot_json,
                     parent_snapshot_json,
-                    &parent_agent_session_id,
+                    session_id,
                 )?,
             );
         }
@@ -387,6 +483,13 @@ impl TaskService {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(resolved_agent_id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(resolved_agent_id.clone())),
+                    purpose: Some(ExecutionPurpose::General),
+                    harness_session_id: reusable_session.as_ref().and_then(|session| {
+                        reusable_external_session
+                            .as_ref()
+                            .map(|_| session.id.clone())
+                    }),
                     role: "interactive".to_owned(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
@@ -394,6 +497,8 @@ impl TaskService {
                     resume_policy: None,
                     stopped_at: None,
                     parent_execution_id: Some(parent_execution_id),
+                    // The generic HarnessSession is the authority. The DB
+                    // layer projects its external id to the legacy field.
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -513,61 +618,30 @@ impl TaskService {
 
         let agent_id = match db::canonical_task_role_name(&parent_execution.role) {
             Some(role) => match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                &role,
+                &self.db, &task.id, &role,
             )
             .await?
             {
                 Some(memberships) => {
-                    let parent_is_usable = match parent_execution.agent_id.as_deref() {
-                        Some(parent_agent_id) => {
-                            if task.repo_id.is_some() {
-                                crate::task_service::is_usable_repository_agent(
-                                    &self.db,
-                                    &task.project_id,
-                                    &memberships,
-                                    parent_agent_id,
-                                )
-                                .await?
-                            } else {
-                                crate::task_service::is_usable_active_agent(
-                                    &self.db,
-                                    &memberships,
-                                    parent_agent_id,
-                                )
-                                .await?
-                            }
-                        }
-                        None => false,
-                    };
-                    if parent_is_usable {
-                        let parent_agent_id = parent_execution
-                            .agent_id
-                            .as_deref()
-                            .expect("parent_is_usable implies a parent Agent");
-                        parent_agent_id.to_owned()
+                    // Re-execute is a new Execution: select the current
+                    // eligible Actor first and do not preserve the old
+                    // Actor merely because that Agent is still usable.
+                    let selected = if task.repo_id.is_some() {
+                        crate::task_service::select_usable_repository_agent_id(
+                            &self.db,
+                            &task.project_id,
+                            &memberships,
+                        )
+                        .await?
                     } else {
-                        let selected = if task.repo_id.is_some() {
-                            crate::task_service::select_usable_repository_agent_id(
-                                &self.db,
-                                &task.project_id,
-                                &memberships,
-                            )
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
                             .await?
-                        } else {
-                            crate::task_service::select_usable_agent_id(
-                                &self.db,
-                                &memberships,
-                            )
-                            .await?
-                        };
-                        selected.ok_or_else(|| {
-                            ServiceError::invalid_operation(format!(
-                                "no usable Agent is available for re-execute role {role}"
-                            ))
-                        })?
-                    }
+                    };
+                    selected.ok_or_else(|| {
+                        ServiceError::invalid_operation(format!(
+                            "no usable Agent is available for re-execute role {role}"
+                        ))
+                    })?
                 }
                 None => {
                     if let Some(parent_agent_id) = parent_execution.agent_id.clone() {
@@ -579,9 +653,7 @@ impl TaskService {
                             &parent_execution.role,
                         )
                         .await?
-                        .filter(|assignment| {
-                            assignment.assignee_type == Some(AssigneeKind::Agent)
-                        })
+                        .filter(|assignment| assignment.assignee_type == Some(AssigneeKind::Agent))
                         .and_then(|assignment| assignment.assignee_id)
                         .ok_or_else(|| {
                             ServiceError::invalid_operation(format!(
@@ -706,13 +778,20 @@ impl TaskService {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(agent.id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+                    purpose: Some(
+                        parent_execution.purpose.clone().unwrap_or_else(|| {
+                            execution_purpose_for_task_type(&task.task_type, &parent_execution.role)
+                        }),
+                    ),
+                    harness_session_id: None,
                     role: parent_execution.role.clone(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    parent_execution_id: None,
+                    parent_execution_id: Some(parent_execution.id.clone()),
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -822,7 +901,18 @@ impl TaskService {
             api_types::RecoveryAction::ResetToInitial,
             api_types::RecoveryAction::CancelTask,
         ];
-        if execution.agent_session_id.is_some() {
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
+        if resumable_external_session(
+            &self.db,
+            &execution,
+            execution.agent_id.as_deref(),
+            current_workspace_id.as_deref(),
+        )
+        .await?
+        .is_some()
+        {
             recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
         }
         let annotation = api_types::TaskBlockingAnnotation {

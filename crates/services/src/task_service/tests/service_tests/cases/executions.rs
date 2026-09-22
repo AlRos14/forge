@@ -306,6 +306,7 @@ async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
             &task.id,
             &agent_id,
             crate::workflow::default_roles::CODER,
+            db::ExecutionPurpose::Implement,
             "implement the task".to_owned(),
         )
         .await
@@ -356,6 +357,7 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
             &task.id,
             &agent_id,
             crate::workflow::default_roles::PLANNER,
+            db::ExecutionPurpose::Plan,
             "plan the task".to_owned(),
         )
         .await
@@ -978,6 +980,7 @@ async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_sam
             &task.id,
             &agent_id,
             crate::workflow::default_roles::REVIEWER,
+            db::ExecutionPurpose::Review,
             "review the task".to_owned(),
         )
         .await
@@ -1014,6 +1017,9 @@ async fn failed_reviewer_execution_marks_running_review_failed() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: crate::workflow::default_roles::REVIEWER.to_owned(),
             status: ExecutionStatus::Failed,
             stop_reason: Some(db::StopReason::ExecutorFailed),
@@ -1117,6 +1123,9 @@ async fn passed_reviewer_execution_with_user_approval_gate_waits_for_human() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
+                    actor_ref: None,
+                    purpose: None,
+                    harness_session_id: None,
             role: crate::workflow::default_roles::REVIEWER.to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1215,7 +1224,7 @@ async fn passed_reviewer_execution_with_user_approval_gate_waits_for_human() {
 }
 
 #[tokio::test]
-async fn follow_up_execution_creates_interactive_child() {
+async fn follow_up_execution_reuses_explicit_harness_session() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1230,6 +1239,9 @@ async fn follow_up_execution_creates_interactive_child() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1237,7 +1249,7 @@ async fn follow_up_execution_creates_interactive_child() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
+            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("parent execution".to_owned()),
@@ -1255,6 +1267,14 @@ async fn follow_up_execution_creates_interactive_child() {
     )
     .await
     .expect("parent execution creates");
+    let parent_execution = ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent_execution.id,
+        "test-session",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent harness session activates");
 
     let result = service
         .follow_up_execution(parent_execution.id.clone(), message.clone(), None, None)
@@ -1267,6 +1287,11 @@ async fn follow_up_execution_creates_interactive_child() {
     );
     assert_eq!(result.execution.summary.as_deref(), Some(message.as_str()));
     assert_eq!(result.execution.role, "interactive".to_owned());
+    assert_eq!(
+        result.execution.harness_session_id,
+        parent_execution.harness_session_id
+    );
+    assert_eq!(result.execution.agent_session_id.as_deref(), Some("test-session"));
     let snapshot: serde_json::Value = serde_json::from_str(
         result
             .execution
@@ -1276,6 +1301,134 @@ async fn follow_up_execution_creates_interactive_child() {
     )
     .expect("snapshot is valid json");
     assert_eq!(snapshot["config"]["resume_session_id"], "test-session");
+}
+
+#[tokio::test]
+async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        "in_progress".to_owned(),
+    )
+    .await;
+    let now = now_rfc3339();
+    let execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"codex","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("historical-shaped execution creates");
+    sqlx::query("UPDATE execution SET agent_session_id = 'legacy-thread' WHERE id = ?")
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .expect("legacy session projection is seeded");
+    let historical = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+
+    let unambiguous = crate::task_service::resumable_external_session(
+        &db,
+        &historical,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("bounded historical lookup succeeds");
+    assert_eq!(unambiguous.as_deref(), Some("legacy-thread"));
+
+    sqlx::query(
+        "INSERT INTO execution_session_migration_issue
+         (id, execution_id, issue_kind, details_json, created_at)
+         VALUES (?, ?, 'historical_session_ambiguous', '{}', ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&execution.id)
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .expect("historical ambiguity marker is inserted");
+
+    let ambiguous = crate::task_service::resumable_external_session(
+        &db,
+        &historical,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("ambiguous lookup fails closed without error");
+    assert_eq!(ambiguous, None);
+    let materialized = crate::task_service::execution::materialize_historical_harness_session(
+        &db,
+        &historical,
+        "legacy-thread",
+    )
+    .await
+    .expect("ambiguous history remains on the legacy projection");
+    assert!(materialized.is_none());
+
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    let annotation = api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ExecutorFailed,
+        blocking_reason: "executor failed".to_owned(),
+        blocked_by: Some("system".to_owned()),
+        blocked_at: Some(now_rfc3339()),
+        blocked_execution_id: Some(historical.id.clone()),
+        artifact: None,
+        message: None,
+        hook: None,
+        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
+    };
+    let actions = crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
+        &task,
+        &workflow,
+        &[historical],
+        Some(&annotation),
+        Some(&std::collections::HashSet::new()),
+    );
+    let session_follow_up = actions
+        .iter()
+        .find(|action| action.action == api_types::ExecutionActionKind::SessionFollowUp)
+        .expect("session follow-up action exists");
+    assert!(!session_follow_up.enabled);
+    let workflow_resume = actions
+        .iter()
+        .find(|action| action.action == api_types::ExecutionActionKind::WorkflowResume)
+        .expect("workflow resume action exists");
+    assert!(!workflow_resume.enabled);
 }
 
 #[tokio::test]
@@ -1325,6 +1478,9 @@ async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_b.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1358,6 +1514,7 @@ async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
             parent_execution.id.clone(),
             "continue current work".to_owned(),
             "test",
+            db::ExecutionPurpose::Implement,
         )
         .await
         .expect("role follow-up succeeds");
@@ -1367,7 +1524,10 @@ async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
         .await
         .expect("historical parent loads")
         .expect("historical parent exists");
-    assert_eq!(historical_parent.agent_id.as_deref(), Some(agent_b.as_str()));
+    assert_eq!(
+        historical_parent.agent_id.as_deref(),
+        Some(agent_b.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1426,6 +1586,9 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_b.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_b.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1451,6 +1614,14 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
     )
     .await
     .expect("parent execution creates");
+    let parent_execution = ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent_execution.id,
+        "suspended-lineage-thread",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent harness session activates");
 
     let follow_up = service
         .dispatch_role_follow_up(
@@ -1459,16 +1630,25 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
             parent_execution.id.clone(),
             "continue with the current eligible Agent".to_owned(),
             "test",
+            db::ExecutionPurpose::Implement,
         )
         .await
         .expect("role follow-up succeeds");
 
     assert_eq!(follow_up.agent_id.as_deref(), Some(agent_a.as_str()));
+    assert_ne!(
+        follow_up.execution.harness_session_id,
+        parent_execution.harness_session_id
+    );
+    assert!(follow_up.execution.agent_session_id.is_none());
     let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
         .await
         .expect("historical parent loads")
         .expect("historical parent exists");
-    assert_eq!(historical_parent.agent_id.as_deref(), Some(agent_b.as_str()));
+    assert_eq!(
+        historical_parent.agent_id.as_deref(),
+        Some(agent_b.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1486,6 +1666,9 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Failed,
             stop_reason: None,
@@ -1517,6 +1700,9 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -1576,7 +1762,7 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
 }
 
 #[tokio::test]
-async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
+async fn follow_up_execution_codex_resumes_explicit_harness_session() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1591,6 +1777,9 @@ async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1598,7 +1787,7 @@ async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("codex-thread".to_owned()),
+            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("parent execution".to_owned()),
@@ -1617,6 +1806,14 @@ async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
     )
     .await
     .expect("parent execution creates");
+    let parent_execution = ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent_execution.id,
+        "codex-thread",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent harness session activates");
 
     let result = service
         .follow_up_execution(parent_execution.id.clone(), message.clone(), None, None)
@@ -1624,6 +1821,11 @@ async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
         .expect("follow-up succeeds");
 
     assert_eq!(result.execution.summary.as_deref(), Some(message.as_str()));
+    assert_eq!(
+        result.execution.harness_session_id,
+        parent_execution.harness_session_id
+    );
+    assert_eq!(result.execution.agent_session_id.as_deref(), Some("codex-thread"));
     let snapshot: serde_json::Value = serde_json::from_str(
         result
             .execution
@@ -1652,6 +1854,9 @@ async fn follow_up_execution_rejects_running_parent() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -1686,7 +1891,7 @@ async fn follow_up_execution_rejects_running_parent() {
 }
 
 #[tokio::test]
-async fn follow_up_on_cancelled_execution_with_session_succeeds() {
+async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1699,7 +1904,10 @@ async fn follow_up_on_cancelled_execution_with_session_succeeds() {
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            agent_id: Some(agent_id),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Cancelled,
             stop_reason: None,
@@ -1707,7 +1915,7 @@ async fn follow_up_on_cancelled_execution_with_session_succeeds() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
+            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("cancelled parent".to_owned()),
@@ -1725,16 +1933,26 @@ async fn follow_up_on_cancelled_execution_with_session_succeeds() {
     )
     .await
     .expect("parent execution creates");
+    let parent_execution = ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent_execution.id,
+        "test-session",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent harness session activates");
 
     let result = service
         .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
         .await;
 
-    assert!(result.is_ok());
+    let child = result.expect("follow-up succeeds");
+    assert_eq!(child.execution.harness_session_id, parent_execution.harness_session_id);
+    assert_eq!(child.execution.agent_session_id.as_deref(), Some("test-session"));
 }
 
 #[tokio::test]
-async fn follow_up_on_cancelled_execution_without_session_returns_error() {
+async fn follow_up_on_cancelled_execution_without_session_starts_new_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1747,7 +1965,10 @@ async fn follow_up_on_cancelled_execution_without_session_returns_error() {
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            agent_id: Some(agent_id),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Cancelled,
             stop_reason: None,
@@ -1774,19 +1995,19 @@ async fn follow_up_on_cancelled_execution_without_session_returns_error() {
     .await
     .expect("parent execution creates");
 
+    let parent_id = parent_execution.id.clone();
     let result = service
         .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
         .await;
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("no resumable session")
-    ));
+    let child = result.expect("follow-up starts a fresh execution");
+    assert_eq!(child.execution.parent_execution_id.as_deref(), Some(parent_id.as_str()));
+    assert!(child.execution.harness_session_id.is_some());
+    assert!(child.execution.agent_session_id.is_none());
 }
 
 #[tokio::test]
-async fn follow_up_execution_rejects_missing_session_id() {
+async fn follow_up_execution_without_session_starts_new_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1799,7 +2020,10 @@ async fn follow_up_execution_rejects_missing_session_id() {
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            agent_id: Some(agent_id),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1826,11 +2050,15 @@ async fn follow_up_execution_rejects_missing_session_id() {
     .await
     .expect("parent execution creates");
 
+    let parent_id = parent_execution.id.clone();
     let result = service
         .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
         .await;
 
-    assert!(result.is_err());
+    let child = result.expect("follow-up starts a fresh execution");
+    assert_eq!(child.execution.parent_execution_id.as_deref(), Some(parent_id.as_str()));
+    assert!(child.execution.harness_session_id.is_some());
+    assert!(child.execution.agent_session_id.is_none());
 }
 
 #[tokio::test]
@@ -1848,6 +2076,9 @@ async fn follow_up_execution_rejects_terminal_task() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1919,6 +2150,9 @@ async fn follow_up_execution_on_blocked_task() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -1970,6 +2204,9 @@ async fn follow_up_execution_rejects_executor_mismatch() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(shell_agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -2059,6 +2296,9 @@ async fn re_execute_uses_current_membership_not_legacy_projection() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_b.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Cancelled,
             stop_reason: None,
@@ -2086,20 +2326,26 @@ async fn re_execute_uses_current_membership_not_legacy_projection() {
     .expect("parent execution creates");
 
     let result = service
-        .re_execute_execution(parent_execution.id)
+        .re_execute_execution(parent_execution.id.clone())
         .await
         .expect("re-execute succeeds");
 
     assert_eq!(result.execution.role, "coder".to_owned());
     assert_eq!(result.execution.status, ExecutionStatus::Running);
     assert_eq!(result.execution.agent_id.as_deref(), Some(agent_b.as_str()));
-    assert_eq!(result.execution.parent_execution_id, None);
+    assert_eq!(
+        result.execution.parent_execution_id.as_deref(),
+        Some(parent_execution.id.as_str())
+    );
     assert_eq!(result.execution.agent_session_id, None);
     let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
         .await
         .expect("historical parent loads")
         .expect("historical parent exists");
-    assert_eq!(historical_parent.agent_id.as_deref(), Some(agent_b.as_str()));
+    assert_eq!(
+        historical_parent.agent_id.as_deref(),
+        Some(agent_b.as_str())
+    );
 }
 
 #[tokio::test]
@@ -2117,6 +2363,9 @@ async fn re_execute_rejects_running_parent() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -2167,6 +2416,9 @@ async fn re_execute_rejects_concurrent_running_execution() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Cancelled,
             stop_reason: None,
@@ -2198,6 +2450,9 @@ async fn re_execute_rejects_concurrent_running_execution() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -2569,6 +2824,9 @@ async fn executor_completion_comment_uses_execution_agent() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -2666,6 +2924,9 @@ async fn seed_completed_coder_execution(
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_id.to_owned()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: crate::workflow::default_roles::CODER.to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,

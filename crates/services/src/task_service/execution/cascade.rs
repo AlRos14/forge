@@ -1,4 +1,5 @@
 use super::*;
+use db::WorkspaceRepo;
 
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
 const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
@@ -128,11 +129,21 @@ impl TaskService {
         guard: &str,
         reason: &str,
     ) -> Result<()> {
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
+        let resumable_session_id = resumable_external_session(
+            &self.db,
+            execution,
+            execution.agent_id.as_deref(),
+            current_workspace_id.as_deref(),
+        )
+        .await?;
         if guard == "subtask_sequence_complete" && task.parent_task_id.is_none() {
             if let Some(next_turn) = self.subtasks_handoff(task).await? {
                 match next_turn {
                     super::subtasks::NextTurn::Prompt { user_prompt } => {
-                        if execution.agent_session_id.is_none() {
+                        if resumable_session_id.is_none() {
                             tracing::warn!(
                                 task_id = %task.id,
                                 execution_id = %execution.id,
@@ -173,7 +184,7 @@ impl TaskService {
 
         if budget <= 0
             || retry_count >= budget as u64
-            || execution.agent_session_id.is_none()
+            || resumable_session_id.is_none()
             || execution.agent_id.is_none()
         {
             return self
@@ -214,29 +225,103 @@ impl TaskService {
         prompt: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Execution>> + Send + 'a>> {
         Box::pin(async move {
-            let agent_session_id = execution.agent_session_id.clone().ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "execution {} missing agent_session_id",
-                    execution.id
-                ))
-            })?;
-            let snapshot_json = execution
-                .executor_config_snapshot_json
-                .as_deref()
+            let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+                .await?
+                .map(|workspace| workspace.id);
+            let authoritative_memberships =
+                if let Some(role) = db::canonical_task_role_name(&execution.role) {
+                    crate::task_service::current_role_memberships_authoritative(
+                        &self.db,
+                        &task.id,
+                        &role,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+            let agent_id = if let Some(memberships) = authoritative_memberships.as_ref() {
+                let selected = if task.repo_id.is_some() {
+                    crate::task_service::select_usable_repository_agent_id(
+                        &self.db,
+                        &task.project_id,
+                        memberships,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::select_usable_agent_id(&self.db, memberships).await?
+                };
+                selected.ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "no usable Agent is available for workflow-guard role {}",
+                        execution.role
+                    ))
+                })?
+            } else {
+                execution.agent_id.clone().ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "execution {} missing agent_id",
+                        execution.id
+                    ))
+                })?
+            };
+            let parent_actor_matches = matches!(
+                execution.actor_ref(),
+                Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &agent_id
+            );
+            let (harness_session_id, updated_snapshot) = if parent_actor_matches {
+                let agent_session_id = resumable_external_session(
+                    &self.db,
+                    execution,
+                    Some(&agent_id),
+                    current_workspace_id.as_deref(),
+                )
+                .await?
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
-                        "execution {} missing executor config snapshot",
+                        "execution {} has no reusable HarnessSession",
                         execution.id
                     ))
                 })?;
-            let updated_snapshot =
-                executor_snapshot_with_resume_thread(snapshot_json, &agent_session_id)?;
-            let agent_id = execution.agent_id.clone().ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "execution {} missing agent_id",
-                    execution.id
-                ))
-            })?;
+                let continuity_execution = if execution.harness_session_id.is_none() {
+                    materialize_historical_harness_session(&self.db, execution, &agent_session_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(format!(
+                                "execution {} has unresolved legacy session authority",
+                                execution.id
+                            ))
+                        })?
+                } else {
+                    execution.clone()
+                };
+                let snapshot_json = execution
+                    .executor_config_snapshot_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(format!(
+                            "execution {} missing executor config snapshot",
+                            execution.id
+                        ))
+                    })?;
+                (
+                    continuity_execution.harness_session_id,
+                    Some(executor_snapshot_with_resume_thread(
+                        snapshot_json,
+                        &agent_session_id,
+                    )?),
+                )
+            } else {
+                // The current RoleMembership Actor wins. A membership change
+                // starts fresh work for the new Agent rather than inheriting
+                // the completed Actor's external thread.
+                let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+                (
+                    None,
+                    build_executor_config_snapshot(&self.db, task, &agent, None).await?,
+                )
+            };
             let execution_id = new_uuid_v4();
             let now = now_rfc3339();
             let resumed = self
@@ -244,7 +329,17 @@ impl TaskService {
                     CreateExecution {
                         id: execution_id.clone(),
                         task_id: task.id.clone(),
-                        agent_id: Some(agent_id),
+                        agent_id: Some(agent_id.clone()),
+                        actor_ref: Some(db::ActorRef::Agent(agent_id)),
+                        purpose: Some(
+                            execution
+                                .purpose
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    execution_purpose_for_task_type(&task.task_type, &execution.role)
+                                }),
+                        ),
+                        harness_session_id,
                         role: execution.role.clone(),
                         status: ExecutionStatus::Running,
                         stop_reason: None,
@@ -252,6 +347,9 @@ impl TaskService {
                         resume_policy: None,
                         stopped_at: None,
                         parent_execution_id: Some(execution.id.clone()),
+                        // The generic HarnessSession is the authority. The
+                        // DB layer projects its external id to the legacy
+                        // field.
                         agent_session_id: None,
                         agent_message_id: None,
                         last_activity_at: None,
@@ -265,8 +363,8 @@ impl TaskService {
                         before_sha: execution.before_sha.clone(),
                         after_sha: None,
                         error: None,
-                        executor_config_snapshot_json: Some(updated_snapshot),
-                        workspace_id: execution.workspace_id.clone(),
+                        executor_config_snapshot_json: updated_snapshot,
+                        workspace_id: current_workspace_id.clone(),
                         created_at: now.clone(),
                         updated_at: now,
                     },
@@ -744,7 +842,17 @@ impl TaskService {
             api_types::RecoveryAction::ResetToInitial,
             api_types::RecoveryAction::CancelTask,
         ];
-        if execution.agent_session_id.is_some() {
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
+        let resumable_session_id = resumable_external_session(
+            &self.db,
+            execution,
+            execution.agent_id.as_deref(),
+            current_workspace_id.as_deref(),
+        )
+        .await?;
+        if resumable_session_id.is_some() {
             recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
         }
         let annotation = api_types::TaskBlockingAnnotation {
@@ -1504,6 +1612,7 @@ impl TaskService {
                 agent_id.clone(),
                 prompt,
                 AUTOMATIC_REVIEW_RECOVERY_TRIGGER,
+                ExecutionPurpose::Implement,
             )
             .await
         {
@@ -1825,7 +1934,10 @@ mod reviewer_message_tests {
             id: "execution-reviewer".to_owned(),
             task_id: "task-reviewer".to_owned(),
             agent_id: Some("agent-reviewer".to_owned()),
+            actor_kind: Some(db::ActorKind::Agent),
+            actor_id: Some("agent-reviewer".to_owned()),
             role: crate::workflow::default_roles::REVIEWER.to_owned(),
+            purpose: Some(db::ExecutionPurpose::Review),
             status: ExecutionStatus::Completed,
             stop_reason: None,
             stopped_by: None,
@@ -1833,6 +1945,7 @@ mod reviewer_message_tests {
             stopped_at: None,
             parent_execution_id: None,
             agent_session_id: None,
+            harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             prompt: None,

@@ -790,16 +790,13 @@ async fn require_identity_scope(
             let assigned_legacy = if task_roles.is_empty() {
                 let assigned_directly = task.assignee_type.as_deref() == Some("agent")
                     && task.assignee_id.as_deref() == Some(identity_id);
-                let assigned_role = db::TaskRoleAssignmentRepo::list_by_task(
-                    &*state.db,
-                    scope_id,
-                )
-                .await?
-                .into_iter()
-                .any(|assignment| {
-                    assignment.assignee_type == Some(db::AssigneeKind::Agent)
-                        && assignment.assignee_id.as_deref() == Some(identity_id)
-                });
+                let assigned_role = db::TaskRoleAssignmentRepo::list_by_task(&*state.db, scope_id)
+                    .await?
+                    .into_iter()
+                    .any(|assignment| {
+                        assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                            && assignment.assignee_id.as_deref() == Some(identity_id)
+                    });
                 assigned_directly || assigned_role
             } else {
                 false

@@ -37,15 +37,13 @@ pub(crate) async fn actor_is_valid_for_project(
             };
             let owner_is_project_actor = match agent.owner_id.as_deref() {
                 Some(owner_id) if project.owner_id.as_deref() == Some(owner_id) => true,
-                Some(owner_id) => {
-                    ProjectMemberRepo::get_member(db, &project.id, owner_id)
-                        .await?
-                        .is_some()
-                }
+                Some(owner_id) => ProjectMemberRepo::get_member(db, &project.id, owner_id)
+                    .await?
+                    .is_some(),
                 None => false,
             };
-            let binding = ProjectAgentBindingRepo::get_active_project_binding(db, &project.id)
-                .await?;
+            let binding =
+                ProjectAgentBindingRepo::get_active_project_binding(db, &project.id).await?;
             let has_active_binding = binding.as_ref().is_some_and(|binding| {
                 binding.state == "active" && binding.identity_id.as_deref() == Some(agent_id)
             });
@@ -72,10 +70,11 @@ pub(crate) async fn actor_is_valid_for_project_in_tx(
             if user_id == "human" {
                 return Ok(false);
             }
-            let user_exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE id = ?)")
-                .bind(user_id)
-                .fetch_one(&mut **transaction)
-                .await?;
+            let user_exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE id = ?)")
+                    .bind(user_id)
+                    .fetch_one(&mut **transaction)
+                    .await?;
             if user_exists == 0 {
                 return Ok(false);
             }
@@ -94,12 +93,11 @@ pub(crate) async fn actor_is_valid_for_project_in_tx(
             if agent_id == "human" {
                 return Ok(false);
             }
-            let Some(agent) = sqlx::query(
-                "SELECT visibility, owner_id FROM agent_current WHERE id = ?",
-            )
-            .bind(agent_id)
-            .fetch_optional(&mut **transaction)
-            .await?
+            let Some(agent) =
+                sqlx::query("SELECT visibility, owner_id FROM agent_current WHERE id = ?")
+                    .bind(agent_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
             else {
                 return Ok(false);
             };
@@ -326,20 +324,22 @@ pub(crate) async fn sync_legacy_role_projection_in_tx(
             .await?;
         }
         for projection_role in projection_roles {
-            sqlx::query(
-                "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-            )
-            .bind(task_id)
-            .bind(projection_role)
-            .execute(&mut **transaction)
-            .await?;
+            sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?")
+                .bind(task_id)
+                .bind(projection_role)
+                .execute(&mut **transaction)
+                .await?;
         }
         return Ok(());
     };
     let actor_kind: String = member.try_get("actor_kind")?;
     let actor_id: String = member.try_get("actor_id")?;
     let member_created_at: String = member.try_get("created_at")?;
-    let assignee_type = if actor_kind == "agent" { "agent" } else { "user" };
+    let assignee_type = if actor_kind == "agent" {
+        "agent"
+    } else {
+        "user"
+    };
     if canonical_role == "implementer" {
         sqlx::query(
             "UPDATE task
@@ -348,7 +348,7 @@ pub(crate) async fn sync_legacy_role_projection_in_tx(
         )
         .bind(assignee_type)
         .bind(&actor_id)
-        .bind(now)
+        .bind(&now)
         .bind(task_id)
         .execute(&mut **transaction)
         .await?;
@@ -372,7 +372,7 @@ pub(crate) async fn sync_legacy_role_projection_in_tx(
         .bind(assignee_type)
         .bind(&actor_id)
         .bind(&member_created_at)
-        .bind(now)
+        .bind(&now)
         .execute(&mut **transaction)
         .await?;
     }

@@ -75,7 +75,8 @@ impl TaskRepo for SqliteDb {
             where_parts.push("status IN (__STATUSES__)");
         }
         if !query.agent_ids.is_empty() {
-            where_parts.push("id IN (
+            where_parts.push(
+                "id IN (
                 SELECT task_role.task_id
                 FROM task_role
                 JOIN role_membership ON role_membership.task_role_id = task_role.id
@@ -91,10 +92,12 @@ impl TaskRepo for SqliteDb {
                       SELECT 1 FROM task_role
                       WHERE task_role.task_id = legacy.task_id
                   )
-            )");
+            )",
+            );
         }
         if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
-            where_parts.push("id IN (
+            where_parts.push(
+                "id IN (
                 SELECT task_role.task_id
                 FROM task_role
                 JOIN role_membership ON role_membership.task_role_id = task_role.id
@@ -110,7 +113,8 @@ impl TaskRepo for SqliteDb {
                       SELECT 1 FROM task_role
                       WHERE task_role.task_id = legacy.task_id
                   )
-            )");
+            )",
+            );
         }
         if query.priority.is_some() {
             where_parts.push("priority = ?");
@@ -152,9 +156,18 @@ impl TaskRepo for SqliteDb {
             .join(" AND ")
             .replace("__STATUSES__", &status_placeholders)
             .replace("__AGENTS__", &agent_placeholders)
-            .replace("__ASSIGNEE_TYPE_FILTER_MEMBERSHIP__", &assignee_type_filter_membership)
-            .replace("__ASSIGNEE_ID_FILTER_MEMBERSHIP__", &assignee_id_filter_membership)
-            .replace("__ASSIGNEE_TYPE_FILTER_LEGACY__", &assignee_type_filter_legacy)
+            .replace(
+                "__ASSIGNEE_TYPE_FILTER_MEMBERSHIP__",
+                &assignee_type_filter_membership,
+            )
+            .replace(
+                "__ASSIGNEE_ID_FILTER_MEMBERSHIP__",
+                &assignee_id_filter_membership,
+            )
+            .replace(
+                "__ASSIGNEE_TYPE_FILTER_LEGACY__",
+                &assignee_type_filter_legacy,
+            )
             .replace("__ASSIGNEE_ID_FILTER_LEGACY__", &assignee_id_filter_legacy);
         let sql = format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",

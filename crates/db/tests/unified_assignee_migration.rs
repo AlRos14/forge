@@ -149,7 +149,10 @@ async fn task_roles_preserve_multi_actor_membership_and_history() {
     .await
     .expect("task inserts");
 
-    for (id, email) in [(&human_a, "human-a@example.com"), (&human_b, "human-b@example.com")] {
+    for (id, email) in [
+        (&human_a, "human-a@example.com"),
+        (&human_b, "human-b@example.com"),
+    ] {
         sqlx::query(
             "INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES (?, ?, 'test', ?, ?)",
         )
@@ -297,12 +300,11 @@ async fn task_roles_preserve_multi_actor_membership_and_history() {
     .await
     .expect("surviving legacy projection loads");
     assert_eq!(surviving_projection, ("user".to_owned(), human_b.clone()));
-    let surviving_task_projection: (String, String) = sqlx::query_as(
-        "SELECT assignee_type, assignee_id FROM task WHERE id = ?",
-    )
-    .bind(&task_id)
-    .fetch_one(&pool)
-    .await
-    .expect("surviving task projection loads");
+    let surviving_task_projection: (String, String) =
+        sqlx::query_as("SELECT assignee_type, assignee_id FROM task WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("surviving task projection loads");
     assert_eq!(surviving_task_projection, ("user".to_owned(), human_b));
 }

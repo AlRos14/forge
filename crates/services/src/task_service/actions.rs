@@ -1,9 +1,10 @@
+use super::execution::resumable_external_session;
 use super::*;
 
 use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
 use db::{
     AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, ReviewRepo,
-    ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo,
+    ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
 };
 
 #[derive(Debug)]
@@ -204,6 +205,9 @@ impl TaskService {
         workflow: &api_types::WorkflowDefinition,
     ) -> Result<Vec<TaskAction>> {
         let executions = self.task_executions(&task.id).await?;
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
         let latest_review = self.latest_review(&task.id).await?;
         let state = workflow
             .states
@@ -213,9 +217,22 @@ impl TaskService {
         let running = executions
             .iter()
             .any(|execution| execution.status == ExecutionStatus::Running);
-        let resumable = executions.iter().any(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
-        });
+        let mut resumable = false;
+        for execution in &executions {
+            if execution.status != ExecutionStatus::Running
+                && resumable_external_session(
+                    &self.db,
+                    execution,
+                    execution.agent_id.as_deref(),
+                    current_workspace_id.as_deref(),
+                )
+                .await?
+                .is_some()
+            {
+                resumable = true;
+                break;
+            }
+        }
         let has_previous_execution = executions.iter().any(|execution| {
             execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
         });
@@ -330,16 +347,37 @@ impl TaskService {
         }
 
         let executions = self.task_executions(&task.id).await?;
-        if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
-        }) {
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
+        let mut resumable_execution = None;
+        for execution in &executions {
+            if execution.status != ExecutionStatus::Running
+                && resumable_external_session(
+                    &self.db,
+                    execution,
+                    execution.agent_id.as_deref(),
+                    current_workspace_id.as_deref(),
+                )
+                .await?
+                .is_some()
+            {
+                resumable_execution = Some(execution);
+                break;
+            }
+        }
+        if let Some(execution) = resumable_execution {
             let launched = self
                 .follow_up_execution(
                     execution.id.clone(),
                     context.clone().unwrap_or_else(|| {
                         "Resume work from the latest worker session.".to_owned()
                     }),
-                    execution.agent_id.clone(),
+                    // The selected Execution supplies causal lineage only.
+                    // Follow-up must select the current RoleMembership Actor
+                    // before deciding whether that Actor may reuse the
+                    // lineage HarnessSession.
+                    None,
                     None,
                 )
                 .await?;
@@ -369,6 +407,10 @@ impl TaskService {
                 &task.id,
                 &agent_id,
                 role,
+                crate::task_service::execution::execution_purpose_for_task_type(
+                    &task.task_type,
+                    role,
+                ),
                 context.unwrap_or_else(|| "Resume task work.".to_owned()),
             )
             .await?;
@@ -391,9 +433,7 @@ impl TaskService {
             .and_then(crate::workflow::effective_role)
         {
             match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                role,
+                &self.db, &task.id, role,
             )
             .await?
             {
@@ -441,9 +481,7 @@ impl TaskService {
             .next();
         if let Some(role) = first_work_role {
             match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                role,
+                &self.db, &task.id, role,
             )
             .await?
             {

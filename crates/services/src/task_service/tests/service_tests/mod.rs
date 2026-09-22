@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent,
     CreateProjectAgentBinding, CreateProjectMember, CreateTask, DaemonRepo, DaemonStatus,
-    ProjectAgentBindingRepo, ProjectMemberRepo,
-    ReplaceProjectAgentBinding, UpdateProject, UpsertDaemon,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceProjectAgentBinding, UpdateProject,
+    UpsertDaemon,
 };
 use executors::{ExecutionResult, ExecutorError};
 use sqlx::Row;
@@ -610,6 +610,11 @@ async fn seed_running_role_execution(
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
+            actor_ref: agent_id
+                .as_ref()
+                .map(|agent_id| db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::General),
+            harness_session_id: None,
             agent_id,
             role: role.to_owned(),
             status: ExecutionStatus::Running,

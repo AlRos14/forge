@@ -25,6 +25,21 @@ Execution
 It represents exactly one Actor acting under exactly one Role for one Purpose.
 The role is historical context, not an Actor subtype.
 
+## Plan PR2 persistence
+
+The additive persistence shape currently stores `actor_kind` and `actor_id` as
+the physical form of `actor_ref`, plus one of these exact purposes:
+`plan`, `implement`, `review`, `validate`, `investigate`, `orchestrate`, or
+`general`. Purpose is supplied by the semantic creation path; it is not a
+permanent alias for a Role or for the transitional executor
+`permission_policy: plan` value.
+
+The old `execution.agent_id` and `execution.agent_session_id` columns remain
+nullable compatibility projections. For a new Agent Execution,
+`actor_ref = Agent(agent_id)` and the Agent id is projected to `agent_id`. A
+new Human Execution stores the real user id, has no Agent projection, and has
+no HarnessSession.
+
 ## Purpose and permission
 
 Initial purposes are plan, implement, review, validate, investigate,
@@ -56,7 +71,22 @@ inside a Task state transition.
 
 A Human Execution has no HarnessSession. An Agent Execution attaches to an
 explicit HarnessSession when continuity is appropriate. A scheduler or
-service must not choose a session by role name or latest execution.
+service must not choose a session by role name, model, Task, or latest
+execution. Parent lineage and session continuity are separate facts.
+
+In PR2, the continuity authority is:
+
+~~~text
+Execution.harness_session_id -> HarnessSession -> external_session_id
+                                                     |
+                                      legacy agent_session_id projection
+~~~
+
+The generic HarnessSession records the Agent, opaque harness kind, effective
+profile/configuration snapshot, capability snapshot, optional workspace scope,
+and a small `pending`/`active`/`ended`/`failed` lifecycle. Its Agent and
+harness identity are immutable. A pending session is not resumable until an
+executor result supplies the external identity.
 
 ## Recovery
 

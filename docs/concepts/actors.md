@@ -30,6 +30,10 @@ Human-specific UI ergonomics are allowed. Human-specific domain shortcuts that
 change authority or bypass the Execution, Artifact, Gate, workspace, or
 collaboration model are not.
 
+New Human Executions persist the concrete user `ActorRef` directly. The
+literal legacy `"human"` assignment sentinel is never persisted as an
+ActorRef, and a Human Execution never receives a fake Agent or HarnessSession.
+
 ## Agent
 
 An Agent is a persistent AI Actor bound to a stable harness identity. When

@@ -14,10 +14,10 @@ use db::{
     AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo,
     AgentChatTurnJob, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
     AgentHandoffStatus as DbHandoffStatus, AgentListQuery, AgentProfileRepo, AgentRepo,
-    AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject,
-    ExecutionRepo, MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectRepo, ReplaceAccountMainAgentBinding,
-    SortBy, SortOrder, TaskDependencyRepo, TaskListQuery, TaskRepo, UpdateProject, UpdateTask,
+    AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
+    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
+    ProjectRepo, ReplaceAccountMainAgentBinding, SortBy, SortOrder, Task, TaskDependencyRepo,
+    TaskListQuery, TaskRepo, UpdateProject, UpdateTask, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
@@ -128,7 +128,7 @@ pub(super) async fn forge_create_task(
             ),
             other => other.into(),
         })?;
-    Ok(task_value(task))
+    task_value_with_resume_authority(state, task).await
 }
 
 pub(super) async fn forge_create_sub_tasks(
@@ -149,9 +149,12 @@ pub(super) async fn forge_create_sub_tasks(
         .task_service
         .create_subtasks(params.parent_task_id, inputs)
         .await?;
-    Ok(serde_json::json!({
-        "subtasks": tasks.into_iter().map(task_value).collect::<Vec<_>>(),
-    }))
+    let mut task_values = Vec::with_capacity(tasks.len());
+    for mut task in tasks {
+        filter_unresumable_session_action(state, &mut task).await?;
+        task_values.push(task_value(task));
+    }
+    Ok(serde_json::json!({ "subtasks": task_values }))
 }
 
 fn invalid_field_error(
@@ -277,7 +280,7 @@ pub(super) async fn forge_list_tasks(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: ListTasksParams = parse_params(params)?;
-    let page = TaskRepo::list(
+    let mut page = TaskRepo::list(
         &*state.db,
         TaskListQuery {
             project_id: params.project_id,
@@ -294,6 +297,9 @@ pub(super) async fn forge_list_tasks(
         },
     )
     .await?;
+    for task in &mut page.items {
+        filter_unresumable_session_action(state, task).await?;
+    }
     Ok(task_page_value(page))
 }
 
@@ -302,7 +308,99 @@ pub(super) async fn forge_get_task(state: &AppState, params: Value) -> Result<Va
     let task = TaskRepo::get_by_id(&*state.db, &params.task_id, false)
         .await?
         .ok_or_else(|| McpToolError::not_found("task", params.task_id))?;
+    task_value_with_resume_authority(state, task).await
+}
+
+async fn task_value_with_resume_authority(
+    state: &AppState,
+    mut task: Task,
+) -> Result<Value, McpToolError> {
+    filter_unresumable_session_action(state, &mut task).await?;
     Ok(task_value(task))
+}
+
+/// Recovery hints are persisted diagnostics, not session authority. Filter
+/// `ResumeSession` only in this response projection using the shared
+/// Execution/HarnessSession authority; never rewrite the stored Task.
+async fn filter_unresumable_session_action(
+    state: &AppState,
+    task: &mut Task,
+) -> Result<(), McpToolError> {
+    let Some(raw_annotation) = task.error_annotation.as_deref() else {
+        return Ok(());
+    };
+    let Ok(mut annotation) = serde_json::from_str::<Value>(raw_annotation) else {
+        return Ok(());
+    };
+    let Some(annotation_object) = annotation.as_object() else {
+        return Ok(());
+    };
+    if annotation_object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none()
+        || !annotation_object
+            .get("recovery_actions")
+            .and_then(Value::as_array)
+            .is_some_and(|actions| {
+                actions
+                    .iter()
+                    .any(|action| action.as_str() == Some("resume_session"))
+            })
+    {
+        return Ok(());
+    }
+
+    let blocked_execution_id = match annotation.get("blocked_execution_id") {
+        Some(Value::String(execution_id)) => Some(execution_id.clone()),
+        Some(Value::Null) | None => None,
+        // A malformed explicit target must fail closed, not fall through to
+        // the latest Execution for this Task.
+        Some(_) => Some(String::new()),
+    };
+    let execution = if let Some(execution_id) = blocked_execution_id.as_deref() {
+        ExecutionRepo::get_by_id(&*state.db, execution_id).await?
+    } else {
+        let task_ids = [task.id.as_str()];
+        ExecutionRepo::list_latest_executions_for_tasks(&*state.db, &task_ids)
+            .await?
+            .into_iter()
+            .next()
+    };
+    let workspace_id = WorkspaceRepo::get_by_task_id(&*state.db, &task.id)
+        .await?
+        .map(|workspace| workspace.id);
+    let resumable = if let Some(execution) = execution {
+        let expected_agent_id = match execution.actor_ref() {
+            Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+            _ => None,
+        };
+        services::task_service::resumable_external_session(
+            &*state.db,
+            &execution,
+            expected_agent_id.as_deref(),
+            workspace_id.as_deref(),
+        )
+        .await?
+        .is_some()
+    } else {
+        false
+    };
+
+    if !resumable {
+        let resume_action = json!(api_types::RecoveryAction::ResumeSession);
+        if let Some(actions) = annotation
+            .get_mut("recovery_actions")
+            .and_then(Value::as_array_mut)
+        {
+            actions.retain(|action| action != &resume_action);
+        }
+        task.error_annotation = Some(
+            serde_json::to_string(&annotation)
+                .map_err(|error| McpToolError::new(-32603, error.to_string()))?,
+        );
+    }
+    Ok(())
 }
 
 pub(super) async fn forge_preview_prompt(
@@ -466,6 +564,8 @@ pub(super) async fn forge_assign_agent(
         .task_service
         .claim_task(params.task_id, Assignee::Agent(params.agent_id), None)
         .await?;
+    let mut claimed = claimed;
+    filter_unresumable_session_action(state, &mut claimed.task).await?;
     Ok(claimed_task_value(claimed))
 }
 
@@ -475,7 +575,7 @@ pub(super) async fn forge_cancel_task(
 ) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
     let task = state.task_service.cancel_task(params.task_id).await?;
-    Ok(task_value(task))
+    task_value_with_resume_authority(state, task).await
 }
 
 pub(super) async fn forge_get_task_diff(
@@ -528,7 +628,7 @@ pub(super) async fn forge_update_task(
         },
     )
     .await?;
-    Ok(task_value(task))
+    task_value_with_resume_authority(state, task).await
 }
 
 pub(super) async fn forge_transition_task(
@@ -554,7 +654,7 @@ pub(super) async fn forge_transition_task(
             },
         )
         .await?;
-    Ok(task_value(task.task))
+    task_value_with_resume_authority(state, task.task).await
 }
 
 pub(super) async fn forge_register_agent(
@@ -741,10 +841,11 @@ pub(super) async fn forge_follow_up_execution(
     let agent_id = optional_string_param(params, "agent_id")?;
     let overrides = optional_overrides_param(params, "overrides")?;
 
-    let launched = state
+    let mut launched = state
         .task_service
         .follow_up_execution(execution_id, message, agent_id, overrides)
         .await?;
+    filter_unresumable_session_action(state, &mut launched.task).await?;
 
     Ok(json!({
         "task": task_value(launched.task),

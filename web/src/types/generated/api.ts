@@ -616,11 +616,14 @@ export type TaskResponse = Task
 export interface Execution {
   id: string
   task_id: string
+  actor_ref?: ActorRef | null
   agent_id?: string | null
   role: ExecutionRole
+  purpose?: string | null
   status: ExecutionStatus
   parent_execution_id?: string | null
   agent_session_id?: string | null
+  harness_session_id?: string | null
   prompt?: string | null
   summary?: string | null
   before_sha?: string | null

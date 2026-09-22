@@ -47,6 +47,9 @@ pub async fn load_agent_dispatch_context(
     let sub_tasks = load_sub_tasks(&db, task_id).await?;
     let last_manual_bounce_reason =
         derive_last_manual_bounce_reason(&transition_log, state_name, workflow);
+    // This legacy workflow policy selects a causal/contextual parent only.
+    // Follow-up creation performs the Actor-first, explicit HarnessSession
+    // continuity check; this lookup is never a session selector.
     let continuation_execution = if should_resume_latest_target_role_thread(execution_policy) {
         latest_terminal_execution_for_role(&db, task_id, role).await?
     } else {
