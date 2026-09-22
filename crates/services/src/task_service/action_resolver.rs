@@ -18,21 +18,18 @@ pub fn resolve_execution_actions(
         executions,
         blocking_annotation,
         None,
-        None,
     )
 }
 
-/// Resolve actions with the set of generic HarnessSessions that are known to
-/// be active and externally identified. The plain resolver remains useful for
-/// callers that already have an execution projection but the API route passes
-/// this set so pending sessions are never advertised as resumable.
+/// Resolve actions with the set of Executions whose continuity was validated
+/// by the common resumability authority. This includes exact active generic
+/// sessions and only safe, unambiguous historical compatibility fallbacks.
 pub fn resolve_execution_actions_with_session_state(
     task: &db::Task,
     workflow: &WorkflowDefinition,
     executions: &[db::Execution],
     blocking_annotation: Option<&TaskBlockingAnnotation>,
-    reusable_harness_session_ids: Option<&HashSet<String>>,
-    current_workspace_id: Option<&str>,
+    resumable_execution_ids: Option<&HashSet<String>>,
 ) -> Vec<ExecutionAction> {
     let is_terminal = workflow.state_kind(&task.status) == Some(StateKind::Terminal);
     let current_state = workflow
@@ -63,7 +60,7 @@ pub fn resolve_execution_actions_with_session_state(
         .iter()
         .filter(|execution| {
             execution_status(execution) != ExecutionStatus::Running
-                && has_resumable_session(execution, reusable_harness_session_ids, current_workspace_id)
+                && has_resumable_session(execution, resumable_execution_ids)
         })
         .max_by(|left, right| left.created_at.cmp(&right.created_at));
 
@@ -81,11 +78,7 @@ pub fn resolve_execution_actions_with_session_state(
     });
     let has_recovery_session = has_resume_recovery_action
         && blocked_execution.is_some_and(|execution| {
-            has_resumable_session(
-                execution,
-                reusable_harness_session_ids,
-                current_workspace_id,
-            )
+            has_resumable_session(execution, resumable_execution_ids)
         });
     let blocked_role_matches = effective_role
         .zip(blocked_execution.map(|execution| execution.role.as_str()))
@@ -220,35 +213,9 @@ pub fn resolve_execution_actions_with_session_state(
 
 fn has_resumable_session(
     execution: &db::Execution,
-    reusable_harness_session_ids: Option<&HashSet<String>>,
-    current_workspace_id: Option<&str>,
+    resumable_execution_ids: Option<&HashSet<String>>,
 ) -> bool {
-    if let Some(session_id) = execution.harness_session_id.as_deref() {
-        return reusable_harness_session_ids
-            .map(|ids| ids.contains(session_id))
-            .unwrap_or(false);
-    }
-    // Bounded historical compatibility: only rows without a generic
-    // reference may use the old external-session projection.
-    let historical_agent_ref = match execution.actor_ref() {
-        None => true,
-        Some(db::ActorRef::Agent(actor_id)) => {
-            execution.agent_id.as_deref() == Some(actor_id.as_str())
-        }
-        Some(db::ActorRef::Human(_)) => false,
-    };
-    historical_agent_ref
-        && execution.agent_id.is_some()
-        && !execution
-            .agent_id
-            .as_deref()
-            .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
-        && execution
-            .agent_session_id
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        && (execution.workspace_id.is_none()
-            || execution.workspace_id.as_deref() == current_workspace_id)
+    resumable_execution_ids.is_some_and(|ids| ids.contains(&execution.id))
 }
 
 fn no_resumable_session_reason(role: Option<&str>) -> String {
@@ -349,7 +316,7 @@ mod tests {
             Some("hs"),
             None,
         );
-        assert!(!has_resumable_session(&pending, Some(&HashSet::new()), None));
+        assert!(!has_resumable_session(&pending, Some(&HashSet::new())));
 
         let active = execution(
             "active",
@@ -358,7 +325,7 @@ mod tests {
             Some("legacy"),
         );
         let active_ids = HashSet::from(["hs".to_owned()]);
-        assert!(has_resumable_session(&active, Some(&active_ids), None));
+        assert!(has_resumable_session(&active, Some(&active_ids)));
 
         let agent_legacy = execution(
             "agent-legacy",
@@ -366,28 +333,24 @@ mod tests {
             None,
             Some("legacy"),
         );
-        assert!(!has_resumable_session(&agent_legacy, None, None));
+        assert!(!has_resumable_session(&agent_legacy, None));
 
         let mut historical = execution("historical", None, None, Some("legacy"));
         historical.agent_id = Some("a".to_owned());
-        assert!(has_resumable_session(&historical, None, None));
+        let checked_historical_ids = HashSet::from([historical.id.clone()]);
+        assert!(has_resumable_session(
+            &historical,
+            Some(&checked_historical_ids)
+        ));
+        assert!(!has_resumable_session(&historical, Some(&HashSet::new())));
 
         let agentless = execution("agentless", None, None, Some("legacy"));
-        assert!(!has_resumable_session(&agentless, None, None));
+        assert!(!has_resumable_session(&agentless, None));
 
         let mut workspace_scoped = execution("workspace", None, None, Some("legacy"));
         workspace_scoped.agent_id = Some("a".to_owned());
         workspace_scoped.workspace_id = Some("workspace-1".to_owned());
-        assert!(!has_resumable_session(
-            &workspace_scoped,
-            None,
-            Some("workspace-2")
-        ));
-        assert!(has_resumable_session(
-            &workspace_scoped,
-            None,
-            Some("workspace-1")
-        ));
+        assert!(!has_resumable_session(&workspace_scoped, None));
     }
 }
 

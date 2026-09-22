@@ -422,7 +422,14 @@ impl TaskService {
             Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &resolved_agent_id
         );
         if parent_actor_matches && parent_execution.harness_session_id.is_none() {
-            if let Some(external_session_id) = parent_execution.agent_session_id.clone() {
+            if let Some(external_session_id) = resumable_external_session(
+                &self.db,
+                &parent_execution,
+                Some(&resolved_agent_id),
+                Some(&workspace.id),
+            )
+            .await?
+            {
                 if let Some(reconciled) = materialize_historical_harness_session(
                     &self.db,
                     &parent_execution,

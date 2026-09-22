@@ -19,6 +19,21 @@ impl ExecutionRepo for SqliteDb {
             .transpose()
     }
 
+    async fn has_historical_session_ambiguity(&self, execution_id: &str) -> Result<bool> {
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM execution_session_migration_issue
+                 WHERE execution_id = ?
+                   AND issue_kind = 'historical_session_ambiguous'
+             )",
+        )
+        .bind(execution_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(marked != 0)
+    }
+
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats> {
         let row = sqlx::query(
             "SELECT \
@@ -417,6 +432,28 @@ async fn bind_external_session_in_tx(
         return Err(DbError::Check(
             "Human Executions cannot receive an external HarnessSession identity".to_owned(),
         ));
+    }
+
+    if execution.actor_kind == Some(ActorKind::Agent) {
+        let snapshot = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+            .unwrap_or_default();
+        if let Some(routing) = snapshot.get("routing") {
+            let selected_candidate_key = routing
+                .as_object()
+                .and_then(|routing| routing.get("selected_candidate_key"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if selected_candidate_key.is_none() {
+                return Err(DbError::Check(
+                    "cannot bind external session identity before executor route resolution"
+                        .to_owned(),
+                ));
+            }
+        }
     }
 
     if let Some(harness_session_id) = execution.harness_session_id.as_deref() {

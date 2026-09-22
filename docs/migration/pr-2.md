@@ -27,13 +27,24 @@ Resume, follow-up, cascade continuation, blocked recovery, action resolution,
 review continuation, and executor-result handling now consult
 `Execution.harness_session_id` first, then the referenced HarnessSession and
 its lifecycle/external identity. The old `execution.agent_session_id` value is
-only a bounded fallback for historical rows without a generic reference, an
-exact persisted Agent identity (including the V089 ActorRef backfill), and an
-exact legacy Agent id with compatible workspace evidence. Agentless, sentinel,
-pending, or ambiguous history is not advertised as resumable. API responses
-and operator/display projections retain old fields but expose the new additive
-fields. Re-execute remains a new Execution and records the old Execution as
-`parent_execution_id`; it does not implicitly reuse its HarnessSession.
+only a bounded fallback for historical rows without a generic reference, a
+persisted `ActorRef::Agent` matching the exact legacy Agent id, a non-empty
+external id, and compatible workspace evidence. The shared resumability
+helper checks `historical_session_ambiguous` evidence before either generic or
+legacy continuity.
+Agentless, sentinel, pending, or ambiguous history is not advertised as
+resumable. API action resolution receives only Execution ids approved by that
+common helper; review, cascade, recovery, and follow-up also use it directly.
+Historical materialization for follow-up and re-execute is gated by the same
+helper before invoking the DB reconciliation path; DB-side ambiguity protection
+remains defense in depth. Task response recovery hints are filtered through the
+same helper too, so a pre-existing annotation cannot advertise `ResumeSession`
+for ambiguous history; this is response projection only and does not rewrite
+the persisted annotation.
+API responses and operator/display projections retain old fields but expose
+the new additive fields. Re-execute remains a new Execution and records the
+old Execution as `parent_execution_id`; it does not implicitly reuse its
+HarnessSession.
 
 Manual session follow-up passes the chosen Execution as causal lineage only;
 the current RoleMembership selects the new Actor before the explicit session
@@ -73,10 +84,18 @@ opaque harness kind, external harness session id, profile/capability snapshots,
 optional workspace scope, predecessor, timestamps, and the
 `pending`/`active`/`ended`/`failed` lifecycle. Agent and harness identity are
 immutable; external identity cannot be changed once known. A pending session
-is not resumable. PR2 only pre-materializes pending continuity for the current
-executor families that can report an external session identity; known
-non-session executors do not receive a fabricated session, and an unknown
-opaque harness can materialize one when its result supplies an identity.
+is not resumable. PR2 pre-materializes pending continuity for fixed or already
+resolved executor snapshots when the current executor family can report an
+external session identity. If ordered fallback routing is unresolved, no
+speculative HarnessSession is created. The terminal result persists the actual
+resolved candidate snapshot and external session result together; DB result
+binding then materializes or activates continuity from that snapshot before
+projecting the legacy id. This records cross-harness winners and same-harness
+account/profile winners accurately. Known non-session executors do not receive
+a fabricated session, and an unknown opaque harness can materialize one when
+its resolved result supplies an identity. If an external id arrives without a
+persisted route winner, result binding fails closed rather than guessing from
+the primary candidate.
 
 Explicit continuity also requires the Execution's snapshotted harness kind to
 match the HarnessSession's opaque harness identity. A profile change within
@@ -129,9 +148,10 @@ or cancelled run remains reconstructible for resume.
   implement, orchestrator -> orchestrate, and all other roles -> general.
 * Existing rows with the same Agent, harness kind, and external session id
   share one HarnessSession when profile/workspace evidence is coherent.
-* Contradictory historical profile/workspace evidence is not merged. Rows stay
-  on bounded legacy compatibility and receive a
-  `historical_session_ambiguous` issue.
+* Contradictory historical profile/workspace evidence is not merged. Rows
+  receive a `historical_session_ambiguous` issue and cannot use the legacy
+  external id as resumable continuity. Historical materialization and result
+  binding retain their DB-side guard as defense in depth.
 
 The migration never rewrites old principal identity from current membership or
 current Agent configuration.
@@ -207,17 +227,32 @@ forward reconciliation remains available before PR13.
 The MCP execution projection has a focused regression test for additive
 `actor_ref`, `purpose`, and `harness_session_id` output.
 
-Service unit coverage covers the exact role-purpose compatibility mapping and
-the action-resolver distinction between pending, active explicit, Agent legacy,
-and historical legacy session state.
+Service coverage checks that a coherent historical session may use the
+bounded fallback, an ambiguity marker makes the common helper return `None`,
+historical materialization also fails closed, and `SessionFollowUp`/
+`WorkflowResume` are not enabled for that row. The action resolver accepts only
+Execution ids validated by the common helper. API response projection coverage
+checks that a stale `ResumeSession` annotation hint is removed when authority
+validation fails.
+
+Routed-session DB regressions cover no speculative pending record,
+rejecting a result without a persisted winner,
+Codex-to-Cursor materialization from the resolved snapshot, same-harness
+account/profile fallback snapshots, sessionless fallback, and idempotent
+repeated callbacks.
+
+V088's four trigger-body UPDATE target aliases were repaired on `main` in
+commit `6682acd` before this branch was rebased. That isolated commit changes
+only the four target aliases and their correlated references in the Human and
+Agent delete-projection triggers; it does not change membership selection or
+projection semantics.
 
 ## Validation actually executed
 
-* This review pass ran static source/migration audits and `git diff --check`
+* This pass uses static source/migration inspection and `git diff --check`
   only. Per instruction, no Cargo, rustc, Rust test, or frontend build command
-  was run after the final edits.
-* An earlier implementation pass attempted the focused PR2 DB target before
-  the no-Rust instruction; it was blocked on the merged PR1 V088 migration
-  chain (`near "AS": syntax error` in trigger-body `UPDATE ... AS ...`
-  syntax). PR2 does not edit V088 by contract. The implementation therefore
-  remains `REQUIRES IMPLEMENTATION-TIME VERIFICATION`.
+  is run. The `sqlite3` CLI is unavailable, so the V088 SQL repair was checked
+  statically only.
+* The earlier V088 migration-chain failure was repaired on `main` before PR2
+  was rebased. Runtime migration behavior, Rust compilation, and focused Rust
+  tests remain `REQUIRES IMPLEMENTATION-TIME VERIFICATION`.

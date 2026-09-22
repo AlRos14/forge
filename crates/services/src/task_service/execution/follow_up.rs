@@ -242,7 +242,14 @@ fn dispatch_role_follow_up_impl(
             Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &agent_id
         );
         if same_actor && lineage_parent.harness_session_id.is_none() {
-            if let Some(external_session_id) = lineage_parent.agent_session_id.clone() {
+            if let Some(external_session_id) = resumable_external_session(
+                &service.db,
+                &lineage_parent,
+                Some(&agent_id),
+                current_workspace_id.as_deref(),
+            )
+            .await?
+            {
                 if let Some(reconciled) = materialize_historical_harness_session(
                     &service.db,
                     &lineage_parent,

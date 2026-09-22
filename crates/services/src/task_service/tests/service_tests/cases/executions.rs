@@ -1304,6 +1304,134 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
 }
 
 #[tokio::test]
+async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        "in_progress".to_owned(),
+    )
+    .await;
+    let now = now_rfc3339();
+    let execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: None,
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"codex","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("historical-shaped execution creates");
+    sqlx::query("UPDATE execution SET agent_session_id = 'legacy-thread' WHERE id = ?")
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .expect("legacy session projection is seeded");
+    let historical = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+
+    let unambiguous = crate::task_service::resumable_external_session(
+        &db,
+        &historical,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("bounded historical lookup succeeds");
+    assert_eq!(unambiguous.as_deref(), Some("legacy-thread"));
+
+    sqlx::query(
+        "INSERT INTO execution_session_migration_issue
+         (id, execution_id, issue_kind, details_json, created_at)
+         VALUES (?, ?, 'historical_session_ambiguous', '{}', ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&execution.id)
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .expect("historical ambiguity marker is inserted");
+
+    let ambiguous = crate::task_service::resumable_external_session(
+        &db,
+        &historical,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("ambiguous lookup fails closed without error");
+    assert_eq!(ambiguous, None);
+    let materialized = crate::task_service::execution::materialize_historical_harness_session(
+        &db,
+        &historical,
+        "legacy-thread",
+    )
+    .await
+    .expect("ambiguous history remains on the legacy projection");
+    assert!(materialized.is_none());
+
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    let annotation = api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ExecutorFailed,
+        blocking_reason: "executor failed".to_owned(),
+        blocked_by: Some("system".to_owned()),
+        blocked_at: Some(now_rfc3339()),
+        blocked_execution_id: Some(historical.id.clone()),
+        artifact: None,
+        message: None,
+        hook: None,
+        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
+    };
+    let actions = crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
+        &task,
+        &workflow,
+        &[historical],
+        Some(&annotation),
+        Some(&std::collections::HashSet::new()),
+    );
+    let session_follow_up = actions
+        .iter()
+        .find(|action| action.action == api_types::ExecutionActionKind::SessionFollowUp)
+        .expect("session follow-up action exists");
+    assert!(!session_follow_up.enabled);
+    let workflow_resume = actions
+        .iter()
+        .find(|action| action.action == api_types::ExecutionActionKind::WorkflowResume)
+        .expect("workflow resume action exists");
+    assert!(!workflow_resume.enabled);
+}
+
+#[tokio::test]
 async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

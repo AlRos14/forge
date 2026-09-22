@@ -385,6 +385,353 @@ async fn non_session_executor_does_not_fabricate_pending_harness_session() {
 }
 
 #[tokio::test]
+async fn unresolved_ordered_fallback_does_not_create_speculative_session() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-routed", "codex").await;
+    let task_id = seed_task(&db, "routed-pending").await;
+    let mut input = execution_input(
+        "pr2-execution-routed-pending",
+        &task_id,
+        "pr2-agent-routed",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        None,
+        None,
+    );
+    input.executor_config_snapshot_json = Some(
+        serde_json::json!({
+            "agent_id": "pr2-agent-routed",
+            "profile_id": profile_id,
+            "executor_type": "codex",
+            "config": {"account": "codex-primary"},
+            "capabilities": ["read"],
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                    {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
+                ]
+            }
+        })
+        .to_string(),
+    );
+
+    let execution = ExecutionRepo::create(&db, input)
+        .await
+        .expect("unresolved routed execution creates");
+    assert_eq!(execution.harness_session_id, None);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_session WHERE agent_id = 'pr2-agent-routed'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("session count loads");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-unresolved-result", "codex").await;
+    let task_id = seed_task(&db, "unresolved-result").await;
+    let mut input = execution_input(
+        "pr2-execution-unresolved-result",
+        &task_id,
+        "pr2-agent-unresolved-result",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        None,
+        None,
+    );
+    input.executor_config_snapshot_json = Some(
+        serde_json::json!({
+            "agent_id": "pr2-agent-unresolved-result",
+            "profile_id": profile_id,
+            "executor_type": "codex",
+            "config": {"account": "primary"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"account": "primary"}},
+                    {"executor_type": "cursor", "config": {"account": "fallback"}}
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let execution = ExecutionRepo::create(&db, input)
+        .await
+        .expect("unresolved routed execution creates without a session");
+
+    let error = ExecutionRepo::update(
+        &db,
+        result_update(&execution.id, Some("unknown-winner-thread")),
+    )
+    .await
+    .expect_err("external identity cannot bind without the actual routed candidate");
+    assert!(matches!(error, DbError::Check(_)));
+    let unchanged = ExecutionRepo::get_by_id(&db, &execution.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+    assert_eq!(unchanged.harness_session_id, None);
+    assert_eq!(unchanged.agent_session_id, None);
+}
+
+#[tokio::test]
+async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-cross-route", "codex").await;
+    let task_id = seed_task(&db, "cross-route").await;
+    let mut input = execution_input(
+        "pr2-execution-cross-route",
+        &task_id,
+        "pr2-agent-cross-route",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        None,
+        None,
+    );
+    input.executor_config_snapshot_json = Some(
+        serde_json::json!({
+            "agent_id": "pr2-agent-cross-route",
+            "profile_id": profile_id,
+            "executor_type": "codex",
+            "config": {"account": "codex-primary"},
+            "capabilities": ["read"],
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                    {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let execution = ExecutionRepo::create(&db, input)
+        .await
+        .expect("routed execution creates without a speculative session");
+    assert_eq!(execution.harness_session_id, None);
+
+    let resolved_snapshot = serde_json::json!({
+        "agent_id": "pr2-agent-cross-route",
+        "profile_id": profile_id,
+        "executor_type": "cursor",
+        "config": {"account": "cursor-fallback"},
+        "capabilities": ["read", "cursor-native"],
+        "routing": {
+            "policy": "ordered_fallback_v1",
+            "selected_candidate_key": "cursor:fallback",
+            "candidates": [
+                {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
+            ]
+        }
+    })
+    .to_string();
+    let mut result = result_update(&execution.id, Some("cursor-thread"));
+    result.executor_config_snapshot_json = Some(Some(resolved_snapshot.clone()));
+    let completed = ExecutionRepo::update(&db, result.clone())
+        .await
+        .expect("resolved route and session result persist atomically");
+    let session_id = completed
+        .harness_session_id
+        .as_deref()
+        .expect("result materializes a generic session");
+    assert_eq!(completed.agent_session_id.as_deref(), Some("cursor-thread"));
+    let persisted_snapshot: serde_json::Value = serde_json::from_str(
+        completed
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("resolved execution snapshot persists"),
+    )
+    .expect("resolved snapshot parses");
+    assert_eq!(persisted_snapshot["executor_type"], "cursor");
+    let session = HarnessSessionRepo::get_by_id(&db, session_id)
+        .await
+        .expect("HarnessSession loads")
+        .expect("HarnessSession exists");
+    let session_snapshot: serde_json::Value =
+        serde_json::from_str(&session.profile_snapshot_json).expect("session snapshot parses");
+    assert_eq!(session.harness_kind, "cursor");
+    assert_eq!(session.external_session_id.as_deref(), Some("cursor-thread"));
+    assert_eq!(session_snapshot["config"]["account"], "cursor-fallback");
+    assert_eq!(
+        session.capabilities_snapshot_json,
+        r#"["read","cursor-native"]"#
+    );
+
+    let repeated = ExecutionRepo::update(&db, result)
+        .await
+        .expect("identical routed result is idempotent");
+    assert_eq!(repeated.harness_session_id.as_deref(), Some(session_id));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_session
+         WHERE agent_id = 'pr2-agent-cross-route'
+           AND harness_kind = 'cursor'
+           AND external_session_id = 'cursor-thread'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("routed session count loads");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-same-route", "codex").await;
+    let task_id = seed_task(&db, "same-route").await;
+    let mut input = execution_input(
+        "pr2-execution-same-route",
+        &task_id,
+        "pr2-agent-same-route",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        None,
+        None,
+    );
+    input.executor_config_snapshot_json = Some(
+        serde_json::json!({
+            "agent_id": "pr2-agent-same-route",
+            "profile_id": profile_id,
+            "executor_type": "codex",
+            "config": {"account": "profile-a"},
+            "capabilities": ["read"],
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"account": "profile-a"}},
+                    {"executor_type": "codex", "config": {"account": "profile-b"}}
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let execution = ExecutionRepo::create(&db, input)
+        .await
+        .expect("routed execution creates without a speculative session");
+    assert_eq!(execution.harness_session_id, None);
+
+    let resolved_snapshot = serde_json::json!({
+        "agent_id": "pr2-agent-same-route",
+        "profile_id": profile_id,
+        "executor_type": "codex",
+        "config": {"account": "profile-b"},
+        "capabilities": ["read", "profile-b-capability"],
+        "routing": {
+            "policy": "ordered_fallback_v1",
+            "selected_candidate_key": "codex:profile-b",
+            "candidates": [
+                {"executor_type": "codex", "config": {"account": "profile-a"}},
+                {"executor_type": "codex", "config": {"account": "profile-b"}}
+            ]
+        }
+    })
+    .to_string();
+    let mut result = result_update(&execution.id, Some("codex-thread-b"));
+    result.executor_config_snapshot_json = Some(Some(resolved_snapshot));
+    let completed = ExecutionRepo::update(&db, result)
+        .await
+        .expect("resolved profile and session result persist together");
+    let session_id = completed
+        .harness_session_id
+        .as_deref()
+        .expect("resolved result materializes session");
+    let session = HarnessSessionRepo::get_by_id(&db, session_id)
+        .await
+        .expect("HarnessSession loads")
+        .expect("HarnessSession exists");
+    let session_snapshot: serde_json::Value =
+        serde_json::from_str(&session.profile_snapshot_json).expect("session snapshot parses");
+    assert_eq!(session.harness_kind, "codex");
+    assert_eq!(session_snapshot["config"]["account"], "profile-b");
+    assert_ne!(session_snapshot["config"]["account"], "profile-a");
+    assert_eq!(
+        session.capabilities_snapshot_json,
+        r#"["read","profile-b-capability"]"#
+    );
+}
+
+#[tokio::test]
+async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-routed-shell", "codex").await;
+    let task_id = seed_task(&db, "routed-shell").await;
+    let mut input = execution_input(
+        "pr2-execution-routed-shell",
+        &task_id,
+        "pr2-agent-routed-shell",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        None,
+        None,
+    );
+    input.executor_config_snapshot_json = Some(
+        serde_json::json!({
+            "agent_id": "pr2-agent-routed-shell",
+            "profile_id": profile_id,
+            "executor_type": "codex",
+            "config": {},
+            "capabilities": ["read"],
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {}},
+                    {"executor_type": "shell", "config": {}}
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let execution = ExecutionRepo::create(&db, input)
+        .await
+        .expect("unresolved route creates without a session");
+    let resolved_snapshot = serde_json::json!({
+        "agent_id": "pr2-agent-routed-shell",
+        "profile_id": profile_id,
+        "executor_type": "shell",
+        "config": {},
+        "capabilities": ["read"],
+        "routing": {
+            "policy": "ordered_fallback_v1",
+            "selected_candidate_key": "shell:fallback",
+            "candidates": [
+                {"executor_type": "codex", "config": {}},
+                {"executor_type": "shell", "config": {}}
+            ]
+        }
+    })
+    .to_string();
+    let mut result = result_update(&execution.id, None);
+    result.status = Some(ExecutionStatus::Completed);
+    result.executor_config_snapshot_json = Some(Some(resolved_snapshot));
+    let completed = ExecutionRepo::update(&db, result)
+        .await
+        .expect("sessionless route result persists");
+    assert_eq!(completed.harness_session_id, None);
+    assert_eq!(completed.agent_session_id, None);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_session WHERE agent_id = 'pr2-agent-routed-shell'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("session count loads");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn human_execution_has_real_actor_and_no_agent_or_harness_session() {
     let db = database().await;
     let now = now_rfc3339();

@@ -126,15 +126,18 @@ it does not make legacy fields bidirectional authority.
    historical and immutable at the HarnessSession boundary.
 6. V062 `agent_session` remains embedded-runtime-only compatibility.
 
-## Preflight validation observation
+## Preflight migration finding and resolution
 
-The merged PR1 migration chain is not executable on a fresh SQLite database at
-this HEAD. V088 fails while creating its delete-projection triggers because
-SQLite rejects trigger-body `UPDATE task_role_assignment AS ...` and
-`UPDATE task AS ...` aliases with `near "AS": syntax error`. PR2 does not edit
-V088 or absorb PR1 cleanup; this is a pre-existing migration-chain blocker for
-runtime migration tests and must be repaired under the PR1 migration ownership
-before a final PR2 readiness verdict.
+The HEAD-era preflight found four invalid UPDATE target aliases in the Human
+and Agent delete-projection triggers in V088. The four target aliases and
+their correlated references were repaired on `main` in isolated commit
+`6682acd` (`fix: repair V088 SQLite delete projection triggers`) before PR2 was
+rebased. The repaired statements retain their selection order and projection
+conditions. A static search found no remaining `UPDATE ... AS ...` target
+aliases or references to the removed `legacy`/`current_task` aliases in V088.
+The `sqlite3` command-line tool was unavailable, so no SQL execution check was
+performed. V088 is no longer a known migration-chain blocker; implementation
+still requires the normal migration and runtime verification gate.
 
 ## Second-pass implementation review corrections
 
@@ -172,3 +175,30 @@ leave implicit:
   Actor-first rule. A changed current RoleMembership Agent receives a fresh
   snapshot and no inherited HarnessSession; only a matching Actor may reuse
   the blocked/completed Execution's explicit continuity.
+
+The second-pass authority review also made these session decisions explicit:
+
+* `resumable_external_session` checks the historical ambiguity issue table
+  before allowing either generic or bounded legacy continuity. It requires a
+  persisted `ActorRef::Agent` matching the legacy Agent id, a non-sentinel id,
+  non-empty external id, compatible workspace, and matching expected Agent.
+* Task action resolution receives Execution ids already validated by that
+  common service helper. It no longer makes its own decision from the legacy
+  projection, so ambiguous rows cannot advertise `SessionFollowUp` or
+  `WorkflowResume`.
+* Follow-up and re-execute historical materialization also request the
+  external identity from that helper before binding it. Cascade, blocked
+  recovery, review continuation, and recovery annotations already use the
+  helper, so the ambiguity rule is shared rather than repeated per caller.
+  Full/light task response projections also suppress stale `ResumeSession`
+  hints when the target Execution fails that authority check; stored history is
+  not rewritten.
+* Routed pending creation is delayed when `routing.selected_candidate_key` is
+  absent. The local runner and remote terminal writer persist the resolved
+  route snapshot and external session result in one Execution update. The DB
+  writes that snapshot first inside its transaction, then materializes or
+  activates HarnessSession continuity from the resulting snapshot and projects
+  the legacy id before commit. This captures both cross-harness and
+  same-harness account/profile fallback without mutating established session
+  history. If an external id arrives while the route winner is still absent,
+  the DB rejects the result rather than binding it to the primary candidate.

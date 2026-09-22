@@ -605,6 +605,10 @@ pub trait RuntimeRepo: Send + Sync {
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
+    /// Return whether migration evidence explicitly marks this historical
+    /// Execution's external session identity as contradictory.  This is a
+    /// fail-closed compatibility check; it is not a generic session lookup.
+    async fn has_historical_session_ambiguity(&self, execution_id: &str) -> Result<bool>;
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats>;
     async fn list_by_task(&self, task_id: &str, page: PageRequest) -> Result<Page<Execution>>;
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>>;

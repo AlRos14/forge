@@ -47,7 +47,7 @@ pub(crate) mod config;
 mod create;
 mod create_subtasks;
 pub(crate) mod execution;
-pub(crate) use execution::resumable_external_session;
+pub use execution::resumable_external_session;
 mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;

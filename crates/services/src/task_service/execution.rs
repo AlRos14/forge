@@ -54,12 +54,20 @@ pub(crate) fn execution_purpose_for_task_type(
 /// Resolve explicit generic continuity. A referenced HarnessSession is the
 /// authority for new rows; the legacy execution.agent_session_id fallback is
 /// only available to historical rows that have not yet been materialized.
-pub(crate) async fn resumable_external_session(
+pub async fn resumable_external_session(
     db: &SqliteDb,
     execution: &Execution,
     expected_agent_id: Option<&str>,
     workspace_id: Option<&str>,
 ) -> Result<Option<String>> {
+    if ExecutionRepo::has_historical_session_ambiguity(db, &execution.id).await? {
+        // Contradictory historical evidence is never resumable, even if a
+        // generic reference was attached by an earlier/incomplete rollout.
+        // Keep this guard in the common authority path so all consumers fail
+        // closed consistently.
+        return Ok(None);
+    }
+
     if let Some(harness_session_id) = execution.harness_session_id.as_deref() {
         let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
             return Ok(None);
@@ -104,26 +112,18 @@ pub(crate) async fn resumable_external_session(
     // their legacy external identity is usable only when the persisted Agent
     // still matches the caller. Never use this path when a generic reference
     // exists, even if the compatibility projection is populated.
-    let historical_agent_ref = match execution.actor_ref() {
-        None => true,
-        Some(db::ActorRef::Agent(actor_id)) => {
-            execution.agent_id.as_deref() == Some(actor_id.as_str())
-        }
-        Some(db::ActorRef::Human(_)) => false,
+    let Some(db::ActorRef::Agent(actor_id)) = execution.actor_ref() else {
+        return Ok(None);
     };
-    if historical_agent_ref
-        && execution.agent_id.is_some()
-        && !execution
-            .agent_id
-            .as_deref()
-            .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
+    if execution.agent_id.as_deref() == Some(actor_id.as_str())
+        && !actor_id.eq_ignore_ascii_case("human")
         && execution
             .agent_session_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         && (execution.workspace_id.is_none()
             || execution.workspace_id.as_deref() == workspace_id)
-        && expected_agent_id.is_none_or(|agent_id| execution.agent_id.as_deref() == Some(agent_id))
+        && expected_agent_id.is_none_or(|agent_id| actor_id == agent_id)
     {
         return Ok(execution.agent_session_id.clone());
     }

@@ -24,6 +24,20 @@ pub(crate) fn map_harness_session(row: SqliteRow) -> Result<HarnessSession> {
 /// remain opaque and can still materialize a session when a result supplies an
 /// external identity.
 fn may_establish_external_session(snapshot: &serde_json::Value) -> bool {
+    // An ordered fallback route has not established continuity until its
+    // winner is persisted.  Do not freeze the primary candidate's harness or
+    // profile snapshot into a pending generic session before routing resolves.
+    if let Some(routing) = snapshot.get("routing") {
+        let selected_candidate_key = routing
+            .as_object()
+            .and_then(|routing| routing.get("selected_candidate_key"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if selected_candidate_key.is_none() {
+            return false;
+        }
+    }
     let Some(executor_type) = snapshot
         .get("executor_type")
         .and_then(serde_json::Value::as_str)
@@ -34,6 +48,46 @@ fn may_establish_external_session(snapshot: &serde_json::Value) -> bool {
     !(executor_type.eq_ignore_ascii_case("shell")
         || executor_type.eq_ignore_ascii_case("gemini")
         || executor_type.eq_ignore_ascii_case("null"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_establish_external_session;
+
+    #[test]
+    fn unresolved_ordered_fallback_does_not_admit_pending_session() {
+        let snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {"profile": "account-a"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"profile": "account-a"}},
+                    {"executor_type": "cursor", "config": {"profile": "account-b"}}
+                ]
+            }
+        });
+
+        assert!(!may_establish_external_session(&snapshot));
+    }
+
+    #[test]
+    fn resolved_ordered_fallback_admits_the_resolved_candidate_snapshot() {
+        let snapshot = serde_json::json!({
+            "executor_type": "cursor",
+            "config": {"profile": "account-b"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "selected_candidate_key": "cursor:account-b",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"profile": "account-a"}},
+                    {"executor_type": "cursor", "config": {"profile": "account-b"}}
+                ]
+            }
+        });
+
+        assert!(may_establish_external_session(&snapshot));
+    }
 }
 
 pub(crate) async fn profile_id_for_snapshot_in_tx(
