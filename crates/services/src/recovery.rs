@@ -7,7 +7,7 @@ use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, Daemon, DaemonRepo, Execution,
     ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo, ResumePolicy, SortBy,
     SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, UpdateAgent, UpdateExecution,
-    UpdateTaskStatus, WorkspaceLeaseRepo,
+    UpdateTaskStatus, WorkspaceLeaseRepo, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -1049,6 +1049,9 @@ pub(crate) async fn cancel_running_executions(
         },
     )
     .await?;
+    let current_workspace_id = WorkspaceRepo::get_by_task_id(db, task_id)
+        .await?
+        .map(|workspace| workspace.id);
     let mut cancelled = Vec::new();
     for execution in page.items {
         if execution.status != ExecutionStatus::Running {
@@ -1058,7 +1061,7 @@ pub(crate) async fn cancel_running_executions(
             db,
             &execution,
             execution.agent_id.as_deref(),
-            execution.workspace_id.as_deref(),
+            current_workspace_id.as_deref(),
         )
         .await?;
         let cancelled_execution = CancelledExecution {

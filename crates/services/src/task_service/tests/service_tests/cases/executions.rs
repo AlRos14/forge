@@ -1458,8 +1458,8 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
             agent_id: Some(agent_b.clone()),
-            actor_ref: None,
-            purpose: None,
+            actor_ref: Some(db::ActorRef::Agent(agent_b.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Completed,
@@ -1486,6 +1486,14 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
     )
     .await
     .expect("parent execution creates");
+    let parent_execution = ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent_execution.id,
+        "suspended-lineage-thread",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent harness session activates");
 
     let follow_up = service
         .dispatch_role_follow_up(
@@ -1500,6 +1508,11 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
         .expect("role follow-up succeeds");
 
     assert_eq!(follow_up.agent_id.as_deref(), Some(agent_a.as_str()));
+    assert_ne!(
+        follow_up.execution.harness_session_id,
+        parent_execution.harness_session_id
+    );
+    assert!(follow_up.execution.agent_session_id.is_none());
     let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
         .await
         .expect("historical parent loads")
@@ -2192,7 +2205,10 @@ async fn re_execute_uses_current_membership_not_legacy_projection() {
     assert_eq!(result.execution.role, "coder".to_owned());
     assert_eq!(result.execution.status, ExecutionStatus::Running);
     assert_eq!(result.execution.agent_id.as_deref(), Some(agent_b.as_str()));
-    assert_eq!(result.execution.parent_execution_id, None);
+    assert_eq!(
+        result.execution.parent_execution_id.as_deref(),
+        Some(parent_execution.id.as_str())
+    );
     assert_eq!(result.execution.agent_session_id, None);
     let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
         .await

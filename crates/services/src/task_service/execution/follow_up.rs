@@ -165,6 +165,13 @@ fn dispatch_role_follow_up_impl(
         } else {
             supplied_parent_execution.clone()
         };
+        // Follow-up continuity is scoped by the Task's current workspace, not
+        // only by the lineage snapshot. If the workspace was replaced after
+        // the parent ran, the explicit session must fail the compatibility
+        // check and the child must start without inheriting it.
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*service.db, &task_id)
+            .await?
+            .map(|workspace| workspace.id);
         let authoritative_memberships =
             crate::task_service::current_role_memberships_authoritative(
                 &service.db,
@@ -252,7 +259,7 @@ fn dispatch_role_follow_up_impl(
                 &service.db,
                 &lineage_parent,
                 &agent_id,
-                lineage_parent.workspace_id.as_deref(),
+                current_workspace_id.as_deref(),
             )
             .await?
         } else {
@@ -361,7 +368,7 @@ fn dispatch_role_follow_up_impl(
                     after_sha: None,
                     error: None,
                     executor_config_snapshot_json,
-                    workspace_id: lineage_parent.workspace_id.clone(),
+                    workspace_id: current_workspace_id.clone(),
                     created_at: now.clone(),
                     updated_at: now,
                 },

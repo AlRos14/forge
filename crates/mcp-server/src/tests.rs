@@ -4,7 +4,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatRepo, AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo,
     AgentStatus, AssigneeKind, CreateAgent, CreateAgentIdentity, CreateAgentProfile,
-    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask,
+    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask, ExecutionPurpose,
     CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus,
     PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, SortBy,
     SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
@@ -517,6 +517,62 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+    });
+}
+
+#[test]
+fn mcp_execution_output_exposes_pr2_authority_fields() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let agent = seed_agent(&state, "PR2 output agent").await;
+        let now = now_rfc3339();
+        ExecutionRepo::create(
+            &*state.db,
+            CreateExecution {
+                id: "pr2-mcp-execution".to_owned(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent.id.clone()),
+                actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+                purpose: Some(ExecutionPurpose::Investigate),
+                harness_session_id: None,
+                role: "implementer".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+
+        let page = call_tool(
+            &state,
+            "forge_list_executions",
+            json!({"task_id": task.id}),
+        )
+        .await;
+        let execution = &page["data"][0];
+        assert_eq!(
+            execution["actor_ref"],
+            json!({"kind": "agent", "id": agent.id})
+        );
+        assert_eq!(execution["purpose"], "investigate");
+        assert!(execution["harness_session_id"].is_null());
     });
 }
 

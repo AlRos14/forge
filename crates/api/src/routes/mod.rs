@@ -337,6 +337,7 @@ async fn task_response_inner(
         );
     }
     let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
+    let current_workspace_id = workspace_model.as_ref().map(|workspace| workspace.id.clone());
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
             Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
@@ -391,11 +392,29 @@ async fn task_response_inner(
             let Some(session) = HarnessSessionRepo::get_by_id(db, session_id).await? else {
                 continue;
             };
+            let execution_harness_kind = execution
+                .executor_config_snapshot_json
+                .as_deref()
+                .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("executor_type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                });
             if matches!(&session.status, HarnessSessionStatus::Active)
-                && session.external_session_id.is_some()
+                && session
+                    .external_session_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
                 && matches!(execution.actor_ref(), Some(db::ActorRef::Agent(ref agent_id)) if agent_id == &session.agent_id)
+                && execution_harness_kind
+                    .as_deref()
+                    .is_none_or(|harness_kind| harness_kind == session.harness_kind)
                 && (session.workspace_id.is_none()
-                    || session.workspace_id == execution.workspace_id)
+                    || session.workspace_id.as_deref() == current_workspace_id.as_deref())
                 && execution
                     .agent_session_id
                     .as_deref()
@@ -412,6 +431,7 @@ async fn task_response_inner(
             &executions,
             blocking_annotation,
             Some(&reusable_harness_session_ids),
+            current_workspace_id.as_deref(),
         )
     } else {
         Vec::new()

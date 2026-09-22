@@ -725,6 +725,11 @@ impl TaskService {
             _ => reason.to_owned(),
         };
         let preserve_resume_context = resume_policy == db::ResumePolicy::Manual;
+        // An explicit generic HarnessSession remains resumable even when the
+        // cancellation was not manual. Preserve the execution snapshot so a
+        // later recovery can reconstruct the same harness invocation.
+        let preserve_harness_context =
+            preserve_resume_context || execution.harness_session_id.is_some();
         if self.daemon_connections.is_some() || self.task_executor.is_some() {
             if let Err(error) = self.cancel_execution_with_provider(execution, reason).await {
                 if matches!(error, ServiceError::DaemonUnavailable { .. }) {
@@ -747,10 +752,11 @@ impl TaskService {
                 resume_policy: Some(Some(resume_policy)),
                 stopped_at: Some(Some(now_rfc3339())),
                 // Manual user stops retain the session and executor snapshot so the
-                // task façade can resume the same worker thread. Lifecycle and task
-                // cancellation paths clear only the legacy projection; the DB
-                // repository ignores that clear when HarnessSession is authoritative.
-                agent_session_id: (!preserve_resume_context).then_some(None),
+                // task façade can resume the same worker thread. An explicit generic
+                // HarnessSession also retains both across lifecycle cancellation;
+                // the repository keeps its legacy projection aligned while the
+                // HarnessSession remains authoritative.
+                agent_session_id: (!preserve_harness_context).then_some(None),
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -758,7 +764,7 @@ impl TaskService {
                 before_sha: None,
                 after_sha: None,
                 error: Some(Some(reason.to_owned())),
-                executor_config_snapshot_json: (!preserve_resume_context).then_some(None),
+                executor_config_snapshot_json: (!preserve_harness_context).then_some(None),
                 updated_at: now_rfc3339(),
             },
         )

@@ -1,5 +1,6 @@
 use super::execution::resumable_external_session;
 use super::*;
+use db::WorkspaceRepo;
 use api_types::{Actor, UserActionSource};
 
 impl TaskService {
@@ -292,11 +293,14 @@ impl TaskService {
         let executor_execution_id = Uuid::parse_str(&execution.id).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
         })?;
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
         let executor_thread_id = resumable_external_session(
             &self.db,
             &execution,
             execution.agent_id.as_deref(),
-            execution.workspace_id.as_deref(),
+            current_workspace_id.as_deref(),
         )
         .await?;
         let (review, outcome) = review_runner

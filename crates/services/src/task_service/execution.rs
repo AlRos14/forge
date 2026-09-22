@@ -64,13 +64,31 @@ pub(crate) async fn resumable_external_session(
         let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
             return Ok(None);
         };
+        let execution_harness_kind = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .get("executor_type")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
         if !matches!(&session.status, HarnessSessionStatus::Active)
-            || session.external_session_id.is_none()
+            || !session
+                .external_session_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
             || !matches!(
                 execution.actor_ref(),
                 Some(db::ActorRef::Agent(ref agent_id)) if agent_id == &session.agent_id
             )
             || expected_agent_id.is_some_and(|agent_id| session.agent_id != agent_id)
+            || execution_harness_kind
+                .as_deref()
+                .is_some_and(|harness_kind| harness_kind != session.harness_kind)
             || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
             || execution
                 .agent_session_id
@@ -95,7 +113,16 @@ pub(crate) async fn resumable_external_session(
     };
     if historical_agent_ref
         && execution.agent_id.is_some()
-        && execution.agent_session_id.is_some()
+        && !execution
+            .agent_id
+            .as_deref()
+            .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
+        && execution
+            .agent_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && (execution.workspace_id.is_none()
+            || execution.workspace_id.as_deref() == workspace_id)
         && expected_agent_id.is_none_or(|agent_id| execution.agent_id.as_deref() == Some(agent_id))
     {
         return Ok(execution.agent_session_id.clone());
@@ -118,15 +145,31 @@ pub(crate) async fn reusable_harness_session_for_agent(
     let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
         return Ok(None);
     };
+    let execution_harness_kind = execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+        .and_then(|snapshot| {
+            snapshot
+                .get("executor_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
     if session.agent_id != agent_id
         || !matches!(
             execution.actor_ref(),
             Some(db::ActorRef::Agent(ref actor_agent_id)) if actor_agent_id == agent_id
         )
-        || !matches!(
-            &session.status,
-            HarnessSessionStatus::Pending | HarnessSessionStatus::Active
-        )
+        || !matches!(&session.status, HarnessSessionStatus::Active)
+        || !session
+            .external_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || execution_harness_kind
+            .as_deref()
+            .is_some_and(|harness_kind| harness_kind != session.harness_kind)
         || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
         || execution
             .agent_session_id

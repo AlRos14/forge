@@ -1742,6 +1742,11 @@ pub struct UpdateExecution {
     pub stopped_by: Option<Option<String>>,
     pub resume_policy: Option<Option<ResumePolicy>>,
     pub stopped_at: Option<Option<String>>,
+    /// Legacy-shaped input retained for callers that receive an
+    /// ExecutionResult. `Some(Some(id))` is an external harness identity and
+    /// is routed through the generic HarnessSession authority by the
+    /// repository; `Some(None)` only clears a historical row with no generic
+    /// session reference.
     pub agent_session_id: Option<Option<String>>,
     pub agent_message_id: Option<Option<String>>,
     pub last_activity_at: Option<Option<String>>,

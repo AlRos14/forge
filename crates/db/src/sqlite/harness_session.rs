@@ -18,6 +18,47 @@ pub(crate) fn map_harness_session(row: SqliteRow) -> Result<HarnessSession> {
     })
 }
 
+/// PR2 only pre-materializes a pending generic session when the current
+/// executor family can actually report an external continuity id. This is a
+/// narrow admission hint, not the PR3 capability model: unknown harness kinds
+/// remain opaque and can still materialize a session when a result supplies an
+/// external identity.
+fn may_establish_external_session(snapshot: &serde_json::Value) -> bool {
+    let Some(executor_type) = snapshot
+        .get("executor_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+    else {
+        return false;
+    };
+    !(executor_type.eq_ignore_ascii_case("shell")
+        || executor_type.eq_ignore_ascii_case("gemini")
+        || executor_type.eq_ignore_ascii_case("null"))
+}
+
+pub(crate) async fn profile_id_for_snapshot_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+    snapshot: &serde_json::Value,
+) -> Result<Option<String>> {
+    let Some(profile_id) = snapshot
+        .get("profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(
+        "SELECT id FROM agent_profile WHERE id = ? AND identity_id = ? LIMIT 1",
+    )
+    .bind(profile_id)
+    .bind(agent_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(Into::into)
+}
+
 pub(crate) async fn create_pending_harness_session_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     input: &CreateExecution,
@@ -25,7 +66,10 @@ pub(crate) async fn create_pending_harness_session_in_tx(
     let Some(ActorRef::Agent(actor_agent_id)) = input.actor_ref.as_ref() else {
         return Ok(None);
     };
-    if input.harness_session_id.is_some() || input.executor_config_snapshot_json.is_none() {
+    if input.harness_session_id.is_some()
+        || input.executor_config_snapshot_json.is_none()
+        || input.status != ExecutionStatus::Running
+    {
         return Ok(input.harness_session_id.clone());
     }
     if input.agent_id.as_deref() != Some(actor_agent_id.as_str()) {
@@ -39,16 +83,16 @@ pub(crate) async fn create_pending_harness_session_in_tx(
         .as_deref()
         .unwrap_or("{}");
     let snapshot = serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
+    if !may_establish_external_session(&snapshot) {
+        return Ok(None);
+    }
     let harness_kind = snapshot
         .get("executor_type")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("legacy")
         .to_owned();
-    let profile_id = snapshot
-        .get("profile_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+    let profile_id = profile_id_for_snapshot_in_tx(transaction, actor_agent_id, &snapshot).await?;
     let capabilities_snapshot_json = snapshot
         .get("capabilities")
         .map(ToString::to_string)
@@ -78,6 +122,7 @@ pub(crate) async fn create_pending_harness_session_in_tx(
 pub(crate) async fn validate_execution_harness_session_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     input: &CreateExecution,
+    allow_pending: bool,
 ) -> Result<()> {
     let Some(session_id) = input.harness_session_id.as_deref() else {
         return Ok(());
@@ -88,7 +133,7 @@ pub(crate) async fn validate_execution_harness_session_in_tx(
         ));
     };
     let row = sqlx::query(
-        "SELECT agent_id, status, workspace_id
+        "SELECT agent_id, harness_kind, status, workspace_id
          FROM harness_session WHERE id = ?",
     )
     .bind(session_id)
@@ -96,6 +141,7 @@ pub(crate) async fn validate_execution_harness_session_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let session_agent_id: String = row.try_get("agent_id")?;
+    let session_harness_kind: String = row.try_get("harness_kind")?;
     let status: HarnessSessionStatus = parse_enum(row.try_get::<String, _>("status")?)?;
     let session_workspace_id: Option<String> = row.try_get("workspace_id")?;
     if session_agent_id != *agent_id {
@@ -103,11 +149,32 @@ pub(crate) async fn validate_execution_harness_session_in_tx(
             "HarnessSession belongs to a different Agent".to_owned(),
         ));
     }
+    if let Some(snapshot_json) = input.executor_config_snapshot_json.as_deref() {
+        let snapshot =
+            serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
+        if let Some(executor_type) = snapshot
+            .get("executor_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if executor_type != session_harness_kind {
+                return Err(DbError::Check(
+                    "HarnessSession belongs to a different harness kind".to_owned(),
+                ));
+            }
+        }
+    }
     if !matches!(
-        status,
+        &status,
         HarnessSessionStatus::Pending | HarnessSessionStatus::Active
     ) {
         return Err(DbError::Check("HarnessSession is not reusable".to_owned()));
+    }
+    if matches!(&status, HarnessSessionStatus::Pending) && !allow_pending {
+        return Err(DbError::Check(
+            "pending HarnessSession cannot be inherited by a new Execution".to_owned(),
+        ));
     }
     if session_workspace_id.is_some()
         && session_workspace_id.as_deref() != input.workspace_id.as_deref()
@@ -169,7 +236,7 @@ impl HarnessSessionRepo for SqliteDb {
         sqlx::query(
             "SELECT * FROM harness_session
              WHERE agent_id = ? AND harness_kind = ? AND external_session_id = ?
-               AND status IN ('pending', 'active')
+               AND status = 'active'
              LIMIT 1",
         )
         .bind(agent_id)
@@ -185,49 +252,41 @@ impl HarnessSessionRepo for SqliteDb {
         let current = HarnessSessionRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)?;
-        let requested_external_session_id = input.external_session_id.clone();
-        let external_session_id = requested_external_session_id
-            .clone()
-            .unwrap_or_else(|| current.external_session_id.clone());
-        if let (Some(current_external), Some(next_external)) = (
-            current.external_session_id.as_deref(),
-            external_session_id.as_deref(),
-        ) {
-            if current_external != next_external {
-                return Err(DbError::Check(
-                    "HarnessSession external identity is immutable once known".to_owned(),
-                ));
-            }
-        }
-        if current.external_session_id.is_some()
-            && requested_external_session_id.is_some_and(|value| value.is_none())
-        {
-            return Err(DbError::Check(
-                "HarnessSession external identity cannot be cleared once known".to_owned(),
-            ));
-        }
         let status = input
             .status
             .clone()
             .unwrap_or_else(|| current.status.clone());
         if matches!(
-            current.status,
+            &current.status,
             HarnessSessionStatus::Ended | HarnessSessionStatus::Failed
         ) && matches!(
-            status,
+            &status,
             HarnessSessionStatus::Pending | HarnessSessionStatus::Active
         ) {
             return Err(DbError::Check(
                 "ended or failed HarnessSession cannot become reusable".to_owned(),
             ));
         }
+        if matches!(&status, HarnessSessionStatus::Active)
+            && current.external_session_id.is_none()
+        {
+            return Err(DbError::Check(
+                "active HarnessSession requires an external session identity".to_owned(),
+            ));
+        }
+        if matches!(&current.status, HarnessSessionStatus::Active)
+            && matches!(&status, HarnessSessionStatus::Pending)
+        {
+            return Err(DbError::Check(
+                "active HarnessSession cannot become pending".to_owned(),
+            ));
+        }
         let last_activity_at = input.last_activity_at.unwrap_or(current.last_activity_at);
         sqlx::query(
             "UPDATE harness_session
-             SET external_session_id = ?, status = ?, last_activity_at = ?, updated_at = ?
+             SET status = ?, last_activity_at = ?, updated_at = ?
              WHERE id = ?",
         )
-        .bind(external_session_id.as_deref())
         .bind(status.to_string())
         .bind(last_activity_at.as_deref())
         .bind(&input.updated_at)

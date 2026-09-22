@@ -135,3 +135,40 @@ SQLite rejects trigger-body `UPDATE task_role_assignment AS ...` and
 V088 or absorb PR1 cleanup; this is a pre-existing migration-chain blocker for
 runtime migration tests and must be repaired under the PR1 migration ownership
 before a final PR2 readiness verdict.
+
+## Second-pass implementation review corrections
+
+The implementation review found and closed several gaps that were not safe to
+leave implicit:
+
+* the reserved legacy `agent_id = 'human'` value is excluded from ActorRef and
+  HarnessSession backfill, recorded as unresolved history, rejected for new
+  writes, and excluded from bounded resume fallback;
+* pending HarnessSessions cannot be advertised or reused as active continuity,
+  and the repository status update cannot establish external identity;
+* executor result callbacks are the only generic external-session authority;
+  Human callbacks fail closed and empty identities are rejected;
+* re-execute records causal `parent_execution_id`, failed claim records retain
+  the semantic role/purpose, and role follow-up compares the current Task
+  workspace before reusing a session;
+* MCP execution projections expose the additive PR2 authority fields.
+* current Task workspace scope is used by action, recovery, cascade, review,
+  and manual-stop resumability checks; the generic session retains its
+  historical workspace token even if operational workspace reset deletes the
+  corresponding `workspace` row;
+* current non-session executor families (`shell`, `gemini`, and `null`) do not
+  receive fabricated pending sessions. Unknown harness kinds remain opaque and
+  can materialize a session only when a result supplies an external identity;
+* HarnessSession predecessor identity and the legacy
+  `execution.agent_session_id` projection are guarded against cross-identity
+  or divergent direct writes.
+* cancellation preserves the execution snapshot whenever an explicit
+  HarnessSession is attached, and follow-up/workflow-guard continuations use
+  only the current Task workspace rather than a stale lineage workspace.
+* manual session follow-up passes the selected Execution as lineage only;
+  current RoleMembership selects the new Actor before continuity is tested, so
+  an Agent change cannot inherit the previous Actor's session.
+* blocked-session recovery and workflow-guard continuations now apply the same
+  Actor-first rule. A changed current RoleMembership Agent receives a fresh
+  snapshot and no inherited HarnessSession; only a matching Actor may reuse
+  the blocked/completed Execution's explicit continuity.

@@ -1,4 +1,5 @@
 use super::*;
+use db::WorkspaceRepo;
 
 impl TaskService {
     pub async fn dispatch_initial_role_execution(
@@ -783,7 +784,7 @@ impl TaskService {
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    parent_execution_id: None,
+                    parent_execution_id: Some(parent_execution.id.clone()),
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -893,11 +894,14 @@ impl TaskService {
             api_types::RecoveryAction::ResetToInitial,
             api_types::RecoveryAction::CancelTask,
         ];
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
         if resumable_external_session(
             &self.db,
             &execution,
             execution.agent_id.as_deref(),
-            execution.workspace_id.as_deref(),
+            current_workspace_id.as_deref(),
         )
         .await?
         .is_some()

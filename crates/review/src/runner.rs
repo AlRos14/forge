@@ -253,6 +253,7 @@ impl ReviewRunner {
                 parent_execution
                     .agent_id
                     .as_ref()
+                    .filter(|agent_id| !agent_id.eq_ignore_ascii_case("human"))
                     .map(|agent_id| db::ActorRef::Agent(agent_id.clone()))
             })
             .ok_or_else(|| {

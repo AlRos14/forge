@@ -4,7 +4,7 @@ use super::*;
 use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
 use db::{
     AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, ReviewRepo,
-    ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo,
+    ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
 };
 
 #[derive(Debug)]
@@ -205,6 +205,9 @@ impl TaskService {
         workflow: &api_types::WorkflowDefinition,
     ) -> Result<Vec<TaskAction>> {
         let executions = self.task_executions(&task.id).await?;
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
         let latest_review = self.latest_review(&task.id).await?;
         let state = workflow
             .states
@@ -221,7 +224,7 @@ impl TaskService {
                     &self.db,
                     execution,
                     execution.agent_id.as_deref(),
-                    execution.workspace_id.as_deref(),
+                    current_workspace_id.as_deref(),
                 )
                 .await?
                 .is_some()
@@ -344,6 +347,9 @@ impl TaskService {
         }
 
         let executions = self.task_executions(&task.id).await?;
+        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .map(|workspace| workspace.id);
         let mut resumable_execution = None;
         for execution in &executions {
             if execution.status != ExecutionStatus::Running
@@ -351,7 +357,7 @@ impl TaskService {
                     &self.db,
                     execution,
                     execution.agent_id.as_deref(),
-                    execution.workspace_id.as_deref(),
+                    current_workspace_id.as_deref(),
                 )
                 .await?
                 .is_some()
@@ -367,7 +373,11 @@ impl TaskService {
                     context.clone().unwrap_or_else(|| {
                         "Resume work from the latest worker session.".to_owned()
                     }),
-                    execution.agent_id.clone(),
+                    // The selected Execution supplies causal lineage only.
+                    // Follow-up must select the current RoleMembership Actor
+                    // before deciding whether that Actor may reuse the
+                    // lineage HarnessSession.
+                    None,
                     None,
                 )
                 .await?;

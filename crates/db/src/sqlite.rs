@@ -615,7 +615,22 @@ impl SqliteDb {
         let mut input = input.clone();
         let actor_kind = input.actor_ref.as_ref().map(ActorRef::kind);
         let actor_id = input.actor_ref.as_ref().map(|value| value.id().to_owned());
+        if input.actor_ref.is_none()
+            && input
+                .agent_id
+                .as_deref()
+                .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
+        {
+            return Err(DbError::Check(
+                "the legacy human sentinel is not a new Execution principal".to_owned(),
+            ));
+        }
         if let Some(actor_ref) = input.actor_ref.as_ref() {
+            if actor_ref.id().eq_ignore_ascii_case("human") {
+                return Err(DbError::Check(
+                    "the legacy human sentinel is not a persisted ActorRef".to_owned(),
+                ));
+            }
             if matches!(actor_ref, ActorRef::Human(_)) {
                 if input.agent_id.is_some()
                     || input.agent_session_id.is_some()
@@ -638,12 +653,18 @@ impl SqliteDb {
             ));
         }
         if input.actor_ref.is_some() {
+            let explicitly_supplied_harness_session = input.harness_session_id.is_some();
             if let Some(session_id) =
                 harness_session::create_pending_harness_session_in_tx(transaction, &input).await?
             {
                 input.harness_session_id = Some(session_id);
             }
-            harness_session::validate_execution_harness_session_in_tx(transaction, &input).await?;
+            harness_session::validate_execution_harness_session_in_tx(
+                transaction,
+                &input,
+                !explicitly_supplied_harness_session,
+            )
+            .await?;
             if let Some(session_id) = input.harness_session_id.as_deref() {
                 let external_session_id: Option<String> = sqlx::query_scalar(
                     "SELECT external_session_id FROM harness_session WHERE id = ?",

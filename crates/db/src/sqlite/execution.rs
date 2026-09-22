@@ -217,10 +217,16 @@ impl ExecutionRepo for SqliteDb {
             push_assignment!("error", error);
         }
         if let Some(executor_config_snapshot_json) = input.executor_config_snapshot_json {
-            push_assignment!(
-                "executor_config_snapshot_json",
-                executor_config_snapshot_json
-            );
+            // An explicit HarnessSession remains resumable after a failed or
+            // cancelled Execution. Preserve the immutable executor snapshot
+            // needed to reconstruct that continuity; cleanup remains valid
+            // for rows that have no generic session authority.
+            if executor_config_snapshot_json.is_some() || execution.harness_session_id.is_none() {
+                push_assignment!(
+                    "executor_config_snapshot_json",
+                    executor_config_snapshot_json
+                );
+            }
         }
         if let Some(stop_reason) = input.stop_reason {
             push_assignment!("stop_reason", stop_reason.map(|value| value.to_string()));
@@ -383,6 +389,11 @@ async fn bind_external_session_in_tx(
     external_session_id: &str,
     updated_at: &str,
 ) -> Result<()> {
+    if external_session_id.trim().is_empty() {
+        return Err(DbError::Check(
+            "external HarnessSession identity cannot be empty".to_owned(),
+        ));
+    }
     let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
         .bind(execution_id)
         .fetch_optional(&mut **transaction)
@@ -402,9 +413,15 @@ async fn bind_external_session_in_tx(
         ));
     }
 
+    if execution.actor_kind == Some(ActorKind::Human) {
+        return Err(DbError::Check(
+            "Human Executions cannot receive an external HarnessSession identity".to_owned(),
+        ));
+    }
+
     if let Some(harness_session_id) = execution.harness_session_id.as_deref() {
         let row = sqlx::query(
-            "SELECT agent_id, external_session_id, status, workspace_id
+            "SELECT agent_id, harness_kind, external_session_id, status, workspace_id
              FROM harness_session WHERE id = ?",
         )
         .bind(harness_session_id)
@@ -412,6 +429,7 @@ async fn bind_external_session_in_tx(
         .await?
         .ok_or(DbError::NotFound)?;
         let session_agent_id: String = row.try_get("agent_id")?;
+        let session_harness_kind: String = row.try_get("harness_kind")?;
         let existing_external: Option<String> = row.try_get("external_session_id")?;
         let status: HarnessSessionStatus = parse_enum(row.try_get::<String, _>("status")?)?;
         let session_workspace_id: Option<String> = row.try_get("workspace_id")?;
@@ -421,6 +439,22 @@ async fn bind_external_session_in_tx(
             return Err(DbError::Check(
                 "HarnessSession does not belong to the Execution Agent".to_owned(),
             ));
+        }
+        if let Some(snapshot_json) = execution.executor_config_snapshot_json.as_deref() {
+            let snapshot =
+                serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
+            if let Some(executor_type) = snapshot
+                .get("executor_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if executor_type != session_harness_kind {
+                    return Err(DbError::Check(
+                        "HarnessSession result uses a different harness kind".to_owned(),
+                    ));
+                }
+            }
         }
         if let Some(existing_external) = existing_external {
             if existing_external != external_session_id {
@@ -465,6 +499,23 @@ async fn bind_external_session_in_tx(
         .bind(execution_id)
         .execute(&mut **transaction)
         .await?;
+        return Ok(());
+    }
+
+    if execution.actor_kind.is_none()
+        && execution
+            .agent_id
+            .as_deref()
+            .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
+    {
+        // The reserved sentinel is historical compatibility only. Preserve its
+        // old projection without turning it into a generic Actor or session.
+        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
+            .bind(external_session_id)
+            .bind(updated_at)
+            .bind(execution_id)
+            .execute(&mut **transaction)
+            .await?;
         return Ok(());
     }
 
@@ -520,10 +571,8 @@ async fn bind_external_session_in_tx(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("legacy")
         .to_owned();
-    let profile_id = snapshot
-        .get("profile_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+    let profile_id =
+        harness_session::profile_id_for_snapshot_in_tx(transaction, agent_id, &snapshot).await?;
     let capabilities_snapshot_json = snapshot
         .get("capabilities")
         .map(ToString::to_string)

@@ -1709,7 +1709,9 @@ execution, and it does not advance the task workflow when it completes.
 
 `POST /api/v1/executions/{id}/re-execute` starts a new execution for the
 current legacy workflow role and role assignment without session continuity;
-completion may participate in the existing workflow cascade. These endpoints
+the new row records the source Execution in `parent_execution_id`, while the
+source history remains unchanged. Completion may participate in the existing
+workflow cascade. These endpoints
 retain the legacy `agent_id` and `agent_session_id` response fields while the
 additive PR2 fields are authoritative:
 

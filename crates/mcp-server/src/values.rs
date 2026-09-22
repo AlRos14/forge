@@ -158,11 +158,17 @@ pub(crate) fn execution_value(execution: Execution) -> Value {
     json!({
         "id": execution.id,
         "task_id": execution.task_id,
+        "actor_ref": execution.actor_ref().map(|actor| match actor {
+            db::ActorRef::Human(id) => json!({"kind": "human", "id": id}),
+            db::ActorRef::Agent(id) => json!({"kind": "agent", "id": id}),
+        }),
         "agent_id": execution.agent_id,
         "role": execution.role.to_string(),
+        "purpose": execution.purpose.map(|purpose| purpose.to_string()),
         "status": execution.status.to_string(),
         "parent_execution_id": execution.parent_execution_id,
         "agent_session_id": execution.agent_session_id,
+        "harness_session_id": execution.harness_session_id,
         "agent_message_id": execution.agent_message_id,
         "prompt": execution.prompt,
         "summary": execution.summary,

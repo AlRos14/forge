@@ -6,15 +6,27 @@
 CREATE TABLE harness_session (
     id                         TEXT PRIMARY KEY,
     agent_id                   TEXT NOT NULL REFERENCES agent_identity(id) ON DELETE RESTRICT,
-    harness_kind               TEXT NOT NULL,
+    harness_kind               TEXT NOT NULL CHECK (length(trim(harness_kind)) > 0),
     external_session_id        TEXT,
     profile_id                 TEXT REFERENCES agent_profile(id) ON DELETE SET NULL,
-    profile_snapshot_json      TEXT NOT NULL DEFAULT '{}',
-    capabilities_snapshot_json TEXT NOT NULL DEFAULT '{}',
-    workspace_id               TEXT REFERENCES workspace(id) ON DELETE SET NULL,
+    profile_snapshot_json      TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(profile_snapshot_json)),
+    capabilities_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(capabilities_snapshot_json)),
+    -- Workspace rows are replaceable operational state. Keep the historical
+    -- scope token without an FK so deleting/resetting a workspace cannot
+    -- silently widen a session into unscoped continuity.
+    workspace_id               TEXT,
     status                     TEXT NOT NULL DEFAULT 'pending'
-                                 CHECK (status IN ('pending', 'active', 'ended', 'failed')),
-    predecessor_session_id     TEXT REFERENCES harness_session(id) ON DELETE SET NULL,
+                                 CHECK (status IN ('pending', 'active', 'ended', 'failed'))
+                                 CHECK (external_session_id IS NULL
+                                        OR length(trim(external_session_id)) > 0)
+                                 CHECK (
+                                     (status = 'pending' AND external_session_id IS NULL)
+                                     OR (status = 'active'
+                                         AND external_session_id IS NOT NULL
+                                         AND length(trim(external_session_id)) > 0)
+                                     OR status IN ('ended', 'failed')
+                                 ),
+    predecessor_session_id     TEXT REFERENCES harness_session(id) ON DELETE RESTRICT,
     created_at                 TEXT NOT NULL,
     updated_at                 TEXT NOT NULL,
     last_activity_at           TEXT
@@ -63,7 +75,8 @@ CREATE INDEX idx_execution_harness_session
 UPDATE execution
 SET actor_kind = 'agent',
     actor_id = agent_id
-WHERE agent_id IS NOT NULL;
+WHERE agent_id IS NOT NULL
+  AND lower(trim(agent_id)) <> 'human';
 
 INSERT INTO execution_session_migration_issue (id, execution_id, issue_kind, details_json, created_at)
 SELECT
@@ -75,10 +88,11 @@ SELECT
         lower(hex(randomblob(6))),
     id,
     'historical_actor_unresolved',
-    '{"reason":"legacy execution has no exact persisted agent identity; current assignment was not consulted"}',
+    '{"reason":"legacy execution has no exact persisted Actor identity (NULL or reserved human sentinel); current assignment was not consulted"}',
     updated_at
 FROM execution
-WHERE agent_id IS NULL;
+WHERE agent_id IS NULL
+   OR lower(trim(agent_id)) = 'human';
 
 -- Historical purpose is a deterministic role-only mapping.  It is deliberately
 -- not reused by new runtime writers, which must supply the semantic purpose.
@@ -86,6 +100,7 @@ UPDATE execution
 SET purpose = CASE lower(trim(role))
     WHEN 'planner' THEN 'plan'
     WHEN 'reviewer' THEN 'review'
+    WHEN 'auditor' THEN 'review'
     WHEN 'coder' THEN 'implement'
     WHEN 'worker' THEN 'implement'
     WHEN 'implementer' THEN 'implement'
@@ -137,7 +152,8 @@ WITH session_rows AS (
         e.updated_at
     FROM execution AS e
     WHERE e.agent_id IS NOT NULL
-      AND e.agent_session_id IS NOT NULL
+      AND lower(trim(e.agent_id)) <> 'human'
+      AND NULLIF(trim(e.agent_session_id), '') IS NOT NULL
 ), grouped AS (
     SELECT
         agent_id,
@@ -181,10 +197,15 @@ SELECT
     coherent.harness_kind,
     coherent.external_session_id,
     first.profile_id,
-    COALESCE(first.executor_config_snapshot_json, '{}'),
     CASE
         WHEN json_valid(first.executor_config_snapshot_json)
-        THEN COALESCE(json_extract(first.executor_config_snapshot_json, '$.capabilities'), '{}')
+        THEN first.executor_config_snapshot_json
+        ELSE '{}'
+    END,
+    CASE
+        WHEN json_valid(first.executor_config_snapshot_json)
+         AND json_valid(json_extract(first.executor_config_snapshot_json, '$.capabilities'))
+        THEN json_extract(first.executor_config_snapshot_json, '$.capabilities')
         ELSE '{}'
     END,
     CASE WHEN coherent.workspace_count = 1 THEN first.workspace_id ELSE NULL END,
@@ -223,7 +244,8 @@ SET harness_session_id = (
       AND hs.external_session_id = execution.agent_session_id
 )
 WHERE execution.agent_id IS NOT NULL
-  AND execution.agent_session_id IS NOT NULL;
+  AND lower(trim(execution.agent_id)) <> 'human'
+  AND NULLIF(trim(execution.agent_session_id), '') IS NOT NULL;
 
 WITH session_rows AS (
     SELECT
@@ -260,7 +282,8 @@ WITH session_rows AS (
         e.workspace_id
     FROM execution AS e
     WHERE e.agent_id IS NOT NULL
-      AND e.agent_session_id IS NOT NULL
+      AND lower(trim(e.agent_id)) <> 'human'
+      AND NULLIF(trim(e.agent_session_id), '') IS NOT NULL
 ), ambiguous AS (
     SELECT agent_id, harness_kind, external_session_id
     FROM session_rows
@@ -296,6 +319,7 @@ CREATE TRIGGER execution_actor_ref_guard_insert
 BEFORE INSERT ON execution
 WHEN (NEW.actor_kind IS NULL AND NEW.actor_id IS NOT NULL)
   OR (NEW.actor_kind IS NOT NULL AND NEW.actor_id IS NULL)
+  OR lower(trim(NEW.actor_id)) = 'human'
   OR (NEW.actor_kind = 'human' AND NOT EXISTS (SELECT 1 FROM user WHERE id = NEW.actor_id))
   OR (NEW.actor_kind = 'agent' AND NOT EXISTS (SELECT 1 FROM agent_identity WHERE id = NEW.actor_id))
 BEGIN
@@ -306,6 +330,7 @@ CREATE TRIGGER execution_actor_ref_guard_update
 BEFORE UPDATE OF actor_kind, actor_id ON execution
 WHEN (NEW.actor_kind IS NULL AND NEW.actor_id IS NOT NULL)
   OR (NEW.actor_kind IS NOT NULL AND NEW.actor_id IS NULL)
+  OR lower(trim(NEW.actor_id)) = 'human'
   OR (NEW.actor_kind = 'human' AND NOT EXISTS (SELECT 1 FROM user WHERE id = NEW.actor_id))
   OR (NEW.actor_kind = 'agent' AND NOT EXISTS (SELECT 1 FROM agent_identity WHERE id = NEW.actor_id))
 BEGIN
@@ -326,6 +351,22 @@ WHEN (NEW.actor_kind = 'human' AND NEW.agent_id IS NOT NULL)
   OR (NEW.actor_kind = 'agent' AND (NEW.agent_id IS NULL OR NEW.agent_id != NEW.actor_id))
 BEGIN
     SELECT RAISE(ABORT, 'execution agent projection is invalid');
+END;
+
+CREATE TRIGGER execution_purpose_guard_insert
+BEFORE INSERT ON execution
+WHEN NEW.actor_kind IS NOT NULL
+ AND NEW.purpose IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'actor-bearing Execution requires an explicit Purpose');
+END;
+
+CREATE TRIGGER execution_purpose_guard_update
+BEFORE UPDATE OF actor_kind, purpose ON execution
+WHEN NEW.actor_kind IS NOT NULL
+ AND NEW.purpose IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'actor-bearing Execution requires an explicit Purpose');
 END;
 
 CREATE TRIGGER execution_harness_session_guard_insert
@@ -364,6 +405,49 @@ BEGIN
     SELECT RAISE(ABORT, 'execution HarnessSession is incompatible with Actor or workspace');
 END;
 
+CREATE TRIGGER execution_harness_projection_guard_insert
+BEFORE INSERT ON execution
+WHEN NEW.harness_session_id IS NOT NULL
+ AND (
+      NOT EXISTS (
+          SELECT 1
+          FROM harness_session AS hs
+          WHERE hs.id = NEW.harness_session_id
+            AND NEW.agent_session_id IS hs.external_session_id
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'Execution legacy session projection diverges from HarnessSession');
+END;
+
+CREATE TRIGGER execution_harness_projection_guard_update
+BEFORE UPDATE OF harness_session_id, agent_session_id ON execution
+WHEN NEW.harness_session_id IS NOT NULL
+ AND (
+      NOT EXISTS (
+          SELECT 1
+          FROM harness_session AS hs
+          WHERE hs.id = NEW.harness_session_id
+            AND NEW.agent_session_id IS hs.external_session_id
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'Execution legacy session projection diverges from HarnessSession');
+END;
+
+-- A direct lifecycle/external-identity update still flows one way from the
+-- generic session authority into every historical Execution projection. The
+-- result writer performs the same update in its surrounding transaction.
+CREATE TRIGGER harness_session_projection_update
+AFTER UPDATE OF external_session_id, status ON harness_session
+WHEN NEW.external_session_id IS NOT NULL
+BEGIN
+    UPDATE execution
+    SET agent_session_id = NEW.external_session_id,
+        updated_at = NEW.updated_at
+    WHERE harness_session_id = NEW.id;
+END;
+
 CREATE TRIGGER execution_actor_role_purpose_immutable
 BEFORE UPDATE OF actor_kind, actor_id, role, purpose ON execution
 WHEN OLD.actor_kind IS NOT NEW.actor_kind
@@ -395,6 +479,14 @@ WHEN OLD.external_session_id IS NOT NULL
  AND NEW.external_session_id IS NOT OLD.external_session_id
 BEGIN
     SELECT RAISE(ABORT, 'HarnessSession external identity is immutable once known');
+END;
+
+CREATE TRIGGER harness_session_lifecycle_guard
+BEFORE UPDATE OF status, external_session_id ON harness_session
+WHEN (OLD.status IN ('ended', 'failed') AND NEW.status IN ('pending', 'active'))
+  OR (OLD.status = 'active' AND NEW.status = 'pending')
+BEGIN
+    SELECT RAISE(ABORT, 'HarnessSession lifecycle transition is invalid');
 END;
 
 CREATE TRIGGER harness_session_snapshot_immutable
@@ -433,4 +525,32 @@ WHEN NEW.profile_id IS NOT NULL
  )
 BEGIN
     SELECT RAISE(ABORT, 'HarnessSession profile does not belong to its Agent');
+END;
+
+CREATE TRIGGER harness_session_predecessor_guard_insert
+BEFORE INSERT ON harness_session
+WHEN NEW.predecessor_session_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1
+     FROM harness_session AS predecessor
+     WHERE predecessor.id = NEW.predecessor_session_id
+       AND predecessor.agent_id = NEW.agent_id
+       AND predecessor.harness_kind = NEW.harness_kind
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'HarnessSession predecessor has incompatible identity');
+END;
+
+CREATE TRIGGER harness_session_predecessor_guard_update
+BEFORE UPDATE OF predecessor_session_id ON harness_session
+WHEN NEW.predecessor_session_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1
+     FROM harness_session AS predecessor
+     WHERE predecessor.id = NEW.predecessor_session_id
+       AND predecessor.agent_id = NEW.agent_id
+       AND predecessor.harness_kind = NEW.harness_kind
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'HarnessSession predecessor has incompatible identity');
 END;

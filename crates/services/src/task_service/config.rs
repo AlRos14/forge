@@ -427,6 +427,8 @@ pub(super) async fn create_failed_execution_record(
     agent: &Agent,
     workspace: &Workspace,
     execution_id: &str,
+    role: &str,
+    purpose: ExecutionPurpose,
     error: String,
 ) -> Result<()> {
     let now = now_rfc3339();
@@ -437,9 +439,9 @@ pub(super) async fn create_failed_execution_record(
             task_id: task_id.to_owned(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(ExecutionPurpose::Implement),
+            purpose: Some(purpose),
             harness_session_id: None,
-            role: "executor".to_owned(),
+            role: role.to_owned(),
             status: ExecutionStatus::Failed,
             stop_reason: None,
             stopped_by: None,

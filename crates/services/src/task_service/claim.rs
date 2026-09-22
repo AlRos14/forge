@@ -107,6 +107,8 @@ impl TaskService {
             }
         }
         let previous_status = task.status.clone();
+        let role = target_role.clone().unwrap_or_else(|| "executor".to_owned());
+        let purpose = super::execution::execution_purpose_for_task_type(&task.task_type, &role);
         let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
             &self.db,
             &self.workspace_root,
@@ -128,6 +130,8 @@ impl TaskService {
                             agent,
                             &workspace,
                             &execution_id,
+                            &role,
+                            purpose.clone(),
                             error.to_string(),
                         )
                         .await?;
@@ -144,8 +148,6 @@ impl TaskService {
                 ServiceError::invalid_operation("human claim is missing its user handle")
             })?),
         };
-        let role = target_role.clone().unwrap_or_else(|| "executor".to_owned());
-        let purpose = super::execution::execution_purpose_for_task_type(&task.task_type, &role);
         let mut transaction = self.db.pool().begin().await.map_err(DbError::from)?;
         let claimed = TaskRepo::claim(
             &*self.db,

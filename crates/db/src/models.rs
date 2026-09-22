@@ -920,7 +920,6 @@ pub struct CreateHarnessSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateHarnessSession {
     pub id: String,
-    pub external_session_id: Option<Option<String>>,
     pub status: Option<HarnessSessionStatus>,
     pub last_activity_at: Option<Option<String>>,
     pub updated_at: String,

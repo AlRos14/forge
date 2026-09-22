@@ -1,9 +1,9 @@
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from, ActorRef,
-    AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, CreateExecution, CreateRepo,
-    CreateWorkspace, DbError, ExecutionPurpose, ExecutionRepo, ExecutionStatus, HarnessSessionRepo,
-    HarnessSessionStatus, RepoRepo, SqliteDb, UpdateExecution, UpdateHarnessSession, WorkMode,
-    WorkspaceRepo, WorkspaceStatus,
+    AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, CreateExecution,
+    CreateHarnessSession, CreateRepo, CreateWorkspace, DbError, ExecutionPurpose, ExecutionRepo,
+    ExecutionStatus, HarnessSessionRepo, HarnessSessionStatus, RepoRepo, SqliteDb,
+    UpdateExecution, UpdateHarnessSession, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use std::{
     fs,
@@ -253,6 +253,24 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     assert!(pending.profile_snapshot_json.contains("test-model"));
     assert_eq!(pending.capabilities_snapshot_json, r#"["read"]"#);
 
+    let pending_inheritance = ExecutionRepo::create(
+        &db,
+        execution_input(
+            "pr2-execution-pending-child",
+            &task_id,
+            "pr2-agent-a",
+            &profile_id,
+            "codex",
+            ExecutionPurpose::Implement,
+            None,
+            Some(session_id.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect_err("pending HarnessSession cannot be inherited");
+    assert!(matches!(pending_inheritance, DbError::Check(_)));
+
     let activated = ExecutionRepo::update(&db, result_update(execution_id, Some("thread-1")))
         .await
         .expect("executor result persists");
@@ -268,11 +286,47 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     assert_eq!(active.status, HarnessSessionStatus::Active);
     assert_eq!(active.external_session_id.as_deref(), Some("thread-1"));
 
+    let direct_projection_divergence = sqlx::query(
+        "UPDATE execution SET agent_session_id = 'different-thread' WHERE id = ?",
+    )
+    .bind(execution_id)
+    .execute(db.pool())
+    .await
+    .expect_err("legacy projection cannot diverge from HarnessSession authority");
+    assert!(direct_projection_divergence
+        .to_string()
+        .contains("projection diverges"));
+
+    let active_to_pending = HarnessSessionRepo::update(
+        &db,
+        UpdateHarnessSession {
+            id: session_id.clone(),
+            status: Some(HarnessSessionStatus::Pending),
+            last_activity_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect_err("an active session cannot be reopened as pending");
+    assert!(matches!(active_to_pending, DbError::Check(_)));
+
+    let direct_active_to_pending = sqlx::query(
+        "UPDATE harness_session SET status = 'pending' WHERE id = ?",
+    )
+    .bind(&session_id)
+    .execute(db.pool())
+    .await
+    .expect_err("SQLite must guard invalid HarnessSession lifecycle transitions");
+    assert!(direct_active_to_pending
+        .to_string()
+        .contains("lifecycle transition"));
+
     let mut failed_update = result_update(execution_id, None);
     failed_update.status = Some(ExecutionStatus::Failed);
-    ExecutionRepo::update(&db, failed_update)
+    let failed = ExecutionRepo::update(&db, failed_update)
         .await
         .expect("failed Execution persists");
+    assert!(failed.executor_config_snapshot_json.is_some());
     let reusable_after_failure = HarnessSessionRepo::get_by_id(&db, &session_id)
         .await
         .expect("session reloads after failure")
@@ -297,6 +351,37 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
         .await
         .expect_err("one Execution cannot change its external session identity");
     assert!(matches!(divergent, DbError::Check(_)));
+}
+
+#[tokio::test]
+async fn non_session_executor_does_not_fabricate_pending_harness_session() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-shell", "shell").await;
+    let task_id = seed_task(&db, "shell").await;
+    let execution = ExecutionRepo::create(
+        &db,
+        execution_input(
+            "pr2-execution-shell",
+            &task_id,
+            "pr2-agent-shell",
+            &profile_id,
+            "shell",
+            ExecutionPurpose::Implement,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("shell execution creates");
+    assert_eq!(execution.harness_session_id, None);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_session WHERE agent_id = 'pr2-agent-shell'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("session count loads");
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -351,6 +436,15 @@ async fn human_execution_has_real_actor_and_no_agent_or_harness_session() {
     );
     assert_eq!(execution.agent_id, None);
     assert_eq!(execution.harness_session_id, None);
+    let external_result = ExecutionRepo::record_harness_session_result(
+        &db,
+        &execution.id,
+        "human-thread",
+        &now_rfc3339(),
+    )
+    .await
+    .expect_err("Human Executions cannot receive external session identity");
+    assert!(matches!(external_result, DbError::Check(_)));
     assert!(matches!(
         ExecutionRepo::create(
             &db,
@@ -656,6 +750,96 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
             .await
             .expect("different harness session activates");
     assert_ne!(a.harness_session_id, other_harness.harness_session_id);
+
+    let cross_harness_inheritance = ExecutionRepo::create(
+        &db,
+        execution_input(
+            "pr2-execution-cross-harness-inheritance",
+            &task_id,
+            "pr2-agent-collision-a",
+            &profile_a,
+            "cursor",
+            ExecutionPurpose::Implement,
+            None,
+            a.harness_session_id.clone(),
+            Some("abc".to_owned()),
+        ),
+    )
+    .await
+    .expect_err("a session cannot cross harness identity");
+    assert!(matches!(cross_harness_inheritance, DbError::Check(_)));
+}
+
+#[tokio::test]
+async fn harness_session_predecessor_cannot_cross_agent_or_harness_identity() {
+    let db = database().await;
+    let profile_a = seed_agent(&db, "pr2-predecessor-agent-a", "codex").await;
+    let profile_b = seed_agent(&db, "pr2-predecessor-agent-b", "codex").await;
+    let now = now_rfc3339();
+    let predecessor = HarnessSessionRepo::create(
+        &db,
+        CreateHarnessSession {
+            id: "pr2-predecessor-parent".to_owned(),
+            agent_id: "pr2-predecessor-agent-a".to_owned(),
+            harness_kind: "codex".to_owned(),
+            external_session_id: None,
+            profile_id: Some(profile_a.clone()),
+            profile_snapshot_json: "{}".to_owned(),
+            capabilities_snapshot_json: "{}".to_owned(),
+            workspace_id: None,
+            status: HarnessSessionStatus::Pending,
+            predecessor_session_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity_at: None,
+        },
+    )
+    .await
+    .expect("predecessor session creates");
+
+    let cross_agent = HarnessSessionRepo::create(
+        &db,
+        CreateHarnessSession {
+            id: "pr2-predecessor-cross-agent".to_owned(),
+            agent_id: "pr2-predecessor-agent-b".to_owned(),
+            harness_kind: "codex".to_owned(),
+            external_session_id: None,
+            profile_id: Some(profile_b.clone()),
+            profile_snapshot_json: "{}".to_owned(),
+            capabilities_snapshot_json: "{}".to_owned(),
+            workspace_id: None,
+            status: HarnessSessionStatus::Pending,
+            predecessor_session_id: Some(predecessor.id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity_at: None,
+        },
+    )
+    .await
+    .expect_err("predecessor cannot cross Agent identity");
+    assert!(cross_agent.to_string().contains("predecessor"));
+
+    let cross_harness = HarnessSessionRepo::create(
+        &db,
+        CreateHarnessSession {
+            id: "pr2-predecessor-cross-harness".to_owned(),
+            agent_id: "pr2-predecessor-agent-a".to_owned(),
+            harness_kind: "cursor".to_owned(),
+            external_session_id: None,
+            profile_id: Some(profile_a),
+            profile_snapshot_json: "{}".to_owned(),
+            capabilities_snapshot_json: "{}".to_owned(),
+            workspace_id: None,
+            status: HarnessSessionStatus::Pending,
+            predecessor_session_id: Some(predecessor.id),
+            created_at: now.clone(),
+            updated_at: now,
+            last_activity_at: None,
+        },
+    )
+    .await
+    .expect_err("predecessor cannot cross harness identity");
+    assert!(cross_harness.to_string().contains("predecessor"));
 }
 
 #[tokio::test]
@@ -733,7 +917,6 @@ async fn session_identity_and_execution_history_are_immutable_and_snapshotted() 
         &db,
         UpdateHarnessSession {
             id: session_id,
-            external_session_id: None,
             status: Some(HarnessSessionStatus::Ended),
             last_activity_at: None,
             updated_at: now_rfc3339(),
@@ -875,6 +1058,17 @@ async fn historical_session_migration_groups_only_coherent_identity() {
     .await;
     seed_legacy_execution(
         &db,
+        "pr2-history-auditor",
+        &task_id,
+        Some("pr2-history-a"),
+        "auditor",
+        Some("auditor-thread"),
+        Some(&snapshot_a),
+        "2026-01-01T00:01:40Z",
+    )
+    .await;
+    seed_legacy_execution(
+        &db,
         "pr2-history-unknown-role",
         &task_id,
         Some("pr2-history-a"),
@@ -939,6 +1133,17 @@ async fn historical_session_migration_groups_only_coherent_identity() {
         "2026-01-01T00:06:00Z",
     )
     .await;
+    seed_legacy_execution(
+        &db,
+        "pr2-history-human-sentinel",
+        &task_id,
+        Some("human"),
+        "coder",
+        Some("human-thread"),
+        Some(&snapshot_a),
+        "2026-01-01T00:07:00Z",
+    )
+    .await;
 
     run_migrations(&pool).await.expect("PR2 migration applies");
     let first = ExecutionRepo::get_by_id(&db, "pr2-history-a-one")
@@ -953,6 +1158,10 @@ async fn historical_session_migration_groups_only_coherent_identity() {
         .await
         .expect("planner execution loads")
         .expect("planner execution exists");
+    let auditor = ExecutionRepo::get_by_id(&db, "pr2-history-auditor")
+        .await
+        .expect("auditor execution loads")
+        .expect("auditor execution exists");
     let unknown_role = ExecutionRepo::get_by_id(&db, "pr2-history-unknown-role")
         .await
         .expect("unknown-role execution loads")
@@ -973,6 +1182,10 @@ async fn historical_session_migration_groups_only_coherent_identity() {
         .await
         .expect("agentless execution loads")
         .expect("agentless execution exists");
+    let sentinel = ExecutionRepo::get_by_id(&db, "pr2-history-human-sentinel")
+        .await
+        .expect("human sentinel execution loads")
+        .expect("human sentinel execution exists");
     assert_eq!(
         first.actor_ref(),
         Some(ActorRef::Agent("pr2-history-a".to_owned()))
@@ -980,6 +1193,7 @@ async fn historical_session_migration_groups_only_coherent_identity() {
     assert_eq!(first.purpose, Some(ExecutionPurpose::Implement));
     assert_eq!(second.purpose, Some(ExecutionPurpose::Review));
     assert_eq!(planner.purpose, Some(ExecutionPurpose::Plan));
+    assert_eq!(auditor.purpose, Some(ExecutionPurpose::Review));
     assert_eq!(unknown_role.purpose, Some(ExecutionPurpose::General));
     assert_eq!(first.harness_session_id, second.harness_session_id);
     assert_ne!(first.harness_session_id, other_agent.harness_session_id);
@@ -987,6 +1201,8 @@ async fn historical_session_migration_groups_only_coherent_identity() {
     assert_eq!(ambiguous.harness_session_id, None);
     assert_eq!(agentless.actor_ref(), None);
     assert_eq!(agentless.purpose, Some(ExecutionPurpose::General));
+    assert_eq!(sentinel.actor_ref(), None);
+    assert_eq!(sentinel.harness_session_id, None);
     let issue_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM execution_session_migration_issue WHERE issue_kind = 'historical_session_ambiguous'",
     )
@@ -995,11 +1211,11 @@ async fn historical_session_migration_groups_only_coherent_identity() {
     .expect("ambiguity issues load");
     assert_eq!(issue_count, 2);
     let actor_issue_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution_session_migration_issue WHERE issue_kind = 'historical_actor_unresolved' AND execution_id = 'pr2-history-agentless'",
+        "SELECT COUNT(*) FROM execution_session_migration_issue WHERE issue_kind = 'historical_actor_unresolved' AND execution_id IN ('pr2-history-agentless', 'pr2-history-human-sentinel')",
     )
     .fetch_one(db.pool())
     .await
     .expect("actor issue loads");
-    assert_eq!(actor_issue_count, 1);
+    assert_eq!(actor_issue_count, 2);
     let _ = fs::remove_dir_all(migration_dir);
 }
