@@ -195,20 +195,20 @@ END;
 CREATE TRIGGER role_membership_human_delete_projection
 AFTER DELETE ON user
 BEGIN
-    UPDATE task_role_assignment AS legacy
+    UPDATE task_role_assignment
     SET assignee_type = (
             SELECT CASE membership.actor_kind WHEN 'agent' THEN 'agent' ELSE 'user' END
             FROM task_role AS role
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = legacy.task_id
-              AND role.role = CASE lower(trim(legacy.role_name))
+            WHERE role.task_id = task_role_assignment.task_id
+              AND role.role = CASE lower(trim(task_role_assignment.role_name))
                   WHEN 'coder' THEN 'implementer'
                   WHEN 'worker' THEN 'implementer'
                   WHEN 'assignee' THEN 'implementer'
                   WHEN 'executor' THEN 'implementer'
-                  ELSE lower(trim(legacy.role_name))
+                  ELSE lower(trim(task_role_assignment.role_name))
               END
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
@@ -220,29 +220,29 @@ BEGIN
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = legacy.task_id
-              AND role.role = CASE lower(trim(legacy.role_name))
+            WHERE role.task_id = task_role_assignment.task_id
+              AND role.role = CASE lower(trim(task_role_assignment.role_name))
                   WHEN 'coder' THEN 'implementer'
                   WHEN 'worker' THEN 'implementer'
                   WHEN 'assignee' THEN 'implementer'
                   WHEN 'executor' THEN 'implementer'
-                  ELSE lower(trim(legacy.role_name))
+                  ELSE lower(trim(task_role_assignment.role_name))
               END
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
             LIMIT 1
         ),
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-    WHERE legacy.assignee_type = 'user' AND legacy.assignee_id = OLD.id;
+    WHERE task_role_assignment.assignee_type = 'user' AND task_role_assignment.assignee_id = OLD.id;
 
-    UPDATE task AS current_task
+    UPDATE task
     SET assignee_type = (
             SELECT CASE membership.actor_kind WHEN 'agent' THEN 'agent' ELSE 'user' END
             FROM task_role AS role
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = current_task.id
+            WHERE role.task_id = task.id
               AND role.role = 'implementer'
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
@@ -254,33 +254,33 @@ BEGIN
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = current_task.id
+            WHERE role.task_id = task.id
               AND role.role = 'implementer'
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
             LIMIT 1
         ),
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-    WHERE current_task.assignee_type = 'user' AND current_task.assignee_id = OLD.id;
+    WHERE task.assignee_type = 'user' AND task.assignee_id = OLD.id;
 END;
 
 CREATE TRIGGER role_membership_agent_delete_projection
 AFTER DELETE ON agent_identity
 BEGIN
-    UPDATE task_role_assignment AS legacy
+    UPDATE task_role_assignment
     SET assignee_type = (
             SELECT CASE membership.actor_kind WHEN 'agent' THEN 'agent' ELSE 'user' END
             FROM task_role AS role
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = legacy.task_id
-              AND role.role = CASE lower(trim(legacy.role_name))
+            WHERE role.task_id = task_role_assignment.task_id
+              AND role.role = CASE lower(trim(task_role_assignment.role_name))
                   WHEN 'coder' THEN 'implementer'
                   WHEN 'worker' THEN 'implementer'
                   WHEN 'assignee' THEN 'implementer'
                   WHEN 'executor' THEN 'implementer'
-                  ELSE lower(trim(legacy.role_name))
+                  ELSE lower(trim(task_role_assignment.role_name))
               END
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
@@ -292,29 +292,29 @@ BEGIN
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = legacy.task_id
-              AND role.role = CASE lower(trim(legacy.role_name))
+            WHERE role.task_id = task_role_assignment.task_id
+              AND role.role = CASE lower(trim(task_role_assignment.role_name))
                   WHEN 'coder' THEN 'implementer'
                   WHEN 'worker' THEN 'implementer'
                   WHEN 'assignee' THEN 'implementer'
                   WHEN 'executor' THEN 'implementer'
-                  ELSE lower(trim(legacy.role_name))
+                  ELSE lower(trim(task_role_assignment.role_name))
               END
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
             LIMIT 1
         ),
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-    WHERE legacy.assignee_type = 'agent' AND legacy.assignee_id = OLD.id;
+    WHERE task_role_assignment.assignee_type = 'agent' AND task_role_assignment.assignee_id = OLD.id;
 
-    UPDATE task AS current_task
+    UPDATE task
     SET assignee_type = (
             SELECT CASE membership.actor_kind WHEN 'agent' THEN 'agent' ELSE 'user' END
             FROM task_role AS role
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = current_task.id
+            WHERE role.task_id = task.id
               AND role.role = 'implementer'
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
@@ -326,14 +326,14 @@ BEGIN
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
              AND membership.status = 'active'
-            WHERE role.task_id = current_task.id
+            WHERE role.task_id = task.id
               AND role.role = 'implementer'
             ORDER BY CASE membership.actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
                      membership.created_at, membership.id
             LIMIT 1
         ),
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-    WHERE current_task.assignee_type = 'agent' AND current_task.assignee_id = OLD.id;
+    WHERE task.assignee_type = 'agent' AND task.assignee_id = OLD.id;
 END;
 
 CREATE TABLE role_membership_migration_issue (
