@@ -1617,6 +1617,11 @@ Task IDs are only references that Forge authorizes.
 | `forge_get_agent_handoff` | Inspect one handoff and its delivery outcome |
 | `forge_create_agent_handoff` | Publish a bounded, deduplicated Main-to-Project handoff |
 
+Task response recovery annotations are preserved as stored, but `ResumeSession`
+is removed from the REST or MCP response projection unless the shared session
+resumability authority confirms continuity for the resolved Execution. This
+filtering does not rewrite the Task's persisted diagnostic history.
+
 Disable the endpoint with `forge --no-mcp` if you don't want it.
 
 `forge_create_task` accepts the optional `type` field (`implementation`, `planning`,

@@ -37,10 +37,10 @@ resumable. API action resolution receives only Execution ids approved by that
 common helper; review, cascade, recovery, and follow-up also use it directly.
 Historical materialization for follow-up and re-execute is gated by the same
 helper before invoking the DB reconciliation path; DB-side ambiguity protection
-remains defense in depth. Task response recovery hints are filtered through the
-same helper too, so a pre-existing annotation cannot advertise `ResumeSession`
-for ambiguous history; this is response projection only and does not rewrite
-the persisted annotation.
+remains defense in depth. REST and every MCP Task response projection filter
+recovery hints through the same helper, so a pre-existing annotation cannot
+advertise `ResumeSession` for ambiguous or otherwise non-resumable history.
+This is response projection only and does not rewrite the persisted annotation.
 API responses and operator/display projections retain old fields but expose
 the new additive fields. Re-execute remains a new Execution and records the
 old Execution as `parent_execution_id`; it does not implicitly reuse its
@@ -231,9 +231,10 @@ Service coverage checks that a coherent historical session may use the
 bounded fallback, an ambiguity marker makes the common helper return `None`,
 historical materialization also fails closed, and `SessionFollowUp`/
 `WorkflowResume` are not enabled for that row. The action resolver accepts only
-Execution ids validated by the common helper. API response projection coverage
-checks that a stale `ResumeSession` annotation hint is removed when authority
-validation fails.
+Execution ids validated by the common helper. REST and MCP response projection
+coverage checks that a stale `ResumeSession` annotation hint is removed when
+authority validation fails; MCP additionally checks that persisted annotation
+history remains unchanged and that coherent legacy continuity remains visible.
 
 Routed-session DB regressions cover no speculative pending record,
 rejecting a result without a persisted winner,
