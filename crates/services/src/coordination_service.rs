@@ -1229,12 +1229,11 @@ async fn action_scope_access(
             let assigned = if !assignments.is_empty() {
                 true
             } else {
-                let has_task_roles: i64 = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM task_role WHERE task_id = ?)",
-                )
-                .bind(scope_id)
-                .fetch_one(db.pool())
-                .await?;
+                let has_task_roles: i64 =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role WHERE task_id = ?)")
+                        .bind(scope_id)
+                        .fetch_one(db.pool())
+                        .await?;
                 has_task_roles == 0
                     && direct_assignee_type.as_deref() == Some("agent")
                     && direct_assignee_id.as_deref() == Some(actor_identity_id)

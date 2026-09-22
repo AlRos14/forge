@@ -307,7 +307,7 @@ async fn assign_default_coder(
             created_at: now.clone(),
             updated_at: now,
         })
-    .await?;
+        .await?;
     Ok(())
 }
 

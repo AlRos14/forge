@@ -7,7 +7,9 @@ pub async fn list_task_role_model(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<TaskRoleResponse>>> {
     require_task_visible(&state, &id, &user).await?;
-    Ok(Json(crate::routes::task_roles_response(&state.db, &id, true).await?))
+    Ok(Json(
+        crate::routes::task_roles_response(&state.db, &id, true).await?,
+    ))
 }
 
 pub async fn create_task_role_model(
@@ -17,7 +19,8 @@ pub async fn create_task_role_model(
     Json(request): Json<CreateTaskRoleRequest>,
 ) -> ApiResult<Json<TaskRoleResponse>> {
     ensure_task_role_access(&state.db, &id, &user.user_id).await?;
-    let policy_json = serde_json::to_string(&request.policy.unwrap_or_else(|| serde_json::json!({})))?;
+    let policy_json =
+        serde_json::to_string(&request.policy.unwrap_or_else(|| serde_json::json!({})))?;
     let mode = to_db_coordination_mode(request.coordination_mode);
     state
         .task_service
@@ -46,13 +49,7 @@ pub async fn update_task_role_model(
         .transpose()?;
     state
         .task_service
-        .update_task_role(
-            &id,
-            &role,
-            request.expected_version,
-            mode,
-            policy_json,
-        )
+        .update_task_role(&id, &role, request.expected_version, mode, policy_json)
         .await
         .map_err(ApiError::from)?;
     let canonical = db::canonical_task_role_name(&role).unwrap_or_default();
@@ -239,7 +236,9 @@ async fn validate_actor_request(
                     .await?
                     .is_none()
             {
-                return Err(ApiError::bad_request("human actor must be a project member"));
+                return Err(ApiError::bad_request(
+                    "human actor must be a project member",
+                ));
             }
         }
     }

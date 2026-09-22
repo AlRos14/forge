@@ -1,3 +1,4 @@
+use super::execution::resumable_external_session;
 use super::*;
 
 use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
@@ -213,9 +214,22 @@ impl TaskService {
         let running = executions
             .iter()
             .any(|execution| execution.status == ExecutionStatus::Running);
-        let resumable = executions.iter().any(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
-        });
+        let mut resumable = false;
+        for execution in &executions {
+            if execution.status != ExecutionStatus::Running
+                && resumable_external_session(
+                    &self.db,
+                    execution,
+                    execution.agent_id.as_deref(),
+                    execution.workspace_id.as_deref(),
+                )
+                .await?
+                .is_some()
+            {
+                resumable = true;
+                break;
+            }
+        }
         let has_previous_execution = executions.iter().any(|execution| {
             execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
         });
@@ -330,9 +344,23 @@ impl TaskService {
         }
 
         let executions = self.task_executions(&task.id).await?;
-        if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
-        }) {
+        let mut resumable_execution = None;
+        for execution in &executions {
+            if execution.status != ExecutionStatus::Running
+                && resumable_external_session(
+                    &self.db,
+                    execution,
+                    execution.agent_id.as_deref(),
+                    execution.workspace_id.as_deref(),
+                )
+                .await?
+                .is_some()
+            {
+                resumable_execution = Some(execution);
+                break;
+            }
+        }
+        if let Some(execution) = resumable_execution {
             let launched = self
                 .follow_up_execution(
                     execution.id.clone(),
@@ -369,6 +397,10 @@ impl TaskService {
                 &task.id,
                 &agent_id,
                 role,
+                crate::task_service::execution::execution_purpose_for_task_type(
+                    &task.task_type,
+                    role,
+                ),
                 context.unwrap_or_else(|| "Resume task work.".to_owned()),
             )
             .await?;
@@ -391,9 +423,7 @@ impl TaskService {
             .and_then(crate::workflow::effective_role)
         {
             match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                role,
+                &self.db, &task.id, role,
             )
             .await?
             {
@@ -441,9 +471,7 @@ impl TaskService {
             .next();
         if let Some(role) = first_work_role {
             match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                role,
+                &self.db, &task.id, role,
             )
             .await?
             {

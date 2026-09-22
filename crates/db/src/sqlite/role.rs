@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    ActorKind, CoordinationMode, CreateRoleMembership, CreateTaskRole, DbError,
-    RoleMembership, RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo,
-    UpdateRoleMembership, UpdateTaskRole,
+    ActorKind, CoordinationMode, CreateRoleMembership, CreateTaskRole, DbError, RoleMembership,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership,
+    UpdateTaskRole,
 };
 use sqlx::{sqlite::SqliteRow, Row};
 use std::str::FromStr;
@@ -158,8 +158,8 @@ impl TaskRoleRepo for SqliteDb {
 #[async_trait]
 impl RoleMembershipRepo for SqliteDb {
     async fn add(&self, input: CreateRoleMembership) -> crate::Result<RoleMembership> {
-        let ended_at = (input.status == RoleMembershipStatus::Ended)
-            .then(|| input.updated_at.clone());
+        let ended_at =
+            (input.status == RoleMembershipStatus::Ended).then(|| input.updated_at.clone());
         sqlx::query(
             "INSERT INTO role_membership
                 (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
@@ -282,11 +282,12 @@ impl RoleMembershipRepo for SqliteDb {
         .await
         .map_err(map_role_sqlx_error)?;
         if result.rows_affected() == 0 {
-            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM role_membership WHERE id = ?")
-                .bind(&input.id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(map_role_sqlx_error)?;
+            let exists: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM role_membership WHERE id = ?")
+                    .bind(&input.id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(map_role_sqlx_error)?;
             return Err(if exists == 0 {
                 DbError::NotFound
             } else {

@@ -5,8 +5,8 @@ use db::{
     CreateAgentIdentity, CreateAgentProfile, CreateProject, ProjectAgentBindingRepo,
     ProjectMemberRepo, ProjectRepo, SqliteDb,
 };
-use services::embedded_agent_service::RequestedCanonicalScope;
 use events::EventBus;
+use services::embedded_agent_service::RequestedCanonicalScope;
 use services::{
     AgentChatService, EmbeddedAgentService, SetMainAgentBindingInput, SetProjectAgentBindingInput,
 };

@@ -17,6 +17,210 @@ pub(in crate::task_service) mod subtasks;
 
 pub(super) use cascade::should_block_task_for_failed_execution;
 
+/// Runtime writers choose purpose from the semantic operation. This helper is
+/// intentionally only a small compatibility mapping for existing role-driven
+/// dispatch paths; callers with a stronger semantic signal pass the purpose
+/// directly.
+pub(crate) fn execution_purpose_for_role(role: &str) -> ExecutionPurpose {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "planner" => ExecutionPurpose::Plan,
+        "reviewer" | "auditor" => ExecutionPurpose::Review,
+        "coder" | "worker" | "implementer" | "executor" | "merge_fixer" => {
+            ExecutionPurpose::Implement
+        }
+        "orchestrator" => ExecutionPurpose::Orchestrate,
+        "interactive" | "system" => ExecutionPurpose::General,
+        _ => ExecutionPurpose::General,
+    }
+}
+
+/// Resolve the purpose at a semantic task-dispatch boundary. Role remains the
+/// fallback for the legacy role-driven implementation path, but task types
+/// with a stronger domain meaning win so validation is not recorded as
+/// implementation merely because its workflow role is `worker`.
+pub(crate) fn execution_purpose_for_task_type(
+    task_type: &str,
+    role: &str,
+) -> ExecutionPurpose {
+    match task_type.trim().to_ascii_lowercase().as_str() {
+        "planning" => ExecutionPurpose::Plan,
+        "review" => ExecutionPurpose::Review,
+        "validation" => ExecutionPurpose::Validate,
+        "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
+        _ => execution_purpose_for_role(role),
+    }
+}
+
+/// Resolve explicit generic continuity. A referenced HarnessSession is the
+/// authority for new rows; the legacy execution.agent_session_id fallback is
+/// only available to historical rows that have not yet been materialized.
+pub(crate) async fn resumable_external_session(
+    db: &SqliteDb,
+    execution: &Execution,
+    expected_agent_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(harness_session_id) = execution.harness_session_id.as_deref() {
+        let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
+            return Ok(None);
+        };
+        if !matches!(&session.status, HarnessSessionStatus::Active)
+            || session.external_session_id.is_none()
+            || !matches!(
+                execution.actor_ref(),
+                Some(db::ActorRef::Agent(ref agent_id)) if agent_id == &session.agent_id
+            )
+            || expected_agent_id.is_some_and(|agent_id| session.agent_id != agent_id)
+            || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
+            || execution
+                .agent_session_id
+                .as_deref()
+                .is_some_and(|legacy_id| Some(legacy_id) != session.external_session_id.as_deref())
+        {
+            return Ok(None);
+        }
+        return Ok(session.external_session_id);
+    }
+
+    // Bounded PR13 cleanup fallback: old rows have no generic reference, so
+    // their legacy external identity is usable only when the persisted Agent
+    // still matches the caller. Never use this path when a generic reference
+    // exists, even if the compatibility projection is populated.
+    let historical_agent_ref = match execution.actor_ref() {
+        None => true,
+        Some(db::ActorRef::Agent(actor_id)) => {
+            execution.agent_id.as_deref() == Some(actor_id.as_str())
+        }
+        Some(db::ActorRef::Human(_)) => false,
+    };
+    if historical_agent_ref
+        && execution.agent_id.is_some()
+        && execution.agent_session_id.is_some()
+        && expected_agent_id.is_none_or(|agent_id| execution.agent_id.as_deref() == Some(agent_id))
+    {
+        return Ok(execution.agent_session_id.clone());
+    }
+    Ok(None)
+}
+
+/// Validate a parent-provided HarnessSession for child attachment. Actor
+/// selection happens before this function; role/task/model similarity is not a
+/// continuity condition.
+pub(crate) async fn reusable_harness_session_for_agent(
+    db: &SqliteDb,
+    execution: &Execution,
+    agent_id: &str,
+    workspace_id: Option<&str>,
+) -> Result<Option<HarnessSession>> {
+    let Some(harness_session_id) = execution.harness_session_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
+        return Ok(None);
+    };
+    if session.agent_id != agent_id
+        || !matches!(
+            execution.actor_ref(),
+            Some(db::ActorRef::Agent(ref actor_agent_id)) if actor_agent_id == agent_id
+        )
+        || !matches!(
+            &session.status,
+            HarnessSessionStatus::Pending | HarnessSessionStatus::Active
+        )
+        || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
+        || execution
+            .agent_session_id
+            .as_deref()
+            .is_some_and(|legacy_id| {
+                session.external_session_id.as_deref() != Some(legacy_id)
+            })
+    {
+        return Ok(None);
+    }
+    Ok(Some(session))
+}
+
+/// Reconcile a pre-PR2 Execution's exact legacy external identity into the
+/// generic authority before a new resume child is created. This is only for
+/// historical rows that were backfilled to an Agent ActorRef; an unresolved
+/// agentless row must fail closed instead of minting continuity.
+pub(crate) async fn materialize_historical_harness_session(
+    db: &SqliteDb,
+    execution: &Execution,
+    external_session_id: &str,
+) -> Result<Option<Execution>> {
+    if execution.harness_session_id.is_some() {
+        return Ok(Some(execution.clone()));
+    }
+    let Some(db::ActorRef::Agent(actor_id)) = execution.actor_ref() else {
+        return Ok(None);
+    };
+    if execution.agent_id.as_deref() != Some(actor_id.as_str()) {
+        return Ok(None);
+    }
+    let reconciled = ExecutionRepo::record_harness_session_result(
+        db,
+        &execution.id,
+        external_session_id,
+        &db::now_rfc3339(),
+    )
+    .await?;
+    if reconciled.harness_session_id.is_some() {
+        Ok(Some(reconciled))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::*;
+
+    #[test]
+    fn role_mapping_is_only_a_compatibility_default() {
+        assert_eq!(
+            execution_purpose_for_role("planner"),
+            ExecutionPurpose::Plan
+        );
+        assert_eq!(
+            execution_purpose_for_role("reviewer"),
+            ExecutionPurpose::Review
+        );
+        assert_eq!(
+            execution_purpose_for_role("implementer"),
+            ExecutionPurpose::Implement
+        );
+        assert_eq!(
+            execution_purpose_for_role("orchestrator"),
+            ExecutionPurpose::Orchestrate
+        );
+        assert_eq!(
+            execution_purpose_for_role("custom"),
+            ExecutionPurpose::General
+        );
+        assert_eq!(
+            execution_purpose_for_role("interactive"),
+            ExecutionPurpose::General
+        );
+    }
+
+    #[test]
+    fn task_dispatch_mapping_keeps_domain_purpose_independent_from_role() {
+        assert_eq!(
+            execution_purpose_for_task_type("validation", "worker"),
+            ExecutionPurpose::Validate
+        );
+        assert_eq!(
+            execution_purpose_for_task_type("investigation", "implementer"),
+            ExecutionPurpose::Investigate
+        );
+        assert_eq!(
+            execution_purpose_for_task_type("implementation", "implementer"),
+            ExecutionPurpose::Implement
+        );
+    }
+}
+
 pub(super) fn publish_terminal_execution_event(service: &TaskService, execution: &Execution) {
     match execution.status {
         ExecutionStatus::Completed => service.publish(ForgeEvent {

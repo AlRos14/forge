@@ -99,6 +99,7 @@ pub async fn answer_task_decision(
         execution_id,
         format!("The authorized user answered the pending questions:\n{}\n\nRevise the plan and emit a new FORGE_RESULT.", request.answers),
         "decision_answered",
+        db::ExecutionPurpose::Plan,
     ).await?;
     let updated = sqlx::query(
         "SELECT id, task_id, execution_id, role, authority_scope, questions_json,

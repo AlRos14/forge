@@ -1425,6 +1425,9 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -1465,7 +1468,7 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
                 role: "worker".to_owned(),
                 capabilities_json: r#"["repository_write"]"#.to_owned(),
                 assigned_principal_type: "agent".to_owned(),
-                assigned_principal_id: agent_id,
+                assigned_principal_id: agent_id.clone(),
                 capability_profile_revision: "forge.capability-profile/v1".to_owned(),
                 capability_profile_digest:
                     "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8"
@@ -1514,13 +1517,12 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     .expect("harmless Task edit does not invalidate the lease");
     assert_eq!(renewed_after_task_edit.len(), 1);
 
-    let task_role_id: String = sqlx::query_scalar(
-        "SELECT id FROM task_role WHERE task_id = ? AND role = 'implementer'",
-    )
-    .bind(&renewed[0].task_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("replacement TaskRole exists");
+    let task_role_id: String =
+        sqlx::query_scalar("SELECT id FROM task_role WHERE task_id = ? AND role = 'implementer'")
+            .bind(&renewed[0].task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("replacement TaskRole exists");
     let ended_at = now.to_rfc3339();
     sqlx::query(
         "UPDATE role_membership
@@ -1684,6 +1686,9 @@ async fn prebaseline_discovery_task_is_admitted_to_running_execution() {
             id: new_uuid_v4(),
             task_id,
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -2612,6 +2617,9 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -2845,6 +2853,9 @@ async fn sqlite_execution_role_auditor_round_trips() {
             id: execution_id.clone(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "auditor".to_string(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -3557,6 +3568,9 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             id: execution_id.clone(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_string(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -4155,6 +4169,9 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
                 id: new_uuid_v4(),
                 task_id: task_id.clone(),
                 agent_id: Some(agent_id.clone()),
+                actor_ref: None,
+                purpose: None,
+                harness_session_id: None,
                 role: "executor".to_string(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -4285,6 +4302,9 @@ async fn agent_task_list_uses_execution_history() {
             id: new_uuid_v4(),
             task_id: executed_task_id.clone(),
             agent_id: Some(agent_id.clone()),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -4392,6 +4412,9 @@ async fn task_claim_rejects_active_entry_barrier() {
                 id: new_uuid_v4(),
                 task_id,
                 agent_id: Some(agent_id),
+                actor_ref: None,
+                purpose: None,
+                harness_session_id: None,
                 role: "executor".to_string(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -4556,6 +4579,9 @@ async fn test_dependency_gate_blocks_non_context_holder() {
             id: new_uuid_v4(),
             task_id: dependency_id.clone(),
             agent_id: Some(context_agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_string(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
@@ -4603,6 +4629,9 @@ async fn test_dependency_gate_blocks_non_context_holder() {
                 id: new_uuid_v4(),
                 task_id,
                 agent_id: Some(other_agent_id),
+                actor_ref: None,
+                purpose: None,
+                harness_session_id: None,
                 role: "executor".to_string(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -5716,6 +5745,9 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
                 id: new_uuid_v4(),
                 task_id: task_id.clone(),
                 agent_id: Some(agent_id.clone()),
+                actor_ref: None,
+                purpose: None,
+                harness_session_id: None,
                 role: "executor".to_owned(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -5760,6 +5792,9 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
             id: new_uuid_v4(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,

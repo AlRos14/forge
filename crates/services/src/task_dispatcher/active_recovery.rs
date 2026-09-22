@@ -112,9 +112,7 @@ impl TaskDispatcher {
         };
         if state.kind == StateKind::Gate && helpers::auto_cascades_on_unassigned_role(state) {
             let role_unassigned = match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                role_name,
+                &self.db, &task.id, role_name,
             )
             .await?
             {
@@ -122,9 +120,10 @@ impl TaskDispatcher {
                     .iter()
                     .any(|membership| membership.status == db::RoleMembershipStatus::Active),
                 None => {
-                    let assignment =
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                            .await?;
+                    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
+                        &*self.db, &task.id, role_name,
+                    )
+                    .await?;
                     helpers::role_assignment_unassigned(assignment.as_ref())
                 }
             };
@@ -140,9 +139,7 @@ impl TaskDispatcher {
             return Ok(false);
         }
         let agent_id = match crate::task_service::current_role_memberships_authoritative(
-            &self.db,
-            &task.id,
-            role_name,
+            &self.db, &task.id, role_name,
         )
         .await?
         {
@@ -230,6 +227,10 @@ impl TaskDispatcher {
                 &task.id,
                 &agent.id,
                 role_name,
+                crate::task_service::execution::execution_purpose_for_task_type(
+                    &task.task_type,
+                    role_name,
+                ),
                 prompt.user,
                 Some(dispatch_metadata),
             )

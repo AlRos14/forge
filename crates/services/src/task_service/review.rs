@@ -1,3 +1,4 @@
+use super::execution::resumable_external_session;
 use super::*;
 use api_types::{Actor, UserActionSource};
 
@@ -291,6 +292,13 @@ impl TaskService {
         let executor_execution_id = Uuid::parse_str(&execution.id).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
         })?;
+        let executor_thread_id = resumable_external_session(
+            &self.db,
+            &execution,
+            execution.agent_id.as_deref(),
+            execution.workspace_id.as_deref(),
+        )
+        .await?;
         let (review, outcome) = review_runner
             .run(ReviewRequest {
                 task_id,
@@ -300,7 +308,7 @@ impl TaskService {
                 logs_path,
                 auditor_agent_id: reviewer_agent_id,
                 review_prompt: review_config.review_prompt,
-                executor_thread_id: execution.agent_session_id,
+                executor_thread_id,
             })
             .await?;
         Ok(Some((review, outcome)))

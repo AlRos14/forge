@@ -1,6 +1,6 @@
 use super::super::*;
-use api_types::ActorRef;
 use crate::{AgentChatService, ProjectMemberService, SetProjectAgentBindingInput};
+use api_types::ActorRef;
 use db::{CoordinationMode, RoleMembershipRepo, TaskRoleRepo};
 
 #[tokio::test]
@@ -64,6 +64,9 @@ async fn reassign_role_cancels_running_active_executor() {
             id: execution_id.clone(),
             task_id: task.id.clone(),
             agent_id: Some(agent_a),
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -242,6 +245,9 @@ async fn run_execution_rechecks_cancelled_status_before_adapter_launch() {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(agent_id),
+                    actor_ref: None,
+                    purpose: None,
+                    harness_session_id: None,
                     role: "executor".to_owned(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
@@ -374,7 +380,11 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
     let memberships = RoleMembershipRepo::list_by_role(&*db, &role.id, true)
         .await
         .expect("membership history loads");
-    assert_eq!(memberships.len(), 1, "same assignment must not create history");
+    assert_eq!(
+        memberships.len(),
+        1,
+        "same assignment must not create history"
+    );
     assert_eq!(memberships[0].status, db::RoleMembershipStatus::Active);
 
     assert!(rx.try_recv().is_err());
@@ -503,9 +513,10 @@ async fn membership_lifecycle_ends_one_member_without_removing_another() {
         )
         .await
         .expect("membership suspends");
-    let current_memberships = RoleMembershipRepo::list_by_role(&*db, &membership_b.task_role_id, false)
-        .await
-        .expect("current memberships load");
+    let current_memberships =
+        RoleMembershipRepo::list_by_role(&*db, &membership_b.task_role_id, false)
+            .await
+            .expect("current memberships load");
     let selected = crate::task_service::select_usable_agent_id(&db, &current_memberships)
         .await
         .expect("usable member selection succeeds");
@@ -532,7 +543,8 @@ async fn membership_lifecycle_ends_one_member_without_removing_another() {
     assert_eq!(history.len(), 2);
     assert!(history
         .iter()
-        .any(|member| member.id == membership_a.id && member.status == db::RoleMembershipStatus::Ended));
+        .any(|member| member.id == membership_a.id
+            && member.status == db::RoleMembershipStatus::Ended));
 }
 
 #[tokio::test]
@@ -598,14 +610,11 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
         .await
         .expect("first Agent pauses");
 
-    let memberships = crate::task_service::current_role_memberships_authoritative(
-        &db,
-        &task.id,
-        "coder",
-    )
-    .await
-    .expect("authoritative memberships load")
-    .expect("TaskRole exists");
+    let memberships =
+        crate::task_service::current_role_memberships_authoritative(&db, &task.id, "coder")
+            .await
+            .expect("authoritative memberships load")
+            .expect("TaskRole exists");
     let selected = crate::task_service::select_usable_agent_id(&db, &memberships)
         .await
         .expect("usable Agent selection succeeds");
@@ -619,13 +628,10 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
         .await
         .expect("generic Agent selection succeeds");
     assert_eq!(generic_selected.as_deref(), Some(agent_a.as_str()));
-    let repository_selected = crate::task_service::select_usable_repository_agent_id(
-        &db,
-        &project_id,
-        &memberships,
-    )
-    .await
-    .expect("repository Agent selection succeeds");
+    let repository_selected =
+        crate::task_service::select_usable_repository_agent_id(&db, &project_id, &memberships)
+            .await
+            .expect("repository Agent selection succeeds");
     assert_eq!(repository_selected.as_deref(), Some(agent_b.as_str()));
 }
 
@@ -674,6 +680,9 @@ async fn membership_does_not_transfer_workspace_lease_authority() {
                 id: new_uuid_v4(),
                 task_id: task.id.clone(),
                 agent_id: Some(agent_a.clone()),
+                actor_ref: None,
+                purpose: None,
+                harness_session_id: None,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -706,15 +715,12 @@ async fn membership_does_not_transfer_workspace_lease_authority() {
         .expect("workspace exists");
 
     let result = service
-        .verify_active_workspace_lease(
-            &task,
-            &workspace,
-            "coder",
-            Some(&agent_b),
-            &execution.id,
-        )
+        .verify_active_workspace_lease(&task, &workspace, "coder", Some(&agent_b), &execution.id)
         .await;
-    assert!(result.is_err(), "membership alone must not transfer A's lease to B");
+    assert!(
+        result.is_err(),
+        "membership alone must not transfer A's lease to B"
+    );
 }
 
 #[tokio::test]
@@ -874,43 +880,23 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     }
 
     assert!(service
-        .add_task_role_member(
-            &task.id,
-            "planner",
-            ActorRef::Agent(outside_agent),
-        )
+        .add_task_role_member(&task.id, "planner", ActorRef::Agent(outside_agent),)
         .await
         .is_err());
     service
-        .add_task_role_member(
-            &task.id,
-            "planner",
-            ActorRef::Agent(member_agent),
-        )
+        .add_task_role_member(&task.id, "planner", ActorRef::Agent(member_agent))
         .await
         .expect("Project member account Agent membership succeeds");
     service
-        .add_task_role_member(
-            &task.id,
-            "implementer",
-            ActorRef::Agent(global_agent),
-        )
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(global_agent))
         .await
         .expect("global Agent membership succeeds");
     service
-        .add_task_role_member(
-            &task.id,
-            "reviewer",
-            ActorRef::Agent(bound_agent),
-        )
+        .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(bound_agent))
         .await
         .expect("project-bound Agent membership succeeds");
     service
-        .add_task_role_member(
-            &task.id,
-            "orchestrator",
-            ActorRef::Agent(paused_agent),
-        )
+        .add_task_role_member(&task.id, "orchestrator", ActorRef::Agent(paused_agent))
         .await
         .expect("paused but valid Agent membership succeeds");
 }
@@ -969,7 +955,10 @@ async fn task_creation_rejects_invalid_explicit_actor_before_task_insert() {
         .fetch_one(db.pool())
         .await
         .expect("task count loads");
-    assert_eq!(after, before, "invalid explicit Actor must not persist a Task");
+    assert_eq!(
+        after, before,
+        "invalid explicit Actor must not persist a Task"
+    );
 }
 
 #[tokio::test]
@@ -1036,7 +1025,10 @@ async fn task_creation_rejects_invalid_project_default_before_task_insert() {
         .fetch_one(db.pool())
         .await
         .expect("task count loads");
-    assert_eq!(after, before, "invalid default Actor must not persist a Task");
+    assert_eq!(
+        after, before,
+        "invalid default Actor must not persist a Task"
+    );
 }
 
 #[tokio::test]
@@ -1048,8 +1040,7 @@ async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let agent_c = seed_agent_with_executor_type(&db, "cursor", "{}").await;
-    let task =
-        seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
@@ -1116,8 +1107,7 @@ async fn invalid_legacy_reassignment_preserves_running_execution() {
     .execute(db.pool())
     .await
     .expect("outsider Agent scope updates");
-    let task =
-        seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(valid_agent.clone()), None),
@@ -1489,7 +1479,10 @@ async fn reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo() {
         } => {
             let new_assignment = new_assignment.expect("new assignment exists");
             assert_eq!(new_assignment.assignee_type.as_deref(), Some("user"));
-            assert_eq!(new_assignment.assignee_id.as_deref(), Some(human_id.as_str()));
+            assert_eq!(
+                new_assignment.assignee_id.as_deref(),
+                Some(human_id.as_str())
+            );
             assert!(triggered_cancellation);
             assert!(transitioned_to_todo);
         }
@@ -1894,15 +1887,16 @@ async fn project_member_removal_ends_human_membership_and_preserves_history() {
 
     let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     let role = service
-        .create_task_role(&task.id, "reviewer", CoordinationMode::Collaborative, "{}".to_owned())
+        .create_task_role(
+            &task.id,
+            "reviewer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
         .await
         .expect("reviewer role creates");
     let membership = service
-        .add_task_role_member(
-            &task.id,
-            "reviewer",
-            ActorRef::Human(member_id.clone()),
-        )
+        .add_task_role_member(&task.id, "reviewer", ActorRef::Human(member_id.clone()))
         .await
         .expect("Human membership creates");
     let mut events = event_bus.subscribe();
@@ -1916,7 +1910,9 @@ async fn project_member_removal_ends_human_membership_and_preserves_history() {
     assert_eq!(event.event_type, "task.updated");
     assert_eq!(event.entity_id, task.id);
     match event.context {
-        EventContext::TaskUpdated { project_id: emitted } => assert_eq!(emitted, project_id),
+        EventContext::TaskUpdated {
+            project_id: emitted,
+        } => assert_eq!(emitted, project_id),
         other => panic!("unexpected scope revocation event context: {other:?}"),
     }
     assert!(events.try_recv().is_err());
@@ -2022,7 +2018,10 @@ async fn project_member_removal_rebuilds_projection_from_surviving_member() {
         .await
         .expect("legacy projection loads")
         .expect("legacy projection exists");
-    assert_eq!(projection.assignee_id.as_deref(), Some(removed_agent.as_str()));
+    assert_eq!(
+        projection.assignee_id.as_deref(),
+        Some(removed_agent.as_str())
+    );
 
     ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_id, &owner_id, &member_id)
@@ -2241,7 +2240,11 @@ async fn project_scope_revocation_isolated_to_affected_project() {
         .await
         .expect("Project 1 role creates");
     service
-        .add_task_role_member(&task_one.id, "implementer", ActorRef::Agent(agent_id.clone()))
+        .add_task_role_member(
+            &task_one.id,
+            "implementer",
+            ActorRef::Agent(agent_id.clone()),
+        )
         .await
         .expect("Project 1 membership creates");
 
@@ -2256,7 +2259,11 @@ async fn project_scope_revocation_isolated_to_affected_project() {
         .await
         .expect("Project 2 role creates");
     service
-        .add_task_role_member(&task_two.id, "implementer", ActorRef::Agent(agent_id.clone()))
+        .add_task_role_member(
+            &task_two.id,
+            "implementer",
+            ActorRef::Agent(agent_id.clone()),
+        )
         .await
         .expect("Project 2 membership creates");
 
@@ -2306,19 +2313,18 @@ async fn ended_scope_membership_is_not_selected_for_new_work() {
         .await
         .expect("Project member removal succeeds");
 
-    let memberships = crate::task_service::current_role_memberships_authoritative(
-        &db,
-        &task.id,
-        "implementer",
-    )
-    .await
-    .expect("authoritative memberships load")
-    .expect("TaskRole exists");
+    let memberships =
+        crate::task_service::current_role_memberships_authoritative(&db, &task.id, "implementer")
+            .await
+            .expect("authoritative memberships load")
+            .expect("TaskRole exists");
     assert!(memberships.is_empty());
-    assert!(crate::task_service::select_usable_agent_id(&db, &memberships)
-        .await
-        .expect("selection succeeds")
-        .is_none());
+    assert!(
+        crate::task_service::select_usable_agent_id(&db, &memberships)
+            .await
+            .expect("selection succeeds")
+            .is_none()
+    );
 }
 
 async fn configure_project_scope(

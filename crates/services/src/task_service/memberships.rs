@@ -3,7 +3,7 @@ use api_types::ActorRef;
 use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, AssigneeKind, CoordinationMode,
     CreateTaskRole, CreateTaskRoleAssignment, ProjectRepo, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, TaskRole, TaskRoleRepo, TaskRoleAssignment, UpdateTaskRole, UserRepo,
+    RoleMembershipStatus, TaskRole, TaskRoleAssignment, TaskRoleRepo, UpdateTaskRole, UserRepo,
 };
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -26,8 +26,8 @@ impl TaskService {
         let roles = TaskRoleRepo::list_by_task(&*self.db, &task.id).await?;
         let mut result = Vec::with_capacity(roles.len());
         for role in roles {
-            let members = RoleMembershipRepo::list_by_role(&*self.db, &role.id, include_ended)
-                .await?;
+            let members =
+                RoleMembershipRepo::list_by_role(&*self.db, &role.id, include_ended).await?;
             result.push((role, members));
         }
         Ok(result)
@@ -384,12 +384,11 @@ impl TaskService {
         .await
         .map_err(map_membership_write_error)?;
         if result.rows_affected() == 0 {
-            let exists: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM role_membership WHERE id = ?",
-            )
-            .bind(&membership.id)
-            .fetch_one(&mut *transaction)
-            .await?;
+            let exists: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM role_membership WHERE id = ?")
+                    .bind(&membership.id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
             return Err(if exists == 0 {
                 ServiceError::Db(db::DbError::NotFound)
             } else {
@@ -454,12 +453,8 @@ impl TaskService {
                 let _agent = AgentRepo::get_by_id(&*self.db, agent_id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-                if !project_actor_scope::actor_is_valid_for_project(
-                    &self.db,
-                    project,
-                    actor_ref,
-                )
-                .await?
+                if !project_actor_scope::actor_is_valid_for_project(&self.db, project, actor_ref)
+                    .await?
                 {
                     return Err(ServiceError::invalid_operation(
                         "agent is not valid for the task project",
@@ -475,12 +470,8 @@ impl TaskService {
                 UserRepo::get_user_by_id(&*self.db, user_id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("user", user_id.clone()))?;
-                if !project_actor_scope::actor_is_valid_for_project(
-                    &self.db,
-                    project,
-                    actor_ref,
-                )
-                .await?
+                if !project_actor_scope::actor_is_valid_for_project(&self.db, project, actor_ref)
+                    .await?
                 {
                     return Err(ServiceError::invalid_operation(
                         "human actor must be a project member",
@@ -543,7 +534,8 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(None);
         };
-        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
+        let workflow =
+            crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
         Ok(workflow
             .roles
             .into_iter()
@@ -704,8 +696,9 @@ fn actor_id(actor_ref: &ActorRef) -> &str {
 }
 
 fn validate_policy_json(policy_json: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(policy_json)
-        .map_err(|error| ServiceError::invalid_operation(format!("invalid role policy: {error}")))?;
+    let value: serde_json::Value = serde_json::from_str(policy_json).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid role policy: {error}"))
+    })?;
     if !value.is_object() {
         return Err(ServiceError::invalid_operation(
             "role policy must be a JSON object",

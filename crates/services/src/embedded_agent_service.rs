@@ -13,8 +13,8 @@ use db::{
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
     CredentialHandle, CredentialHandleRepo, ExecutionRepo, ExecutionStatus, PageRequest,
     ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RotateAgentSession,
-    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo,
-    UpdateAgentSession, UpsertAgentConnectionHealth,
+    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo, UpdateAgentSession,
+    UpsertAgentConnectionHealth,
 };
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType,
@@ -1287,7 +1287,11 @@ impl EmbeddedAgentService {
                 // `coder`, while the target TaskRole calls it `implementer`.
                 // Once a TaskRole exists, only current membership admits this
                 // scope; the old row is consulted only for pre-V088 data.
-                let membership_role = if role == "worker" { "implementer" } else { role.as_str() };
+                let membership_role = if role == "worker" {
+                    "implementer"
+                } else {
+                    role.as_str()
+                };
                 match crate::task_service::current_role_memberships_authoritative(
                     &self.db,
                     task_id,

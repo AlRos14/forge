@@ -55,9 +55,31 @@ that context materially changes which native account is used. Changing model,
 reasoning effort, approval policy, sandbox settings, or other non-identity
 harness arguments may create a new profile revision on the same Agent.
 
-The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of representation,
-each Execution snapshots the exact effective profile, credential context, and
-capabilities used; later profile revisions never rewrite historical Executions.
+## HarnessSession (Plan PR2)
+
+PR2 adds a generic `HarnessSession` as the durable continuity record for an
+Agent in one opaque harness kind. It stores the optional external
+harness-native session id, profile and capability snapshots, optional
+workspace scope, predecessor, timestamps, and the minimal `pending`, `active`,
+`ended`, and `failed` lifecycle. Agent and harness identity are immutable;
+profile/capability snapshots are historical and are not rewritten when the
+Agent's current profile changes.
+
+Execution resume uses the explicit `Execution.harness_session_id` reference,
+then the session's `external_session_id`. A session is not inferred from a
+Role, Task, model, or latest Execution, and a session scoped to one workspace
+is not silently reused in another. Human Executions have no HarnessSession.
+
+The existing `agent_session` table and `AgentSession` model are deliberately
+different. They belong to the embedded Agent Runtime/Agent Host, together
+with `agent_context_scope`, protected runtime state, and context manifests.
+They remain legacy embedded-runtime infrastructure until the named later
+cleanup; they are not the generic Execution continuity authority.
+
+The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of
+representation, each Execution snapshots the exact effective profile,
+credential context, and capabilities used; later profile revisions never
+rewrite historical Executions.
 
 ## HarnessAdapter
 

@@ -138,6 +138,14 @@ impl TaskService {
             None => None,
         };
         let agent_id = agent.as_ref().map(|agent| agent.id.clone());
+        let actor_ref = match agent_id.as_deref() {
+            Some(agent_id) => db::ActorRef::Agent(agent_id.to_owned()),
+            None => db::ActorRef::Human(assignee_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation("human claim is missing its user handle")
+            })?),
+        };
+        let role = target_role.clone().unwrap_or_else(|| "executor".to_owned());
+        let purpose = super::execution::execution_purpose_for_task_type(&task.task_type, &role);
         let mut transaction = self.db.pool().begin().await.map_err(DbError::from)?;
         let claimed = TaskRepo::claim(
             &*self.db,
@@ -154,7 +162,10 @@ impl TaskService {
                     id: execution_id.clone(),
                     task_id: task_id.clone(),
                     agent_id: agent_id.clone(),
-                    role: target_role.clone().unwrap_or_else(|| "executor".to_owned()),
+                    actor_ref: Some(actor_ref),
+                    purpose: Some(purpose),
+                    harness_session_id: None,
+                    role,
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
@@ -708,9 +719,7 @@ impl TaskService {
         actor_id: &str,
     ) -> Result<()> {
         match crate::task_service::current_role_memberships_authoritative(
-            &self.db,
-            task_id,
-            role_name,
+            &self.db, task_id, role_name,
         )
         .await?
         {
@@ -743,12 +752,9 @@ impl TaskService {
                 if actor_kind != db::ActorKind::Agent {
                     return Ok(());
                 }
-                let existing = TaskRoleAssignmentRepo::get_by_task_and_role(
-                    &*self.db,
-                    task_id,
-                    role_name,
-                )
-                .await?;
+                let existing =
+                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name)
+                        .await?;
                 if existing.as_ref().is_some_and(|assignment| {
                     assignment.assignee_type != Some(AssigneeKind::Agent)
                         || assignment.assignee_id.as_deref() != Some(actor_id)

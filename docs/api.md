@@ -1702,12 +1702,26 @@ execution appear inactive.
 ### Manual continuation and re-execution
 
 `POST /api/v1/executions/{id}/follow-up` is the manual continuation path. It
-preserves the parent session when supported, uses the interactive role, and
-does not advance the task workflow when it completes.
+creates a new Execution with the interactive role and preserves the parent's
+HarnessSession only when the selected Agent, explicit session, and workspace
+constraints all match. It never infers continuity from a role or latest
+execution, and it does not advance the task workflow when it completes.
 
 `POST /api/v1/executions/{id}/re-execute` starts a new execution for the
 current legacy workflow role and role assignment without session continuity;
 completion may participate in the existing workflow cascade. These endpoints
-describe the transitional execution surface that remains until the explicit
-HarnessSession, Actor, and lifecycle migrations. They are not the target
-identity mechanism.
+retain the legacy `agent_id` and `agent_session_id` response fields while the
+additive PR2 fields are authoritative:
+
+~~~json
+{
+  "actor_ref": {"kind": "agent", "id": "..."},
+  "purpose": "implement",
+  "harness_session_id": "forge-session-id"
+}
+~~~
+
+`harness_session_id` is Forge's durable record id. The legacy
+`agent_session_id`, when present, is the one-way projection of the external
+harness-native session id stored by that record. A Human Execution returns a
+real human `actor_ref`, `agent_id: null`, and `harness_session_id: null`.

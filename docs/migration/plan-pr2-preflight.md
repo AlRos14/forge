@@ -1,0 +1,137 @@
+# Plan PR2 — HEAD-era execution/session preflight
+
+## Baseline
+
+This audit was performed on the merged Plan PR1 baseline:
+
+| Item | Value |
+| --- | --- |
+| Branch | `feat/plan-pr2-execution-session` |
+| HEAD | `87795825b3cdb93098502d35fd9291a519c61b9b` |
+| Parent | Merge of Plan PR1, `f47667d691e58270dcda893cff09c7a7f8a32790` |
+| Migration head | `V088__task_roles_and_memberships.sql` |
+| Existing untracked state | `.recovery-pr0a/` preserved and not inspected as product source |
+
+The audit is deliberately limited to Plan PR2. It does not redesign the
+executor facade, workflow cognition, review runtime, WorkUnit model, or the
+embedded Agent Runtime.
+
+## Current Execution persistence
+
+`execution` currently persists `agent_id`, `role`, `parent_execution_id`, and
+`agent_session_id`. `CreateExecution` and `UpdateExecution` expose those legacy
+fields. `ExecutionRepo::create` inserts through the transaction-aware
+`create_execution_in_tx`; `ExecutionRepo::update` writes mutable terminal and
+telemetry fields. `executor_config_snapshot_json` is already historical data
+and remains independent of the new HarnessSession snapshot.
+
+## Production writer inventory
+
+Every production `CreateExecution` path was classified before implementation:
+
+| Path | Classification | PR2 treatment |
+| --- | --- | --- |
+| `task_service/claim.rs` | A: claim creates the initial execution | Explicit ActorRef and Purpose; pending HarnessSession for Agent work where materialized |
+| `task_service/execution/launch.rs` | A: manual, workflow, interactive, and resume launches | Explicit semantic purpose; explicit session continuity only |
+| `task_service/execution/follow_up.rs` | A: review/rework follow-up | Select Actor first; reuse only an explicit compatible session |
+| `task_service/execution/recovery.rs` | A/C: blocked recovery and re-execution | Use the referenced blocked/parent execution, not latest role data |
+| `task_service/execution/cascade.rs` | A: cascade/subtask propagation | Default new/no session unless continuation is explicit |
+| `task_service/config.rs` | A: failed execution records | Explicit principal/purpose for the failed historical record |
+| `review/src/runner.rs` | A: reviewer/auditor execution records | Review purpose; no role-derived global purpose |
+| `merge_service.rs`, `agent_service.rs`, `memory.rs`, `shutdown.rs`, `db/sqlite/analytics.rs` | F: test-only execution fixtures | Updated struct shape; not production creation authority |
+
+The shared DB input is extended so production writers cannot omit the target
+principal or purpose without an explicit compatibility helper. Test fixtures
+are not treated as production authority.
+
+## Session reader/writer inventory
+
+### A — creates a new Execution
+
+The service launch, claim, follow-up, recovery, cascade, failed-record, and
+review paths listed above create Executions. These are all required to supply
+ActorRef and Purpose. Session creation is centralized in the TaskService
+execution-start path so retrying an Execution with an existing reference does
+not create another generic session. The embedded/operational paths in the
+table are test fixtures, not production creation authority.
+
+### B — writes external harness session identity
+
+The task execution runner (`task_service/execution/runner.rs`), review/auditor
+runner (`review/src/runner.rs`), and remote daemon terminal notification path
+(`task_service.rs`) consume `ExecutionResult.agent_session_id` or terminal
+notification session data. The value is an external harness-native
+identifier. PR2 writes it first to `harness_session.external_session_id` and
+then projects it to the legacy `execution.agent_session_id` field in the same
+transaction where practical.
+
+CLI adapters continue to emit the external value. They do not know the generic
+HarnessSession primary key.
+
+### C — selects a previous session for resume
+
+The current selectors are in:
+
+- `task_service/action_resolver.rs` and `actions.rs` resumability checks;
+- `task_service/execution/follow_up.rs`;
+- `task_service/execution/launch.rs`;
+- `task_service/execution/cascade.rs`;
+- `task_service/execution/recovery.rs`;
+- review configuration/dispatch paths that pass the executor thread ID.
+
+The workflow dispatch loader still selects a latest terminal execution for
+causal prompt context when a legacy workflow policy requests it. That result
+is lineage/context only; follow-up creation performs the Actor-first,
+explicit-HarnessSession check and the loader never selects a session.
+
+PR2 changes new-session selection to use `Execution.harness_session_id` and
+the resolved HarnessSession. A legacy `execution.agent_session_id` fallback is
+retained only for pre-authority historical Agent rows with an exact legacy
+Agent id and no generic reference; agentless or ambiguous history fails closed.
+The fallback is marked for PR13 removal. Role/latest-execution lookup is not a
+new authority.
+
+### D — merely displays session data
+
+Execution API responses, daemon terminal notifications, operator status,
+execution logs, MCP projections, and web-generated bindings expose or carry
+legacy session data. PR2 adds the new additive fields where execution details
+are already exposed and retains the old fields for compatibility.
+
+### E — embedded Agent Runtime / Agent Host
+
+`AgentSessionRepo`, `agent_session`, `agent_context_scope`,
+`protected_agent_session_state`, `protected_interaction`, context manifests,
+`embedded_agent_service`, `embedded_task_executor`, `agent_chat_turn_worker`,
+and `agent-host` remain a separate legacy runtime vertical. Their session is
+not the generic HarnessSession authority. PR10 owns behavioral
+removal/extraction; PR13 owns remaining schema cleanup.
+
+### F — historical compatibility
+
+Existing `agent_id`, `agent_session_id`, executor snapshot, workflow-role,
+review, and task-assignment readers remain only where needed to preserve old
+rows or public shapes. New code documents the direction of every projection;
+it does not make legacy fields bidirectional authority.
+
+## Required PR2 invariants
+
+1. New Executions persist a real `ActorRef` and an explicit `ExecutionPurpose`.
+2. Human Executions persist a real user ID, no Agent, and no HarnessSession.
+3. Agent continuity uses `Execution.harness_session_id` → HarnessSession →
+   external session ID.
+4. Same role, Task, model, or latest Execution never independently selects a
+   session.
+5. Agent, harness identity, profile snapshot, and capability snapshot remain
+   historical and immutable at the HarnessSession boundary.
+6. V062 `agent_session` remains embedded-runtime-only compatibility.
+
+## Preflight validation observation
+
+The merged PR1 migration chain is not executable on a fresh SQLite database at
+this HEAD. V088 fails while creating its delete-projection triggers because
+SQLite rejects trigger-body `UPDATE task_role_assignment AS ...` and
+`UPDATE task AS ...` aliases with `near "AS": syntax error`. PR2 does not edit
+V088 or absorb PR1 cleanup; this is a pre-existing migration-chain blocker for
+runtime migration tests and must be repaired under the PR1 migration ownership
+before a final PR2 readiness verdict.

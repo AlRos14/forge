@@ -6,8 +6,8 @@ use db::{
     CreateProjectMember, CreateTask, MemoryItem, MemoryRepository, ProjectAgentBindingRepo,
     ProjectMemberRepo, ProjectRepo, SqliteDb, TaskRepo,
 };
-use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
 use events::EventBus;
+use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
 use serde_json::json;
 use services::{
     AgentChatService, CoordinationToolProvider, SendAgentChatMessageInput, SetMainAgentBindingInput,

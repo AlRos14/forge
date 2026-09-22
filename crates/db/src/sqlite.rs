@@ -1,8 +1,8 @@
 use crate::{
-    new_uuid_v4, AccountMainAgentBinding, AccountMainAgentBindingRepo, AdmitAgentChatTurn,
-    AdmitAgentHandoff, AdmittedAgentChatTurn, AdmittedAgentHandoff, Agent, AgentAction,
-    AgentActionApproval, AgentActionExecution, AgentActionListQuery, AgentActionRepo, AgentChat,
-    AgentChatInstructionRevision, AgentChatMessage, AgentChatMessageListQuery,
+    new_uuid_v4, AccountMainAgentBinding, AccountMainAgentBindingRepo, ActorKind, ActorRef,
+    AdmitAgentChatTurn, AdmitAgentHandoff, AdmittedAgentChatTurn, AdmittedAgentHandoff, Agent,
+    AgentAction, AgentActionApproval, AgentActionExecution, AgentActionListQuery, AgentActionRepo,
+    AgentChat, AgentChatInstructionRevision, AgentChatMessage, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatRepo, AgentChatSourceRef, AgentChatTransactionRepo,
     AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentCommitment,
     AgentCommitmentEvidence, AgentCommitmentLifecycle, AgentCommitmentListQuery,
@@ -17,34 +17,32 @@ use crate::{
     CreateAgentChatTurnJob, CreateAgentCommitment, CreateAgentCommitmentEvidence,
     CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem, CreateAgentProfile,
     CreateAgentQuestion, CreateAttentionProjection, CreateDomainEvent, CreateExecution,
-    CreateNotification, CreatePrMetadata, CreatePrProviderConfig, CreateProject,
-    CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
+    CreateHarnessSession, CreateNotification, CreatePrMetadata, CreatePrProviderConfig,
+    CreateProject, CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
     CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
     CreateProjectReleaseMediaPin, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
     CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession,
     CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent,
     DomainEventRepo, EventConsumerCursor, Execution, ExecutionRepo, ExecutionStatus,
-    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, FailAgentChatTurn, IntegrationRepo,
-    MediaAsset, ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page,
-    PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project,
-    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectHookRun,
-    ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment,
-    ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary,
-    ProjectTokenStats, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo,
-    Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo,
-    SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo,
-    SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task, TaskComment,
-    TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo,
-    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
-    TerminalSessionStatus,
-    TransferAgentCommitment, UpdateAgent, UpdateAgentAction, UpdateAgentChat,
-    UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
-    UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
-    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo,
-    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
-    UpsertAttentionConsumerHealth, UpsertDaemon,
-    UpsertExecutionUsage, Workspace, WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, FailAgentChatTurn, HarnessSession,
+    HarnessSessionRepo, HarnessSessionStatus, IntegrationRepo, MediaAsset, ModelTokenBreakdown,
+    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, PrMetadata,
+    PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentBinding,
+    ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
+    ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment, ProjectMediaTombstone,
+    ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
+    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo, Result, Review,
+    ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, SelectAgentProfile,
+    SharedMediaRepo, Skill, SkillRepo, SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder,
+    Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery,
+    TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
+    TerminalSessionStatus, TransferAgentCommitment, UpdateAgent, UpdateAgentAction,
+    UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem,
+    UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution, UpdateHarnessSession,
+    UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
+    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
+    UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth, UpsertDaemon, UpsertExecutionUsage,
+    Workspace, WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -64,6 +62,7 @@ mod embedded_agent;
 mod execution;
 mod execution_usage;
 mod external_link;
+mod harness_session;
 mod inbox;
 mod integration;
 mod lcm;
@@ -81,8 +80,8 @@ mod project_hook_run;
 mod project_member;
 mod provider_authorization;
 mod repo;
-mod role;
 mod review;
+mod role;
 mod runtime;
 mod shared_media;
 mod skill;
@@ -443,7 +442,16 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
         agent_id: row.try_get("agent_id")?,
+        actor_kind: row
+            .try_get::<Option<String>, _>("actor_kind")?
+            .map(parse_enum)
+            .transpose()?,
+        actor_id: row.try_get("actor_id")?,
         role: row.try_get::<String, _>("role")?,
+        purpose: row
+            .try_get::<Option<String>, _>("purpose")?
+            .map(parse_enum)
+            .transpose()?,
         status: parse_enum(row.try_get::<String, _>("status")?)?,
         stop_reason: row
             .try_get::<Option<String>, _>("stop_reason")?
@@ -457,6 +465,7 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
         stopped_at: row.try_get("stopped_at")?,
         parent_execution_id: row.try_get("parent_execution_id")?,
         agent_session_id: row.try_get("agent_session_id")?,
+        harness_session_id: row.try_get("harness_session_id")?,
         agent_message_id: row.try_get("agent_message_id")?,
         last_activity_at: row.try_get("last_activity_at")?,
         prompt: row.try_get("prompt")?,
@@ -603,16 +612,84 @@ impl SqliteDb {
         if input.status == ExecutionStatus::Running && input.workspace_id.is_some() {
             Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
         }
+        let mut input = input.clone();
+        let actor_kind = input.actor_ref.as_ref().map(ActorRef::kind);
+        let actor_id = input.actor_ref.as_ref().map(|value| value.id().to_owned());
+        if let Some(actor_ref) = input.actor_ref.as_ref() {
+            if matches!(actor_ref, ActorRef::Human(_)) {
+                if input.agent_id.is_some()
+                    || input.agent_session_id.is_some()
+                    || input.harness_session_id.is_some()
+                {
+                    return Err(DbError::Check(
+                        "Human Execution cannot carry Agent/session compatibility fields"
+                            .to_owned(),
+                    ));
+                }
+            } else if input.agent_id.as_deref() != Some(actor_ref.id()) {
+                return Err(DbError::Check(
+                    "Agent Execution ActorRef and agent_id must match".to_owned(),
+                ));
+            }
+        }
+        if input.actor_ref.is_some() && input.purpose.is_none() {
+            return Err(DbError::Check(
+                "new Execution writes require an explicit purpose".to_owned(),
+            ));
+        }
+        if input.actor_ref.is_some() {
+            if let Some(session_id) =
+                harness_session::create_pending_harness_session_in_tx(transaction, &input).await?
+            {
+                input.harness_session_id = Some(session_id);
+            }
+            harness_session::validate_execution_harness_session_in_tx(transaction, &input).await?;
+            if let Some(session_id) = input.harness_session_id.as_deref() {
+                let external_session_id: Option<String> = sqlx::query_scalar(
+                    "SELECT external_session_id FROM harness_session WHERE id = ?",
+                )
+                .bind(session_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+                match (external_session_id, input.agent_session_id.as_deref()) {
+                    (Some(external_session_id), None) => {
+                        input.agent_session_id = Some(external_session_id);
+                    }
+                    (Some(external_session_id), Some(legacy_session_id))
+                        if external_session_id != legacy_session_id =>
+                    {
+                        return Err(DbError::Check(
+                            "Execution legacy session projection disagrees with HarnessSession"
+                                .to_owned(),
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(DbError::Check(
+                            "pending HarnessSession cannot have an external session projection"
+                                .to_owned(),
+                        ));
+                    }
+                    _ => {}
+                }
+            } else if input.agent_session_id.is_some() {
+                return Err(DbError::Check(
+                    "new Execution session identity must use HarnessSession authority".to_owned(),
+                ));
+            }
+        }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, role, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
         .bind(input.agent_id.as_deref())
+        .bind(actor_kind.map(|value| value.to_string()))
+        .bind(actor_id.as_deref())
         .bind(&input.role)
+        .bind(input.purpose.as_ref().map(ToString::to_string))
         .bind(input.status.to_string())
         .bind(stop_reason.as_deref())
         .bind(input.stopped_by.as_deref())
@@ -620,6 +697,7 @@ impl SqliteDb {
         .bind(input.stopped_at.as_deref())
         .bind(input.parent_execution_id.as_deref())
         .bind(input.agent_session_id.as_deref())
+        .bind(input.harness_session_id.as_deref())
         .bind(input.agent_message_id.as_deref())
         .bind(input.last_activity_at.as_deref())
         .bind(prompt)

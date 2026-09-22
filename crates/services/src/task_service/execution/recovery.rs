@@ -418,7 +418,7 @@ impl TaskService {
         let blocked_execution_id = annotation.blocked_execution_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("resume_session requires blocked_execution_id")
         })?;
-        let blocked_execution = ExecutionRepo::get_by_id(&*self.db, blocked_execution_id)
+        let mut blocked_execution = ExecutionRepo::get_by_id(&*self.db, blocked_execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", blocked_execution_id.to_owned()))?;
         let agent_id = blocked_execution
@@ -426,19 +426,63 @@ impl TaskService {
             .as_ref()
             .cloned()
             .ok_or_else(|| ServiceError::invalid_operation("blocked execution has no assignee"))?;
-        let agent_session_id = blocked_execution.agent_session_id.clone().ok_or_else(|| {
-            ServiceError::invalid_operation("blocked execution has no resumable session")
-        })?;
         let snapshot_json = blocked_execution
             .executor_config_snapshot_json
-            .as_deref()
+            .clone()
             .ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "blocked execution missing executor config snapshot",
                 )
             })?;
+        self.ensure_task_runnable(&task).await?;
+        let (workspace, workspace_created_by_attempt) =
+            super::super::workspace::prepare_workspace_owned(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &task.id,
+                self.repo_cache_locks.clone(),
+            )
+            .await?;
+        let mut agent_session_id = resumable_external_session(
+            &self.db,
+            &blocked_execution,
+            Some(&agent_id),
+            Some(&workspace.id),
+        )
+        .await?;
+        if blocked_execution.harness_session_id.is_none() {
+            let external_session_id = agent_session_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "blocked execution has no reusable HarnessSession (legacy fallback unavailable)",
+                )
+            })?;
+            blocked_execution = materialize_historical_harness_session(
+                &self.db,
+                &blocked_execution,
+                &external_session_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "blocked execution has unresolved legacy session authority",
+                )
+            })?;
+            agent_session_id = resumable_external_session(
+                &self.db,
+                &blocked_execution,
+                Some(&agent_id),
+                Some(&workspace.id),
+            )
+            .await?;
+        }
+        let agent_session_id = agent_session_id.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "blocked execution HarnessSession is not reusable in this workspace",
+            )
+        })?;
         let updated_snapshot =
-            executor_snapshot_with_resume_thread(snapshot_json, &agent_session_id)?;
+            executor_snapshot_with_resume_thread(&snapshot_json, &agent_session_id)?;
         let updated_snapshot = if let Some(ctx) = context.as_deref() {
             let mut snap: serde_json::Value =
                 serde_json::from_str(&updated_snapshot).map_err(|e| {
@@ -456,16 +500,6 @@ impl TaskService {
         } else {
             updated_snapshot
         };
-        self.ensure_task_runnable(&task).await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
-            .await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -487,7 +521,20 @@ impl TaskService {
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: updated_task.id.clone(),
-                    agent_id: Some(agent_id),
+                    agent_id: Some(agent_id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(agent_id)),
+                    purpose: Some(
+                        blocked_execution
+                            .purpose
+                            .clone()
+                            .unwrap_or_else(|| {
+                                execution_purpose_for_task_type(
+                                    &updated_task.task_type,
+                                    &blocked_execution.role,
+                                )
+                            }),
+                    ),
+                    harness_session_id: blocked_execution.harness_session_id.clone(),
                     role: blocked_execution.role.clone(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
@@ -495,7 +542,9 @@ impl TaskService {
                     resume_policy: None,
                     stopped_at: None,
                     parent_execution_id: Some(blocked_execution.id.clone()),
-                    agent_session_id: Some(agent_session_id),
+                    // The generic HarnessSession is the authority. The DB
+                    // layer projects its external id to the legacy field.
+                    agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
                     summary: match (
@@ -608,9 +657,7 @@ impl TaskService {
             ServiceError::invalid_operation(format!("state {} has no executable role", task.status))
         })?;
         let agent_id = match crate::task_service::current_role_memberships_authoritative(
-            &self.db,
-            &task.id,
-            role_name,
+            &self.db, &task.id, role_name,
         )
         .await?
         {
@@ -632,17 +679,14 @@ impl TaskService {
                 })?
             }
             None => {
-                let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-                    &*self.db,
-                    &task.id,
-                    role_name,
-                )
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(format!(
-                        "task has no assignment for role {role_name}"
-                    ))
-                })?;
+                let assignment =
+                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(format!(
+                                "task has no assignment for role {role_name}"
+                            ))
+                        })?;
                 if assignment.assignee_type != Some(AssigneeKind::Agent) {
                     return Err(ServiceError::invalid_operation(format!(
                         "role {role_name} is not assigned to an agent"
@@ -721,6 +765,9 @@ impl TaskService {
                     id: new_uuid_v4(),
                     task_id: recovered.id.clone(),
                     agent_id: Some(agent.id.clone()),
+                    actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+                    purpose: Some(execution_purpose_for_task_type(&recovered.task_type, role_name)),
+                    harness_session_id: None,
                     role: role_name.to_owned(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
@@ -1226,7 +1273,14 @@ impl TaskService {
                 .map(str::to_owned)
         }) {
             if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? {
-                if execution.agent_session_id.is_some()
+                if resumable_external_session(
+                    &self.db,
+                    &execution,
+                    execution.agent_id.as_deref(),
+                    execution.workspace_id.as_deref(),
+                )
+                .await?
+                .is_some()
                     && matches!(
                         execution.status,
                         ExecutionStatus::Completed
@@ -1238,6 +1292,10 @@ impl TaskService {
                     return Ok(Some(execution));
                 }
             }
+            // An explicit blocked execution is the recovery target. Do not
+            // replace it with a newer same-role execution when its session is
+            // absent or unusable.
+            return Ok(None);
         }
 
         latest_resumable_interactive_role_execution(&self.db, &task.id, &role_name).await
@@ -1250,9 +1308,7 @@ impl TaskService {
     ) -> Result<String> {
         if let Some(role_name) = self.current_effective_role_name(task).await? {
             match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                &role_name,
+                &self.db, &task.id, &role_name,
             )
             .await?
             {
@@ -1314,13 +1370,10 @@ impl TaskService {
                     ));
                 }
                 None => {
-                    if let Some(assignment) =
-                        TaskRoleAssignmentRepo::get_by_task_and_role(
-                            &*self.db,
-                            &task.id,
-                            &role_name,
-                        )
-                        .await?
+                    if let Some(assignment) = TaskRoleAssignmentRepo::get_by_task_and_role(
+                        &*self.db, &task.id, &role_name,
+                    )
+                    .await?
                     {
                         if assignment.assignee_type == Some(AssigneeKind::Agent) {
                             if let Some(agent_id) = assignment.assignee_id {
@@ -2150,13 +2203,26 @@ async fn latest_resumable_interactive_exact_role(
         },
     )
     .await?;
-    Ok(page.items.into_iter().find(|execution| {
-        execution.agent_session_id.is_some()
-            && matches!(
-                execution.status,
-                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-            )
-    }))
+    for execution in page.items {
+        if !matches!(
+            execution.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        ) {
+            continue;
+        }
+        if resumable_external_session(
+            db,
+            &execution,
+            execution.agent_id.as_deref(),
+            execution.workspace_id.as_deref(),
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(Some(execution));
+        }
+    }
+    Ok(None)
 }
 
 fn execution_matches_role(execution: &Execution, role: &str) -> bool {

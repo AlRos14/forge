@@ -177,6 +177,7 @@ async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_move
             &user_moved.task.id,
             &agent_id,
             crate::workflow::default_roles::PLANNER,
+            db::ExecutionPurpose::Plan,
             "plan the task".to_owned(),
         )
         .await;
@@ -267,11 +268,7 @@ async fn test_user_claim_bypasses_capacity_check() {
         .expect("task creates");
 
     let claimed = service
-        .claim_task(
-            task.id,
-            Assignee::User(human_id),
-            None,
-        )
+        .claim_task(task.id, Assignee::User(human_id), None)
         .await
         .expect("user claim succeeds without an agent");
 

@@ -1,17 +1,20 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
     ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, RoleMembershipResponse,
     RoleMembershipStatus, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleResponse, TaskRoleAssignmentResponse,
-    TaskType, WorkspaceResponse,
+    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse,
+    TaskRoleResponse, TaskType, WorkspaceResponse,
 };
 use db::{
-    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
-    Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo, SortBy, SortOrder,
-    Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo,
-    Workspace, WorkspaceRepo,
+    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution,
+    HarnessSessionRepo, HarnessSessionStatus, Page, PageRequest, Project, ProjectRepo, Repo,
+    Review, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task, TaskRoleAssignment,
+    TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +22,7 @@ use services::workflow::engine::WorkflowEngine;
 use services::{
     plan_artifact::{latest_plan_for_task, read_plan_for_workspace, PlanArtifactError},
     task_diagnostics::{derive_workflow_exception, derive_workflow_health},
-    task_service::action_resolver::resolve_execution_actions,
+    task_service::action_resolver::resolve_execution_actions_with_session_state,
 };
 use sqlx::Row;
 
@@ -380,7 +383,36 @@ async fn task_response_inner(
         let blocking_annotation = blocked_metadata_annotation
             .as_ref()
             .or(error_blocking_annotation);
-        resolve_execution_actions(&task, &workflow, &executions, blocking_annotation)
+        let mut reusable_harness_session_ids = HashSet::new();
+        for execution in &executions {
+            let Some(session_id) = execution.harness_session_id.as_deref() else {
+                continue;
+            };
+            let Some(session) = HarnessSessionRepo::get_by_id(db, session_id).await? else {
+                continue;
+            };
+            if matches!(&session.status, HarnessSessionStatus::Active)
+                && session.external_session_id.is_some()
+                && matches!(execution.actor_ref(), Some(db::ActorRef::Agent(ref agent_id)) if agent_id == &session.agent_id)
+                && (session.workspace_id.is_none()
+                    || session.workspace_id == execution.workspace_id)
+                && execution
+                    .agent_session_id
+                    .as_deref()
+                    .is_none_or(|legacy_id| {
+                        session.external_session_id.as_deref() == Some(legacy_id)
+                    })
+            {
+                reusable_harness_session_ids.insert(session_id.to_owned());
+            }
+        }
+        resolve_execution_actions_with_session_state(
+            &task,
+            &workflow,
+            &executions,
+            blocking_annotation,
+            Some(&reusable_harness_session_ids),
+        )
     } else {
         Vec::new()
     };
@@ -671,10 +703,7 @@ pub async fn task_roles_response(
             }),
             policy,
             version: role.version,
-            members: members
-                .into_iter()
-                .map(role_membership_response)
-                .collect(),
+            members: members.into_iter().map(role_membership_response).collect(),
             created_at: role.created_at,
             updated_at: role.updated_at,
         });
@@ -778,14 +807,21 @@ pub fn workspace_response(workspace: Workspace) -> WorkspaceResponse {
 }
 
 pub fn execution_response(execution: Execution) -> ExecutionResponse {
+    let actor_ref = execution.actor_ref().map(|actor| match actor {
+        db::ActorRef::Human(id) => api_types::ActorRef::Human(id),
+        db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id),
+    });
     ExecutionResponse {
         id: execution.id,
         task_id: execution.task_id,
+        actor_ref,
         agent_id: execution.agent_id,
         role: execution.role,
+        purpose: execution.purpose.map(|purpose| purpose.to_string()),
         status: execution_status_response(execution.status),
         parent_execution_id: execution.parent_execution_id,
         agent_session_id: execution.agent_session_id,
+        harness_session_id: execution.harness_session_id,
         prompt: execution.prompt,
         summary: execution.summary,
         logs_path: execution.logs_path,

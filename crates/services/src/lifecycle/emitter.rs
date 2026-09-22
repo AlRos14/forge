@@ -208,16 +208,17 @@ impl LifecycleEventEmitter {
             execution_id.or_else(|| execution.as_ref().map(|item| item.id.clone()));
         let resolved_agent_id = if agent_id.is_some() {
             agent_id
-        } else if let Some(execution_agent_id) = execution
-            .as_ref()
-            .and_then(|item| item.agent_id.clone())
+        } else if let Some(execution_agent_id) =
+            execution.as_ref().and_then(|item| item.agent_id.clone())
         {
             Some(execution_agent_id)
         } else if task.assignee_type.as_deref() == Some("agent")
             && TaskRoleRepo::list_by_task(&*self.db, &task.id)
-            .await
-            .map_err(|error| format!("failed to inspect TaskRole for task {}: {error}", task.id))?
-            .is_empty()
+                .await
+                .map_err(|error| {
+                    format!("failed to inspect TaskRole for task {}: {error}", task.id)
+                })?
+                .is_empty()
         {
             task.assignee_id.clone()
         } else {

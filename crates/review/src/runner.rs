@@ -1,8 +1,8 @@
 use crate::auditor::{self, AuditorVerdict};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, AgentStatus, CreateExecution, CreateReview,
-    Execution, ExecutionRepo, ExecutionStatus, RepoRepo, Review, ReviewRepo, ReviewStatus,
-    SqliteDb, TaskRepo, UpdateExecution,
+    Execution, ExecutionPurpose, ExecutionRepo, ExecutionStatus, RepoRepo, Review, ReviewRepo,
+    ReviewStatus, SqliteDb, TaskRepo, UpdateExecution,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -241,13 +241,39 @@ impl ReviewRunner {
         workspace_id: String,
         req: &ReviewRequest,
     ) -> Result<Execution, ReviewError> {
+        let parent_execution = ExecutionRepo::get_by_id(&*self.db, executor_execution_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let actor_ref = req
+            .auditor_agent_id
+            .as_ref()
+            .map(|agent_id| db::ActorRef::Agent(agent_id.clone()))
+            .or_else(|| parent_execution.actor_ref())
+            .or_else(|| {
+                parent_execution
+                    .agent_id
+                    .as_ref()
+                    .map(|agent_id| db::ActorRef::Agent(agent_id.clone()))
+            })
+            .ok_or_else(|| {
+                db::DbError::Check(
+                    "review Execution requires a persisted reviewer or parent Actor".to_owned(),
+                )
+            })?;
+        let agent_id = match &actor_ref {
+            db::ActorRef::Agent(agent_id) => Some(agent_id.clone()),
+            db::ActorRef::Human(_) => None,
+        };
         let now = now_rfc3339();
         ExecutionRepo::create(
             &*self.db,
             CreateExecution {
                 id: new_uuid_v4(),
                 task_id: task_id.to_owned(),
-                agent_id: None,
+                agent_id,
+                actor_ref: Some(actor_ref),
+                purpose: Some(ExecutionPurpose::Review),
+                harness_session_id: None,
                 role: "reviewer".to_string(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -410,6 +436,9 @@ impl ReviewRunner {
                 id: auditor_execution_id.clone(),
                 task_id: task_id.clone(),
                 agent_id: Some(auditor_agent.id.clone()),
+                actor_ref: Some(db::ActorRef::Agent(auditor_agent.id.clone())),
+                purpose: Some(ExecutionPurpose::Review),
+                harness_session_id: None,
                 role: "auditor".to_string(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -729,6 +758,7 @@ async fn build_auditor_config_snapshot(
     serde_json::to_string(&json!({
         "agent_id": agent.id,
         "executor_type": agent.executor_type,
+        "profile_id": agent.profile_id,
         "model": agent.model,
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,

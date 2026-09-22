@@ -738,7 +738,7 @@ async fn revoke_active_workspace_lease(db: &SqliteDb, task_id: &str) {
 
 pub(crate) struct CancelledExecution {
     pub execution_id: String,
-    pub agent_session_id: Option<String>,
+    pub resumable_external_session_id: Option<String>,
 }
 
 pub(crate) struct RecoverTaskOutcome {
@@ -838,7 +838,7 @@ async fn recover_task(
     let should_auto_resume = stop_reason == StopReason::CrashRecovery;
     for execution in cancelled
         .iter()
-        .filter(|execution| execution.agent_session_id.is_some())
+        .filter(|execution| execution.resumable_external_session_id.is_some())
     {
         has_resumable_execution = true;
         if should_auto_resume {
@@ -1054,9 +1054,16 @@ pub(crate) async fn cancel_running_executions(
         if execution.status != ExecutionStatus::Running {
             continue;
         }
+        let resumable_external_session_id = crate::task_service::resumable_external_session(
+            db,
+            &execution,
+            execution.agent_id.as_deref(),
+            execution.workspace_id.as_deref(),
+        )
+        .await?;
         let cancelled_execution = CancelledExecution {
             execution_id: execution.id.clone(),
-            agent_session_id: execution.agent_session_id.clone(),
+            resumable_external_session_id,
         };
         if ExecutionRepo::update(
             db,
@@ -1603,6 +1610,9 @@ mod tests {
                 id: new_uuid_v4(),
                 task_id,
                 agent_id: Some(agent_id),
+                actor_ref: None,
+                purpose: None,
+                harness_session_id: None,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -2112,7 +2122,7 @@ mod tests {
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0].execution_id, execution.id);
         assert_eq!(
-            cancelled[0].agent_session_id.as_deref(),
+            cancelled[0].resumable_external_session_id.as_deref(),
             Some("session-789")
         );
     }

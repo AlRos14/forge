@@ -130,9 +130,7 @@ impl TaskDispatcher {
                 return Ok(None);
             };
             match crate::task_service::current_role_memberships_authoritative(
-                &self.db,
-                &task.id,
-                role_name,
+                &self.db, &task.id, role_name,
             )
             .await?
             {
@@ -147,8 +145,7 @@ impl TaskDispatcher {
                     } else {
                         crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
                     };
-                    if let Some(agent_id) = selected
-                    {
+                    if let Some(agent_id) = selected {
                         // Existing dispatch remains the bounded compatibility
                         // selector until WorkUnit/orchestrator scheduling: the
                         // stable membership order supplies a deterministic
@@ -171,9 +168,10 @@ impl TaskDispatcher {
                     }
                 }
                 None => {
-                    let assignment =
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                            .await?;
+                    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
+                        &*self.db, &task.id, role_name,
+                    )
+                    .await?;
                     match assignment {
                         Some(assignment)
                             if assignment.assignee_type == Some(db::AssigneeKind::Agent)
@@ -184,7 +182,9 @@ impl TaskDispatcher {
                                 agent_id: assignment.assignee_id.expect("checked by match guard"),
                             }));
                         }
-                        Some(assignment) if assignment.assignee_type == Some(db::AssigneeKind::User) => {
+                        Some(assignment)
+                            if assignment.assignee_type == Some(db::AssigneeKind::User) =>
+                        {
                             return Ok(None);
                         }
                         Some(assignment)

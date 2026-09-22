@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use api_types::ActorRef;
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBinding, AccountMainAgentBindingRepo,
     AdmitAgentChatTurn, AdmitAgentHandoff, AgentChat, AgentChatMessage, AgentChatMessageAuthorType,
@@ -18,7 +19,6 @@ use db::{
     ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, ReplaceAccountMainAgentBinding,
     ReplaceProjectAgentBinding, SqliteDb, UpdateAgentChat,
 };
-use api_types::ActorRef;
 use events::EventBus;
 use serde_json::json;
 use sqlx::Row;
@@ -867,11 +867,8 @@ impl AgentChatService<SqliteDb> {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let current = ProjectAgentBindingRepo::get_active_project_binding(
-            &*self.db,
-            &project_id,
-        )
-        .await?;
+        let current =
+            ProjectAgentBindingRepo::get_active_project_binding(&*self.db, &project_id).await?;
         let binding = match (current, input.expected_version) {
             (Some(current), Some(expected)) if current.version == expected => {
                 let mut transaction = self.db.pool().begin().await?;
