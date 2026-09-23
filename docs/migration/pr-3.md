@@ -217,7 +217,11 @@ required for Start too: an older adapter could read stale provider resume keys
 from a historical snapshot and turn generic Start into a continuation.
 Reviewer Start additionally requires `execution_role_v1`, because the Shell
 reviewer compatibility command depends on role context. An older server's
-Start payload still defaults to Start on a PR3 daemon. Pre-PR3 omission of
+Start or Resume payload lacks the required `invocation` field and is rejected
+by a PR3 daemon during parameter decoding, before execution dispatch. The
+daemon does not infer invocation from provider config keys. Together with new
+servers rejecting old daemons before dispatch, this requires a PR3 server and
+daemon pair for remote execution during rolling upgrades. Pre-PR3 omission of
 winner capabilities resolves to an all-Unknown versioned snapshot, never
 primary capability evidence. If a legacy winner omits effective policy, the
 server recomputes it through the registered adapter using the exact returned
@@ -285,7 +289,7 @@ and its registry are removed as production authority.
 | Embedded execution/policy path | Existing Agent Host and embedded operator policy readers remain isolated from external HarnessAdapters. | Embedded capabilities are not represented as external harness evidence. | PR10 |
 | Historical effective-policy interpretation | Existing snapshots without adapter-interpreted policy may use the old snapshot reader; the Embedded path is separately bounded. | It cannot overwrite current candidate policy; a remote winner's policy is recomputed from that winner or removed. | PR13 / PR10 |
 | Shell reviewer command | The exact generic `role == reviewer` marker selects the existing fixed command inside ShellAdapter. | It is a Shell compatibility command, not native review-mode capability or verdict authority. | PR8 |
-| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`. | Missing/unknown support rejects before dispatch; there is no provider-specific dual-write fallback. | Retained transport contract; naming cleanup is PR12 |
+| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`; daemon Start params require `invocation`. | New servers reject old daemons before dispatch; PR3 daemons reject old-server payloads missing `invocation` before dispatch. There is no provider-specific dual-write or inference fallback. | Retained transport contract; naming cleanup is PR12 |
 
 ## Public surface and schema
 
@@ -327,7 +331,8 @@ Focused test additions cover:
 * Historical session identity checks that allow same-account model/effort
   changes but reject harness, account, credential, missing, or malformed
   historical identity evidence.
-* Daemon invocation serialization/backward defaults, remote Resume dispatch,
+* Daemon invocation serialization, rejection of legacy payloads missing
+  invocation, remote Resume dispatch,
   role protocol negotiation, safe Start delivery to an old decoder, and remote
   winner capability results.
 * Review adapter winner capability snapshot and retained legacy Agent tags.
@@ -366,7 +371,8 @@ Named focused test additions include:
 * `initial_harness_policy_comes_from_the_registered_adapter`
 * `profile_and_capability_changes_do_not_rewrite_an_active_session_snapshot`
 * `generic_start_and_resume_survive_daemon_transport_serialization`
-* `old_daemon_start_payload_defaults_to_generic_start`
+* `pre_pr3_execution_start_without_invocation_is_rejected`
+* `pre_pr3_resume_request_is_rejected_before_adapter_dispatch`
 * `new_server_start_rejects_pre_pr3_daemon_before_dispatch`
 * `remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role`
 * `remote_resolved_candidate_carries_effective_harness_capabilities`
@@ -384,9 +390,10 @@ read-only shim is bounded PR13 cleanup.
 
 Verification that completed:
 
-* `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` passed before the final
-  legacy-array parser adjustment, test-only dependency/fixture edits, and the
-  TypeScript schema-version annotation.
+* `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` passed before later
+  production parser/runtime-policy/credential-provenance changes, test-only
+  dependency/fixture edits, and the TypeScript schema-version annotation. The
+  final workspace compilation is **UNVERIFIED**.
 * `cargo test -p api-types export_typescript -- --ignored --exact` passed once
   and emitted checked-in bindings. The subsequent `schema_version: number`
   annotation was mirrored statically in its TypeScript binding.
@@ -405,9 +412,10 @@ Verification that completed:
 
 No frontend build/test/typecheck, Forge runtime, real provider invocation, or
 database migration execution was performed. Tests are present but their final
-post-fix execution **REQUIRES IMPLEMENTATION-TIME VERIFICATION**. Production
-workspace compilation passed, but tests and CI-equivalent formatting are not
-fully green; this ledger does not claim PR3 is merge-ready.
+post-fix execution **REQUIRES IMPLEMENTATION-TIME VERIFICATION**. The prior
+workspace compilation result predates later production changes; current
+compilation, tests, and CI-equivalent formatting are not fully verified, so
+this ledger does not claim PR3 is merge-ready.
 
 ## Static audit results
 

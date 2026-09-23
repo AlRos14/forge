@@ -117,7 +117,6 @@ pub struct ExecutionStartParams {
     pub executor_config: serde_json::Value,
     #[ts(type = "unknown")]
     pub prompt: serde_json::Value,
-    #[serde(default)]
     pub invocation: crate::HarnessInvocation,
     pub max_turns: Option<u32>,
 }
@@ -372,16 +371,40 @@ mod tests {
     }
 
     #[test]
-    fn old_daemon_start_payload_defaults_to_generic_start() {
-        let mut encoded = serde_json::to_value(execution_start_params(HarnessInvocation::Start))
-            .expect("start params serialize");
-        encoded.as_object_mut().unwrap().remove("invocation");
-        encoded.as_object_mut().unwrap().remove("role");
+    fn pre_pr3_execution_start_without_invocation_is_rejected() {
+        let legacy_start_payload = serde_json::json!({
+            "task_id": "task-1",
+            "execution_id": "execution-1",
+            "workspace_path": "/tmp/worktree",
+            "executor_type": "codex",
+            "executor_config": {},
+            "prompt": { "description": "start" },
+            "max_turns": null
+        });
+        assert!(serde_json::from_value::<ExecutionStartParams>(legacy_start_payload).is_err());
 
-        let decoded: ExecutionStartParams =
-            serde_json::from_value(encoded).expect("old start payload remains readable");
-        assert_eq!(decoded.invocation, HarnessInvocation::Start);
-        assert!(decoded.role.is_empty());
+        for (executor_type, key) in [
+            ("codex", "resume_thread_id"),
+            ("claude", "resume_session_id"),
+            ("cursor", "resume_session_id"),
+            ("smith", "resume_session_id"),
+        ] {
+            let mut executor_config = serde_json::Map::new();
+            executor_config.insert(key.to_owned(), serde_json::json!("session-123"));
+            let payload = serde_json::json!({
+                "task_id": "task-1",
+                "execution_id": "execution-1",
+                "workspace_path": "/tmp/worktree",
+                "executor_type": executor_type,
+                "executor_config": executor_config,
+                "prompt": { "description": "continue" },
+                "max_turns": null
+            });
+
+            let error = serde_json::from_value::<ExecutionStartParams>(payload)
+                .expect_err("pre-PR3 payload must not silently default to Start");
+            assert!(error.to_string().contains("invocation"));
+        }
     }
 
     #[test]

@@ -190,10 +190,12 @@ unknown schema, or a missing `generic_harness_invocation_v1` feature rejects
 dispatch. This also prevents an older adapter from interpreting stale
 provider resume keys in a fresh Start snapshot. Reviewer Start additionally
 requires `execution_role_v1` because the Shell reviewer compatibility command
-depends on that role context. An older server's Start payload still defaults
-to Start on a PR3 daemon. A legacy remote route winner without capabilities
-gets all-Unknown evidence; its policy is recomputed using its exact kind/config
-or removed, never copied from the primary candidate.
+depends on that role context. PR3 daemon dispatch requires the generic
+`invocation` field; an old server's Start or Resume payload without it is
+rejected before execution, with no provider-specific config inference. A
+legacy remote route winner without capabilities gets all-Unknown evidence;
+its policy is recomputed using its exact kind/config or removed, never copied
+from the primary candidate.
 
 The post-implementation searches found no production `CodingExecutorAdapter`
 authority, no provider-specific resume mutation outside adapters, and no

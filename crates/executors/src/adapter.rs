@@ -376,8 +376,8 @@ impl FallbackExecutor {
                     &preferred_kind,
                     &interpretation.permission_policy,
                     &interpretation.isolation_posture,
-                Some(&ctx.worktree_path),
-                None,
+                    Some(&ctx.worktree_path),
+                    None,
                     &preferred_config,
                 )
             },
@@ -430,8 +430,8 @@ impl FallbackExecutor {
                             &candidate.executor_type,
                             &interpretation.permission_policy,
                             &interpretation.isolation_posture,
-                        Some(&ctx.worktree_path),
-                        None,
+                            Some(&ctx.worktree_path),
+                            None,
                             &config,
                         )
                     },

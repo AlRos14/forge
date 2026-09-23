@@ -845,6 +845,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_pr3_resume_request_is_rejected_before_adapter_dispatch() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(ResumeRecordingAdapter {
+            invocations: Arc::clone(&invocations),
+        }));
+        let runtime = DaemonRuntime::new_with_registry_and_tracker(
+            tx,
+            dir.path().to_path_buf(),
+            Arc::new(registry),
+            ActiveExecutionTracker::default(),
+        );
+
+        let response = runtime
+            .handle_request(DaemonFrame::Request {
+                id: "legacy-resume".to_owned(),
+                method: METHOD_EXECUTION_START.to_owned(),
+                params: serde_json::json!({
+                    "task_id": "task-legacy",
+                    "execution_id": "exec-legacy",
+                    "workspace_path": dir.path().to_string_lossy(),
+                    "executor_type": "codex",
+                    "executor_config": { "resume_thread_id": "session-123" },
+                    "prompt": { "description": "continue" },
+                    "max_turns": null
+                }),
+            })
+            .await;
+
+        let DaemonFrame::Error { error, .. } = response else {
+            panic!("legacy request without invocation must be rejected");
+        };
+        assert_eq!(error.code, api_types::INVALID_FRAME);
+        assert!(error.message.contains("invocation"));
+        assert!(invocations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn shell_execution_reports_completion_notification() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();

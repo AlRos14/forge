@@ -16,6 +16,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Remote execution dispatch now requires a daemon that advertises the generic
   HarnessInvocation protocol. Older daemons are rejected before Start or Resume
   dispatch because they cannot guarantee fresh-start and exact-resume semantics.
+  PR3 daemons also reject old-server execution payloads without the required
+  generic `invocation`, so rolling upgrades require both sides to use PR3.
 - Ordered fallback candidates must preserve the Agent's harness and
   identity-bearing native account. Cross-harness or account changes now fail
   before dispatch; select or reassign a separate Agent for that failover.
