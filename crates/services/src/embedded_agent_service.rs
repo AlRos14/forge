@@ -710,11 +710,10 @@ impl EmbeddedAgentService {
         Ok((agent, entry, profile, health))
     }
 
-    /// Inject the referenced provider entry's API key into an in-memory
-    /// executor config snapshot as the provider's environment variable
-    /// (`auth_source: forge_provider` dispatch). The mutated value is handed
-    /// to the spawned executor only — it is never written back to the
-    /// database, events, or logs.
+    /// Attach the referenced provider entry's API key to the in-memory
+    /// runtime environment (`auth_source: forge_provider` dispatch). The
+    /// runtime-only field is consumed by the executor boundary and never
+    /// becomes part of candidate config or persisted execution provenance.
     pub async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()> {
         let executor_type = agent_config
             .get("executor_type")
@@ -762,15 +761,7 @@ impl EmbeddedAgentService {
             .map_err(redacted_host_error)?;
         let env = agent_config
             .as_object_mut()
-            .and_then(|snapshot| snapshot.get_mut("config"))
-            .and_then(Value::as_object_mut)
-            .map(|config| {
-                config
-                    .entry("command_overrides")
-                    .or_insert_with(|| json!({}))
-            })
-            .and_then(Value::as_object_mut)
-            .map(|overrides| overrides.entry("env").or_insert_with(|| json!({})))
+            .map(|snapshot| snapshot.entry("runtime_env").or_insert_with(|| json!({})))
             .and_then(Value::as_object_mut)
             .ok_or_else(|| {
                 ServiceError::invalid_operation("executor config snapshot is not injectable")
@@ -2427,11 +2418,11 @@ mod tests {
             .await
             .expect("injection succeeds");
         assert_eq!(
-            snapshot["config"]["command_overrides"]["env"]["OPENAI_API_KEY"],
+            snapshot["runtime_env"]["OPENAI_API_KEY"],
             Value::String("injected-secret-value".to_owned())
         );
-        // The stored agent row never gains the secret: injection mutates only
-        // the in-memory dispatch snapshot.
+        assert_eq!(snapshot["config"], json!({}));
+        // Neither stored Agent state nor candidate config gains the secret.
         let stored = AgentRepo::get_by_id(&*service.db, &agent.id)
             .await
             .expect("agent reads")

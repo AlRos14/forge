@@ -104,6 +104,11 @@ impl CodexAdapter {
     fn resolve_config(ctx: &ExecutionContext) -> CodexConfig {
         let mut config: CodexConfig =
             serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--resume", "--resume-thread"],
+            &["--continue"],
+        );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => {
                 config.resume_thread_id = None;
@@ -367,17 +372,15 @@ impl HarnessAdapter for CodexAdapter {
         use executors::CapabilitySupport as S;
         crate::harness_capabilities(
             S::Native, S::Emulated, S::Native, S::Native, S::Native, S::Native, S::Native,
-            S::Native, S::Native, S::Unsupported, S::Unsupported, S::Native, S::Unsupported,
+            S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
             S::Unsupported, S::Unsupported, S::Unsupported,
         )
     }
 
-    fn effective_execution_policy(
+    fn interpret_execution_policy(
         &self,
         config: &Value,
-        effective_cwd: Option<&str>,
-        workspace_root: Option<&str>,
-    ) -> api_types::EffectiveExecutionPolicy {
+    ) -> executors::HarnessPolicyInterpretation {
         let permission = config
             .get("permission_policy")
             .and_then(Value::as_str)
@@ -386,9 +389,10 @@ impl HarnessAdapter for CodexAdapter {
             .get("sandbox")
             .and_then(Value::as_str)
             .unwrap_or(if permission == "plan" { "read-only" } else { "workspace-write" });
-        executors::effective_policy::from_harness_interpretation(
-            &self.kind(), permission, isolation, effective_cwd, workspace_root, config,
-        )
+        executors::HarnessPolicyInterpretation {
+            permission_policy: permission.to_owned(),
+            isolation_posture: isolation.to_owned(),
+        }
     }
 
     fn executable_name(&self) -> Option<String> {
@@ -547,7 +551,7 @@ impl CodexAdapter {
                 // sending the follow-up turn.
                 let resumed_thread_id = match client
                     .thread_resume(ThreadResumeParams::from_start(
-                        resume_thread_id,
+                        resume_thread_id.clone(),
                         Self::thread_start_params(config, &ctx.worktree_path),
                     ))
                     .await
@@ -566,6 +570,11 @@ impl CodexAdapter {
                     }
                     Err(error) => return Err(error),
                 };
+                if resumed_thread_id != resume_thread_id {
+                    return Err(ExecutorError::Unavailable(format!(
+                        "Codex returned thread {resumed_thread_id} for requested HarnessSession {resume_thread_id}"
+                    )));
+                }
                 let turn = client
                     .turn_start(resumed_thread_id.clone(), ctx.description.clone())
                     .await?;
@@ -1089,13 +1098,15 @@ mod tests {
         let stale = serde_json::json!({
             "resume_thread_id":"old-thread",
             "resume_thread_in_place":true,
-            "resume_fallback_prompt":"old prompt"
+            "resume_fallback_prompt":"old prompt",
+            "additional_params":["--resume=old-cli-thread", "--continue", "--verbose"]
         });
         let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
         let start_config = CodexAdapter::resolve_config(&start);
         assert!(start_config.resume_thread_id.is_none());
         assert!(start_config.resume_thread_in_place.is_none());
         assert!(start_config.resume_fallback_prompt.is_none());
+        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -1107,6 +1118,7 @@ mod tests {
         assert_eq!(resume_config.resume_thread_id.as_deref(), Some("exact-thread"));
         assert_eq!(resume_config.resume_thread_in_place, Some(true));
         assert!(resume_config.resume_fallback_prompt.is_none());
+        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
     }
 
     #[test]

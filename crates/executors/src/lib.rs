@@ -13,12 +13,13 @@ pub mod shell;
 pub use adapter::{
     AdapterExecutor, AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions,
     ExecutionOverrides, ExecutorKind, FallbackExecutor, HarnessAdapter,
-    HarnessAdapterRegistry, UsageObservation, DEFAULT_ACCOUNT_COOLDOWN,
+    HarnessAdapterRegistry, HarnessPolicyInterpretation, UsageObservation, DEFAULT_ACCOUNT_COOLDOWN,
 };
 pub use api_types::{CapabilitySupport, HarnessCapabilities, HarnessInvocation};
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     account_key, account_key_for_context, candidate_key, validate_ordered_fallback_routing,
+    validate_same_agent_candidate,
     merge_overrides, normalize_harness_config, ClaudeCodeConfig, CodexConfig,
     CommandOverrides, CursorConfig, EmbeddedConfig, ExecutorCandidate, ExecutorRouting,
     GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome,

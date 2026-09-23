@@ -38,6 +38,11 @@ impl OpencodeAdapter {
     fn resolve_config(ctx: &ExecutionContext) -> OpencodeConfig {
         let mut config: OpencodeConfig =
             serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--session", "--resume"],
+            &["--continue"],
+        );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => config.resume_session_id = None,
             executors::HarnessInvocation::Resume { external_session_id } => {
@@ -293,6 +298,12 @@ impl HarnessAdapter for OpencodeAdapter {
                 ..Default::default()
             });
         }
+
+        crate::require_exact_resumed_session(
+            "OpenCode",
+            config.resume_session_id.as_deref(),
+            stream.agent_session_id.as_deref(),
+        )?;
 
         let after_sha = if let Ok(false) =
             git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
@@ -821,9 +832,14 @@ mod tests {
 
     #[test]
     fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
-        let stale = serde_json::json!({"resume_session_id":"old-session"});
+        let stale = serde_json::json!({
+            "resume_session_id":"old-session",
+            "additional_params":["--session", "old-cli-session", "--continue", "--verbose"]
+        });
         let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
-        assert!(OpencodeAdapter::resolve_config(&start).resume_session_id.is_none());
+        let start_config = OpencodeAdapter::resolve_config(&start);
+        assert!(start_config.resume_session_id.is_none());
+        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -831,12 +847,9 @@ mod tests {
             },
             stale,
         );
-        assert_eq!(
-            OpencodeAdapter::resolve_config(&resume)
-                .resume_session_id
-                .as_deref(),
-            Some("exact-session")
-        );
+        let resume_config = OpencodeAdapter::resolve_config(&resume);
+        assert_eq!(resume_config.resume_session_id.as_deref(), Some("exact-session"));
+        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
     }
     use executors::CommandOverrides;
 

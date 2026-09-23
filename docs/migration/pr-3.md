@@ -8,11 +8,13 @@ Plan PR3 replaces the external harness protocol authority with the typed
 names. This change does not implement planning artifacts, review workflow
 migration, orchestration, embedded-runtime removal, or final public renames.
 
-The implementation is based on `5e5d8fb29a02264c46577905a1bdfe87820f19e2`
+The implementation started from `5e5d8fb29a02264c46577905a1bdfe87820f19e2`
 and the static preflight in [`plan-pr3-preflight.md`](plan-pr3-preflight.md).
-The source tree and tests were reviewed statically. Rust, Cargo, frontend,
-database migration, and runtime verification were intentionally not run;
-those claims **REQUIRE IMPLEMENTATION-TIME VERIFICATION**.
+The follow-up audit tightened Agent-bound routing, capability snapshot
+evolution, daemon negotiation, remote winner provenance, and historical
+session identity checks. Verification results below describe the commands
+that actually completed; the final workspace test run was stopped after the
+filesystem reached 0 bytes free.
 
 ## Old and new adapter authority
 
@@ -58,6 +60,11 @@ TaskService, daemon transport, account usage, operator status, the Shell
 reviewer-command compatibility path, and API discovery, are recorded in the
 preflight document.
 
+ReviewRunner changes are limited to invoking the registered HarnessAdapter,
+normalizing its concrete config, and persisting the actual reviewer Execution
+candidate's capability/policy snapshot. Review verdict, retry, and lifecycle
+behavior remain unchanged because PR3 snapshots apply to every Agent Execution.
+
 ## Capability model and evidence
 
 `CapabilitySupport` has four distinct values:
@@ -90,8 +97,8 @@ dimension order above:
 
 | Adapter | Support by dimension | Evidence summary |
 | --- | --- | --- |
-| Codex | Native; Emulated; Native; Native; Native; Native; Native; Native; Native; Unsupported; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported | App-server thread resume/fork; normalized JSON-RPC events and usage; account rate-limit RPC; explicit model/reasoning/approval/sandbox params. `PermissionPolicy::Plan` maps restrictions only. Process cancellation is Forge-emulated. |
-| Claude Code | Native; Emulated; Native; Native; Unsupported; Native; Native; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | Explicit `--resume`, stream-json event parsing, model/effort/permission flags, usage normalization; configured native `--permission-mode plan`; process cancellation is Forge-emulated. |
+| Codex | Native; Emulated; Native; Native; Native; Native; Native; Native; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | App-server thread resume; normalized JSON-RPC events and usage; account rate-limit RPC; explicit model/reasoning/approval/sandbox params. The internal `thread/fork` helper is not reachable through the generic adapter boundary, so `fork` is Unsupported. `PermissionPolicy::Plan` maps restrictions only. Process cancellation is Forge-emulated. |
+| Claude Code | Native; Emulated; Native; Native; Unsupported; Native; Native; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | Explicit `--resume`, stream-json event parsing, model/effort/permission flags, usage normalization; the separate `ClaudeCodeConfig.plan` option emits native `--permission-mode plan`. It is not yet connected to `ExecutionPurpose::Plan`; the legacy `PermissionPolicy::Plan` mapping alone is not capability evidence. Process cancellation is Forge-emulated. |
 | Cursor | Native; Emulated; Native; Native; Emulated; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unknown; Unsupported; Unsupported; Unsupported | Explicit `--resume`, stream-json parsing and token usage, model/force flags; Forge PTY `/usage` observation and text parsing; no proven steering protocol; process cancellation is Forge-emulated. |
 | OpenCode | Native; Emulated; Native; Unsupported; Unsupported; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | `--session`, JSON event parsing, model and permission flags; no usage extraction; process cancellation is Forge-emulated. |
 | Gemini | Unsupported; Emulated; Unknown; Unsupported; Unsupported; Native; Unsupported; Native; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | JSON-shaped line parsing is implemented but no structured-event contract is established; model, `--yolo`, and sandbox flags exist; no session ID or usage; process cancellation is Forge-emulated. |
@@ -99,13 +106,15 @@ dimension order above:
 | Shell | Unsupported; Emulated; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | ShellExecutor process termination; no harness session, model, cognition, structured event, or usage protocol. Reviewer compatibility command is translated inside ShellAdapter. |
 | Null | Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | Delay/no-op test adapter has no session or cognition protocol; cancellation is a no-op. |
 
-Shell and Null expose no cognitive capabilities. Only Claude Code reports
-native planning, based on its configured explicit native plan-mode argument.
-Codex `PermissionPolicy::Plan`, read-only sandboxes, propose-only behavior,
-and prompt conventions do not imply native planning. `ExecutionPurpose::Plan`
-remains independent from permission and is not turned into a planning
-workflow. Provider credential/runtime capability types remain separate from
-HarnessCapabilities.
+Shell and Null expose no cognitive capabilities. Claude's explicit
+`ClaudeCodeConfig.plan` option invokes its native `--permission-mode plan`
+flag, so its planning capability is Native. The generic
+`ExecutionPurpose::Plan` is not connected to that option yet, and
+`PermissionPolicy::Plan`, Codex read-only settings, propose-only behavior, and
+prompt conventions do not independently prove native planning.
+`ExecutionPurpose::Plan` remains independent from permission and is not turned
+into a planning workflow. Provider credential/runtime capability types remain
+separate from HarnessCapabilities.
 
 ## Configuration, policy, and capability snapshots
 
@@ -133,6 +142,15 @@ candidate. They also capture the primary adapter's
 initial primary entries with the actual winner's config, effective policy,
 and capabilities.
 
+Credential values resolved from an Agent's `credential_ref` travel only in a
+runtime-only `runtime_env` attached to the in-memory dispatch snapshot. The
+executor applies it after candidate normalization to the actual invocation
+config. Candidate keys, resolved candidate config, capability/policy evidence,
+Execution snapshots, HarnessSession snapshots, and route attempts never
+contain those injected values. Same-Agent fallback candidates receive the
+same runtime environment only after their harness/account identity is
+validated.
+
 New HarnessSession `capabilities_snapshot_json` values come from
 `harness_capabilities`. Pending-session materialization prefers that field;
 result-time binding updates the pending session with the actual winner's
@@ -142,6 +160,14 @@ snapshots are parsed as PR3 evidence; unknown/malformed content is Unknown.
 The narrow PR2 compatibility resolver only recognizes its exact historical
 snapshot shapes and explicit known resumable harness kinds. PR13 owns removing
 that resolver.
+
+Durable snapshots use `{ "schema_version": 1, "capabilities": { ... } }`;
+this versioned JSON contract is separate from the current Rust struct. Readers
+preserve known v1 dimensions when future dimensions are present, resolve a
+missing dimension or unknown support label to Unknown, and reject partial
+unversioned objects, malformed versions, and unsupported schema versions as
+resume evidence. Existing rows are not rewritten. The exact PR2 compatibility
+resolver is the only unversioned exception and remains owned by PR13.
 
 No new capability table or migration was added. Existing V089 Execution and
 HarnessSession JSON snapshot fields represent this authority. Migration head
@@ -158,12 +184,20 @@ the exact external ID using its own native protocol; unsupported or unknown
 resume fails explicitly. Fresh Start removes or ignores stale session-scoped
 fields inside the adapter.
 
-Start retains ordered fallback behavior. Each route candidate carries its own
-normalized config, `HarnessCapabilities`, effective policy, candidate/account
-identity, and adapter. The actual winner is attached to the local result and
-remote terminal result. Its capability snapshot flows into the Execution and
-pending HarnessSession. Thus Codex A → Codex B and Codex → Cursor both preserve
-the winner's evidence rather than the primary candidate's.
+Start retains ordered fallback only within one Agent identity. Every route is
+revalidated against the Agent's harness kind and the PR0A identity-bearing
+account key before dispatch, including old persisted route snapshots. A
+Codex-to-Cursor route and an account-key or credential identity change are
+rejected; selecting another harness or native account requires explicitly
+selecting/reassigning another Agent. Codex `CODEX_HOME` and Smith
+provider/profile identity follow the existing account-key rules. Same-harness,
+same-account variations in model, reasoning effort, sandbox, approval, and
+other non-identity settings remain valid. Each accepted route candidate carries
+its own normalized config,
+`HarnessCapabilities`, effective policy, candidate/account identity, and
+adapter. The actual winner is attached to the local result and remote terminal
+result, and its evidence flows into the Execution and HarnessSession. No
+candidate-specific state from the primary survives a winner change.
 
 Resume promotes and pins the exact session-producing candidate. If that exact
 candidate is unavailable, another candidate is not started as a substitute.
@@ -176,7 +210,22 @@ or unsupported historical evidence fails closed except for the narrow PR2
 compatibility case above.
 
 The same generic invocation and resolved candidate/capability data cross
-`ExecutionStartParams` to the daemon. Local and daemon execution converge on
+`ExecutionStartParams` to the daemon. Every remote execution negotiates
+`generic_harness_invocation_v1` through `daemon.protocol_capabilities` before
+`execution.start`; an old daemon without that capability is rejected. This is
+required for Start too: an older adapter could read stale provider resume keys
+from a historical snapshot and turn generic Start into a continuation.
+Reviewer Start additionally requires `execution_role_v1`, because the Shell
+reviewer compatibility command depends on role context. An older server's
+Start payload still defaults to Start on a PR3 daemon. Pre-PR3 omission of
+winner capabilities resolves to an all-Unknown versioned snapshot, never
+primary capability evidence. If a legacy winner omits effective policy, the
+server recomputes it through the registered adapter using the exact returned
+winner kind/config; if that cannot be done, the stale primary policy is
+removed. Candidate-key/config mismatch or an unlisted/identity-changing
+winner is rejected. Cancel's request shape is unchanged.
+
+Local and daemon execution converge on
 `HarnessAdapter.start` / `HarnessAdapter.resume`; transport does not mutate
 provider-specific config. The Shell reviewer compatibility role is carried as
 generic role context so ShellAdapter owns its command translation. This does
@@ -200,14 +249,20 @@ no-op is Unsupported. Forge retains deterministic cancellation authority.
 ## Effective policy boundary
 
 Adapters interpret concrete harness config into generic permission and
-isolation posture. Forge core retains workspace containment and high-risk
-classification/enforcement. Codex `danger-full-access` remains high risk;
-Claude skip-permissions remains high risk; Cursor force/propose behavior maps
-to the generic policy. Adapter interpretation does not grant authority or
-authorize risky work. New snapshots capture primary-adapter policy before
-dispatch; the selected route result replaces it with the actual winner's
-policy. The old service-side harness-kind interpreter remains only for
-historical snapshots (PR13) and the bounded Embedded exception (PR10).
+isolation posture only; the adapter cannot set risk classification or
+workspace authority. Forge core classifies high-risk posture and retains the
+existing workspace/lease and authorization checks at dispatch. The generic
+policy's `is_high_risk` field is descriptive evidence and does not itself
+grant or revoke a lease. The standalone `validate_workspace_policy` helper is
+not an authorization path; production authority is checked by
+`verify_execution_workspace_authority` and the active WorkspaceLease checks.
+Codex `danger-full-access` remains high risk; Claude skip-permissions remains
+high risk; Cursor force/propose behavior maps to the generic policy. Adapter
+interpretation does not grant authority or authorize risky work. New
+snapshots capture primary-adapter policy before dispatch; the selected route
+result replaces it with the actual winner's policy. The old service-side
+harness-kind interpreter remains only for historical snapshots (PR13) and
+the bounded Embedded exception (PR10).
 
 ## Embedded exception and transitional facade
 
@@ -221,13 +276,27 @@ FallbackExecutor, daemon execution, embedded routing, and tests. It owns
 generic routing/fallback/cancellation coordination only. `CodingExecutorAdapter`
 and its registry are removed as production authority.
 
+## Compatibility shims and cleanup owners
+
+| Shim | Why it remains and exact accepted evidence | Why it grants no new authority | Cleanup owner |
+| --- | --- | --- | --- |
+| PR2 HarnessSession capability snapshots | Only unversioned arrays containing strings or the exact empty object shape are recognized, and only for the explicit PR2 resume-capable harness allowlist. | These values are legacy Agent tags, not dimensional support; all other unversioned or malformed content is Unknown and fails closed. | PR13 |
+| Pre-PR2 `Execution.agent_session_id` reader | Requires an exact persisted known `executor_type`, matching Actor/Agent, harness, account key, credential reference, and a non-ambiguous external ID. | It reads historical continuity only; it does not mutate old rows or infer support from product reputation. | PR13 |
+| Embedded execution/policy path | Existing Agent Host and embedded operator policy readers remain isolated from external HarnessAdapters. | Embedded capabilities are not represented as external harness evidence. | PR10 |
+| Historical effective-policy interpretation | Existing snapshots without adapter-interpreted policy may use the old snapshot reader; the Embedded path is separately bounded. | It cannot overwrite current candidate policy; a remote winner's policy is recomputed from that winner or removed. | PR13 / PR10 |
+| Shell reviewer command | The exact generic `role == reviewer` marker selects the existing fixed command inside ShellAdapter. | It is a Shell compatibility command, not native review-mode capability or verdict authority. | PR8 |
+| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`. | Missing/unknown support rejects before dispatch; there is no provider-specific dual-write fallback. | Retained transport contract; naming cleanup is PR12 |
+
 ## Public surface and schema
 
 Executor discovery adds typed `harness_capabilities` from the execution
 registry. Existing executor endpoint/type vocabulary and provider-auth
 capability endpoints are unchanged. Rust shared types, checked-in generated
-TypeScript bindings, and the web API type were updated statically; generation
-and frontend consistency **REQUIRE IMPLEMENTATION-TIME VERIFICATION**.
+TypeScript bindings, and the web API type were updated. The api-types
+TypeScript export test completed once and emitted the checked-in bindings; the
+`u64` schema version is annotated/exported as the JSON `number` it is. No
+frontend build, test, or typecheck ran, so frontend integration still
+**REQUIRES IMPLEMENTATION-TIME VERIFICATION**.
 
 No migration was added, no persisted history was rewritten, and migration head
 remains V089. The change is additive in capability snapshot JSON and API
@@ -237,7 +306,7 @@ resuming sessions created through PR3 after software rollback may require
 forward-fix/recovery with the PR3 binary. No rollback or migration execution
 was performed.
 
-## Tests added, not executed
+## Tests added and verification status
 
 Focused test additions cover:
 
@@ -249,13 +318,18 @@ Focused test additions cover:
   OpenCode, plus Start sanitation of stale session configuration.
 * Shell reviewer command translation inside the adapter.
 * Generic adapter invocation, unsupported Resume, no Resume fallback,
-  cross-harness and same-harness winner capability propagation, and usage
+  rejection of identity-changing routes, same-agent winner capability
+  propagation, and usage
   observation dispatch.
 * Historical PR2 capability parsing, legacy Agent tags versus new typed
   snapshots, actual-winner Execution/HarnessSession snapshots, and preserving
   active historical snapshots after profile changes.
+* Historical session identity checks that allow same-account model/effort
+  changes but reject harness, account, credential, missing, or malformed
+  historical identity evidence.
 * Daemon invocation serialization/backward defaults, remote Resume dispatch,
-  and remote winner capability results.
+  role protocol negotiation, safe Start delivery to an old decoder, and remote
+  winner capability results.
 * Review adapter winner capability snapshot and retained legacy Agent tags.
 
 Named focused test additions include:
@@ -263,6 +337,7 @@ Named focused test additions include:
 * `support_levels_remain_distinct_and_unknown_fails_closed`
 * `typed_snapshot_requires_all_dimensions_and_rejects_legacy_extra_fields`
 * `registered_adapters_expose_only_integration_evidence`
+* `explicit_claude_plan_mode_is_exposed_as_native_planning_support`
 * `adapter_policy_interpretation_preserves_core_high_risk_classification`
 * `core_classifies_adapter_reported_high_risk_posture`
 * `permission_plan_does_not_create_native_planning_or_risk`
@@ -277,24 +352,62 @@ Named focused test additions include:
 * `resume_intent_reaches_adapter_and_does_not_advance_to_fallback`
 * `resume_does_not_use_an_available_alternate_candidate`
 * `sticky_resume_fails_when_exact_candidate_left_route`
-* `cross_harness_start_fallback_records_cursor_capabilities`
-* `same_harness_start_fallback_records_profile_b_capabilities`
-* `sticky_resume_promotes_cross_harness_capabilities_and_policy`
+* `fallback_cannot_switch_harness_identity`
+* `sticky_resume_rejects_cross_harness_candidate`
+* `same_agent_start_fallback_records_winning_model_capabilities`
+  (also verifies runtime credential env reaches the winner without entering
+  candidate provenance)
+* `provider_env_injection_is_in_memory_only_and_refuses_oauth`
+* `resolved_same_agent_ordered_fallback_admits_the_resolved_snapshot`
 * `unknown_resume_is_an_explicit_unsupported_capability`
 * `generic_usage_observation_routes_through_registered_adapter`
 * `historical_resume_support_is_typed_or_narrow_pr2_compatibility`
+* `historical_session_identity_allows_run_config_but_rejects_harness_account_and_credential_changes`
 * `initial_harness_policy_comes_from_the_registered_adapter`
 * `profile_and_capability_changes_do_not_rewrite_an_active_session_snapshot`
 * `generic_start_and_resume_survive_daemon_transport_serialization`
 * `old_daemon_start_payload_defaults_to_generic_start`
+* `new_server_start_rejects_pre_pr3_daemon_before_dispatch`
+* `remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role`
 * `remote_resolved_candidate_carries_effective_harness_capabilities`
 * `remote_resume_intent_reaches_harness_adapter_and_reports_capabilities`
+* `resume_result_must_confirm_exact_external_session`
+* `missing_claude_session_fails_before_starting_a_new_session`
 * `auditor_snapshot_records_resolved_adapter_capabilities_without_overwriting_agent_tags`
 
-These tests were added but **NOT RUN**. No Cargo/Rust command, frontend build or
-test, Forge runtime, provider invocation, or database migration execution was
-performed. All behavioral and compilation claims **REQUIRE IMPLEMENTATION-TIME
-VERIFICATION**.
+The pre-PR2 `Execution.agent_session_id` compatibility reader additionally
+requires an exact persisted `executor_type` in the historical Execution
+snapshot, a known PR2 adapter with implemented resume, and equality with the
+current immutable Agent harness identity. Contradictory/missing evidence,
+Shell/Null, and historical ambiguity return no resumable session. This
+read-only shim is bounded PR13 cleanup.
+
+Verification that completed:
+
+* `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` passed before the final
+  legacy-array parser adjustment, test-only dependency/fixture edits, and the
+  TypeScript schema-version annotation.
+* `cargo test -p api-types export_typescript -- --ignored --exact` passed once
+  and emitted checked-in bindings. The subsequent `schema_version: number`
+  annotation was mirrored statically in its TypeScript binding.
+* `git diff --check` passed after source edits.
+* `cargo fmt --all -- --check` failed. The clean `origin/main` baseline also
+  fails formatting on existing files, and the current tree has additional
+  formatter deltas in PR3-touched files. No workspace-wide reformat was applied
+  because it would add broad unrelated changes.
+* `FORGE_SKIP_WEB_BUILD=1 cargo test --workspace` was attempted several times.
+  Early attempts exposed missing test-only imports/dependencies and stale
+  fixture field access; those observed errors were corrected. A subsequent
+  run was interrupted before the suite completed after the filesystem reached
+  0 bytes free. `cargo clean` removed 33.0 GiB of generated Rust/Cargo files
+  and restored 31 GiB free. The complete suite and focused tests are therefore
+  **NOT VERIFIED**.
+
+No frontend build/test/typecheck, Forge runtime, real provider invocation, or
+database migration execution was performed. Tests are present but their final
+post-fix execution **REQUIRES IMPLEMENTATION-TIME VERIFICATION**. Production
+workspace compilation passed, but tests and CI-equivalent formatting are not
+fully green; this ledger does not claim PR3 is merge-ready.
 
 ## Static audit results
 
@@ -317,6 +430,10 @@ At the final source audit:
   candidate-account identity are retained to preserve PR0A routing semantics.
 * Legacy Agent capabilities, typed effective `harness_capabilities`, and
   historical HarnessSession snapshots remain distinct.
+* PR3 rejects Agent routing that changes harness or identity-bearing account.
+  Historical PR2 sessions materialized from contradictory cross-harness or
+  cross-account winners remain untouched but are not advertised or resumed
+  under the current Agent identity.
 * No Purpose-to-permission coupling, new planning/review workflow, new
   capability table, migration, or PR4+ lifecycle work was added.
 

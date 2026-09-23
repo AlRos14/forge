@@ -61,6 +61,24 @@ pub(crate) fn harness_capabilities(
     }
 }
 
+/// Refuse to report a successful Resume unless the integration's normalized
+/// result confirms the exact external session requested by Forge.
+pub(crate) fn require_exact_resumed_session(
+    harness: &str,
+    requested: Option<&str>,
+    reported: Option<&str>,
+) -> Result<(), executors::ExecutorError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if reported == Some(requested) {
+        return Ok(());
+    }
+    Err(executors::ExecutorError::Unavailable(format!(
+        "{harness} did not confirm requested HarnessSession {requested}; refusing to report Resume success"
+    )))
+}
+
 /// Build a registry with all built-in adapters.
 pub fn default_registry() -> HarnessAdapterRegistry {
     let mut registry = HarnessAdapterRegistry::new();
@@ -101,6 +119,19 @@ mod capability_tests {
     use executors::CapabilitySupport as S;
 
     #[test]
+    fn resume_result_must_confirm_exact_external_session() {
+        assert!(
+            require_exact_resumed_session("Cursor", Some("session-a"), Some("session-a"))
+                .is_ok()
+        );
+        for reported in [None, Some("session-b")] {
+            let error = require_exact_resumed_session("Cursor", Some("session-a"), reported)
+                .expect_err("mismatched or absent session evidence fails closed");
+            assert!(matches!(error, executors::ExecutorError::Unavailable(_)));
+        }
+    }
+
+    #[test]
     fn registered_adapters_expose_only_integration_evidence() {
         let registry = default_registry();
         let config = serde_json::json!({});
@@ -117,14 +148,14 @@ mod capability_tests {
             harness_capabilities(
                 S::Native, S::Emulated, S::Native, S::Native, S::Native, S::Native,
                 S::Native, S::Native, S::Native, S::Unsupported, S::Unsupported,
-                S::Native, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
             )
         );
         assert_eq!(codex.resume, S::Native);
         assert_eq!(codex.cancel, S::Emulated);
         assert_eq!(codex.structured_events, S::Native);
         assert_eq!(codex.account_usage_observation, S::Native);
-        assert_eq!(codex.fork, S::Native);
+        assert_eq!(codex.fork, S::Unsupported);
         assert_eq!(codex.planning, S::Unsupported);
 
         let claude = caps(executors::ExecutorKind::ClaudeCode);
@@ -231,20 +262,27 @@ mod capability_tests {
     #[test]
     fn adapter_policy_interpretation_preserves_core_high_risk_classification() {
         let registry = default_registry();
-        let codex = registry.get(&executors::ExecutorKind::Codex).unwrap();
-        let codex_policy = codex.effective_execution_policy(
-            &serde_json::json!({"sandbox":"danger-full-access"}),
-            Some("/tmp/workspace/task"),
-            Some("/tmp/workspace"),
+        let effective = |kind: executors::ExecutorKind, config: serde_json::Value| {
+            let adapter = registry.get(&kind).expect("adapter registered");
+            let interpretation = adapter.interpret_execution_policy(&config);
+            executors::effective_policy::from_adapter_interpretation(
+                &kind,
+                &interpretation,
+                Some("/tmp/workspace/task"),
+                Some("/tmp/workspace"),
+                &config,
+            )
+        };
+        let codex_policy = effective(
+            executors::ExecutorKind::Codex,
+            serde_json::json!({"sandbox":"danger-full-access"}),
         );
         assert_eq!(codex_policy.isolation_posture, "danger-full-access");
         assert!(codex_policy.is_high_risk);
 
-        let claude = registry.get(&executors::ExecutorKind::ClaudeCode).unwrap();
-        let claude_policy = claude.effective_execution_policy(
-            &serde_json::json!({"dangerously_skip_permissions":true}),
-            Some("/tmp/workspace/task"),
-            Some("/tmp/workspace"),
+        let claude_policy = effective(
+            executors::ExecutorKind::ClaudeCode,
+            serde_json::json!({"dangerously_skip_permissions":true}),
         );
         assert_eq!(
             claude_policy.isolation_posture,
@@ -252,16 +290,13 @@ mod capability_tests {
         );
         assert!(claude_policy.is_high_risk);
 
-        let cursor = registry.get(&executors::ExecutorKind::Cursor).unwrap();
-        let force = cursor.effective_execution_policy(
-            &serde_json::json!({"force":true}),
-            Some("/tmp/workspace/task"),
-            Some("/tmp/workspace"),
+        let force = effective(
+            executors::ExecutorKind::Cursor,
+            serde_json::json!({"force":true}),
         );
-        let propose_only = cursor.effective_execution_policy(
-            &serde_json::json!({"force":false,"permission_policy":"plan"}),
-            Some("/tmp/workspace/task"),
-            Some("/tmp/workspace"),
+        let propose_only = effective(
+            executors::ExecutorKind::Cursor,
+            serde_json::json!({"force":false,"permission_policy":"plan"}),
         );
         assert_eq!(force.isolation_posture, "force");
         assert!(force.is_high_risk);

@@ -77,7 +77,12 @@ fn export_typescript() {
     WorkMode::export().expect("export WorkMode");
     CapabilitySupport::export().expect("export CapabilitySupport");
     HarnessCapabilities::export().expect("export HarnessCapabilities");
+    HarnessCapabilitiesSnapshot::export().expect("export HarnessCapabilitiesSnapshot");
     HarnessInvocation::export().expect("export HarnessInvocation");
+    DaemonProtocolCapabilitiesRequest::export().expect("export DaemonProtocolCapabilitiesRequest");
+    DaemonProtocolCapabilities::export().expect("export DaemonProtocolCapabilities");
+    ExecutionStartParams::export().expect("export ExecutionStartParams");
+    RemoteResolvedCandidate::export().expect("export RemoteResolvedCandidate");
     CreateRepoRequest::export().expect("export CreateRepoRequest");
     UpdateRepoRequest::export().expect("export UpdateRepoRequest");
     RepoResponse::export().expect("export RepoResponse");

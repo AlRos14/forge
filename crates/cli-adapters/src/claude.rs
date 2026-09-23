@@ -8,6 +8,7 @@ use executors::{
     ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use normalize::NormalizedEntry;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -159,6 +160,11 @@ impl ClaudeCodeAdapter {
     fn resolve_config(ctx: &ExecutionContext) -> ClaudeCodeConfig {
         let mut config: ClaudeCodeConfig =
             serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--resume"],
+            &["--continue"],
+        );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => config.resume_session_id = None,
             executors::HarnessInvocation::Resume { external_session_id } => {
@@ -262,11 +268,19 @@ impl ClaudeCodeAdapter {
         let config = Self::resolve_config(&ctx);
         let resume_session_id = config.resume_session_id.clone();
         let worktree = Path::new(&ctx.worktree_path);
+        let claude_home = dirs::home_dir();
+        if let Some(session_id) = resume_session_id.as_deref() {
+            ensure_exact_claude_session(
+                claude_home.as_deref(),
+                worktree,
+                session_id,
+                config.command_overrides.env.as_ref(),
+            )?;
+        }
         let mut cmd =
             Self::build_command_for_cwd(&config, resume_session_id.as_deref(), Some(worktree));
         cmd.current_dir(&ctx.worktree_path);
         let run_started_at = std::time::SystemTime::now();
-        let claude_home = dirs::home_dir();
 
         let hook_path = install_stop_hook(Path::new(&ctx.worktree_path)).await?;
 
@@ -344,6 +358,11 @@ impl ClaudeCodeAdapter {
             ),
             None => stream.agent_session_id.clone(),
         };
+        crate::require_exact_resumed_session(
+            "Claude Code",
+            resume_session_id.as_deref(),
+            agent_session_id.as_deref(),
+        )?;
         let after_sha = if status == ExecutionOutcome::Completed {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
@@ -430,19 +449,22 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
+        let resume = if claude_config_dir_override(_config) {
+            S::Unknown
+        } else {
+            S::Native
+        };
         crate::harness_capabilities(
-            S::Native, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
+            resume, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
             S::Native, S::Native, S::Unsupported, S::Native, S::Unsupported, S::Unsupported,
             S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
         )
     }
 
-    fn effective_execution_policy(
+    fn interpret_execution_policy(
         &self,
         config: &serde_json::Value,
-        effective_cwd: Option<&str>,
-        workspace_root: Option<&str>,
-    ) -> api_types::EffectiveExecutionPolicy {
+    ) -> executors::HarnessPolicyInterpretation {
         let permission = config
             .get("permission_policy")
             .and_then(serde_json::Value::as_str)
@@ -460,9 +482,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         } else {
             "standard"
         };
-        executors::effective_policy::from_harness_interpretation(
-            &self.kind(), permission, isolation, effective_cwd, workspace_root, config,
-        )
+        executors::HarnessPolicyInterpretation {
+            permission_policy: permission.to_owned(),
+            isolation_posture: isolation.to_owned(),
+        }
     }
 
     fn executable_name(&self) -> Option<String> {
@@ -895,6 +918,47 @@ fn claude_sessions_dir(home: &Path, cwd: &Path) -> PathBuf {
     home.join(".claude").join("projects").join(encoded)
 }
 
+fn claude_config_dir_override(config: &Value) -> bool {
+    config
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get("CLAUDE_CONFIG_DIR"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || std::env::var_os("CLAUDE_CONFIG_DIR").is_some()
+}
+
+fn ensure_exact_claude_session(
+    home: Option<&Path>,
+    cwd: &Path,
+    session_id: &str,
+    profile_env: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), ExecutorError> {
+    if profile_env
+        .and_then(|env| env.get("CLAUDE_CONFIG_DIR"))
+        .is_some_and(|value| !value.trim().is_empty())
+        || std::env::var_os("CLAUDE_CONFIG_DIR").is_some()
+    {
+        return Err(ExecutorError::UnsupportedCapability {
+            capability: "resume".to_owned(),
+            support: executors::CapabilitySupport::Unknown,
+        });
+    }
+    let Some(home) = home else {
+        return Err(ExecutorError::Unavailable(
+            "cannot verify exact Claude Code HarnessSession without a home directory".to_owned(),
+        ));
+    };
+    if !claude_session_exists(home, cwd, session_id) {
+        return Err(ExecutorError::Unavailable(format!(
+            "Claude Code HarnessSession {session_id} does not exist for this workspace; resume cannot start a fresh session"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the actual session id claude-code persisted for this cwd, preferring the
 /// `.jsonl` file with the latest mtime ≥ `run_started_at`. Falls back to `captured`
 /// if no file matches the run window. Returns `None` only if both inputs are absent.
@@ -1004,9 +1068,14 @@ mod tests {
 
     #[test]
     fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
-        let stale = serde_json::json!({"resume_session_id":"old-session"});
+        let stale = serde_json::json!({
+            "resume_session_id":"old-session",
+            "additional_params":["--resume", "old-cli-session", "--continue", "--verbose"]
+        });
         let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
-        assert!(ClaudeCodeAdapter::resolve_config(&start).resume_session_id.is_none());
+        let start_config = ClaudeCodeAdapter::resolve_config(&start);
+        assert!(start_config.resume_session_id.is_none());
+        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -1014,11 +1083,30 @@ mod tests {
             },
             stale,
         );
+        let resume_config = ClaudeCodeAdapter::resolve_config(&resume);
+        assert_eq!(resume_config.resume_session_id.as_deref(), Some("exact-session"));
+        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+    }
+
+    #[test]
+    fn missing_claude_session_fails_before_starting_a_new_session() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let error = ensure_exact_claude_session(
+            Some(home.path()),
+            cwd.path(),
+            "missing-exact-session",
+            None,
+        )
+        .expect_err("missing exact session must fail before CLI spawn");
+        assert!(matches!(error, ExecutorError::Unavailable(_)));
+        assert!(error.to_string().contains("cannot start a fresh session"));
+
+        let mut config = serde_json::json!({});
+        config["env"] = serde_json::json!({"CLAUDE_CONFIG_DIR":"/custom/claude"});
         assert_eq!(
-            ClaudeCodeAdapter::resolve_config(&resume)
-                .resume_session_id
-                .as_deref(),
-            Some("exact-session")
+            ClaudeCodeAdapter::new().capabilities(&config).resume,
+            executors::CapabilitySupport::Unknown
         );
     }
 
@@ -1293,6 +1381,28 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|window| window == ["--permission-mode", "plan"])
+        );
+    }
+
+    #[test]
+    fn explicit_claude_plan_mode_is_exposed_as_native_planning_support() {
+        let config = ClaudeCodeConfig {
+            plan: Some(true),
+            command_overrides: CommandOverrides::default(),
+            ..ClaudeCodeConfig::default()
+        };
+        let command = ClaudeCodeAdapter::build_command(&config, None);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|window| window == ["--permission-mode", "plan"]));
+
+        let normalized = serde_json::to_value(config).expect("Claude config serializes");
+        assert_eq!(
+            ClaudeCodeAdapter::new().capabilities(&normalized).planning,
+            executors::CapabilitySupport::Native
         );
     }
 

@@ -70,6 +70,45 @@ impl ExecutionProvider for RemoteExecutionProvider {
         &self,
         params: api_types::ExecutionStartParams,
     ) -> Result<api_types::ExecutionStartResult> {
+        // Every PR3 dispatch requires the generic invocation contract. An
+        // older daemon can ignore the additive field and inspect legacy
+        // provider resume keys left in a historical snapshot, turning Start
+        // into an unintended Resume. Reject before dispatch unless the daemon
+        // proves it understands adapter-owned Start/Resume semantics.
+        let mut required_features = vec![
+            api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
+        ];
+        if params.role == "reviewer" {
+            required_features.push(api_types::DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1);
+        }
+        {
+            let capabilities: api_types::DaemonProtocolCapabilities = self
+                .registry
+                .send_request(
+                    &self.daemon_id,
+                    api_types::METHOD_PROTOCOL_CAPABILITIES,
+                    api_types::DaemonProtocolCapabilitiesRequest {},
+                    api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
+                )
+                .await
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "cannot verify remote daemon execution protocol support: {error}"
+                    ))
+                })?;
+            let unsupported = required_features
+                .into_iter()
+                .filter(|feature| !capabilities.supports(feature))
+                .collect::<Vec<_>>();
+            if !unsupported.is_empty() {
+                return Err(ServiceError::invalid_operation(
+                    format!(
+                        "remote daemon does not advertise required protocol features: {}",
+                        unsupported.join(", ")
+                    ),
+                ));
+            }
+        }
         self.registry
             .send_request(
                 &self.daemon_id,

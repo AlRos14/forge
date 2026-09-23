@@ -623,13 +623,16 @@ impl ReviewRunner {
             &executors::ExecutionOverrides::default(),
         )?;
         let capabilities = adapter.capabilities(&config);
-        let effective_policy = adapter.effective_execution_policy(
-            &config,
+        let interpretation = adapter.interpret_execution_policy(&config);
+        let effective_policy = executors::effective_policy::from_adapter_interpretation(
+            &kind,
+            &interpretation,
             Some(effective_cwd),
             None,
+            &config,
         );
         snapshot["config"] = config;
-        snapshot["harness_capabilities"] = serde_json::to_value(capabilities)?;
+        snapshot["harness_capabilities"] = serde_json::to_value(capabilities.snapshot())?;
         snapshot["effective_execution_policy"] = serde_json::to_value(effective_policy)?;
         Ok(serde_json::to_string(&snapshot)?)
     }
@@ -756,7 +759,8 @@ fn snapshot_with_resolved_candidate(
     let mut snapshot = serde_json::from_str::<Value>(snapshot_json)?;
     snapshot["executor_type"] = Value::String(candidate.executor_type.to_string());
     snapshot["config"] = candidate.config.clone();
-    snapshot["harness_capabilities"] = serde_json::to_value(&candidate.harness_capabilities)?;
+    snapshot["harness_capabilities"] =
+        serde_json::to_value(candidate.harness_capabilities.snapshot())?;
     snapshot["effective_execution_policy"] = serde_json::to_value(&candidate.effective_policy)?;
     Ok(serde_json::to_string(&snapshot)?)
 }

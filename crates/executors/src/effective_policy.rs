@@ -1,4 +1,5 @@
 use crate::ExecutorKind;
+use crate::HarnessPolicyInterpretation;
 use api_types::EffectiveExecutionPolicy;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +37,26 @@ pub fn from_harness_interpretation(
         scoped_tools: collect_string_values(config, config, "scoped_tools"),
         mcp_servers: collect_string_values(config, config, "mcp_servers"),
     }
+}
+
+/// Convert adapter-owned interpretation into Forge-owned deterministic
+/// effective policy. Adapters cannot set the derived risk bit or workspace
+/// roots themselves.
+pub fn from_adapter_interpretation(
+    executor_kind: &ExecutorKind,
+    interpretation: &HarnessPolicyInterpretation,
+    effective_cwd: Option<&str>,
+    workspace_root: Option<&str>,
+    config: &Value,
+) -> EffectiveExecutionPolicy {
+    from_harness_interpretation(
+        executor_kind,
+        &interpretation.permission_policy,
+        &interpretation.isolation_posture,
+        effective_cwd,
+        workspace_root,
+        config,
+    )
 }
 
 pub fn validate_workspace_policy(

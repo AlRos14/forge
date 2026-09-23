@@ -8,6 +8,46 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::{ExecutionOverrides, ExecutorError, ExecutorKind};
 
+/// Runtime-only environment values attached to an in-memory execution
+/// snapshot. This key is consumed before candidate provenance is produced.
+pub const RUNTIME_ENV_KEY: &str = "runtime_env";
+
+/// Apply runtime-only environment values after adapter config normalization.
+/// These values are deliberately excluded from candidate identity, snapshots,
+/// capability evidence, and policy evidence.
+pub fn with_runtime_environment(
+    config: &Value,
+    execution_snapshot: &Value,
+) -> Result<Value, ExecutorError> {
+    let Some(runtime_env) = execution_snapshot.get(RUNTIME_ENV_KEY) else {
+        return Ok(config.clone());
+    };
+    let runtime_env = runtime_env.as_object().ok_or_else(|| {
+        ExecutorError::Other("runtime_env in execution context must be an object".to_owned())
+    })?;
+    if runtime_env.is_empty() {
+        return Ok(config.clone());
+    }
+
+    let mut resolved = config.clone();
+    let object = resolved.as_object_mut().ok_or_else(|| {
+        ExecutorError::Other("normalized harness config must be an object".to_owned())
+    })?;
+    let env = object
+        .entry("env")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let env = env.as_object_mut().ok_or_else(|| {
+        ExecutorError::Other("normalized harness env must be an object".to_owned())
+    })?;
+    for (key, value) in runtime_env {
+        let value = value.as_str().ok_or_else(|| {
+            ExecutorError::Other("runtime_env values must be strings".to_owned())
+        })?;
+        env.insert(key.clone(), Value::String(value.to_owned()));
+    }
+    Ok(resolved)
+}
+
 /// Shared command override fields embedded in every typed config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CommandOverrides {
@@ -108,6 +148,9 @@ pub struct CodexConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ClaudeCodeConfig {
     pub model: Option<String>,
+    /// Select Claude Code's explicit native plan permission mode. This is
+    /// integration evidence for planning support; generic Purpose remains a
+    /// separate Execution field until its consumer migrates in PR7.
     pub plan: Option<bool>,
     pub approvals: Option<String>,
     pub effort: Option<String>,
@@ -437,6 +480,32 @@ pub fn account_key(kind: &ExecutorKind, config: &Value) -> String {
     }
 }
 
+/// Reject route candidates that would make one Agent Execution impersonate a
+/// different harness or configured native account. Non-identity run settings
+/// such as model, effort, sandbox, and approval remain routable when the
+/// harness and account key stay the same. Agent-level profile and credential
+/// references are immutable for the whole route and are not route inputs.
+pub fn validate_same_agent_candidate(
+    primary_kind: &ExecutorKind,
+    primary_config: &Value,
+    candidate_kind: &ExecutorKind,
+    candidate_config: &Value,
+) -> Result<(), ExecutorError> {
+    if primary_kind != candidate_kind {
+        return Err(ExecutorError::Other(format!(
+            "fallback candidate changes Agent harness identity from {primary_kind} to {candidate_kind}; select or reassign a separate Agent"
+        )));
+    }
+    let primary_account = account_key(primary_kind, primary_config);
+    let candidate_account = account_key(candidate_kind, candidate_config);
+    if primary_account != candidate_account {
+        return Err(ExecutorError::Other(format!(
+            "fallback candidate changes Agent native account identity from {primary_account} to {candidate_account}; select or reassign a separate Agent"
+        )));
+    }
+    Ok(())
+}
+
 /// Build the account key used for a usage observation when credentials are
 /// host-local. `host_identity` is supplied by the execution environment (for
 /// example a daemon id or the local server marker), never resolved through the
@@ -607,7 +676,14 @@ pub fn validate_ordered_fallback_routing(
         ));
     }
     let mut seen = std::collections::HashSet::new();
+    let primary = &candidates[0];
     for candidate in &candidates {
+        validate_same_agent_candidate(
+            &primary.executor_type,
+            &primary.config,
+            &candidate.executor_type,
+            &candidate.config,
+        )?;
         let key = candidate_key(&candidate.executor_type, &candidate.config);
         if !seen.insert(key.clone()) {
             return Err(ExecutorError::Other(format!(
@@ -756,23 +832,63 @@ mod tests {
     fn routing_normalizes_each_candidate_and_preserves_order() {
         let routing = build_ordered_fallback_routing(
             ExecutorKind::Smith,
-            serde_json::json!({"profile": "acct-1"}),
+            serde_json::json!({"profile": "acct-1", "model": "model-a"}),
             &[
-                serde_json::json!({"executor_type": "smith", "config": {"profile": "acct-2", "unknown_field": true}}),
-                serde_json::json!({"executor_type": "claude_code", "config": {}}),
+                serde_json::json!({"executor_type": "smith", "config": {"profile": "acct-1", "model": "model-b", "unknown_field": true}}),
             ],
         )
         .expect("routing builds");
 
         assert_eq!(routing.policy, ROUTING_POLICY_ORDERED_FALLBACK_V1);
-        assert_eq!(routing.candidates.len(), 3);
+        assert_eq!(routing.candidates.len(), 2);
         assert_eq!(routing.candidates[0].executor_type, ExecutorKind::Smith);
-        assert_eq!(routing.candidates[1].config["profile"], "acct-2");
+        assert_eq!(routing.candidates[1].config["profile"], "acct-1");
+        assert_eq!(routing.candidates[1].config["model"], "model-b");
         assert!(routing.candidates[1].config.get("unknown_field").is_none());
-        assert_eq!(
-            routing.candidates[2].executor_type,
-            ExecutorKind::ClaudeCode
-        );
+    }
+
+    #[test]
+    fn same_agent_routing_rejects_harness_or_identity_bearing_account_changes() {
+        let codex_a = serde_json::json!({"env":{"CODEX_HOME":"/accounts/a"}});
+        let codex_b = serde_json::json!({"env":{"CODEX_HOME":"/accounts/b"}});
+        assert!(validate_same_agent_candidate(
+            &ExecutorKind::Codex,
+            &codex_a,
+            &ExecutorKind::Codex,
+            &codex_b,
+        )
+        .is_err());
+        assert!(validate_same_agent_candidate(
+            &ExecutorKind::Codex,
+            &serde_json::json!({}),
+            &ExecutorKind::Cursor,
+            &serde_json::json!({}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn same_agent_routing_allows_non_identity_profile_variation() {
+        let primary = serde_json::json!({
+            "profile": "agent-profile",
+            "model": "model-a",
+            "effort": "low",
+            "sandbox": "workspace-write"
+        });
+        let candidate = serde_json::json!({
+            "profile": "agent-profile",
+            "model": "model-b",
+            "effort": "high",
+            "sandbox": "read-only"
+        });
+
+        validate_same_agent_candidate(
+            &ExecutorKind::ClaudeCode,
+            &primary,
+            &ExecutorKind::ClaudeCode,
+            &candidate,
+        )
+        .expect("run settings may vary for the same harness/account identity");
     }
 
     #[test]

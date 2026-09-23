@@ -57,8 +57,8 @@ Native and Emulated are available. The dimension order is:
 
 | Adapter | Dimensional support in the order above | Source evidence |
 | --- | --- | --- |
-| `codex` | Native; Emulated; Native; Native; Native; Native; Native; Native; Native; Unsupported; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported | `codex.rs` uses app-server `thread/resume` and `thread/fork`; `ThreadStartParams` carries model, reasoning, approval, and sandbox; the client normalizes protocol events and usage. `query_account_usage` requests account rate limits over JSON-RPC. Public adapter cancellation signals/kills the child process, so it is Emulated even though an internal RPC helper exists. `PermissionPolicy::Plan` only maps to read-only sandbox/approval settings. |
-| `claude_code` | Native; Emulated; Native; Native; Unsupported; Native; Native; Native; Unsupported; Native (adapter invokes native `--permission-mode plan` when configured); Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | `claude.rs` emits `--resume`, `--output-format=stream-json`, `--model`, `--effort`, and native permission-mode flags; normalized result events carry token usage. Cancellation signals the child process. The adapter exposes planning because its explicit `plan` config invokes harness `--permission-mode plan`; the generic `PermissionPolicy::Plan` label by itself is not capability evidence. The old missing-session fallback that could drop `--resume` is removed by PR3. |
+| `codex` | Native; Emulated; Native; Native; Native; Native; Native; Native; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | `codex.rs` exposes app-server `thread/resume`; `ThreadStartParams` carries model, reasoning, approval, and sandbox; the client normalizes protocol events and usage. `query_account_usage` requests account rate limits over JSON-RPC. Public adapter cancellation signals/kills the child process, so it is Emulated. An internal `thread/fork` helper is not reachable through the generic adapter invocation and does not establish a supported `fork` capability. `PermissionPolicy::Plan` only maps to read-only sandbox/approval settings. |
+| `claude_code` | Native; Emulated; Native; Native; Unsupported; Native; Native; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | `claude.rs` emits `--resume`, `--output-format=stream-json`, `--model`, `--effort`, and `--permission-mode plan` for the explicit Claude `plan` config; normalized result events carry token usage. The native plan flag is not yet connected to `ExecutionPurpose::Plan`; the legacy `PermissionPolicy::Plan` mapping is not itself capability evidence. Cancellation signals the child process; missing exact sessions fail before launch. |
 | `cursor` | Native; Emulated; Native; Native; Emulated; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unknown; Unsupported; Unsupported; Unsupported | `cursor.rs` emits `--resume`, `--output-format stream-json`, `--model`, and `--force`; event parser extracts token usage and session IDs. `/usage` is a Forge-driven PTY command and text parser. Cancellation kills the child. No Forge steering implementation is present, so steering remains Unknown and fails closed. |
 | `opencode` | Native; Emulated; Native; Unsupported; Unsupported; Native; Unsupported; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | `opencode.rs` uses `--session`, `--format json`, and `--model`; its JSON event parser extracts session IDs and text but no usage. `--dangerously-skip-permissions` is the implemented native permission flag. Cancellation kills the child. |
 | `gemini` | Unsupported; Emulated; Unknown; Unsupported; Unsupported; Native; Unsupported; Native; Native; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported; Unsupported | `gemini.rs` emits `--output-format=json`, `--model`, `--yolo`, and `--sandbox`; it parses JSON-shaped lines but does not establish a structured event-stream contract, so structured events stay Unknown. It returns no session ID or usage. Cancellation kills the process. |
@@ -71,13 +71,14 @@ filters, or embedded Agent capability data. It is not evidence for any matrix
 entry and is not the effective HarnessCapabilities authority.
 
 The table above was captured before refactoring and checked against the
-migrated adapter methods before the implementation was finalized. In
+migrated adapter methods during the final audit. In
 particular, Codex, Claude Code, Cursor, OpenCode, Smith, Shell, and Gemini
 cancel by Forge-managed process cancellation and are therefore `Emulated`;
-Null cancellation is a no-op and remains `Unsupported`. Only Claude Code has
-an implemented harness-native planning invocation in this integration, through
-its explicit `--permission-mode plan` configuration. Codex's read-only
-`PermissionPolicy::Plan` mapping remains `planning = Unsupported`.
+Null cancellation is a no-op and remains `Unsupported`. Claude's explicit
+`ClaudeCodeConfig.plan` path emits its native `--permission-mode plan` flag,
+so that adapter reports planning support. The generic `ExecutionPurpose::Plan`
+is not connected to the flag yet, and a `PermissionPolicy::Plan` value alone
+does not prove native planning. PR7 consumes Purpose independently.
 
 ## Post-implementation static reader/writer result
 
@@ -147,7 +148,8 @@ to preserve PR0A `cursor_poll` semantics.
    PR13 removal.
 6. Keep Codex `CODEX_HOME`, Smith provider/profile account keys, opaque
    credential references, daemon-local account identity, cooldowns, fallback
-   order, and route attempts unchanged.
+   order, and route attempts unchanged; reject candidates whose harness or
+   explicit identity-bearing account key changes the Agent identity.
 7. Add typed discovery output from the same adapter registry. Provider
    credential/runtime capability types remain a separate domain.
 
@@ -159,3 +161,65 @@ preflight identifies no schema need and plans no migration. Execution Purpose
 remains separate from permission. No plan Artifact, review workflow, WorkUnit,
 orchestration workflow, Agent Host removal, public executor rename, or
 historical-row rewrite is in PR3 scope.
+
+## Supplemental post-implementation audit findings
+
+The baseline route accepted cross-harness fallbacks and same-harness account
+switches, and PR2 could materialize a historical HarnessSession for the actual
+winner under the primary Agent. PR3 now rejects those route snapshots before
+local or remote dispatch. Historical rows remain immutable; the resume reader
+compares Actor, Agent harness, session snapshot harness/account/credential,
+Execution snapshot identity, and the current Agent. Contradictory PR2 history
+is kept for audit but is not advertised or resumed as the current Agent's
+continuity. Same-account changes to model, effort, sandbox, or permission
+remain eligible as profile/run configuration.
+
+The durable capability parser distinguishes versioned PR3 v1 snapshots,
+unversioned PR2 data, malformed input, and unsupported future versions. V1
+snapshots allow missing dimensions to resolve as Unknown and ignore unknown
+dimension names; arbitrary partial unversioned objects never become support.
+Only the exact PR2 string-tag array or empty-object shapes reach the bounded
+known-harness compatibility allowlist. An initial static follow-up found that
+the parser classified legacy arrays as malformed before that resolver; it now
+classifies arrays as unversioned so the caller can apply the strict shape and
+harness checks. Non-string arrays fail the compatibility shape check.
+
+Every PR3 remote execution negotiates `daemon.protocol_capabilities` before
+`execution.start`; no response, an old daemon's unsupported-method error, an
+unknown schema, or a missing `generic_harness_invocation_v1` feature rejects
+dispatch. This also prevents an older adapter from interpreting stale
+provider resume keys in a fresh Start snapshot. Reviewer Start additionally
+requires `execution_role_v1` because the Shell reviewer compatibility command
+depends on that role context. An older server's Start payload still defaults
+to Start on a PR3 daemon. A legacy remote route winner without capabilities
+gets all-Unknown evidence; its policy is recomputed using its exact kind/config
+or removed, never copied from the primary candidate.
+
+The post-implementation searches found no production `CodingExecutorAdapter`
+authority, no provider-specific resume mutation outside adapters, and no
+direct concrete Codex/Cursor usage probe outside the adapter registry. The
+standalone effective-policy workspace helper has test callers only; actual
+execution workspace authority remains the service's lease/authority checks,
+not that helper. `is_high_risk` is a core-derived policy classification and
+does not itself grant or revoke a lease.
+
+A final provenance audit found that provider credentials were being injected
+into the normalized candidate config before fallback, which could affect the
+candidate key and leak into winner snapshots. Injection now uses a runtime-only
+`runtime_env` field on the in-memory dispatch snapshot; the executor overlays
+it after normalization for adapter detection/invocation, while candidate
+identity and all persisted winner evidence use the clean config. The focused
+fallback and credential-injection tests cover this split. The DB admission
+fixture was also narrowed from a cross-harness example to a same-Agent,
+same-account model variation. Claude's existing explicit `plan` config flag
+was verified against the emitted native CLI mode and is exposed as planning
+support; the generic Purpose and legacy PermissionPolicy mapping remain
+separate.
+
+Verification status: workspace `cargo check` passed before final test-only
+fixes. The TypeScript export test passed. Full workspace tests were attempted,
+but after fixing observed test compile errors, the final run was stopped when
+the filesystem reached 0 bytes free. `cargo clean` removed 33.0 GiB of
+generated artifacts and restored 31 GiB free. No tests completed after the
+final test-source edits; this supplemental audit does not claim behavioral
+verification.

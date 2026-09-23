@@ -1,6 +1,6 @@
 use crate::{
-    config::{merge_overrides, ExecutorRouting, ROUTING_SNAPSHOT_KEY},
-    ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor,
+    config::merge_overrides, ExecutionContext, ExecutionResult, ExecutorError,
+    ResolvedExecutorCandidate, TaskExecutor,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,15 @@ pub struct DiscoveredOptions {
     pub models: Vec<String>,
     pub permission_policies: Vec<String>,
     pub cli_specific: serde_json::Value,
+}
+
+/// Generic policy posture after one adapter interprets its concrete config.
+/// Deterministic risk classification and workspace authority remain in Forge
+/// core and are not adapter-controlled fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessPolicyInterpretation {
+    pub permission_policy: String,
+    pub isolation_posture: String,
 }
 
 /// Per-execution overrides applied on top of profile config.
@@ -187,24 +196,19 @@ pub trait HarnessAdapter: Send + Sync {
         None
     }
 
-    fn effective_execution_policy(
+    fn interpret_execution_policy(
         &self,
         config: &serde_json::Value,
-        effective_cwd: Option<&str>,
-        workspace_root: Option<&str>,
-    ) -> api_types::EffectiveExecutionPolicy {
+    ) -> HarnessPolicyInterpretation {
         let config = config.get("config").unwrap_or(config);
-        crate::effective_policy::from_harness_interpretation(
-            &self.kind(),
-            config
+        HarnessPolicyInterpretation {
+            permission_policy: config
                 .get("permission_policy")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown"),
-            "not_applicable",
-            effective_cwd,
-            workspace_root,
-            config,
-        )
+                .unwrap_or("unknown")
+                .to_owned(),
+            isolation_posture: "not_applicable".to_owned(),
+        }
     }
 }
 
@@ -266,16 +270,22 @@ impl TaskExecutor for AdapterExecutor {
             ExecutorError::Other(format!("No adapter registered for executor type: {kind}"))
         })?;
         let config = adapter.normalize_config(&raw_config, &ExecutionOverrides::default())?;
+        let invocation_config =
+            crate::config::with_runtime_environment(&config, &ctx.agent_config)?;
         let capabilities = adapter.capabilities(&config);
-        let effective_policy = adapter.effective_execution_policy(
-            &config,
+        let policy_interpretation = adapter.interpret_execution_policy(&config);
+        let effective_policy = crate::effective_policy::from_harness_interpretation(
+            &kind,
+            &policy_interpretation.permission_policy,
+            &policy_interpretation.isolation_posture,
             Some(&ctx.worktree_path),
             None,
+            &config,
         );
-        ctx.agent_config = config;
-        let invocation = ctx.invocation.clone();
         let candidate_key = crate::config::candidate_key(&kind, &config);
         let execution_config = config.clone();
+        ctx.agent_config = invocation_config;
+        let invocation = ctx.invocation.clone();
         let mut result = match invocation {
             api_types::HarnessInvocation::Start => adapter.start(ctx).await?,
             api_types::HarnessInvocation::Resume {
@@ -360,11 +370,17 @@ impl FallbackExecutor {
             candidate_key: crate::config::candidate_key(&preferred_kind, &preferred_config),
             account_key: crate::config::account_key(&preferred_kind, &preferred_config),
             harness_capabilities: preferred_adapter.capabilities(&preferred_config),
-            effective_policy: preferred_adapter.effective_execution_policy(
-                &preferred_config,
+            effective_policy: {
+                let interpretation = preferred_adapter.interpret_execution_policy(&preferred_config);
+                crate::effective_policy::from_harness_interpretation(
+                    &preferred_kind,
+                    &interpretation.permission_policy,
+                    &interpretation.isolation_posture,
                 Some(&ctx.worktree_path),
                 None,
-            ),
+                    &preferred_config,
+                )
+            },
             kind: preferred_kind,
             config: preferred_config,
         };
@@ -394,6 +410,12 @@ impl FallbackExecutor {
                 })?;
                 let config = adapter
                     .normalize_config(&candidate.config, &ExecutionOverrides::default())?;
+                crate::config::validate_same_agent_candidate(
+                    &candidates[0].kind,
+                    &candidates[0].config,
+                    &candidate.executor_type,
+                    &config,
+                )?;
                 let key = crate::config::candidate_key(&candidate.executor_type, &config);
                 if candidates.iter().any(|c| c.candidate_key == key) {
                     continue;
@@ -402,11 +424,17 @@ impl FallbackExecutor {
                     account_key: crate::config::account_key(&candidate.executor_type, &config),
                     candidate_key: key,
                     harness_capabilities: adapter.capabilities(&config),
-                    effective_policy: adapter.effective_execution_policy(
-                        &config,
+                    effective_policy: {
+                        let interpretation = adapter.interpret_execution_policy(&config);
+                        crate::effective_policy::from_harness_interpretation(
+                            &candidate.executor_type,
+                            &interpretation.permission_policy,
+                            &interpretation.isolation_posture,
                         Some(&ctx.worktree_path),
                         None,
-                    ),
+                            &config,
+                        )
+                    },
                     kind: candidate.executor_type,
                     config,
                 });
@@ -560,10 +588,12 @@ impl TaskExecutor for FallbackExecutor {
                     break 'chain None; // fall through to the registry error below
                 };
 
+                let invocation_config = crate::config::with_runtime_environment(
+                    &candidate.config,
+                    &ctx.agent_config,
+                )?;
                 if matches!(
-                    adapter
-                        .detect(&candidate.config)
-                        .status,
+                    adapter.detect(&invocation_config).status,
                     AvailabilityStatus::NotFound
                 ) {
                     attempts.push(crate::config::RouteAttempt {
@@ -592,7 +622,7 @@ impl TaskExecutor for FallbackExecutor {
                 }
 
                 let mut candidate_ctx = ctx.clone();
-                candidate_ctx.agent_config = candidate.config.clone();
+                candidate_ctx.agent_config = invocation_config;
                 let attempt = match candidate_ctx.invocation.clone() {
                     api_types::HarnessInvocation::Start => adapter.start(candidate_ctx).await,
                     api_types::HarnessInvocation::Resume { external_session_id } => {
@@ -896,7 +926,7 @@ mod tests {
 
         let result = executor
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                    invocation: crate::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
@@ -997,6 +1027,7 @@ mod tests {
         kind: ExecutorKind,
         behaviors: std::collections::HashMap<String, ScriptedBehavior>,
         calls: Arc<std::sync::Mutex<Vec<String>>>,
+        observed_configs: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         invocations: Arc<std::sync::Mutex<Vec<api_types::HarnessInvocation>>>,
         started: Arc<tokio::sync::Notify>,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -1011,6 +1042,7 @@ mod tests {
                     .map(|(profile, behavior)| ((*profile).to_owned(), behavior.clone()))
                     .collect(),
                 calls: Arc::default(),
+                observed_configs: Arc::default(),
                 invocations: Arc::default(),
                 started: Arc::new(tokio::sync::Notify::new()),
                 cancelled: Arc::default(),
@@ -1033,10 +1065,13 @@ mod tests {
         }
 
         fn detect(&self, config: &serde_json::Value) -> AvailabilityInfo {
-            let profile = config.get("profile").and_then(serde_json::Value::as_str);
-            let unavailable = profile.is_some_and(|profile| {
+            let key = config
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| config.get("profile").and_then(serde_json::Value::as_str));
+            let unavailable = key.is_some_and(|key| {
                 matches!(
-                    self.behaviors.get(profile),
+                    self.behaviors.get(key),
                     Some(ScriptedBehavior::UnavailableAtDetect)
                 )
             });
@@ -1052,11 +1087,11 @@ mod tests {
         }
 
         fn capabilities(&self, config: &serde_json::Value) -> api_types::HarnessCapabilities {
-            let profile = config.get("profile").and_then(serde_json::Value::as_str);
+            let model = config.get("model").and_then(serde_json::Value::as_str);
             api_types::HarnessCapabilities {
                 resume: api_types::CapabilitySupport::Native,
                 account_usage_observation: api_types::CapabilitySupport::Native,
-                structured_events: if profile == Some("acct-1") {
+                structured_events: if model == Some("model-a") {
                     api_types::CapabilitySupport::Native
                 } else {
                     api_types::CapabilitySupport::Emulated
@@ -1077,16 +1112,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(ctx.invocation.clone());
-            let profile = ctx.agent_config["profile"]
+            self.observed_configs
+                .lock()
+                .unwrap()
+                .push(ctx.agent_config.clone());
+            let key = ctx.agent_config["model"]
                 .as_str()
-                .expect("scripted config has profile")
+                .or_else(|| ctx.agent_config["profile"].as_str())
+                .expect("scripted config has model or profile")
                 .to_owned();
-            self.calls.lock().unwrap().push(profile.clone());
+            self.calls.lock().unwrap().push(key.clone());
             let usage = |output_tokens: i64| crate::TokenUsage {
                 output_tokens,
                 ..Default::default()
             };
-            match self.behaviors.get(&profile).expect("scripted behavior") {
+            match self.behaviors.get(&key).expect("scripted behavior") {
                 ScriptedBehavior::Complete {
                     usage_output_tokens,
                 } => Ok(ExecutionResult {
@@ -1141,7 +1181,7 @@ mod tests {
 
     fn routed_ctx(execution_id: &str, logs_dir: &std::path::Path) -> ExecutionContext {
         ExecutionContext {
-            invocation: executors::HarnessInvocation::Start,
+            invocation: crate::HarnessInvocation::Start,
             task_id: "task".to_owned(),
             execution_id: execution_id.to_owned(),
             role: "coder".to_owned(),
@@ -1149,12 +1189,12 @@ mod tests {
             description: "do it".to_owned(),
             agent_config: serde_json::json!({
                 "executor_type": "smith",
-                "config": {"profile": "acct-1"},
+                "config": {"profile": "acct-1", "model": "model-a"},
                 "routing": {
                     "policy": "ordered_fallback_v1",
                     "candidates": [
-                        {"executor_type": "smith", "config": {"profile": "acct-1"}},
-                        {"executor_type": "smith", "config": {"profile": "acct-2"}}
+                        {"executor_type": "smith", "config": {"profile": "acct-1", "model": "model-a"}},
+                        {"executor_type": "smith", "config": {"profile": "acct-1", "model": "model-b"}}
                     ]
                 }
             }),
@@ -1179,18 +1219,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_advances_on_usage_exhaustion_and_aggregates_usage() {
+    async fn usage_exhaustion_does_not_fall_back_across_agent_identity() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
             (
-                "acct-1",
+                "model-a",
                 ScriptedBehavior::Exhausted {
                     retry_after_ms: 60_000,
                     usage_output_tokens: 10,
                 },
             ),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Complete {
                     usage_output_tokens: 5,
                 },
@@ -1200,24 +1240,18 @@ mod tests {
         let result = executor
             .execute(routed_ctx("exec-1", dir.path()))
             .await
-            .expect("chain succeeds");
+            .expect("exhaustion is returned as an execution result");
 
-        assert_eq!(result.status, ExecutionOutcome::Completed);
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1", "acct-2"]);
-        assert_eq!(result.usage.expect("usage aggregated").output_tokens, 15);
-        let resolved = result.resolved_candidate.expect("winner recorded");
-        assert!(resolved.candidate_key.contains("profile=acct-2"));
-        assert_eq!(
-            resolved.harness_capabilities.structured_events,
-            api_types::CapabilitySupport::Emulated,
-            "same-harness fallback snapshots the winning candidate's capabilities"
-        );
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
+        assert_eq!(result.usage.expect("usage is preserved").output_tokens, 10);
+        assert!(result.resolved_candidate.is_none());
         let outcomes: Vec<_> = result.route_attempts.iter().map(|a| a.outcome).collect();
         assert_eq!(
             outcomes,
             vec![
                 crate::config::RouteAttemptOutcome::UsageExhausted,
-                crate::config::RouteAttemptOutcome::Completed
+                crate::config::RouteAttemptOutcome::SkippedCooldown
             ]
         );
     }
@@ -1226,9 +1260,9 @@ mod tests {
     async fn task_failure_stops_chain_without_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
-            ("acct-1", ScriptedBehavior::FailTask),
+            ("model-a", ScriptedBehavior::FailTask),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Complete {
                     usage_output_tokens: 5,
                 },
@@ -1245,22 +1279,22 @@ mod tests {
             result.failure_class,
             Some(crate::ExecutionFailureClass::TaskFailed)
         );
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
     }
 
     #[tokio::test]
-    async fn all_candidates_cooling_fails_fast_and_cooldowns_are_shared() {
+    async fn same_agent_candidates_share_account_cooldown() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
             (
-                "acct-1",
+                "model-a",
                 ScriptedBehavior::Exhausted {
                     retry_after_ms: 60_000,
                     usage_output_tokens: 0,
                 },
             ),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Exhausted {
                     retry_after_ms: 30_000,
                     usage_output_tokens: 0,
@@ -1278,7 +1312,7 @@ mod tests {
         );
         let retry = first.retry_after.expect("earliest retry propagated");
         assert!(retry <= std::time::Duration::from_millis(30_000));
-        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(calls.lock().unwrap().len(), 1);
 
         // A second execution sees both accounts cooling: fail fast, no spawns.
         let second = executor
@@ -1291,7 +1325,7 @@ mod tests {
         );
         assert_eq!(
             calls.lock().unwrap().len(),
-            2,
+            1,
             "no CLI spawned while cooling"
         );
         let outcomes: Vec<_> = second.route_attempts.iter().map(|a| a.outcome).collect();
@@ -1308,9 +1342,9 @@ mod tests {
     async fn cancel_between_hops_spawns_no_further_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = ScriptedAdapter::new(ExecutorKind::Smith, &[
-            ("acct-1", ScriptedBehavior::AwaitCancel),
+            ("model-a", ScriptedBehavior::AwaitCancel),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Complete {
                     usage_output_tokens: 5,
                 },
@@ -1336,14 +1370,14 @@ mod tests {
 
         let result = run.await.expect("join").expect("terminal result");
         assert_eq!(result.status, ExecutionOutcome::Cancelled);
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
     }
 
     #[tokio::test]
     async fn snapshot_without_routing_dispatches_single_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[(
-            "acct-1",
+                "acct-1",
             ScriptedBehavior::Complete {
                 usage_output_tokens: 1,
             },
@@ -1371,8 +1405,8 @@ mod tests {
         let adapter = ScriptedAdapter::new(
             ExecutorKind::Smith,
             &[
-                ("acct-1", ScriptedBehavior::Complete { usage_output_tokens: 1 }),
-                ("acct-2", ScriptedBehavior::Complete { usage_output_tokens: 2 }),
+                ("model-a", ScriptedBehavior::Complete { usage_output_tokens: 1 }),
+                ("model-b", ScriptedBehavior::Complete { usage_output_tokens: 2 }),
             ],
         );
         let calls = Arc::clone(&adapter.calls);
@@ -1388,7 +1422,7 @@ mod tests {
         let result = executor.execute(ctx).await.expect("resume completes");
 
         assert_eq!(result.status, ExecutionOutcome::Completed);
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
         assert_eq!(
             *invocations.lock().unwrap(),
             vec![api_types::HarnessInvocation::Resume {
@@ -1401,9 +1435,9 @@ mod tests {
     async fn resume_does_not_use_an_available_alternate_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
-            ("acct-1", ScriptedBehavior::UnavailableAtDetect),
+            ("model-a", ScriptedBehavior::UnavailableAtDetect),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Complete {
                     usage_output_tokens: 2,
                 },
@@ -1426,7 +1460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_harness_start_fallback_records_cursor_capabilities() {
+    async fn fallback_cannot_switch_harness_identity() {
         let dir = tempfile::tempdir().unwrap();
         let codex = ScriptedAdapter::new(
             ExecutorKind::Codex,
@@ -1454,26 +1488,23 @@ mod tests {
             }
         });
 
-        let result = executor.execute(ctx).await.expect("Cursor fallback completes");
-        let winner = result.resolved_candidate.expect("winner recorded");
-
-        assert_eq!(winner.executor_type, ExecutorKind::Cursor);
-        assert!(winner.candidate_key.starts_with("cursor:"));
-        assert_eq!(winner.harness_capabilities.resume, api_types::CapabilitySupport::Native);
-        assert_eq!(*cursor_calls.lock().unwrap(), vec!["acct-b"]);
+        let result = executor.execute(ctx).await;
+        assert!(result.is_err(), "cross-harness fallback must be rejected");
+        assert!(cursor_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn same_harness_start_fallback_records_profile_b_capabilities() {
+    async fn same_agent_start_fallback_records_winning_model_capabilities() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = ScriptedAdapter::new(
             ExecutorKind::Smith,
             &[
-                ("acct-1", ScriptedBehavior::UnavailableAtDetect),
-                ("acct-2", ScriptedBehavior::Complete { usage_output_tokens: 3 }),
+                ("model-a", ScriptedBehavior::UnavailableAtDetect),
+                ("model-b", ScriptedBehavior::Complete { usage_output_tokens: 3 }),
             ],
         );
         let calls = Arc::clone(&adapter.calls);
+        let observed_configs = Arc::clone(&adapter.observed_configs);
         let mut registry = HarnessAdapterRegistry::new();
         registry.register(Box::new(adapter));
         let executor = FallbackExecutor::new(Arc::new(registry));
@@ -1481,11 +1512,12 @@ mod tests {
         let mut ctx = routed_ctx("same-harness-fallback", dir.path());
         ctx.agent_config = serde_json::json!({
             "executor_type": "smith",
-            "config": {"profile":"acct-1"},
+            "config": {"profile":"acct-1", "model":"model-a"},
+            "runtime_env": {"SMITH_API_KEY":"runtime-secret"},
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type":"smith","config":{"profile":"acct-2"}}
+                    {"executor_type":"smith","config":{"profile":"acct-1", "model":"model-b"}}
                 ]
             }
         });
@@ -1494,12 +1526,24 @@ mod tests {
         let winner = result.resolved_candidate.expect("winner recorded");
 
         assert_eq!(winner.executor_type, ExecutorKind::Smith);
-        assert_eq!(winner.config["profile"], "acct-2");
+        assert_eq!(winner.config["profile"], "acct-1");
+        assert_eq!(winner.config["model"], "model-b");
         assert_eq!(
             winner.harness_capabilities.structured_events,
             api_types::CapabilitySupport::Emulated
         );
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-2"]);
+        assert_eq!(
+            winner.candidate_key,
+            crate::config::candidate_key(
+                &ExecutorKind::Smith,
+                &serde_json::json!({"profile":"acct-1", "model":"model-b"})
+            )
+        );
+        assert!(winner.config.get("env").is_none());
+        let invoked_config = observed_configs.lock().unwrap()[0].clone();
+        assert_eq!(invoked_config["model"], "model-b");
+        assert_eq!(invoked_config["env"]["SMITH_API_KEY"], "runtime-secret");
+        assert_eq!(*calls.lock().unwrap(), vec!["model-b"]);
     }
 
     #[tokio::test]

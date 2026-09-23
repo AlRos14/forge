@@ -100,7 +100,7 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
 
     // Normalize before keying: legacy snapshots may hold un-normalized
     // configs, and `{}` must key identically to its normalized expansion.
-    let candidate_key_of = |value: &Value| -> Option<String> {
+    let candidate_of = |value: &Value| -> Option<(ExecutorKind, Value)> {
         let kind = value
             .get("executor_type")
             .and_then(Value::as_str)?
@@ -108,16 +108,33 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
             .ok()?;
         let config = value.get("config")?;
         let normalized = normalize_candidate_config(&kind, config, adapter_registry).ok()?;
-        Some(executors::candidate_key(&kind, &normalized))
+        Some((kind, normalized))
+    };
+    let candidate_key_of = |value: &Value| -> Option<String> {
+        let (kind, config) = candidate_of(value)?;
+        Some(executors::candidate_key(&kind, &config))
     };
 
-    let Some(parent_key) = candidate_key_of(&parent) else {
+    let Some((parent_kind, parent_config)) = candidate_of(&parent) else {
         return Err(ServiceError::invalid_operation(
             "cannot resolve exact HarnessSession candidate from parent snapshot",
         ));
     };
+    let Some((fresh_kind, fresh_config)) = candidate_of(&fresh) else {
+        return Err(ServiceError::invalid_operation(
+            "cannot resolve current Agent harness candidate for HarnessSession resume",
+        ));
+    };
+    executors::validate_same_agent_candidate(
+        &fresh_kind,
+        &fresh_config,
+        &parent_kind,
+        &parent_config,
+    )
+    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let parent_key = executors::candidate_key(&parent_kind, &parent_config);
 
-    if candidate_key_of(&fresh).as_deref() == Some(parent_key.as_str()) {
+    if executors::candidate_key(&fresh_kind, &fresh_config) == parent_key {
         return executor_snapshot_for_harness_resume(fresh_snapshot_json);
     }
 
@@ -172,7 +189,7 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
                 object.insert("config".to_owned(), candidate_config);
                 object.insert(
                     "harness_capabilities".to_owned(),
-                    serde_json::to_value(capabilities).map_err(|error| {
+                    serde_json::to_value(capabilities.snapshot()).map_err(|error| {
                         ServiceError::invalid_operation(format!(
                             "invalid HarnessCapabilities snapshot: {error}"
                         ))
@@ -291,7 +308,7 @@ pub(super) async fn build_executor_config_snapshot(
         "permission_policy": agent.permission_policy,
         "config": normalized_config,
         "capabilities": capabilities,
-        "harness_capabilities": harness_capabilities,
+        "harness_capabilities": harness_capabilities.snapshot(),
         // Keep both the Agent's explicit daemon binding and the daemon chosen
         // for this Execution. The resolved daemon is routing, not Agent
         // identity, but it is factual host provenance for host-local usage.
@@ -366,6 +383,9 @@ pub(crate) fn apply_route_outcome_to_snapshot(
     if !has_routing && outcome.selected.is_none() {
         return Ok(None);
     }
+    if let Some((candidate_key, executor_type, config, _, _)) = &outcome.selected {
+        validate_route_winner(&snapshot, candidate_key, executor_type, config)?;
+    }
     let Some(object) = snapshot.as_object_mut() else {
         return Ok(None);
     };
@@ -378,8 +398,28 @@ pub(crate) fn apply_route_outcome_to_snapshot(
         );
         object.insert("config".to_owned(), config.clone());
         object.insert("harness_capabilities".to_owned(), harness_capabilities.clone());
+        for key in ["model", "permission_policy"] {
+            match config.get(key) {
+                Some(value) => {
+                    object.insert(key.to_owned(), value.clone());
+                }
+                None => {
+                    object.remove(key);
+                }
+            }
+        }
+        let reasoning_effort = config
+            .get("model_reasoning_effort")
+            .or_else(|| config.get("effort"));
+        if let Some(value) = reasoning_effort {
+            object.insert("reasoning_effort".to_owned(), value.clone());
+        } else {
+            object.remove("reasoning_effort");
+        }
         if let Some(effective_policy) = effective_policy {
             object.insert("effective_execution_policy".to_owned(), effective_policy.clone());
+        } else {
+            object.remove("effective_execution_policy");
         }
     }
     if !has_routing {
@@ -421,6 +461,61 @@ pub(crate) fn apply_route_outcome_to_snapshot(
     serde_json::to_string(&snapshot).map(Some).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
     })
+}
+
+fn validate_route_winner(
+    snapshot: &Value,
+    selected_key: &str,
+    executor_type: &str,
+    config: &Value,
+) -> Result<()> {
+    let primary_kind = snapshot
+        .get("executor_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ServiceError::invalid_operation("executor snapshot missing executor_type"))?
+        .parse::<ExecutorKind>()
+        .map_err(ServiceError::invalid_operation)?;
+    let primary_config = snapshot
+        .get("config")
+        .ok_or_else(|| ServiceError::invalid_operation("executor snapshot missing config"))?;
+    let winner_kind = executor_type
+        .parse::<ExecutorKind>()
+        .map_err(ServiceError::invalid_operation)?;
+    executors::validate_same_agent_candidate(
+        &primary_kind,
+        primary_config,
+        &winner_kind,
+        config,
+    )
+    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+
+    let expected_key = executors::candidate_key(&winner_kind, config);
+    if selected_key != expected_key {
+        return Err(ServiceError::invalid_operation(
+            "resolved candidate key does not match the winner config",
+        ));
+    }
+
+    if let Some(routing_value) = snapshot.get(executors::ROUTING_SNAPSHOT_KEY) {
+        let routing: executors::ExecutorRouting = serde_json::from_value(routing_value.clone())
+            .map_err(|error| ServiceError::invalid_operation(format!("invalid routing snapshot: {error}")))?;
+        let is_configured = routing.candidates.iter().any(|candidate| {
+            candidate.executor_type == winner_kind
+                && candidate.config == *config
+                && executors::candidate_key(&candidate.executor_type, &candidate.config)
+                    == selected_key
+        });
+        if !is_configured {
+            return Err(ServiceError::invalid_operation(
+                "resolved candidate is not present in the immutable execution route",
+            ));
+        }
+    } else if selected_key != executors::candidate_key(&primary_kind, primary_config) {
+        return Err(ServiceError::invalid_operation(
+            "single-candidate execution resolved to a different candidate",
+        ));
+    }
+    Ok(())
 }
 
 /// Build the validated `routing` snapshot block, or `None` when the agent
@@ -481,6 +576,36 @@ fn routing_snapshot_value(
     serde_json::to_value(&routing).map(Some).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid routing snapshot: {error}"))
     })
+}
+
+/// Revalidate persisted routes at both local and remote dispatch boundaries.
+/// This rejects pre-PR3 routes that could otherwise make one Agent run as a
+/// different harness/account after the profile was saved.
+pub(super) fn validate_agent_routing_snapshot(snapshot: &Value) -> Result<()> {
+    let Some(routing_value) = snapshot.get(executors::ROUTING_SNAPSHOT_KEY) else {
+        return Ok(());
+    };
+    let primary_kind = snapshot
+        .get("executor_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ServiceError::invalid_operation("executor snapshot missing executor_type"))?
+        .parse::<ExecutorKind>()
+        .map_err(ServiceError::invalid_operation)?;
+    let primary_config = snapshot
+        .get("config")
+        .ok_or_else(|| ServiceError::invalid_operation("executor snapshot missing config"))?;
+    let routing: executors::ExecutorRouting = serde_json::from_value(routing_value.clone())
+        .map_err(|error| ServiceError::invalid_operation(format!("invalid routing snapshot: {error}")))?;
+    for candidate in routing.candidates {
+        executors::validate_same_agent_candidate(
+            &primary_kind,
+            primary_config,
+            &candidate.executor_type,
+            &candidate.config,
+        )
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn normalize_candidate_config(
@@ -544,19 +669,57 @@ fn effective_harness_policy(
         return Ok(None);
     }
     let policy_for = |registry: &executors::HarnessAdapterRegistry| {
-        registry
-            .get(kind)
-            .map(|adapter| adapter.effective_execution_policy(normalized_config, None, None))
-            .ok_or_else(|| {
-                executors::ExecutorError::Other(format!(
-                    "No HarnessAdapter registered for {kind}"
-                ))
-            })
+        let adapter = registry.get(kind).ok_or_else(|| {
+            executors::ExecutorError::Other(format!(
+                "No HarnessAdapter registered for {kind}"
+            ))
+        })?;
+        let interpretation = adapter.interpret_execution_policy(normalized_config);
+        Ok(executors::effective_policy::from_adapter_interpretation(
+            kind,
+            &interpretation,
+            None,
+            None,
+            normalized_config,
+        ))
     };
     match adapter_registry {
         Some(registry) => policy_for(registry).map(Some),
         None => policy_for(&cli_adapters::default_registry()).map(Some),
     }
+}
+
+pub(crate) fn recompute_effective_policy_for_route_winner(
+    executor_type: &str,
+    config: &Value,
+    adapter_registry: Option<&executors::HarnessAdapterRegistry>,
+    effective_cwd: Option<&str>,
+) -> Option<Value> {
+    let kind = executor_type.parse::<ExecutorKind>().ok()?;
+    if kind == ExecutorKind::Embedded {
+        return None;
+    }
+    let default_registry;
+    let registry = match adapter_registry {
+        Some(registry) => registry,
+        None => {
+            default_registry = cli_adapters::default_registry();
+            &default_registry
+        }
+    };
+    let adapter = registry.get(&kind)?;
+    let normalized = adapter
+        .normalize_config(config, &ExecutionOverrides::default())
+        .ok()?;
+    let interpretation = adapter.interpret_execution_policy(&normalized);
+    serde_json::to_value(executors::effective_policy::from_adapter_interpretation(
+        &kind,
+        &interpretation,
+        effective_cwd,
+        None,
+        &normalized,
+    ))
+    .ok()
 }
 
 pub(super) async fn create_failed_execution_record(
@@ -698,7 +861,7 @@ pub(super) fn execution_overrides_to_config_layer(
 ) -> Result<Value> {
     let mut layer = json!({});
     if let Some(overrides) = overrides {
-        merge_overrides(&mut layer, &overrides)?;
+        executors::merge_overrides(&mut layer, &overrides)?;
     }
     Ok(layer)
 }
@@ -795,20 +958,28 @@ mod tests {
         let routing = routing_snapshot_value(
             ExecutorKind::Smith,
             &primary,
-            &[serde_json::json!({"executor_type": "claude_code", "config": {}})],
+            &[serde_json::json!({
+                "executor_type": "smith",
+                "config": {"profile": "acct-1", "model": "model-b"}
+            })],
             None,
         )
         .expect("routing builds")
         .expect("routing present");
         assert_eq!(routing["policy"], "ordered_fallback_v1");
         assert_eq!(routing["candidates"].as_array().unwrap().len(), 2);
-        assert_eq!(routing["candidates"][1]["executor_type"], "claude_code");
+        assert_eq!(routing["candidates"][1]["executor_type"], "smith");
+        assert_eq!(routing["candidates"][1]["config"]["model"], "model-b");
     }
 
     fn smith_snapshot(profile: &str, with_routing: bool) -> String {
+        smith_snapshot_for(profile, "model-a", with_routing)
+    }
+
+    fn smith_snapshot_for(profile: &str, model: &str, with_routing: bool) -> String {
         let config = normalize_candidate_config(
             &ExecutorKind::Smith,
-            &serde_json::json!({"profile": profile}),
+            &serde_json::json!({"profile": profile, "model": model}),
             None,
         )
         .expect("config resolves");
@@ -828,14 +999,17 @@ mod tests {
         let mut snapshot = serde_json::json!({
             "executor_type": "smith",
             "config": config,
-            "harness_capabilities": capabilities,
+            "harness_capabilities": capabilities.snapshot(),
             "effective_execution_policy": effective_policy,
         });
         if with_routing {
             let routing = routing_snapshot_value(
                 ExecutorKind::Smith,
                 &snapshot["config"],
-                &[serde_json::json!({"executor_type": "smith", "config": {"profile": "acct-2"}})],
+                &[serde_json::json!({
+                    "executor_type": "smith",
+                    "config": {"profile": profile, "model": "model-b"}
+                })],
                 None,
             )
             .expect("routing builds")
@@ -862,12 +1036,13 @@ mod tests {
         let fresh = smith_snapshot("acct-1", true);
         // Parent ran on the fallback candidate acct-2 (its winner was
         // persisted at top level).
-        let parent = smith_snapshot("acct-2", false);
+        let parent = smith_snapshot_for("acct-1", "model-b", false);
 
         let resumed = executor_snapshot_with_sticky_candidate(&fresh, &parent, None)
             .expect("sticky resume succeeds");
         let snapshot: Value = serde_json::from_str(&resumed).unwrap();
-        assert_eq!(snapshot["config"]["profile"], "acct-2");
+        assert_eq!(snapshot["config"]["profile"], "acct-1");
+        assert_eq!(snapshot["config"]["model"], "model-b");
         assert_eq!(snapshot["dispatch_metadata"]["execution_policy"], "explicit_harness_session");
         // The full route stays available for fallback.
         assert_eq!(
@@ -877,9 +1052,9 @@ mod tests {
     }
 
     #[test]
-    fn sticky_resume_promotes_cross_harness_capabilities_and_policy() {
+    fn sticky_resume_rejects_cross_harness_candidate() {
         let registry = cli_adapters::default_registry();
-        let mut fresh: Value = serde_json::from_str(&smith_snapshot("acct-1", false)).unwrap();
+        let fresh: Value = serde_json::from_str(&smith_snapshot("acct-1", false)).unwrap();
         let fallback = normalize_candidate_config(
             &ExecutorKind::ClaudeCode,
             &json!({}),
@@ -895,45 +1070,27 @@ mod tests {
             })],
             Some(&registry),
         )
-        .expect("route validates")
-        .expect("fallback route exists");
-        fresh[executors::ROUTING_SNAPSHOT_KEY] = routing;
-        let parent = json!({
-            "executor_type": "claude_code",
-            "config": normalize_candidate_config(
-                &ExecutorKind::ClaudeCode,
-                &json!({}),
-                Some(&registry),
-            )
-            .expect("parent config normalizes"),
-        })
-        .to_string();
+        .expect_err("cross-harness fallback is rejected at route creation");
+        assert!(routing.to_string().contains("changes Agent harness identity"));
 
-        let resumed = executor_snapshot_with_sticky_candidate(
-            &fresh.to_string(),
-            &parent,
+        let legacy_route = json!({
+            "executor_type": "smith",
+            "config": fresh["config"],
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type":"smith", "config": fresh["config"]},
+                    {"executor_type":"claude_code", "config": {}}
+                ]
+            }
+        });
+        let claude_parent = json!({"executor_type":"claude_code", "config":{}}).to_string();
+        assert!(executor_snapshot_with_sticky_candidate(
+            &legacy_route.to_string(),
+            &claude_parent,
             Some(&registry),
         )
-        .expect("cross-harness sticky resume succeeds");
-        let resumed: Value = serde_json::from_str(&resumed).unwrap();
-        let claude = registry
-            .get(&ExecutorKind::ClaudeCode)
-            .expect("Claude Code adapter registered");
-        let expected_capabilities = claude.capabilities(&resumed["config"]);
-        let expected_policy =
-            claude.effective_execution_policy(&resumed["config"], None, None);
-
-        assert_eq!(resumed["executor_type"], "claude_code");
-        assert_eq!(
-            resumed["harness_capabilities"],
-            serde_json::to_value(expected_capabilities).unwrap()
-        );
-        assert_eq!(
-            resumed["effective_execution_policy"],
-            serde_json::to_value(expected_policy).unwrap()
-        );
-        assert_eq!(resumed["harness_capabilities"]["planning"], "native");
-        assert_eq!(resumed["dispatch_metadata"]["execution_policy"], "explicit_harness_session");
+        .is_err());
     }
 
     #[test]
@@ -982,24 +1139,29 @@ mod tests {
 
     #[test]
     fn apply_route_outcome_records_winner_attempts_and_disposition() {
-        let snapshot = smith_snapshot("acct-1", true);
+        let snapshot_value: Value = serde_json::from_str(&smith_snapshot("acct-1", true)).unwrap();
+        let first = &snapshot_value["routing"]["candidates"][0];
+        let winner = &snapshot_value["routing"]["candidates"][1];
+        let winner_kind = ExecutorKind::Smith;
+        let winner_config = winner["config"].clone();
+        let winner_key = executors::candidate_key(&winner_kind, &winner_config);
+        let first_key = executors::candidate_key(
+            &ExecutorKind::Smith,
+            &first["config"],
+        );
+        let unknown_capabilities = api_types::HarnessCapabilities::unknown().snapshot();
+        let snapshot = snapshot_value.to_string();
         let outcome = RouteOutcome {
             selected: Some((
-                "smith:profile=acct-2#test".to_owned(),
+                winner_key.clone(),
                 "smith".to_owned(),
-                serde_json::json!({"profile": "acct-2"}),
-                serde_json::json!({"resume": "native"}),
-                Some(serde_json::json!({"isolation_posture": "not_applicable"})),
+                winner_config.clone(),
+                serde_json::to_value(unknown_capabilities).unwrap(),
+                None,
             )),
             attempts: vec![
-                (
-                    "smith:profile=acct-1#test".to_owned(),
-                    "usage_exhausted".to_owned(),
-                ),
-                (
-                    "smith:profile=acct-2#test".to_owned(),
-                    "completed".to_owned(),
-                ),
+                (first_key, "unavailable".to_owned()),
+                (winner_key.clone(), "completed".to_owned()),
             ],
             unavailable_retry_at: None,
         };
@@ -1008,25 +1170,117 @@ mod tests {
             .expect("outcome applies")
             .expect("routed snapshot updates");
         let value: Value = serde_json::from_str(&updated).unwrap();
-        assert_eq!(value["config"]["profile"], "acct-2");
+        assert_eq!(value["config"]["profile"], "acct-1");
+        assert_eq!(value["config"]["model"], "model-b");
         assert_eq!(
             value["routing"]["selected_candidate_key"],
-            "smith:profile=acct-2#test"
+            winner_key
         );
         assert_eq!(
-            value["routing"]["attempts"][0]["outcome"],
-            "usage_exhausted"
+            value["routing"]["attempts"][0]["outcome"], "unavailable"
         );
+        assert_eq!(value["harness_capabilities"]["schema_version"], 1);
+        assert_eq!(value["harness_capabilities"]["capabilities"]["resume"], "unknown");
+        assert!(value.get("effective_execution_policy").is_none());
         // Provenance: the configured route is retained.
         assert_eq!(value["routing"]["candidates"].as_array().unwrap().len(), 2);
 
         // Single-candidate snapshots also record the actual invocation winner.
         let legacy = smith_snapshot("acct-1", false);
-        let updated = apply_route_outcome_to_snapshot(&legacy, &outcome)
+        let primary_value: Value = serde_json::from_str(&legacy).unwrap();
+        let primary_config = primary_value["config"].clone();
+        let primary_key = executors::candidate_key(&ExecutorKind::Smith, &primary_config);
+        let adapter = cli_adapters::default_registry();
+        let primary_capabilities = adapter
+            .get(&ExecutorKind::Smith)
+            .unwrap()
+            .capabilities(&primary_config);
+        let primary_outcome = RouteOutcome {
+            selected: Some((
+                primary_key,
+                "smith".to_owned(),
+                primary_config,
+                serde_json::to_value(primary_capabilities.snapshot()).unwrap(),
+                None,
+            )),
+            ..RouteOutcome::default()
+        };
+        let updated = apply_route_outcome_to_snapshot(&legacy, &primary_outcome)
             .expect("legacy path succeeds")
             .expect("winner capability snapshot is added");
         let updated: Value = serde_json::from_str(&updated).unwrap();
-        assert_eq!(updated["harness_capabilities"]["resume"], "native");
+        assert_eq!(updated["harness_capabilities"]["schema_version"], 1);
+        assert_eq!(updated["harness_capabilities"]["capabilities"]["resume"], "native");
+    }
+
+    #[test]
+    fn old_remote_winner_cannot_inherit_primary_candidate_evidence() {
+        let snapshot_value: Value = serde_json::from_str(&smith_snapshot("acct-1", true)).unwrap();
+        let primary_policy = snapshot_value["effective_execution_policy"].clone();
+        assert!(!primary_policy.is_null());
+        let winner = &snapshot_value["routing"]["candidates"][1];
+        let winner_config = winner["config"].clone();
+        let winner_key = executors::candidate_key(&ExecutorKind::Smith, &winner_config);
+        let outcome = RouteOutcome {
+            selected: Some((
+                winner_key,
+                "smith".to_owned(),
+                winner_config,
+                serde_json::to_value(
+                    api_types::HarnessCapabilities::unknown().snapshot(),
+                )
+                .unwrap(),
+                None,
+            )),
+            ..RouteOutcome::default()
+        };
+
+        let resolved = apply_route_outcome_to_snapshot(&snapshot_value.to_string(), &outcome)
+            .expect("legacy remote winner snapshot applies")
+            .expect("route result persists");
+        let resolved: Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(resolved["harness_capabilities"]["capabilities"]["resume"], "unknown");
+        assert!(resolved.get("effective_execution_policy").is_none());
+        assert_eq!(
+            resolved["routing"]["selected_candidate_key"],
+            resolved["routing"]["candidates"][1]
+                .get("config")
+                .map(|config| executors::candidate_key(&ExecutorKind::Smith, config))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_route_rejects_harness_and_identity_account_switches_but_allows_run_settings() {
+        let cross_harness = json!({
+            "executor_type":"codex",
+            "config":{"env":{"CODEX_HOME":"/accounts/a"}},
+            "routing":{"policy":"ordered_fallback_v1","candidates":[
+                {"executor_type":"codex","config":{"env":{"CODEX_HOME":"/accounts/a"}}},
+                {"executor_type":"cursor","config":{}}
+            ]}
+        });
+        assert!(validate_agent_routing_snapshot(&cross_harness).is_err());
+
+        let account_switch = json!({
+            "executor_type":"codex",
+            "config":{"env":{"CODEX_HOME":"/accounts/a"}},
+            "routing":{"policy":"ordered_fallback_v1","candidates":[
+                {"executor_type":"codex","config":{"env":{"CODEX_HOME":"/accounts/a"}}},
+                {"executor_type":"codex","config":{"env":{"CODEX_HOME":"/accounts/b"}}}
+            ]}
+        });
+        assert!(validate_agent_routing_snapshot(&account_switch).is_err());
+
+        let same_agent_profile_variation = json!({
+            "executor_type":"codex",
+            "config":{"env":{"CODEX_HOME":"/accounts/a"},"model":"model-a","model_reasoning_effort":"low"},
+            "routing":{"policy":"ordered_fallback_v1","candidates":[
+                {"executor_type":"codex","config":{"env":{"CODEX_HOME":"/accounts/a"},"model":"model-a","model_reasoning_effort":"low"}},
+                {"executor_type":"codex","config":{"env":{"CODEX_HOME":"/accounts/a"},"model":"model-b","model_reasoning_effort":"high","sandbox":"read-only"}}
+            ]}
+        });
+        assert!(validate_agent_routing_snapshot(&same_agent_profile_variation).is_ok());
     }
 
     #[test]

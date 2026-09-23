@@ -1371,6 +1371,36 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
     .expect("bounded historical lookup succeeds");
     assert_eq!(unambiguous.as_deref(), Some("legacy-thread"));
 
+    let mut unsupported_legacy_harness = historical.clone();
+    unsupported_legacy_harness.executor_config_snapshot_json = Some(
+        serde_json::json!({"agent_id":agent_id.clone(),"executor_type":"shell","config":{}})
+            .to_string(),
+    );
+    let unsupported = crate::task_service::resumable_external_session(
+        &db,
+        &unsupported_legacy_harness,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("unsupported legacy evidence fails closed without an error");
+    assert_eq!(unsupported, None);
+
+    let mut mismatched_legacy_agent = historical.clone();
+    mismatched_legacy_agent.executor_config_snapshot_json = Some(
+        serde_json::json!({"agent_id":"another-agent","executor_type":"codex","config":{}})
+            .to_string(),
+    );
+    let mismatched = crate::task_service::resumable_external_session(
+        &db,
+        &mismatched_legacy_agent,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("contradictory legacy evidence fails closed without an error");
+    assert_eq!(mismatched, None);
+
     sqlx::query(
         "INSERT INTO execution_session_migration_issue
          (id, execution_id, issue_kind, details_json, created_at)
@@ -1638,10 +1668,10 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
 
     assert_eq!(follow_up.agent_id.as_deref(), Some(agent_a.as_str()));
     assert_ne!(
-        follow_up.execution.harness_session_id,
+        follow_up.harness_session_id,
         parent_execution.harness_session_id
     );
-    assert!(follow_up.execution.agent_session_id.is_none());
+    assert!(follow_up.agent_session_id.is_none());
     let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
         .await
         .expect("historical parent loads")

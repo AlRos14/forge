@@ -137,7 +137,7 @@ fn harness_capabilities_for(executor_type: &str) -> serde_json::Value {
         "shell" => capabilities["cancel"] = serde_json::json!("emulated"),
         _ => {}
     }
-    capabilities
+    serde_json::json!({"schema_version": 1, "capabilities": capabilities})
 }
 
 async fn seed_workspaces(db: &SqliteDb, task_id: &str) -> (String, String) {
@@ -555,13 +555,13 @@ async fn unresolved_ordered_fallback_does_not_create_speculative_session() {
             "agent_id": "pr2-agent-routed",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "codex-primary"},
+            "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "codex-primary"}},
-                    {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"}},
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-b"}}
                 ]
             }
         })
@@ -602,12 +602,12 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
             "agent_id": "pr2-agent-unresolved-result",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "primary"},
+            "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"},
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "primary"}},
-                    {"executor_type": "cursor", "config": {"account": "fallback"}}
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"}},
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-b"}}
                 ]
             }
         })
@@ -633,7 +633,7 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
 }
 
 #[tokio::test]
-async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently() {
+async fn cross_harness_winner_cannot_materialize_under_a_different_agent_identity() {
     let db = database().await;
     let profile_id = seed_agent(&db, "pr2-agent-cross-route", "codex").await;
     let task_id = seed_task(&db, "cross-route").await;
@@ -653,12 +653,12 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
             "agent_id": "pr2-agent-cross-route",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "codex-primary"},
+            "config": {"env":{"CODEX_HOME":"/accounts/codex-a"}},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/codex-a"}}},
                     {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
                 ]
             }
@@ -681,7 +681,7 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
             "policy": "ordered_fallback_v1",
             "selected_candidate_key": "cursor:fallback",
             "candidates": [
-                {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/codex-a"}}},
                 {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
             ]
         }
@@ -689,41 +689,10 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
     .to_string();
     let mut result = result_update(&execution.id, Some("cursor-thread"));
     result.executor_config_snapshot_json = Some(Some(resolved_snapshot.clone()));
-    let completed = ExecutionRepo::update(&db, result.clone())
+    let error = ExecutionRepo::update(&db, result.clone())
         .await
-        .expect("resolved route and session result persist atomically");
-    let session_id = completed
-        .harness_session_id
-        .as_deref()
-        .expect("result materializes a generic session");
-    assert_eq!(completed.agent_session_id.as_deref(), Some("cursor-thread"));
-    let persisted_snapshot: serde_json::Value = serde_json::from_str(
-        completed
-            .executor_config_snapshot_json
-            .as_deref()
-            .expect("resolved execution snapshot persists"),
-    )
-    .expect("resolved snapshot parses");
-    assert_eq!(persisted_snapshot["executor_type"], "cursor");
-    let session = HarnessSessionRepo::get_by_id(&db, session_id)
-        .await
-        .expect("HarnessSession loads")
-        .expect("HarnessSession exists");
-    let session_snapshot: serde_json::Value =
-        serde_json::from_str(&session.profile_snapshot_json).expect("session snapshot parses");
-    assert_eq!(session.harness_kind, "cursor");
-    assert_eq!(session.external_session_id.as_deref(), Some("cursor-thread"));
-    assert_eq!(session_snapshot["config"]["account"], "cursor-fallback");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&session.capabilities_snapshot_json)
-            .expect("typed Cursor capabilities parse"),
-        harness_capabilities_for("cursor")
-    );
-
-    let repeated = ExecutionRepo::update(&db, result)
-        .await
-        .expect("identical routed result is idempotent");
-    assert_eq!(repeated.harness_session_id.as_deref(), Some(session_id));
+        .expect_err("cross-harness result cannot impersonate the Agent identity");
+    assert!(matches!(error, DbError::Check(_)));
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM harness_session
          WHERE agent_id = 'pr2-agent-cross-route'
@@ -733,7 +702,7 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
     .fetch_one(db.pool())
     .await
     .expect("routed session count loads");
-    assert_eq!(count, 1);
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -757,13 +726,13 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
             "agent_id": "pr2-agent-same-route",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "profile-a"},
+            "config": {"profile": "same-account", "model": "model-a"},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "profile-a"}},
-                    {"executor_type": "codex", "config": {"account": "profile-b"}}
+                    {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-a"}},
+                    {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-b"}}
                 ]
             }
         })
@@ -778,15 +747,15 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
         "agent_id": "pr2-agent-same-route",
         "profile_id": profile_id,
         "executor_type": "codex",
-        "config": {"account": "profile-b"},
+        "config": {"profile": "same-account", "model": "model-b"},
         "capabilities": ["read", "profile-b-capability"],
         "harness_capabilities": harness_capabilities_for("codex"),
         "routing": {
             "policy": "ordered_fallback_v1",
-            "selected_candidate_key": "codex:profile-b",
+            "selected_candidate_key": "codex:same-account:model-b",
             "candidates": [
-                {"executor_type": "codex", "config": {"account": "profile-a"}},
-                {"executor_type": "codex", "config": {"account": "profile-b"}}
+                {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-a"}},
+                {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-b"}}
             ]
         }
     })
@@ -807,8 +776,8 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
     let session_snapshot: serde_json::Value =
         serde_json::from_str(&session.profile_snapshot_json).expect("session snapshot parses");
     assert_eq!(session.harness_kind, "codex");
-    assert_eq!(session_snapshot["config"]["account"], "profile-b");
-    assert_ne!(session_snapshot["config"]["account"], "profile-a");
+    assert_eq!(session_snapshot["config"]["profile"], "same-account");
+    assert_eq!(session_snapshot["config"]["model"], "model-b");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&session.capabilities_snapshot_json)
             .expect("typed Codex capabilities parse"),
@@ -819,14 +788,14 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
 #[tokio::test]
 async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
     let db = database().await;
-    let profile_id = seed_agent(&db, "pr2-agent-routed-shell", "codex").await;
+    let profile_id = seed_agent(&db, "pr2-agent-routed-shell", "shell").await;
     let task_id = seed_task(&db, "routed-shell").await;
     let mut input = execution_input(
         "pr2-execution-routed-shell",
         &task_id,
         "pr2-agent-routed-shell",
         &profile_id,
-        "codex",
+        "shell",
         ExecutionPurpose::Implement,
         None,
         None,
@@ -836,14 +805,14 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         serde_json::json!({
             "agent_id": "pr2-agent-routed-shell",
             "profile_id": profile_id,
-            "executor_type": "codex",
-            "config": {},
+            "executor_type": "shell",
+            "config": {"command":"echo primary"},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {}},
-                    {"executor_type": "shell", "config": {}}
+                    {"executor_type": "shell", "config": {"command":"echo primary"}},
+                    {"executor_type": "shell", "config": {"command":"echo fallback"}}
                 ]
             }
         })
@@ -856,14 +825,14 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         "agent_id": "pr2-agent-routed-shell",
         "profile_id": profile_id,
         "executor_type": "shell",
-        "config": {},
+        "config": {"command":"echo fallback"},
         "capabilities": ["read"],
         "routing": {
             "policy": "ordered_fallback_v1",
             "selected_candidate_key": "shell:fallback",
             "candidates": [
-                {"executor_type": "codex", "config": {}},
-                {"executor_type": "shell", "config": {}}
+                {"executor_type": "shell", "config": {"command":"echo primary"}},
+                {"executor_type": "shell", "config": {"command":"echo fallback"}}
             ]
         }
     })

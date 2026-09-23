@@ -9,10 +9,13 @@ use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::Result;
 use api_types::{
     DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
-    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
+    DaemonProtocolCapabilities, DaemonProtocolCapabilitiesRequest, ExecutionStartParams,
+    ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
     FsListParams, RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt,
     RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
     METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
+    METHOD_PROTOCOL_CAPABILITIES, DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
     METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
     METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
@@ -204,6 +207,21 @@ impl DaemonRuntime {
         };
 
         match method.as_str() {
+            METHOD_PROTOCOL_CAPABILITIES => {
+                match decode_params::<DaemonProtocolCapabilitiesRequest>(&id, params) {
+                    Ok(_) => response_frame(
+                        id,
+                        DaemonProtocolCapabilities {
+                            schema_version: 1,
+                            features: vec![
+                                DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
+                                DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                            ],
+                        },
+                    ),
+                    Err(frame) => frame,
+                }
+            }
             METHOD_FS_LIST => match decode_params::<FsListParams>(&id, params) {
                 Ok(params) => match daemon_fs::list_entries(params, &self.workspace_root).await {
                     Ok(result) => response_frame(id, result),
@@ -439,6 +457,12 @@ fn spawn_account_usage_probe(
         .and_then(Value::as_str)?
         .parse::<executors::ExecutorKind>()
         .ok()?;
+    // PR0A's periodic account quota observation is Cursor-specific. Other
+    // HarnessAdapters may expose an explicit probe without changing this
+    // scheduling/accounting policy.
+    if kind != executors::ExecutorKind::Cursor {
+        return None;
+    }
     let config = agent_config.get("config").cloned().unwrap_or(Value::Null);
     let execution_id = execution_id.to_owned();
     let cancel = CancellationToken::new();
@@ -530,7 +554,7 @@ fn terminal_notification_from_result(
                 candidate_key: candidate.candidate_key,
                 executor_type: candidate.executor_type.to_string(),
                 config: candidate.config,
-                harness_capabilities: candidate.harness_capabilities,
+                harness_capabilities: Some(candidate.harness_capabilities.snapshot()),
                 effective_policy: Some(candidate.effective_policy),
             }),
         route_attempts: if result.route_attempts.is_empty() {
@@ -712,8 +736,9 @@ mod tests {
 
     use super::*;
     use api_types::{
-        ExecutionLogNotification, FsListResult, METHOD_EXECUTION_LOG, METHOD_EXECUTION_TERMINAL,
-        METHOD_FS_LIST,
+        ExecutionLogNotification, FsListResult,
+        DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, METHOD_EXECUTION_LOG,
+        METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES,
     };
     use async_trait::async_trait;
     use executors::{
@@ -799,6 +824,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_advertises_generic_harness_invocation_protocol() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let response = runtime
+            .handle_request(DaemonFrame::Request {
+                id: "protocol-1".to_owned(),
+                method: METHOD_PROTOCOL_CAPABILITIES.to_owned(),
+                params: serde_json::json!({}),
+            })
+            .await;
+        let DaemonFrame::Response { result, .. } = response else {
+            panic!("expected protocol capability response");
+        };
+        let capabilities: DaemonProtocolCapabilities =
+            serde_json::from_value(result).expect("protocol response parses");
+        assert!(capabilities.supports(DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1));
+        assert!(capabilities.supports(DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1));
+    }
+
+    #[tokio::test]
     async fn shell_execution_reports_completion_notification() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -874,8 +920,18 @@ mod tests {
         let winner = terminal
             .resolved_candidate
             .expect("remote result includes the selected adapter");
-        assert_eq!(winner.harness_capabilities.resume, api_types::CapabilitySupport::Native);
-        assert_eq!(winner.harness_capabilities.cancel, api_types::CapabilitySupport::Emulated);
+        let capabilities = winner
+            .harness_capabilities
+            .expect("remote winner carries versioned capability evidence");
+        let api_types::HarnessCapabilitiesSnapshotRead::VersionedV1(capabilities) =
+            api_types::HarnessCapabilitiesSnapshot::from_value(
+                &serde_json::to_value(capabilities).unwrap(),
+            )
+        else {
+            panic!("winner capability evidence is readable");
+        };
+        assert_eq!(capabilities.resume, api_types::CapabilitySupport::Native);
+        assert_eq!(capabilities.cancel, api_types::CapabilitySupport::Emulated);
     }
 
     #[cfg(unix)]

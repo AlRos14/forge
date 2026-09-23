@@ -12,7 +12,7 @@ use serde_json::json;
 use sqlx::Row;
 
 use super::{
-    DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler,
+    DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler, ExecutionProvider,
     ServerExecutionEventSink,
 };
 use crate::ServiceError;
@@ -253,6 +253,243 @@ async fn daemon_transport_registry_happy_path_completes_typed_response() {
 
     assert_eq!(result.message, "ok");
     handle.await.expect("dispatcher task joins");
+}
+
+#[tokio::test]
+async fn remote_resume_requires_protocol_feature_and_dispatches_exact_session() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("daemon-1".to_owned());
+    registry.register("daemon-1".to_owned(), connection);
+    let dispatcher = registry.clone();
+    let handle = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request {
+            id: capability_id,
+            method,
+            ..
+        } = outbound.recv().await.expect("capability request sent")
+        else {
+            panic!("expected capability request");
+        };
+        assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+        dispatcher.dispatch_incoming(
+            "daemon-1",
+            api_types::DaemonFrame::Response {
+                id: capability_id,
+                result: json!({
+                    "schema_version": 1,
+                    "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+                }),
+            },
+        );
+
+        let api_types::DaemonFrame::Request {
+            id: start_id,
+            method,
+            params,
+        } = outbound.recv().await.expect("execution request sent")
+        else {
+            panic!("expected execution request");
+        };
+        assert_eq!(method, api_types::METHOD_EXECUTION_START);
+        assert_eq!(
+            params["invocation"],
+            json!({"type":"resume", "external_session_id":"session-exact-7"})
+        );
+        dispatcher.dispatch_incoming(
+            "daemon-1",
+            api_types::DaemonFrame::Response {
+                id: start_id,
+                result: json!({"execution_id":"execution-1", "accepted":true}),
+            },
+        );
+    });
+
+    let provider = super::RemoteExecutionProvider::new(registry, "daemon-1".to_owned());
+    let result = provider
+        .start(api_types::ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            role: "worker".to_owned(),
+            workspace_path: "/work".to_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: json!({"executor_type":"codex","config":{}}),
+            prompt: json!({"description":"resume"}),
+            invocation: api_types::HarnessInvocation::Resume {
+                external_session_id: "session-exact-7".to_owned(),
+            },
+            max_turns: None,
+        })
+        .await
+        .expect("supported Resume dispatches");
+    assert!(result.accepted);
+    handle.await.expect("daemon exchange joins");
+}
+
+#[tokio::test]
+async fn new_server_start_rejects_pre_pr3_daemon_before_dispatch() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("daemon-legacy".to_owned());
+    registry.register("daemon-legacy".to_owned(), connection);
+    let dispatcher = registry.clone();
+    let handle = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request { id, method, params } =
+            outbound.recv().await.expect("protocol check is sent first")
+        else {
+            panic!("expected protocol request");
+        };
+        assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+        assert!(params.is_object());
+        dispatcher.dispatch_incoming(
+            "daemon-legacy",
+            api_types::DaemonFrame::Error {
+                id: Some(id),
+                error: api_types::DaemonErrorPayload {
+                    code: api_types::UNSUPPORTED_METHOD.to_owned(),
+                    message: "pre-PR3 daemon has no protocol capability endpoint".to_owned(),
+                    details: None,
+                },
+            },
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(40), outbound.recv())
+            .await
+            .is_err(), "Start must not be sent without proven generic invocation support");
+    });
+
+    let provider = super::RemoteExecutionProvider::new(
+        registry,
+        "daemon-legacy".to_owned(),
+    );
+    let result = provider
+        .start(api_types::ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-legacy-start".to_owned(),
+            role: "coder".to_owned(),
+            workspace_path: "/work".to_owned(),
+            executor_type: "codex".to_owned(),
+            // A legacy provider session field could turn Start into a
+            // continuation when an older daemon ignores `invocation`.
+            executor_config: json!({"executor_type":"codex","config":{"resume_thread_id":"stale"}}),
+            prompt: json!({"description":"fresh start"}),
+            invocation: api_types::HarnessInvocation::Start,
+            max_turns: None,
+        })
+        .await
+        .expect_err("old daemon must be rejected before interpreting stale resume config");
+    assert!(matches!(result, ServiceError::InvalidOperation { .. }));
+    handle.await.expect("old daemon rejection joins");
+}
+
+#[tokio::test]
+async fn remote_resume_rejects_old_or_unknown_daemon_protocol_before_dispatch() {
+    for supported in [false, true] {
+        let registry = make_registry();
+        let (connection, mut outbound) = DaemonConnection::new("daemon-legacy".to_owned());
+        registry.register("daemon-legacy".to_owned(), connection);
+        let dispatcher = registry.clone();
+        let handle = tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, .. } =
+                outbound.recv().await.expect("protocol check sent")
+            else {
+                panic!("expected protocol request");
+            };
+            assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+            if supported {
+                dispatcher.dispatch_incoming(
+                    "daemon-legacy",
+                    api_types::DaemonFrame::Response {
+                        id,
+                        result: json!({"schema_version":1,"features":[]}),
+                    },
+                );
+            } else {
+                dispatcher.dispatch_incoming(
+                    "daemon-legacy",
+                    api_types::DaemonFrame::Error {
+                        id: Some(id),
+                        error: api_types::DaemonErrorPayload {
+                            code: api_types::UNSUPPORTED_METHOD.to_owned(),
+                            message: "unsupported protocol query".to_owned(),
+                            details: None,
+                        },
+                    },
+                );
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(40), outbound.recv())
+                .await
+                .is_err(), "Resume must not be sent without proven support");
+        });
+
+        let provider = super::RemoteExecutionProvider::new(
+            registry,
+            "daemon-legacy".to_owned(),
+        );
+        let result = provider
+            .start(api_types::ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: "execution-1".to_owned(),
+                role: "worker".to_owned(),
+                workspace_path: "/work".to_owned(),
+                executor_type: "codex".to_owned(),
+                executor_config: json!({"executor_type":"codex","config":{}}),
+                prompt: json!({"description":"resume"}),
+                invocation: api_types::HarnessInvocation::Resume {
+                    external_session_id: "session-exact-7".to_owned(),
+                },
+                max_turns: None,
+            })
+            .await;
+        assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
+        handle.await.expect("legacy protocol exchange joins");
+    }
+}
+
+#[tokio::test]
+async fn remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("daemon-legacy".to_owned());
+    registry.register("daemon-legacy".to_owned(), connection);
+    let dispatcher = registry.clone();
+    let handle = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request { id, method, .. } =
+            outbound.recv().await.expect("protocol check sent")
+        else {
+            panic!("expected protocol request");
+        };
+        assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+        dispatcher.dispatch_incoming(
+            "daemon-legacy",
+            api_types::DaemonFrame::Response {
+                id,
+                result: json!({
+                    "schema_version":1,
+                    "features":[api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+                }),
+            },
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(40), outbound.recv())
+            .await
+            .is_err(), "reviewer Start must not be sent without role support");
+    });
+
+    let provider = super::RemoteExecutionProvider::new(
+        registry,
+        "daemon-legacy".to_owned(),
+    );
+    let result = provider
+        .start(api_types::ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-review".to_owned(),
+            role: "reviewer".to_owned(),
+            workspace_path: "/work".to_owned(),
+            executor_type: "shell".to_owned(),
+            executor_config: json!({"executor_type":"shell","config":{}}),
+            prompt: json!({"description":"review"}),
+            invocation: api_types::HarnessInvocation::Start,
+            max_turns: None,
+        })
+        .await;
+    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
+    handle.await.expect("legacy protocol exchange joins");
 }
 
 #[tokio::test]

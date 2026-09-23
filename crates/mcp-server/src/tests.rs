@@ -7,7 +7,8 @@ use db::{
     CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask, ExecutionPurpose,
     CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus,
     PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, SortBy,
-    SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
+    SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateTask,
+    UpsertDaemon,
     UserRepo,
 };
 use events::EventBus;

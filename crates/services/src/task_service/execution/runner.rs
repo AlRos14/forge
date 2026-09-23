@@ -122,6 +122,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
+        crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
         if execution.role == crate::workflow::default_roles::REVIEWER
             || matches!(
                 task.task_type.as_str(),
@@ -263,8 +264,6 @@ impl TaskService {
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let assistant_turn_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let usage_provider = super::usage_provider_from_agent_config(&agent_config);
-        let usage_model_fallback = usage_model_fallback(&agent_config);
 
         // Spawn a task that forwards log entries to the event bus
         let event_bus = self.event_bus.clone();
@@ -497,7 +496,8 @@ impl TaskService {
                     candidate.candidate_key.clone(),
                     candidate.executor_type.to_string(),
                     candidate.config.clone(),
-                    serde_json::to_value(&candidate.harness_capabilities).unwrap_or(Value::Null),
+                    serde_json::to_value(candidate.harness_capabilities.snapshot())
+                        .unwrap_or(Value::Null),
                     Some(serde_json::to_value(&candidate.effective_policy).unwrap_or(Value::Null)),
                 )
             }),
@@ -520,6 +520,20 @@ impl TaskService {
             )?,
             None => None,
         };
+        let winner_snapshot = snapshot_update
+            .as_deref()
+            .or(current_execution.executor_config_snapshot_json.as_deref())
+            .map(ToOwned::to_owned);
+        let winner_snapshot_value = winner_snapshot
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok());
+        let usage_provider = winner_snapshot_value
+            .as_ref()
+            .map(super::usage_provider_from_agent_config)
+            .unwrap_or_else(|| "unknown".to_owned());
+        let usage_model_fallback = winner_snapshot_value
+            .as_ref()
+            .and_then(usage_model_fallback);
 
         let now = now_rfc3339();
         let (status, stop_reason, stopped_by, resume_policy, stopped_at) = match result.status {
@@ -580,7 +594,7 @@ impl TaskService {
         if let Some(account_usage) = result.account_usage.as_ref() {
             if let Err(error) = super::persist_account_usage_snapshot(
                 &self.db,
-                current_execution.executor_config_snapshot_json.as_deref(),
+                winner_snapshot.as_deref(),
                 &updated.id,
                 account_usage,
             )
@@ -820,6 +834,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
         if execution.role == crate::workflow::default_roles::REVIEWER
             || matches!(
                 task.task_type.as_str(),

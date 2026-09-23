@@ -501,17 +501,50 @@ impl TaskService {
 
         let executor_unavailable = notification.failure_class
             == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable);
+        let route_effective_cwd = if notification
+            .resolved_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.effective_policy.is_none())
+        {
+            match current_execution.workspace_id.as_deref() {
+                Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                    .await?
+                    .map(|workspace| workspace.worktree_path),
+                None => None,
+            }
+        } else {
+            None
+        };
         let route_outcome = crate::task_service::config::RouteOutcome {
             selected: notification.resolved_candidate.as_ref().map(|candidate| {
+                let harness_capabilities = candidate
+                    .harness_capabilities
+                    .as_ref()
+                    .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                    .unwrap_or_else(|| {
+                        serde_json::to_value(
+                            api_types::HarnessCapabilities::unknown().snapshot(),
+                        )
+                        .expect("unknown harness capability snapshot serializes")
+                    });
+                let effective_policy = candidate
+                    .effective_policy
+                    .as_ref()
+                    .and_then(|policy| serde_json::to_value(policy).ok())
+                    .or_else(|| {
+                        crate::task_service::config::recompute_effective_policy_for_route_winner(
+                            &candidate.executor_type,
+                            &candidate.config,
+                            self.adapter_registry.as_deref(),
+                            route_effective_cwd.as_deref(),
+                        )
+                    });
                 (
                     candidate.candidate_key.clone(),
                     candidate.executor_type.clone(),
                     candidate.config.clone(),
-                    serde_json::to_value(&candidate.harness_capabilities).unwrap_or(Value::Null),
-                    candidate
-                        .effective_policy
-                        .as_ref()
-                        .map(|policy| serde_json::to_value(policy).unwrap_or(Value::Null)),
+                    harness_capabilities,
+                    effective_policy,
                 )
             }),
             attempts: notification
@@ -530,6 +563,10 @@ impl TaskService {
             )?,
             None => None,
         };
+        let winner_snapshot = snapshot_update
+            .as_deref()
+            .or(current_execution.executor_config_snapshot_json.as_deref())
+            .map(ToOwned::to_owned);
 
         let execution_id = notification.execution_id.clone();
         let terminal_ts = notification.ts.clone();
@@ -564,7 +601,7 @@ impl TaskService {
         if let Some(account_usage) = notification.account_usage.as_ref() {
             if let Err(error) = execution::persist_account_usage_snapshot_with_host(
                 &self.db,
-                current_execution.executor_config_snapshot_json.as_deref(),
+                winner_snapshot.as_deref(),
                 &updated.id,
                 account_usage,
                 host_identity,
@@ -577,7 +614,7 @@ impl TaskService {
 
         if let Some(usage) = notification.usage {
             let provider = execution::usage_provider_from_snapshot(
-                current_execution.executor_config_snapshot_json.as_deref(),
+                winner_snapshot.as_deref(),
             );
             let model = usage.model.unwrap_or_else(|| "default".to_owned());
             if let Err(error) = ExecutionUsageRepo::upsert(

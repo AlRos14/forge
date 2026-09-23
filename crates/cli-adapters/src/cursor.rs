@@ -144,6 +144,11 @@ impl CursorAdapter {
     fn resolve_config(ctx: &ExecutionContext) -> CursorConfig {
         let mut config: CursorConfig =
             serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--resume", "--session"],
+            &["--continue"],
+        );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => config.resume_session_id = None,
             executors::HarnessInvocation::Resume { external_session_id } => {
@@ -380,12 +385,10 @@ impl HarnessAdapter for CursorAdapter {
         )
     }
 
-    fn effective_execution_policy(
+    fn interpret_execution_policy(
         &self,
         config: &Value,
-        effective_cwd: Option<&str>,
-        workspace_root: Option<&str>,
-    ) -> api_types::EffectiveExecutionPolicy {
+    ) -> executors::HarnessPolicyInterpretation {
         let permission = config
             .get("permission_policy")
             .and_then(Value::as_str)
@@ -395,9 +398,10 @@ impl HarnessAdapter for CursorAdapter {
             .and_then(Value::as_bool)
             .unwrap_or(permission != "plan");
         let isolation = if force { "force" } else { "propose_only" };
-        executors::effective_policy::from_harness_interpretation(
-            &self.kind(), permission, isolation, effective_cwd, workspace_root, config,
-        )
+        executors::HarnessPolicyInterpretation {
+            permission_policy: permission.to_owned(),
+            isolation_posture: isolation.to_owned(),
+        }
     }
 
     fn executable_name(&self) -> Option<String> {
@@ -564,6 +568,12 @@ impl HarnessAdapter for CursorAdapter {
                 ..Default::default()
             });
         }
+
+        crate::require_exact_resumed_session(
+            "Cursor",
+            config.resume_session_id.as_deref(),
+            stream.agent_session_id.as_deref(),
+        )?;
 
         let after_sha = if let Ok(false) =
             git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
@@ -1305,9 +1315,14 @@ mod tests {
 
     #[test]
     fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
-        let stale = serde_json::json!({"resume_session_id":"old-session"});
+        let stale = serde_json::json!({
+            "resume_session_id":"old-session",
+            "additional_params":["--resume=old-cli-session", "--continue", "--verbose"]
+        });
         let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
-        assert!(CursorAdapter::resolve_config(&start).resume_session_id.is_none());
+        let start_config = CursorAdapter::resolve_config(&start);
+        assert!(start_config.resume_session_id.is_none());
+        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -1315,12 +1330,9 @@ mod tests {
             },
             stale,
         );
-        assert_eq!(
-            CursorAdapter::resolve_config(&resume)
-                .resume_session_id
-                .as_deref(),
-            Some("exact-session")
-        );
+        let resume_config = CursorAdapter::resolve_config(&resume);
+        assert_eq!(resume_config.resume_session_id.as_deref(), Some("exact-session"));
+        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
     }
 
     #[test]

@@ -40,7 +40,11 @@ fn auditor_snapshot_records_resolved_adapter_capabilities_without_overwriting_ag
 
     assert_eq!(updated["executor_type"], "cursor");
     assert_eq!(updated["config"]["model"], "new");
-    assert_eq!(updated["harness_capabilities"]["resume"], "native");
+    assert_eq!(updated["harness_capabilities"]["schema_version"], 1);
+    assert_eq!(
+        updated["harness_capabilities"]["capabilities"]["resume"],
+        "native"
+    );
     assert_eq!(updated["capabilities"][0], "legacy-tag");
 }
 

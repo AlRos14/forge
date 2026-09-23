@@ -72,6 +72,27 @@ pub async fn resumable_external_session(
         let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
             return Ok(None);
         };
+        let Some(agent) = AgentRepo::get_by_id(db, &session.agent_id).await? else {
+            return Ok(None);
+        };
+        if !harness_session_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            &session.harness_kind,
+            &session.profile_snapshot_json,
+        ) || !harness_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            execution.executor_config_snapshot_json.as_deref(),
+        ) {
+            // Historical PR2 fallbacks could have written a session under an
+            // Agent whose primary harness/account identity did not match the
+            // actual candidate. Keep that history, but do not advertise or
+            // resume it as continuity for the current Agent identity.
+            return Ok(None);
+        }
         let execution_harness_kind = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -128,9 +149,137 @@ pub async fn resumable_external_session(
             || execution.workspace_id.as_deref() == workspace_id)
         && expected_agent_id.is_none_or(|agent_id| actor_id == agent_id)
     {
+        let Some(snapshot_value) = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(snapshot_kind) = snapshot_value
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .filter(|kind| is_known_pr2_resume_harness(kind))
+        else {
+            return Ok(None);
+        };
+        if snapshot_value
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_some_and(|snapshot_agent_id| snapshot_agent_id != actor_id)
+        {
+            return Ok(None);
+        }
+        let Some(agent) = AgentRepo::get_by_id(db, &actor_id).await? else {
+            return Ok(None);
+        };
+        if !agent.executor_type.eq_ignore_ascii_case(snapshot_kind)
+            || !harness_identity_matches_value(
+                &agent.executor_type,
+                &agent.config_json,
+                agent.credential_ref.as_deref(),
+                &snapshot_value,
+            )
+        {
+            return Ok(None);
+        }
         return Ok(execution.agent_session_id.clone());
     }
     Ok(None)
+}
+
+fn harness_session_identity_matches_snapshot(
+    agent_harness_kind: &str,
+    agent_config_json: &str,
+    agent_credential_ref: Option<&str>,
+    session_harness_kind: &str,
+    profile_snapshot_json: &str,
+) -> bool {
+    let (Ok(agent_kind), Ok(session_kind), Ok(snapshot)) = (
+        agent_harness_kind.parse::<executors::ExecutorKind>(),
+        session_harness_kind.parse::<executors::ExecutorKind>(),
+        serde_json::from_str::<Value>(profile_snapshot_json),
+    ) else {
+        return false;
+    };
+    let Some(snapshot_kind) = snapshot
+        .get("executor_type")
+        .and_then(Value::as_str)
+        .and_then(|kind| kind.parse::<executors::ExecutorKind>().ok())
+    else {
+        return false;
+    };
+    if agent_kind != session_kind || snapshot_kind != session_kind {
+        return false;
+    }
+    harness_identity_matches_value(
+        agent_harness_kind,
+        agent_config_json,
+        agent_credential_ref,
+        &snapshot,
+    )
+}
+
+fn harness_identity_matches_snapshot(
+    agent_harness_kind: &str,
+    agent_config_json: &str,
+    agent_credential_ref: Option<&str>,
+    snapshot_json: Option<&str>,
+) -> bool {
+    let Some(snapshot) = snapshot_json
+        .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+    else {
+        return false;
+    };
+    harness_identity_matches_value(
+        agent_harness_kind,
+        agent_config_json,
+        agent_credential_ref,
+        &snapshot,
+    )
+}
+
+fn harness_identity_matches_value(
+    agent_harness_kind: &str,
+    agent_config_json: &str,
+    agent_credential_ref: Option<&str>,
+    snapshot: &Value,
+) -> bool {
+    let (Ok(agent_kind), Ok(agent_config)) = (
+        agent_harness_kind.parse::<executors::ExecutorKind>(),
+        serde_json::from_str::<Value>(agent_config_json),
+    ) else {
+        return false;
+    };
+    let Some(snapshot_kind) = snapshot
+        .get("executor_type")
+        .and_then(Value::as_str)
+        .and_then(|kind| kind.parse::<executors::ExecutorKind>().ok())
+    else {
+        return false;
+    };
+    let Some(snapshot_config) = snapshot.get("config") else {
+        return false;
+    };
+    if agent_kind != snapshot_kind {
+        return false;
+    }
+    let current_credential_ref = agent_credential_ref
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty());
+    let historical_credential_ref = snapshot
+        .get("credential_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty());
+    current_credential_ref == historical_credential_ref
+        && executors::validate_same_agent_candidate(
+            &agent_kind,
+            &agent_config,
+            &snapshot_kind,
+            snapshot_config,
+        )
+        .is_ok()
 }
 
 /// Build the runtime-only invocation from the durable HarnessSession link.
@@ -176,6 +325,9 @@ pub(crate) async fn reusable_harness_session_for_agent(
     let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
         return Ok(None);
     };
+    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
+        return Ok(None);
+    };
     let execution_harness_kind = execution
         .executor_config_snapshot_json
         .as_deref()
@@ -201,6 +353,19 @@ pub(crate) async fn reusable_harness_session_for_agent(
         || execution_harness_kind
             .as_deref()
             .is_some_and(|harness_kind| harness_kind != session.harness_kind)
+        || !harness_session_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            &session.harness_kind,
+            &session.profile_snapshot_json,
+        )
+        || !harness_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            execution.executor_config_snapshot_json.as_deref(),
+        )
         || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
         || execution
             .agent_session_id
@@ -225,16 +390,18 @@ fn harness_session_resume_is_available(session: &HarnessSession) -> bool {
     let Ok(snapshot) = serde_json::from_str::<Value>(&session.capabilities_snapshot_json) else {
         return false;
     };
-    // A typed PR3 snapshot is complete and strict. Partial or legacy JSON must
-    // never acquire capability authority merely because it has a `resume`
-    // key with a plausible value.
-    if let Ok(capabilities) =
-        serde_json::from_value::<api_types::HarnessCapabilities>(snapshot.clone())
-    {
-        return capabilities.resume.is_available();
+    match api_types::HarnessCapabilitiesSnapshot::from_value(&snapshot) {
+        api_types::HarnessCapabilitiesSnapshotRead::VersionedV1(capabilities) => {
+            return capabilities.resume.is_available();
+        }
+        api_types::HarnessCapabilitiesSnapshotRead::UnsupportedVersion(_)
+        | api_types::HarnessCapabilitiesSnapshotRead::Malformed => return false,
+        api_types::HarnessCapabilitiesSnapshotRead::Unversioned => {}
     }
-    // Bounded PR2 compatibility: those integrations had an explicit exact
-    // resume protocol at that time. PR13 removes this allowlist.
+    // Bounded PR2 compatibility: only its exact tag-array/empty-object shapes
+    // and integrations with an implemented exact resume protocol are trusted.
+    // Partial capability-looking objects and malformed/future versioned data
+    // never enter this path. PR13 removes this allowlist.
     let legacy_shape = snapshot.as_array().is_some_and(|tags| {
         tags.iter().all(Value::is_string)
     }) || snapshot
@@ -243,8 +410,12 @@ fn harness_session_resume_is_available(session: &HarnessSession) -> bool {
     if !legacy_shape {
         return false;
     }
+    is_known_pr2_resume_harness(&session.harness_kind)
+}
+
+fn is_known_pr2_resume_harness(harness_kind: &str) -> bool {
     matches!(
-        session.harness_kind.as_str(),
+        harness_kind,
         "codex" | "claude_code" | "cursor" | "opencode" | "smith"
     )
 }
@@ -284,6 +455,59 @@ pub(crate) async fn materialize_historical_harness_session(
 #[cfg(test)]
 mod purpose_tests {
     use super::*;
+
+    #[test]
+    fn historical_session_identity_allows_run_config_but_rejects_harness_account_and_credential_changes() {
+        let current_config = r#"{"model":"gpt-5","env":{"CODEX_HOME":"/accounts/one"}}"#;
+        let same_identity_new_model = r#"{"executor_type":"codex","credential_ref":"cred-one","config":{"model":"gpt-5.1","model_reasoning_effort":"high","env":{"CODEX_HOME":"/accounts/one"}}}"#;
+        assert!(harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            same_identity_new_model,
+        ));
+
+        let other_harness = r#"{"executor_type":"cursor","credential_ref":"cred-one","config":{"model":"gpt-5.1"}}"#;
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "cursor",
+            other_harness,
+        ));
+
+        let other_account = r#"{"executor_type":"codex","credential_ref":"cred-one","config":{"model":"gpt-5","env":{"CODEX_HOME":"/accounts/two"}}}"#;
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            other_account,
+        ));
+
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-two"),
+            "codex",
+            same_identity_new_model,
+        ));
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            r#"{"executor_type":"codex","config":{"model":"gpt-5"}}"#,
+        ));
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            "{malformed",
+        ));
+    }
 
     #[test]
     fn role_mapping_is_only_a_compatibility_default() {
@@ -601,7 +825,8 @@ pub(super) fn spawn_account_usage_probe(
     execution_id: String,
     executor: Arc<dyn executors::TaskExecutor>,
 ) -> Option<CursorUsageProbe> {
-    let value = serde_json::from_str::<Value>(snapshot.as_deref()?).ok()?;
+    let snapshot = snapshot?;
+    let value = serde_json::from_str::<Value>(&snapshot).ok()?;
     let kind = value
         .get("executor_type")
         .and_then(Value::as_str)?
@@ -846,16 +1071,32 @@ mod tests {
         typed.resume = api_types::CapabilitySupport::Native;
         assert!(harness_session_resume_is_available(&harness_session(
             "custom_harness",
-            serde_json::to_value(typed).unwrap(),
+            serde_json::to_value(typed.snapshot()).unwrap(),
         )));
 
         assert!(!harness_session_resume_is_available(&harness_session(
             "custom_harness",
-            serde_json::to_value(api_types::HarnessCapabilities::unknown()).unwrap(),
+            serde_json::to_value(api_types::HarnessCapabilities::unknown().snapshot()).unwrap(),
         )));
         assert!(!harness_session_resume_is_available(&harness_session(
             "codex",
             json!({"resume":"unsupported"}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"resume":"native"}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!(["legacy-tag", 7]),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"schema_version":"one", "capabilities":{"resume":"native"}}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"schema_version":1, "capabilities":{"resume":"future_native"}}),
         )));
         assert!(!harness_session_resume_is_available(&harness_session(
             "gemini",
@@ -864,6 +1105,11 @@ mod tests {
         assert!(harness_session_resume_is_available(&harness_session(
             "codex",
             json!(["legacy-agent-tag"]),
+        )));
+        assert!(harness_session_resume_is_available(&harness_session("codex", json!({}))));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"schema_version": 2, "capabilities": {"resume":"native"}}),
         )));
     }
 

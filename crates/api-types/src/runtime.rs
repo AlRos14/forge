@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use serde_json::Value;
 use ts_rs::TS;
 
@@ -95,6 +96,106 @@ impl HarnessCapabilities {
             subagents: CapabilitySupport::Unsupported,
         }
     }
+
+    /// Encode stable, versioned evidence for durable Execution and
+    /// HarnessSession snapshots. The public/runtime struct above remains the
+    /// current dimensional view; it is not itself the persistence format.
+    pub fn snapshot(&self) -> HarnessCapabilitiesSnapshot {
+        let dimensions = serde_json::to_value(self)
+            .expect("HarnessCapabilities contains only serializable scalar fields");
+        let capabilities = dimensions
+            .as_object()
+            .expect("HarnessCapabilities serializes as an object")
+            .iter()
+            .map(|(name, support)| (name.clone(), support.clone()))
+            .collect();
+        HarnessCapabilitiesSnapshot {
+            schema_version: HARNESS_CAPABILITIES_SCHEMA_VERSION,
+            capabilities,
+        }
+    }
+}
+
+/// Durable, forward-extensible representation of capability evidence.
+/// Unknown dimensions are retained as opaque JSON and ignored by older
+/// readers; a known dimension absent from a historical snapshot resolves to
+/// Unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HarnessCapabilitiesSnapshot {
+    #[ts(type = "number")]
+    pub schema_version: u64,
+    #[ts(type = "Record<string, unknown>")]
+    pub capabilities: BTreeMap<String, Value>,
+}
+
+pub const HARNESS_CAPABILITIES_SCHEMA_VERSION: u64 = 1;
+
+/// Outcome of decoding a durable or remote capability snapshot. The caller
+/// may apply the narrow PR2 compatibility rule only to `Unversioned` values
+/// that match its exact historical shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessCapabilitiesSnapshotRead {
+    VersionedV1(HarnessCapabilities),
+    Unversioned,
+    UnsupportedVersion(u64),
+    Malformed,
+}
+
+impl HarnessCapabilitiesSnapshot {
+    pub fn from_value(value: &Value) -> HarnessCapabilitiesSnapshotRead {
+        let Some(object) = value.as_object() else {
+            // PR2 stored the Agent's authored capability tags directly; that
+            // legacy field is an array, not a capability snapshot. Let the
+            // narrowly scoped caller inspect the exact legacy shape, while
+            // keeping scalar/malformed JSON fail-closed.
+            return if value.is_array() {
+                HarnessCapabilitiesSnapshotRead::Unversioned
+            } else {
+                HarnessCapabilitiesSnapshotRead::Malformed
+            };
+        };
+        let Some(version_value) = object.get("schema_version") else {
+            return HarnessCapabilitiesSnapshotRead::Unversioned;
+        };
+        let Some(version) = version_value.as_u64() else {
+            return HarnessCapabilitiesSnapshotRead::Malformed;
+        };
+        if version != HARNESS_CAPABILITIES_SCHEMA_VERSION {
+            return HarnessCapabilitiesSnapshotRead::UnsupportedVersion(version);
+        }
+        let Some(dimensions) = object.get("capabilities").and_then(Value::as_object) else {
+            return HarnessCapabilitiesSnapshotRead::Malformed;
+        };
+
+        let support = |name: &str| match dimensions.get(name).and_then(Value::as_str) {
+            Some("native") => CapabilitySupport::Native,
+            Some("emulated") => CapabilitySupport::Emulated,
+            Some("unsupported") => CapabilitySupport::Unsupported,
+            Some("unknown") | None => CapabilitySupport::Unknown,
+            // A future support label is not evidence of availability to this
+            // reader. Preserve the snapshot, but fail closed for that field.
+            Some(_) => CapabilitySupport::Unknown,
+        };
+        HarnessCapabilitiesSnapshotRead::VersionedV1(HarnessCapabilities {
+            resume: support("resume"),
+            cancel: support("cancel"),
+            structured_events: support("structured_events"),
+            usage_reporting: support("usage_reporting"),
+            account_usage_observation: support("account_usage_observation"),
+            model_selection: support("model_selection"),
+            reasoning_controls: support("reasoning_controls"),
+            approval_policy: support("approval_policy"),
+            sandbox_controls: support("sandbox_controls"),
+            planning: support("planning"),
+            review_mode: support("review_mode"),
+            fork: support("fork"),
+            steer: support("steer"),
+            pause_resume: support("pause_resume"),
+            compaction: support("compaction"),
+            subagents: support("subagents"),
+        })
+    }
 }
 
 /// Runtime-only request to begin a harness run or continue one exact session.
@@ -154,7 +255,10 @@ pub struct AgentAvailabilityResponse {
 
 #[cfg(test)]
 mod harness_capability_tests {
-    use super::{CapabilitySupport as S, HarnessCapabilities};
+    use super::{
+        CapabilitySupport as S, HarnessCapabilities, HarnessCapabilitiesSnapshot,
+        HarnessCapabilitiesSnapshotRead,
+    };
 
     #[test]
     fn support_levels_remain_distinct_and_unknown_fails_closed() {
@@ -180,6 +284,58 @@ mod harness_capability_tests {
         let mut complete = serde_json::to_value(HarnessCapabilities::unknown()).unwrap();
         complete["legacy_tag"] = serde_json::json!("planning");
         assert!(serde_json::from_value::<HarnessCapabilities>(complete).is_err());
+    }
+
+    #[test]
+    fn versioned_capability_snapshots_are_forward_extensible_and_fail_closed() {
+        let mut historical = HarnessCapabilities::unknown();
+        historical.resume = S::Native;
+        historical.cancel = S::Emulated;
+        let mut v1 = historical.snapshot();
+        v1.capabilities.remove("steer");
+        v1.capabilities
+            .insert("future_operation".to_owned(), serde_json::json!("native"));
+        let value = serde_json::to_value(&v1).expect("snapshot serializes");
+
+        let HarnessCapabilitiesSnapshotRead::VersionedV1(decoded) =
+            HarnessCapabilitiesSnapshot::from_value(&value)
+        else {
+            panic!("v1 historical evidence is readable");
+        };
+        assert_eq!(decoded.resume, S::Native);
+        assert_eq!(decoded.cancel, S::Emulated);
+        assert_eq!(decoded.steer, S::Unknown);
+        assert_eq!(v1.capabilities["future_operation"], "native");
+
+        assert_eq!(
+            HarnessCapabilitiesSnapshot::from_value(&serde_json::json!({"resume":"native"})),
+            HarnessCapabilitiesSnapshotRead::Unversioned
+        );
+        assert_eq!(
+            HarnessCapabilitiesSnapshot::from_value(&serde_json::json!({
+                "schema_version": "one",
+                "capabilities": {"resume":"native"}
+            })),
+            HarnessCapabilitiesSnapshotRead::Malformed
+        );
+        assert_eq!(
+            HarnessCapabilitiesSnapshot::from_value(&serde_json::json!({
+                "schema_version": 2,
+                "capabilities": {"resume":"native"}
+            })),
+            HarnessCapabilitiesSnapshotRead::UnsupportedVersion(2)
+        );
+        assert_eq!(
+            HarnessCapabilitiesSnapshot::from_value(&serde_json::json!({
+                "schema_version": 1,
+                "capabilities": ["native"]
+            })),
+            HarnessCapabilitiesSnapshotRead::Malformed
+        );
+        assert_eq!(
+            HarnessCapabilitiesSnapshot::from_value(&serde_json::json!(["legacy-tag"])),
+            HarnessCapabilitiesSnapshotRead::Unversioned
+        );
     }
 }
 

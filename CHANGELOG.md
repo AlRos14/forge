@@ -13,6 +13,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   by the existing `harness_session_id` relation and a runtime-only generic
   Start/Resume invocation. The HarnessSession relation remains the durable
   continuity authority; typed `harness_capabilities` records support evidence.
+- Remote execution dispatch now requires a daemon that advertises the generic
+  HarnessInvocation protocol. Older daemons are rejected before Start or Resume
+  dispatch because they cannot guarantee fresh-start and exact-resume semantics.
+- Ordered fallback candidates must preserve the Agent's harness and
+  identity-bearing native account. Cross-harness or account changes now fail
+  before dispatch; select or reassign a separate Agent for that failover.
 - Execution responses now expose additive `actor_ref`, `purpose`, and
   `harness_session_id` fields. New Executions persist a real Human or Agent
   principal and an explicit purpose; legacy `agent_id` and `agent_session_id`

@@ -608,13 +608,20 @@ async fn bind_external_session_in_tx(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("legacy")
         .to_owned();
+    if harness_kind != "legacy" {
+        harness_session::validate_agent_harness_identity_in_tx(
+            transaction,
+            agent_id,
+            &harness_kind,
+        )
+        .await?;
+    }
     let profile_id =
         harness_session::profile_id_for_snapshot_in_tx(transaction, agent_id, &snapshot).await?;
     let capabilities_snapshot_json = snapshot
         .get("harness_capabilities")
-        .or_else(|| snapshot.get("capabilities"))
         .map(ToString::to_string)
-        .unwrap_or_else(|| "{}".to_owned());
+        .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
     let existing = sqlx::query(
         "SELECT id, status, workspace_id FROM harness_session
          WHERE agent_id = ? AND harness_kind = ? AND external_session_id = ?
