@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, GeminiConfig, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
@@ -103,13 +103,53 @@ impl Default for GeminiAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for GeminiAdapter {
+impl HarnessAdapter for GeminiAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Gemini
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
         detect_gemini_availability()
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<GeminiConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Unsupported, S::Emulated, S::Unknown, S::Unsupported, S::Unsupported, S::Native,
+            S::Unsupported, S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+        )
+    }
+
+    fn effective_execution_policy(
+        &self,
+        config: &serde_json::Value,
+        effective_cwd: Option<&str>,
+        workspace_root: Option<&str>,
+    ) -> api_types::EffectiveExecutionPolicy {
+        let permission = config
+            .get("permission_policy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let isolation = config
+            .get("sandbox")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not_applicable");
+        executors::effective_policy::from_harness_interpretation(
+            &self.kind(), permission, isolation, effective_cwd, workspace_root, config,
+        )
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("gemini".to_owned())
     }
 
     async fn discover_options(

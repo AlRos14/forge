@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -201,6 +202,7 @@ impl Default for NullConfig {
 }
 
 /// Deserialize a raw JSON config into the typed config struct for an executor kind.
+#[cfg(test)]
 pub fn deserialize_config(
     kind: ExecutorKind,
     json: &Value,
@@ -251,6 +253,7 @@ pub fn merge_overrides(
 
 /// Resolve config JSON by applying overrides, deserializing into the typed struct,
 /// and serializing back to normalized JSON.
+#[cfg(test)]
 pub fn resolve_config_value(
     kind: ExecutorKind,
     json: &Value,
@@ -271,6 +274,7 @@ pub fn resolve_config_value(
     }
 }
 
+#[cfg(test)]
 fn deserialize_typed<T>(
     kind: ExecutorKind,
     json: &Value,
@@ -295,6 +299,22 @@ where
     serde_json::to_value(config).map_err(|error| {
         ExecutorError::Other(format!("Failed to serialize {} config: {error}", kind))
     })
+}
+
+/// Merge generic per-execution overrides and normalize one adapter-owned
+/// configuration type. Concrete adapters call this with their own type so
+/// routing does not choose a provider schema.
+pub fn normalize_harness_config<T>(
+    kind: ExecutorKind,
+    json: &Value,
+    overrides: &ExecutionOverrides,
+) -> Result<Value, ExecutorError>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let mut merged = json.clone();
+    merge_overrides(&mut merged, overrides)?;
+    normalize_typed::<T>(kind, &merged)
 }
 
 /// Authored agent-config key holding the ordered fallback candidates.
@@ -520,6 +540,7 @@ fn stable_config_hash(config: &Value) -> u32 {
 
 /// Build and validate an ordered-fallback route from a normalized primary
 /// candidate plus the raw authored `fallbacks` entries.
+#[cfg(test)]
 pub fn build_ordered_fallback_routing(
     primary_kind: ExecutorKind,
     primary_config: Value,
@@ -572,6 +593,19 @@ pub fn build_ordered_fallback_routing(
         });
     }
 
+    validate_ordered_fallback_routing(candidates)
+}
+
+/// Validate and snapshot candidates that were already normalized by their
+/// registered HarnessAdapters.
+pub fn validate_ordered_fallback_routing(
+    candidates: Vec<ExecutorCandidate>,
+) -> Result<ExecutorRouting, ExecutorError> {
+    if candidates.is_empty() {
+        return Err(ExecutorError::Other(
+            "fallback routing requires a primary candidate".to_owned(),
+        ));
+    }
     let mut seen = std::collections::HashSet::new();
     for candidate in &candidates {
         let key = candidate_key(&candidate.executor_type, &candidate.config);

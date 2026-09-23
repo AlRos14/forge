@@ -3,11 +3,11 @@ use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, CreateAgent,
     PageRequest, SortBy, SortOrder, SqliteDb, SystemSettingRepo,
 };
-use executors::{AdapterRegistry, ExecutorKind};
+use executors::{HarnessAdapterRegistry, ExecutorKind};
 
 pub async fn ensure_default_agents(
     db: &SqliteDb,
-    registry: &AdapterRegistry,
+    registry: &HarnessAdapterRegistry,
 ) -> Result<Vec<Agent>> {
     let kinds = registry.kinds();
     tracing::info!(

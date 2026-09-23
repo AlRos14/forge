@@ -729,9 +729,13 @@ existing workspace-authority checks.
 ## Agent execution options
 
 The two `discovered-options` endpoints return the adapter's selectable
-`models`, `permission_policies`, adapter-specific capability metadata under
-`cli_specific`, and the daemons that can run that executor. Model ids remain a
-string array for API compatibility. When an adapter has model-specific
+`models`, `permission_policies`, adapter-specific metadata under
+`cli_specific`, dimensional `harness_capabilities`, and the daemons that can
+run that executor. Each harness capability is `native`, `emulated`,
+`unsupported`, or `unknown`; Unknown is not available, and Emulated remains
+distinct from Native. Provider credential/runtime capabilities are a separate
+API domain. Model ids remain a string array for API compatibility. When an
+adapter has model-specific
 reasoning controls, `cli_specific.model_reasoning_efforts` maps each model id
 to its supported values; `cli_specific.reasoning_efforts` is the union used
 when no model is selected.

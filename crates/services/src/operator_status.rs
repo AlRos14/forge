@@ -620,6 +620,19 @@ fn effective_policy(
     workspace_path: Option<&str>,
 ) -> Option<EffectiveExecutionPolicy> {
     let snapshot = serde_json::from_str::<Value>(snapshot_json?).ok()?;
+    if let Some(mut policy) = snapshot
+        .get("effective_execution_policy")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<EffectiveExecutionPolicy>(value).ok())
+    {
+        if let Some(workspace_path) = workspace_path {
+            policy.effective_cwd = Some(workspace_path.to_owned());
+            policy.workspace_root = Some(workspace_path.to_owned());
+        }
+        return Some(policy);
+    }
+    // Historical snapshot compatibility. New executions persist the adapter
+    // interpretation above; PR13 removes this reader with legacy snapshots.
     let config = snapshot.get("config").unwrap_or(&Value::Null);
     let executor_kind = snapshot
         .get("executor_type")

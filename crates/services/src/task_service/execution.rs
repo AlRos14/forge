@@ -105,6 +105,9 @@ pub async fn resumable_external_session(
         {
             return Ok(None);
         }
+        if !harness_session_resume_is_available(&session) {
+            return Ok(None);
+        }
         return Ok(session.external_session_id);
     }
 
@@ -128,6 +131,34 @@ pub async fn resumable_external_session(
         return Ok(execution.agent_session_id.clone());
     }
     Ok(None)
+}
+
+/// Build the runtime-only invocation from the durable HarnessSession link.
+/// Absence means Start. A present but unusable link is an explicit failure and
+/// can never be rewritten into a fresh run.
+pub async fn harness_invocation_for_execution(
+    db: &SqliteDb,
+    execution: &Execution,
+    workspace_id: Option<&str>,
+) -> Result<api_types::HarnessInvocation> {
+    if execution.harness_session_id.is_none() {
+        return Ok(api_types::HarnessInvocation::Start);
+    }
+    let external_session_id = resumable_external_session(
+        db,
+        execution,
+        execution.agent_id.as_deref(),
+        workspace_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        ServiceError::invalid_operation(
+            "explicit HarnessSession is not resumable under its historical capability evidence",
+        )
+    })?;
+    Ok(api_types::HarnessInvocation::Resume {
+        external_session_id,
+    })
 }
 
 /// Validate a parent-provided HarnessSession for child attachment. Actor
@@ -180,7 +211,42 @@ pub(crate) async fn reusable_harness_session_for_agent(
     {
         return Ok(None);
     }
+    if !harness_session_resume_is_available(&session) {
+        return Ok(None);
+    }
     Ok(Some(session))
+}
+
+/// PR2 wrote Agent tag JSON into this column. New snapshots use the typed
+/// HarnessCapabilities shape; that evidence wins. For untyped PR2 history,
+/// only adapter kinds whose concrete PR2 integration explicitly implemented
+/// resume receive this bounded compatibility allowance. PR13 removes it.
+fn harness_session_resume_is_available(session: &HarnessSession) -> bool {
+    let Ok(snapshot) = serde_json::from_str::<Value>(&session.capabilities_snapshot_json) else {
+        return false;
+    };
+    // A typed PR3 snapshot is complete and strict. Partial or legacy JSON must
+    // never acquire capability authority merely because it has a `resume`
+    // key with a plausible value.
+    if let Ok(capabilities) =
+        serde_json::from_value::<api_types::HarnessCapabilities>(snapshot.clone())
+    {
+        return capabilities.resume.is_available();
+    }
+    // Bounded PR2 compatibility: those integrations had an explicit exact
+    // resume protocol at that time. PR13 removes this allowlist.
+    let legacy_shape = snapshot.as_array().is_some_and(|tags| {
+        tags.iter().all(Value::is_string)
+    }) || snapshot
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty);
+    if !legacy_shape {
+        return false;
+    }
+    matches!(
+        session.harness_kind.as_str(),
+        "codex" | "claude_code" | "cursor" | "opencode" | "smith"
+    )
 }
 
 /// Reconcile a pre-PR2 Execution's exact legacy external identity into the
@@ -529,19 +595,21 @@ impl CursorUsageProbe {
     }
 }
 
-pub(super) fn spawn_cursor_usage_probe(
+pub(super) fn spawn_account_usage_probe(
     db: Arc<SqliteDb>,
     snapshot: Option<String>,
     execution_id: String,
+    executor: Arc<dyn executors::TaskExecutor>,
 ) -> Option<CursorUsageProbe> {
-    let is_cursor = snapshot.as_deref().and_then(|snapshot| {
-        serde_json::from_str::<Value>(snapshot)
-            .ok()?
-            .get("executor_type")
-            .and_then(Value::as_str)
-            .map(|executor_type| executor_type == "cursor")
-    }) == Some(true);
-    if !is_cursor {
+    let value = serde_json::from_str::<Value>(snapshot.as_deref()?).ok()?;
+    let kind = value
+        .get("executor_type")
+        .and_then(Value::as_str)?
+        .parse::<executors::ExecutorKind>()
+        .ok()?;
+    // PR0A's periodic account quota poll is Cursor-specific. Other adapters
+    // can expose an explicit observation API without changing that policy.
+    if kind != executors::ExecutorKind::Cursor {
         return None;
     }
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -551,9 +619,12 @@ pub(super) fn spawn_cursor_usage_probe(
             if task_cancel.is_cancelled() {
                 break;
             }
-            persist_cursor_account_usage_probe(
+            persist_account_usage_probe(
                 &db,
-                snapshot.as_deref(),
+                &snapshot,
+                kind.clone(),
+                value.get("config").unwrap_or(&Value::Null).clone(),
+                Arc::clone(&executor),
                 &execution_id,
                 task_cancel.clone(),
             )
@@ -567,37 +638,30 @@ pub(super) fn spawn_cursor_usage_probe(
     Some(CursorUsageProbe { cancel, task })
 }
 
-async fn persist_cursor_account_usage_probe(
+async fn persist_account_usage_probe(
     db: &SqliteDb,
-    snapshot: Option<&str>,
+    snapshot: &str,
+    kind: executors::ExecutorKind,
+    config: Value,
+    executor: Arc<dyn executors::TaskExecutor>,
     execution_id: &str,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let Some(snapshot) = snapshot else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(snapshot) else {
-        return;
-    };
-    let config = serde_json::from_value::<executors::CursorConfig>(
-        value.get("config").cloned().unwrap_or(Value::Null),
-    )
-    .unwrap_or_default();
-    match cli_adapters::cursor::query_account_usage_with_cancel(&config, cancel.clone()).await {
-        Ok(usage) => {
+    match executor.observe_usage(kind, &config, cancel.clone()).await {
+        Ok(Some(observation)) => {
             if let Err(error) = persist_account_usage_snapshot_with_source(
                 db,
                 Some(snapshot),
                 execution_id,
-                &usage,
-                "cursor_poll",
+                &observation.value,
+                observation.source.as_deref().unwrap_or("harness_account_usage"),
             )
             .await
             {
                 tracing::warn!(
                     execution_id = %execution_id,
                     %error,
-                    "failed to persist Cursor account usage snapshot"
+                    "failed to persist harness account usage snapshot"
                 );
             }
         }
@@ -605,10 +669,10 @@ async fn persist_cursor_account_usage_probe(
             tracing::warn!(
                 execution_id = %execution_id,
                 %error,
-                "failed to probe Cursor account usage"
+                "failed to observe harness account usage"
             );
         }
-        Err(_) => {}
+        Ok(None) | Err(_) => {}
     }
 }
 
@@ -752,10 +816,56 @@ pub(super) async fn persist_planner_result(
 mod tests {
     use super::{
         account_usage_from_log_entry, account_usage_source_from_payload, normalize_account_usage,
-        snapshot_usage_account_key,
+        snapshot_usage_account_key, harness_session_resume_is_available,
     };
+    use db::{HarnessSession, HarnessSessionStatus};
     use executors::{LogEntry, LogKind, LogStream};
     use serde_json::json;
+
+    fn harness_session(harness_kind: &str, capabilities: serde_json::Value) -> HarnessSession {
+        HarnessSession {
+            id: "session-row".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            harness_kind: harness_kind.to_owned(),
+            external_session_id: Some("external-session".to_owned()),
+            profile_id: None,
+            profile_snapshot_json: "{}".to_owned(),
+            capabilities_snapshot_json: capabilities.to_string(),
+            workspace_id: Some("workspace-1".to_owned()),
+            status: HarnessSessionStatus::Active,
+            predecessor_session_id: None,
+            created_at: "2026-09-23T00:00:00Z".to_owned(),
+            updated_at: "2026-09-23T00:00:00Z".to_owned(),
+            last_activity_at: None,
+        }
+    }
+
+    #[test]
+    fn historical_resume_support_is_typed_or_narrow_pr2_compatibility() {
+        let mut typed = api_types::HarnessCapabilities::unknown();
+        typed.resume = api_types::CapabilitySupport::Native;
+        assert!(harness_session_resume_is_available(&harness_session(
+            "custom_harness",
+            serde_json::to_value(typed).unwrap(),
+        )));
+
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "custom_harness",
+            serde_json::to_value(api_types::HarnessCapabilities::unknown()).unwrap(),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"resume":"unsupported"}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "gemini",
+            json!(["legacy-agent-tag"]),
+        )));
+        assert!(harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!(["legacy-agent-tag"]),
+        )));
+    }
 
     #[test]
     fn wraps_codex_rate_limit_params_as_rate_limits() {

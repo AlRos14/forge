@@ -92,6 +92,54 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
     task_id
 }
 
+fn harness_capabilities_for(executor_type: &str) -> serde_json::Value {
+    let mut capabilities = serde_json::json!({
+        "resume":"unsupported",
+        "cancel":"unsupported",
+        "structured_events":"unsupported",
+        "usage_reporting":"unsupported",
+        "account_usage_observation":"unsupported",
+        "model_selection":"unsupported",
+        "reasoning_controls":"unsupported",
+        "approval_policy":"unsupported",
+        "sandbox_controls":"unsupported",
+        "planning":"unsupported",
+        "review_mode":"unsupported",
+        "fork":"unsupported",
+        "steer":"unsupported",
+        "pause_resume":"unsupported",
+        "compaction":"unsupported",
+        "subagents":"unsupported"
+    });
+    match executor_type {
+        "codex" => {
+            capabilities["resume"] = serde_json::json!("native");
+            capabilities["cancel"] = serde_json::json!("emulated");
+            capabilities["structured_events"] = serde_json::json!("native");
+            capabilities["usage_reporting"] = serde_json::json!("native");
+            capabilities["account_usage_observation"] = serde_json::json!("native");
+            capabilities["model_selection"] = serde_json::json!("native");
+            capabilities["reasoning_controls"] = serde_json::json!("native");
+            capabilities["approval_policy"] = serde_json::json!("native");
+            capabilities["sandbox_controls"] = serde_json::json!("native");
+            capabilities["fork"] = serde_json::json!("native");
+        }
+        "cursor" => {
+            capabilities["resume"] = serde_json::json!("native");
+            capabilities["cancel"] = serde_json::json!("emulated");
+            capabilities["structured_events"] = serde_json::json!("native");
+            capabilities["usage_reporting"] = serde_json::json!("native");
+            capabilities["account_usage_observation"] = serde_json::json!("emulated");
+            capabilities["model_selection"] = serde_json::json!("native");
+            capabilities["approval_policy"] = serde_json::json!("native");
+            capabilities["steer"] = serde_json::json!("unknown");
+        }
+        "shell" => capabilities["cancel"] = serde_json::json!("emulated"),
+        _ => {}
+    }
+    capabilities
+}
+
 async fn seed_workspaces(db: &SqliteDb, task_id: &str) -> (String, String) {
     let now = now_rfc3339();
     let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
@@ -185,6 +233,7 @@ fn execution_input(
                 "profile_id": profile_id,
                 "executor_type": executor_type,
                 "capabilities": ["read"],
+                "harness_capabilities": harness_capabilities_for(executor_type),
                 "config": {"model": "test-model"}
             })
             .to_string(),
@@ -250,9 +299,15 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     assert_eq!(pending.agent_id, "pr2-agent-a");
     assert_eq!(pending.harness_kind, "codex");
     assert_eq!(pending.profile_id.as_deref(), Some(profile_id.as_str()));
-    assert!(pending.profile_snapshot_json.contains("test-model"));
-    assert_eq!(pending.capabilities_snapshot_json, r#"["read"]"#);
-
+    let profile_snapshot: serde_json::Value =
+        serde_json::from_str(&pending.profile_snapshot_json).expect("profile snapshot parses");
+    assert_eq!(profile_snapshot["config"]["model"], "test-model");
+    assert_eq!(profile_snapshot["capabilities"], serde_json::json!(["read"]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&pending.capabilities_snapshot_json)
+            .expect("typed HarnessCapabilities parse"),
+        harness_capabilities_for("codex")
+    );
     let pending_inheritance = ExecutionRepo::create(
         &db,
         execution_input(
@@ -351,6 +406,101 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
         .await
         .expect_err("one Execution cannot change its external session identity");
     assert!(matches!(divergent, DbError::Check(_)));
+}
+
+#[tokio::test]
+async fn profile_and_capability_changes_do_not_rewrite_an_active_session_snapshot() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-capability-history", "codex").await;
+    let task_id = seed_task(&db, "capability-history").await;
+    let original = ExecutionRepo::create(
+        &db,
+        execution_input(
+            "pr2-execution-capability-history-original",
+            &task_id,
+            "pr2-agent-capability-history",
+            &profile_id,
+            "codex",
+            ExecutionPurpose::Implement,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("original execution creates");
+    let original = ExecutionRepo::update(
+        &db,
+        result_update(&original.id, Some("capability-history-thread")),
+    )
+    .await
+    .expect("original session activates");
+    let session_id = original.harness_session_id.clone().expect("session link");
+    let historical_capabilities = HarnessSessionRepo::get_by_id(&db, &session_id)
+        .await
+        .expect("session loads")
+        .expect("session exists")
+        .capabilities_snapshot_json;
+
+    let mut changed_profile = execution_input(
+        "pr2-execution-capability-history-follow-up",
+        &task_id,
+        "pr2-agent-capability-history",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        Some(session_id.clone()),
+        Some("capability-history-thread".to_owned()),
+    );
+    let mut changed_snapshot: serde_json::Value = serde_json::from_str(
+        changed_profile
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("follow-up snapshot exists"),
+    )
+    .expect("follow-up snapshot parses");
+    changed_snapshot["config"]["model"] = serde_json::json!("new-profile-model");
+    changed_snapshot["harness_capabilities"] = serde_json::json!({
+        "resume":"unknown",
+        "cancel":"unknown",
+        "structured_events":"unknown",
+        "usage_reporting":"unknown",
+        "account_usage_observation":"unknown",
+        "model_selection":"unknown",
+        "reasoning_controls":"unknown",
+        "approval_policy":"unknown",
+        "sandbox_controls":"unknown",
+        "planning":"unknown",
+        "review_mode":"unknown",
+        "fork":"unknown",
+        "steer":"unknown",
+        "pause_resume":"unknown",
+        "compaction":"unknown",
+        "subagents":"unknown"
+    });
+    changed_profile.executor_config_snapshot_json = Some(changed_snapshot.to_string());
+    let follow_up = ExecutionRepo::create(&db, changed_profile)
+        .await
+        .expect("follow-up execution references the existing session");
+    let followed = ExecutionRepo::update(
+        &db,
+        result_update(&follow_up.id, Some("capability-history-thread")),
+    )
+    .await
+    .expect("follow-up result persists");
+    assert_eq!(followed.harness_session_id.as_deref(), Some(session_id.as_str()));
+
+    let persisted = HarnessSessionRepo::get_by_id(&db, &session_id)
+        .await
+        .expect("session loads")
+        .expect("session exists");
+    assert_eq!(persisted.capabilities_snapshot_json, historical_capabilities);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&persisted.capabilities_snapshot_json)
+            .expect("historical snapshot parses"),
+        harness_capabilities_for("codex")
+    );
 }
 
 #[tokio::test]
@@ -526,6 +676,7 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
         "executor_type": "cursor",
         "config": {"account": "cursor-fallback"},
         "capabilities": ["read", "cursor-native"],
+        "harness_capabilities": harness_capabilities_for("cursor"),
         "routing": {
             "policy": "ordered_fallback_v1",
             "selected_candidate_key": "cursor:fallback",
@@ -564,8 +715,9 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
     assert_eq!(session.external_session_id.as_deref(), Some("cursor-thread"));
     assert_eq!(session_snapshot["config"]["account"], "cursor-fallback");
     assert_eq!(
-        session.capabilities_snapshot_json,
-        r#"["read","cursor-native"]"#
+        serde_json::from_str::<serde_json::Value>(&session.capabilities_snapshot_json)
+            .expect("typed Cursor capabilities parse"),
+        harness_capabilities_for("cursor")
     );
 
     let repeated = ExecutionRepo::update(&db, result)
@@ -628,6 +780,7 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
         "executor_type": "codex",
         "config": {"account": "profile-b"},
         "capabilities": ["read", "profile-b-capability"],
+        "harness_capabilities": harness_capabilities_for("codex"),
         "routing": {
             "policy": "ordered_fallback_v1",
             "selected_candidate_key": "codex:profile-b",
@@ -657,8 +810,9 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
     assert_eq!(session_snapshot["config"]["account"], "profile-b");
     assert_ne!(session_snapshot["config"]["account"], "profile-a");
     assert_eq!(
-        session.capabilities_snapshot_json,
-        r#"["read","profile-b-capability"]"#
+        serde_json::from_str::<serde_json::Value>(&session.capabilities_snapshot_json)
+            .expect("typed Codex capabilities parse"),
+        harness_capabilities_for("codex")
     );
 }
 

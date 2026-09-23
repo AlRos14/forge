@@ -12,7 +12,6 @@ use crate::{
 use ::review::{ReviewRequest, ReviewRunner};
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
 use api_types::{Actor, ActorRef, ProjectSettings, UserActionSource};
-use cli_adapters::codex::protocol::RESUME_THREAD_ID_CONFIG_KEY;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
     CommentAuthorType, CreateExecution, CreateTask, CreateTaskComment, CreateTaskRoleAssignment,
@@ -25,8 +24,7 @@ use db::{
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
-    merge_overrides, resolve_config_value, ExecutionContext, ExecutionOutcome, ExecutionOverrides,
-    ExecutorKind, TaskExecutor,
+    ExecutionContext, ExecutionOutcome, ExecutionOverrides, ExecutorKind, TaskExecutor,
 };
 use serde_json::{json, Value};
 use std::{
@@ -80,7 +78,7 @@ use self::config::{
 use self::{
     config::{
         build_executor_config_snapshot, create_failed_execution_record,
-        executor_snapshot_with_resume_thread, executor_snapshot_without_resume_thread,
+        executor_snapshot_for_fresh_start, executor_snapshot_for_harness_resume,
         parse_json_value, truncate_utf8_bytes,
     },
     logs::execution_logs_path,
@@ -120,6 +118,7 @@ pub struct TaskService {
     cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
     review_runner: Option<Arc<ReviewRunner>>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
+    adapter_registry: Option<Arc<executors::HarnessAdapterRegistry>>,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
@@ -196,6 +195,7 @@ impl TaskService {
             cleanup_scheduler: None,
             review_runner: None,
             task_executor: None,
+            adapter_registry: None,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
@@ -227,6 +227,14 @@ impl TaskService {
 
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {
         self.task_executor = Some(task_executor);
+        self
+    }
+
+    pub fn with_adapter_registry(
+        mut self,
+        adapter_registry: Arc<executors::HarnessAdapterRegistry>,
+    ) -> Self {
+        self.adapter_registry = Some(adapter_registry);
         self
     }
 
@@ -499,6 +507,11 @@ impl TaskService {
                     candidate.candidate_key.clone(),
                     candidate.executor_type.clone(),
                     candidate.config.clone(),
+                    serde_json::to_value(&candidate.harness_capabilities).unwrap_or(Value::Null),
+                    candidate
+                        .effective_policy
+                        .as_ref()
+                        .map(|policy| serde_json::to_value(policy).unwrap_or(Value::Null)),
                 )
             }),
             attempts: notification

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy, SmithConfig, TokenUsage,
 };
@@ -55,7 +55,15 @@ impl SmithAdapter {
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> SmithConfig {
-        serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
+        let mut config: SmithConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        match &ctx.invocation {
+            executors::HarnessInvocation::Start => config.resume_session_id = None,
+            executors::HarnessInvocation::Resume { external_session_id } => {
+                config.resume_session_id = Some(external_session_id.clone());
+            }
+        }
+        config
     }
 
     fn build_command(config: &SmithConfig, prompt: &str) -> tokio::process::Command {
@@ -149,13 +157,34 @@ impl Default for SmithAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for SmithAdapter {
+impl HarnessAdapter for SmithAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Smith
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
         detect_smith_availability()
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<SmithConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Native, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
+            S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+        )
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("smith".to_owned())
     }
 
     async fn discover_options(
@@ -830,6 +859,26 @@ mod git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
+        let stale = serde_json::json!({"resume_session_id":"old-session"});
+        let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        assert!(SmithAdapter::resolve_config(&start).resume_session_id.is_none());
+
+        let resume = crate::test_execution_context(
+            executors::HarnessInvocation::Resume {
+                external_session_id: "exact-session".to_owned(),
+            },
+            stale,
+        );
+        assert_eq!(
+            SmithAdapter::resolve_config(&resume)
+                .resume_session_id
+                .as_deref(),
+            Some("exact-session")
+        );
+    }
 
     async fn stream_fixture(lines: &[serde_json::Value]) -> StreamResult {
         let dir = tempfile::tempdir().unwrap();

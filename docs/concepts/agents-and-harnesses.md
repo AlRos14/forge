@@ -78,8 +78,11 @@ cleanup; they are not the generic Execution continuity authority.
 
 The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of
 representation, each Execution snapshots the exact effective profile,
-credential context, and capabilities used; later profile revisions never
-rewrite historical Executions.
+credential context, and typed `harness_capabilities` used by the selected
+adapter; later profile revisions never rewrite historical Executions. The
+separate legacy Agent `capabilities_json` field remains authored tags and
+filters. New HarnessSession capability snapshots preserve effective typed
+support evidence historically.
 
 ## HarnessAdapter
 
@@ -101,10 +104,19 @@ into native harness behavior.
 
 ## Capabilities
 
-Capabilities are dimensional. Relevant support is explicitly classified as
-native, emulated, or unsupported. For example, a read-only sandbox is not
-native planning unless the harness exposes a planning mode through the
-integration. An unknown Cursor or Codex feature remains unknown until detected.
+Capabilities are dimensional. Each dimension is explicitly classified as
+`native`, `emulated`, `unsupported`, or `unknown`. Only native and emulated
+support are available, and unknown fails closed. For example, a read-only
+sandbox is not native planning unless the integration invokes a harness-native
+planning mode. `PermissionPolicy::Plan` remains permission vocabulary and does
+not itself prove native planning support.
+
+Execution continuity is a generic `Start` or `Resume { external_session_id }`
+intent derived from `Execution.harness_session_id` and the historical
+HarnessSession. The adapter translates Resume into that harness's protocol.
+An explicit Resume never falls through to another route candidate or silently
+starts a fresh run. Start may use ordered fallback routing; the actual winner's
+capabilities and candidate identity are recorded in the Execution snapshot.
 
 The core must not implement a provider-specific reasoning loop, prompt
 protocol, context manager, or pretend-native fallback. It may enforce

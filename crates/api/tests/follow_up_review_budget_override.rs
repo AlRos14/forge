@@ -22,7 +22,7 @@ use axum::{
 };
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter,
 };
@@ -166,9 +166,9 @@ async fn task_review_budget_override_wins_over_project_setting() {
         latest_coder
             .executor_config_snapshot
             .as_ref()
-            .expect("latest coder records config snapshot")["config"]["resume_thread_id"],
-        "follow-up-session-1",
-        "latest coder follow-up should carry the resumed thread"
+            .expect("latest coder records config snapshot")["dispatch"]["execution_policy"],
+        "explicit_harness_session",
+        "latest coder follow-up should record generic session continuity"
     );
     let blocked = blocked_task
         .blocked
@@ -193,7 +193,7 @@ impl ReviewFailCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for ReviewFailCodexAdapter {
+impl HarnessAdapter for ReviewFailCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -302,7 +302,7 @@ struct TestHarness {
 
 async fn test_app(
     workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
+    adapter: impl HarnessAdapter + 'static,
 ) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
@@ -310,7 +310,7 @@ async fn test_app(
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
@@ -473,8 +473,8 @@ async fn poll_until_coder_follow_up_count(
                     && execution
                         .executor_config_snapshot
                         .as_ref()
-                        .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                        == Some(FIRST_EXECUTOR_SESSION_ID)
+                        .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                        == Some("explicit_harness_session")
             })
             .count();
         if count >= expected_count {

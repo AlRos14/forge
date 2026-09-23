@@ -22,7 +22,7 @@ use axum::{
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter,
 };
@@ -117,8 +117,8 @@ async fn auditor_failure_dispatches_follow_up_executor_with_thread_reuse() {
                 && execution
                     .executor_config_snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(FIRST_EXECUTOR_SESSION_ID)
+                    .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                    == Some("explicit_harness_session")
         })
         .expect("coder follow-up execution with session continuity exists");
     assert_eq!(follow_up_execution.status, ExecutionStatus::Running);
@@ -127,10 +127,12 @@ async fn auditor_failure_dispatches_follow_up_executor_with_thread_reuse() {
         .as_ref()
         .expect("follow-up execution records config snapshot");
     assert_eq!(
-        follow_up_snapshot["config"]["resume_thread_id"], FIRST_EXECUTOR_SESSION_ID,
-        "coder follow-up resumes the initial executor thread"
+        follow_up_snapshot["dispatch"]["execution_policy"],
+        "explicit_harness_session",
+        "follow-up records generic HarnessSession continuity"
     );
-    assert_eq!(follow_up_snapshot["config"]["resume_thread_in_place"], true);
+    assert!(follow_up_snapshot["config"].get("resume_thread_id").is_none());
+    assert!(follow_up_snapshot["config"].get("resume_thread_in_place").is_none());
     assert!(
         follow_up_snapshot["config"]
             .get("resume_fallback_prompt")
@@ -201,7 +203,7 @@ impl ReviewFailCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for ReviewFailCodexAdapter {
+impl HarnessAdapter for ReviewFailCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -307,7 +309,7 @@ struct TestHarness {
 
 async fn test_app(
     workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
+    adapter: impl HarnessAdapter + 'static,
 ) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
@@ -315,7 +317,7 @@ async fn test_app(
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
@@ -486,8 +488,8 @@ async fn poll_until_reused_execution_running(
                 && execution
                     .executor_config_snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(FIRST_EXECUTOR_SESSION_ID)
+                    .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                    == Some("explicit_harness_session")
         }) {
             return executions;
         }

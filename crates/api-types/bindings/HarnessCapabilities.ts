@@ -1,0 +1,3 @@
+import type { CapabilitySupport } from "./CapabilitySupport";
+
+export type HarnessCapabilities = { resume: CapabilitySupport, cancel: CapabilitySupport, structured_events: CapabilitySupport, usage_reporting: CapabilitySupport, account_usage_observation: CapabilitySupport, model_selection: CapabilitySupport, reasoning_controls: CapabilitySupport, approval_policy: CapabilitySupport, sandbox_controls: CapabilitySupport, planning: CapabilitySupport, review_mode: CapabilitySupport, fork: CapabilitySupport, steer: CapabilitySupport, pause_resume: CapabilitySupport, compaction: CapabilitySupport, subagents: CapabilitySupport, };

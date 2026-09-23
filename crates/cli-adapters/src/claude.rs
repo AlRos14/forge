@@ -3,7 +3,7 @@ mod normalize;
 use async_trait::async_trait;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, ClaudeCodeConfig, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, ClaudeCodeConfig, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
@@ -157,7 +157,15 @@ impl ClaudeCodeAdapter {
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> ClaudeCodeConfig {
-        serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
+        let mut config: ClaudeCodeConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        match &ctx.invocation {
+            executors::HarnessInvocation::Start => config.resume_session_id = None,
+            executors::HarnessInvocation::Resume { external_session_id } => {
+                config.resume_session_id = Some(external_session_id.clone());
+            }
+        }
+        config
     }
 
     #[cfg(test)]
@@ -168,25 +176,13 @@ impl ClaudeCodeAdapter {
         Self::build_command_for_cwd(config, resume_session_id, None)
     }
 
-    /// Like [`Self::build_command`] but additionally drops `--resume <id>` if the
-    /// session file claude-code would look up doesn't exist on disk for `cwd`. This
-    /// prevents the noisy "No conversation found with session ID" warning and the
-    /// subsequent fresh-session-with-wrong-reported-id dance.
+    /// Build a command for the exact requested session. Claude reports a
+    /// missing session as an execution error; Forge must not turn it into Start.
     fn build_command_for_cwd(
         config: &ClaudeCodeConfig,
         resume_session_id: Option<&str>,
-        cwd: Option<&Path>,
+        _cwd: Option<&Path>,
     ) -> tokio::process::Command {
-        let resume_session_id = match (resume_session_id, cwd, dirs::home_dir()) {
-            (Some(id), Some(cwd), Some(home)) if !claude_session_exists(&home, cwd, id) => {
-                eprintln!(
-                    "[claude-adapter] resume session file missing on disk for cwd={} session_id={id}; starting fresh session",
-                    cwd.display()
-                );
-                None
-            }
-            (id, _, _) => id,
-        };
         Self::build_command_inner(config, resume_session_id)
     }
 
@@ -264,7 +260,7 @@ impl ClaudeCodeAdapter {
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
-        let resume_session_id = resume_session_id(&ctx);
+        let resume_session_id = config.resume_session_id.clone();
         let worktree = Path::new(&ctx.worktree_path);
         let mut cmd =
             Self::build_command_for_cwd(&config, resume_session_id.as_deref(), Some(worktree));
@@ -414,7 +410,7 @@ impl Default for ClaudeCodeAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for ClaudeCodeAdapter {
+impl HarnessAdapter for ClaudeCodeAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::ClaudeCode
     }
@@ -422,6 +418,55 @@ impl CodingExecutorAdapter for ClaudeCodeAdapter {
     fn check_availability(&self) -> AvailabilityInfo {
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         availability_from_home(&home)
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<ClaudeCodeConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Native, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
+            S::Native, S::Native, S::Unsupported, S::Native, S::Unsupported, S::Unsupported,
+            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+        )
+    }
+
+    fn effective_execution_policy(
+        &self,
+        config: &serde_json::Value,
+        effective_cwd: Option<&str>,
+        workspace_root: Option<&str>,
+    ) -> api_types::EffectiveExecutionPolicy {
+        let permission = config
+            .get("permission_policy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let isolation = if config
+            .get("dangerously_skip_permissions")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            "dangerously_skip_permissions"
+        } else if config.get("plan").and_then(serde_json::Value::as_bool) == Some(true)
+            || permission == "plan"
+        {
+            "plan"
+        } else {
+            "standard"
+        };
+        executors::effective_policy::from_harness_interpretation(
+            &self.kind(), permission, isolation, effective_cwd, workspace_root, config,
+        )
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("claude".to_owned())
     }
 
     async fn discover_options(
@@ -835,13 +880,6 @@ async fn uninstall_stop_hook(path: Option<PathBuf>) {
     }
 }
 
-fn resume_session_id(ctx: &ExecutionContext) -> Option<String> {
-    ctx.agent_config
-        .get("resume_session_id")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-}
-
 /// Map a worktree path to the directory claude-code uses for its session JSONL files,
 /// e.g. `/Volumes/Data/.../subtask-app` → `~/.claude/projects/-Volumes-Data-...-subtask-app`.
 /// Mirrors claude-code's encoding: replace `/` and `.` with `-`.
@@ -965,6 +1003,26 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
+        let stale = serde_json::json!({"resume_session_id":"old-session"});
+        let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        assert!(ClaudeCodeAdapter::resolve_config(&start).resume_session_id.is_none());
+
+        let resume = crate::test_execution_context(
+            executors::HarnessInvocation::Resume {
+                external_session_id: "exact-session".to_owned(),
+            },
+            stale,
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::resolve_config(&resume)
+                .resume_session_id
+                .as_deref(),
+            Some("exact-session")
+        );
+    }
+
+    #[test]
     fn usage_limit_signature_with_epoch_classifies() {
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1057,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn build_command_for_cwd_drops_resume_when_session_file_missing() {
+    fn missing_session_keeps_exact_resume_request() {
         let home = tempfile::tempdir().expect("home");
         let cwd = tempfile::tempdir().expect("cwd");
         // Pretend the user's HOME is our temp dir by directly probing the helper:
@@ -1075,11 +1133,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        // Sanity: build_command_inner WOULD include --resume here.
+        // The adapter preserves exact continuity and lets Claude report that
+        // the requested session cannot be opened.
         assert!(args.contains(&"--resume".to_owned()));
-        // build_command_for_cwd would *drop* it because the session isn't on disk —
-        // but we can't easily intercept dirs::home_dir() in this test, so just
-        // assert the helper returns false for the missing file.
+        assert!(args.contains(&session_id.to_owned()));
     }
 
     #[test]

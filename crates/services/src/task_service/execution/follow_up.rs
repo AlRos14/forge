@@ -272,12 +272,20 @@ fn dispatch_role_follow_up_impl(
         } else {
             None
         };
+        if same_actor
+            && lineage_parent.harness_session_id.is_some()
+            && reusable_session.is_none()
+        {
+            return Err(ServiceError::invalid_operation(
+                "explicit HarnessSession is not resumable for this follow-up",
+            ));
+        }
         let reusable_external_session = reusable_session
             .as_ref()
             .filter(|session| matches!(&session.status, db::HarnessSessionStatus::Active))
             .and_then(|session| session.external_session_id.clone());
         let executor_config_snapshot_json =
-            if let Some(agent_session_id) = reusable_external_session.as_deref() {
+            if reusable_external_session.is_some() {
                 let snapshot_json = lineage_parent
                     .executor_config_snapshot_json
                     .as_deref()
@@ -287,12 +295,16 @@ fn dispatch_role_follow_up_impl(
                             lineage_parent.id
                         ))
                     })?;
-                Some(executor_snapshot_with_resume_thread(
-                    snapshot_json,
-                    agent_session_id,
-                )?)
+                Some(executor_snapshot_for_harness_resume(snapshot_json)?)
             } else {
-                build_executor_config_snapshot(&service.db, &task, &agent, None).await?
+                build_executor_config_snapshot(
+                    &service.db,
+                    &task,
+                    &agent,
+                    None,
+                    service.adapter_registry.as_deref(),
+                )
+                .await?
             };
         let execution_id = new_uuid_v4();
         let logs_path = execution_logs_path(

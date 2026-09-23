@@ -109,10 +109,21 @@ snapshots the exact effective profile, account context, and capabilities used.
 See [actors.md](concepts/actors.md) and
 [agents-and-harnesses.md](concepts/agents-and-harnesses.md).
 
-The platform exposes capability support dimensionally. A capability is
-native, emulated, or unsupported where that distinction matters. Unknown
-support is not support. The core never advertises a read-only sandbox, prompt
-convention, or fallback process as native harness planning or steering.
+The platform exposes capability support dimensionally through
+`HarnessAdapter`. Each capability is `native`, `emulated`, `unsupported`, or
+`unknown`; only native and emulated are available. Unknown support fails
+closed. The core never advertises a read-only sandbox, permission policy, or
+fallback process as native harness planning or steering.
+
+Plan PR3 establishes `HarnessAdapter` as the sole external harness authority
+for detection, config normalization, dimensional capability evidence,
+Start/Resume translation, cancellation, normalized events/results, and usage
+observation. `TaskExecutor` remains a transitional supervisor facade for
+routing, fallback, and cancellation propagation. Agent `capabilities_json`
+remains legacy authored tag/filter data; effective harness support is stored
+under `harness_capabilities` in Execution and HarnessSession snapshots. Resume
+uses the exact recorded HarnessSession candidate, while only Start may walk the
+ordered fallback route.
 
 ## Roles and memberships
 

@@ -23,7 +23,7 @@ use axum::{
 use db::ReviewRepo;
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter,
 };
@@ -114,16 +114,16 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
                 && execution
                     .executor_config_snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(EXECUTOR_SESSION_ID)
+                    .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                    == Some("explicit_harness_session")
         })
-        .expect("coder follow-up with resume_thread_id exists");
+        .expect("coder follow-up with generic HarnessSession continuity exists");
     assert_eq!(
         coder_follow_up
             .executor_config_snapshot
             .as_ref()
-            .expect("coder follow-up records config snapshot")["config"]["resume_thread_id"],
-        EXECUTOR_SESSION_ID
+            .expect("coder follow-up records config snapshot")["dispatch"]["execution_policy"],
+        "explicit_harness_session"
     );
 
     let start = Instant::now();
@@ -228,7 +228,7 @@ impl MergeConflictCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for MergeConflictCodexAdapter {
+impl HarnessAdapter for MergeConflictCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -381,7 +381,7 @@ fn resolve_conflict_in_worktree(worktree_path: &Path) {
 
 struct CompletingCodexAdapter;
 
-impl CodingExecutorAdapter for CompletingCodexAdapter {
+impl HarnessAdapter for CompletingCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -451,7 +451,7 @@ struct TestHarness {
 
 async fn test_app(
     workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
+    adapter: impl HarnessAdapter + 'static,
 ) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
@@ -459,7 +459,7 @@ async fn test_app(
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
@@ -750,8 +750,8 @@ async fn poll_until_role_follow_up(
                 && execution
                     .executor_config_snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(EXECUTOR_SESSION_ID)
+                    .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                    == Some("explicit_harness_session")
         }) {
             return executions;
         }

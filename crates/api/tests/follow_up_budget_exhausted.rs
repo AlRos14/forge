@@ -22,7 +22,7 @@ use axum::{
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter,
 };
@@ -327,7 +327,7 @@ impl ReviewFailCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for ReviewFailCodexAdapter {
+impl HarnessAdapter for ReviewFailCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -447,7 +447,7 @@ struct TestHarness {
 
 async fn test_app(
     workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
+    adapter: impl HarnessAdapter + 'static,
 ) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
@@ -455,7 +455,7 @@ async fn test_app(
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)

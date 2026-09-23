@@ -8,6 +8,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- New Execution snapshots no longer write harness-native resume flags such as
+  `resume_thread_id` or `resume_session_id` into config. Continuity is expressed
+  by the existing `harness_session_id` relation and a runtime-only generic
+  Start/Resume invocation. The HarnessSession relation remains the durable
+  continuity authority; typed `harness_capabilities` records support evidence.
 - Execution responses now expose additive `actor_ref`, `purpose`, and
   `harness_session_id` fields. New Executions persist a real Human or Agent
   principal and an explicit purpose; legacy `agent_id` and `agent_session_id`
@@ -57,6 +62,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- External CLI integrations now run through one `HarnessAdapter` registry with
+  explicit native/emulated/unsupported/unknown support per capability. Executor
+  discovery includes additive `harness_capabilities`; winner capabilities are
+  preserved in Execution and HarnessSession snapshots. No schema migration was
+  needed.
 - Durable, immutable Task plan revisions survive Workspace cleanup, expose the
   full Markdown and revision digest through `GET /api/v1/tasks/{id}/plan`, and
   bind review evidence to the exact plan and git head.

@@ -1300,7 +1300,8 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
             .expect("snapshot exists"),
     )
     .expect("snapshot is valid json");
-    assert_eq!(snapshot["config"]["resume_session_id"], "test-session");
+    assert_eq!(snapshot["dispatch"]["execution_policy"], "explicit_harness_session");
+    assert!(snapshot["config"].get("resume_session_id").is_none());
 }
 
 #[tokio::test]
@@ -1834,8 +1835,9 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
             .expect("snapshot exists"),
     )
     .expect("snapshot is valid json");
-    assert_eq!(snapshot["config"]["resume_thread_id"], "codex-thread");
-    assert_eq!(snapshot["config"]["resume_thread_in_place"], true);
+    assert_eq!(snapshot["dispatch"]["execution_policy"], "explicit_harness_session");
+    assert!(snapshot["config"].get("resume_thread_id").is_none());
+    assert!(snapshot["config"].get("resume_thread_in_place").is_none());
     assert!(snapshot["config"].get("resume_fallback_prompt").is_none());
 }
 

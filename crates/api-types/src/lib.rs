@@ -75,6 +75,9 @@ fn export_typescript() {
     ProductGenesisActiveResponse::export().expect("export ProductGenesisActiveResponse");
     CancelProductGenesisRequest::export().expect("export CancelProductGenesisRequest");
     WorkMode::export().expect("export WorkMode");
+    CapabilitySupport::export().expect("export CapabilitySupport");
+    HarnessCapabilities::export().expect("export HarnessCapabilities");
+    HarnessInvocation::export().expect("export HarnessInvocation");
     CreateRepoRequest::export().expect("export CreateRepoRequest");
     UpdateRepoRequest::export().expect("export UpdateRepoRequest");
     RepoResponse::export().expect("export RepoResponse");

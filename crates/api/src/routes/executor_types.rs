@@ -70,11 +70,18 @@ pub async fn executor_type_discovered_options(
         })
         .await
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let capability_config = adapter
+        .normalize_config(
+            &serde_json::json!({}),
+            &executors::ExecutionOverrides::default(),
+        )
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
     Ok(Json(DiscoveredOptionsResponse {
         models: discovered.models,
         permission_policies: discovered.permission_policies,
         cli_specific: discovered.cli_specific,
+        harness_capabilities: adapter.capabilities(&capability_config),
         available_daemons: daemons
             .into_iter()
             .map(|daemon| DiscoveredDaemonResponse {

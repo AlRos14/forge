@@ -305,9 +305,8 @@ impl TaskService {
                     })?;
                 (
                     continuity_execution.harness_session_id,
-                    Some(executor_snapshot_with_resume_thread(
+                    Some(executor_snapshot_for_harness_resume(
                         snapshot_json,
-                        &agent_session_id,
                     )?),
                 )
             } else {
@@ -319,7 +318,14 @@ impl TaskService {
                     .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
                 (
                     None,
-                    build_executor_config_snapshot(&self.db, task, &agent, None).await?,
+                    build_executor_config_snapshot(
+                        &self.db,
+                        task,
+                        &agent,
+                        None,
+                        self.adapter_registry.as_deref(),
+                    )
+                    .await?,
                 )
             };
             let execution_id = new_uuid_v4();

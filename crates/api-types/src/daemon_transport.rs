@@ -88,12 +88,16 @@ pub struct FsBranchesResult {
 pub struct ExecutionStartParams {
     pub task_id: String,
     pub execution_id: String,
+    #[serde(default)]
+    pub role: String,
     pub workspace_path: String,
     pub executor_type: String,
     #[ts(type = "unknown")]
     pub executor_config: serde_json::Value,
     #[ts(type = "unknown")]
     pub prompt: serde_json::Value,
+    #[serde(default)]
+    pub invocation: crate::HarnessInvocation,
     pub max_turns: Option<u32>,
 }
 
@@ -188,6 +192,10 @@ pub struct RemoteResolvedCandidate {
     pub executor_type: String,
     #[ts(type = "Record<string, unknown>")]
     pub config: serde_json::Value,
+    #[serde(default)]
+    pub harness_capabilities: crate::HarnessCapabilities,
+    #[serde(default)]
+    pub effective_policy: Option<crate::EffectiveExecutionPolicy>,
 }
 
 /// One candidate attempt outcome from a remote execution's fallback route.
@@ -302,7 +310,68 @@ pub struct DaemonErrorPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonErrorPayload, DaemonFrame, TerminalOutputNotification};
+    use super::{
+        DaemonErrorPayload, DaemonFrame, ExecutionStartParams, RemoteResolvedCandidate,
+        TerminalOutputNotification,
+    };
+    use crate::HarnessInvocation;
+
+    fn execution_start_params(invocation: HarnessInvocation) -> ExecutionStartParams {
+        ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            role: "coder".to_owned(),
+            workspace_path: "/tmp/worktree".to_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: serde_json::json!({"model":"test"}),
+            prompt: serde_json::json!({"description":"continue"}),
+            invocation,
+            max_turns: None,
+        }
+    }
+
+    #[test]
+    fn generic_start_and_resume_survive_daemon_transport_serialization() {
+        for invocation in [
+            HarnessInvocation::Start,
+            HarnessInvocation::Resume {
+                external_session_id: "external-session-abc".to_owned(),
+            },
+        ] {
+            let params = execution_start_params(invocation.clone());
+            let encoded = serde_json::to_value(&params).expect("start params serialize");
+            let decoded: ExecutionStartParams =
+                serde_json::from_value(encoded).expect("start params deserialize");
+            assert_eq!(decoded.invocation, invocation);
+            assert_eq!(decoded.role, "coder");
+        }
+    }
+
+    #[test]
+    fn old_daemon_start_payload_defaults_to_generic_start() {
+        let mut encoded = serde_json::to_value(execution_start_params(HarnessInvocation::Start))
+            .expect("start params serialize");
+        encoded.as_object_mut().unwrap().remove("invocation");
+        encoded.as_object_mut().unwrap().remove("role");
+
+        let decoded: ExecutionStartParams =
+            serde_json::from_value(encoded).expect("old start payload remains readable");
+        assert_eq!(decoded.invocation, HarnessInvocation::Start);
+        assert!(decoded.role.is_empty());
+    }
+
+    #[test]
+    fn remote_resolved_candidate_carries_effective_harness_capabilities() {
+        let candidate = RemoteResolvedCandidate {
+            candidate_key: "cursor:profile=work#1234".to_owned(),
+            executor_type: "cursor".to_owned(),
+            config: serde_json::json!({"profile":"work"}),
+            harness_capabilities: crate::HarnessCapabilities::unknown(),
+            effective_policy: None,
+        };
+        let encoded = serde_json::to_value(candidate).expect("candidate serializes");
+        assert_eq!(encoded["harness_capabilities"]["resume"], "unknown");
+    }
 
     #[test]
     fn request_frame_round_trips() {

@@ -512,14 +512,14 @@ impl TaskService {
                 )
                 .await?;
             }
-            let agent_session_id = agent_session_id.ok_or_else(|| {
+            let _agent_session_id = agent_session_id.ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "blocked execution HarnessSession is not reusable in this workspace",
                 )
             })?;
             (
                 blocked_execution.harness_session_id.clone(),
-                executor_snapshot_with_resume_thread(&snapshot_json, &agent_session_id)?,
+                executor_snapshot_for_harness_resume(&snapshot_json)?,
             )
         } else {
             // Recovery still creates a new Execution, but a current Actor
@@ -529,7 +529,13 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
             (
                 None,
-                build_executor_config_snapshot(&self.db, &task, &agent, None)
+                build_executor_config_snapshot(
+                    &self.db,
+                    &task,
+                    &agent,
+                    None,
+                    self.adapter_registry.as_deref(),
+                )
                     .await?
                     .ok_or_else(|| {
                         ServiceError::invalid_operation(
@@ -810,7 +816,14 @@ impl TaskService {
             )
             .await?;
         let executor_config_snapshot_json =
-            build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
+            build_executor_config_snapshot(
+                &self.db,
+                &task,
+                &agent,
+                None,
+                self.adapter_registry.as_deref(),
+            )
+            .await?;
         // Clear recovery state before issuing an exact-version WorkspaceLease.
         let recovered = self.clear_blocking_metadata(&task.id).await?;
         let now = now_rfc3339();

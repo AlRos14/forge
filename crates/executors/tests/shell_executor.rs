@@ -13,8 +13,10 @@ fn execution_context(
 ) -> ExecutionContext {
     let log_path = dir.path().join(log_name);
     ExecutionContext {
+        invocation: executors::HarnessInvocation::Start,
         task_id: "task-1".to_string(),
         execution_id: execution_id.to_string(),
+        role: "coder".to_string(),
         worktree_path: dir.path().to_string_lossy().to_string(),
         description: description.to_string(),
         agent_config: serde_json::json!({}),
@@ -33,8 +35,10 @@ async fn shell_executor_runs_echo_and_writes_logs() {
     let executor = ShellExecutor::default();
     let result = executor
         .execute(ExecutionContext {
+                    invocation: executors::HarnessInvocation::Start,
             task_id: "task-1".to_string(),
             execution_id: "exec-1".to_string(),
+            role: "coder".to_string(),
             worktree_path: dir.path().to_string_lossy().to_string(),
             description: "echo hello world".to_string(),
             agent_config: serde_json::json!({}),
@@ -129,8 +133,10 @@ async fn shell_executor_non_zero_exit_is_failure_with_stderr_logged() {
     let executor = ShellExecutor::default();
     let result = executor
         .execute(ExecutionContext {
+                    invocation: executors::HarnessInvocation::Start,
             task_id: "task-1".to_string(),
             execution_id: "exec-fail".to_string(),
+            role: "coder".to_string(),
             worktree_path: dir.path().to_string_lossy().to_string(),
             description: "sh -c 'echo err >&2; exit 3'".to_string(),
             agent_config: serde_json::json!({}),

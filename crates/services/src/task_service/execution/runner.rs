@@ -258,7 +258,7 @@ impl TaskService {
             return Err(error);
         }
 
-        let description = execution_description(&execution, &task, &agent_config);
+        let description = execution_description(&execution, &task);
 
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -415,15 +415,26 @@ impl TaskService {
         } else {
             None
         };
-        let cursor_usage_probe = super::spawn_cursor_usage_probe(
-            Arc::clone(&self.db),
-            execution.executor_config_snapshot_json.clone(),
-            execution_id.clone(),
-        );
+        let invocation = super::harness_invocation_for_execution(
+            &self.db,
+            &execution,
+            Some(&workspace.id),
+        )
+        .await?;
+        let usage_probe = self.task_executor.clone().and_then(|executor| {
+            super::spawn_account_usage_probe(
+                Arc::clone(&self.db),
+                execution.executor_config_snapshot_json.clone(),
+                execution_id.clone(),
+                executor,
+            )
+        });
         let execution_result = executor
             .execute(ExecutionContext {
+                invocation,
                 task_id: task.id.clone(),
                 execution_id: execution_id.clone(),
+                role: execution.role.clone(),
                 worktree_path: workspace.worktree_path.clone(),
                 description,
                 agent_config,
@@ -433,7 +444,7 @@ impl TaskService {
                 log_sender: Some(log_tx),
             })
             .await;
-        if let Some(probe) = cursor_usage_probe {
+        if let Some(probe) = usage_probe {
             probe.stop().await;
         }
         if let Err(error) = executors::LogWriter::compact(std::path::Path::new(&logs_path)).await {
@@ -486,6 +497,8 @@ impl TaskService {
                     candidate.candidate_key.clone(),
                     candidate.executor_type.to_string(),
                     candidate.config.clone(),
+                    serde_json::to_value(&candidate.harness_capabilities).unwrap_or(Value::Null),
+                    Some(serde_json::to_value(&candidate.effective_policy).unwrap_or(Value::Null)),
                 )
             }),
             attempts: result
@@ -822,33 +835,35 @@ impl TaskService {
                 ServiceError::invalid_operation("executor config snapshot missing executor_type")
             })?
             .to_owned();
-        let description = execution_description(execution, &task, &executor_config);
+        let description = execution_description(execution, &task);
         let max_turns = self.resolve_max_turns(&task).await?;
+        let invocation = super::harness_invocation_for_execution(
+            &self.db,
+            execution,
+            Some(&workspace.id),
+        )
+        .await?;
 
         Ok(api_types::ExecutionStartParams {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
+            role: execution.role.clone(),
             workspace_path: workspace.worktree_path,
             executor_type,
             executor_config,
             prompt: json!({ "description": description }),
+            invocation,
             max_turns,
         })
     }
 }
 
-fn execution_description(execution: &Execution, task: &Task, agent_config: &Value) -> String {
-    let is_shell_executor =
-        agent_config.get("executor_type").and_then(Value::as_str) == Some("shell");
-    if is_shell_executor && execution.role == crate::workflow::default_roles::REVIEWER {
-        r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#.to_owned()
-    } else {
-        execution
-            .summary
-            .clone()
-            .or_else(|| task.description.clone())
-            .unwrap_or_else(|| task.title.clone())
-    }
+fn execution_description(execution: &Execution, task: &Task) -> String {
+    execution
+        .summary
+        .clone()
+        .or_else(|| task.description.clone())
+        .unwrap_or_else(|| task.title.clone())
 }
 
 fn usage_model_fallback(agent_config: &Value) -> Option<String> {

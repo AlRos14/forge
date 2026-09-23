@@ -1,9 +1,20 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
+    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionResult, ExecutorError, ExecutorKind,
     ShellExecutor, TaskExecutor,
 };
+
+const REVIEW_RESULT_COMMAND: &str =
+    r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#;
+
+fn command_for_context(ctx: &ExecutionContext) -> &str {
+    if ctx.role == "reviewer" {
+        REVIEW_RESULT_COMMAND
+    } else {
+        &ctx.description
+    }
+}
 
 /// Shell adapter: wraps the existing ShellExecutor.
 pub struct ShellAdapter {
@@ -25,9 +36,31 @@ impl Default for ShellAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for ShellAdapter {
+impl HarnessAdapter for ShellAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Shell
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<executors::ShellConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Unsupported, S::Emulated, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported,
+        )
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("sh".to_owned())
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -45,7 +78,10 @@ impl CodingExecutorAdapter for ShellAdapter {
         Ok(DiscoveredOptions::default())
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+    async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+        if ctx.role == "reviewer" {
+            ctx.description = command_for_context(&ctx).to_owned();
+        }
         self.inner.execute(ctx).await
     }
 
@@ -59,6 +95,19 @@ mod tests {
     use super::*;
     use executors::{ExecutionOutcome, LogKind, LogReader};
 
+    #[test]
+    fn reviewer_compatibility_command_is_owned_by_shell_adapter() {
+        let mut ctx = crate::test_execution_context(
+            executors::HarnessInvocation::Start,
+            serde_json::json!({}),
+        );
+        ctx.role = "reviewer".to_owned();
+        assert_eq!(command_for_context(&ctx), REVIEW_RESULT_COMMAND);
+        ctx.role = "coder".to_owned();
+        ctx.description = "printf normal-task".to_owned();
+        assert_eq!(command_for_context(&ctx), "printf normal-task");
+    }
+
     #[tokio::test]
     async fn shell_adapter_executes_simple_command_and_writes_stdout() {
         let dir = tempfile::tempdir().unwrap();
@@ -67,8 +116,10 @@ mod tests {
 
         let result = adapter
             .execute(ExecutionContext {
+                    invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "printf shell-adapter-ok".to_owned(),
                 agent_config: serde_json::json!({}),

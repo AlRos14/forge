@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use config::{default_config_path, ForgeConfig};
 use db::SqliteDb;
 use events::EventBus;
-use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
+use executors::{HarnessAdapterRegistry, FallbackExecutor, TaskExecutor};
 use services::{
     AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
     CommitmentService, DaemonService, EmbeddedAgentService, MemoryService, MergeService,
@@ -83,7 +83,7 @@ pub struct AppState {
     pub operator_status_emitter: Arc<OperatorStatusEmitter>,
     pub cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
     pub review_runner: Arc<review::ReviewRunner>,
-    pub adapter_registry: Arc<AdapterRegistry>,
+    pub adapter_registry: Arc<HarnessAdapterRegistry>,
     pub task_executor: Arc<dyn TaskExecutor>,
     pub task_dispatcher: Option<Arc<services::TaskDispatcher>>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
@@ -100,14 +100,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, mcp_enabled: bool) -> Self {
-        Self::with_adapter_registry(db, event_bus, mcp_enabled, Arc::new(AdapterRegistry::new()))
+        Self::with_adapter_registry(db, event_bus, mcp_enabled, Arc::new(HarnessAdapterRegistry::new()))
     }
 
     pub fn with_adapter_registry(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
         mcp_enabled: bool,
-        adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry: Arc<HarnessAdapterRegistry>,
     ) -> Self {
         Self::with_adapter_registry_and_shutdown(
             db,
@@ -122,7 +122,7 @@ impl AppState {
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
         mcp_enabled: bool,
-        adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry: Arc<HarnessAdapterRegistry>,
         shutdown_signal: ShutdownSignal,
     ) -> Self {
         let workspace_root = default_workspace_root();
@@ -162,7 +162,7 @@ impl AppState {
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
         mcp_enabled: bool,
-        adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry: Arc<HarnessAdapterRegistry>,
         merge_service: Arc<MergeService>,
         cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
         review_runner: Arc<review::ReviewRunner>,
@@ -228,6 +228,7 @@ impl AppState {
                 .with_cleanup_scheduler(Arc::clone(&cleanup_scheduler))
                 .with_review_runner(Arc::clone(&review_runner))
                 .with_task_executor(Arc::clone(&task_executor))
+                .with_adapter_registry(Arc::clone(&adapter_registry))
                 .with_daemon_connections(Arc::clone(&daemon_connections))
                 .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
                 .with_terminal_activity_tracker(Arc::clone(&terminal_activity))

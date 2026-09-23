@@ -6,8 +6,8 @@ use db::{
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
-    resolve_config_value, AdapterExecutor, AdapterRegistry, ExecutionContext, ExecutionOutcome,
-    ExecutionOverrides, LogKind, LogStream, LogWriter, TaskExecutor,
+    AdapterExecutor, HarnessAdapterRegistry, ExecutionContext, ExecutionOutcome, LogKind,
+    LogStream, LogWriter, ResolvedExecutorCandidate, TaskExecutor,
 };
 use serde_json::{json, Value};
 use std::{path::PathBuf, process::ExitStatus, sync::Arc};
@@ -23,6 +23,7 @@ pub struct ReviewRunner {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     executor: Arc<dyn TaskExecutor>,
+    adapter_registry: Option<Arc<HarnessAdapterRegistry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,12 +93,14 @@ impl ReviewRunner {
     pub fn new(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
-        adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry: Arc<HarnessAdapterRegistry>,
     ) -> Self {
+        let registry = Arc::clone(&adapter_registry);
         Self {
             db,
             event_bus,
-            executor: Arc::new(AdapterExecutor::new(adapter_registry)),
+            executor: Arc::new(AdapterExecutor::new(Arc::clone(&registry))),
+            adapter_registry: Some(registry),
         }
     }
 
@@ -112,6 +115,7 @@ impl ReviewRunner {
             db,
             event_bus,
             executor,
+            adapter_registry: None,
         }
     }
 
@@ -430,6 +434,10 @@ impl ReviewRunner {
         // An auditor is independent by session boundary, even when the same
         // agent identity or harness produced the implementation.
         let snapshot = build_auditor_config_snapshot(&auditor_agent, None).await?;
+        let snapshot = self.normalize_auditor_snapshot(
+            &snapshot,
+            &req.workspace_path.display().to_string(),
+        )?;
         let now = now_rfc3339();
         let auditor_execution = ExecutionRepo::create(
             &*self.db,
@@ -466,8 +474,10 @@ impl ReviewRunner {
         let execution_result = self
             .executor
             .execute(ExecutionContext {
+                    invocation: executors::HarnessInvocation::Start,
                 task_id,
                 execution_id: auditor_execution.id.clone(),
+                role: "reviewer".to_owned(),
                 worktree_path: req.workspace_path.display().to_string(),
                 description: prompt,
                 agent_config: serde_json::from_str(&snapshot)?,
@@ -528,6 +538,10 @@ impl ReviewRunner {
             ExecutionOutcome::Failed => ExecutionStatus::Failed,
             ExecutionOutcome::Cancelled => ExecutionStatus::Cancelled,
         };
+        let snapshot = snapshot_with_resolved_candidate(
+            &snapshot,
+            result.resolved_candidate.as_ref(),
+        )?;
         let finished_at = now_rfc3339();
         ExecutionRepo::update(
             &*self.db,
@@ -546,7 +560,7 @@ impl ReviewRunner {
                 before_sha: None,
                 after_sha: Some(result.after_sha),
                 error: Some(result.error.clone()),
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: Some(Some(snapshot)),
                 updated_at: finished_at,
             },
         )
@@ -580,6 +594,44 @@ impl ReviewRunner {
                 details: AuditorDetails::failed(reason),
             },
         }))
+    }
+
+    fn normalize_auditor_snapshot(
+        &self,
+        snapshot_json: &str,
+        effective_cwd: &str,
+    ) -> Result<String, ReviewError> {
+        let Some(registry) = self.adapter_registry.as_ref() else {
+            return Ok(snapshot_json.to_owned());
+        };
+        let mut snapshot = serde_json::from_str::<Value>(snapshot_json)?;
+        let kind = snapshot
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                executors::ExecutorError::Other(
+                    "auditor executor snapshot missing executor_type".to_owned(),
+                )
+            })?
+            .parse::<executors::ExecutorKind>()
+            .map_err(executors::ExecutorError::Other)?;
+        let adapter = registry.get(&kind).ok_or_else(|| {
+            executors::ExecutorError::Other(format!("No HarnessAdapter registered for {kind}"))
+        })?;
+        let config = adapter.normalize_config(
+            snapshot.get("config").unwrap_or(&Value::Null),
+            &executors::ExecutionOverrides::default(),
+        )?;
+        let capabilities = adapter.capabilities(&config);
+        let effective_policy = adapter.effective_execution_policy(
+            &config,
+            Some(effective_cwd),
+            None,
+        );
+        snapshot["config"] = config;
+        snapshot["harness_capabilities"] = serde_json::to_value(capabilities)?;
+        snapshot["effective_execution_policy"] = serde_json::to_value(effective_policy)?;
+        Ok(serde_json::to_string(&snapshot)?)
     }
 
     async fn load_auditor_agent(
@@ -694,6 +746,21 @@ impl AuditorRunResult {
     }
 }
 
+fn snapshot_with_resolved_candidate(
+    snapshot_json: &str,
+    candidate: Option<&ResolvedExecutorCandidate>,
+) -> Result<String, ReviewError> {
+    let Some(candidate) = candidate else {
+        return Ok(snapshot_json.to_owned());
+    };
+    let mut snapshot = serde_json::from_str::<Value>(snapshot_json)?;
+    snapshot["executor_type"] = Value::String(candidate.executor_type.to_string());
+    snapshot["config"] = candidate.config.clone();
+    snapshot["harness_capabilities"] = serde_json::to_value(&candidate.harness_capabilities)?;
+    snapshot["effective_execution_policy"] = serde_json::to_value(&candidate.effective_policy)?;
+    Ok(serde_json::to_string(&snapshot)?)
+}
+
 async fn read_git_diff(
     workspace_path: &std::path::Path,
     default_branch: &str,
@@ -746,16 +813,10 @@ async fn build_auditor_config_snapshot(
     let mut base_config = parse_json_value("agent config_json", &agent.config_json)?;
     apply_agent_fields_to_config(agent, &mut base_config)?;
     let capabilities = parse_json_value("agent capabilities_json", &agent.capabilities_json)?;
-    let kind = agent
-        .executor_type
-        .parse()
-        .map_err(executors::ExecutorError::Other)?;
     let execution_overrides = extra_config.unwrap_or_else(|| json!({}));
     let (merged_config, overrides_applied) =
         merge_config_layers(&base_config, &execution_overrides);
-    let normalized_config =
-        resolve_config_value(kind, &merged_config, &ExecutionOverrides::default())?;
-    let overrides_applied = overrides_applied.retain_config_keys(&normalized_config);
+    let overrides_applied = overrides_applied.retain_config_keys(&merged_config);
     serde_json::to_string(&json!({
         "agent_id": agent.id,
         "executor_type": agent.executor_type,
@@ -763,7 +824,7 @@ async fn build_auditor_config_snapshot(
         "model": agent.model,
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,
-        "config": normalized_config,
+        "config": merged_config,
         "capabilities": capabilities,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),

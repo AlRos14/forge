@@ -148,7 +148,8 @@ pub(crate) async fn create_pending_harness_session_in_tx(
         .to_owned();
     let profile_id = profile_id_for_snapshot_in_tx(transaction, actor_agent_id, &snapshot).await?;
     let capabilities_snapshot_json = snapshot
-        .get("capabilities")
+        .get("harness_capabilities")
+        .or_else(|| snapshot.get("capabilities"))
         .map(ToString::to_string)
         .unwrap_or_else(|| "{}".to_owned());
     let id = new_uuid_v4();

@@ -121,7 +121,15 @@ impl TaskService {
         let execution_id = new_uuid_v4();
         let executor_config_snapshot_json = match agent.as_ref() {
             Some(agent) => {
-                match build_executor_config_snapshot(&self.db, &task, agent, overrides).await {
+                match build_executor_config_snapshot(
+                    &self.db,
+                    &task,
+                    agent,
+                    overrides,
+                    self.adapter_registry.as_deref(),
+                )
+                .await
+                {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
                         create_failed_execution_record(

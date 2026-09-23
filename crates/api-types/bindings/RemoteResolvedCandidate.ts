@@ -3,4 +3,7 @@
 /**
  * The executor candidate that actually ran a remote execution.
  */
-export type RemoteResolvedCandidate = { candidate_key: string, executor_type: string, config: Record<string, unknown>, };
+import type { HarnessCapabilities } from "./HarnessCapabilities";
+import type { EffectiveExecutionPolicy } from "./EffectiveExecutionPolicy";
+
+export type RemoteResolvedCandidate = { candidate_key: string, executor_type: string, config: Record<string, unknown>, harness_capabilities: HarnessCapabilities, effective_policy: EffectiveExecutionPolicy | null, };

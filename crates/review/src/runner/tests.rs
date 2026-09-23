@@ -10,6 +10,40 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tempfile::TempDir;
 
+#[test]
+fn auditor_snapshot_records_resolved_adapter_capabilities_without_overwriting_agent_tags() {
+    let snapshot = r#"{"executor_type":"codex","config":{"model":"old"},"capabilities":["legacy-tag"]}"#;
+    let candidate = executors::ResolvedExecutorCandidate {
+        candidate_key: "cursor:profile=review".to_owned(),
+        executor_type: executors::ExecutorKind::Cursor,
+        config: json!({"profile":"review","model":"new"}),
+        harness_capabilities: api_types::HarnessCapabilities {
+            resume: api_types::CapabilitySupport::Native,
+            ..api_types::HarnessCapabilities::unknown()
+        },
+        effective_policy: api_types::EffectiveExecutionPolicy {
+            executor_kind: "cursor".to_owned(),
+            permission_policy: "auto".to_owned(),
+            isolation_posture: "propose_only".to_owned(),
+            is_high_risk: false,
+            effective_cwd: None,
+            workspace_root: None,
+            environment_posture: "inherited".to_owned(),
+            scoped_tools: Vec::new(),
+            mcp_servers: Vec::new(),
+        },
+    };
+
+    let updated = snapshot_with_resolved_candidate(snapshot, Some(&candidate))
+        .expect("winner snapshot serializes");
+    let updated: Value = serde_json::from_str(&updated).unwrap();
+
+    assert_eq!(updated["executor_type"], "cursor");
+    assert_eq!(updated["config"]["model"], "new");
+    assert_eq!(updated["harness_capabilities"]["resume"], "native");
+    assert_eq!(updated["capabilities"][0], "legacy-tag");
+}
+
 struct SeededReview {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
@@ -530,7 +564,7 @@ async fn empty_steps_auto_passes() {
     let runner = ReviewRunner::new(
         seed.db.clone(),
         seed.event_bus.clone(),
-        Arc::new(AdapterRegistry::new()),
+        Arc::new(HarnessAdapterRegistry::new()),
     );
 
     let (review, outcome) = runner.run(request(&seed)).await.unwrap();
@@ -547,7 +581,7 @@ async fn passing_step_records_pass() {
     let runner = ReviewRunner::new(
         seed.db.clone(),
         seed.event_bus.clone(),
-        Arc::new(AdapterRegistry::new()),
+        Arc::new(HarnessAdapterRegistry::new()),
     );
 
     let (review, outcome) = runner.run(request(&seed)).await.unwrap();
@@ -566,7 +600,7 @@ async fn failing_step_records_fail() {
     let runner = ReviewRunner::new(
         seed.db.clone(),
         seed.event_bus.clone(),
-        Arc::new(AdapterRegistry::new()),
+        Arc::new(HarnessAdapterRegistry::new()),
     );
 
     let (review, outcome) = runner.run(request(&seed)).await.unwrap();
@@ -591,7 +625,7 @@ async fn attempt_numbers_increment() {
     let runner = ReviewRunner::new(
         seed.db.clone(),
         seed.event_bus.clone(),
-        Arc::new(AdapterRegistry::new()),
+        Arc::new(HarnessAdapterRegistry::new()),
     );
 
     let (first, first_outcome) = runner.run(request(&seed)).await.unwrap();

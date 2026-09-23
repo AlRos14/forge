@@ -243,7 +243,7 @@ async fn transition_to_review_runs_configured_review_runner() {
     let runner = Arc::new(::review::ReviewRunner::new(
         Arc::clone(&db),
         Arc::clone(&event_bus),
-        Arc::new(executors::AdapterRegistry::new()),
+        Arc::new(executors::HarnessAdapterRegistry::new()),
     ));
     let service =
         TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)).with_review_runner(runner);

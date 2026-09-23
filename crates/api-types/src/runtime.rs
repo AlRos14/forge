@@ -2,6 +2,111 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
+/// How the current Forge integration implements one harness operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CapabilitySupport {
+    Native,
+    Emulated,
+    Unsupported,
+    Unknown,
+}
+
+impl CapabilitySupport {
+    pub const fn is_available(self) -> bool {
+        matches!(self, Self::Native | Self::Emulated)
+    }
+
+    pub const fn is_native(self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
+
+/// Effective, non-secret capability evidence for one normalized harness
+/// configuration. Unknown is always fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct HarnessCapabilities {
+    pub resume: CapabilitySupport,
+    pub cancel: CapabilitySupport,
+    pub structured_events: CapabilitySupport,
+    pub usage_reporting: CapabilitySupport,
+    pub account_usage_observation: CapabilitySupport,
+    pub model_selection: CapabilitySupport,
+    pub reasoning_controls: CapabilitySupport,
+    pub approval_policy: CapabilitySupport,
+    pub sandbox_controls: CapabilitySupport,
+    pub planning: CapabilitySupport,
+    pub review_mode: CapabilitySupport,
+    pub fork: CapabilitySupport,
+    pub steer: CapabilitySupport,
+    pub pause_resume: CapabilitySupport,
+    pub compaction: CapabilitySupport,
+    pub subagents: CapabilitySupport,
+}
+
+impl Default for HarnessCapabilities {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+impl HarnessCapabilities {
+    pub const fn unknown() -> Self {
+        Self {
+            resume: CapabilitySupport::Unknown,
+            cancel: CapabilitySupport::Unknown,
+            structured_events: CapabilitySupport::Unknown,
+            usage_reporting: CapabilitySupport::Unknown,
+            account_usage_observation: CapabilitySupport::Unknown,
+            model_selection: CapabilitySupport::Unknown,
+            reasoning_controls: CapabilitySupport::Unknown,
+            approval_policy: CapabilitySupport::Unknown,
+            sandbox_controls: CapabilitySupport::Unknown,
+            planning: CapabilitySupport::Unknown,
+            review_mode: CapabilitySupport::Unknown,
+            fork: CapabilitySupport::Unknown,
+            steer: CapabilitySupport::Unknown,
+            pause_resume: CapabilitySupport::Unknown,
+            compaction: CapabilitySupport::Unknown,
+            subagents: CapabilitySupport::Unknown,
+        }
+    }
+
+    pub const fn unsupported() -> Self {
+        Self {
+            resume: CapabilitySupport::Unsupported,
+            cancel: CapabilitySupport::Unsupported,
+            structured_events: CapabilitySupport::Unsupported,
+            usage_reporting: CapabilitySupport::Unsupported,
+            account_usage_observation: CapabilitySupport::Unsupported,
+            model_selection: CapabilitySupport::Unsupported,
+            reasoning_controls: CapabilitySupport::Unsupported,
+            approval_policy: CapabilitySupport::Unsupported,
+            sandbox_controls: CapabilitySupport::Unsupported,
+            planning: CapabilitySupport::Unsupported,
+            review_mode: CapabilitySupport::Unsupported,
+            fork: CapabilitySupport::Unsupported,
+            steer: CapabilitySupport::Unsupported,
+            pause_resume: CapabilitySupport::Unsupported,
+            compaction: CapabilitySupport::Unsupported,
+            subagents: CapabilitySupport::Unsupported,
+        }
+    }
+}
+
+/// Runtime-only request to begin a harness run or continue one exact session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum HarnessInvocation {
+    #[default]
+    Start,
+    Resume { external_session_id: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorTypeDescriptor {
     #[serde(rename = "type")]
@@ -23,6 +128,7 @@ pub struct DiscoveredOptionsResponse {
     pub models: Vec<String>,
     pub permission_policies: Vec<String>,
     pub cli_specific: Value,
+    pub harness_capabilities: HarnessCapabilities,
     #[serde(default)]
     pub available_daemons: Vec<DiscoveredDaemonResponse>,
     #[serde(default)]
@@ -44,6 +150,37 @@ pub struct AgentAvailabilityResponse {
     pub active_task_count: i64,
     pub max_concurrent_tasks: i64,
     pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod harness_capability_tests {
+    use super::{CapabilitySupport as S, HarnessCapabilities};
+
+    #[test]
+    fn support_levels_remain_distinct_and_unknown_fails_closed() {
+        assert!(S::Native.is_available());
+        assert!(S::Native.is_native());
+        assert!(S::Emulated.is_available());
+        assert!(!S::Emulated.is_native());
+        assert!(!S::Unsupported.is_available());
+        assert!(!S::Unknown.is_available());
+
+        assert_eq!(
+            serde_json::to_value(S::Emulated).expect("support serializes"),
+            serde_json::json!("emulated")
+        );
+        assert_eq!(HarnessCapabilities::default().resume, S::Unknown);
+    }
+
+    #[test]
+    fn typed_snapshot_requires_all_dimensions_and_rejects_legacy_extra_fields() {
+        let incomplete = serde_json::json!({"resume":"native"});
+        assert!(serde_json::from_value::<HarnessCapabilities>(incomplete).is_err());
+
+        let mut complete = serde_json::to_value(HarnessCapabilities::unknown()).unwrap();
+        complete["legacy_tag"] = serde_json::json!("planning");
+        assert!(serde_json::from_value::<HarnessCapabilities>(complete).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

@@ -416,7 +416,7 @@ async fn detect_clis() -> Vec<DetectedCli> {
             continue;
         };
         let availability = adapter.check_availability();
-        let (path, version) = cli_path_and_version(&kind).await;
+        let (path, version) = cli_path_and_version(&kind, adapter).await;
         detected.push(DetectedCli {
             kind: kind.to_string(),
             availability: availability_status(&availability.status).to_owned(),
@@ -436,17 +436,16 @@ fn availability_status(status: &AvailabilityStatus) -> &'static str {
     }
 }
 
-async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<String>) {
-    match kind {
-        ExecutorKind::Embedded => (None, None),
-        ExecutorKind::Shell => shell_path_and_version(),
-        ExecutorKind::Codex => binary_path_and_version("codex").await,
-        ExecutorKind::ClaudeCode => binary_path_and_version("claude").await,
-        ExecutorKind::Cursor => binary_path_and_version("cursor-agent").await,
-        ExecutorKind::Opencode => binary_path_and_version("opencode").await,
-        ExecutorKind::Gemini => binary_path_and_version("gemini").await,
-        ExecutorKind::Smith => binary_path_and_version("smith").await,
-        ExecutorKind::Null => (None, None),
+async fn cli_path_and_version(
+    kind: &ExecutorKind,
+    adapter: &dyn executors::HarnessAdapter,
+) -> (Option<String>, Option<String>) {
+    if kind == &ExecutorKind::Shell {
+        shell_path_and_version()
+    } else if let Some(binary) = adapter.executable_name() {
+        binary_path_and_version(&binary).await
+    } else {
+        (None, None)
     }
 }
 

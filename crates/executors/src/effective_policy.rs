@@ -3,34 +3,38 @@ use api_types::EffectiveExecutionPolicy;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
-pub fn resolve_effective_policy(
+/// Build the common policy snapshot after a HarnessAdapter has interpreted
+/// its own config into generic permission and isolation labels. High-risk
+/// classification stays here with Forge's deterministic policy authority.
+pub fn from_harness_interpretation(
     executor_kind: &ExecutorKind,
-    config_snapshot: &Value,
-    workspace_path: Option<&str>,
+    permission_policy: &str,
+    isolation_posture: &str,
+    effective_cwd: Option<&str>,
     workspace_root: Option<&str>,
+    config: &Value,
 ) -> EffectiveExecutionPolicy {
-    let config = config_snapshot.get("config").unwrap_or(config_snapshot);
-    let permission_policy = config_string(config, config_snapshot, "permission_policy")
-        .unwrap_or_else(|| "unknown".to_owned());
-    let isolation_posture = resolve_isolation_posture(executor_kind, config, config_snapshot);
-    let codex_high_risk =
-        matches!(executor_kind, ExecutorKind::Codex) && isolation_posture == "danger-full-access";
-    let claude_code_high_risk = matches!(executor_kind, ExecutorKind::ClaudeCode)
-        && config_bool(config, config_snapshot, "dangerously_skip_permissions") == Some(true);
-    let cursor_high_risk =
-        matches!(executor_kind, ExecutorKind::Cursor) && isolation_posture == "force";
-    let is_high_risk = codex_high_risk || claude_code_high_risk || cursor_high_risk;
-
     EffectiveExecutionPolicy {
         executor_kind: executor_kind.to_string(),
-        permission_policy,
-        isolation_posture,
-        is_high_risk,
-        effective_cwd: workspace_path.map(str::to_owned),
+        permission_policy: permission_policy.to_owned(),
+        isolation_posture: isolation_posture.to_owned(),
+        is_high_risk: matches!(
+            isolation_posture,
+            "danger-full-access" | "dangerously_skip_permissions" | "force"
+        ),
+        effective_cwd: effective_cwd.map(str::to_owned),
         workspace_root: workspace_root.map(str::to_owned),
-        environment_posture: "inherited".to_owned(),
-        scoped_tools: collect_string_values(config, config_snapshot, "scoped_tools"),
-        mcp_servers: collect_string_values(config, config_snapshot, "mcp_servers"),
+        environment_posture: if config
+            .get("env")
+            .and_then(Value::as_object)
+            .is_some_and(|env| !env.is_empty())
+        {
+            "custom".to_owned()
+        } else {
+            "inherited".to_owned()
+        },
+        scoped_tools: collect_string_values(config, config, "scoped_tools"),
+        mcp_servers: collect_string_values(config, config, "mcp_servers"),
     }
 }
 
@@ -78,55 +82,6 @@ pub enum WorkspacePolicyError {
     MissingWorkspaceRoot,
     #[error("failed to resolve path {path}: {reason}")]
     PathResolutionFailed { path: String, reason: String },
-}
-
-fn resolve_isolation_posture(
-    executor_kind: &ExecutorKind,
-    config: &Value,
-    config_snapshot: &Value,
-) -> String {
-    match executor_kind {
-        ExecutorKind::Embedded => "task_workspace".to_owned(),
-        ExecutorKind::Codex => config_string(config, config_snapshot, "sandbox")
-            .unwrap_or_else(|| "not_applicable".to_owned()),
-        ExecutorKind::ClaudeCode => {
-            if config_bool(config, config_snapshot, "dangerously_skip_permissions") == Some(true) {
-                "dangerously_skip_permissions".to_owned()
-            } else {
-                "standard".to_owned()
-            }
-        }
-        ExecutorKind::Cursor => {
-            if config_bool(config, config_snapshot, "force").unwrap_or_else(|| {
-                config_string(config, config_snapshot, "permission_policy").as_deref()
-                    != Some("plan")
-            }) {
-                "force".to_owned()
-            } else {
-                "propose_only".to_owned()
-            }
-        }
-        ExecutorKind::Shell
-        | ExecutorKind::Opencode
-        | ExecutorKind::Gemini
-        | ExecutorKind::Smith
-        | ExecutorKind::Null => "not_applicable".to_owned(),
-    }
-}
-
-fn config_string(config: &Value, config_snapshot: &Value, key: &str) -> Option<String> {
-    config
-        .get(key)
-        .or_else(|| config_snapshot.get(key))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn config_bool(config: &Value, config_snapshot: &Value, key: &str) -> Option<bool> {
-    config
-        .get(key)
-        .or_else(|| config_snapshot.get(key))
-        .and_then(Value::as_bool)
 }
 
 fn collect_string_values(config: &Value, config_snapshot: &Value, key: &str) -> Vec<String> {
@@ -191,113 +146,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn resolves_codex_effective_policy() {
-        let policy = resolve_effective_policy(
+    fn core_classifies_adapter_reported_high_risk_posture() {
+        let policy = from_harness_interpretation(
             &ExecutorKind::Codex,
-            &json!({
-                "permission_policy": "supervised",
-                "sandbox": "workspace-write",
-                "scoped_tools": ["apply_patch"],
-                "mcp_servers": ["filesystem"]
-            }),
+            "auto",
+            "danger-full-access",
             Some("/tmp/workspace/task/repo"),
             Some("/tmp/workspace"),
+            &json!({"env": {}}),
         );
-
-        assert_eq!(policy.executor_kind, "codex");
-        assert_eq!(policy.permission_policy, "supervised");
-        assert_eq!(policy.isolation_posture, "workspace-write");
-        assert!(!policy.is_high_risk);
-        assert_eq!(
-            policy.effective_cwd.as_deref(),
-            Some("/tmp/workspace/task/repo")
-        );
-        assert_eq!(policy.workspace_root.as_deref(), Some("/tmp/workspace"));
-        assert_eq!(policy.environment_posture, "inherited");
-        assert_eq!(policy.scoped_tools, vec!["apply_patch"]);
-        assert_eq!(policy.mcp_servers, vec!["filesystem"]);
-    }
-
-    #[test]
-    fn resolves_claude_code_effective_policy() {
-        let policy = resolve_effective_policy(
-            &ExecutorKind::ClaudeCode,
-            &json!({
-                "config": {
-                    "permission_policy": "auto",
-                    "dangerously_skip_permissions": false
-                }
-            }),
-            Some("/tmp/workspace/task/repo"),
-            Some("/tmp/workspace"),
-        );
-
-        assert_eq!(policy.executor_kind, "claude_code");
-        assert_eq!(policy.permission_policy, "auto");
-        assert_eq!(policy.isolation_posture, "standard");
-        assert!(!policy.is_high_risk);
-    }
-
-    #[test]
-    fn resolves_shell_effective_policy() {
-        let policy = resolve_effective_policy(
-            &ExecutorKind::Shell,
-            &json!({ "permission_policy": "plan" }),
-            Some("/tmp/workspace/task/repo"),
-            Some("/tmp/workspace"),
-        );
-
-        assert_eq!(policy.executor_kind, "shell");
-        assert_eq!(policy.permission_policy, "plan");
-        assert_eq!(policy.isolation_posture, "not_applicable");
-        assert!(!policy.is_high_risk);
-    }
-
-    #[test]
-    fn resolves_opencode_effective_policy() {
-        let policy = resolve_effective_policy(
-            &ExecutorKind::Opencode,
-            &json!({ "permission_policy": "auto" }),
-            Some("/tmp/workspace/task/repo"),
-            Some("/tmp/workspace"),
-        );
-
-        assert_eq!(policy.executor_kind, "opencode");
-        assert_eq!(policy.permission_policy, "auto");
-        assert_eq!(policy.isolation_posture, "not_applicable");
-        assert!(!policy.is_high_risk);
-    }
-
-    #[test]
-    fn marks_codex_danger_full_access_high_risk() {
-        let policy = resolve_effective_policy(
-            &ExecutorKind::Codex,
-            &json!({
-                "permission_policy": "auto",
-                "sandbox": "danger-full-access"
-            }),
-            None,
-            None,
-        );
-
+        assert!(policy.is_high_risk);
         assert_eq!(policy.isolation_posture, "danger-full-access");
-        assert!(policy.is_high_risk);
+        assert_eq!(policy.effective_cwd.as_deref(), Some("/tmp/workspace/task/repo"));
+        assert_eq!(policy.workspace_root.as_deref(), Some("/tmp/workspace"));
     }
 
     #[test]
-    fn marks_claude_code_skip_permissions_high_risk() {
-        let policy = resolve_effective_policy(
-            &ExecutorKind::ClaudeCode,
-            &json!({
-                "permission_policy": "auto",
-                "dangerously_skip_permissions": true
-            }),
+    fn permission_plan_does_not_create_native_planning_or_risk() {
+        let policy = from_harness_interpretation(
+            &ExecutorKind::Shell,
+            "plan",
+            "not_applicable",
             None,
             None,
+            &json!({}),
         );
-
-        assert_eq!(policy.isolation_posture, "dangerously_skip_permissions");
-        assert!(policy.is_high_risk);
+        assert_eq!(policy.permission_policy, "plan");
+        assert!(!policy.is_high_risk);
     }
 
     #[test]
