@@ -3,9 +3,9 @@ mod normalize;
 use async_trait::async_trait;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, ClaudeCodeConfig, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, ClaudeCodeConfig, DiscoverContext, DiscoveredOptions,
+    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use normalize::NormalizedEntry;
 use serde_json::Value;
@@ -167,7 +167,9 @@ impl ClaudeCodeAdapter {
         );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => config.resume_session_id = None,
-            executors::HarnessInvocation::Resume { external_session_id } => {
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
                 config.resume_session_id = Some(external_session_id.clone());
             }
         }
@@ -455,9 +457,22 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             S::Native
         };
         crate::harness_capabilities(
-            resume, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
-            S::Native, S::Native, S::Unsupported, S::Native, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            resume,
+            S::Emulated,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
         )
     }
 
@@ -1072,10 +1087,14 @@ mod tests {
             "resume_session_id":"old-session",
             "additional_params":["--resume", "old-cli-session", "--continue", "--verbose"]
         });
-        let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
         let start_config = ClaudeCodeAdapter::resolve_config(&start);
         assert!(start_config.resume_session_id.is_none());
-        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -1084,8 +1103,14 @@ mod tests {
             stale,
         );
         let resume_config = ClaudeCodeAdapter::resolve_config(&resume);
-        assert_eq!(resume_config.resume_session_id.as_deref(), Some("exact-session"));
-        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            resume_config.resume_session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
     }
 
     #[test]
@@ -1397,7 +1422,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert!(args.windows(2).any(|window| window == ["--permission-mode", "plan"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--permission-mode", "plan"])
+        );
 
         let normalized = serde_json::to_value(config).expect("Claude config serializes");
         assert_eq!(

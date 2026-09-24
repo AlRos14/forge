@@ -35,7 +35,7 @@ async fn shell_executor_runs_echo_and_writes_logs() {
     let executor = ShellExecutor::default();
     let result = executor
         .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+            invocation: executors::HarnessInvocation::Start,
             task_id: "task-1".to_string(),
             execution_id: "exec-1".to_string(),
             role: "coder".to_string(),
@@ -133,7 +133,7 @@ async fn shell_executor_non_zero_exit_is_failure_with_stderr_logged() {
     let executor = ShellExecutor::default();
     let result = executor
         .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+            invocation: executors::HarnessInvocation::Start,
             task_id: "task-1".to_string(),
             execution_id: "exec-fail".to_string(),
             role: "coder".to_string(),

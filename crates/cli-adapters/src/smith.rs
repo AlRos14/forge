@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy, SmithConfig, TokenUsage,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter, PermissionPolicy, SmithConfig, TokenUsage,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -64,7 +64,9 @@ impl SmithAdapter {
         );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => config.resume_session_id = None,
-            executors::HarnessInvocation::Resume { external_session_id } => {
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
                 config.resume_session_id = Some(external_session_id.clone());
             }
         }
@@ -182,9 +184,22 @@ impl HarnessAdapter for SmithAdapter {
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
         crate::harness_capabilities(
-            S::Native, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
-            S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
         )
     }
 
@@ -877,10 +892,14 @@ mod tests {
             "resume_session_id":"old-session",
             "additional_params":["--resume", "old-cli-session", "--continue", "--verbose"]
         });
-        let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
         let start_config = SmithAdapter::resolve_config(&start);
         assert!(start_config.resume_session_id.is_none());
-        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -889,8 +908,14 @@ mod tests {
             stale,
         );
         let resume_config = SmithAdapter::resolve_config(&resume);
-        assert_eq!(resume_config.resume_session_id.as_deref(), Some("exact-session"));
-        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            resume_config.resume_session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
     }
 
     async fn stream_fixture(lines: &[serde_json::Value]) -> StreamResult {

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, GeminiConfig, LogKind, LogStream, LogWriter, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, GeminiConfig, HarnessAdapter,
+    LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -130,9 +130,22 @@ impl HarnessAdapter for GeminiAdapter {
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
         crate::harness_capabilities(
-            S::Unsupported, S::Emulated, S::Unknown, S::Unsupported, S::Unsupported, S::Native,
-            S::Unsupported, S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported,
+            S::Emulated,
+            S::Unknown,
+            S::Unsupported,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
         )
     }
 

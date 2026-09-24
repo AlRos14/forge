@@ -461,8 +461,8 @@ mod tests {
             max_turns: None,
         })
         .expect("Start payload serializes");
-        let old_decoded: OldExecutionStartParams = serde_json::from_value(new_payload)
-            .expect("old daemon ignores additive Start intent");
+        let old_decoded: OldExecutionStartParams =
+            serde_json::from_value(new_payload).expect("old daemon ignores additive Start intent");
         assert_eq!(old_decoded.task_id, "task-1");
         assert_eq!(old_decoded.execution_id, "execution-1");
         assert_eq!(old_decoded.workspace_path, "/work");

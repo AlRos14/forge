@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, NullConfig,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, NullConfig,
 };
 use std::time::Duration;
 
@@ -84,7 +83,7 @@ mod tests {
 
         let result = adapter
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),

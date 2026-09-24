@@ -7,7 +7,9 @@ async fn observe_usage(executor_type: &str, config_json: &str) -> Result<Value> 
         .parse::<executors::ExecutorKind>()
         .map_err(ServiceError::invalid_operation)?;
     let raw_config = serde_json::from_str::<Value>(config_json).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid {executor_type} agent configuration: {error}"))
+        ServiceError::invalid_operation(format!(
+            "invalid {executor_type} agent configuration: {error}"
+        ))
     })?;
     let registry = cli_adapters::default_registry();
     let adapter = registry.get(&kind).ok_or_else(|| {
@@ -28,7 +30,9 @@ async fn observe_usage(executor_type: &str, config_json: &str) -> Result<Value> 
         .await
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
         .map(|observation| observation.value)
-        .ok_or_else(|| ServiceError::invalid_operation("HarnessAdapter returned no usage observation"))
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("HarnessAdapter returned no usage observation")
+        })
 }
 
 pub async fn refresh_codex_usage(config_json: &str) -> Result<Value> {

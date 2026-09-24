@@ -8,16 +8,15 @@ use std::{
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::Result;
 use api_types::{
-    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
-    DaemonProtocolCapabilities, DaemonProtocolCapabilitiesRequest, ExecutionStartParams,
-    ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
-    FsListParams, RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt,
-    RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
-    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
-    METHOD_PROTOCOL_CAPABILITIES, DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
-    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
-    METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
-    METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
+    DaemonErrorPayload, DaemonFrame, DaemonProtocolCapabilities, DaemonProtocolCapabilitiesRequest,
+    ExecutionCancelParams, ExecutionCancelResult, ExecutionStartParams, ExecutionStartResult,
+    ExecutionTerminalNotification, FsBranchesParams, FsListParams, RemoteExecutionFailureClass,
+    RemoteResolvedCandidate, RemoteRouteAttempt, RemoteTokenUsage,
+    DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, INVALID_FRAME, METHOD_EXECUTION_CANCEL,
+    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES,
+    METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
+    METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
@@ -472,7 +471,10 @@ fn spawn_account_usage_probe(
             if task_cancel.is_cancelled() {
                 break;
             }
-            match executor.observe_usage(kind.clone(), &config, task_cancel.clone()).await {
+            match executor
+                .observe_usage(kind.clone(), &config, task_cancel.clone())
+                .await
+            {
                 Ok(Some(observation)) => emit_execution_log(
                     &outbound,
                     LogEntry {
@@ -548,7 +550,7 @@ fn terminal_notification_from_result(
                 .format(&Rfc3339)
                 .ok()
         }),
-            resolved_candidate: result
+        resolved_candidate: result
             .resolved_candidate
             .map(|candidate| RemoteResolvedCandidate {
                 candidate_key: candidate.candidate_key,
@@ -780,10 +782,7 @@ mod tests {
             Ok(DiscoveredOptions::default())
         }
 
-        async fn execute(
-            &self,
-            ctx: ExecutionContext,
-        ) -> Result<ExecutionResult, ExecutorError> {
+        async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
             self.invocations.lock().unwrap().push(ctx.invocation);
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,

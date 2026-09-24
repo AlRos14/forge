@@ -128,16 +128,11 @@ pub(crate) fn clear_session_arguments(
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
-        if boolean_flags
-            .iter()
-            .any(|flag| argument.as_str() == *flag)
-        {
+        if boolean_flags.iter().any(|flag| argument.as_str() == *flag) {
             index += 1;
             continue;
         }
-        let exact_value_flag = value_flags
-            .iter()
-            .any(|flag| argument.as_str() == *flag);
+        let exact_value_flag = value_flags.iter().any(|flag| argument.as_str() == *flag);
         let inline_value_flag = value_flags.iter().any(|flag| {
             argument
                 .strip_prefix(*flag)

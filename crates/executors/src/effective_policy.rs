@@ -178,7 +178,10 @@ mod tests {
         );
         assert!(policy.is_high_risk);
         assert_eq!(policy.isolation_posture, "danger-full-access");
-        assert_eq!(policy.effective_cwd.as_deref(), Some("/tmp/workspace/task/repo"));
+        assert_eq!(
+            policy.effective_cwd.as_deref(),
+            Some("/tmp/workspace/task/repo")
+        );
         assert_eq!(policy.workspace_root.as_deref(), Some("/tmp/workspace"));
     }
 

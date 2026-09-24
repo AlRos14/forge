@@ -78,8 +78,8 @@ use self::config::{
 use self::{
     config::{
         build_executor_config_snapshot, create_failed_execution_record,
-        executor_snapshot_for_fresh_start, executor_snapshot_for_harness_resume,
-        parse_json_value, truncate_utf8_bytes,
+        executor_snapshot_for_fresh_start, executor_snapshot_for_harness_resume, parse_json_value,
+        truncate_utf8_bytes,
     },
     logs::execution_logs_path,
     review_config::review_config_from_json,
@@ -522,10 +522,8 @@ impl TaskService {
                     .as_ref()
                     .and_then(|snapshot| serde_json::to_value(snapshot).ok())
                     .unwrap_or_else(|| {
-                        serde_json::to_value(
-                            api_types::HarnessCapabilities::unknown().snapshot(),
-                        )
-                        .expect("unknown harness capability snapshot serializes")
+                        serde_json::to_value(api_types::HarnessCapabilities::unknown().snapshot())
+                            .expect("unknown harness capability snapshot serializes")
                     });
                 let effective_policy = candidate
                     .effective_policy
@@ -613,9 +611,7 @@ impl TaskService {
         }
 
         if let Some(usage) = notification.usage {
-            let provider = execution::usage_provider_from_snapshot(
-                winner_snapshot.as_deref(),
-            );
+            let provider = execution::usage_provider_from_snapshot(winner_snapshot.as_deref());
             let model = usage.model.unwrap_or_else(|| "default".to_owned());
             if let Err(error) = ExecutionUsageRepo::upsert(
                 &*self.db,

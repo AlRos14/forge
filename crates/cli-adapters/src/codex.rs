@@ -9,9 +9,9 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 #[cfg(unix)]
 use command_group::{Signal, UnixChildExt};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodexConfig, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, CodexConfig, DiscoverContext, DiscoveredOptions,
+    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use protocol::{
     AskForApproval, SandboxMode, ThreadForkParams, ThreadForkResponse, ThreadResumeParams,
@@ -115,7 +115,9 @@ impl CodexAdapter {
                 config.resume_thread_in_place = None;
                 config.resume_fallback_prompt = None;
             }
-            executors::HarnessInvocation::Resume { external_session_id } => {
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
                 config.resume_thread_id = Some(external_session_id.clone());
                 config.resume_thread_in_place = Some(true);
                 config.resume_fallback_prompt = None;
@@ -371,24 +373,39 @@ impl HarnessAdapter for CodexAdapter {
     fn capabilities(&self, _config: &Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
         crate::harness_capabilities(
-            S::Native, S::Emulated, S::Native, S::Native, S::Native, S::Native, S::Native,
-            S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
         )
     }
 
-    fn interpret_execution_policy(
-        &self,
-        config: &Value,
-    ) -> executors::HarnessPolicyInterpretation {
+    fn interpret_execution_policy(&self, config: &Value) -> executors::HarnessPolicyInterpretation {
         let permission = config
             .get("permission_policy")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let isolation = config
-            .get("sandbox")
-            .and_then(Value::as_str)
-            .unwrap_or(if permission == "plan" { "read-only" } else { "workspace-write" });
+        let isolation =
+            config
+                .get("sandbox")
+                .and_then(Value::as_str)
+                .unwrap_or(if permission == "plan" {
+                    "read-only"
+                } else {
+                    "workspace-write"
+                });
         executors::HarnessPolicyInterpretation {
             permission_policy: permission.to_owned(),
             isolation_posture: isolation.to_owned(),
@@ -1101,12 +1118,16 @@ mod tests {
             "resume_fallback_prompt":"old prompt",
             "additional_params":["--resume=old-cli-thread", "--continue", "--verbose"]
         });
-        let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
         let start_config = CodexAdapter::resolve_config(&start);
         assert!(start_config.resume_thread_id.is_none());
         assert!(start_config.resume_thread_in_place.is_none());
         assert!(start_config.resume_fallback_prompt.is_none());
-        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -1115,10 +1136,16 @@ mod tests {
             stale,
         );
         let resume_config = CodexAdapter::resolve_config(&resume);
-        assert_eq!(resume_config.resume_thread_id.as_deref(), Some("exact-thread"));
+        assert_eq!(
+            resume_config.resume_thread_id.as_deref(),
+            Some("exact-thread")
+        );
         assert_eq!(resume_config.resume_thread_in_place, Some(true));
         assert!(resume_config.resume_fallback_prompt.is_none());
-        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
     }
 
     #[test]
@@ -1515,7 +1542,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
         let adapter = CodexAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
                 role: "coder".to_owned(),
@@ -1573,7 +1600,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 
         let result = CodexAdapter::new()
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
                 role: "coder".to_owned(),

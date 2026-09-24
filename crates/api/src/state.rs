@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use config::{default_config_path, ForgeConfig};
 use db::SqliteDb;
 use events::EventBus;
-use executors::{HarnessAdapterRegistry, FallbackExecutor, TaskExecutor};
+use executors::{FallbackExecutor, HarnessAdapterRegistry, TaskExecutor};
 use services::{
     AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
     CommitmentService, DaemonService, EmbeddedAgentService, MemoryService, MergeService,
@@ -100,7 +100,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, mcp_enabled: bool) -> Self {
-        Self::with_adapter_registry(db, event_bus, mcp_enabled, Arc::new(HarnessAdapterRegistry::new()))
+        Self::with_adapter_registry(
+            db,
+            event_bus,
+            mcp_enabled,
+            Arc::new(HarnessAdapterRegistry::new()),
+        )
     }
 
     pub fn with_adapter_registry(

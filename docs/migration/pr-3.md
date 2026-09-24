@@ -12,10 +12,14 @@ The implementation started from `5e5d8fb29a02264c46577905a1bdfe87820f19e2`
 and the static preflight in [`plan-pr3-preflight.md`](plan-pr3-preflight.md).
 The follow-up audit tightened Agent-bound routing, capability snapshot
 evolution, daemon negotiation, remote winner provenance, and historical
-session identity checks. Verification results below distinguish completed
-focused checks from the workspace test run, which did not complete after its
-Cargo target exhausted the available filesystem space. The temporary targets
-used for validation are removed after the final checks.
+session identity checks.
+
+The final verification compares the branch against `origin/main` at
+`5e5d8fb29a02264c46577905a1bdfe87820f19e2`. The serial services suite has
+22 shared failed test names and no PR3-only failures. The complete workspace
+attempt stopped at `api/tests/daemon_connect`; all five tests also failed on
+`origin/main` at the same localhost bind. The validation details below
+separate these results from successful focused checks.
 
 ## Old and new adapter authority
 
@@ -324,9 +328,9 @@ registry. Existing executor endpoint/type vocabulary and provider-auth
 capability endpoints are unchanged. Rust shared types, checked-in generated
 TypeScript bindings, and the web API type were updated. The api-types
 TypeScript export test completed once and emitted the checked-in bindings; the
-`u64` schema version is annotated/exported as the JSON `number` it is. No
-frontend build, test, or typecheck ran, so frontend integration still
-**REQUIRES IMPLEMENTATION-TIME VERIFICATION**.
+`u64` schema version is annotated/exported as the JSON `number` it is. The
+frontend build and tests were not run; `pnpm typecheck` passed, as recorded in
+the verification table below.
 
 No migration was added, no persisted history was rewritten, and migration head
 remains V089. The change is additive in capability snapshot JSON and API
@@ -422,56 +426,234 @@ current immutable Agent harness identity. Contradictory/missing evidence,
 Shell/Null, and historical ambiguity return no resumable session. This
 read-only shim is bounded PR13 cleanup.
 
-Verification that completed against the final production code:
+## Verification status — 2026-09-25
 
-* `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` passed after the final
-  production changes. Later Rust edits were limited to test fixtures.
-* `cargo test -p cli-adapters -p executors -p services --lib -- --test-threads=1`
-  completed the CLI adapter library tests (105 passed). The executor library
-  tests were rerun after correcting two test-fixture expectations and passed
-  64/64.
-* `cargo test -p services --lib daemon_transport::tests:: -- --test-threads=1`
-  passed 15/15, including both connection-generation replacement tests and
-  old/unknown daemon Resume rejection.
-* `cargo test -p api-types --lib harness_capability_tests -- --test-threads=1`
-  passed 3/3, including forward-extensible v1 reads and fail-closed malformed
-  or unsupported versions.
-* `cargo test -p api --test fs_daemon_routing -- --test-threads=1` passed
-  18/18. Remote execution roundtrip passed 4/4, merge-conflict happy path
-  passed 1/1, and merge-fix exhaustion passed 1/1. The `task_diff` target's
-  two tests still fail before HarnessAdapter dispatch with
-  `WorkspaceLease role is not a TaskRole`, also present in unchanged service
-  governance paths on `main`.
-* `cargo test -p db --test pr2_execution_session -- --test-threads=1` passed
-  15/16 after correcting the PR3 identity, immutable-profile, and workspace
-  test fixtures. Its remaining `historical_session_migration_groups_only_coherent_identity`
-  failure was reproduced on `origin/main` with the same foreign-key error.
-  The `workspace_scoped_session_is_not_reused_in_another_workspace` fixture
-  also failed on `origin/main` because it created two workspaces for one task;
-  the PR3 branch now uses distinct tasks and passes that test.
-* The services library suite completed 643 tests, with 26 failures and 1
-  ignored. Focused PR3 recovery/resumability tests were corrected and rerun
-  successfully. Remaining failures include sandbox-denied subprocess/socket
-  tests, legacy TaskService fixtures rejected by the existing WorkspaceLease
-  TaskRole check, and unrelated existing service failures. This broad suite
-  did not produce a clean result.
-* `cargo test -p api-types export_typescript -- --ignored --exact` passed once
-  and emitted the checked-in bindings. The `schema_version: number` binding
-  annotation is mirrored statically; no frontend tooling ran.
-* `cargo fmt --all -- --check` fails on formatting deltas also present in
-  clean `origin/main`. Every changed Rust source file passes
-  `rustfmt --check --edition 2021` individually; no workspace-wide reformat
-  was applied.
-* `git diff --check` passes.
-* `cargo test --workspace` was attempted but did not complete: its Cargo target
-  exhausted available filesystem space before the suite finished. No complete
-  workspace test result is claimed.
+### Serial services baseline comparison
 
-No frontend build/test/typecheck, Forge runtime, real provider invocation, or
-database migration execution was performed. The workspace test suite and
-global formatting check remain incomplete, so this ledger does not claim the
-full repository Definition of Done or CI-equivalent verification.
+Commands used the same offline Cargo environment, `RUSTFLAGS='-C debuginfo=0'`,
+`FORGE_SKIP_WEB_BUILD=1`, and `--test-threads=1`.
 
+| Revision | Result |
+| --- | --- |
+| PR3 final formatted tree | 647 passed, 22 failed, 1 ignored; 981.19 seconds |
+| `origin/main` | 505 passed, 152 failed, 1 ignored; 870.62 seconds |
+
+The unmodified `origin/main` services test target did not compile because two
+assertions accessed `.execution` on a returned `db::Execution`. In the
+temporary main worktree, only those two test field paths were corrected so
+the same suite could run; production files were unchanged for that run. This
+comparison uses the resulting test names:
+
+**Shared failures (22):**
+
+```text
+lifecycle::runner::tests::test_script_hook_returns_non_zero_exit_code_for_failure
+lifecycle::runner::tests::test_script_hook_returns_stdout_stderr_and_exit_zero
+provider_authorization::tests::server_owned_loopback_serves_the_browser_callback
+task_service::tests::service_tests::cases::dependencies::test_user_claim_bypasses_capacity_check
+task_service::tests::service_tests::cases::executions::before_enter_blocks_when_required_before_work_hook_fails
+task_service::tests::service_tests::cases::executions::executor_completion_guard_rejection_follows_up_before_blocking
+task_service::tests::service_tests::cases::executions::follow_up_execution_codex_resumes_explicit_harness_session
+task_service::tests::service_tests::cases::executions::follow_up_execution_on_blocked_task
+task_service::tests::service_tests::cases::executions::follow_up_execution_reuses_explicit_harness_session
+task_service::tests::service_tests::cases::executions::follow_up_execution_without_session_starts_new_execution
+task_service::tests::service_tests::cases::executions::follow_up_on_cancelled_execution_reuses_active_harness_session
+task_service::tests::service_tests::cases::executions::follow_up_on_cancelled_execution_without_session_starts_new_execution
+task_service::tests::service_tests::cases::executions::interactive_execution_completion_does_not_trigger_review_cascade
+task_service::tests::service_tests::cases::executions::launch_execution_creates_interactive_execution_and_workspace
+task_service::tests::service_tests::cases::executions::re_execute_uses_current_membership_not_legacy_projection
+task_service::tests::service_tests::cases::executions::role_follow_up_does_not_reuse_suspended_lineage_agent
+task_service::tests::service_tests::cases::executions::role_follow_up_keeps_active_lineage_agent_over_legacy_projection
+task_service::tests::service_tests::cases::executions::subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_follow_up
+task_service::tests::service_tests::cases::roles::legacy_singleton_mutations_cannot_collapse_multi_member_role
+task_service::tests::service_tests::cases::roles::membership_does_not_transfer_workspace_lease_authority
+task_service::tests::service_tests::cases::roles::membership_projection_failure_rolls_back_authority_and_projection
+task_service::tests::service_tests::cases::roles::project_member_removal_rebuilds_projection_from_surviving_member
+```
+
+**Main-only failures (130):**
+
+```text
+agent_service::tests::effective_status_is_busy_at_capacity
+daemon_transport::tests::execution_log_from_non_owner_daemon_is_rejected
+daemon_transport::tests::execution_log_from_owner_updates_last_activity_at
+daemon_transport::tests::execution_terminal_from_non_owner_daemon_is_rejected
+daemon_transport::tests::unpinned_remote_usage_logs_use_execution_daemon_provenance
+memory::tests::record_execution_summary_if_present_is_idempotent
+memory::tests::record_review_result_if_final_is_idempotent
+memory::tests::record_review_result_if_final_records_final_after_awaiting_human
+merge_service::tests::clean_merge_returns_done
+merge_service::tests::conflicting_merge_returns_conflict_and_aborts
+merge_service::tests::dirty_target_repo_returns_target_dirty
+merge_service::tests::dirty_worktree_returns_dirty
+recovery::tests::cancel_running_executions_returns_cancelled_execution_metadata
+recovery::tests::crash_recovery_cancels_running_executions
+recovery::tests::crash_recovery_clears_stale_recovery_annotations_for_completed_execution
+recovery::tests::crash_recovery_does_not_follow_up_resumable_execution
+recovery::tests::crash_recovery_keeps_active_task_with_resumable_execution
+recovery::tests::crash_recovery_preserves_legitimate_pending_recovery_annotations
+recovery::tests::daemon_report_reconcile_interrupts_missing_old_running_execution
+recovery::tests::daemon_report_reconcile_leaves_fresh_running_execution_untouched
+recovery::tests::daemon_report_without_active_execution_ids_does_not_reconcile
+recovery::tests::heartbeat_monitor_cancels_stalled_executions_of_daemonless_agents
+recovery::tests::heartbeat_monitor_clears_disconnect_tracking_when_daemon_reconnects
+recovery::tests::heartbeat_monitor_does_not_cancel_remote_stalled_executions_via_embedded_executor
+recovery::tests::heartbeat_monitor_fails_remote_execution_when_daemon_stays_disconnected
+recovery::tests::heartbeat_monitor_leaves_remote_execution_alone_within_disconnect_grace
+recovery::tests::heartbeat_monitor_marks_stalled_executions_and_schedules_retry
+recovery::tests::heartbeat_monitor_skips_embedded_daemon_executions_for_disconnect_check
+recovery::tests::heartbeat_monitor_times_out_busy_agents_and_recovers_tasks
+recovery::tests::rotated_logs_keep_execution_alive_but_silence_still_stalls
+shutdown::tests::shutdown_cancels_running_executor_processes_before_recovery
+shutdown::tests::shutdown_keeps_active_task_with_resumable_execution
+shutdown::tests::shutdown_stops_accepting_work_and_recovers_in_progress_tasks
+task_dispatcher::tests::dispatcher_dispatches_when_graceful_shutdown_stop_is_auto
+task_dispatcher::tests::dispatcher_does_not_dispatch_when_graceful_shutdown_stop_is_manual
+task_dispatcher::tests::dispatcher_enters_unassigned_auto_planning_gate_before_coder_dispatch
+task_dispatcher::tests::dispatcher_recovers_task_stuck_in_unassigned_optional_planning_gate
+task_dispatcher::tests::dispatcher_recovers_undispatched_active_task
+task_dispatcher::tests::dispatcher_recovers_undispatched_reviewer_task
+task_dispatcher::tests::dispatcher_respects_priority_ordering
+task_dispatcher::tests::dispatcher_skips_auto_restart_for_task_cancelled_execution
+task_dispatcher::tests::dispatcher_skips_auto_restart_for_user_cancelled_execution
+task_dispatcher::tests::dispatcher_skips_legacy_stopped_execution_without_resume_policy
+task_dispatcher::tests::dispatcher_skips_reviewer_until_configured_ci_has_finished
+task_dispatcher::tests::dispatcher_skips_task_when_agent_at_capacity
+task_dispatcher::tests::dispatcher_skips_unassigned_planning_gate_before_coder_dispatch
+task_dispatcher::tests::dispatcher_waits_for_deferred_dispatch_cooldown
+task_service::action_resolver::tests::explicit_harness_state_controls_resumability
+task_service::config::tests::executor_snapshot_with_resume_thread_sets_codex_resume_thread_id
+task_service::tests::action_resolver_role_targeting::test_resolve_execution_actions_targets_current_role
+task_service::tests::diagnostics_exception::test_derive_workflow_exception_failed_planner_offers_retry
+task_service::tests::diagnostics_exception::test_derive_workflow_exception_infers_actions_for_empty_exhausted_annotation
+task_service::tests::diagnostics_exception::test_derive_workflow_exception_review_failed_no_annotation
+task_service::tests::diagnostics_exception::test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available
+task_service::tests::diagnostics_exception::test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error_annotation
+task_service::tests::diagnostics_exception::test_reviewer_execution_failure_only_offers_retry_or_pass
+task_service::tests::diagnostics_health::test_workflow_health_failed_when_coder_failed_without_block_marker
+task_service::tests::diagnostics_health::test_workflow_health_running_reviewer
+task_service::tests::diagnostics_health::test_workflow_health_stuck_when_coder_completed_without_transition
+task_service::tests::recovery_events::test_reset_retry_window_publishes_recovery_and_resume_events
+task_service::tests::recovery_reset_retry_window::test_reset_retry_window_preserves_history_and_refreshes_budget
+task_service::tests::recovery_reset_retry_window::test_resume_process_moves_failed_review_back_to_in_progress
+task_service::tests::service_tests::cases::claim::claim_assigns_implicit_assignee_and_uses_claim_execution
+task_service::tests::service_tests::cases::claim::claim_recovers_task_branch_left_by_a_rejected_workspace_attempt
+task_service::tests::service_tests::cases::claim::claim_root_with_subtask_does_not_dispatch_parent_coder_prompt
+task_service::tests::service_tests::cases::claim::claim_uses_custom_workflow_active_target
+task_service::tests::service_tests::cases::claim::create_claim_and_transition_task
+task_service::tests::service_tests::cases::claim::default_workflow_assigns_declared_roles_not_assignee
+task_service::tests::service_tests::cases::dependencies::test_done_transition_emits_dependency_satisfied_event
+task_service::tests::service_tests::cases::executions::ambiguous_historical_session_fails_closed_for_resume_and_actions
+task_service::tests::service_tests::cases::executions::before_enter_runs_required_before_work_hook_before_role_dispatch
+task_service::tests::service_tests::cases::executions::claim_task_records_codex_overrides_in_normalized_snapshot
+task_service::tests::service_tests::cases::executions::claim_task_records_execution_permission_policy_override_in_snapshot
+task_service::tests::service_tests::cases::executions::dispatch_initial_role_execution_creates_execution_and_spawns
+task_service::tests::service_tests::cases::executions::dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_same_task
+task_service::tests::service_tests::cases::executions::executor_completion_comment_uses_execution_agent
+task_service::tests::service_tests::cases::executions::executor_completion_guard_rejection_blocks_when_retry_budget_exhausted
+task_service::tests::service_tests::cases::executions::failed_reviewer_execution_marks_running_review_failed
+task_service::tests::service_tests::cases::executions::follow_up_execution_rejects_executor_mismatch
+task_service::tests::service_tests::cases::executions::follow_up_execution_rejects_running_parent
+task_service::tests::service_tests::cases::executions::follow_up_execution_rejects_terminal_task
+task_service::tests::service_tests::cases::executions::follow_up_rejects_a_running_repository_role_without_mutating_task
+task_service::tests::service_tests::cases::executions::passed_reviewer_execution_with_user_approval_gate_waits_for_human
+task_service::tests::service_tests::cases::executions::planner_completion_marks_task_awaiting_plan_review_until_approved
+task_service::tests::service_tests::cases::executions::re_execute_rejects_concurrent_running_execution
+task_service::tests::service_tests::cases::executions::re_execute_rejects_running_parent
+task_service::tests::service_tests::cases::executions::recover_reexecute_without_blocked_execution_dispatches_current_state_role
+task_service::tests::service_tests::cases::executions::retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes
+task_service::tests::service_tests::cases::executions::run_execution_batches_execution_log_events
+task_service::tests::service_tests::cases::executions::run_execution_dispatches_shell_adapter_and_updates_execution
+task_service::tests::service_tests::cases::executions::run_execution_emits_terminal_execution_event
+task_service::tests::service_tests::cases::executions::run_execution_rejects_when_terminal_active_in_workspace
+task_service::tests::service_tests::cases::executions::skip_hook_once_bypasses_only_one_dispatch_attempt
+task_service::tests::service_tests::cases::roles::cancel_execution_invokes_task_executor_cancel
+task_service::tests::service_tests::cases::roles::cancel_task_cancels_running_execution
+task_service::tests::service_tests::cases::roles::invalid_legacy_reassignment_preserves_running_execution
+task_service::tests::service_tests::cases::roles::reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo
+task_service::tests::service_tests::cases::roles::reassign_coder_with_workspace_allows_both_reset_flags
+task_service::tests::service_tests::cases::roles::reassign_coder_with_workspace_allows_reset_workspace
+task_service::tests::service_tests::cases::roles::reassign_mid_exec_coder_with_reset_worktree_flag_in_event
+task_service::tests::service_tests::cases::roles::reassign_non_coder_role_does_not_cancel_or_transition
+task_service::tests::service_tests::cases::roles::reassign_role_cancels_running_active_executor
+task_service::tests::service_tests::cases::roles::run_execution_rechecks_cancelled_status_before_adapter_launch
+task_service::tests::service_tests::cases::roles::system_transition_does_not_cancel_running_active_executor
+task_service::tests::service_tests::cases::roles::user_transition_cancels_running_active_executor_before_status_change
+task_service::tests::service_tests::cases::subtask_modes::batch_5_6_root_claim_starts_subtask_sequence
+task_service::tests::service_tests::cases::transitions::transition_to_review_runs_configured_review_runner
+task_service::tests::service_tests::cases::user_override::override_move_out_of_active_state_cancels_running_execution
+task_service::tests::service_tests::cases::user_override::park_running_task_to_backlog
+task_service::tests::service_tests::cases::user_override::user_subtask_into_review_review_pass_cascade_and_hooks_succeed
+workflow::actions::tests::auto_cascade_review_failure_at_budget_blocks_with_metadata
+workflow::actions::tests::auto_cascade_review_failure_budget_blocks_with_metadata
+workflow::actions::tests::ci_fails_reviewer_not_dispatched_cascade_handles_bounce
+workflow::actions::tests::ci_passes_then_reviewer_dispatched_via_dispatch_role_agent
+workflow::actions::tests::dispatch_role_agent_emits_event_for_coder_assignment
+workflow::actions::tests::dispatch_role_agent_initial_dispatch_creates_execution_with_capacity
+workflow::actions::tests::dispatch_role_agent_initial_dispatch_skips_at_capacity
+workflow::actions::tests::dispatch_role_agent_initial_dispatch_skips_when_execution_already_running
+workflow::actions::tests::merge_fix_re_review_runs_ci_only_and_skips_reviewer
+workflow::actions::tests::planning_rejection_budget_allows_revision_at_configured_limit
+workflow::actions::tests::reviewer_at_capacity_ci_runs_dispatch_queues
+workflow::actions::tests::reviewer_dispatch_ignores_waiting_review_tasks_without_running_execution
+workflow::actions::tests::run_ci_steps_creates_passed_review_record
+workflow::actions::tests::run_ci_steps_failure_prevents_reviewer_dispatch
+workflow::actions::tests::run_ci_steps_keeps_review_running_when_reviewer_at_capacity
+workflow::actions::tests::run_ci_steps_pass_then_dispatches_reviewer
+workflow::actions::tests::run_ci_steps_with_user_approval_gate_waits_for_human
+workflow::actions::tests::run_ci_steps_without_reviewer_cascades_to_merging
+workflow::actions::tests::subtask_root_still_dispatches_reviewer_after_coder_completion
+workflow::actions::tests::unconfigured_review_with_user_approval_gate_waits_for_human
+```
+
+**PR3-only failures:** none.
+
+The main-only set includes tests that fail before later assertions because
+main's `execution` INSERT supplies 28 values for 27 columns. PR3 removes the
+extra SQL placeholder. To compare behavior after that blocker, the temporary
+main worktree received only that one-line SQL correction and the two test
+accessor corrections. Then the full `task_service::tests::service_tests::cases::executions::`
+filter failed 14 tests; those names and their post-insert failures match the
+14 execution failures in the PR3 full services run. The exact
+`test_user_claim_bypasses_capacity_check` also failed on both revisions after
+the SQL correction. No production change from PR3 creates an additional
+services failure.
+
+### Focused checks
+
+| Target | Result |
+| --- | --- |
+| `cargo test -p cli-adapters --lib -- --test-threads=1` | 105/105 passed on final formatted tree |
+| `cargo test -p executors --lib -- --test-threads=1` | 64/64 passed on final formatted tree |
+| `cargo test -p services --lib daemon_transport::tests:: -- --test-threads=1` | 15/15 passed on final formatted tree, including connection-generation serialization and exact Resume protocol cases |
+| `cargo test -p api-types --lib harness_capability_tests -- --test-threads=1` | 3/3 passed on final formatted tree |
+| `cargo test -p db --test pr2_execution_session -- --test-threads=1` | PR3: 15/16; main: 1/15. The exact `historical_session_migration_groups_only_coherent_identity` failed on both with the same SQLite foreign-key error. |
+| `cargo test -p api --test fs_daemon_routing -- --test-threads=1` | PR3: 15/18. Main before the SQL correction: 13/18; main after that correction: 15/18. The same 3 tests fail on all runs while binding localhost with `PermissionDenied`. |
+| `cargo test -p api --test remote_execution_roundtrip -- --test-threads=1` | PR3 and main: 0/4; all four fail binding localhost with `PermissionDenied`. |
+| `cargo test -p api --test daemon_connect -- --test-threads=1` | PR3 workspace run and main: 0/5; all five fail binding localhost with `PermissionDenied`. |
+| `cargo test -p api --test task_diff -- --test-threads=1` | PR3: 0/2 at the TaskRole lease guard. Main: 0/2 at the 28-values/27-columns INSERT; after replaying the one-line PR3 SQL correction in the temporary worktree, both reach and fail at the same TaskRole lease guard. |
+
+The failed localhost tests are reported as comparison results, not inferred
+environment labels: their exact test targets were run on both revisions and
+returned the same bind error.
+
+### Compile, format, bindings, and workspace
+
+| Check | Result |
+| --- | --- |
+| `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` | PASS on final formatted tree (1m55s) |
+| `cargo fmt --all -- --check` | FAIL on both PR3 and main only at unchanged `crates/api/src/routes/mod.rs` lines 11, 337, and 1241 |
+| Individual `rustfmt --check` for all changed Rust files | PASS 87/87, using each crate's declared edition (2024 for `cli-adapters` and `agent-host`, 2021 elsewhere) |
+| `cargo test -p api-types export_typescript -- --ignored --exact` | PASS 1/1; checked-in TypeScript bindings were generated |
+| `pnpm typecheck` | PASS (`tsc -b`) |
+| `git diff --check` | PASS after removing generated trailing whitespace |
+| `cargo test --workspace -- --test-threads=1` | INCOMPLETE: stopped at `api/tests/daemon_connect` (0/5). The same exact target on main also failed 0/5 with the same bind error; Cargo did not reach later targets. |
+
+No database migration was added; schema head remains V089. The full workspace
+test command stopped at the first failed integration target, not because of
+disk exhaustion. The task-local Cargo targets and temporary main worktree were
+removed after recording the results. No frontend build/test, Forge runtime,
+real provider invocation, database migration execution, or CI run was done.
 ## Static audit results
 
 At the final source audit:

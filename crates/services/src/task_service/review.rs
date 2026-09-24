@@ -1,7 +1,7 @@
 use super::execution::resumable_external_session;
 use super::*;
-use db::WorkspaceRepo;
 use api_types::{Actor, UserActionSource};
+use db::WorkspaceRepo;
 
 impl TaskService {
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {

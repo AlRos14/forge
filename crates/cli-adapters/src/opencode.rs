@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, OpencodeConfig, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter, OpencodeConfig, PermissionPolicy,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,9 @@ impl OpencodeAdapter {
         );
         match &ctx.invocation {
             executors::HarnessInvocation::Start => config.resume_session_id = None,
-            executors::HarnessInvocation::Resume { external_session_id } => {
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
                 config.resume_session_id = Some(external_session_id.clone());
             }
         }
@@ -140,9 +142,22 @@ impl HarnessAdapter for OpencodeAdapter {
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
         crate::harness_capabilities(
-            S::Native, S::Emulated, S::Native, S::Unsupported, S::Unsupported, S::Native,
-            S::Unsupported, S::Native, S::Unsupported, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
         )
     }
 
@@ -836,10 +851,14 @@ mod tests {
             "resume_session_id":"old-session",
             "additional_params":["--session", "old-cli-session", "--continue", "--verbose"]
         });
-        let start = crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
         let start_config = OpencodeAdapter::resolve_config(&start);
         assert!(start_config.resume_session_id.is_none());
-        assert_eq!(start_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
 
         let resume = crate::test_execution_context(
             executors::HarnessInvocation::Resume {
@@ -848,8 +867,14 @@ mod tests {
             stale,
         );
         let resume_config = OpencodeAdapter::resolve_config(&resume);
-        assert_eq!(resume_config.resume_session_id.as_deref(), Some("exact-session"));
-        assert_eq!(resume_config.command_overrides.additional_params, Some(vec!["--verbose".to_owned()]));
+        assert_eq!(
+            resume_config.resume_session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
     }
     use executors::CommandOverrides;
 
@@ -986,7 +1011,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         let adapter = OpencodeAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
@@ -1032,7 +1057,7 @@ printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message"
         let adapter = OpencodeAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
@@ -1077,7 +1102,7 @@ printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-
         let adapter = OpencodeAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),

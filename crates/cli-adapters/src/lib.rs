@@ -121,8 +121,7 @@ mod capability_tests {
     #[test]
     fn resume_result_must_confirm_exact_external_session() {
         assert!(
-            require_exact_resumed_session("Cursor", Some("session-a"), Some("session-a"))
-                .is_ok()
+            require_exact_resumed_session("Cursor", Some("session-a"), Some("session-a")).is_ok()
         );
         for reported in [None, Some("session-b")] {
             let error = require_exact_resumed_session("Cursor", Some("session-a"), reported)
@@ -146,9 +145,22 @@ mod capability_tests {
         assert_eq!(
             codex,
             harness_capabilities(
-                S::Native, S::Emulated, S::Native, S::Native, S::Native, S::Native,
-                S::Native, S::Native, S::Native, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Native,
+                S::Emulated,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
             )
         );
         assert_eq!(codex.resume, S::Native);
@@ -162,9 +174,22 @@ mod capability_tests {
         assert_eq!(
             claude,
             harness_capabilities(
-                S::Native, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
-                S::Native, S::Native, S::Unsupported, S::Native, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Native,
+                S::Emulated,
+                S::Native,
+                S::Native,
+                S::Unsupported,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Unsupported,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
             )
         );
         assert_eq!(claude.resume, S::Native);
@@ -176,9 +201,22 @@ mod capability_tests {
         assert_eq!(
             cursor,
             harness_capabilities(
-                S::Native, S::Emulated, S::Native, S::Native, S::Emulated, S::Native,
-                S::Unsupported, S::Native, S::Unsupported, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unknown, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Native,
+                S::Emulated,
+                S::Native,
+                S::Native,
+                S::Emulated,
+                S::Native,
+                S::Unsupported,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unknown,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
             )
         );
         assert_eq!(cursor.resume, S::Native);
@@ -190,9 +228,22 @@ mod capability_tests {
         assert_eq!(
             opencode,
             harness_capabilities(
-                S::Native, S::Emulated, S::Native, S::Unsupported, S::Unsupported, S::Native,
-                S::Unsupported, S::Native, S::Unsupported, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Native,
+                S::Emulated,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Native,
+                S::Unsupported,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
             )
         );
         assert_eq!(opencode.resume, S::Native);
@@ -203,9 +254,22 @@ mod capability_tests {
         assert_eq!(
             gemini,
             harness_capabilities(
-                S::Unsupported, S::Emulated, S::Unknown, S::Unsupported, S::Unsupported,
-                S::Native, S::Unsupported, S::Native, S::Native, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Unsupported,
+                S::Emulated,
+                S::Unknown,
+                S::Unsupported,
+                S::Unsupported,
+                S::Native,
+                S::Unsupported,
+                S::Native,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
             )
         );
         assert_eq!(gemini.resume, S::Unsupported);
@@ -217,9 +281,22 @@ mod capability_tests {
         assert_eq!(
             smith,
             harness_capabilities(
-                S::Native, S::Emulated, S::Native, S::Native, S::Unsupported, S::Native,
-                S::Native, S::Native, S::Unsupported, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Native,
+                S::Emulated,
+                S::Native,
+                S::Native,
+                S::Unsupported,
+                S::Native,
+                S::Native,
+                S::Native,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
             )
         );
         assert_eq!(smith.resume, S::Native);
@@ -230,9 +307,21 @@ mod capability_tests {
         assert_eq!(
             shell,
             harness_capabilities(
-                S::Unsupported, S::Emulated, S::Unsupported, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
-                S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+                S::Unsupported,
+                S::Emulated,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
+                S::Unsupported,
                 S::Unsupported,
             )
         );

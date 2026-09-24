@@ -4,7 +4,7 @@ use crate::daemon_service::{
 use crate::{Result, ServiceError};
 use db::SqliteDb;
 use events::EventBus;
-use executors::{HarnessAdapterRegistry, AvailabilityStatus, ExecutorKind};
+use executors::{AvailabilityStatus, ExecutorKind, HarnessAdapterRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use ts_rs::TS;
 
 /// How the current Forge integration implements one harness operation.
@@ -205,7 +205,9 @@ impl HarnessCapabilitiesSnapshot {
 pub enum HarnessInvocation {
     #[default]
     Start,
-    Resume { external_session_id: String },
+    Resume {
+        external_session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

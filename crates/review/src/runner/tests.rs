@@ -12,7 +12,8 @@ use tempfile::TempDir;
 
 #[test]
 fn auditor_snapshot_records_resolved_adapter_capabilities_without_overwriting_agent_tags() {
-    let snapshot = r#"{"executor_type":"codex","config":{"model":"old"},"capabilities":["legacy-tag"]}"#;
+    let snapshot =
+        r#"{"executor_type":"codex","config":{"model":"old"},"capabilities":["legacy-tag"]}"#;
     let candidate = executors::ResolvedExecutorCandidate {
         candidate_key: "cursor:profile=review".to_owned(),
         executor_type: executors::ExecutorKind::Cursor,

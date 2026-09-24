@@ -1,12 +1,10 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionResult, ExecutorError, ExecutorKind,
-    ShellExecutor, TaskExecutor,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, ShellExecutor, TaskExecutor,
 };
 
-const REVIEW_RESULT_COMMAND: &str =
-    r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#;
+const REVIEW_RESULT_COMMAND: &str = r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#;
 
 fn command_for_context(ctx: &ExecutionContext) -> &str {
     if ctx.role == "reviewer" {
@@ -46,15 +44,31 @@ impl HarnessAdapter for ShellAdapter {
         config: &serde_json::Value,
         overrides: &executors::ExecutionOverrides,
     ) -> Result<serde_json::Value, ExecutorError> {
-        executors::normalize_harness_config::<executors::ShellConfig>(self.kind(), config, overrides)
+        executors::normalize_harness_config::<executors::ShellConfig>(
+            self.kind(),
+            config,
+            overrides,
+        )
     }
 
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
         crate::harness_capabilities(
-            S::Unsupported, S::Emulated, S::Unsupported, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
-            S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported, S::Unsupported,
+            S::Unsupported,
+            S::Emulated,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
             S::Unsupported,
         )
     }
@@ -116,7 +130,7 @@ mod tests {
 
         let result = adapter
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),

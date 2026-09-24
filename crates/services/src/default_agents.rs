@@ -3,7 +3,7 @@ use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, CreateAgent,
     PageRequest, SortBy, SortOrder, SqliteDb, SystemSettingRepo,
 };
-use executors::{HarnessAdapterRegistry, ExecutorKind};
+use executors::{ExecutorKind, HarnessAdapterRegistry};
 
 pub async fn ensure_default_agents(
     db: &SqliteDb,

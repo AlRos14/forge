@@ -475,7 +475,7 @@ impl CliAgentChatSessionBackend {
 
         let started = std::time::Instant::now();
         let execution = self.executor.execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+            invocation: executors::HarnessInvocation::Start,
             task_id: chat_id.to_owned(),
             execution_id: job_id.to_owned(),
             role: "interactive".to_owned(),

@@ -6,7 +6,7 @@ use db::{
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
-    AdapterExecutor, HarnessAdapterRegistry, ExecutionContext, ExecutionOutcome, LogKind,
+    AdapterExecutor, ExecutionContext, ExecutionOutcome, HarnessAdapterRegistry, LogKind,
     LogStream, LogWriter, ResolvedExecutorCandidate, TaskExecutor,
 };
 use serde_json::{json, Value};
@@ -434,10 +434,8 @@ impl ReviewRunner {
         // An auditor is independent by session boundary, even when the same
         // agent identity or harness produced the implementation.
         let snapshot = build_auditor_config_snapshot(&auditor_agent, None).await?;
-        let snapshot = self.normalize_auditor_snapshot(
-            &snapshot,
-            &req.workspace_path.display().to_string(),
-        )?;
+        let snapshot =
+            self.normalize_auditor_snapshot(&snapshot, &req.workspace_path.display().to_string())?;
         let now = now_rfc3339();
         let auditor_execution = ExecutionRepo::create(
             &*self.db,
@@ -474,7 +472,7 @@ impl ReviewRunner {
         let execution_result = self
             .executor
             .execute(ExecutionContext {
-                    invocation: executors::HarnessInvocation::Start,
+                invocation: executors::HarnessInvocation::Start,
                 task_id,
                 execution_id: auditor_execution.id.clone(),
                 role: "reviewer".to_owned(),
@@ -538,10 +536,8 @@ impl ReviewRunner {
             ExecutionOutcome::Failed => ExecutionStatus::Failed,
             ExecutionOutcome::Cancelled => ExecutionStatus::Cancelled,
         };
-        let snapshot = snapshot_with_resolved_candidate(
-            &snapshot,
-            result.resolved_candidate.as_ref(),
-        )?;
+        let snapshot =
+            snapshot_with_resolved_candidate(&snapshot, result.resolved_candidate.as_ref())?;
         let finished_at = now_rfc3339();
         ExecutionRepo::update(
             &*self.db,
