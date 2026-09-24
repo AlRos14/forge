@@ -13,7 +13,7 @@ use sqlx::Row;
 
 use super::{
     DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler, ExecutionProvider,
-    ServerExecutionEventSink,
+    ServerExecutionEventSink, DAEMON_OUTBOUND_BUFFER,
 };
 use crate::ServiceError;
 
@@ -408,6 +408,120 @@ async fn remote_dispatch_does_not_cross_daemon_connection_generation() {
         replacement_was_quiet,
         "execution.start must not be sent through replacement connection B"
     );
+}
+
+#[tokio::test]
+async fn replacement_after_final_generation_check_cannot_dispatch_to_stale_connection() {
+    let registry = make_registry();
+    let (connection_a, mut outbound_a) = DaemonConnection::new("daemon-1".to_owned());
+    for seq in 0..DAEMON_OUTBOUND_BUFFER - 1 {
+        connection_a
+            .outbound
+            .try_send(api_types::DaemonFrame::Heartbeat { seq: seq as u64 })
+            .expect("fill connection A before capability request");
+    }
+    registry.register("daemon-1".to_owned(), connection_a.clone());
+
+    let provider = super::RemoteExecutionProvider::new(registry.clone(), "daemon-1".to_owned());
+    let start = tokio::spawn(async move {
+        provider
+            .start(api_types::ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: "execution-atomic-enqueue".to_owned(),
+                role: "worker".to_owned(),
+                workspace_path: "/work".to_owned(),
+                executor_type: "codex".to_owned(),
+                executor_config: json!({"executor_type":"codex","config":{}}),
+                prompt: json!({"description":"resume"}),
+                invocation: api_types::HarnessInvocation::Resume {
+                    external_session_id: "session-exact-7".to_owned(),
+                },
+                max_turns: None,
+            })
+            .await
+    });
+
+    for _ in 0..DAEMON_OUTBOUND_BUFFER - 1 {
+        let api_types::DaemonFrame::Heartbeat { .. } = outbound_a
+            .recv()
+            .await
+            .expect("prefilled heartbeat is present")
+        else {
+            panic!("expected queued heartbeat before protocol request");
+        };
+    }
+    let api_types::DaemonFrame::Request {
+        id: capabilities_request_id,
+        method,
+        ..
+    } = outbound_a
+        .recv()
+        .await
+        .expect("connection A receives protocol negotiation")
+    else {
+        panic!("expected protocol request on connection A");
+    };
+    assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+
+    // Fill A after negotiation so execution.start can reach the outbound queue
+    // boundary but cannot be enqueued until after the replacement below.
+    for seq in 0..DAEMON_OUTBOUND_BUFFER {
+        connection_a
+            .outbound
+            .try_send(api_types::DaemonFrame::Heartbeat { seq: seq as u64 })
+            .expect("fill connection A after reading capability request");
+    }
+    registry.dispatch_incoming(
+        "daemon-1",
+        api_types::DaemonFrame::Response {
+            id: capabilities_request_id,
+            result: json!({
+                "schema_version": 1,
+                "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+            }),
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !connection_a
+                .pending
+                .lock()
+                .expect("connection A pending lock")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("execution request reaches the queued-send boundary");
+
+    // Replacing A while its send is blocked must prevent dispatch on both A
+    // and B once channel capacity becomes available.
+    let (connection_b, mut outbound_b) = DaemonConnection::new("daemon-1".to_owned());
+    registry.register("daemon-1".to_owned(), connection_b);
+
+    for _ in 0..DAEMON_OUTBOUND_BUFFER {
+        let api_types::DaemonFrame::Heartbeat { .. } = outbound_a
+            .recv()
+            .await
+            .expect("prefilled heartbeat is drained")
+        else {
+            panic!("stale connection A must not receive execution.start");
+        };
+    }
+
+    let result = start.await.expect("remote start task joins");
+    assert!(matches!(
+        result,
+        Err(ServiceError::DaemonUnavailable { daemon_id }) if daemon_id == "daemon-1"
+    ));
+    assert!(matches!(
+        outbound_b.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]

@@ -201,12 +201,16 @@ The post-implementation searches found no production `CodingExecutorAdapter`
 authority, no provider-specific resume mutation outside adapters, and no
 direct concrete Codex/Cursor usage probe outside the adapter registry. The
 remote dispatch follow-up pins protocol negotiation and `execution.start` to
-the same captured connection generation; a replacement after negotiation
-returns unavailable and cannot redirect the operation to another daemon
-instance. The standalone effective-policy workspace helper has test callers
-only; service lease/authority checks remain the actual execution workspace
-authority, not that helper. `is_high_risk` is a core-derived policy
-classification and does not itself grant or revoke a lease.
+the same captured connection generation. The final identity check and permit
+enqueue share the connection-map mutex with `register()`, so replacement and
+enqueue have one serialized order; if replacement wins, the call returns
+unavailable without dispatching to A or B. Related inbound reconnect debt is
+deferred: `run_command_socket` still calls `dispatch_incoming` with only the
+logical daemon ID, so PR15 owns connection-generation validation for stale
+responses and notifications. The standalone effective-policy workspace
+helper has test callers only; service lease/authority checks remain the actual
+execution workspace authority, not that helper. `is_high_risk` is a core-derived
+policy classification and does not itself grant or revoke a lease.
 
 A final provenance audit found that provider credentials were being injected
 into the normalized candidate config before fallback, which could affect the

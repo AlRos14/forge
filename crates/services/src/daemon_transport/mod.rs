@@ -345,22 +345,49 @@ impl DaemonConnectionRegistry {
             params,
         };
 
-        // The request is always written to this captured connection. Recheck
-        // after installing the pending response so a replacement cannot make
-        // us silently dispatch through the new generation.
-        if !self.is_current(daemon_id, connection.id()) {
+        // Reserve capacity before taking the registry lock. The final
+        // generation check and permit send below are synchronous under the
+        // same lock used by register(), so replacement cannot interleave
+        // between them. If replacement occurs while waiting for capacity,
+        // fail without sending on either generation.
+        let mut stale_rx = connection.stale_receiver();
+        if connection.is_stale() {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
+        let permit = tokio::select! {
+            permit = connection.outbound.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    lock(&connection.pending).remove(&request_id);
+                    return Err(ServiceError::DaemonUnavailable {
+                        daemon_id: daemon_id.to_owned(),
+                    });
+                }
+            },
+            _ = stale_rx.changed() => {
+                lock(&connection.pending).remove(&request_id);
+                return Err(ServiceError::DaemonUnavailable {
+                    daemon_id: daemon_id.to_owned(),
+                });
+            }
+        };
 
-        if connection.outbound.send(frame).await.is_err() {
+        let connections = lock(&self.inner.connections);
+        let still_current = connections
+            .get(daemon_id)
+            .is_some_and(|current| current.id() == connection.id() && !current.is_stale());
+        if !still_current {
+            drop(connections);
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
+        permit.send(frame);
+        drop(connections);
 
         let result = match tokio::time::timeout(timeout_duration, receiver).await {
             Ok(Ok(Ok(result))) => result,

@@ -229,13 +229,15 @@ winner kind/config; if that cannot be done, the stale primary policy is
 removed. Candidate-key/config mismatch or an unlisted/identity-changing
 winner is rejected. Cancel's request shape is unchanged.
 
-Each remote Start captures the current `DaemonConnection` generation before
-protocol negotiation. Both `daemon.protocol_capabilities` and
-`execution.start` are sent through that captured connection. If reconnect
-replaces it after negotiation, Start fails as unavailable; it never resolves
-the same logical `daemon_id` again and silently dispatches through the new
-generation. A later Execution performs its own negotiation against the new
-connection.
+Each remote execution call captures the current `DaemonConnection` generation
+before protocol negotiation. Both `daemon.protocol_capabilities` and
+`execution.start` are sent through that captured connection. The registry
+reserves channel capacity first, then holds the same connections mutex used by
+`register()` across the final generation check and synchronous permit send.
+If replacement wins before that critical section, the call fails as
+unavailable without sending Start on either connection. If dispatch wins the
+lock first, enqueue linearizes before replacement. A later Execution performs
+its own negotiation against the new connection.
 
 Local and daemon execution converge on
 `HarnessAdapter.start` / `HarnessAdapter.resume`; transport does not mutate
@@ -297,7 +299,18 @@ and its registry are removed as production authority.
 | Embedded execution/policy path | Existing Agent Host and embedded operator policy readers remain isolated from external HarnessAdapters. | Embedded capabilities are not represented as external harness evidence. | PR10 |
 | Historical effective-policy interpretation | Existing snapshots without adapter-interpreted policy may use the old snapshot reader; the Embedded path is separately bounded. | It cannot overwrite current candidate policy; a remote winner's policy is recomputed from that winner or removed. | PR13 / PR10 |
 | Shell reviewer command | The exact generic `role == reviewer` marker selects the existing fixed command inside ShellAdapter. | It is a Shell compatibility command, not native review-mode capability or verdict authority. | PR8 |
-| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`; daemon Start params require `invocation`; capability check and Start share one captured connection generation. | Mixed protocol versions reject before dispatch; replacement during negotiation returns unavailable instead of reselecting by `daemon_id`. There is no provider-specific dual-write or inference fallback. | Retained transport contract; naming cleanup is PR12 |
+| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`; daemon Start params require `invocation`; capability check and Start share one captured connection generation, with final generation check and enqueue serialized against `register()`. | Mixed protocol versions reject before dispatch; a replacement that linearizes first returns unavailable without dispatch to stale A or replacement B. There is no provider-specific dual-write or inference fallback. | Retained transport contract; naming cleanup is PR12 |
+
+## Related deferred reconnect debt
+
+The incoming command-socket path still loses connection generation: API
+`run_command_socket` has `connection_id`, but passes only `daemon_id` through
+`handle_daemon_text_frame` to `DaemonConnectionRegistry::dispatch_incoming`.
+That registry resolves the current connection by logical daemon ID, so a
+frame selected from a stale socket during reconnect could be attributed to the
+replacement generation. This PR3 change hardens outbound protocol negotiation
+and Start enqueue only. **PR15** owns generation-bound inbound dispatch and
+regression coverage for stale responses and execution notifications.
 
 ## Public surface and schema
 
