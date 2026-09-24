@@ -549,15 +549,15 @@ async fn new_server_start_rejects_pre_pr3_daemon_before_dispatch() {
                 },
             },
         );
-        assert!(tokio::time::timeout(Duration::from_millis(40), outbound.recv())
-            .await
-            .is_err(), "Start must not be sent without proven generic invocation support");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), outbound.recv())
+                .await
+                .is_err(),
+            "Start must not be sent without proven generic invocation support"
+        );
     });
 
-    let provider = super::RemoteExecutionProvider::new(
-        registry,
-        "daemon-legacy".to_owned(),
-    );
+    let provider = super::RemoteExecutionProvider::new(registry, "daemon-legacy".to_owned());
     let result = provider
         .start(api_types::ExecutionStartParams {
             task_id: "task-1".to_owned(),
@@ -613,15 +613,15 @@ async fn remote_resume_rejects_old_or_unknown_daemon_protocol_before_dispatch() 
                     },
                 );
             }
-            assert!(tokio::time::timeout(Duration::from_millis(40), outbound.recv())
-                .await
-                .is_err(), "Resume must not be sent without proven support");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), outbound.recv())
+                    .await
+                    .is_err(),
+                "Resume must not be sent without proven support"
+            );
         });
 
-        let provider = super::RemoteExecutionProvider::new(
-            registry,
-            "daemon-legacy".to_owned(),
-        );
+        let provider = super::RemoteExecutionProvider::new(registry, "daemon-legacy".to_owned());
         let result = provider
             .start(api_types::ExecutionStartParams {
                 task_id: "task-1".to_owned(),
@@ -665,15 +665,15 @@ async fn remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role() {
                 }),
             },
         );
-        assert!(tokio::time::timeout(Duration::from_millis(40), outbound.recv())
-            .await
-            .is_err(), "reviewer Start must not be sent without role support");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), outbound.recv())
+                .await
+                .is_err(),
+            "reviewer Start must not be sent without role support"
+        );
     });
 
-    let provider = super::RemoteExecutionProvider::new(
-        registry,
-        "daemon-legacy".to_owned(),
-    );
+    let provider = super::RemoteExecutionProvider::new(registry, "daemon-legacy".to_owned());
     let result = provider
         .start(api_types::ExecutionStartParams {
             task_id: "task-1".to_owned(),

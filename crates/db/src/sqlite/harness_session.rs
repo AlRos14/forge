@@ -103,14 +103,12 @@ pub(crate) async fn profile_id_for_snapshot_in_tx(
     else {
         return Ok(None);
     };
-    sqlx::query_scalar(
-        "SELECT id FROM agent_profile WHERE id = ? AND identity_id = ? LIMIT 1",
-    )
-    .bind(profile_id)
-    .bind(agent_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(Into::into)
+    sqlx::query_scalar("SELECT id FROM agent_profile WHERE id = ? AND identity_id = ? LIMIT 1")
+        .bind(profile_id)
+        .bind(agent_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(Into::into)
 }
 
 /// Durable guard for INV-003: a resolved Execution snapshot cannot materialize
@@ -121,7 +119,13 @@ pub(crate) async fn validate_agent_harness_identity_in_tx(
     harness_kind: &str,
 ) -> Result<()> {
     let configured_kind: Option<String> = sqlx::query_scalar(
-        "SELECT executor_type FROM agent WHERE id = ? LIMIT 1",
+        "SELECT profile.executor_type
+         FROM agent_identity AS identity
+         JOIN agent_profile AS profile
+           ON profile.id = identity.selected_profile_id
+          AND profile.identity_id = identity.id
+         WHERE identity.id = ?
+         LIMIT 1",
     )
     .bind(agent_id)
     .fetch_optional(&mut **transaction)
@@ -229,8 +233,7 @@ pub(crate) async fn validate_execution_harness_session_in_tx(
         ));
     }
     if let Some(snapshot_json) = input.executor_config_snapshot_json.as_deref() {
-        let snapshot =
-            serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
+        let snapshot = serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
         if let Some(executor_type) = snapshot
             .get("executor_type")
             .and_then(serde_json::Value::as_str)
@@ -347,8 +350,7 @@ impl HarnessSessionRepo for SqliteDb {
                 "ended or failed HarnessSession cannot become reusable".to_owned(),
             ));
         }
-        if matches!(&status, HarnessSessionStatus::Active)
-            && current.external_session_id.is_none()
+        if matches!(&status, HarnessSessionStatus::Active) && current.external_session_id.is_none()
         {
             return Err(DbError::Check(
                 "active HarnessSession requires an external session identity".to_owned(),

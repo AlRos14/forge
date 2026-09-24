@@ -77,9 +77,8 @@ pub fn resolve_execution_actions_with_session_state(
             .contains(&RecoveryAction::ResumeSession)
     });
     let has_recovery_session = has_resume_recovery_action
-        && blocked_execution.is_some_and(|execution| {
-            has_resumable_session(execution, resumable_execution_ids)
-        });
+        && blocked_execution
+            .is_some_and(|execution| has_resumable_session(execution, resumable_execution_ids));
     let blocked_role_matches = effective_role
         .zip(blocked_execution.map(|execution| execution.role.as_str()))
         .is_some_and(|(role, blocked_role)| role == blocked_role);
@@ -324,7 +323,7 @@ mod tests {
             Some("hs"),
             Some("legacy"),
         );
-        let active_ids = HashSet::from(["hs".to_owned()]);
+        let active_ids = HashSet::from([active.id.clone()]);
         assert!(has_resumable_session(&active, Some(&active_ids)));
 
         let agent_legacy = execution(

@@ -22,9 +22,9 @@ use axum::{
 };
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -190,6 +190,12 @@ impl HarnessAdapter for ReviewFailCodexAdapter {
         ExecutorKind::Codex
     }
 
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
+    }
+
     fn check_availability(&self) -> AvailabilityInfo {
         AvailabilityInfo {
             status: AvailabilityStatus::Authenticated,
@@ -220,12 +226,12 @@ impl HarnessAdapter for ReviewFailCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let pause_after_unblock = Arc::clone(&self.pause_after_unblock);
         Box::pin(async move {
-            if ctx.description.contains("FORGE_RESULT:") {
+            if ctx.role == "reviewer" {
                 write_auditor_failure(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some("auditor-session".to_owned()),
+                    agent_session_id: Some(format!("auditor-session-{}", ctx.execution_id)),
                     summary: Some("auditor failed the implementation".to_owned()),
                     error: None,
                     usage: None,
@@ -237,10 +243,14 @@ impl HarnessAdapter for ReviewFailCodexAdapter {
             if pause_after_unblock.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
-            let session_id = if call_index == 0 {
-                FIRST_EXECUTOR_SESSION_ID.to_owned()
-            } else {
-                format!("follow-up-session-{call_index}")
+            let session_id = match &ctx.invocation {
+                api_types::HarnessInvocation::Resume {
+                    external_session_id,
+                } => external_session_id.clone(),
+                api_types::HarnessInvocation::Start if call_index == 0 => {
+                    FIRST_EXECUTOR_SESSION_ID.to_owned()
+                }
+                api_types::HarnessInvocation::Start => format!("fresh-session-{call_index}"),
             };
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
@@ -289,10 +299,7 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl HarnessAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");

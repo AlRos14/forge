@@ -12,9 +12,10 @@ The implementation started from `5e5d8fb29a02264c46577905a1bdfe87820f19e2`
 and the static preflight in [`plan-pr3-preflight.md`](plan-pr3-preflight.md).
 The follow-up audit tightened Agent-bound routing, capability snapshot
 evolution, daemon negotiation, remote winner provenance, and historical
-session identity checks. Verification results below describe the commands
-that actually completed; the final workspace test run was stopped after the
-filesystem reached 0 bytes free.
+session identity checks. Verification results below distinguish completed
+focused checks from the workspace test run, which did not complete after its
+Cargo target exhausted the available filesystem space. The temporary targets
+used for validation are removed after the final checks.
 
 ## Old and new adapter authority
 
@@ -185,14 +186,18 @@ resume fails explicitly. Fresh Start removes or ignores stale session-scoped
 fields inside the adapter.
 
 Start retains ordered fallback only within one Agent identity. Every route is
-revalidated against the Agent's harness kind and the PR0A identity-bearing
-account key before dispatch, including old persisted route snapshots. A
-Codex-to-Cursor route and an account-key or credential identity change are
-rejected; selecting another harness or native account requires explicitly
-selecting/reassigning another Agent. Codex `CODEX_HOME` and Smith
+revalidated against the Agent's harness kind, the PR0A identity-bearing account
+key, and equality of the generic opaque command override channels before
+dispatch, including old persisted route snapshots. `env`,
+`base_command_override`, and `additional_params` must be structurally identical
+across same-Agent candidates because the core cannot prove that an adapter will
+not use them to select another native account or context. This rejects, for
+example, different Claude `CLAUDE_CONFIG_DIR` or `ANTHROPIC_API_KEY` values.
+Selecting another harness or identity-bearing native account requires
+explicitly selecting/reassigning another Agent. Codex `CODEX_HOME` and Smith
 provider/profile identity follow the existing account-key rules. Same-harness,
-same-account variations in model, reasoning effort, sandbox, approval, and
-other non-identity settings remain valid. Each accepted route candidate carries
+same-identity variations in model, reasoning effort, sandbox, approval, and
+other explicit run settings remain valid. Each accepted route candidate carries
 its own normalized config,
 `HarnessCapabilities`, effective policy, candidate/account identity, and
 adapter. The actual winner is attached to the local result and remote terminal
@@ -381,6 +386,11 @@ Named focused test additions include:
 * `sticky_resume_fails_when_exact_candidate_left_route`
 * `fallback_cannot_switch_harness_identity`
 * `sticky_resume_rejects_cross_harness_candidate`
+* `claude_fallback_cannot_change_config_dir_identity`
+* `same_agent_fallback_cannot_change_command_environment`
+* `same_agent_fallback_cannot_change_opaque_command_arguments`
+* `same_agent_fallback_cannot_change_wrapper_command`
+* `same_agent_fallback_allows_model_effort_sandbox_variation`
 * `same_agent_start_fallback_records_winning_model_capabilities`
   (also verifies runtime credential env reaches the winner without entering
   candidate provenance)
@@ -396,6 +406,7 @@ Named focused test additions include:
 * `pre_pr3_execution_start_without_invocation_is_rejected`
 * `pre_pr3_resume_request_is_rejected_before_adapter_dispatch`
 * `remote_dispatch_does_not_cross_daemon_connection_generation`
+* `replacement_after_final_generation_check_cannot_dispatch_to_stale_connection`
 * `new_server_start_rejects_pre_pr3_daemon_before_dispatch`
 * `remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role`
 * `remote_resolved_candidate_carries_effective_harness_capabilities`
@@ -411,34 +422,55 @@ current immutable Agent harness identity. Contradictory/missing evidence,
 Shell/Null, and historical ambiguity return no resumable session. This
 read-only shim is bounded PR13 cleanup.
 
-Verification that completed:
+Verification that completed against the final production code:
 
-* `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` passed before later
-  production parser/runtime-policy/credential-provenance changes, test-only
-  dependency/fixture edits, and the TypeScript schema-version annotation. The
-  final workspace compilation is **UNVERIFIED**.
+* `FORGE_SKIP_WEB_BUILD=1 cargo check --workspace` passed after the final
+  production changes. Later Rust edits were limited to test fixtures.
+* `cargo test -p cli-adapters -p executors -p services --lib -- --test-threads=1`
+  completed the CLI adapter library tests (105 passed). The executor library
+  tests were rerun after correcting two test-fixture expectations and passed
+  64/64.
+* `cargo test -p services --lib daemon_transport::tests:: -- --test-threads=1`
+  passed 15/15, including both connection-generation replacement tests and
+  old/unknown daemon Resume rejection.
+* `cargo test -p api-types --lib harness_capability_tests -- --test-threads=1`
+  passed 3/3, including forward-extensible v1 reads and fail-closed malformed
+  or unsupported versions.
+* `cargo test -p api --test fs_daemon_routing -- --test-threads=1` passed
+  18/18. Remote execution roundtrip passed 4/4, merge-conflict happy path
+  passed 1/1, and merge-fix exhaustion passed 1/1. The `task_diff` target's
+  two tests still fail before HarnessAdapter dispatch with
+  `WorkspaceLease role is not a TaskRole`, also present in unchanged service
+  governance paths on `main`.
+* `cargo test -p db --test pr2_execution_session -- --test-threads=1` passed
+  15/16 after correcting the PR3 identity, immutable-profile, and workspace
+  test fixtures. Its remaining `historical_session_migration_groups_only_coherent_identity`
+  failure was reproduced on `origin/main` with the same foreign-key error.
+  The `workspace_scoped_session_is_not_reused_in_another_workspace` fixture
+  also failed on `origin/main` because it created two workspaces for one task;
+  the PR3 branch now uses distinct tasks and passes that test.
+* The services library suite completed 643 tests, with 26 failures and 1
+  ignored. Focused PR3 recovery/resumability tests were corrected and rerun
+  successfully. Remaining failures include sandbox-denied subprocess/socket
+  tests, legacy TaskService fixtures rejected by the existing WorkspaceLease
+  TaskRole check, and unrelated existing service failures. This broad suite
+  did not produce a clean result.
 * `cargo test -p api-types export_typescript -- --ignored --exact` passed once
-  and emitted checked-in bindings. The subsequent `schema_version: number`
-  annotation was mirrored statically in its TypeScript binding.
-* `git diff --check` passed after source edits.
-* `cargo fmt --all -- --check` failed. The clean `origin/main` baseline also
-  fails formatting on existing files, and the current tree has additional
-  formatter deltas in PR3-touched files. No workspace-wide reformat was applied
-  because it would add broad unrelated changes.
-* `FORGE_SKIP_WEB_BUILD=1 cargo test --workspace` was attempted several times.
-  Early attempts exposed missing test-only imports/dependencies and stale
-  fixture field access; those observed errors were corrected. A subsequent
-  run was interrupted before the suite completed after the filesystem reached
-  0 bytes free. `cargo clean` removed 33.0 GiB of generated Rust/Cargo files
-  and restored 31 GiB free. The complete suite and focused tests are therefore
-  **NOT VERIFIED**.
+  and emitted the checked-in bindings. The `schema_version: number` binding
+  annotation is mirrored statically; no frontend tooling ran.
+* `cargo fmt --all -- --check` fails on formatting deltas also present in
+  clean `origin/main`. Every changed Rust source file passes
+  `rustfmt --check --edition 2021` individually; no workspace-wide reformat
+  was applied.
+* `git diff --check` passes.
+* `cargo test --workspace` was attempted but did not complete: its Cargo target
+  exhausted available filesystem space before the suite finished. No complete
+  workspace test result is claimed.
 
 No frontend build/test/typecheck, Forge runtime, real provider invocation, or
-database migration execution was performed. Tests are present but their final
-post-fix execution **REQUIRES IMPLEMENTATION-TIME VERIFICATION**. The prior
-workspace compilation result predates later production changes; current
-compilation, tests, and CI-equivalent formatting are not fully verified, so
-this ledger does not claim PR3 is merge-ready.
+database migration execution was performed. The workspace test suite and
+global formatting check remain incomplete, so this ledger does not claim the
+full repository Definition of Done or CI-equivalent verification.
 
 ## Static audit results
 

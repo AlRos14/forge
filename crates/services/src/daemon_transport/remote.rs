@@ -70,21 +70,20 @@ impl ExecutionProvider for RemoteExecutionProvider {
         &self,
         params: api_types::ExecutionStartParams,
     ) -> Result<api_types::ExecutionStartResult> {
-        let connection = self
-            .registry
-            .get(&self.daemon_id)
-            .ok_or_else(|| ServiceError::DaemonUnavailable {
-                daemon_id: self.daemon_id.clone(),
-            })?;
+        let connection =
+            self.registry
+                .get(&self.daemon_id)
+                .ok_or_else(|| ServiceError::DaemonUnavailable {
+                    daemon_id: self.daemon_id.clone(),
+                })?;
         // Every PR3 dispatch requires the generic invocation contract. An
         // older daemon can ignore the additive field and inspect legacy
         // provider resume keys left in a historical snapshot, turning Start
         // into an unintended Resume. Pin negotiation and execution to the
         // same connection generation: daemon_id alone can identify a newly
         // reconnected, older daemon after capability negotiation completes.
-        let mut required_features = vec![
-            api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
-        ];
+        let mut required_features =
+            vec![api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1];
         if params.role == "reviewer" {
             required_features.push(api_types::DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1);
         }
@@ -109,12 +108,10 @@ impl ExecutionProvider for RemoteExecutionProvider {
                 .filter(|feature| !capabilities.supports(feature))
                 .collect::<Vec<_>>();
             if !unsupported.is_empty() {
-                return Err(ServiceError::invalid_operation(
-                    format!(
-                        "remote daemon does not advertise required protocol features: {}",
-                        unsupported.join(", ")
-                    ),
-                ));
+                return Err(ServiceError::invalid_operation(format!(
+                    "remote daemon does not advertise required protocol features: {}",
+                    unsupported.join(", ")
+                )));
             }
         }
         self.registry

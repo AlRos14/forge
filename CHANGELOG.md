@@ -21,7 +21,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Protocol negotiation and Start dispatch are pinned to one daemon connection
   generation; reconnect replacement during negotiation fails closed.
 - Ordered fallback candidates must preserve the Agent's harness and
-  identity-bearing native account. Cross-harness or account changes now fail
+  identity-bearing native account. Generic command override channels
+  (`env`, `base_command_override`, and `additional_params`) must also remain
+  structurally identical because adapters may use them to select an account or
+  native context. Cross-harness, account, or opaque command changes now fail
   before dispatch; select or reassign a separate Agent for that failover.
 - Execution responses now expose additive `actor_ref`, `purpose`, and
   `harness_session_id` fields. New Executions persist a real Human or Agent

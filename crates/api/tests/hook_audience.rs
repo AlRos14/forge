@@ -190,6 +190,7 @@ fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
         merge_service: None,
         cleanup_scheduler: None,
         task_executor: None,
+        adapter_registry: None,
         daemon_connections: None,
         workspace_exec_locks: None,
         terminal_activity: None,

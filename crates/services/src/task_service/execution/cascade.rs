@@ -231,9 +231,7 @@ impl TaskService {
             let authoritative_memberships =
                 if let Some(role) = db::canonical_task_role_name(&execution.role) {
                     crate::task_service::current_role_memberships_authoritative(
-                        &self.db,
-                        &task.id,
-                        &role,
+                        &self.db, &task.id, &role,
                     )
                     .await?
                 } else {
@@ -305,9 +303,7 @@ impl TaskService {
                     })?;
                 (
                     continuity_execution.harness_session_id,
-                    Some(executor_snapshot_for_harness_resume(
-                        snapshot_json,
-                    )?),
+                    Some(executor_snapshot_for_harness_resume(snapshot_json)?),
                 )
             } else {
                 // The current RoleMembership Actor wins. A membership change
@@ -337,14 +333,9 @@ impl TaskService {
                         task_id: task.id.clone(),
                         agent_id: Some(agent_id.clone()),
                         actor_ref: Some(db::ActorRef::Agent(agent_id)),
-                        purpose: Some(
-                            execution
-                                .purpose
-                                .clone()
-                                .unwrap_or_else(|| {
-                                    execution_purpose_for_task_type(&task.task_type, &execution.role)
-                                }),
-                        ),
+                        purpose: Some(execution.purpose.clone().unwrap_or_else(|| {
+                            execution_purpose_for_task_type(&task.task_type, &execution.role)
+                        })),
                         harness_session_id,
                         role: execution.role.clone(),
                         status: ExecutionStatus::Running,

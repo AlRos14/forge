@@ -38,10 +38,7 @@ pub(crate) fn execution_purpose_for_role(role: &str) -> ExecutionPurpose {
 /// fallback for the legacy role-driven implementation path, but task types
 /// with a stronger domain meaning win so validation is not recorded as
 /// implementation merely because its workflow role is `worker`.
-pub(crate) fn execution_purpose_for_task_type(
-    task_type: &str,
-    role: &str,
-) -> ExecutionPurpose {
+pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> ExecutionPurpose {
     match task_type.trim().to_ascii_lowercase().as_str() {
         "planning" => ExecutionPurpose::Plan,
         "review" => ExecutionPurpose::Review,
@@ -145,8 +142,7 @@ pub async fn resumable_external_session(
             .agent_session_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
-        && (execution.workspace_id.is_none()
-            || execution.workspace_id.as_deref() == workspace_id)
+        && (execution.workspace_id.is_none() || execution.workspace_id.as_deref() == workspace_id)
         && expected_agent_id.is_none_or(|agent_id| actor_id == agent_id)
     {
         let Some(snapshot_value) = execution
@@ -226,8 +222,8 @@ fn harness_identity_matches_snapshot(
     agent_credential_ref: Option<&str>,
     snapshot_json: Option<&str>,
 ) -> bool {
-    let Some(snapshot) = snapshot_json
-        .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+    let Some(snapshot) =
+        snapshot_json.and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
     else {
         return false;
     };
@@ -290,21 +286,29 @@ pub async fn harness_invocation_for_execution(
     execution: &Execution,
     workspace_id: Option<&str>,
 ) -> Result<api_types::HarnessInvocation> {
-    if execution.harness_session_id.is_none() {
+    let Some(harness_session_id) = execution.harness_session_id.as_deref() else {
+        return Ok(api_types::HarnessInvocation::Start);
+    };
+    let Some(session) = db::HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
+        return Err(ServiceError::invalid_operation(
+            "Execution HarnessSession reference is missing",
+        ));
+    };
+    if session.status == db::HarnessSessionStatus::Pending && session.external_session_id.is_none()
+    {
+        // New Agent Executions receive a pending session row before dispatch.
+        // That row is the destination for the session created by Start, not a
+        // request to Resume an external session that does not exist yet.
         return Ok(api_types::HarnessInvocation::Start);
     }
-    let external_session_id = resumable_external_session(
-        db,
-        execution,
-        execution.agent_id.as_deref(),
-        workspace_id,
-    )
-    .await?
-    .ok_or_else(|| {
-        ServiceError::invalid_operation(
+    let external_session_id =
+        resumable_external_session(db, execution, execution.agent_id.as_deref(), workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
             "explicit HarnessSession is not resumable under its historical capability evidence",
         )
-    })?;
+            })?;
     Ok(api_types::HarnessInvocation::Resume {
         external_session_id,
     })
@@ -370,9 +374,7 @@ pub(crate) async fn reusable_harness_session_for_agent(
         || execution
             .agent_session_id
             .as_deref()
-            .is_some_and(|legacy_id| {
-                session.external_session_id.as_deref() != Some(legacy_id)
-            })
+            .is_some_and(|legacy_id| session.external_session_id.as_deref() != Some(legacy_id))
     {
         return Ok(None);
     }
@@ -402,11 +404,10 @@ fn harness_session_resume_is_available(session: &HarnessSession) -> bool {
     // and integrations with an implemented exact resume protocol are trusted.
     // Partial capability-looking objects and malformed/future versioned data
     // never enter this path. PR13 removes this allowlist.
-    let legacy_shape = snapshot.as_array().is_some_and(|tags| {
-        tags.iter().all(Value::is_string)
-    }) || snapshot
-        .as_object()
-        .is_some_and(serde_json::Map::is_empty);
+    let legacy_shape = snapshot
+        .as_array()
+        .is_some_and(|tags| tags.iter().all(Value::is_string))
+        || snapshot.as_object().is_some_and(serde_json::Map::is_empty);
     if !legacy_shape {
         return false;
     }
@@ -457,7 +458,8 @@ mod purpose_tests {
     use super::*;
 
     #[test]
-    fn historical_session_identity_allows_run_config_but_rejects_harness_account_and_credential_changes() {
+    fn historical_session_identity_allows_run_config_but_rejects_harness_account_and_credential_changes(
+    ) {
         let current_config = r#"{"model":"gpt-5","env":{"CODEX_HOME":"/accounts/one"}}"#;
         let same_identity_new_model = r#"{"executor_type":"codex","credential_ref":"cred-one","config":{"model":"gpt-5.1","model_reasoning_effort":"high","env":{"CODEX_HOME":"/accounts/one"}}}"#;
         assert!(harness_session_identity_matches_snapshot(
@@ -879,7 +881,10 @@ async fn persist_account_usage_probe(
                 Some(snapshot),
                 execution_id,
                 &observation.value,
-                observation.source.as_deref().unwrap_or("harness_account_usage"),
+                observation
+                    .source
+                    .as_deref()
+                    .unwrap_or("harness_account_usage"),
             )
             .await
             {
@@ -1040,8 +1045,8 @@ pub(super) async fn persist_planner_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        account_usage_from_log_entry, account_usage_source_from_payload, normalize_account_usage,
-        snapshot_usage_account_key, harness_session_resume_is_available,
+        account_usage_from_log_entry, account_usage_source_from_payload,
+        harness_session_resume_is_available, normalize_account_usage, snapshot_usage_account_key,
     };
     use db::{HarnessSession, HarnessSessionStatus};
     use executors::{LogEntry, LogKind, LogStream};
@@ -1106,7 +1111,10 @@ mod tests {
             "codex",
             json!(["legacy-agent-tag"]),
         )));
-        assert!(harness_session_resume_is_available(&harness_session("codex", json!({}))));
+        assert!(harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({})
+        )));
         assert!(!harness_session_resume_is_available(&harness_session(
             "codex",
             json!({"schema_version": 2, "capabilities": {"resume":"native"}}),

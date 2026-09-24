@@ -193,15 +193,14 @@ impl TaskService {
             .await?;
         self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(&agent_id), None)
             .await?;
-        let executor_config_snapshot_json =
-            build_executor_config_snapshot(
-                &self.db,
-                &task,
-                &agent,
-                overrides,
-                self.adapter_registry.as_deref(),
-            )
-            .await?;
+        let executor_config_snapshot_json = build_executor_config_snapshot(
+            &self.db,
+            &task,
+            &agent,
+            overrides,
+            self.adapter_registry.as_deref(),
+        )
+        .await?;
         let now = now_rfc3339();
         let execution = self
             .create_running_execution(
@@ -478,15 +477,14 @@ impl TaskService {
             .as_ref()
             .filter(|session| matches!(&session.status, db::HarnessSessionStatus::Active))
             .and_then(|session| session.external_session_id.clone());
-        let mut executor_config_snapshot_json =
-            build_executor_config_snapshot(
-                &self.db,
-                &task,
-                &agent,
-                overrides,
-                self.adapter_registry.as_deref(),
-            )
-            .await?;
+        let mut executor_config_snapshot_json = build_executor_config_snapshot(
+            &self.db,
+            &task,
+            &agent,
+            overrides,
+            self.adapter_registry.as_deref(),
+        )
+        .await?;
         if let (Some(_session_id), Some(snapshot_json), Some(parent_snapshot_json)) = (
             reusable_external_session.as_deref(),
             executor_config_snapshot_json.as_deref(),
@@ -663,8 +661,7 @@ impl TaskService {
                         )
                         .await?
                     } else {
-                        crate::task_service::select_usable_agent_id(&self.db, &memberships)
-                            .await?
+                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
                     };
                     selected.ok_or_else(|| {
                         ServiceError::invalid_operation(format!(
@@ -763,15 +760,14 @@ impl TaskService {
                 self.repo_cache_locks.clone(),
             )
             .await?;
-        let executor_config_snapshot_json =
-            build_executor_config_snapshot(
-                &self.db,
-                &task,
-                &agent,
-                None,
-                self.adapter_registry.as_deref(),
-            )
-            .await?;
+        let executor_config_snapshot_json = build_executor_config_snapshot(
+            &self.db,
+            &task,
+            &agent,
+            None,
+            self.adapter_registry.as_deref(),
+        )
+        .await?;
         let role_name = &parent_execution.role;
         let state = workflow
             .states
@@ -815,11 +811,9 @@ impl TaskService {
                     task_id: task.id.clone(),
                     agent_id: Some(agent.id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-                    purpose: Some(
-                        parent_execution.purpose.clone().unwrap_or_else(|| {
-                            execution_purpose_for_task_type(&task.task_type, &parent_execution.role)
-                        }),
-                    ),
+                    purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
+                        execution_purpose_for_task_type(&task.task_type, &parent_execution.role)
+                    })),
                     harness_session_id: None,
                     role: parent_execution.role.clone(),
                     status: ExecutionStatus::Running,

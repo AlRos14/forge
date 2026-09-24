@@ -286,13 +286,8 @@ impl DaemonConnectionRegistry {
             .ok_or_else(|| ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             })?;
-        self.send_request_on_connection_with_timeout(
-            &connection,
-            method,
-            params,
-            timeout_duration,
-        )
-        .await
+        self.send_request_on_connection_with_timeout(&connection, method, params, timeout_duration)
+            .await
     }
 
     pub(crate) async fn send_request_on_connection<P, R>(
@@ -375,19 +370,24 @@ impl DaemonConnectionRegistry {
             }
         };
 
-        let connections = lock(&self.inner.connections);
-        let still_current = connections
-            .get(daemon_id)
-            .is_some_and(|current| current.id() == connection.id() && !current.is_stale());
-        if !still_current {
-            drop(connections);
+        let sent = {
+            let connections = lock(&self.inner.connections);
+            let still_current = connections
+                .get(daemon_id)
+                .is_some_and(|current| current.id() == connection.id() && !current.is_stale());
+            if still_current {
+                permit.send(frame);
+                true
+            } else {
+                false
+            }
+        };
+        if !sent {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
-        permit.send(frame);
-        drop(connections);
 
         let result = match tokio::time::timeout(timeout_duration, receiver).await {
             Ok(Ok(Ok(result))) => result,

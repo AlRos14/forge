@@ -23,9 +23,9 @@ use axum::{
 use db::ReviewRepo;
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -34,6 +34,15 @@ use tower::ServiceExt;
 const EXECUTOR_SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
 const FOLLOW_UP_SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 const AUDITOR_SESSION_ID: &str = "55555555-5555-4555-8555-555555555555";
+
+fn session_id_for(ctx: &ExecutionContext, start_session_id: &str) -> String {
+    match &ctx.invocation {
+        api_types::HarnessInvocation::Start => start_session_id.to_owned(),
+        api_types::HarnessInvocation::Resume {
+            external_session_id,
+        } => external_session_id.clone(),
+    }
+}
 
 #[tokio::test]
 async fn merge_conflict_follow_up_resolves_and_reaches_done() {
@@ -209,6 +218,12 @@ impl HarnessAdapter for MergeConflictCodexAdapter {
         ExecutorKind::Codex
     }
 
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
+    }
+
     fn check_availability(&self) -> AvailabilityInfo {
         AvailabilityInfo {
             status: AvailabilityStatus::Authenticated,
@@ -240,12 +255,12 @@ impl HarnessAdapter for MergeConflictCodexAdapter {
         let resolve_follow_up = self.resolve_follow_up;
         let conflict_prepared = Arc::clone(&self.conflict_prepared);
         Box::pin(async move {
-            if ctx.description.contains("FORGE_RESULT:") {
+            if ctx.role == "reviewer" {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some(AUDITOR_SESSION_ID.to_owned()),
+                    agent_session_id: Some(session_id_for(&ctx, AUDITOR_SESSION_ID)),
                     summary: Some("auditor passed the implementation".to_owned()),
                     error: None,
                     usage: None,
@@ -258,7 +273,7 @@ impl HarnessAdapter for MergeConflictCodexAdapter {
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some(FOLLOW_UP_SESSION_ID.to_owned()),
+                    agent_session_id: Some(session_id_for(&ctx, FOLLOW_UP_SESSION_ID)),
                     summary: Some("merge conflict resolved".to_owned()),
                     error: None,
                     usage: None,
@@ -281,7 +296,7 @@ impl HarnessAdapter for MergeConflictCodexAdapter {
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
                 after_sha: None,
-                agent_session_id: Some(EXECUTOR_SESSION_ID.to_owned()),
+                agent_session_id: Some(session_id_for(&ctx, EXECUTOR_SESSION_ID)),
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
@@ -360,6 +375,12 @@ impl HarnessAdapter for CompletingCodexAdapter {
         ExecutorKind::Codex
     }
 
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
+    }
+
     fn check_availability(&self) -> AvailabilityInfo {
         AvailabilityInfo {
             status: AvailabilityStatus::Authenticated,
@@ -391,10 +412,11 @@ impl HarnessAdapter for CompletingCodexAdapter {
             if ctx.description.contains("merge failed due to conflicts") {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
+            let session_id = session_id_for(&ctx, "merge-follow-up-session");
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
                 after_sha: None,
-                agent_session_id: Some("merge-follow-up-session".to_owned()),
+                agent_session_id: Some(session_id),
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
@@ -423,10 +445,7 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl HarnessAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");

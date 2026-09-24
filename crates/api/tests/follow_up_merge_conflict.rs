@@ -19,9 +19,8 @@ use axum::{
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, HarnessAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -92,7 +91,8 @@ async fn merge_conflict_dispatches_follow_up_executor() {
         .expect("merge transition runs");
     assert_eq!(transition.task.status, "merge_failed".to_owned());
 
-    let executions = poll_until_role_follow_up(&harness.app, &task_id, "coder").await;
+    let executions =
+        poll_until_role_follow_up(&harness.app, &task_id, "coder", &mut events_rx).await;
     let follow_up_execution = executions
         .iter()
         .find(|execution| {
@@ -112,7 +112,9 @@ async fn merge_conflict_dispatches_follow_up_executor() {
         follow_up_snapshot["dispatch"]["execution_policy"],
         "explicit_harness_session"
     );
-    assert!(follow_up_snapshot["config"].get("resume_thread_id").is_none());
+    assert!(follow_up_snapshot["config"]
+        .get("resume_thread_id")
+        .is_none());
     assert!(
         follow_up_snapshot["config"]
             .get("resume_fallback_prompt")
@@ -222,6 +224,12 @@ impl HarnessAdapter for CompletingCodexAdapter {
         ExecutorKind::Codex
     }
 
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
+    }
+
     fn check_availability(&self) -> AvailabilityInfo {
         AvailabilityInfo {
             status: AvailabilityStatus::Authenticated,
@@ -253,10 +261,16 @@ impl HarnessAdapter for CompletingCodexAdapter {
             if ctx.description.contains("merge failed due to conflicts") {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
+            let session_id = match &ctx.invocation {
+                api_types::HarnessInvocation::Resume {
+                    external_session_id,
+                } => external_session_id.clone(),
+                api_types::HarnessInvocation::Start => EXECUTOR_SESSION_ID.to_owned(),
+            };
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
                 after_sha: None,
-                agent_session_id: Some("merge-follow-up-session".to_owned()),
+                agent_session_id: Some(session_id),
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
@@ -285,10 +299,7 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl HarnessAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
@@ -411,15 +422,45 @@ async fn seed_review_task_with_executor(
     )
     .await
     .expect("workspace creates");
+    let mut harness_capabilities = api_types::HarnessCapabilities::unknown();
+    harness_capabilities.resume = api_types::CapabilitySupport::Native;
+    let capability_snapshot = harness_capabilities.snapshot();
+    let harness_session_id = db::new_uuid_v4();
+    db::HarnessSessionRepo::create(
+        &*harness.state.db,
+        db::CreateHarnessSession {
+            id: harness_session_id.clone(),
+            agent_id: agent_id.to_owned(),
+            harness_kind: "codex".to_owned(),
+            external_session_id: Some(EXECUTOR_SESSION_ID.to_owned()),
+            profile_id: None,
+            profile_snapshot_json: json!({
+                "executor_type": "codex",
+                "config": {},
+                "credential_ref": null
+            })
+            .to_string(),
+            capabilities_snapshot_json: serde_json::to_string(&capability_snapshot)
+                .expect("capability snapshot serializes"),
+            workspace_id: Some(workspace_id.clone()),
+            status: db::HarnessSessionStatus::Active,
+            predecessor_session_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity_at: Some(now.clone()),
+        },
+    )
+    .await
+    .expect("HarnessSession creates");
     db::ExecutionRepo::create(
         &*harness.state.db,
         db::CreateExecution {
             id: db::new_uuid_v4(),
             task_id: task_id.to_owned(),
             agent_id: Some(agent_id.to_owned()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
+            actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            harness_session_id: Some(harness_session_id),
             role: "coder".to_owned(),
             status: db::ExecutionStatus::Completed,
             stop_reason: None,
@@ -427,7 +468,7 @@ async fn seed_review_task_with_executor(
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some(EXECUTOR_SESSION_ID.to_owned()),
+            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("initial executor completed".to_owned()),
@@ -440,6 +481,7 @@ async fn seed_review_task_with_executor(
                     "executor_type": "codex",
                     "config": {},
                     "capabilities": [],
+                    "harness_capabilities": capability_snapshot,
                     "overrides_applied": { "profile": [], "agent": [], "execution": [] },
                     "snapshotted_at": now
                 })
@@ -561,10 +603,12 @@ async fn poll_until_role_follow_up(
     app: &Router,
     task_id: &str,
     role: &str,
+    events_rx: &mut tokio::sync::broadcast::Receiver<ForgeEvent>,
 ) -> Vec<ExecutionResponse> {
+    let mut latest = Vec::new();
     for _ in 0..100 {
-        let executions = executions_for_task(app, task_id).await;
-        if executions.iter().any(|execution| {
+        latest = executions_for_task(app, task_id).await;
+        if latest.iter().any(|execution| {
             execution.role == role
                 && execution
                     .executor_config_snapshot
@@ -572,11 +616,12 @@ async fn poll_until_role_follow_up(
                     .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
                     == Some("explicit_harness_session")
         }) {
-            return executions;
+            return latest;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("task did not resume {role} follow-up within timeout");
+    let events = drain_events(events_rx).await;
+    panic!("task did not resume {role} follow-up within timeout; executions={latest:#?}; events={events:#?}");
 }
 
 async fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<ForgeEvent>) -> Vec<ForgeEvent> {

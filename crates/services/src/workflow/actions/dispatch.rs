@@ -193,6 +193,9 @@ impl HookAction for DispatchRoleAgent {
                     let mut service =
                         TaskService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus))
                             .with_task_executor(task_executor);
+                    if let Some(adapter_registry) = ctx.adapter_registry.as_ref().cloned() {
+                        service = service.with_adapter_registry(adapter_registry);
+                    }
                     if let Some(review_runner) = ctx.review_runner.as_ref().cloned() {
                         service = service.with_review_runner(review_runner);
                     }

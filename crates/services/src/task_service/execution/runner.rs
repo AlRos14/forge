@@ -414,12 +414,9 @@ impl TaskService {
         } else {
             None
         };
-        let invocation = super::harness_invocation_for_execution(
-            &self.db,
-            &execution,
-            Some(&workspace.id),
-        )
-        .await?;
+        let invocation =
+            super::harness_invocation_for_execution(&self.db, &execution, Some(&workspace.id))
+                .await?;
         let usage_probe = self.task_executor.clone().and_then(|executor| {
             super::spawn_account_usage_probe(
                 Arc::clone(&self.db),
@@ -852,12 +849,9 @@ impl TaskService {
             .to_owned();
         let description = execution_description(execution, &task);
         let max_turns = self.resolve_max_turns(&task).await?;
-        let invocation = super::harness_invocation_for_execution(
-            &self.db,
-            execution,
-            Some(&workspace.id),
-        )
-        .await?;
+        let invocation =
+            super::harness_invocation_for_execution(&self.db, execution, Some(&workspace.id))
+                .await?;
 
         Ok(api_types::ExecutionStartParams {
             task_id: task.id.clone(),

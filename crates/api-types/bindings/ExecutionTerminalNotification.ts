@@ -9,7 +9,7 @@ export type ExecutionTerminalNotification = { execution_id: string, exit_code: n
  * Structured failure disposition. Absent on older daemons — the server
  * then falls back to generic executor-failed handling.
  */
-failure_class: RemoteExecutionFailureClass | null, 
+failure_class: RemoteExecutionFailureClass | null,
 /**
  * RFC3339 time when an unavailable executor route is worth retrying.
  */

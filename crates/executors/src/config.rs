@@ -40,9 +40,9 @@ pub fn with_runtime_environment(
         ExecutorError::Other("normalized harness env must be an object".to_owned())
     })?;
     for (key, value) in runtime_env {
-        let value = value.as_str().ok_or_else(|| {
-            ExecutorError::Other("runtime_env values must be strings".to_owned())
-        })?;
+        let value = value
+            .as_str()
+            .ok_or_else(|| ExecutorError::Other("runtime_env values must be strings".to_owned()))?;
         env.insert(key.clone(), Value::String(value.to_owned()));
     }
     Ok(resolved)
@@ -481,10 +481,13 @@ pub fn account_key(kind: &ExecutorKind, config: &Value) -> String {
 }
 
 /// Reject route candidates that would make one Agent Execution impersonate a
-/// different harness or configured native account. Non-identity run settings
-/// such as model, effort, sandbox, and approval remain routable when the
-/// harness and account key stay the same. Agent-level profile and credential
-/// references are immutable for the whole route and are not route inputs.
+/// different harness or configured native account. Generic command override
+/// channels are opaque: adapters may use them to select accounts, config
+/// directories, wrappers, or native modes, so same-Agent candidates must keep
+/// them identical. Explicit run settings such as model, effort, sandbox, and
+/// approval remain routable when the harness and account key stay the same.
+/// Agent-level profile and credential references are immutable for the whole
+/// route and are not route inputs.
 pub fn validate_same_agent_candidate(
     primary_kind: &ExecutorKind,
     primary_config: &Value,
@@ -502,6 +505,15 @@ pub fn validate_same_agent_candidate(
         return Err(ExecutorError::Other(format!(
             "fallback candidate changes Agent native account identity from {primary_account} to {candidate_account}; select or reassign a separate Agent"
         )));
+    }
+    for field in ["base_command_override", "additional_params", "env"] {
+        let primary_value = primary_config.get(field).filter(|value| !value.is_null());
+        let candidate_value = candidate_config.get(field).filter(|value| !value.is_null());
+        if primary_value != candidate_value {
+            return Err(ExecutorError::Other(format!(
+                "fallback candidate changes opaque command configuration field {field}; same-Agent fallback cannot prove that this preserves native harness identity"
+            )));
+        }
     }
     Ok(())
 }
@@ -868,7 +880,67 @@ mod tests {
     }
 
     #[test]
-    fn same_agent_routing_allows_non_identity_profile_variation() {
+    fn claude_fallback_cannot_change_config_dir_identity() {
+        let result = build_ordered_fallback_routing(
+            ExecutorKind::ClaudeCode,
+            serde_json::json!({"env":{"CLAUDE_CONFIG_DIR":"/accounts/a"}}),
+            &[serde_json::json!({
+                "executor_type":"claude_code",
+                "config":{"env":{"CLAUDE_CONFIG_DIR":"/accounts/b"}}
+            })],
+        );
+
+        let error = result.expect_err("a different Claude config directory changes identity");
+        assert!(error.to_string().contains("env"));
+    }
+
+    #[test]
+    fn same_agent_fallback_cannot_change_command_environment() {
+        let primary = serde_json::json!({"env":{"ANTHROPIC_API_KEY":"account-a"}});
+        let candidate = serde_json::json!({"env":{"ANTHROPIC_API_KEY":"account-b"}});
+
+        let error = validate_same_agent_candidate(
+            &ExecutorKind::ClaudeCode,
+            &primary,
+            &ExecutorKind::ClaudeCode,
+            &candidate,
+        )
+        .expect_err("environment overrides can select another native account");
+        assert!(error.to_string().contains("env"));
+    }
+
+    #[test]
+    fn same_agent_fallback_cannot_change_opaque_command_arguments() {
+        let primary = serde_json::json!({"additional_params":["--account", "account-a"]});
+        let candidate = serde_json::json!({"additional_params":["--account", "account-b"]});
+
+        let error = validate_same_agent_candidate(
+            &ExecutorKind::Opencode,
+            &primary,
+            &ExecutorKind::Opencode,
+            &candidate,
+        )
+        .expect_err("opaque CLI arguments may select another native identity");
+        assert!(error.to_string().contains("additional_params"));
+    }
+
+    #[test]
+    fn same_agent_fallback_cannot_change_wrapper_command() {
+        let primary = serde_json::json!({"base_command_override":"/accounts/a/claude"});
+        let candidate = serde_json::json!({"base_command_override":"/accounts/b/claude"});
+
+        let error = validate_same_agent_candidate(
+            &ExecutorKind::ClaudeCode,
+            &primary,
+            &ExecutorKind::ClaudeCode,
+            &candidate,
+        )
+        .expect_err("a wrapper override is opaque identity-bearing configuration");
+        assert!(error.to_string().contains("base_command_override"));
+    }
+
+    #[test]
+    fn same_agent_fallback_allows_model_effort_sandbox_variation() {
         let primary = serde_json::json!({
             "profile": "agent-profile",
             "model": "model-a",
