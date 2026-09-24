@@ -326,6 +326,91 @@ async fn remote_resume_requires_protocol_feature_and_dispatches_exact_session() 
 }
 
 #[tokio::test]
+async fn remote_dispatch_does_not_cross_daemon_connection_generation() {
+    let registry = make_registry();
+    let (connection_a, mut outbound_a) = DaemonConnection::new("daemon-1".to_owned());
+    let connection_a_id = connection_a.id();
+    registry.register("daemon-1".to_owned(), connection_a);
+    let provider = super::RemoteExecutionProvider::new(registry.clone(), "daemon-1".to_owned());
+    let start = tokio::spawn(async move {
+        provider
+            .start(api_types::ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: "execution-generation-change".to_owned(),
+                role: "worker".to_owned(),
+                workspace_path: "/work".to_owned(),
+                executor_type: "codex".to_owned(),
+                executor_config: json!({"executor_type":"codex","config":{}}),
+                prompt: json!({"description":"resume"}),
+                invocation: api_types::HarnessInvocation::Resume {
+                    external_session_id: "session-exact-7".to_owned(),
+                },
+                max_turns: None,
+            })
+            .await
+    });
+
+    let api_types::DaemonFrame::Request {
+        id: capabilities_request_id,
+        method,
+        ..
+    } = outbound_a
+        .recv()
+        .await
+        .expect("connection A receives protocol negotiation")
+    else {
+        panic!("expected protocol request on connection A");
+    };
+    assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+    registry.dispatch_incoming(
+        "daemon-1",
+        api_types::DaemonFrame::Response {
+            id: capabilities_request_id,
+            result: json!({
+                "schema_version": 1,
+                "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+            }),
+        },
+    );
+
+    let (connection_b, mut outbound_b) = DaemonConnection::new("daemon-1".to_owned());
+    assert_ne!(connection_a_id, connection_b.id());
+    registry.register("daemon-1".to_owned(), connection_b);
+
+    let replacement_request =
+        tokio::time::timeout(Duration::from_millis(40), outbound_b.recv()).await;
+    let replacement_was_quiet = replacement_request.is_err();
+    match replacement_request {
+        Err(_) => {}
+        Ok(Some(api_types::DaemonFrame::Request { id, method, .. })) => {
+            assert_eq!(method, api_types::METHOD_EXECUTION_START);
+            registry.dispatch_incoming(
+                "daemon-1",
+                api_types::DaemonFrame::Response {
+                    id,
+                    result: json!({
+                        "execution_id":"execution-generation-change",
+                        "accepted":true
+                    }),
+                },
+            );
+        }
+        Ok(Some(frame)) => panic!("unexpected frame sent through replacement B: {frame:?}"),
+        Ok(None) => panic!("replacement connection closed unexpectedly"),
+    }
+
+    let result = start.await.expect("remote start task joins");
+    assert!(matches!(
+        result,
+        Err(ServiceError::DaemonUnavailable { daemon_id }) if daemon_id == "daemon-1"
+    ));
+    assert!(
+        replacement_was_quiet,
+        "execution.start must not be sent through replacement connection B"
+    );
+}
+
+#[tokio::test]
 async fn new_server_start_rejects_pre_pr3_daemon_before_dispatch() {
     let registry = make_registry();
     let (connection, mut outbound) = DaemonConnection::new("daemon-legacy".to_owned());

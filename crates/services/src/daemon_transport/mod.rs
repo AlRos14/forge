@@ -286,6 +286,52 @@ impl DaemonConnectionRegistry {
             .ok_or_else(|| ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             })?;
+        self.send_request_on_connection_with_timeout(
+            &connection,
+            method,
+            params,
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_request_on_connection<P, R>(
+        &self,
+        connection: &DaemonConnection,
+        method: &str,
+        params: P,
+        timeout_secs: u64,
+    ) -> Result<R, ServiceError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        self.send_request_on_connection_with_timeout(
+            connection,
+            method,
+            params,
+            Duration::from_secs(timeout_secs),
+        )
+        .await
+    }
+
+    pub(crate) async fn send_request_on_connection_with_timeout<P, R>(
+        &self,
+        connection: &DaemonConnection,
+        method: &str,
+        params: P,
+        timeout_duration: Duration,
+    ) -> Result<R, ServiceError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let daemon_id = connection.daemon_id.as_str();
+        if !self.is_current(daemon_id, connection.id()) {
+            return Err(ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
         let request_id = Uuid::new_v4().to_string();
         let params = serde_json::to_value(params).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid daemon request params: {error}"))
@@ -298,6 +344,16 @@ impl DaemonConnectionRegistry {
             method: method.to_owned(),
             params,
         };
+
+        // The request is always written to this captured connection. Recheck
+        // after installing the pending response so a replacement cannot make
+        // us silently dispatch through the new generation.
+        if !self.is_current(daemon_id, connection.id()) {
+            lock(&connection.pending).remove(&request_id);
+            return Err(ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
 
         if connection.outbound.send(frame).await.is_err() {
             lock(&connection.pending).remove(&request_id);

@@ -200,10 +200,13 @@ from the primary candidate.
 The post-implementation searches found no production `CodingExecutorAdapter`
 authority, no provider-specific resume mutation outside adapters, and no
 direct concrete Codex/Cursor usage probe outside the adapter registry. The
-standalone effective-policy workspace helper has test callers only; actual
-execution workspace authority remains the service's lease/authority checks,
-not that helper. `is_high_risk` is a core-derived policy classification and
-does not itself grant or revoke a lease.
+remote dispatch follow-up pins protocol negotiation and `execution.start` to
+the same captured connection generation; a replacement after negotiation
+returns unavailable and cannot redirect the operation to another daemon
+instance. The standalone effective-policy workspace helper has test callers
+only; service lease/authority checks remain the actual execution workspace
+authority, not that helper. `is_high_risk` is a core-derived policy
+classification and does not itself grant or revoke a lease.
 
 A final provenance audit found that provider credentials were being injected
 into the normalized candidate config before fallback, which could affect the

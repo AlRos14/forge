@@ -70,11 +70,18 @@ impl ExecutionProvider for RemoteExecutionProvider {
         &self,
         params: api_types::ExecutionStartParams,
     ) -> Result<api_types::ExecutionStartResult> {
+        let connection = self
+            .registry
+            .get(&self.daemon_id)
+            .ok_or_else(|| ServiceError::DaemonUnavailable {
+                daemon_id: self.daemon_id.clone(),
+            })?;
         // Every PR3 dispatch requires the generic invocation contract. An
         // older daemon can ignore the additive field and inspect legacy
         // provider resume keys left in a historical snapshot, turning Start
-        // into an unintended Resume. Reject before dispatch unless the daemon
-        // proves it understands adapter-owned Start/Resume semantics.
+        // into an unintended Resume. Pin negotiation and execution to the
+        // same connection generation: daemon_id alone can identify a newly
+        // reconnected, older daemon after capability negotiation completes.
         let mut required_features = vec![
             api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
         ];
@@ -84,17 +91,18 @@ impl ExecutionProvider for RemoteExecutionProvider {
         {
             let capabilities: api_types::DaemonProtocolCapabilities = self
                 .registry
-                .send_request(
-                    &self.daemon_id,
+                .send_request_on_connection(
+                    &connection,
                     api_types::METHOD_PROTOCOL_CAPABILITIES,
                     api_types::DaemonProtocolCapabilitiesRequest {},
                     api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
                 )
                 .await
-                .map_err(|error| {
-                    ServiceError::invalid_operation(format!(
+                .map_err(|error| match error {
+                    unavailable @ ServiceError::DaemonUnavailable { .. } => unavailable,
+                    error => ServiceError::invalid_operation(format!(
                         "cannot verify remote daemon execution protocol support: {error}"
-                    ))
+                    )),
                 })?;
             let unsupported = required_features
                 .into_iter()
@@ -110,8 +118,8 @@ impl ExecutionProvider for RemoteExecutionProvider {
             }
         }
         self.registry
-            .send_request(
-                &self.daemon_id,
+            .send_request_on_connection(
+                &connection,
                 api_types::METHOD_EXECUTION_START,
                 params,
                 api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,

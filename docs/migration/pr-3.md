@@ -229,6 +229,14 @@ winner kind/config; if that cannot be done, the stale primary policy is
 removed. Candidate-key/config mismatch or an unlisted/identity-changing
 winner is rejected. Cancel's request shape is unchanged.
 
+Each remote Start captures the current `DaemonConnection` generation before
+protocol negotiation. Both `daemon.protocol_capabilities` and
+`execution.start` are sent through that captured connection. If reconnect
+replaces it after negotiation, Start fails as unavailable; it never resolves
+the same logical `daemon_id` again and silently dispatches through the new
+generation. A later Execution performs its own negotiation against the new
+connection.
+
 Local and daemon execution converge on
 `HarnessAdapter.start` / `HarnessAdapter.resume`; transport does not mutate
 provider-specific config. The Shell reviewer compatibility role is carried as
@@ -289,7 +297,7 @@ and its registry are removed as production authority.
 | Embedded execution/policy path | Existing Agent Host and embedded operator policy readers remain isolated from external HarnessAdapters. | Embedded capabilities are not represented as external harness evidence. | PR10 |
 | Historical effective-policy interpretation | Existing snapshots without adapter-interpreted policy may use the old snapshot reader; the Embedded path is separately bounded. | It cannot overwrite current candidate policy; a remote winner's policy is recomputed from that winner or removed. | PR13 / PR10 |
 | Shell reviewer command | The exact generic `role == reviewer` marker selects the existing fixed command inside ShellAdapter. | It is a Shell compatibility command, not native review-mode capability or verdict authority. | PR8 |
-| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`; daemon Start params require `invocation`. | New servers reject old daemons before dispatch; PR3 daemons reject old-server payloads missing `invocation` before dispatch. There is no provider-specific dual-write or inference fallback. | Retained transport contract; naming cleanup is PR12 |
+| Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`; daemon Start params require `invocation`; capability check and Start share one captured connection generation. | Mixed protocol versions reject before dispatch; replacement during negotiation returns unavailable instead of reselecting by `daemon_id`. There is no provider-specific dual-write or inference fallback. | Retained transport contract; naming cleanup is PR12 |
 
 ## Public surface and schema
 
@@ -332,7 +340,8 @@ Focused test additions cover:
   changes but reject harness, account, credential, missing, or malformed
   historical identity evidence.
 * Daemon invocation serialization, rejection of legacy payloads missing
-  invocation, remote Resume dispatch,
+  invocation, remote Resume dispatch, and same-generation protocol negotiation
+  plus Start dispatch,
   role protocol negotiation, safe Start delivery to an old decoder, and remote
   winner capability results.
 * Review adapter winner capability snapshot and retained legacy Agent tags.
@@ -373,6 +382,7 @@ Named focused test additions include:
 * `generic_start_and_resume_survive_daemon_transport_serialization`
 * `pre_pr3_execution_start_without_invocation_is_rejected`
 * `pre_pr3_resume_request_is_rejected_before_adapter_dispatch`
+* `remote_dispatch_does_not_cross_daemon_connection_generation`
 * `new_server_start_rejects_pre_pr3_daemon_before_dispatch`
 * `remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role`
 * `remote_resolved_candidate_carries_effective_harness_capabilities`
