@@ -8,13 +8,15 @@ use std::{
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::Result;
 use api_types::{
-    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
-    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
-    FsListParams, RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt,
-    RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
-    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
-    METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
-    METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
+    DaemonErrorPayload, DaemonFrame, DaemonProtocolCapabilities, DaemonProtocolCapabilitiesRequest,
+    ExecutionCancelParams, ExecutionCancelResult, ExecutionStartParams, ExecutionStartResult,
+    ExecutionTerminalNotification, FsBranchesParams, FsListParams, RemoteExecutionFailureClass,
+    RemoteResolvedCandidate, RemoteRouteAttempt, RemoteTokenUsage,
+    DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, INVALID_FRAME, METHOD_EXECUTION_CANCEL,
+    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES,
+    METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
+    METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
@@ -167,7 +169,20 @@ impl DaemonRuntime {
         workspace_root: PathBuf,
         active_executions: ActiveExecutionTracker,
     ) -> Arc<Self> {
-        let registry = Arc::new(cli_adapters::default_registry());
+        Self::new_with_registry_and_tracker(
+            outbound,
+            workspace_root,
+            Arc::new(cli_adapters::default_registry()),
+            active_executions,
+        )
+    }
+
+    pub fn new_with_registry_and_tracker(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+        registry: Arc<executors::HarnessAdapterRegistry>,
+        active_executions: ActiveExecutionTracker,
+    ) -> Arc<Self> {
         Arc::new(Self {
             workspace_root,
             outbound,
@@ -191,6 +206,21 @@ impl DaemonRuntime {
         };
 
         match method.as_str() {
+            METHOD_PROTOCOL_CAPABILITIES => {
+                match decode_params::<DaemonProtocolCapabilitiesRequest>(&id, params) {
+                    Ok(_) => response_frame(
+                        id,
+                        DaemonProtocolCapabilities {
+                            schema_version: 1,
+                            features: vec![
+                                DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
+                                DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                            ],
+                        },
+                    ),
+                    Err(frame) => frame,
+                }
+            }
             METHOD_FS_LIST => match decode_params::<FsListParams>(&id, params) {
                 Ok(params) => match daemon_fs::list_entries(params, &self.workspace_root).await {
                     Ok(result) => response_frame(id, result),
@@ -255,8 +285,10 @@ impl DaemonRuntime {
         let logs_path = local_execution_log_path(&self.workspace_root, &params.execution_id);
         let description = prompt_description(&params.prompt);
         let ctx = ExecutionContext {
+            invocation: params.invocation.clone(),
             task_id: params.task_id.clone(),
             execution_id: params.execution_id.clone(),
+            role: params.role.clone(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,
             agent_config: params.executor_config,
@@ -302,8 +334,12 @@ async fn run_execution_task(
     active_executions: ActiveExecutionTracker,
 ) {
     let _active_guard = active_executions.track(ctx.execution_id.clone());
-    let cursor_usage_probe =
-        spawn_cursor_usage_probe(&ctx.agent_config, &ctx.execution_id, outbound.clone());
+    let usage_probe = spawn_account_usage_probe(
+        &ctx.agent_config,
+        &ctx.execution_id,
+        outbound.clone(),
+        Arc::clone(&executor),
+    );
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     ctx.log_sender = Some(log_tx);
     let log_outbound = outbound.clone();
@@ -359,7 +395,7 @@ async fn run_execution_task(
         }
         Err(error) => Err(error),
     };
-    if let Some(probe) = cursor_usage_probe {
+    if let Some(probe) = usage_probe {
         probe.stop().await;
     }
     // The executor owns the only log sender in ctx, so completion should close the
@@ -409,18 +445,24 @@ impl CursorUsageProbe {
     }
 }
 
-fn spawn_cursor_usage_probe(
+fn spawn_account_usage_probe(
     agent_config: &Value,
     execution_id: &str,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
+    executor: Arc<FallbackExecutor>,
 ) -> Option<CursorUsageProbe> {
-    if agent_config.get("executor_type").and_then(Value::as_str) != Some("cursor") {
+    let kind = agent_config
+        .get("executor_type")
+        .and_then(Value::as_str)?
+        .parse::<executors::ExecutorKind>()
+        .ok()?;
+    // PR0A's periodic account quota observation is Cursor-specific. Other
+    // HarnessAdapters may expose an explicit probe without changing this
+    // scheduling/accounting policy.
+    if kind != executors::ExecutorKind::Cursor {
         return None;
     }
-    let config = serde_json::from_value::<executors::CursorConfig>(
-        agent_config.get("config").cloned().unwrap_or(Value::Null),
-    )
-    .ok()?;
+    let config = agent_config.get("config").cloned().unwrap_or(Value::Null);
     let execution_id = execution_id.to_owned();
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -429,13 +471,11 @@ fn spawn_cursor_usage_probe(
             if task_cancel.is_cancelled() {
                 break;
             }
-            match cli_adapters::cursor::query_account_usage_with_cancel(
-                &config,
-                task_cancel.clone(),
-            )
-            .await
+            match executor
+                .observe_usage(kind.clone(), &config, task_cancel.clone())
+                .await
             {
-                Ok(usage) => emit_execution_log(
+                Ok(Some(observation)) => emit_execution_log(
                     &outbound,
                     LogEntry {
                         schema_version: 1,
@@ -446,12 +486,13 @@ fn spawn_cursor_usage_probe(
                         stream: executors::LogStream::Heartbeat,
                         payload: serde_json::json!({
                             "method": "forge/cursor/usage",
-                            "params": usage,
-                            "source": "cursor_poll"
+                            "params": observation.value,
+                            "source": observation.source.unwrap_or_else(|| "harness_account_usage".to_owned())
                         }),
                         truncated: false,
                     },
                 ),
+                Ok(None) => break,
                 Err(error) if !task_cancel.is_cancelled() => {
                     tracing::debug!(
                         execution_id = %execution_id,
@@ -515,6 +556,8 @@ fn terminal_notification_from_result(
                 candidate_key: candidate.candidate_key,
                 executor_type: candidate.executor_type.to_string(),
                 config: candidate.config,
+                harness_capabilities: Some(candidate.harness_capabilities.snapshot()),
+                effective_policy: Some(candidate.effective_policy),
             }),
         route_attempts: if result.route_attempts.is_empty() {
             None
@@ -691,13 +734,66 @@ fn rfc3339_now() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use api_types::{
-        ExecutionLogNotification, FsListResult, METHOD_EXECUTION_LOG, METHOD_EXECUTION_TERMINAL,
-        METHOD_FS_LIST,
+        ExecutionLogNotification, FsListResult,
+        DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, METHOD_EXECUTION_LOG,
+        METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES,
+    };
+    use async_trait::async_trait;
+    use executors::{
+        AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+        ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter,
+        HarnessAdapterRegistry,
     };
     use tokio::sync::mpsc;
+
+    struct ResumeRecordingAdapter {
+        invocations: Arc<Mutex<Vec<executors::HarnessInvocation>>>,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for ResumeRecordingAdapter {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Codex
+        }
+
+        fn check_availability(&self) -> AvailabilityInfo {
+            AvailabilityInfo {
+                status: AvailabilityStatus::Authenticated,
+                authenticated_at: None,
+                config_path: None,
+            }
+        }
+
+        fn capabilities(&self, _config: &serde_json::Value) -> api_types::HarnessCapabilities {
+            let mut capabilities = api_types::HarnessCapabilities::unsupported();
+            capabilities.resume = api_types::CapabilitySupport::Native;
+            capabilities.cancel = api_types::CapabilitySupport::Emulated;
+            capabilities
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: DiscoverContext,
+        ) -> Result<DiscoveredOptions, ExecutorError> {
+            Ok(DiscoveredOptions::default())
+        }
+
+        async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+            self.invocations.lock().unwrap().push(ctx.invocation);
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                ..Default::default()
+            })
+        }
+
+        async fn cancel(&self, _execution_id: &str) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn fs_list_returns_entries_under_workspace_root() {
@@ -727,6 +823,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_advertises_generic_harness_invocation_protocol() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let response = runtime
+            .handle_request(DaemonFrame::Request {
+                id: "protocol-1".to_owned(),
+                method: METHOD_PROTOCOL_CAPABILITIES.to_owned(),
+                params: serde_json::json!({}),
+            })
+            .await;
+        let DaemonFrame::Response { result, .. } = response else {
+            panic!("expected protocol capability response");
+        };
+        let capabilities: DaemonProtocolCapabilities =
+            serde_json::from_value(result).expect("protocol response parses");
+        assert!(capabilities.supports(DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1));
+        assert!(capabilities.supports(DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1));
+    }
+
+    #[tokio::test]
+    async fn pre_pr3_resume_request_is_rejected_before_adapter_dispatch() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(ResumeRecordingAdapter {
+            invocations: Arc::clone(&invocations),
+        }));
+        let runtime = DaemonRuntime::new_with_registry_and_tracker(
+            tx,
+            dir.path().to_path_buf(),
+            Arc::new(registry),
+            ActiveExecutionTracker::default(),
+        );
+
+        let response = runtime
+            .handle_request(DaemonFrame::Request {
+                id: "legacy-resume".to_owned(),
+                method: METHOD_EXECUTION_START.to_owned(),
+                params: serde_json::json!({
+                    "task_id": "task-legacy",
+                    "execution_id": "exec-legacy",
+                    "workspace_path": dir.path().to_string_lossy(),
+                    "executor_type": "codex",
+                    "executor_config": { "resume_thread_id": "session-123" },
+                    "prompt": { "description": "continue" },
+                    "max_turns": null
+                }),
+            })
+            .await;
+
+        let DaemonFrame::Error { error, .. } = response else {
+            panic!("legacy request without invocation must be rejected");
+        };
+        assert_eq!(error.code, api_types::INVALID_FRAME);
+        assert!(error.message.contains("invocation"));
+        assert!(invocations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn shell_execution_reports_completion_notification() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -737,6 +894,7 @@ mod tests {
             .start(ExecutionStartParams {
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
+                role: "coder".to_owned(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({
@@ -744,6 +902,7 @@ mod tests {
                     "config": {}
                 }),
                 prompt: serde_json::json!({ "description": "printf ok > marker.txt" }),
+                invocation: executors::HarnessInvocation::Start,
                 max_turns: None,
             })
             .await
@@ -758,6 +917,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remote_resume_intent_reaches_harness_adapter_and_reports_capabilities() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(ResumeRecordingAdapter {
+            invocations: Arc::clone(&invocations),
+        }));
+        let runtime = DaemonRuntime::new_with_registry_and_tracker(
+            tx,
+            dir.path().to_path_buf(),
+            Arc::new(registry),
+            ActiveExecutionTracker::default(),
+        );
+        let invocation = api_types::HarnessInvocation::Resume {
+            external_session_id: "remote-session-abc".to_owned(),
+        };
+
+        runtime
+            .start(ExecutionStartParams {
+                task_id: "task-remote-resume".to_owned(),
+                execution_id: "exec-remote-resume".to_owned(),
+                role: "coder".to_owned(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "codex".to_owned(),
+                executor_config: serde_json::json!({
+                    "executor_type":"codex",
+                    "config":{"model":"test"}
+                }),
+                prompt: serde_json::json!({"description":"resume this exact session"}),
+                invocation: invocation.clone(),
+                max_turns: None,
+            })
+            .await
+            .expect("remote execution is accepted");
+
+        let terminal = next_terminal_notification(&mut rx, "exec-remote-resume").await;
+        assert_eq!(*invocations.lock().unwrap(), vec![invocation]);
+        let winner = terminal
+            .resolved_candidate
+            .expect("remote result includes the selected adapter");
+        let capabilities = winner
+            .harness_capabilities
+            .expect("remote winner carries versioned capability evidence");
+        let api_types::HarnessCapabilitiesSnapshotRead::VersionedV1(capabilities) =
+            api_types::HarnessCapabilitiesSnapshot::from_value(
+                &serde_json::to_value(capabilities).unwrap(),
+            )
+        else {
+            panic!("winner capability evidence is readable");
+        };
+        assert_eq!(capabilities.resume, api_types::CapabilitySupport::Native);
+        assert_eq!(capabilities.cancel, api_types::CapabilitySupport::Emulated);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_execution_can_be_cancelled() {
@@ -770,6 +985,7 @@ mod tests {
             .start(ExecutionStartParams {
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
+                role: "coder".to_owned(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({
@@ -777,6 +993,7 @@ mod tests {
                     "config": {}
                 }),
                 prompt: serde_json::json!({ "description": "printf 'started\\n'; sleep 30" }),
+                invocation: executors::HarnessInvocation::Start,
                 max_turns: None,
             })
             .await

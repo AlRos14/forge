@@ -4,11 +4,11 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatRepo, AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo,
     AgentStatus, AssigneeKind, CreateAgent, CreateAgentIdentity, CreateAgentProfile,
-    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask, ExecutionPurpose,
-    CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, SortBy,
-    SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
-    UserRepo,
+    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask,
+    CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionPurpose, ExecutionRepo,
+    ExecutionStatus, PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo,
+    RepoRepo, SortBy, SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject,
+    UpdateTask, UpsertDaemon, UserRepo,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -279,10 +279,7 @@ async fn seed_execution(state: &AppState, task_id: String) -> String {
     execution_id
 }
 
-async fn seed_task_with_legacy_resume_hint(
-    state: &AppState,
-    ambiguous_history: bool,
-) -> Task {
+async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: bool) -> Task {
     let task = seed_task(state).await;
     let agent = seed_agent(state, "Legacy resume agent").await;
     let now = now_rfc3339();
@@ -651,12 +648,7 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
         .await
         .expect("execution creates");
 
-        let page = call_tool(
-            &state,
-            "forge_list_executions",
-            json!({"task_id": task.id}),
-        )
-        .await;
+        let page = call_tool(&state, "forge_list_executions", json!({"task_id": task.id})).await;
         let execution = &page["data"][0];
         assert_eq!(
             execution["actor_ref"],
@@ -689,7 +681,10 @@ fn mcp_task_projection_hides_resume_for_ambiguous_legacy_session() {
             .expect("task lookup succeeds")
             .expect("task remains persisted");
         let persisted_annotation: Value = serde_json::from_str(
-            persisted.error_annotation.as_deref().expect("annotation persists"),
+            persisted
+                .error_annotation
+                .as_deref()
+                .expect("annotation persists"),
         )
         .expect("persisted annotation is valid JSON");
         assert!(persisted_annotation["recovery_actions"]

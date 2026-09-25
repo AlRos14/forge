@@ -1092,6 +1092,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1211,6 +1212,7 @@ dependencies = [
  "anyhow",
  "api",
  "api-types",
+ "async-trait",
  "axum",
  "clap",
  "cli-adapters",
@@ -2556,6 +2558,7 @@ dependencies = [
 name = "review"
 version = "0.8.0"
 dependencies = [
+ "api-types",
  "async-trait",
  "db",
  "events",

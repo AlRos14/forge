@@ -4,7 +4,7 @@ use crate::daemon_service::{
 use crate::{Result, ServiceError};
 use db::SqliteDb;
 use events::EventBus;
-use executors::{AdapterRegistry, AvailabilityStatus, ExecutorKind};
+use executors::{AvailabilityStatus, ExecutorKind, HarnessAdapterRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ const CREDENTIALS_FILE: &str = "daemon_credentials.json";
 #[derive(Clone)]
 pub struct EmbeddedDaemon {
     service: DaemonService,
-    adapter_registry: Arc<AdapterRegistry>,
+    adapter_registry: Arc<HarnessAdapterRegistry>,
     forge_home: PathBuf,
     workspace_root: PathBuf,
     report_interval: Duration,
@@ -44,7 +44,7 @@ impl EmbeddedDaemon {
     pub async fn new(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
-        adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry: Arc<HarnessAdapterRegistry>,
         forge_home: PathBuf,
         workspace_root: PathBuf,
     ) -> Result<Self> {
@@ -61,7 +61,7 @@ impl EmbeddedDaemon {
     pub fn with_report_interval(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
-        adapter_registry: Arc<AdapterRegistry>,
+        adapter_registry: Arc<HarnessAdapterRegistry>,
         forge_home: PathBuf,
         workspace_root: PathBuf,
         report_interval: Duration,
@@ -191,7 +191,7 @@ impl EmbeddedDaemon {
                 continue;
             };
             let availability = adapter.check_availability();
-            let (path, version) = cli_path_and_version(&kind).await;
+            let (path, version) = cli_path_and_version(&kind, adapter).await;
             detected.push(DetectedCliInput {
                 kind: kind.to_string(),
                 availability: availability_status(&availability.status).to_owned(),
@@ -225,19 +225,19 @@ pub fn is_embedded_daemon_machine(machine_id: &str) -> bool {
     machine_id == embedded_machine_id()
 }
 
-async fn cli_path_and_version(kind: &ExecutorKind) -> (Option<String>, Option<String>) {
-    match kind {
-        // Forge-hosted native profiles do not have a CLI binary or daemon
-        // detection record. They are dispatched by the Task executor router.
-        ExecutorKind::Embedded => (None, None),
-        ExecutorKind::Shell => (Some("/bin/sh".to_owned()), None),
-        ExecutorKind::Codex => binary_path_and_version("codex").await,
-        ExecutorKind::ClaudeCode => binary_path_and_version("claude").await,
-        ExecutorKind::Cursor => binary_path_and_version("cursor-agent").await,
-        ExecutorKind::Opencode => binary_path_and_version("opencode").await,
-        ExecutorKind::Gemini => binary_path_and_version("gemini").await,
-        ExecutorKind::Smith => binary_path_and_version("smith").await,
-        ExecutorKind::Null => (None, None),
+async fn cli_path_and_version(
+    kind: &ExecutorKind,
+    adapter: &dyn executors::HarnessAdapter,
+) -> (Option<String>, Option<String>) {
+    if kind == &ExecutorKind::Shell {
+        // Shell is a compatibility executor and its advertised path remains
+        // host-platform specific; cognitive harness binary identity belongs
+        // to the registered adapter.
+        (Some("/bin/sh".to_owned()), None)
+    } else if let Some(binary) = adapter.executable_name() {
+        binary_path_and_version(&binary).await
+    } else {
+        (None, None)
     }
 }
 
@@ -321,7 +321,7 @@ mod tests {
         EmbeddedDaemon::new(
             test_db().await,
             Arc::new(EventBus::new(16)),
-            Arc::new(AdapterRegistry::new()),
+            Arc::new(HarnessAdapterRegistry::new()),
             forge_home.to_path_buf(),
             forge_home.join("workspaces"),
         )

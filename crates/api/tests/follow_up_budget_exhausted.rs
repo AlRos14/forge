@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -22,9 +22,9 @@ use axum::{
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -181,7 +181,10 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
 
     let workspaces_root = TestDir::new("forge-budget-three-workspaces");
-    let harness = test_app(workspaces_root.path(), ReviewFailCodexAdapter::new()).await;
+    let adapter = ReviewFailCodexAdapter::new();
+    let resume_session_ids = Arc::clone(&adapter.resume_session_ids);
+    let executor_calls = Arc::clone(&adapter.executor_calls);
+    let harness = test_app(workspaces_root.path(), adapter).await;
     let mut events_rx = harness.event_bus.subscribe();
 
     let project: ProjectResponse = json_request(
@@ -243,7 +246,25 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
     let start = std::time::Instant::now();
     let task = loop {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!("timed out waiting for blocked metadata to be set");
+            let executions = executions_for_task(&harness.app, &created_task.id).await;
+            let execution_state = executions
+                .iter()
+                .map(|execution| {
+                    format!(
+                        "{} role={} status={:?} error={:?} session={:?}",
+                        execution.id,
+                        execution.role,
+                        execution.status,
+                        execution.error,
+                        execution.agent_session_id
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "timed out waiting for blocked metadata; executor_calls={}; resume_session_ids={:?}; executions={execution_state:#?}",
+                executor_calls.load(Ordering::SeqCst),
+                resume_session_ids.lock().expect("resume ids lock")
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let t: TaskResponse = empty_request(
@@ -266,7 +287,8 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
         .count();
     assert_eq!(
         rejection_count, 2,
-        "budget = 3 blocks on the third failure; two prior rejections are recorded in the transition log"
+        "budget = 3 blocks on the third failure; two prior rejections are recorded in the transition log; executions={executions:#?}; blocked={:#?}",
+        task.blocked
     );
     let coder_follow_ups = executions
         .iter()
@@ -275,6 +297,11 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
     assert_eq!(
         coder_follow_ups, 2,
         "budget = 3: two review rejections each produce a coder follow-up with parent_execution_id set for session continuity"
+    );
+    assert_eq!(
+        *resume_session_ids.lock().expect("resume ids lock"),
+        [FIRST_EXECUTOR_SESSION_ID, FIRST_EXECUTOR_SESSION_ID],
+        "same-Agent follow-ups resume the exact external session returned by their parent execution"
     );
     let blocked = task
         .blocked
@@ -317,19 +344,29 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
 
 struct ReviewFailCodexAdapter {
     executor_calls: Arc<AtomicUsize>,
+    reviewer_calls: Arc<AtomicUsize>,
+    resume_session_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl ReviewFailCodexAdapter {
     fn new() -> Self {
         Self {
             executor_calls: Arc::new(AtomicUsize::new(0)),
+            reviewer_calls: Arc::new(AtomicUsize::new(0)),
+            resume_session_ids: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
 
-impl CodingExecutorAdapter for ReviewFailCodexAdapter {
+impl HarnessAdapter for ReviewFailCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
+    }
+
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -360,17 +397,33 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
         Self: 'async_trait,
     {
         let executor_calls = Arc::clone(&self.executor_calls);
+        let reviewer_calls = Arc::clone(&self.reviewer_calls);
+        let resume_session_ids = Arc::clone(&self.resume_session_ids);
         Box::pin(async move {
-            if ctx
-                .description
-                .starts_with("The reviewer flagged this implementation")
+            if let api_types::HarnessInvocation::Resume {
+                external_session_id,
+            } = &ctx.invocation
             {
+                resume_session_ids
+                    .lock()
+                    .expect("resume ids lock")
+                    .push(external_session_id.clone());
+            }
+            if ctx.role == "coder" && ctx.description.contains("Review feedback:") {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
+                let session_id = match &ctx.invocation {
+                    api_types::HarnessInvocation::Resume {
+                        external_session_id,
+                    } => external_session_id.clone(),
+                    api_types::HarnessInvocation::Start => {
+                        format!("follow-up-session-{call_index}")
+                    }
+                };
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some(format!("follow-up-session-{call_index}")),
+                    agent_session_id: Some(session_id),
                     summary: Some("coder addressed review feedback".to_owned()),
                     error: None,
                     usage: None,
@@ -378,12 +431,13 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 });
             }
 
-            if ctx.description.contains("FORGE_RESULT:") {
+            if ctx.role == "reviewer" {
                 write_auditor_failure(&ctx).await?;
+                let reviewer_call_index = reviewer_calls.fetch_add(1, Ordering::SeqCst);
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some("auditor-session".to_owned()),
+                    agent_session_id: Some(format!("auditor-session-{reviewer_call_index}")),
                     summary: Some("auditor failed the implementation".to_owned()),
                     error: None,
                     usage: None,
@@ -445,17 +499,14 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)

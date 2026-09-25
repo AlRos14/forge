@@ -1480,6 +1480,15 @@ mod tests {
         status: AgentStatus,
         last_heartbeat_at: Option<String>,
     ) -> Agent {
+        seed_agent_with_harness(db, status, last_heartbeat_at, "shell").await
+    }
+
+    async fn seed_agent_with_harness(
+        db: &SqliteDb,
+        status: AgentStatus,
+        last_heartbeat_at: Option<String>,
+        harness_kind: &str,
+    ) -> Agent {
         let now = now_rfc3339();
         let daemon_id = new_uuid_v4();
         DaemonRepo::upsert_by_machine_id(
@@ -1507,9 +1516,9 @@ mod tests {
             db,
             CreateAgent {
                 id: new_uuid_v4(),
-                name: "codex".to_owned(),
+                name: harness_kind.to_owned(),
                 description: None,
-                executor_type: "shell".to_owned(),
+                executor_type: harness_kind.to_owned(),
                 model: None,
                 reasoning_effort: None,
                 permission_policy: None,
@@ -1606,15 +1615,24 @@ mod tests {
         agent_id: String,
         agent_session_id: Option<String>,
     ) -> db::Execution {
+        let agent = AgentRepo::get_by_id(db, &agent_id)
+            .await
+            .expect("agent loads")
+            .expect("agent exists");
+        let resume_support = if agent.executor_type == "codex" {
+            "native"
+        } else {
+            "unsupported"
+        };
         let now = now_rfc3339();
-        ExecutionRepo::create(
+        let mut execution = ExecutionRepo::create(
             db,
             CreateExecution {
                 id: new_uuid_v4(),
                 task_id,
-                agent_id: Some(agent_id),
-                actor_ref: None,
-                purpose: None,
+                agent_id: Some(agent_id.clone()),
+                actor_ref: Some(db::ActorRef::Agent(agent_id)),
+                purpose: Some(db::ExecutionPurpose::Implement),
                 harness_session_id: None,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,
@@ -1623,7 +1641,7 @@ mod tests {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id,
+                agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -1631,16 +1649,28 @@ mod tests {
                 before_sha: None,
                 after_sha: None,
                 error: None,
-                executor_config_snapshot_json: Some(
-                    r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-                ),
+                executor_config_snapshot_json: Some(format!(
+                    r#"{{"executor_type":"{}","config":{{}},"harness_capabilities":{{"schema_version":1,"capabilities":{{"resume":"{}"}}}}}}"#,
+                    agent.executor_type, resume_support
+                )),
                 workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             },
         )
         .await
-        .expect("execution creates")
+        .expect("execution creates");
+        if let Some(external_session_id) = agent_session_id {
+            execution = ExecutionRepo::record_harness_session_result(
+                db,
+                &execution.id,
+                &external_session_id,
+                &now_rfc3339(),
+            )
+            .await
+            .expect("harness session activates");
+        }
+        execution
     }
 
     #[tokio::test]
@@ -2095,7 +2125,8 @@ mod tests {
     async fn cancel_running_executions_returns_cancelled_execution_metadata() {
         let db = Arc::new(sqlite_db().await);
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let agent =
+            seed_agent_with_harness(&db, AgentStatus::Busy, Some(now_rfc3339()), "codex").await;
         let task = seed_task(
             &db,
             project_id,
@@ -2136,7 +2167,8 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(1024));
         let _task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let agent =
+            seed_agent_with_harness(&db, AgentStatus::Busy, Some(now_rfc3339()), "codex").await;
         let task = seed_task(
             &db,
             project_id,
@@ -2182,7 +2214,8 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(1024));
         let _task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let agent =
+            seed_agent_with_harness(&db, AgentStatus::Busy, Some(now_rfc3339()), "codex").await;
         let task = seed_task(
             &db,
             project_id,

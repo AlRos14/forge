@@ -3,9 +3,9 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 #[cfg(unix)]
 use command_group::{Signal, UnixChildExt};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, CursorConfig, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, CursorConfig, DiscoverContext, DiscoveredOptions,
+    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -142,7 +142,22 @@ impl CursorAdapter {
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> CursorConfig {
-        serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
+        let mut config: CursorConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--resume", "--session"],
+            &["--continue"],
+        );
+        match &ctx.invocation {
+            executors::HarnessInvocation::Start => config.resume_session_id = None,
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
+                config.resume_session_id = Some(external_session_id.clone());
+            }
+        }
+        config
     }
 
     fn write_runtime_prompt(
@@ -346,13 +361,78 @@ impl Default for CursorAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for CursorAdapter {
+impl HarnessAdapter for CursorAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Cursor
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
         detect_cursor_availability()
+    }
+
+    fn normalize_config(
+        &self,
+        config: &Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<Value, ExecutorError> {
+        executors::normalize_harness_config::<CursorConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unknown,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+        )
+    }
+
+    fn interpret_execution_policy(&self, config: &Value) -> executors::HarnessPolicyInterpretation {
+        let permission = config
+            .get("permission_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let force = config
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(permission != "plan");
+        let isolation = if force { "force" } else { "propose_only" };
+        executors::HarnessPolicyInterpretation {
+            permission_policy: permission.to_owned(),
+            isolation_posture: isolation.to_owned(),
+        }
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("cursor-agent".to_owned())
+    }
+
+    async fn observe_usage(
+        &self,
+        config: &Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<executors::UsageObservation>, ExecutorError> {
+        let config = serde_json::from_value::<CursorConfig>(config.clone()).map_err(|error| {
+            ExecutorError::Other(format!("invalid Cursor usage config: {error}"))
+        })?;
+        let value = query_account_usage_with_cancel(&config, cancel).await?;
+        Ok(Some(executors::UsageObservation {
+            value,
+            source: Some("cursor_poll".to_owned()),
+        }))
     }
 
     async fn discover_options(
@@ -500,6 +580,12 @@ impl CodingExecutorAdapter for CursorAdapter {
                 ..Default::default()
             });
         }
+
+        crate::require_exact_resumed_session(
+            "Cursor",
+            config.resume_session_id.as_deref(),
+            stream.agent_session_id.as_deref(),
+        )?;
 
         let after_sha = if let Ok(false) =
             git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
@@ -1240,6 +1326,38 @@ mod tests {
     use executors::CommandOverrides;
 
     #[test]
+    fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
+        let stale = serde_json::json!({
+            "resume_session_id":"old-session",
+            "additional_params":["--resume=old-cli-session", "--continue", "--verbose"]
+        });
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start_config = CursorAdapter::resolve_config(&start);
+        assert!(start_config.resume_session_id.is_none());
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+
+        let resume = crate::test_execution_context(
+            executors::HarnessInvocation::Resume {
+                external_session_id: "exact-session".to_owned(),
+            },
+            stale,
+        );
+        let resume_config = CursorAdapter::resolve_config(&resume);
+        assert_eq!(
+            resume_config.resume_session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+    }
+
+    #[test]
     fn command_builder_maps_cursor_args() {
         let config = CursorConfig {
             model: Some("gpt-5".to_owned()),
@@ -1495,8 +1613,10 @@ mod tests {
 
         let result = adapter
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task-1".to_owned(),
                 execution_id,
+                role: "coder".to_owned(),
                 worktree_path: worktree.path().display().to_string(),
                 description: "x".repeat(MAX_DIRECT_PROMPT_BYTES + 1),
                 agent_config: serde_json::json!({
@@ -1553,8 +1673,10 @@ mod tests {
         let prompt = "large prompt ".repeat(40_000);
         let result = CursorAdapter::new()
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task-1".to_owned(),
                 execution_id,
+                role: "coder".to_owned(),
                 worktree_path: worktree.path().display().to_string(),
                 description: prompt.clone(),
                 agent_config: serde_json::json!({

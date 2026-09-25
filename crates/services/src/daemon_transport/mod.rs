@@ -286,6 +286,47 @@ impl DaemonConnectionRegistry {
             .ok_or_else(|| ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             })?;
+        self.send_request_on_connection_with_timeout(&connection, method, params, timeout_duration)
+            .await
+    }
+
+    pub(crate) async fn send_request_on_connection<P, R>(
+        &self,
+        connection: &DaemonConnection,
+        method: &str,
+        params: P,
+        timeout_secs: u64,
+    ) -> Result<R, ServiceError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        self.send_request_on_connection_with_timeout(
+            connection,
+            method,
+            params,
+            Duration::from_secs(timeout_secs),
+        )
+        .await
+    }
+
+    pub(crate) async fn send_request_on_connection_with_timeout<P, R>(
+        &self,
+        connection: &DaemonConnection,
+        method: &str,
+        params: P,
+        timeout_duration: Duration,
+    ) -> Result<R, ServiceError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let daemon_id = connection.daemon_id.as_str();
+        if !self.is_current(daemon_id, connection.id()) {
+            return Err(ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
         let request_id = Uuid::new_v4().to_string();
         let params = serde_json::to_value(params).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid daemon request params: {error}"))
@@ -299,7 +340,49 @@ impl DaemonConnectionRegistry {
             params,
         };
 
-        if connection.outbound.send(frame).await.is_err() {
+        // Reserve capacity before taking the registry lock. The final
+        // generation check and permit send below are synchronous under the
+        // same lock used by register(), so replacement cannot interleave
+        // between them. If replacement occurs while waiting for capacity,
+        // fail without sending on either generation.
+        let mut stale_rx = connection.stale_receiver();
+        if connection.is_stale() {
+            lock(&connection.pending).remove(&request_id);
+            return Err(ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
+        let permit = tokio::select! {
+            permit = connection.outbound.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    lock(&connection.pending).remove(&request_id);
+                    return Err(ServiceError::DaemonUnavailable {
+                        daemon_id: daemon_id.to_owned(),
+                    });
+                }
+            },
+            _ = stale_rx.changed() => {
+                lock(&connection.pending).remove(&request_id);
+                return Err(ServiceError::DaemonUnavailable {
+                    daemon_id: daemon_id.to_owned(),
+                });
+            }
+        };
+
+        let sent = {
+            let connections = lock(&self.inner.connections);
+            let still_current = connections
+                .get(daemon_id)
+                .is_some_and(|current| current.id() == connection.id() && !current.is_stale());
+            if still_current {
+                permit.send(frame);
+                true
+            } else {
+                false
+            }
+        };
+        if !sent {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),

@@ -26,9 +26,8 @@ use db::{
 };
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -409,7 +408,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(DelayedCodexAdapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
@@ -458,7 +457,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
 
 struct DelayedCodexAdapter;
 
-impl CodingExecutorAdapter for DelayedCodexAdapter {
+impl HarnessAdapter for DelayedCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }

@@ -88,9 +88,19 @@ and a small `pending`/`active`/`ended`/`failed` lifecycle. Its Agent and
 harness identity are immutable. A pending session is not resumable until an
 executor result supplies the external identity.
 
+Plan PR3 snapshots effective `harness_capabilities` separately from the legacy
+Agent `capabilities_json` tags/filters. The historical HarnessSession snapshot
+is not recomputed when an Agent profile changes. Runtime invocation is generic:
+an Execution without a HarnessSession starts; an Execution with one resumes the
+exact external session through its HarnessAdapter. Unknown or unsupported
+resume fails explicitly. Start may advance through the configured fallback
+route, and its actual winner's candidate and capability evidence are stored on
+the Execution and any newly established HarnessSession.
+
 ## Recovery
 
 Restart recovery uses the persisted Execution, lease, workspace, and session
 records. A recovered run either resumes the exact explicitly attached session
-when the adapter supports it, or follows an explicit unsupported/fallback
-policy. It never silently changes Actor identity.
+when historical and current adapter capability evidence allow it, or returns
+an explicit unavailable/unsupported result. It never silently changes Actor
+identity or turns Resume into Start.

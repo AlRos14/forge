@@ -396,7 +396,8 @@ async fn remote_daemon_disconnect_fails_running_execution() {
 async fn remote_executor_unavailable_defers_and_persists_route() {
     let mut fixture = setup_remote_roundtrip("remote-unavailable").await;
 
-    // A routed agent: shell primary with a null-executor fallback.
+    // A routed legacy shell agent: fallback may vary its command while
+    // preserving the Agent's stable harness identity.
     let routed_agent: AgentResponse = json_request_with_bearer(
         &fixture.harness.app,
         Method::POST,
@@ -407,7 +408,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             "executor_type": "shell",
             "daemon_id": fixture.registration.daemon_id,
             "config_json": {
-                "fallbacks": [ { "executor_type": "null", "config": {} } ]
+                "fallbacks": [ { "executor_type": "shell", "config": {"command":"echo fallback"} } ]
             },
         }),
         StatusCode::OK,
@@ -492,7 +493,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
                     outcome: "usage_exhausted".to_owned(),
                 },
                 api_types::RemoteRouteAttempt {
-                    candidate_key: "null#fallback".to_owned(),
+                    candidate_key: "shell#fallback".to_owned(),
                     outcome: "unavailable".to_owned(),
                 },
             ]),

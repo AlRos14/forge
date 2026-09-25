@@ -702,7 +702,7 @@ impl SqliteDb {
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)

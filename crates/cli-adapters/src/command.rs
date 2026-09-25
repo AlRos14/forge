@@ -113,6 +113,48 @@ impl CommandBuilder {
     }
 }
 
+/// Remove provider-native session selectors from authored extra arguments for
+/// a generic fresh Start. Adapter callers pass only the flags understood by
+/// their concrete integration; opaque wrappers remain outside this parser.
+pub(crate) fn clear_session_arguments(
+    overrides: &mut CommandOverrides,
+    value_flags: &[&str],
+    boolean_flags: &[&str],
+) {
+    let Some(arguments) = overrides.additional_params.take() else {
+        return;
+    };
+    let mut filtered = Vec::with_capacity(arguments.len());
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if boolean_flags.iter().any(|flag| argument.as_str() == *flag) {
+            index += 1;
+            continue;
+        }
+        let exact_value_flag = value_flags.iter().any(|flag| argument.as_str() == *flag);
+        let inline_value_flag = value_flags.iter().any(|flag| {
+            argument
+                .strip_prefix(*flag)
+                .is_some_and(|suffix| suffix.starts_with('='))
+        });
+        if exact_value_flag || inline_value_flag {
+            index += 1;
+            if exact_value_flag
+                && arguments
+                    .get(index)
+                    .is_some_and(|value| !value.starts_with('-'))
+            {
+                index += 1;
+            }
+            continue;
+        }
+        filtered.push(argument.clone());
+        index += 1;
+    }
+    overrides.additional_params = Some(filtered);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +212,27 @@ mod tests {
         assert_eq!(
             envs.get(&OsString::from("MY_VAR")),
             Some(&OsString::from("profile_val"))
+        );
+    }
+
+    #[test]
+    fn fresh_start_filters_provider_session_arguments_only() {
+        let mut overrides = CommandOverrides {
+            additional_params: Some(vec![
+                "--verbose".into(),
+                "--resume".into(),
+                "old-session".into(),
+                "--session=stale".into(),
+                "--continue".into(),
+                "--model".into(),
+                "model-a".into(),
+            ]),
+            ..CommandOverrides::default()
+        };
+        clear_session_arguments(&mut overrides, &["--resume", "--session"], &["--continue"]);
+        assert_eq!(
+            overrides.additional_params,
+            Some(vec!["--verbose".into(), "--model".into(), "model-a".into()])
         );
     }
 }

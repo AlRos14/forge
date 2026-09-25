@@ -121,7 +121,15 @@ impl TaskService {
         let execution_id = new_uuid_v4();
         let executor_config_snapshot_json = match agent.as_ref() {
             Some(agent) => {
-                match build_executor_config_snapshot(&self.db, &task, agent, overrides).await {
+                match build_executor_config_snapshot(
+                    &self.db,
+                    &task,
+                    agent,
+                    overrides,
+                    self.adapter_registry.as_deref(),
+                )
+                .await
+                {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
                         create_failed_execution_record(
@@ -679,6 +687,7 @@ impl TaskService {
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
             task_executor: self.task_executor.clone(),
+            adapter_registry: self.adapter_registry.clone(),
             daemon_connections: self.daemon_connections.clone(),
             workspace_exec_locks: self.workspace_exec_locks.clone(),
             terminal_activity: self.terminal_activity.clone(),

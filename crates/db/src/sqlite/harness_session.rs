@@ -72,16 +72,16 @@ mod tests {
     }
 
     #[test]
-    fn resolved_ordered_fallback_admits_the_resolved_candidate_snapshot() {
+    fn resolved_same_agent_ordered_fallback_admits_the_resolved_snapshot() {
         let snapshot = serde_json::json!({
-            "executor_type": "cursor",
-            "config": {"profile": "account-b"},
+            "executor_type": "codex",
+            "config": {"profile": "account-a", "model": "model-b"},
             "routing": {
                 "policy": "ordered_fallback_v1",
-                "selected_candidate_key": "cursor:account-b",
+                "selected_candidate_key": "codex:account-a#candidate-b",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"profile": "account-a"}},
-                    {"executor_type": "cursor", "config": {"profile": "account-b"}}
+                    {"executor_type": "codex", "config": {"profile": "account-a", "model": "model-a"}},
+                    {"executor_type": "codex", "config": {"profile": "account-a", "model": "model-b"}}
                 ]
             }
         });
@@ -103,14 +103,40 @@ pub(crate) async fn profile_id_for_snapshot_in_tx(
     else {
         return Ok(None);
     };
-    sqlx::query_scalar(
-        "SELECT id FROM agent_profile WHERE id = ? AND identity_id = ? LIMIT 1",
+    sqlx::query_scalar("SELECT id FROM agent_profile WHERE id = ? AND identity_id = ? LIMIT 1")
+        .bind(profile_id)
+        .bind(agent_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(Into::into)
+}
+
+/// Durable guard for INV-003: a resolved Execution snapshot cannot materialize
+/// a session under an Agent whose persisted harness identity differs.
+pub(crate) async fn validate_agent_harness_identity_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+    harness_kind: &str,
+) -> Result<()> {
+    let configured_kind: Option<String> = sqlx::query_scalar(
+        "SELECT profile.executor_type
+         FROM agent_identity AS identity
+         JOIN agent_profile AS profile
+           ON profile.id = identity.selected_profile_id
+          AND profile.identity_id = identity.id
+         WHERE identity.id = ?
+         LIMIT 1",
     )
-    .bind(profile_id)
     .bind(agent_id)
     .fetch_optional(&mut **transaction)
-    .await
-    .map_err(Into::into)
+    .await?;
+    let configured_kind = configured_kind.ok_or(DbError::NotFound)?;
+    if !configured_kind.eq_ignore_ascii_case(harness_kind) {
+        return Err(DbError::Check(format!(
+            "Execution harness {harness_kind} contradicts Agent harness identity {configured_kind}"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) async fn create_pending_harness_session_in_tx(
@@ -146,11 +172,14 @@ pub(crate) async fn create_pending_harness_session_in_tx(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("legacy")
         .to_owned();
+    if harness_kind != "legacy" {
+        validate_agent_harness_identity_in_tx(transaction, actor_agent_id, &harness_kind).await?;
+    }
     let profile_id = profile_id_for_snapshot_in_tx(transaction, actor_agent_id, &snapshot).await?;
     let capabilities_snapshot_json = snapshot
-        .get("capabilities")
+        .get("harness_capabilities")
         .map(ToString::to_string)
-        .unwrap_or_else(|| "{}".to_owned());
+        .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
     let id = new_uuid_v4();
     sqlx::query(
         "INSERT INTO harness_session (
@@ -204,14 +233,14 @@ pub(crate) async fn validate_execution_harness_session_in_tx(
         ));
     }
     if let Some(snapshot_json) = input.executor_config_snapshot_json.as_deref() {
-        let snapshot =
-            serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
+        let snapshot = serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
         if let Some(executor_type) = snapshot
             .get("executor_type")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
+            validate_agent_harness_identity_in_tx(transaction, agent_id, executor_type).await?;
             if executor_type != session_harness_kind {
                 return Err(DbError::Check(
                     "HarnessSession belongs to a different harness kind".to_owned(),
@@ -321,8 +350,7 @@ impl HarnessSessionRepo for SqliteDb {
                 "ended or failed HarnessSession cannot become reusable".to_owned(),
             ));
         }
-        if matches!(&status, HarnessSessionStatus::Active)
-            && current.external_session_id.is_none()
+        if matches!(&status, HarnessSessionStatus::Active) && current.external_session_id.is_none()
         {
             return Err(DbError::Check(
                 "active HarnessSession requires an external session identity".to_owned(),

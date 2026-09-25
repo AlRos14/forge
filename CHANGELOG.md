@@ -8,6 +8,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- New Execution snapshots no longer write harness-native resume flags such as
+  `resume_thread_id` or `resume_session_id` into config. Continuity is expressed
+  by the existing `harness_session_id` relation and a runtime-only generic
+  Start/Resume invocation. The HarnessSession relation remains the durable
+  continuity authority; typed `harness_capabilities` records support evidence.
+- Remote execution dispatch now requires a daemon that advertises the generic
+  HarnessInvocation protocol. Older daemons are rejected before Start or Resume
+  dispatch because they cannot guarantee fresh-start and exact-resume semantics.
+  PR3 daemons also reject old-server execution payloads without the required
+  generic `invocation`, so rolling upgrades require both sides to use PR3.
+  Protocol negotiation and Start dispatch are pinned to one daemon connection
+  generation; reconnect replacement during negotiation fails closed.
+- Ordered fallback candidates must preserve the Agent's harness and
+  identity-bearing native account. Generic command override channels
+  (`env`, `base_command_override`, and `additional_params`) must also remain
+  structurally identical because adapters may use them to select an account or
+  native context. Cross-harness, account, or opaque command changes now fail
+  before dispatch; select or reassign a separate Agent for that failover.
 - Execution responses now expose additive `actor_ref`, `purpose`, and
   `harness_session_id` fields. New Executions persist a real Human or Agent
   principal and an explicit purpose; legacy `agent_id` and `agent_session_id`
@@ -57,6 +75,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- External CLI integrations now run through one `HarnessAdapter` registry with
+  explicit native/emulated/unsupported/unknown support per capability. Executor
+  discovery includes additive `harness_capabilities`; winner capabilities are
+  preserved in Execution and HarnessSession snapshots. No schema migration was
+  needed.
 - Durable, immutable Task plan revisions survive Workspace cleanup, expose the
   full Markdown and revision digest through `GET /api/v1/tasks/{id}/plan`, and
   bind review evidence to the exact plan and git head.

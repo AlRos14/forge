@@ -553,10 +553,16 @@ pub async fn agent_discovered_options(
             .await
             .map_err(|error| ApiError::bad_request(error.to_string()))?
     };
+    let raw_config = serde_json::from_str::<serde_json::Value>(&agent.config_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let normalized_config = adapter
+        .normalize_config(&raw_config, &executors::ExecutionOverrides::default())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(DiscoveredOptionsResponse {
         models: discovered.models,
         permission_policies: discovered.permission_policies,
         cli_specific: discovered.cli_specific,
+        harness_capabilities: adapter.capabilities(&normalized_config),
         available_daemons: daemons
             .into_iter()
             .map(|daemon| DiscoveredDaemonResponse {

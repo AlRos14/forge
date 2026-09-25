@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, GeminiConfig, LogKind, LogStream, LogWriter, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, GeminiConfig, HarnessAdapter,
+    LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,14 @@ impl GeminiAdapter {
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> GeminiConfig {
-        serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
+        let mut config: GeminiConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--resume", "--session"],
+            &["--continue"],
+        );
+        config
     }
 
     fn build_command(config: &GeminiConfig) -> tokio::process::Command {
@@ -103,13 +110,65 @@ impl Default for GeminiAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for GeminiAdapter {
+impl HarnessAdapter for GeminiAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Gemini
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
         detect_gemini_availability()
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<GeminiConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Unsupported,
+            S::Emulated,
+            S::Unknown,
+            S::Unsupported,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+        )
+    }
+
+    fn interpret_execution_policy(
+        &self,
+        config: &serde_json::Value,
+    ) -> executors::HarnessPolicyInterpretation {
+        let permission = config
+            .get("permission_policy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let isolation = config
+            .get("sandbox")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not_applicable");
+        executors::HarnessPolicyInterpretation {
+            permission_policy: permission.to_owned(),
+            isolation_posture: isolation.to_owned(),
+        }
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("gemini".to_owned())
     }
 
     async fn discover_options(
@@ -442,6 +501,21 @@ fn executable_in_path(name: &str) -> bool {
 mod tests {
     use super::*;
     use executors::CommandOverrides;
+
+    #[test]
+    fn fresh_gemini_start_discards_session_scoped_cli_arguments() {
+        let ctx = crate::test_execution_context(
+            executors::HarnessInvocation::Start,
+            serde_json::json!({
+                "additional_params":["--resume", "old-session", "--session=stale", "--continue", "--verbose"]
+            }),
+        );
+        let config = GeminiAdapter::resolve_config(&ctx);
+        assert_eq!(
+            config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+    }
 
     #[tokio::test]
     async fn discovery_advertises_current_models_and_aliases() {

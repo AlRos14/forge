@@ -1,5 +1,5 @@
 use cli_adapters::CodexAdapter;
-use executors::{CodingExecutorAdapter, ExecutionContext, ExecutionOutcome};
+use executors::{ExecutionContext, ExecutionOutcome, HarnessAdapter};
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -37,9 +37,11 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
 
     let logs_path = tempdir.path().join("log.jsonl");
     let ctx = ExecutionContext {
+        invocation: executors::HarnessInvocation::Start,
         worktree_path: tempdir.path().to_string_lossy().into_owned(),
         task_id: "smoke".to_owned(),
         execution_id: "smoke-exec".to_owned(),
+        role: "coder".to_owned(),
         description: "Create a file called HELLO.md in the repo root with the single word banana."
             .to_owned(),
         agent_config: json!({

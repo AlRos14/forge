@@ -7,6 +7,10 @@ pub const METHOD_FS_LIST: &str = "fs.list";
 pub const METHOD_FS_BRANCHES: &str = "fs.branches";
 pub const METHOD_EXECUTION_START: &str = "execution.start";
 pub const METHOD_EXECUTION_CANCEL: &str = "execution.cancel";
+pub const METHOD_PROTOCOL_CAPABILITIES: &str = "daemon.protocol_capabilities";
+pub const DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1: &str =
+    "generic_harness_invocation_v1";
+pub const DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1: &str = "execution_role_v1";
 pub const METHOD_EXECUTION_LOG: &str = "execution.log";
 pub const METHOD_EXECUTION_TERMINAL: &str = "execution.terminal";
 pub const METHOD_TERMINAL_START: &str = "terminal.start";
@@ -23,6 +27,23 @@ pub const INVALID_FRAME: &str = "invalid_frame";
 pub const INVALID_INPUT: &str = "invalid_input";
 pub const PATH_GUARDRAIL: &str = "path_guardrail";
 pub const EXECUTION_NOT_FOUND: &str = "execution_not_found";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DaemonProtocolCapabilitiesRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DaemonProtocolCapabilities {
+    pub schema_version: u32,
+    pub features: Vec<String>,
+}
+
+impl DaemonProtocolCapabilities {
+    pub fn supports(&self, feature: &str) -> bool {
+        self.schema_version == 1 && self.features.iter().any(|item| item == feature)
+    }
+}
 
 pub const DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS: u64 = 30;
 pub const DAEMON_HEARTBEAT_INTERVAL_SECS: u64 = 20;
@@ -88,12 +109,15 @@ pub struct FsBranchesResult {
 pub struct ExecutionStartParams {
     pub task_id: String,
     pub execution_id: String,
+    #[serde(default)]
+    pub role: String,
     pub workspace_path: String,
     pub executor_type: String,
     #[ts(type = "unknown")]
     pub executor_config: serde_json::Value,
     #[ts(type = "unknown")]
     pub prompt: serde_json::Value,
+    pub invocation: crate::HarnessInvocation,
     pub max_turns: Option<u32>,
 }
 
@@ -188,6 +212,12 @@ pub struct RemoteResolvedCandidate {
     pub executor_type: String,
     #[ts(type = "Record<string, unknown>")]
     pub config: serde_json::Value,
+    /// Absent on pre-PR3 daemons. The server resolves absence to an explicit
+    /// all-Unknown snapshot and never inherits primary-candidate evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_capabilities: Option<crate::HarnessCapabilitiesSnapshot>,
+    #[serde(default)]
+    pub effective_policy: Option<crate::EffectiveExecutionPolicy>,
 }
 
 /// One candidate attempt outcome from a remote execution's fallback route.
@@ -302,7 +332,145 @@ pub struct DaemonErrorPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonErrorPayload, DaemonFrame, TerminalOutputNotification};
+    use super::{
+        DaemonErrorPayload, DaemonFrame, ExecutionStartParams, RemoteResolvedCandidate,
+        TerminalOutputNotification,
+    };
+    use crate::HarnessInvocation;
+    use serde::Deserialize;
+
+    fn execution_start_params(invocation: HarnessInvocation) -> ExecutionStartParams {
+        ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            role: "coder".to_owned(),
+            workspace_path: "/tmp/worktree".to_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: serde_json::json!({"model":"test"}),
+            prompt: serde_json::json!({"description":"continue"}),
+            invocation,
+            max_turns: None,
+        }
+    }
+
+    #[test]
+    fn generic_start_and_resume_survive_daemon_transport_serialization() {
+        for invocation in [
+            HarnessInvocation::Start,
+            HarnessInvocation::Resume {
+                external_session_id: "external-session-abc".to_owned(),
+            },
+        ] {
+            let params = execution_start_params(invocation.clone());
+            let encoded = serde_json::to_value(&params).expect("start params serialize");
+            let decoded: ExecutionStartParams =
+                serde_json::from_value(encoded).expect("start params deserialize");
+            assert_eq!(decoded.invocation, invocation);
+            assert_eq!(decoded.role, "coder");
+        }
+    }
+
+    #[test]
+    fn pre_pr3_execution_start_without_invocation_is_rejected() {
+        let legacy_start_payload = serde_json::json!({
+            "task_id": "task-1",
+            "execution_id": "execution-1",
+            "workspace_path": "/tmp/worktree",
+            "executor_type": "codex",
+            "executor_config": {},
+            "prompt": { "description": "start" },
+            "max_turns": null
+        });
+        assert!(serde_json::from_value::<ExecutionStartParams>(legacy_start_payload).is_err());
+
+        for (executor_type, key) in [
+            ("codex", "resume_thread_id"),
+            ("claude", "resume_session_id"),
+            ("cursor", "resume_session_id"),
+            ("smith", "resume_session_id"),
+        ] {
+            let mut executor_config = serde_json::Map::new();
+            executor_config.insert(key.to_owned(), serde_json::json!("session-123"));
+            let payload = serde_json::json!({
+                "task_id": "task-1",
+                "execution_id": "execution-1",
+                "workspace_path": "/tmp/worktree",
+                "executor_type": executor_type,
+                "executor_config": executor_config,
+                "prompt": { "description": "continue" },
+                "max_turns": null
+            });
+
+            let error = serde_json::from_value::<ExecutionStartParams>(payload)
+                .expect_err("pre-PR3 payload must not silently default to Start");
+            assert!(error.to_string().contains("invocation"));
+        }
+    }
+
+    #[test]
+    fn remote_resolved_candidate_carries_effective_harness_capabilities() {
+        let candidate = RemoteResolvedCandidate {
+            candidate_key: "cursor:profile=work#1234".to_owned(),
+            executor_type: "cursor".to_owned(),
+            config: serde_json::json!({"profile":"work"}),
+            harness_capabilities: Some(crate::HarnessCapabilities::unknown().snapshot()),
+            effective_policy: None,
+        };
+        let encoded = serde_json::to_value(candidate).expect("candidate serializes");
+        assert_eq!(encoded["harness_capabilities"]["schema_version"], 1);
+        assert_eq!(
+            encoded["harness_capabilities"]["capabilities"]["resume"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn old_daemon_winner_omission_is_not_inherited_as_capability_evidence() {
+        let candidate: RemoteResolvedCandidate = serde_json::from_value(serde_json::json!({
+            "candidate_key":"codex#primary",
+            "executor_type":"codex",
+            "config":{"model":"model-a"}
+        }))
+        .expect("legacy resolved candidate remains decodable");
+        assert!(candidate.harness_capabilities.is_none());
+        assert!(candidate.effective_policy.is_none());
+    }
+
+    #[test]
+    fn new_server_start_payload_remains_safe_for_old_daemon() {
+        #[derive(Deserialize)]
+        struct OldExecutionStartParams {
+            task_id: String,
+            execution_id: String,
+            workspace_path: String,
+            executor_type: String,
+            executor_config: serde_json::Value,
+            prompt: serde_json::Value,
+            max_turns: Option<u32>,
+        }
+
+        let new_payload = serde_json::to_value(ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            role: "worker".to_owned(),
+            workspace_path: "/work".to_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: serde_json::json!({"executor_type":"codex","config":{}}),
+            prompt: serde_json::json!({"description":"start"}),
+            invocation: crate::HarnessInvocation::Start,
+            max_turns: None,
+        })
+        .expect("Start payload serializes");
+        let old_decoded: OldExecutionStartParams =
+            serde_json::from_value(new_payload).expect("old daemon ignores additive Start intent");
+        assert_eq!(old_decoded.task_id, "task-1");
+        assert_eq!(old_decoded.execution_id, "execution-1");
+        assert_eq!(old_decoded.workspace_path, "/work");
+        assert_eq!(old_decoded.executor_type, "codex");
+        assert_eq!(old_decoded.executor_config["executor_type"], "codex");
+        assert_eq!(old_decoded.prompt["description"], "start");
+        assert_eq!(old_decoded.max_turns, None);
+    }
 
     #[test]
     fn request_frame_round_trips() {

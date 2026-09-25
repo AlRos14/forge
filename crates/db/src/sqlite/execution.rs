@@ -608,12 +608,20 @@ async fn bind_external_session_in_tx(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("legacy")
         .to_owned();
+    if harness_kind != "legacy" {
+        harness_session::validate_agent_harness_identity_in_tx(
+            transaction,
+            agent_id,
+            &harness_kind,
+        )
+        .await?;
+    }
     let profile_id =
         harness_session::profile_id_for_snapshot_in_tx(transaction, agent_id, &snapshot).await?;
     let capabilities_snapshot_json = snapshot
-        .get("capabilities")
+        .get("harness_capabilities")
         .map(ToString::to_string)
-        .unwrap_or_else(|| "{}".to_owned());
+        .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
     let existing = sqlx::query(
         "SELECT id, status, workspace_id FROM harness_session
          WHERE agent_id = ? AND harness_kind = ? AND external_session_id = ?
@@ -628,7 +636,7 @@ async fn bind_external_session_in_tx(
         let existing_status: HarnessSessionStatus =
             parse_enum(existing.try_get::<String, _>("status")?)?;
         if matches!(
-            existing_status,
+            &existing_status,
             HarnessSessionStatus::Ended | HarnessSessionStatus::Failed
         ) {
             return Err(DbError::Check(
@@ -643,7 +651,19 @@ async fn bind_external_session_in_tx(
                 "external session identity is workspace-incompatible".to_owned(),
             ));
         }
-        existing.try_get::<String, _>("id")?
+        let existing_id = existing.try_get::<String, _>("id")?;
+        if matches!(&existing_status, HarnessSessionStatus::Pending)
+            && snapshot.get("harness_capabilities").is_some()
+        {
+            sqlx::query(
+                "UPDATE harness_session SET capabilities_snapshot_json = ? WHERE id = ? AND status = 'pending'",
+            )
+            .bind(&capabilities_snapshot_json)
+            .bind(&existing_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        existing_id
     } else {
         let id = crate::new_uuid_v4();
         sqlx::query(

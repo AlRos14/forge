@@ -27,29 +27,6 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
         .claim_task(task.id, Assignee::Agent(agent_id), None)
         .await
         .expect("task claims");
-    ExecutionRepo::update(
-        &*db,
-        db::UpdateExecution {
-            id: claimed.execution.id.clone(),
-            status: None,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            agent_session_id: Some(Some("test-session".to_owned())),
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("seed executor session id");
     let workspace =
         WorkspaceRepo::get_by_id(&*db, claimed.execution.workspace_id.as_deref().unwrap())
             .await
@@ -1258,7 +1235,7 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
+                r#"{"executor_type":"claude_code","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
             ),
             workspace_id: None,
             created_at: now.clone(),
@@ -1291,7 +1268,10 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
         result.execution.harness_session_id,
         parent_execution.harness_session_id
     );
-    assert_eq!(result.execution.agent_session_id.as_deref(), Some("test-session"));
+    assert_eq!(
+        result.execution.agent_session_id.as_deref(),
+        Some("test-session")
+    );
     let snapshot: serde_json::Value = serde_json::from_str(
         result
             .execution
@@ -1300,7 +1280,11 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
             .expect("snapshot exists"),
     )
     .expect("snapshot is valid json");
-    assert_eq!(snapshot["config"]["resume_session_id"], "test-session");
+    assert_eq!(
+        snapshot["dispatch"]["execution_policy"],
+        "explicit_harness_session"
+    );
+    assert!(snapshot["config"].get("resume_session_id").is_none());
 }
 
 #[tokio::test]
@@ -1308,13 +1292,7 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        "in_progress".to_owned(),
-    )
-    .await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
@@ -1360,15 +1338,41 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
         .expect("execution loads")
         .expect("execution exists");
 
-    let unambiguous = crate::task_service::resumable_external_session(
+    let unambiguous =
+        crate::task_service::resumable_external_session(&db, &historical, Some(&agent_id), None)
+            .await
+            .expect("bounded historical lookup succeeds");
+    assert_eq!(unambiguous.as_deref(), Some("legacy-thread"));
+
+    let mut unsupported_legacy_harness = historical.clone();
+    unsupported_legacy_harness.executor_config_snapshot_json = Some(
+        serde_json::json!({"agent_id":agent_id.clone(),"executor_type":"shell","config":{}})
+            .to_string(),
+    );
+    let unsupported = crate::task_service::resumable_external_session(
         &db,
-        &historical,
+        &unsupported_legacy_harness,
         Some(&agent_id),
         None,
     )
     .await
-    .expect("bounded historical lookup succeeds");
-    assert_eq!(unambiguous.as_deref(), Some("legacy-thread"));
+    .expect("unsupported legacy evidence fails closed without an error");
+    assert_eq!(unsupported, None);
+
+    let mut mismatched_legacy_agent = historical.clone();
+    mismatched_legacy_agent.executor_config_snapshot_json = Some(
+        serde_json::json!({"agent_id":"another-agent","executor_type":"codex","config":{}})
+            .to_string(),
+    );
+    let mismatched = crate::task_service::resumable_external_session(
+        &db,
+        &mismatched_legacy_agent,
+        Some(&agent_id),
+        None,
+    )
+    .await
+    .expect("contradictory legacy evidence fails closed without an error");
+    assert_eq!(mismatched, None);
 
     sqlx::query(
         "INSERT INTO execution_session_migration_issue
@@ -1382,14 +1386,10 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
     .await
     .expect("historical ambiguity marker is inserted");
 
-    let ambiguous = crate::task_service::resumable_external_session(
-        &db,
-        &historical,
-        Some(&agent_id),
-        None,
-    )
-    .await
-    .expect("ambiguous lookup fails closed without error");
+    let ambiguous =
+        crate::task_service::resumable_external_session(&db, &historical, Some(&agent_id), None)
+            .await
+            .expect("ambiguous lookup fails closed without error");
     assert_eq!(ambiguous, None);
     let materialized = crate::task_service::execution::materialize_historical_harness_session(
         &db,
@@ -1412,13 +1412,14 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
         hook: None,
         recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
     };
-    let actions = crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
-        &task,
-        &workflow,
-        &[historical],
-        Some(&annotation),
-        Some(&std::collections::HashSet::new()),
-    );
+    let actions =
+        crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
+            &task,
+            &workflow,
+            &[historical],
+            Some(&annotation),
+            Some(&std::collections::HashSet::new()),
+        );
     let session_follow_up = actions
         .iter()
         .find(|action| action.action == api_types::ExecutionActionKind::SessionFollowUp)
@@ -1497,7 +1498,7 @@ async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{}}"#.to_owned(),
+                r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
             ),
             workspace_id: Some(workspace_id),
             created_at: now.clone(),
@@ -1637,10 +1638,10 @@ async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
 
     assert_eq!(follow_up.agent_id.as_deref(), Some(agent_a.as_str()));
     assert_ne!(
-        follow_up.execution.harness_session_id,
+        follow_up.harness_session_id,
         parent_execution.harness_session_id
     );
-    assert!(follow_up.execution.agent_session_id.is_none());
+    assert!(follow_up.agent_session_id.is_none());
     let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
         .await
         .expect("historical parent loads")
@@ -1796,7 +1797,7 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{"resume_fallback_prompt":"do not send this full prompt"}}"#
+                r#"{"executor_type":"codex","config":{"resume_fallback_prompt":"do not send this full prompt"},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#
                     .to_owned(),
             ),
             workspace_id: None,
@@ -1825,7 +1826,10 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
         result.execution.harness_session_id,
         parent_execution.harness_session_id
     );
-    assert_eq!(result.execution.agent_session_id.as_deref(), Some("codex-thread"));
+    assert_eq!(
+        result.execution.agent_session_id.as_deref(),
+        Some("codex-thread")
+    );
     let snapshot: serde_json::Value = serde_json::from_str(
         result
             .execution
@@ -1834,9 +1838,16 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
             .expect("snapshot exists"),
     )
     .expect("snapshot is valid json");
-    assert_eq!(snapshot["config"]["resume_thread_id"], "codex-thread");
-    assert_eq!(snapshot["config"]["resume_thread_in_place"], true);
-    assert!(snapshot["config"].get("resume_fallback_prompt").is_none());
+    assert_eq!(
+        snapshot["dispatch"]["execution_policy"],
+        "explicit_harness_session"
+    );
+    assert!(snapshot["config"].get("resume_thread_id").is_none());
+    assert!(snapshot["config"].get("resume_thread_in_place").is_none());
+    assert_eq!(
+        snapshot["config"]["resume_fallback_prompt"], "do not send this full prompt",
+        "the service preserves historical config; the Codex adapter owns normalization"
+    );
 }
 
 #[tokio::test]
@@ -1864,7 +1875,7 @@ async fn follow_up_execution_rejects_running_parent() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
+            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("running parent".to_owned()),
@@ -1882,7 +1893,6 @@ async fn follow_up_execution_rejects_running_parent() {
     )
     .await
     .expect("parent execution creates");
-
     let result = service
         .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
         .await;
@@ -1896,7 +1906,7 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
@@ -1924,7 +1934,7 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
             ),
             workspace_id: None,
             created_at: now.clone(),
@@ -1947,8 +1957,14 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
         .await;
 
     let child = result.expect("follow-up succeeds");
-    assert_eq!(child.execution.harness_session_id, parent_execution.harness_session_id);
-    assert_eq!(child.execution.agent_session_id.as_deref(), Some("test-session"));
+    assert_eq!(
+        child.execution.harness_session_id,
+        parent_execution.harness_session_id
+    );
+    assert_eq!(
+        child.execution.agent_session_id.as_deref(),
+        Some("test-session")
+    );
 }
 
 #[tokio::test]
@@ -2001,7 +2017,10 @@ async fn follow_up_on_cancelled_execution_without_session_starts_new_execution()
         .await;
 
     let child = result.expect("follow-up starts a fresh execution");
-    assert_eq!(child.execution.parent_execution_id.as_deref(), Some(parent_id.as_str()));
+    assert_eq!(
+        child.execution.parent_execution_id.as_deref(),
+        Some(parent_id.as_str())
+    );
     assert!(child.execution.harness_session_id.is_some());
     assert!(child.execution.agent_session_id.is_none());
 }
@@ -2056,7 +2075,10 @@ async fn follow_up_execution_without_session_starts_new_execution() {
         .await;
 
     let child = result.expect("follow-up starts a fresh execution");
-    assert_eq!(child.execution.parent_execution_id.as_deref(), Some(parent_id.as_str()));
+    assert_eq!(
+        child.execution.parent_execution_id.as_deref(),
+        Some(parent_id.as_str())
+    );
     assert!(child.execution.harness_session_id.is_some());
     assert!(child.execution.agent_session_id.is_none());
 }
@@ -2118,7 +2140,7 @@ async fn follow_up_execution_on_blocked_task() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     TaskRepo::update(
         &*db,
@@ -2149,9 +2171,9 @@ async fn follow_up_execution_on_blocked_task() {
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            agent_id: Some(agent_id),
-            actor_ref: None,
-            purpose: None,
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id)),
+            purpose: Some(db::ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
@@ -2160,7 +2182,7 @@ async fn follow_up_execution_on_blocked_task() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
+            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("completed parent".to_owned()),
@@ -2169,7 +2191,7 @@ async fn follow_up_execution_on_blocked_task() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
             ),
             workspace_id: None,
             created_at: now.clone(),
@@ -2178,6 +2200,14 @@ async fn follow_up_execution_on_blocked_task() {
     )
     .await
     .expect("parent execution creates");
+    let parent_execution = ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent_execution.id,
+        "test-session",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent harness session activates");
 
     let result = service
         .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)

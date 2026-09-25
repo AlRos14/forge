@@ -291,6 +291,7 @@ mod subtask_hook_test_support {
                 merge_service: None,
                 cleanup_scheduler: None,
                 task_executor: None,
+                adapter_registry: None,
                 daemon_connections: None,
                 workspace_exec_locks: None,
                 terminal_activity: None,

@@ -422,17 +422,14 @@ impl TaskService {
         let mut blocked_execution = ExecutionRepo::get_by_id(&*self.db, blocked_execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", blocked_execution_id.to_owned()))?;
-        let authoritative_memberships =
-            if let Some(role) = db::canonical_task_role_name(&blocked_execution.role) {
-                crate::task_service::current_role_memberships_authoritative(
-                    &self.db,
-                    &task.id,
-                    &role,
-                )
+        let authoritative_memberships = if let Some(role) =
+            db::canonical_task_role_name(&blocked_execution.role)
+        {
+            crate::task_service::current_role_memberships_authoritative(&self.db, &task.id, &role)
                 .await?
-            } else {
-                None
-            };
+        } else {
+            None
+        };
         let agent_id = if let Some(memberships) = authoritative_memberships.as_ref() {
             let selected = if task.repo_id.is_some() {
                 crate::task_service::select_usable_repository_agent_id(
@@ -455,7 +452,9 @@ impl TaskService {
                 .agent_id
                 .as_ref()
                 .cloned()
-                .ok_or_else(|| ServiceError::invalid_operation("blocked execution has no assignee"))?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("blocked execution has no assignee")
+                })?
         };
         let parent_actor_matches = matches!(
             blocked_execution.actor_ref(),
@@ -512,14 +511,14 @@ impl TaskService {
                 )
                 .await?;
             }
-            let agent_session_id = agent_session_id.ok_or_else(|| {
+            let _agent_session_id = agent_session_id.ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "blocked execution HarnessSession is not reusable in this workspace",
                 )
             })?;
             (
                 blocked_execution.harness_session_id.clone(),
-                executor_snapshot_with_resume_thread(&snapshot_json, &agent_session_id)?,
+                executor_snapshot_for_harness_resume(&snapshot_json)?,
             )
         } else {
             // Recovery still creates a new Execution, but a current Actor
@@ -529,13 +528,19 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
             (
                 None,
-                build_executor_config_snapshot(&self.db, &task, &agent, None)
-                    .await?
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "current recovery Agent produced no executor config snapshot",
-                        )
-                    })?,
+                build_executor_config_snapshot(
+                    &self.db,
+                    &task,
+                    &agent,
+                    None,
+                    self.adapter_registry.as_deref(),
+                )
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "current recovery Agent produced no executor config snapshot",
+                    )
+                })?,
             )
         };
         let updated_snapshot = if let Some(ctx) = context.as_deref() {
@@ -578,17 +583,12 @@ impl TaskService {
                     task_id: updated_task.id.clone(),
                     agent_id: Some(agent_id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent_id)),
-                    purpose: Some(
-                        blocked_execution
-                            .purpose
-                            .clone()
-                            .unwrap_or_else(|| {
-                                execution_purpose_for_task_type(
-                                    &updated_task.task_type,
-                                    &blocked_execution.role,
-                                )
-                            }),
-                    ),
+                    purpose: Some(blocked_execution.purpose.clone().unwrap_or_else(|| {
+                        execution_purpose_for_task_type(
+                            &updated_task.task_type,
+                            &blocked_execution.role,
+                        )
+                    })),
                     harness_session_id,
                     role: blocked_execution.role.clone(),
                     status: ExecutionStatus::Running,
@@ -809,8 +809,14 @@ impl TaskService {
                 self.repo_cache_locks.clone(),
             )
             .await?;
-        let executor_config_snapshot_json =
-            build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
+        let executor_config_snapshot_json = build_executor_config_snapshot(
+            &self.db,
+            &task,
+            &agent,
+            None,
+            self.adapter_registry.as_deref(),
+        )
+        .await?;
         // Clear recovery state before issuing an exact-version WorkspaceLease.
         let recovered = self.clear_blocking_metadata(&task.id).await?;
         let now = now_rfc3339();
@@ -821,7 +827,10 @@ impl TaskService {
                     task_id: recovered.id.clone(),
                     agent_id: Some(agent.id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-                    purpose: Some(execution_purpose_for_task_type(&recovered.task_type, role_name)),
+                    purpose: Some(execution_purpose_for_task_type(
+                        &recovered.task_type,
+                        role_name,
+                    )),
                     harness_session_id: None,
                     role: role_name.to_owned(),
                     status: ExecutionStatus::Running,
@@ -1157,6 +1166,7 @@ impl TaskService {
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
                 task_executor: self.task_executor.clone(),
+                adapter_registry: self.adapter_registry.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -1742,6 +1752,7 @@ impl TaskService {
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
                 task_executor: self.task_executor.clone(),
+                adapter_registry: self.adapter_registry.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -1804,6 +1815,7 @@ impl TaskService {
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
             task_executor: self.task_executor.clone(),
+            adapter_registry: self.adapter_registry.clone(),
             daemon_connections: self.daemon_connections.clone(),
             workspace_exec_locks: self.workspace_exec_locks.clone(),
             terminal_activity: self.terminal_activity.clone(),
@@ -2022,6 +2034,7 @@ impl TaskService {
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
                 task_executor: self.task_executor.clone(),
+                adapter_registry: self.adapter_registry.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -2238,8 +2251,7 @@ async fn latest_resumable_interactive_role_execution(
         .await?
         .map(|workspace| workspace.id);
     if let Some(execution) =
-        latest_resumable_interactive_exact_role(db, task_id, role, workspace_id.as_deref())
-            .await?
+        latest_resumable_interactive_exact_role(db, task_id, role, workspace_id.as_deref()).await?
     {
         return Ok(Some(execution));
     }
@@ -2281,14 +2293,9 @@ async fn latest_resumable_interactive_exact_role(
         ) {
             continue;
         }
-        if resumable_external_session(
-            db,
-            &execution,
-            execution.agent_id.as_deref(),
-            workspace_id,
-        )
-        .await?
-        .is_some()
+        if resumable_external_session(db, &execution, execution.agent_id.as_deref(), workspace_id)
+            .await?
+            .is_some()
         {
             return Ok(Some(execution));
         }

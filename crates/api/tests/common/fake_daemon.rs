@@ -6,8 +6,10 @@ use api::{serve_with_listener, AppState};
 use api_types::{
     DaemonFrame, DaemonRegisterResponse, DaemonResponse, ExecutionLogNotification,
     ExecutionStartResult, ExecutionTerminalNotification, FsEntry, FsListResult,
-    TerminalClientFrame, TerminalServerFrame, METHOD_EXECUTION_LOG, METHOD_EXECUTION_START,
-    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
+    TerminalClientFrame, TerminalServerFrame, DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, METHOD_EXECUTION_LOG,
+    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
+    METHOD_PROTOCOL_CAPABILITIES,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -185,6 +187,21 @@ pub async fn next_daemon_request(
         let frame: DaemonFrame = serde_json::from_str(text.as_ref()).expect("daemon frame parses");
         match frame {
             DaemonFrame::Request { id, method, params } => {
+                if method == METHOD_PROTOCOL_CAPABILITIES {
+                    send_daemon_response(
+                        socket,
+                        id,
+                        api_types::DaemonProtocolCapabilities {
+                            schema_version: 1,
+                            features: vec![
+                                DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
+                                DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                            ],
+                        },
+                    )
+                    .await;
+                    continue;
+                }
                 assert_eq!(method, expected_method);
                 return (id, params);
             }
@@ -513,9 +530,9 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
         CreateExecution {
             id: uuid::Uuid::new_v4().to_string(),
             task_id,
-            agent_id: Some(agent_id),
-            actor_ref: None,
-            purpose: None,
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id)),
+            purpose: Some(db::ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
@@ -532,7 +549,14 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                json!({
+                    "executor_type": "codex",
+                    "config": {},
+                    "harness_capabilities": api_types::HarnessCapabilities::unknown().snapshot()
+                })
+                .to_string(),
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now,
@@ -674,8 +698,8 @@ pub async fn seed_startable_execution_for_daemon(
             id: uuid::Uuid::new_v4().to_string(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
-            actor_ref: None,
-            purpose: None,
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,

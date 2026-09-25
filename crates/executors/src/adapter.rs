@@ -1,10 +1,12 @@
 use crate::{
-    config::resolve_config_value, ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor,
+    config::merge_overrides, ExecutionContext, ExecutionResult, ExecutorError,
+    ResolvedExecutorCandidate, TaskExecutor,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Registry of known CLI executor families.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,15 @@ pub struct DiscoveredOptions {
     pub cli_specific: serde_json::Value,
 }
 
+/// Generic policy posture after one adapter interprets its concrete config.
+/// Deterministic risk classification and workspace authority remain in Forge
+/// core and are not adapter-controlled fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessPolicyInterpretation {
+    pub permission_policy: String,
+    pub isolation_posture: String,
+}
+
 /// Per-execution overrides applied on top of profile config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionOverrides {
@@ -96,20 +107,45 @@ pub struct ExecutionOverrides {
     pub permission_policy: Option<String>,
 }
 
-/// Typed adapter trait for CLI-specific executor implementations.
+/// Harness protocol and capability authority for one concrete integration.
 #[async_trait]
-pub trait CodingExecutorAdapter: Send + Sync {
+pub trait HarnessAdapter: Send + Sync {
     fn kind(&self) -> ExecutorKind;
 
-    fn check_availability(&self) -> AvailabilityInfo;
+    /// Legacy family-level detector used by adapters whose availability does
+    /// not depend on one candidate's normalized configuration.
+    fn check_availability(&self) -> AvailabilityInfo {
+        AvailabilityInfo {
+            status: AvailabilityStatus::NotFound,
+            authenticated_at: None,
+            config_path: None,
+        }
+    }
 
-    /// Availability of one specific candidate config. Defaults to the
-    /// executor-family-level check; adapters whose config selects an account
-    /// (Smith profiles, Codex profiles) may override with a per-account
-    /// check. Account state that no precheck can see is still discovered
-    /// through typed runtime errors during execution.
-    fn check_candidate_availability(&self, _config: &serde_json::Value) -> AvailabilityInfo {
+    /// Detect availability without starting a model turn. Detection remains
+    /// advisory; typed runtime availability failures may still advance Start
+    /// fallback routes.
+    fn detect(&self, _config: &serde_json::Value) -> AvailabilityInfo {
         self.check_availability()
+    }
+
+    /// Return evidence for the exact normalized candidate configuration.
+    /// The default is Unknown for every dimension and therefore fails closed.
+    fn capabilities(&self, _config: &serde_json::Value) -> api_types::HarnessCapabilities {
+        api_types::HarnessCapabilities::unknown()
+    }
+
+    /// Normalize one concrete harness configuration after generic profile and
+    /// execution override layers have been merged. Concrete adapters override
+    /// this with their own typed config.
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        let mut normalized = config.clone();
+        merge_overrides(&mut normalized, overrides)?;
+        Ok(normalized)
     }
 
     async fn discover_options(
@@ -117,29 +153,90 @@ pub trait CodingExecutorAdapter: Send + Sync {
         ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError>;
 
+    /// Run the normalized invocation carried by the generic context. Concrete
+    /// protocol translation stays inside the adapter implementation.
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError>;
 
+    async fn start(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+        ctx.invocation = api_types::HarnessInvocation::Start;
+        self.execute(ctx).await
+    }
+
+    async fn resume(
+        &self,
+        mut ctx: ExecutionContext,
+        external_session_id: &str,
+    ) -> Result<ExecutionResult, ExecutorError> {
+        let support = self.capabilities(&ctx.agent_config).resume;
+        if !support.is_available() {
+            return Err(ExecutorError::UnsupportedCapability {
+                capability: "resume".to_owned(),
+                support,
+            });
+        }
+        ctx.invocation = api_types::HarnessInvocation::Resume {
+            external_session_id: external_session_id.to_owned(),
+        };
+        self.execute(ctx).await
+    }
+
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
+
+    /// Optional account/quota observation, separate from per-execution token
+    /// usage. It must not start a model turn.
+    async fn observe_usage(
+        &self,
+        _config: &serde_json::Value,
+        _cancel: CancellationToken,
+    ) -> Result<Option<UsageObservation>, ExecutorError> {
+        Ok(None)
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        None
+    }
+
+    fn interpret_execution_policy(
+        &self,
+        config: &serde_json::Value,
+    ) -> HarnessPolicyInterpretation {
+        let config = config.get("config").unwrap_or(config);
+        HarnessPolicyInterpretation {
+            permission_policy: config
+                .get("permission_policy")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            isolation_posture: "not_applicable".to_owned(),
+        }
+    }
 }
 
-/// Registry mapping ExecutorKind to adapter implementations.
-pub struct AdapterRegistry {
-    adapters: HashMap<ExecutorKind, Box<dyn CodingExecutorAdapter>>,
+#[derive(Debug, Clone)]
+pub struct UsageObservation {
+    pub value: serde_json::Value,
+    pub source: Option<String>,
 }
 
-impl AdapterRegistry {
+/// Registry mapping the current ExecutorKind compatibility identifier to the
+/// sole HarnessAdapter authority for that candidate.
+pub struct HarnessAdapterRegistry {
+    adapters: HashMap<ExecutorKind, Box<dyn HarnessAdapter>>,
+}
+
+impl HarnessAdapterRegistry {
     pub fn new() -> Self {
         Self {
             adapters: HashMap::new(),
         }
     }
 
-    pub fn register(&mut self, adapter: Box<dyn CodingExecutorAdapter>) {
+    pub fn register(&mut self, adapter: Box<dyn HarnessAdapter>) {
         let kind = adapter.kind();
         self.adapters.insert(kind, adapter);
     }
 
-    pub fn get(&self, kind: &ExecutorKind) -> Option<&dyn CodingExecutorAdapter> {
+    pub fn get(&self, kind: &ExecutorKind) -> Option<&dyn HarnessAdapter> {
         self.adapters.get(kind).map(|a| a.as_ref())
     }
 
@@ -148,7 +245,7 @@ impl AdapterRegistry {
     }
 }
 
-impl Default for AdapterRegistry {
+impl Default for HarnessAdapterRegistry {
     fn default() -> Self {
         Self::new()
     }
@@ -156,11 +253,11 @@ impl Default for AdapterRegistry {
 
 /// Supervisor-facing executor that dispatches to a typed CLI adapter.
 pub struct AdapterExecutor {
-    registry: Arc<AdapterRegistry>,
+    registry: Arc<HarnessAdapterRegistry>,
 }
 
 impl AdapterExecutor {
-    pub fn new(registry: Arc<AdapterRegistry>) -> Self {
+    pub fn new(registry: Arc<HarnessAdapterRegistry>) -> Self {
         Self { registry }
     }
 }
@@ -168,13 +265,41 @@ impl AdapterExecutor {
 #[async_trait]
 impl TaskExecutor for AdapterExecutor {
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-        let (kind, config) = resolve_context_config(&ctx.agent_config)?;
+        let (kind, raw_config) = executor_config_pair(&ctx.agent_config)?;
         let adapter = self.registry.get(&kind).ok_or_else(|| {
             ExecutorError::Other(format!("No adapter registered for executor type: {kind}"))
         })?;
-
-        ctx.agent_config = config;
-        adapter.execute(ctx).await
+        let config = adapter.normalize_config(&raw_config, &ExecutionOverrides::default())?;
+        let invocation_config =
+            crate::config::with_runtime_environment(&config, &ctx.agent_config)?;
+        let capabilities = adapter.capabilities(&config);
+        let policy_interpretation = adapter.interpret_execution_policy(&config);
+        let effective_policy = crate::effective_policy::from_harness_interpretation(
+            &kind,
+            &policy_interpretation.permission_policy,
+            &policy_interpretation.isolation_posture,
+            Some(&ctx.worktree_path),
+            None,
+            &config,
+        );
+        let candidate_key = crate::config::candidate_key(&kind, &config);
+        let execution_config = config.clone();
+        ctx.agent_config = invocation_config;
+        let invocation = ctx.invocation.clone();
+        let mut result = match invocation {
+            api_types::HarnessInvocation::Start => adapter.start(ctx).await?,
+            api_types::HarnessInvocation::Resume {
+                external_session_id,
+            } => adapter.resume(ctx, &external_session_id).await?,
+        };
+        result.resolved_candidate = Some(ResolvedExecutorCandidate {
+            candidate_key,
+            executor_type: kind,
+            config: execution_config,
+            harness_capabilities: capabilities,
+            effective_policy,
+        });
+        Ok(result)
     }
 
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
@@ -184,6 +309,15 @@ impl TaskExecutor for AdapterExecutor {
             }
         }
         Ok(())
+    }
+
+    async fn observe_usage(
+        &self,
+        kind: ExecutorKind,
+        config: &serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<UsageObservation>, ExecutorError> {
+        observe_usage_with_registry(&self.registry, kind, config, cancel).await
     }
 }
 
@@ -195,7 +329,7 @@ pub const DEFAULT_ACCOUNT_COOLDOWN: std::time::Duration = std::time::Duration::f
 /// advancing only on availability failures. Snapshots without a `routing`
 /// block behave exactly like `AdapterExecutor`.
 pub struct FallbackExecutor {
-    registry: Arc<AdapterRegistry>,
+    registry: Arc<HarnessAdapterRegistry>,
     cooldowns: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     cancellations: std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
@@ -205,10 +339,12 @@ struct RouteCandidate {
     config: serde_json::Value,
     candidate_key: String,
     account_key: String,
+    harness_capabilities: api_types::HarnessCapabilities,
+    effective_policy: api_types::EffectiveExecutionPolicy,
 }
 
 impl FallbackExecutor {
-    pub fn new(registry: Arc<AdapterRegistry>) -> Self {
+    pub fn new(registry: Arc<HarnessAdapterRegistry>) -> Self {
         Self {
             registry,
             cooldowns: std::sync::Mutex::new(HashMap::new()),
@@ -219,17 +355,44 @@ impl FallbackExecutor {
     /// The preferred candidate is the snapshot's top-level pair (the launch
     /// path points it at the sticky winner); remaining route candidates
     /// follow in configured order.
-    fn route(agent_config: &serde_json::Value) -> Result<Vec<RouteCandidate>, ExecutorError> {
-        let (preferred_kind, preferred_config) = resolve_context_config(agent_config)?;
+    fn route(
+        &self,
+        ctx: &ExecutionContext,
+        include_fallbacks: bool,
+    ) -> Result<Vec<RouteCandidate>, ExecutorError> {
+        let (preferred_kind, raw_preferred_config) = executor_config_pair(&ctx.agent_config)?;
+        let preferred_adapter = self.registry.get(&preferred_kind).ok_or_else(|| {
+            ExecutorError::Other(format!(
+                "No adapter registered for executor type: {preferred_kind}"
+            ))
+        })?;
+        let preferred_config = preferred_adapter
+            .normalize_config(&raw_preferred_config, &ExecutionOverrides::default())?;
         let preferred = RouteCandidate {
             candidate_key: crate::config::candidate_key(&preferred_kind, &preferred_config),
             account_key: crate::config::account_key(&preferred_kind, &preferred_config),
+            harness_capabilities: preferred_adapter.capabilities(&preferred_config),
+            effective_policy: {
+                let interpretation =
+                    preferred_adapter.interpret_execution_policy(&preferred_config);
+                crate::effective_policy::from_harness_interpretation(
+                    &preferred_kind,
+                    &interpretation.permission_policy,
+                    &interpretation.isolation_posture,
+                    Some(&ctx.worktree_path),
+                    None,
+                    &preferred_config,
+                )
+            },
             kind: preferred_kind,
             config: preferred_config,
         };
 
         let mut candidates = vec![preferred];
-        let routing = agent_config.get(crate::config::ROUTING_SNAPSHOT_KEY);
+        if !include_fallbacks {
+            return Ok(candidates);
+        }
+        let routing = ctx.agent_config.get(crate::config::ROUTING_SNAPSHOT_KEY);
         if let Some(routing) = routing {
             let routing: crate::config::ExecutorRouting = serde_json::from_value(routing.clone())
                 .map_err(|error| {
@@ -242,12 +405,19 @@ impl FallbackExecutor {
                 )));
             }
             for candidate in routing.candidates {
-                // Normalize (idempotent for snapshot-built routes) so keys are
-                // consistent regardless of how the routing block was authored.
-                let config = resolve_config_value(
-                    candidate.executor_type.clone(),
-                    &candidate.config,
-                    &ExecutionOverrides::default(),
+                let adapter = self.registry.get(&candidate.executor_type).ok_or_else(|| {
+                    ExecutorError::Other(format!(
+                        "No adapter registered for executor type: {}",
+                        candidate.executor_type
+                    ))
+                })?;
+                let config =
+                    adapter.normalize_config(&candidate.config, &ExecutionOverrides::default())?;
+                crate::config::validate_same_agent_candidate(
+                    &candidates[0].kind,
+                    &candidates[0].config,
+                    &candidate.executor_type,
+                    &config,
                 )?;
                 let key = crate::config::candidate_key(&candidate.executor_type, &config);
                 if candidates.iter().any(|c| c.candidate_key == key) {
@@ -256,6 +426,18 @@ impl FallbackExecutor {
                 candidates.push(RouteCandidate {
                     account_key: crate::config::account_key(&candidate.executor_type, &config),
                     candidate_key: key,
+                    harness_capabilities: adapter.capabilities(&config),
+                    effective_policy: {
+                        let interpretation = adapter.interpret_execution_policy(&config);
+                        crate::effective_policy::from_harness_interpretation(
+                            &candidate.executor_type,
+                            &interpretation.permission_policy,
+                            &interpretation.isolation_posture,
+                            Some(&ctx.worktree_path),
+                            None,
+                            &config,
+                        )
+                    },
                     kind: candidate.executor_type,
                     config,
                 });
@@ -345,7 +527,8 @@ impl FallbackExecutor {
 #[async_trait]
 impl TaskExecutor for FallbackExecutor {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-        let candidates = Self::route(&ctx.agent_config)?;
+        let is_resume = matches!(&ctx.invocation, api_types::HarnessInvocation::Resume { .. });
+        let candidates = self.route(&ctx, !is_resume)?;
         let cancelled = self.cancellation_flag(&ctx.execution_id);
         let single_candidate = candidates.len() == 1;
 
@@ -408,10 +591,10 @@ impl TaskExecutor for FallbackExecutor {
                     break 'chain None; // fall through to the registry error below
                 };
 
+                let invocation_config =
+                    crate::config::with_runtime_environment(&candidate.config, &ctx.agent_config)?;
                 if matches!(
-                    adapter
-                        .check_candidate_availability(&candidate.config)
-                        .status,
+                    adapter.detect(&invocation_config).status,
                     AvailabilityStatus::NotFound
                 ) {
                     attempts.push(crate::config::RouteAttempt {
@@ -440,8 +623,13 @@ impl TaskExecutor for FallbackExecutor {
                 }
 
                 let mut candidate_ctx = ctx.clone();
-                candidate_ctx.agent_config = candidate.config.clone();
-                let attempt = adapter.execute(candidate_ctx).await;
+                candidate_ctx.agent_config = invocation_config;
+                let attempt = match candidate_ctx.invocation.clone() {
+                    api_types::HarnessInvocation::Start => adapter.start(candidate_ctx).await,
+                    api_types::HarnessInvocation::Resume {
+                        external_session_id,
+                    } => adapter.resume(candidate_ctx, &external_session_id).await,
+                };
                 writer = crate::LogWriter::new(
                     std::path::Path::new(&ctx.logs_path),
                     ctx.execution_id.clone(),
@@ -476,6 +664,8 @@ impl TaskExecutor for FallbackExecutor {
                             candidate_key: candidate.candidate_key.clone(),
                             executor_type: candidate.kind.clone(),
                             config: candidate.config.clone(),
+                            harness_capabilities: candidate.harness_capabilities.clone(),
+                            effective_policy: candidate.effective_policy.clone(),
                         });
                         result.route_attempts = std::mem::take(&mut attempts);
                         break 'chain Some(result);
@@ -540,10 +730,17 @@ impl TaskExecutor for FallbackExecutor {
             )));
         }
 
-        let summary = format!(
-            "no executor candidate available: {}",
-            skip_reasons.join(", ")
-        );
+        let summary = if is_resume {
+            format!(
+                "exact harness session candidate unavailable; resume was not rerouted: {}",
+                skip_reasons.join(", ")
+            )
+        } else {
+            format!(
+                "no executor candidate available: {}",
+                skip_reasons.join(", ")
+            )
+        };
         Ok(Self::unavailable_result(
             attempts,
             aggregated_usage,
@@ -568,9 +765,38 @@ impl TaskExecutor for FallbackExecutor {
         }
         Ok(())
     }
+
+    async fn observe_usage(
+        &self,
+        kind: ExecutorKind,
+        config: &serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<UsageObservation>, ExecutorError> {
+        observe_usage_with_registry(&self.registry, kind, config, cancel).await
+    }
 }
 
-fn resolve_context_config(
+async fn observe_usage_with_registry(
+    registry: &HarnessAdapterRegistry,
+    kind: ExecutorKind,
+    config: &serde_json::Value,
+    cancel: CancellationToken,
+) -> Result<Option<UsageObservation>, ExecutorError> {
+    let adapter = registry.get(&kind).ok_or_else(|| {
+        ExecutorError::Other(format!("No adapter registered for executor type: {kind}"))
+    })?;
+    let normalized = adapter.normalize_config(config, &ExecutionOverrides::default())?;
+    let capabilities = adapter.capabilities(&normalized);
+    if !capabilities.account_usage_observation.is_available() {
+        return Err(ExecutorError::UnsupportedCapability {
+            capability: "account_usage_observation".to_owned(),
+            support: capabilities.account_usage_observation,
+        });
+    }
+    adapter.observe_usage(&normalized, cancel).await
+}
+
+fn executor_config_pair(
     agent_config: &serde_json::Value,
 ) -> Result<(ExecutorKind, serde_json::Value), ExecutorError> {
     let object = agent_config.as_object().ok_or_else(|| {
@@ -587,24 +813,45 @@ fn resolve_context_config(
             "No adapter registered for executor type: {executor_type}"
         ))
     })?;
-    let config = object.get("config").unwrap_or(agent_config);
-    let config = resolve_config_value(kind.clone(), config, &ExecutionOverrides::default())?;
+    let config = object.get("config").unwrap_or(agent_config).clone();
     Ok((kind, config))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_shell_command_plan, ExecutionOutcome, ExecutionResult, ShellConfig};
+    use crate::{
+        build_shell_command_plan, CodexConfig, ExecutionOutcome, ExecutionResult, ShellConfig,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn resolve_context_config(
+        snapshot: &serde_json::Value,
+    ) -> Result<(ExecutorKind, serde_json::Value), ExecutorError> {
+        let (kind, raw_config) = executor_config_pair(snapshot)?;
+        let config = crate::config::resolve_config_value(
+            kind.clone(),
+            &raw_config,
+            &ExecutionOverrides::default(),
+        )?;
+        Ok((kind, config))
+    }
 
     struct CapturingAdapter;
 
     #[async_trait]
-    impl CodingExecutorAdapter for CapturingAdapter {
+    impl HarnessAdapter for CapturingAdapter {
         fn kind(&self) -> ExecutorKind {
             ExecutorKind::Codex
+        }
+
+        fn normalize_config(
+            &self,
+            config: &serde_json::Value,
+            overrides: &ExecutionOverrides,
+        ) -> Result<serde_json::Value, ExecutorError> {
+            crate::normalize_harness_config::<CodexConfig>(self.kind(), config, overrides)
         }
 
         fn check_availability(&self) -> AvailabilityInfo {
@@ -649,7 +896,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CodingExecutorAdapter for CancelTrackingAdapter {
+    impl HarnessAdapter for CancelTrackingAdapter {
         fn kind(&self) -> ExecutorKind {
             ExecutorKind::Shell
         }
@@ -690,14 +937,16 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_executor_dispatches_using_snapshot_config() {
-        let mut registry = AdapterRegistry::new();
+        let mut registry = HarnessAdapterRegistry::new();
         registry.register(Box::new(CapturingAdapter));
         let executor = AdapterExecutor::new(Arc::new(registry));
 
         let result = executor
             .execute(ExecutionContext {
+                invocation: crate::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: ".".to_owned(),
                 description: "do it".to_owned(),
                 agent_config: serde_json::json!({
@@ -788,23 +1037,30 @@ mod tests {
             usage_output_tokens: i64,
         },
         AwaitCancel,
+        UnavailableAtDetect,
     }
 
     struct ScriptedAdapter {
+        kind: ExecutorKind,
         behaviors: std::collections::HashMap<String, ScriptedBehavior>,
         calls: Arc<std::sync::Mutex<Vec<String>>>,
+        observed_configs: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        invocations: Arc<std::sync::Mutex<Vec<api_types::HarnessInvocation>>>,
         started: Arc<tokio::sync::Notify>,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl ScriptedAdapter {
-        fn new(behaviors: &[(&str, ScriptedBehavior)]) -> Self {
+        fn new(kind: ExecutorKind, behaviors: &[(&str, ScriptedBehavior)]) -> Self {
             Self {
+                kind,
                 behaviors: behaviors
                     .iter()
                     .map(|(profile, behavior)| ((*profile).to_owned(), behavior.clone()))
                     .collect(),
                 calls: Arc::default(),
+                observed_configs: Arc::default(),
+                invocations: Arc::default(),
                 started: Arc::new(tokio::sync::Notify::new()),
                 cancelled: Arc::default(),
             }
@@ -812,9 +1068,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl CodingExecutorAdapter for ScriptedAdapter {
+    impl HarnessAdapter for ScriptedAdapter {
         fn kind(&self) -> ExecutorKind {
-            ExecutorKind::Smith
+            self.kind.clone()
         }
 
         fn check_availability(&self) -> AvailabilityInfo {
@@ -822,6 +1078,42 @@ mod tests {
                 status: AvailabilityStatus::Authenticated,
                 authenticated_at: None,
                 config_path: None,
+            }
+        }
+
+        fn detect(&self, config: &serde_json::Value) -> AvailabilityInfo {
+            let key = config
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| config.get("profile").and_then(serde_json::Value::as_str));
+            let unavailable = key.is_some_and(|key| {
+                matches!(
+                    self.behaviors.get(key),
+                    Some(ScriptedBehavior::UnavailableAtDetect)
+                )
+            });
+            AvailabilityInfo {
+                status: if unavailable {
+                    AvailabilityStatus::NotFound
+                } else {
+                    AvailabilityStatus::Authenticated
+                },
+                authenticated_at: None,
+                config_path: None,
+            }
+        }
+
+        fn capabilities(&self, config: &serde_json::Value) -> api_types::HarnessCapabilities {
+            let model = config.get("model").and_then(serde_json::Value::as_str);
+            api_types::HarnessCapabilities {
+                resume: api_types::CapabilitySupport::Native,
+                account_usage_observation: api_types::CapabilitySupport::Native,
+                structured_events: if model == Some("model-a") {
+                    api_types::CapabilitySupport::Native
+                } else {
+                    api_types::CapabilitySupport::Emulated
+                },
+                ..api_types::HarnessCapabilities::unknown()
             }
         }
 
@@ -833,16 +1125,25 @@ mod tests {
         }
 
         async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-            let profile = ctx.agent_config["profile"]
+            self.invocations
+                .lock()
+                .unwrap()
+                .push(ctx.invocation.clone());
+            self.observed_configs
+                .lock()
+                .unwrap()
+                .push(ctx.agent_config.clone());
+            let key = ctx.agent_config["model"]
                 .as_str()
-                .expect("scripted config has profile")
+                .or_else(|| ctx.agent_config["profile"].as_str())
+                .expect("scripted config has model or profile")
                 .to_owned();
-            self.calls.lock().unwrap().push(profile.clone());
+            self.calls.lock().unwrap().push(key.clone());
             let usage = |output_tokens: i64| crate::TokenUsage {
                 output_tokens,
                 ..Default::default()
             };
-            match self.behaviors.get(&profile).expect("scripted behavior") {
+            match self.behaviors.get(&key).expect("scripted behavior") {
                 ScriptedBehavior::Complete {
                     usage_output_tokens,
                 } => Ok(ExecutionResult {
@@ -872,6 +1173,9 @@ mod tests {
                         ..Default::default()
                     })
                 }
+                ScriptedBehavior::UnavailableAtDetect => Err(ExecutorError::Unavailable(
+                    "scripted candidate should have been filtered by detect".to_owned(),
+                )),
             }
         }
 
@@ -879,22 +1183,35 @@ mod tests {
             self.cancelled.store(true, Ordering::SeqCst);
             Ok(())
         }
+
+        async fn observe_usage(
+            &self,
+            config: &serde_json::Value,
+            _cancel: CancellationToken,
+        ) -> Result<Option<UsageObservation>, ExecutorError> {
+            Ok(Some(UsageObservation {
+                value: serde_json::json!({"profile": config["profile"]}),
+                source: Some("scripted_adapter_usage".to_owned()),
+            }))
+        }
     }
 
     fn routed_ctx(execution_id: &str, logs_dir: &std::path::Path) -> ExecutionContext {
         ExecutionContext {
+            invocation: crate::HarnessInvocation::Start,
             task_id: "task".to_owned(),
             execution_id: execution_id.to_owned(),
+            role: "coder".to_owned(),
             worktree_path: ".".to_owned(),
             description: "do it".to_owned(),
             agent_config: serde_json::json!({
                 "executor_type": "smith",
-                "config": {"profile": "acct-1"},
+                "config": {"profile": "acct-1", "model": "model-a"},
                 "routing": {
                     "policy": "ordered_fallback_v1",
                     "candidates": [
-                        {"executor_type": "smith", "config": {"profile": "acct-1"}},
-                        {"executor_type": "smith", "config": {"profile": "acct-2"}}
+                        {"executor_type": "smith", "config": {"profile": "acct-1", "model": "model-a"}},
+                        {"executor_type": "smith", "config": {"profile": "acct-1", "model": "model-b"}}
                     ]
                 }
             }),
@@ -911,26 +1228,26 @@ mod tests {
     fn fallback_executor(
         behaviors: &[(&str, ScriptedBehavior)],
     ) -> (FallbackExecutor, Arc<std::sync::Mutex<Vec<String>>>) {
-        let adapter = ScriptedAdapter::new(behaviors);
+        let adapter = ScriptedAdapter::new(ExecutorKind::Smith, behaviors);
         let calls = Arc::clone(&adapter.calls);
-        let mut registry = AdapterRegistry::new();
+        let mut registry = HarnessAdapterRegistry::new();
         registry.register(Box::new(adapter));
         (FallbackExecutor::new(Arc::new(registry)), calls)
     }
 
     #[tokio::test]
-    async fn fallback_advances_on_usage_exhaustion_and_aggregates_usage() {
+    async fn usage_exhaustion_does_not_fall_back_across_agent_identity() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
             (
-                "acct-1",
+                "model-a",
                 ScriptedBehavior::Exhausted {
                     retry_after_ms: 60_000,
                     usage_output_tokens: 10,
                 },
             ),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Complete {
                     usage_output_tokens: 5,
                 },
@@ -940,19 +1257,18 @@ mod tests {
         let result = executor
             .execute(routed_ctx("exec-1", dir.path()))
             .await
-            .expect("chain succeeds");
+            .expect("exhaustion is returned as an execution result");
 
-        assert_eq!(result.status, ExecutionOutcome::Completed);
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1", "acct-2"]);
-        assert_eq!(result.usage.expect("usage aggregated").output_tokens, 15);
-        let resolved = result.resolved_candidate.expect("winner recorded");
-        assert!(resolved.candidate_key.contains("profile=acct-2"));
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
+        assert_eq!(result.usage.expect("usage is preserved").output_tokens, 10);
+        assert!(result.resolved_candidate.is_none());
         let outcomes: Vec<_> = result.route_attempts.iter().map(|a| a.outcome).collect();
         assert_eq!(
             outcomes,
             vec![
                 crate::config::RouteAttemptOutcome::UsageExhausted,
-                crate::config::RouteAttemptOutcome::Completed
+                crate::config::RouteAttemptOutcome::SkippedCooldown
             ]
         );
     }
@@ -961,9 +1277,9 @@ mod tests {
     async fn task_failure_stops_chain_without_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
-            ("acct-1", ScriptedBehavior::FailTask),
+            ("model-a", ScriptedBehavior::FailTask),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Complete {
                     usage_output_tokens: 5,
                 },
@@ -980,22 +1296,22 @@ mod tests {
             result.failure_class,
             Some(crate::ExecutionFailureClass::TaskFailed)
         );
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
     }
 
     #[tokio::test]
-    async fn all_candidates_cooling_fails_fast_and_cooldowns_are_shared() {
+    async fn same_agent_candidates_share_account_cooldown() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
             (
-                "acct-1",
+                "model-a",
                 ScriptedBehavior::Exhausted {
                     retry_after_ms: 60_000,
                     usage_output_tokens: 0,
                 },
             ),
             (
-                "acct-2",
+                "model-b",
                 ScriptedBehavior::Exhausted {
                     retry_after_ms: 30_000,
                     usage_output_tokens: 0,
@@ -1012,8 +1328,9 @@ mod tests {
             Some(crate::ExecutionFailureClass::ExecutorUnavailable)
         );
         let retry = first.retry_after.expect("earliest retry propagated");
-        assert!(retry <= std::time::Duration::from_millis(30_000));
-        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert!(retry > std::time::Duration::from_secs(30));
+        assert!(retry <= std::time::Duration::from_secs(60));
+        assert_eq!(calls.lock().unwrap().len(), 1);
 
         // A second execution sees both accounts cooling: fail fast, no spawns.
         let second = executor
@@ -1026,7 +1343,7 @@ mod tests {
         );
         assert_eq!(
             calls.lock().unwrap().len(),
-            2,
+            1,
             "no CLI spawned while cooling"
         );
         let outcomes: Vec<_> = second.route_attempts.iter().map(|a| a.outcome).collect();
@@ -1042,18 +1359,21 @@ mod tests {
     #[tokio::test]
     async fn cancel_between_hops_spawns_no_further_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let adapter = ScriptedAdapter::new(&[
-            ("acct-1", ScriptedBehavior::AwaitCancel),
-            (
-                "acct-2",
-                ScriptedBehavior::Complete {
-                    usage_output_tokens: 5,
-                },
-            ),
-        ]);
+        let adapter = ScriptedAdapter::new(
+            ExecutorKind::Smith,
+            &[
+                ("model-a", ScriptedBehavior::AwaitCancel),
+                (
+                    "model-b",
+                    ScriptedBehavior::Complete {
+                        usage_output_tokens: 5,
+                    },
+                ),
+            ],
+        );
         let calls = Arc::clone(&adapter.calls);
         let started = Arc::clone(&adapter.started);
-        let mut registry = AdapterRegistry::new();
+        let mut registry = HarnessAdapterRegistry::new();
         registry.register(Box::new(adapter));
         let executor = Arc::new(FallbackExecutor::new(Arc::new(registry)));
 
@@ -1071,7 +1391,7 @@ mod tests {
 
         let result = run.await.expect("join").expect("terminal result");
         assert_eq!(result.status, ExecutionOutcome::Cancelled);
-        assert_eq!(*calls.lock().unwrap(), vec!["acct-1"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
     }
 
     #[tokio::test]
@@ -1101,9 +1421,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_intent_reaches_adapter_and_does_not_advance_to_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ScriptedAdapter::new(
+            ExecutorKind::Smith,
+            &[
+                (
+                    "model-a",
+                    ScriptedBehavior::Complete {
+                        usage_output_tokens: 1,
+                    },
+                ),
+                (
+                    "model-b",
+                    ScriptedBehavior::Complete {
+                        usage_output_tokens: 2,
+                    },
+                ),
+            ],
+        );
+        let calls = Arc::clone(&adapter.calls);
+        let invocations = Arc::clone(&adapter.invocations);
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(adapter));
+        let executor = FallbackExecutor::new(Arc::new(registry));
+
+        let mut ctx = routed_ctx("resume-exec", dir.path());
+        ctx.invocation = api_types::HarnessInvocation::Resume {
+            external_session_id: "external-session-abc".to_owned(),
+        };
+        let result = executor.execute(ctx).await.expect("resume completes");
+
+        assert_eq!(result.status, ExecutionOutcome::Completed);
+        assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
+        assert_eq!(
+            *invocations.lock().unwrap(),
+            vec![api_types::HarnessInvocation::Resume {
+                external_session_id: "external-session-abc".to_owned()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_use_an_available_alternate_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[
+            ("model-a", ScriptedBehavior::UnavailableAtDetect),
+            (
+                "model-b",
+                ScriptedBehavior::Complete {
+                    usage_output_tokens: 2,
+                },
+            ),
+        ]);
+        let mut ctx = routed_ctx("resume-exec", dir.path());
+        ctx.invocation = api_types::HarnessInvocation::Resume {
+            external_session_id: "session-from-acct-1".to_owned(),
+        };
+
+        let result = executor
+            .execute(ctx)
+            .await
+            .expect("unavailable is a result");
+
+        assert_eq!(
+            result.failure_class,
+            Some(crate::ExecutionFailureClass::ExecutorUnavailable)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(result.route_attempts.len(), 1);
+        assert!(result.resolved_candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_cannot_switch_harness_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = ScriptedAdapter::new(
+            ExecutorKind::Codex,
+            &[("acct-a", ScriptedBehavior::UnavailableAtDetect)],
+        );
+        let cursor = ScriptedAdapter::new(
+            ExecutorKind::Cursor,
+            &[(
+                "acct-b",
+                ScriptedBehavior::Complete {
+                    usage_output_tokens: 3,
+                },
+            )],
+        );
+        let cursor_calls = Arc::clone(&cursor.calls);
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(codex));
+        registry.register(Box::new(cursor));
+        let executor = FallbackExecutor::new(Arc::new(registry));
+
+        let mut ctx = routed_ctx("cross-harness-exec", dir.path());
+        ctx.agent_config = serde_json::json!({
+            "executor_type": "codex",
+            "config": {"profile": "acct-a"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "cursor", "config": {"profile": "acct-b"}}
+                ]
+            }
+        });
+
+        let result = executor.execute(ctx).await;
+        assert!(result.is_err(), "cross-harness fallback must be rejected");
+        assert!(cursor_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_agent_start_fallback_records_winning_model_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ScriptedAdapter::new(
+            ExecutorKind::Smith,
+            &[
+                ("model-a", ScriptedBehavior::UnavailableAtDetect),
+                (
+                    "model-b",
+                    ScriptedBehavior::Complete {
+                        usage_output_tokens: 3,
+                    },
+                ),
+            ],
+        );
+        let calls = Arc::clone(&adapter.calls);
+        let observed_configs = Arc::clone(&adapter.observed_configs);
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(adapter));
+        let executor = FallbackExecutor::new(Arc::new(registry));
+
+        let mut ctx = routed_ctx("same-harness-fallback", dir.path());
+        ctx.agent_config = serde_json::json!({
+            "executor_type": "smith",
+            "config": {"profile":"acct-1", "model":"model-a"},
+            "runtime_env": {"SMITH_API_KEY":"runtime-secret"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type":"smith","config":{"profile":"acct-1", "model":"model-b"}}
+                ]
+            }
+        });
+
+        let result = executor
+            .execute(ctx)
+            .await
+            .expect("same-kind fallback completes");
+        let winner = result.resolved_candidate.expect("winner recorded");
+
+        assert_eq!(winner.executor_type, ExecutorKind::Smith);
+        assert_eq!(winner.config["profile"], "acct-1");
+        assert_eq!(winner.config["model"], "model-b");
+        assert_eq!(
+            winner.harness_capabilities.structured_events,
+            api_types::CapabilitySupport::Emulated
+        );
+        assert_eq!(
+            winner.candidate_key,
+            crate::config::candidate_key(
+                &ExecutorKind::Smith,
+                &serde_json::json!({"profile":"acct-1", "model":"model-b"})
+            )
+        );
+        assert!(winner.config.get("env").is_none());
+        let invoked_config = observed_configs.lock().unwrap()[0].clone();
+        assert_eq!(invoked_config["model"], "model-b");
+        assert_eq!(invoked_config["env"]["SMITH_API_KEY"], "runtime-secret");
+        assert_eq!(*calls.lock().unwrap(), vec!["model-b"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_resume_is_an_explicit_unsupported_capability() {
+        let adapter = CapturingAdapter;
+        let ctx = routed_ctx("unknown-resume", std::path::Path::new("/tmp"));
+
+        let error = adapter
+            .resume(ctx, "session-unknown")
+            .await
+            .expect_err("unknown resume must fail closed");
+
+        assert!(matches!(
+            error,
+            ExecutorError::UnsupportedCapability {
+                capability,
+                support: api_types::CapabilitySupport::Unknown,
+            } if capability == "resume"
+        ));
+    }
+
+    #[tokio::test]
+    async fn generic_usage_observation_routes_through_registered_adapter() {
+        let adapter = ScriptedAdapter::new(
+            ExecutorKind::Smith,
+            &[(
+                "acct-usage",
+                ScriptedBehavior::Complete {
+                    usage_output_tokens: 0,
+                },
+            )],
+        );
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(adapter));
+        let executor = AdapterExecutor::new(Arc::new(registry));
+
+        let observation = executor
+            .observe_usage(
+                ExecutorKind::Smith,
+                &serde_json::json!({"profile":"acct-usage"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("adapter observation succeeds")
+            .expect("adapter returns an observation");
+
+        assert_eq!(
+            observation.value,
+            serde_json::json!({"profile":"acct-usage"})
+        );
+        assert_eq!(
+            observation.source.as_deref(),
+            Some("scripted_adapter_usage")
+        );
+    }
+
+    #[tokio::test]
     async fn adapter_executor_cancel_passthrough_reaches_registered_adapter() {
         let cancel_calls = Arc::new(AtomicUsize::new(0));
-        let mut registry = AdapterRegistry::new();
+        let mut registry = HarnessAdapterRegistry::new();
         registry.register(Box::new(CancelTrackingAdapter {
             cancel_calls: Arc::clone(&cancel_calls),
         }));

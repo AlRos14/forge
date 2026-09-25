@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, NullConfig,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, NullConfig,
 };
 use std::time::Duration;
 
@@ -21,9 +20,21 @@ impl Default for NullAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for NullAdapter {
+impl HarnessAdapter for NullAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Null
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<NullConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        executors::HarnessCapabilities::unsupported()
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -72,8 +83,10 @@ mod tests {
 
         let result = adapter
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: ".".to_owned(),
                 description: "test".to_owned(),
                 agent_config: serde_json::json!({"delay_seconds": 1}),

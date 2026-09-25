@@ -242,6 +242,7 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
         merge_service: ctx.merge_service.clone(),
         cleanup_scheduler: ctx.cleanup_scheduler.clone(),
         task_executor: ctx.task_executor.clone(),
+        adapter_registry: ctx.adapter_registry.clone(),
         daemon_connections: ctx.daemon_connections.clone(),
         workspace_exec_locks: ctx.workspace_exec_locks.clone(),
         terminal_activity: ctx.terminal_activity.clone(),

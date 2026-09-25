@@ -38,10 +38,7 @@ pub(crate) fn execution_purpose_for_role(role: &str) -> ExecutionPurpose {
 /// fallback for the legacy role-driven implementation path, but task types
 /// with a stronger domain meaning win so validation is not recorded as
 /// implementation merely because its workflow role is `worker`.
-pub(crate) fn execution_purpose_for_task_type(
-    task_type: &str,
-    role: &str,
-) -> ExecutionPurpose {
+pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> ExecutionPurpose {
     match task_type.trim().to_ascii_lowercase().as_str() {
         "planning" => ExecutionPurpose::Plan,
         "review" => ExecutionPurpose::Review,
@@ -72,6 +69,27 @@ pub async fn resumable_external_session(
         let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
             return Ok(None);
         };
+        let Some(agent) = AgentRepo::get_by_id(db, &session.agent_id).await? else {
+            return Ok(None);
+        };
+        if !harness_session_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            &session.harness_kind,
+            &session.profile_snapshot_json,
+        ) || !harness_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            execution.executor_config_snapshot_json.as_deref(),
+        ) {
+            // Historical PR2 fallbacks could have written a session under an
+            // Agent whose primary harness/account identity did not match the
+            // actual candidate. Keep that history, but do not advertise or
+            // resume it as continuity for the current Agent identity.
+            return Ok(None);
+        }
         let execution_harness_kind = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -105,6 +123,9 @@ pub async fn resumable_external_session(
         {
             return Ok(None);
         }
+        if !harness_session_resume_is_available(&session) {
+            return Ok(None);
+        }
         return Ok(session.external_session_id);
     }
 
@@ -121,13 +142,176 @@ pub async fn resumable_external_session(
             .agent_session_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
-        && (execution.workspace_id.is_none()
-            || execution.workspace_id.as_deref() == workspace_id)
+        && (execution.workspace_id.is_none() || execution.workspace_id.as_deref() == workspace_id)
         && expected_agent_id.is_none_or(|agent_id| actor_id == agent_id)
     {
+        let Some(snapshot_value) = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(snapshot_kind) = snapshot_value
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .filter(|kind| is_known_pr2_resume_harness(kind))
+        else {
+            return Ok(None);
+        };
+        if snapshot_value
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_some_and(|snapshot_agent_id| snapshot_agent_id != actor_id)
+        {
+            return Ok(None);
+        }
+        let Some(agent) = AgentRepo::get_by_id(db, &actor_id).await? else {
+            return Ok(None);
+        };
+        if !agent.executor_type.eq_ignore_ascii_case(snapshot_kind)
+            || !harness_identity_matches_value(
+                &agent.executor_type,
+                &agent.config_json,
+                agent.credential_ref.as_deref(),
+                &snapshot_value,
+            )
+        {
+            return Ok(None);
+        }
         return Ok(execution.agent_session_id.clone());
     }
     Ok(None)
+}
+
+fn harness_session_identity_matches_snapshot(
+    agent_harness_kind: &str,
+    agent_config_json: &str,
+    agent_credential_ref: Option<&str>,
+    session_harness_kind: &str,
+    profile_snapshot_json: &str,
+) -> bool {
+    let (Ok(agent_kind), Ok(session_kind), Ok(snapshot)) = (
+        agent_harness_kind.parse::<executors::ExecutorKind>(),
+        session_harness_kind.parse::<executors::ExecutorKind>(),
+        serde_json::from_str::<Value>(profile_snapshot_json),
+    ) else {
+        return false;
+    };
+    let Some(snapshot_kind) = snapshot
+        .get("executor_type")
+        .and_then(Value::as_str)
+        .and_then(|kind| kind.parse::<executors::ExecutorKind>().ok())
+    else {
+        return false;
+    };
+    if agent_kind != session_kind || snapshot_kind != session_kind {
+        return false;
+    }
+    harness_identity_matches_value(
+        agent_harness_kind,
+        agent_config_json,
+        agent_credential_ref,
+        &snapshot,
+    )
+}
+
+fn harness_identity_matches_snapshot(
+    agent_harness_kind: &str,
+    agent_config_json: &str,
+    agent_credential_ref: Option<&str>,
+    snapshot_json: Option<&str>,
+) -> bool {
+    let Some(snapshot) =
+        snapshot_json.and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+    else {
+        return false;
+    };
+    harness_identity_matches_value(
+        agent_harness_kind,
+        agent_config_json,
+        agent_credential_ref,
+        &snapshot,
+    )
+}
+
+fn harness_identity_matches_value(
+    agent_harness_kind: &str,
+    agent_config_json: &str,
+    agent_credential_ref: Option<&str>,
+    snapshot: &Value,
+) -> bool {
+    let (Ok(agent_kind), Ok(agent_config)) = (
+        agent_harness_kind.parse::<executors::ExecutorKind>(),
+        serde_json::from_str::<Value>(agent_config_json),
+    ) else {
+        return false;
+    };
+    let Some(snapshot_kind) = snapshot
+        .get("executor_type")
+        .and_then(Value::as_str)
+        .and_then(|kind| kind.parse::<executors::ExecutorKind>().ok())
+    else {
+        return false;
+    };
+    let Some(snapshot_config) = snapshot.get("config") else {
+        return false;
+    };
+    if agent_kind != snapshot_kind {
+        return false;
+    }
+    let current_credential_ref = agent_credential_ref
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty());
+    let historical_credential_ref = snapshot
+        .get("credential_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty());
+    current_credential_ref == historical_credential_ref
+        && executors::validate_same_agent_candidate(
+            &agent_kind,
+            &agent_config,
+            &snapshot_kind,
+            snapshot_config,
+        )
+        .is_ok()
+}
+
+/// Build the runtime-only invocation from the durable HarnessSession link.
+/// Absence means Start. A present but unusable link is an explicit failure and
+/// can never be rewritten into a fresh run.
+pub async fn harness_invocation_for_execution(
+    db: &SqliteDb,
+    execution: &Execution,
+    workspace_id: Option<&str>,
+) -> Result<api_types::HarnessInvocation> {
+    let Some(harness_session_id) = execution.harness_session_id.as_deref() else {
+        return Ok(api_types::HarnessInvocation::Start);
+    };
+    let Some(session) = db::HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
+        return Err(ServiceError::invalid_operation(
+            "Execution HarnessSession reference is missing",
+        ));
+    };
+    if session.status == db::HarnessSessionStatus::Pending && session.external_session_id.is_none()
+    {
+        // New Agent Executions receive a pending session row before dispatch.
+        // That row is the destination for the session created by Start, not a
+        // request to Resume an external session that does not exist yet.
+        return Ok(api_types::HarnessInvocation::Start);
+    }
+    let external_session_id =
+        resumable_external_session(db, execution, execution.agent_id.as_deref(), workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+            "explicit HarnessSession is not resumable under its historical capability evidence",
+        )
+            })?;
+    Ok(api_types::HarnessInvocation::Resume {
+        external_session_id,
+    })
 }
 
 /// Validate a parent-provided HarnessSession for child attachment. Actor
@@ -143,6 +327,9 @@ pub(crate) async fn reusable_harness_session_for_agent(
         return Ok(None);
     };
     let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
+        return Ok(None);
+    };
+    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
         return Ok(None);
     };
     let execution_harness_kind = execution
@@ -170,17 +357,68 @@ pub(crate) async fn reusable_harness_session_for_agent(
         || execution_harness_kind
             .as_deref()
             .is_some_and(|harness_kind| harness_kind != session.harness_kind)
+        || !harness_session_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            &session.harness_kind,
+            &session.profile_snapshot_json,
+        )
+        || !harness_identity_matches_snapshot(
+            &agent.executor_type,
+            &agent.config_json,
+            agent.credential_ref.as_deref(),
+            execution.executor_config_snapshot_json.as_deref(),
+        )
         || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
         || execution
             .agent_session_id
             .as_deref()
-            .is_some_and(|legacy_id| {
-                session.external_session_id.as_deref() != Some(legacy_id)
-            })
+            .is_some_and(|legacy_id| session.external_session_id.as_deref() != Some(legacy_id))
     {
         return Ok(None);
     }
+    if !harness_session_resume_is_available(&session) {
+        return Ok(None);
+    }
     Ok(Some(session))
+}
+
+/// PR2 wrote Agent tag JSON into this column. New snapshots use the typed
+/// HarnessCapabilities shape; that evidence wins. For untyped PR2 history,
+/// only adapter kinds whose concrete PR2 integration explicitly implemented
+/// resume receive this bounded compatibility allowance. PR13 removes it.
+fn harness_session_resume_is_available(session: &HarnessSession) -> bool {
+    let Ok(snapshot) = serde_json::from_str::<Value>(&session.capabilities_snapshot_json) else {
+        return false;
+    };
+    match api_types::HarnessCapabilitiesSnapshot::from_value(&snapshot) {
+        api_types::HarnessCapabilitiesSnapshotRead::VersionedV1(capabilities) => {
+            return capabilities.resume.is_available();
+        }
+        api_types::HarnessCapabilitiesSnapshotRead::UnsupportedVersion(_)
+        | api_types::HarnessCapabilitiesSnapshotRead::Malformed => return false,
+        api_types::HarnessCapabilitiesSnapshotRead::Unversioned => {}
+    }
+    // Bounded PR2 compatibility: only its exact tag-array/empty-object shapes
+    // and integrations with an implemented exact resume protocol are trusted.
+    // Partial capability-looking objects and malformed/future versioned data
+    // never enter this path. PR13 removes this allowlist.
+    let legacy_shape = snapshot
+        .as_array()
+        .is_some_and(|tags| tags.iter().all(Value::is_string))
+        || snapshot.as_object().is_some_and(serde_json::Map::is_empty);
+    if !legacy_shape {
+        return false;
+    }
+    is_known_pr2_resume_harness(&session.harness_kind)
+}
+
+fn is_known_pr2_resume_harness(harness_kind: &str) -> bool {
+    matches!(
+        harness_kind,
+        "codex" | "claude_code" | "cursor" | "opencode" | "smith"
+    )
 }
 
 /// Reconcile a pre-PR2 Execution's exact legacy external identity into the
@@ -218,6 +456,60 @@ pub(crate) async fn materialize_historical_harness_session(
 #[cfg(test)]
 mod purpose_tests {
     use super::*;
+
+    #[test]
+    fn historical_session_identity_allows_run_config_but_rejects_harness_account_and_credential_changes(
+    ) {
+        let current_config = r#"{"model":"gpt-5","env":{"CODEX_HOME":"/accounts/one"}}"#;
+        let same_identity_new_model = r#"{"executor_type":"codex","credential_ref":"cred-one","config":{"model":"gpt-5.1","model_reasoning_effort":"high","env":{"CODEX_HOME":"/accounts/one"}}}"#;
+        assert!(harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            same_identity_new_model,
+        ));
+
+        let other_harness = r#"{"executor_type":"cursor","credential_ref":"cred-one","config":{"model":"gpt-5.1"}}"#;
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "cursor",
+            other_harness,
+        ));
+
+        let other_account = r#"{"executor_type":"codex","credential_ref":"cred-one","config":{"model":"gpt-5","env":{"CODEX_HOME":"/accounts/two"}}}"#;
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            other_account,
+        ));
+
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-two"),
+            "codex",
+            same_identity_new_model,
+        ));
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            r#"{"executor_type":"codex","config":{"model":"gpt-5"}}"#,
+        ));
+        assert!(!harness_session_identity_matches_snapshot(
+            "codex",
+            current_config,
+            Some("cred-one"),
+            "codex",
+            "{malformed",
+        ));
+    }
 
     #[test]
     fn role_mapping_is_only_a_compatibility_default() {
@@ -529,19 +821,22 @@ impl CursorUsageProbe {
     }
 }
 
-pub(super) fn spawn_cursor_usage_probe(
+pub(super) fn spawn_account_usage_probe(
     db: Arc<SqliteDb>,
     snapshot: Option<String>,
     execution_id: String,
+    executor: Arc<dyn executors::TaskExecutor>,
 ) -> Option<CursorUsageProbe> {
-    let is_cursor = snapshot.as_deref().and_then(|snapshot| {
-        serde_json::from_str::<Value>(snapshot)
-            .ok()?
-            .get("executor_type")
-            .and_then(Value::as_str)
-            .map(|executor_type| executor_type == "cursor")
-    }) == Some(true);
-    if !is_cursor {
+    let snapshot = snapshot?;
+    let value = serde_json::from_str::<Value>(&snapshot).ok()?;
+    let kind = value
+        .get("executor_type")
+        .and_then(Value::as_str)?
+        .parse::<executors::ExecutorKind>()
+        .ok()?;
+    // PR0A's periodic account quota poll is Cursor-specific. Other adapters
+    // can expose an explicit observation API without changing that policy.
+    if kind != executors::ExecutorKind::Cursor {
         return None;
     }
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -551,9 +846,12 @@ pub(super) fn spawn_cursor_usage_probe(
             if task_cancel.is_cancelled() {
                 break;
             }
-            persist_cursor_account_usage_probe(
+            persist_account_usage_probe(
                 &db,
-                snapshot.as_deref(),
+                &snapshot,
+                kind.clone(),
+                value.get("config").unwrap_or(&Value::Null).clone(),
+                Arc::clone(&executor),
                 &execution_id,
                 task_cancel.clone(),
             )
@@ -567,37 +865,33 @@ pub(super) fn spawn_cursor_usage_probe(
     Some(CursorUsageProbe { cancel, task })
 }
 
-async fn persist_cursor_account_usage_probe(
+async fn persist_account_usage_probe(
     db: &SqliteDb,
-    snapshot: Option<&str>,
+    snapshot: &str,
+    kind: executors::ExecutorKind,
+    config: Value,
+    executor: Arc<dyn executors::TaskExecutor>,
     execution_id: &str,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let Some(snapshot) = snapshot else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(snapshot) else {
-        return;
-    };
-    let config = serde_json::from_value::<executors::CursorConfig>(
-        value.get("config").cloned().unwrap_or(Value::Null),
-    )
-    .unwrap_or_default();
-    match cli_adapters::cursor::query_account_usage_with_cancel(&config, cancel.clone()).await {
-        Ok(usage) => {
+    match executor.observe_usage(kind, &config, cancel.clone()).await {
+        Ok(Some(observation)) => {
             if let Err(error) = persist_account_usage_snapshot_with_source(
                 db,
                 Some(snapshot),
                 execution_id,
-                &usage,
-                "cursor_poll",
+                &observation.value,
+                observation
+                    .source
+                    .as_deref()
+                    .unwrap_or("harness_account_usage"),
             )
             .await
             {
                 tracing::warn!(
                     execution_id = %execution_id,
                     %error,
-                    "failed to persist Cursor account usage snapshot"
+                    "failed to persist harness account usage snapshot"
                 );
             }
         }
@@ -605,10 +899,10 @@ async fn persist_cursor_account_usage_probe(
             tracing::warn!(
                 execution_id = %execution_id,
                 %error,
-                "failed to probe Cursor account usage"
+                "failed to observe harness account usage"
             );
         }
-        Err(_) => {}
+        Ok(None) | Err(_) => {}
     }
 }
 
@@ -751,11 +1045,81 @@ pub(super) async fn persist_planner_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        account_usage_from_log_entry, account_usage_source_from_payload, normalize_account_usage,
-        snapshot_usage_account_key,
+        account_usage_from_log_entry, account_usage_source_from_payload,
+        harness_session_resume_is_available, normalize_account_usage, snapshot_usage_account_key,
     };
+    use db::{HarnessSession, HarnessSessionStatus};
     use executors::{LogEntry, LogKind, LogStream};
     use serde_json::json;
+
+    fn harness_session(harness_kind: &str, capabilities: serde_json::Value) -> HarnessSession {
+        HarnessSession {
+            id: "session-row".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            harness_kind: harness_kind.to_owned(),
+            external_session_id: Some("external-session".to_owned()),
+            profile_id: None,
+            profile_snapshot_json: "{}".to_owned(),
+            capabilities_snapshot_json: capabilities.to_string(),
+            workspace_id: Some("workspace-1".to_owned()),
+            status: HarnessSessionStatus::Active,
+            predecessor_session_id: None,
+            created_at: "2026-09-23T00:00:00Z".to_owned(),
+            updated_at: "2026-09-23T00:00:00Z".to_owned(),
+            last_activity_at: None,
+        }
+    }
+
+    #[test]
+    fn historical_resume_support_is_typed_or_narrow_pr2_compatibility() {
+        let mut typed = api_types::HarnessCapabilities::unknown();
+        typed.resume = api_types::CapabilitySupport::Native;
+        assert!(harness_session_resume_is_available(&harness_session(
+            "custom_harness",
+            serde_json::to_value(typed.snapshot()).unwrap(),
+        )));
+
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "custom_harness",
+            serde_json::to_value(api_types::HarnessCapabilities::unknown().snapshot()).unwrap(),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"resume":"unsupported"}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"resume":"native"}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!(["legacy-tag", 7]),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"schema_version":"one", "capabilities":{"resume":"native"}}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"schema_version":1, "capabilities":{"resume":"future_native"}}),
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "gemini",
+            json!(["legacy-agent-tag"]),
+        )));
+        assert!(harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!(["legacy-agent-tag"]),
+        )));
+        assert!(harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({})
+        )));
+        assert!(!harness_session_resume_is_available(&harness_session(
+            "codex",
+            json!({"schema_version": 2, "capabilities": {"resume":"native"}}),
+        )));
+    }
 
     #[test]
     fn wraps_codex_rate_limit_params_as_rate_limits() {

@@ -51,13 +51,14 @@ async fn test_resolve_execution_actions_targets_current_role() {
         coder_execution.id.clone(),
         reviewer_execution.id.clone(),
     ]);
-    let actions = crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
-        &task,
-        &workflow,
-        &executions,
-        Some(&annotation),
-        Some(&resumable_execution_ids),
-    );
+    let actions =
+        crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
+            &task,
+            &workflow,
+            &executions,
+            Some(&annotation),
+            Some(&resumable_execution_ids),
+        );
 
     let workflow_resume = actions
         .iter()
@@ -101,16 +102,17 @@ async fn test_resolve_execution_actions_targets_current_role() {
         "2026-05-02T10:10:00Z",
     )
     .await;
-    let actions = crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
-        &task,
-        &workflow,
-        &[coder_without_session],
-        Some(&api_types::TaskBlockingAnnotation {
-            blocked_execution_id: Some("missing".to_owned()),
-            ..annotation
-        }),
-        Some(&std::collections::HashSet::new()),
-    );
+    let actions =
+        crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
+            &task,
+            &workflow,
+            &[coder_without_session],
+            Some(&api_types::TaskBlockingAnnotation {
+                blocked_execution_id: Some("missing".to_owned()),
+                ..annotation
+            }),
+            Some(&std::collections::HashSet::new()),
+        );
     let workflow_resume = actions
         .iter()
         .find(|action| action.action == api_types::ExecutionActionKind::WorkflowResume)

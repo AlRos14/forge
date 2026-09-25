@@ -1078,9 +1078,35 @@ export interface AgentDiscoveredOptions {
   models: string[]
   permission_policies: string[]
   cli_specific: Record<string, unknown>
+  harness_capabilities: HarnessCapabilities
   available_daemons: Array<{ id: string; name: string; status: string }>
   warning: string | null
 }
+
+export type CapabilitySupport = 'native' | 'emulated' | 'unsupported' | 'unknown'
+
+export interface HarnessCapabilities {
+  resume: CapabilitySupport
+  cancel: CapabilitySupport
+  structured_events: CapabilitySupport
+  usage_reporting: CapabilitySupport
+  account_usage_observation: CapabilitySupport
+  model_selection: CapabilitySupport
+  reasoning_controls: CapabilitySupport
+  approval_policy: CapabilitySupport
+  sandbox_controls: CapabilitySupport
+  planning: CapabilitySupport
+  review_mode: CapabilitySupport
+  fork: CapabilitySupport
+  steer: CapabilitySupport
+  pause_resume: CapabilitySupport
+  compaction: CapabilitySupport
+  subagents: CapabilitySupport
+}
+
+export type HarnessInvocation =
+  | { type: 'start' }
+  | { type: 'resume'; external_session_id: string }
 
 export interface AgentAvailability {
   available: boolean

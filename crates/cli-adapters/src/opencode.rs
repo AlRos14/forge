@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, OpencodeConfig, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter, OpencodeConfig, PermissionPolicy,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,22 @@ impl OpencodeAdapter {
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> OpencodeConfig {
-        serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
+        let mut config: OpencodeConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--session", "--resume"],
+            &["--continue"],
+        );
+        match &ctx.invocation {
+            executors::HarnessInvocation::Start => config.resume_session_id = None,
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
+                config.resume_session_id = Some(external_session_id.clone());
+            }
+        }
+        config
     }
 
     fn build_command(config: &OpencodeConfig, prompt: &str) -> tokio::process::Command {
@@ -107,13 +122,47 @@ impl Default for OpencodeAdapter {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for OpencodeAdapter {
+impl HarnessAdapter for OpencodeAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Opencode
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
         detect_opencode_availability()
+    }
+
+    fn normalize_config(
+        &self,
+        config: &serde_json::Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<serde_json::Value, ExecutorError> {
+        executors::normalize_harness_config::<OpencodeConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+        )
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("opencode".to_owned())
     }
 
     async fn discover_options(
@@ -264,6 +313,12 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 ..Default::default()
             });
         }
+
+        crate::require_exact_resumed_session(
+            "OpenCode",
+            config.resume_session_id.as_deref(),
+            stream.agent_session_id.as_deref(),
+        )?;
 
         let after_sha = if let Ok(false) =
             git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
@@ -789,6 +844,38 @@ fn strip_ansi_codes(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
+        let stale = serde_json::json!({
+            "resume_session_id":"old-session",
+            "additional_params":["--session", "old-cli-session", "--continue", "--verbose"]
+        });
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start_config = OpencodeAdapter::resolve_config(&start);
+        assert!(start_config.resume_session_id.is_none());
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+
+        let resume = crate::test_execution_context(
+            executors::HarnessInvocation::Resume {
+                external_session_id: "exact-session".to_owned(),
+            },
+            stale,
+        );
+        let resume_config = OpencodeAdapter::resolve_config(&resume);
+        assert_eq!(
+            resume_config.resume_session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+    }
     use executors::CommandOverrides;
 
     #[test]
@@ -924,8 +1011,10 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         let adapter = OpencodeAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -968,8 +1057,10 @@ printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message"
         let adapter = OpencodeAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -1011,8 +1102,10 @@ printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-
         let adapter = OpencodeAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({

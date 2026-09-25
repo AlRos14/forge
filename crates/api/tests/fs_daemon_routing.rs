@@ -11,14 +11,15 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    BranchListResponse, CreateTerminalSessionResponse, DaemonFrame, ErrorResponse,
-    ExecutionTerminalNotification, FsListResponse, TerminalAvailability, TerminalClientFrame,
-    TerminalInputParams, TerminalInputResult, TerminalOutputNotification, TerminalResizeParams,
-    TerminalResizeResult, TerminalServerFrame, TerminalSessionResponse,
+    BranchListResponse, CreateTerminalSessionResponse, DaemonFrame, DaemonProtocolCapabilities,
+    ErrorResponse, ExecutionTerminalNotification, FsListResponse, TerminalAvailability,
+    TerminalClientFrame, TerminalInputParams, TerminalInputResult, TerminalOutputNotification,
+    TerminalResizeParams, TerminalResizeResult, TerminalServerFrame, TerminalSessionResponse,
     TerminalSessionStatus as ApiTerminalSessionStatus, TerminalStartParams, TerminalStartResult,
     TerminalTerminateParams, TerminalTerminateResult, METHOD_EXECUTION_START,
-    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_OUTPUT,
-    METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, PATH_GUARDRAIL,
+    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT,
+    METHOD_TERMINAL_OUTPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
+    METHOD_TERMINAL_TERMINATE, PATH_GUARDRAIL,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -509,11 +510,8 @@ async fn connected_remote_daemon_receives_execution_start_request() {
     let starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
         tokio::spawn(async move { service.start_execution(execution_id).await });
 
-    let frame = outbound.recv().await.expect("server sends execution start");
-    let DaemonFrame::Request { id, method, params } = frame else {
-        panic!("expected daemon request frame");
-    };
-    assert_eq!(method, METHOD_EXECUTION_START);
+    let (id, params) =
+        next_execution_start_request(&state, &registration.daemon_id, &mut outbound).await;
     assert_eq!(params["execution_id"], fixture.execution.id);
     assert_eq!(params["task_id"], fixture.task_id);
     assert_eq!(params["workspace_path"], fixture.workspace_path);
@@ -559,11 +557,8 @@ async fn remote_execution_start_error_marks_execution_failed() {
     let starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
         tokio::spawn(async move { service.start_execution(execution_id).await });
 
-    let frame = outbound.recv().await.expect("server sends execution start");
-    let DaemonFrame::Request { id, method, .. } = frame else {
-        panic!("expected daemon request frame");
-    };
-    assert_eq!(method, METHOD_EXECUTION_START);
+    let (id, _params) =
+        next_execution_start_request(&state, &registration.daemon_id, &mut outbound).await;
 
     state.daemon_connections.dispatch_incoming(
         &registration.daemon_id,
@@ -972,6 +967,39 @@ async fn test_state() -> Arc<AppState> {
 
 fn test_app(state: &AppState) -> Router {
     build_router(state.clone(), temp_web_dist())
+}
+
+async fn next_execution_start_request(
+    state: &AppState,
+    daemon_id: &str,
+    outbound: &mut tokio::sync::mpsc::Receiver<DaemonFrame>,
+) -> (String, Value) {
+    loop {
+        let frame = outbound.recv().await.expect("server sends daemon request");
+        let DaemonFrame::Request { id, method, params } = frame else {
+            panic!("expected daemon request frame");
+        };
+        if method == METHOD_PROTOCOL_CAPABILITIES {
+            state.daemon_connections.dispatch_incoming(
+                daemon_id,
+                DaemonFrame::Response {
+                    id,
+                    result: serde_json::to_value(DaemonProtocolCapabilities {
+                        schema_version: 1,
+                        features: vec![
+                            api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1
+                                .to_owned(),
+                            api_types::DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                        ],
+                    })
+                    .expect("protocol capabilities serialize"),
+                },
+            );
+            continue;
+        }
+        assert_eq!(method, METHOD_EXECUTION_START);
+        return (id, params);
+    }
 }
 async fn empty_request<T: DeserializeOwned>(
     app: &Router,

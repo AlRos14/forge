@@ -1,9 +1,10 @@
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from, ActorRef,
-    AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, CreateExecution,
-    CreateHarnessSession, CreateRepo, CreateWorkspace, DbError, ExecutionPurpose, ExecutionRepo,
-    ExecutionStatus, HarnessSessionRepo, HarnessSessionStatus, RepoRepo, SqliteDb,
-    UpdateExecution, UpdateHarnessSession, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    AgentProfileRepo, AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile,
+    CreateExecution, CreateHarnessSession, CreateRepo, CreateWorkspace, DbError, ExecutionPurpose,
+    ExecutionRepo, ExecutionStatus, HarnessSessionRepo, HarnessSessionStatus, RepoRepo,
+    SelectAgentProfile, SqliteDb, UpdateExecution, UpdateHarnessSession, WorkMode, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use std::{
     fs,
@@ -18,6 +19,15 @@ async fn database() -> SqliteDb {
 }
 
 async fn seed_agent(db: &SqliteDb, agent_id: &str, executor_type: &str) -> String {
+    seed_agent_with_policy(db, agent_id, executor_type, "plan").await
+}
+
+async fn seed_agent_with_policy(
+    db: &SqliteDb,
+    agent_id: &str,
+    executor_type: &str,
+    permission_policy: &str,
+) -> String {
     let now = now_rfc3339();
     let profile_id = new_uuid_v4();
     AgentRepo::create_identity_with_profile(
@@ -47,7 +57,7 @@ async fn seed_agent(db: &SqliteDb, agent_id: &str, executor_type: &str) -> Strin
             provider: Some("test".to_owned()),
             model: Some("test-model".to_owned()),
             reasoning_effort: None,
-            permission_policy: Some("plan".to_owned()),
+            permission_policy: Some(permission_policy.to_owned()),
             prompt_template: None,
             capabilities_json: r#"["read"]"#.to_owned(),
             tool_policy_json: "{}".to_owned(),
@@ -92,20 +102,68 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
     task_id
 }
 
-async fn seed_workspaces(db: &SqliteDb, task_id: &str) -> (String, String) {
+fn harness_capabilities_for(executor_type: &str) -> serde_json::Value {
+    let mut capabilities = serde_json::json!({
+        "resume":"unsupported",
+        "cancel":"unsupported",
+        "structured_events":"unsupported",
+        "usage_reporting":"unsupported",
+        "account_usage_observation":"unsupported",
+        "model_selection":"unsupported",
+        "reasoning_controls":"unsupported",
+        "approval_policy":"unsupported",
+        "sandbox_controls":"unsupported",
+        "planning":"unsupported",
+        "review_mode":"unsupported",
+        "fork":"unsupported",
+        "steer":"unsupported",
+        "pause_resume":"unsupported",
+        "compaction":"unsupported",
+        "subagents":"unsupported"
+    });
+    match executor_type {
+        "codex" => {
+            capabilities["resume"] = serde_json::json!("native");
+            capabilities["cancel"] = serde_json::json!("emulated");
+            capabilities["structured_events"] = serde_json::json!("native");
+            capabilities["usage_reporting"] = serde_json::json!("native");
+            capabilities["account_usage_observation"] = serde_json::json!("native");
+            capabilities["model_selection"] = serde_json::json!("native");
+            capabilities["reasoning_controls"] = serde_json::json!("native");
+            capabilities["approval_policy"] = serde_json::json!("native");
+            capabilities["sandbox_controls"] = serde_json::json!("native");
+            capabilities["fork"] = serde_json::json!("native");
+        }
+        "cursor" => {
+            capabilities["resume"] = serde_json::json!("native");
+            capabilities["cancel"] = serde_json::json!("emulated");
+            capabilities["structured_events"] = serde_json::json!("native");
+            capabilities["usage_reporting"] = serde_json::json!("native");
+            capabilities["account_usage_observation"] = serde_json::json!("emulated");
+            capabilities["model_selection"] = serde_json::json!("native");
+            capabilities["approval_policy"] = serde_json::json!("native");
+            capabilities["steer"] = serde_json::json!("unknown");
+        }
+        "shell" => capabilities["cancel"] = serde_json::json!("emulated"),
+        _ => {}
+    }
+    serde_json::json!({"schema_version": 1, "capabilities": capabilities})
+}
+
+async fn seed_workspace(db: &SqliteDb, task_id: &str, label: &str) -> String {
     let now = now_rfc3339();
     let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
         .bind(task_id)
         .fetch_one(db.pool())
         .await
         .expect("task project loads");
-    let repo_id = format!("pr2-repo-{task_id}");
+    let repo_id = format!("pr2-repo-{label}");
     RepoRepo::create(
         db,
         CreateRepo {
             id: repo_id.clone(),
             project_id,
-            name: "PR2 repo".to_owned(),
+            name: format!("PR2 repo {label}"),
             remote_url: "https://example.invalid/pr2.git".to_owned(),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
@@ -123,27 +181,31 @@ async fn seed_workspaces(db: &SqliteDb, task_id: &str) -> (String, String) {
         .await
         .expect("task repo binds");
 
-    let first = format!("pr2-workspace-{task_id}-one");
-    let second = format!("pr2-workspace-{task_id}-two");
-    for (id, branch) in [(&first, "pr2-one"), (&second, "pr2-two")] {
-        WorkspaceRepo::create(
-            db,
-            CreateWorkspace {
-                id: id.clone(),
-                task_id: task_id.to_owned(),
-                repo_id: repo_id.clone(),
-                worktree_path: format!("/tmp/{id}"),
-                branch: branch.to_owned(),
-                status: WorkspaceStatus::Ready,
-                before_sha: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("workspace creates");
-    }
-    (first, second)
+    let id = format!("pr2-workspace-{label}");
+    WorkspaceRepo::create(
+        db,
+        CreateWorkspace {
+            id: id.clone(),
+            task_id: task_id.to_owned(),
+            repo_id,
+            worktree_path: format!("/tmp/{id}"),
+            branch: format!("pr2-{label}"),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("workspace creates");
+    id
+}
+
+async fn seed_workspaces(db: &SqliteDb, task_id: &str) -> (String, String, String) {
+    let first = seed_workspace(db, task_id, "one").await;
+    let second_task_id = seed_task(db, "workspace-second").await;
+    let second = seed_workspace(db, &second_task_id, "two").await;
+    (first, second_task_id, second)
 }
 
 fn execution_input(
@@ -185,6 +247,7 @@ fn execution_input(
                 "profile_id": profile_id,
                 "executor_type": executor_type,
                 "capabilities": ["read"],
+                "harness_capabilities": harness_capabilities_for(executor_type),
                 "config": {"model": "test-model"}
             })
             .to_string(),
@@ -250,9 +313,18 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     assert_eq!(pending.agent_id, "pr2-agent-a");
     assert_eq!(pending.harness_kind, "codex");
     assert_eq!(pending.profile_id.as_deref(), Some(profile_id.as_str()));
-    assert!(pending.profile_snapshot_json.contains("test-model"));
-    assert_eq!(pending.capabilities_snapshot_json, r#"["read"]"#);
-
+    let profile_snapshot: serde_json::Value =
+        serde_json::from_str(&pending.profile_snapshot_json).expect("profile snapshot parses");
+    assert_eq!(profile_snapshot["config"]["model"], "test-model");
+    assert_eq!(
+        profile_snapshot["capabilities"],
+        serde_json::json!(["read"])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&pending.capabilities_snapshot_json)
+            .expect("typed HarnessCapabilities parse"),
+        harness_capabilities_for("codex")
+    );
     let pending_inheritance = ExecutionRepo::create(
         &db,
         execution_input(
@@ -286,13 +358,12 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     assert_eq!(active.status, HarnessSessionStatus::Active);
     assert_eq!(active.external_session_id.as_deref(), Some("thread-1"));
 
-    let direct_projection_divergence = sqlx::query(
-        "UPDATE execution SET agent_session_id = 'different-thread' WHERE id = ?",
-    )
-    .bind(execution_id)
-    .execute(db.pool())
-    .await
-    .expect_err("legacy projection cannot diverge from HarnessSession authority");
+    let direct_projection_divergence =
+        sqlx::query("UPDATE execution SET agent_session_id = 'different-thread' WHERE id = ?")
+            .bind(execution_id)
+            .execute(db.pool())
+            .await
+            .expect_err("legacy projection cannot diverge from HarnessSession authority");
     assert!(direct_projection_divergence
         .to_string()
         .contains("projection diverges"));
@@ -310,13 +381,12 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     .expect_err("an active session cannot be reopened as pending");
     assert!(matches!(active_to_pending, DbError::Check(_)));
 
-    let direct_active_to_pending = sqlx::query(
-        "UPDATE harness_session SET status = 'pending' WHERE id = ?",
-    )
-    .bind(&session_id)
-    .execute(db.pool())
-    .await
-    .expect_err("SQLite must guard invalid HarnessSession lifecycle transitions");
+    let direct_active_to_pending =
+        sqlx::query("UPDATE harness_session SET status = 'pending' WHERE id = ?")
+            .bind(&session_id)
+            .execute(db.pool())
+            .await
+            .expect_err("SQLite must guard invalid HarnessSession lifecycle transitions");
     assert!(direct_active_to_pending
         .to_string()
         .contains("lifecycle transition"));
@@ -351,6 +421,107 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
         .await
         .expect_err("one Execution cannot change its external session identity");
     assert!(matches!(divergent, DbError::Check(_)));
+}
+
+#[tokio::test]
+async fn profile_and_capability_changes_do_not_rewrite_an_active_session_snapshot() {
+    let db = database().await;
+    let profile_id = seed_agent(&db, "pr2-agent-capability-history", "codex").await;
+    let task_id = seed_task(&db, "capability-history").await;
+    let original = ExecutionRepo::create(
+        &db,
+        execution_input(
+            "pr2-execution-capability-history-original",
+            &task_id,
+            "pr2-agent-capability-history",
+            &profile_id,
+            "codex",
+            ExecutionPurpose::Implement,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("original execution creates");
+    let original = ExecutionRepo::update(
+        &db,
+        result_update(&original.id, Some("capability-history-thread")),
+    )
+    .await
+    .expect("original session activates");
+    let session_id = original.harness_session_id.clone().expect("session link");
+    let historical_capabilities = HarnessSessionRepo::get_by_id(&db, &session_id)
+        .await
+        .expect("session loads")
+        .expect("session exists")
+        .capabilities_snapshot_json;
+
+    let mut changed_profile = execution_input(
+        "pr2-execution-capability-history-follow-up",
+        &task_id,
+        "pr2-agent-capability-history",
+        &profile_id,
+        "codex",
+        ExecutionPurpose::Implement,
+        None,
+        Some(session_id.clone()),
+        Some("capability-history-thread".to_owned()),
+    );
+    let mut changed_snapshot: serde_json::Value = serde_json::from_str(
+        changed_profile
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("follow-up snapshot exists"),
+    )
+    .expect("follow-up snapshot parses");
+    changed_snapshot["config"]["model"] = serde_json::json!("new-profile-model");
+    changed_snapshot["harness_capabilities"] = serde_json::json!({
+        "resume":"unknown",
+        "cancel":"unknown",
+        "structured_events":"unknown",
+        "usage_reporting":"unknown",
+        "account_usage_observation":"unknown",
+        "model_selection":"unknown",
+        "reasoning_controls":"unknown",
+        "approval_policy":"unknown",
+        "sandbox_controls":"unknown",
+        "planning":"unknown",
+        "review_mode":"unknown",
+        "fork":"unknown",
+        "steer":"unknown",
+        "pause_resume":"unknown",
+        "compaction":"unknown",
+        "subagents":"unknown"
+    });
+    changed_profile.executor_config_snapshot_json = Some(changed_snapshot.to_string());
+    let follow_up = ExecutionRepo::create(&db, changed_profile)
+        .await
+        .expect("follow-up execution references the existing session");
+    let followed = ExecutionRepo::update(
+        &db,
+        result_update(&follow_up.id, Some("capability-history-thread")),
+    )
+    .await
+    .expect("follow-up result persists");
+    assert_eq!(
+        followed.harness_session_id.as_deref(),
+        Some(session_id.as_str())
+    );
+
+    let persisted = HarnessSessionRepo::get_by_id(&db, &session_id)
+        .await
+        .expect("session loads")
+        .expect("session exists");
+    assert_eq!(
+        persisted.capabilities_snapshot_json,
+        historical_capabilities
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&persisted.capabilities_snapshot_json)
+            .expect("historical snapshot parses"),
+        harness_capabilities_for("codex")
+    );
 }
 
 #[tokio::test]
@@ -405,13 +576,13 @@ async fn unresolved_ordered_fallback_does_not_create_speculative_session() {
             "agent_id": "pr2-agent-routed",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "codex-primary"},
+            "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "codex-primary"}},
-                    {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"}},
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-b"}}
                 ]
             }
         })
@@ -452,12 +623,12 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
             "agent_id": "pr2-agent-unresolved-result",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "primary"},
+            "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"},
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "primary"}},
-                    {"executor_type": "cursor", "config": {"account": "fallback"}}
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-a"}},
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/a"}, "model":"model-b"}}
                 ]
             }
         })
@@ -483,7 +654,7 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
 }
 
 #[tokio::test]
-async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently() {
+async fn cross_harness_winner_cannot_materialize_under_a_different_agent_identity() {
     let db = database().await;
     let profile_id = seed_agent(&db, "pr2-agent-cross-route", "codex").await;
     let task_id = seed_task(&db, "cross-route").await;
@@ -503,12 +674,12 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
             "agent_id": "pr2-agent-cross-route",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "codex-primary"},
+            "config": {"env":{"CODEX_HOME":"/accounts/codex-a"}},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                    {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/codex-a"}}},
                     {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
                 ]
             }
@@ -526,11 +697,12 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
         "executor_type": "cursor",
         "config": {"account": "cursor-fallback"},
         "capabilities": ["read", "cursor-native"],
+        "harness_capabilities": harness_capabilities_for("cursor"),
         "routing": {
             "policy": "ordered_fallback_v1",
             "selected_candidate_key": "cursor:fallback",
             "candidates": [
-                {"executor_type": "codex", "config": {"account": "codex-primary"}},
+                {"executor_type": "codex", "config": {"env":{"CODEX_HOME":"/accounts/codex-a"}}},
                 {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
             ]
         }
@@ -538,40 +710,10 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
     .to_string();
     let mut result = result_update(&execution.id, Some("cursor-thread"));
     result.executor_config_snapshot_json = Some(Some(resolved_snapshot.clone()));
-    let completed = ExecutionRepo::update(&db, result.clone())
+    let error = ExecutionRepo::update(&db, result.clone())
         .await
-        .expect("resolved route and session result persist atomically");
-    let session_id = completed
-        .harness_session_id
-        .as_deref()
-        .expect("result materializes a generic session");
-    assert_eq!(completed.agent_session_id.as_deref(), Some("cursor-thread"));
-    let persisted_snapshot: serde_json::Value = serde_json::from_str(
-        completed
-            .executor_config_snapshot_json
-            .as_deref()
-            .expect("resolved execution snapshot persists"),
-    )
-    .expect("resolved snapshot parses");
-    assert_eq!(persisted_snapshot["executor_type"], "cursor");
-    let session = HarnessSessionRepo::get_by_id(&db, session_id)
-        .await
-        .expect("HarnessSession loads")
-        .expect("HarnessSession exists");
-    let session_snapshot: serde_json::Value =
-        serde_json::from_str(&session.profile_snapshot_json).expect("session snapshot parses");
-    assert_eq!(session.harness_kind, "cursor");
-    assert_eq!(session.external_session_id.as_deref(), Some("cursor-thread"));
-    assert_eq!(session_snapshot["config"]["account"], "cursor-fallback");
-    assert_eq!(
-        session.capabilities_snapshot_json,
-        r#"["read","cursor-native"]"#
-    );
-
-    let repeated = ExecutionRepo::update(&db, result)
-        .await
-        .expect("identical routed result is idempotent");
-    assert_eq!(repeated.harness_session_id.as_deref(), Some(session_id));
+        .expect_err("cross-harness result cannot impersonate the Agent identity");
+    assert!(matches!(error, DbError::Check(_)));
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM harness_session
          WHERE agent_id = 'pr2-agent-cross-route'
@@ -581,7 +723,7 @@ async fn cross_harness_fallback_materializes_from_resolved_snapshot_idempotently
     .fetch_one(db.pool())
     .await
     .expect("routed session count loads");
-    assert_eq!(count, 1);
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -605,13 +747,13 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
             "agent_id": "pr2-agent-same-route",
             "profile_id": profile_id,
             "executor_type": "codex",
-            "config": {"account": "profile-a"},
+            "config": {"profile": "same-account", "model": "model-a"},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {"account": "profile-a"}},
-                    {"executor_type": "codex", "config": {"account": "profile-b"}}
+                    {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-a"}},
+                    {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-b"}}
                 ]
             }
         })
@@ -626,14 +768,15 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
         "agent_id": "pr2-agent-same-route",
         "profile_id": profile_id,
         "executor_type": "codex",
-        "config": {"account": "profile-b"},
+        "config": {"profile": "same-account", "model": "model-b"},
         "capabilities": ["read", "profile-b-capability"],
+        "harness_capabilities": harness_capabilities_for("codex"),
         "routing": {
             "policy": "ordered_fallback_v1",
-            "selected_candidate_key": "codex:profile-b",
+            "selected_candidate_key": "codex:same-account:model-b",
             "candidates": [
-                {"executor_type": "codex", "config": {"account": "profile-a"}},
-                {"executor_type": "codex", "config": {"account": "profile-b"}}
+                {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-a"}},
+                {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-b"}}
             ]
         }
     })
@@ -654,25 +797,26 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
     let session_snapshot: serde_json::Value =
         serde_json::from_str(&session.profile_snapshot_json).expect("session snapshot parses");
     assert_eq!(session.harness_kind, "codex");
-    assert_eq!(session_snapshot["config"]["account"], "profile-b");
-    assert_ne!(session_snapshot["config"]["account"], "profile-a");
+    assert_eq!(session_snapshot["config"]["profile"], "same-account");
+    assert_eq!(session_snapshot["config"]["model"], "model-b");
     assert_eq!(
-        session.capabilities_snapshot_json,
-        r#"["read","profile-b-capability"]"#
+        serde_json::from_str::<serde_json::Value>(&session.capabilities_snapshot_json)
+            .expect("typed Codex capabilities parse"),
+        harness_capabilities_for("codex")
     );
 }
 
 #[tokio::test]
 async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
     let db = database().await;
-    let profile_id = seed_agent(&db, "pr2-agent-routed-shell", "codex").await;
+    let profile_id = seed_agent(&db, "pr2-agent-routed-shell", "shell").await;
     let task_id = seed_task(&db, "routed-shell").await;
     let mut input = execution_input(
         "pr2-execution-routed-shell",
         &task_id,
         "pr2-agent-routed-shell",
         &profile_id,
-        "codex",
+        "shell",
         ExecutionPurpose::Implement,
         None,
         None,
@@ -682,14 +826,14 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         serde_json::json!({
             "agent_id": "pr2-agent-routed-shell",
             "profile_id": profile_id,
-            "executor_type": "codex",
-            "config": {},
+            "executor_type": "shell",
+            "config": {"command":"echo primary"},
             "capabilities": ["read"],
             "routing": {
                 "policy": "ordered_fallback_v1",
                 "candidates": [
-                    {"executor_type": "codex", "config": {}},
-                    {"executor_type": "shell", "config": {}}
+                    {"executor_type": "shell", "config": {"command":"echo primary"}},
+                    {"executor_type": "shell", "config": {"command":"echo fallback"}}
                 ]
             }
         })
@@ -702,14 +846,14 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         "agent_id": "pr2-agent-routed-shell",
         "profile_id": profile_id,
         "executor_type": "shell",
-        "config": {},
+        "config": {"command":"echo fallback"},
         "capabilities": ["read"],
         "routing": {
             "policy": "ordered_fallback_v1",
             "selected_candidate_key": "shell:fallback",
             "candidates": [
-                {"executor_type": "codex", "config": {}},
-                {"executor_type": "shell", "config": {}}
+                {"executor_type": "shell", "config": {"command":"echo primary"}},
+                {"executor_type": "shell", "config": {"command":"echo fallback"}}
             ]
         }
     })
@@ -949,12 +1093,7 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
 #[tokio::test]
 async fn execution_purpose_does_not_alias_permission_policy() {
     let db = database().await;
-    let profile_id = seed_agent(&db, "pr2-agent-permission", "codex").await;
-    sqlx::query("UPDATE agent_profile SET permission_policy = 'auto' WHERE id = ?")
-        .bind(&profile_id)
-        .execute(db.pool())
-        .await
-        .expect("permission policy updates");
+    let profile_id = seed_agent_with_policy(&db, "pr2-agent-permission", "codex", "auto").await;
     let task_id = seed_task(&db, "purpose-permission").await;
     let execution = ExecutionRepo::create(
         &db,
@@ -987,7 +1126,7 @@ async fn workspace_scoped_session_is_not_reused_in_another_workspace() {
     let db = database().await;
     let profile_id = seed_agent(&db, "pr2-agent-workspace", "codex").await;
     let task_id = seed_task(&db, "workspace").await;
-    let (workspace_one, workspace_two) = seed_workspaces(&db, &task_id).await;
+    let (workspace_one, other_task_id, workspace_two) = seed_workspaces(&db, &task_id).await;
     let parent = ExecutionRepo::create(
         &db,
         execution_input(
@@ -1015,7 +1154,7 @@ async fn workspace_scoped_session_is_not_reused_in_another_workspace() {
     let session_id = parent.harness_session_id.clone().expect("session");
     let child = execution_input(
         "pr2-execution-workspace-child",
-        &task_id,
+        &other_task_id,
         "pr2-agent-workspace",
         &profile_id,
         "codex",
@@ -1034,7 +1173,7 @@ async fn workspace_scoped_session_is_not_reused_in_another_workspace() {
 async fn external_identity_is_scoped_by_agent_and_harness() {
     let db = database().await;
     let profile_a = seed_agent(&db, "pr2-agent-collision-a", "codex").await;
-    let profile_b = seed_agent(&db, "pr2-agent-collision-b", "codex").await;
+    let profile_b = seed_agent(&db, "pr2-agent-collision-b", "cursor").await;
     let task_id = seed_task(&db, "collision").await;
     let a = ExecutionRepo::create(
         &db,
@@ -1062,7 +1201,7 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
             &task_id,
             "pr2-agent-collision-b",
             &profile_b,
-            "codex",
+            "cursor",
             ExecutionPurpose::Implement,
             None,
             None,
@@ -1076,7 +1215,7 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
         .expect("agent B session activates");
     assert_ne!(a.harness_session_id, b.harness_session_id);
 
-    let other_harness = ExecutionRepo::create(
+    let same_agent_harness_change = ExecutionRepo::create(
         &db,
         execution_input(
             "pr2-execution-collision-harness",
@@ -1091,12 +1230,8 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
         ),
     )
     .await
-    .expect("different harness execution creates");
-    let other_harness =
-        ExecutionRepo::record_harness_session_result(&db, &other_harness.id, "abc", &now_rfc3339())
-            .await
-            .expect("different harness session activates");
-    assert_ne!(a.harness_session_id, other_harness.harness_session_id);
+    .expect_err("an Agent cannot change its harness identity through execution routing");
+    assert!(matches!(same_agent_harness_change, DbError::Check(_)));
 
     let cross_harness_inheritance = ExecutionRepo::create(
         &db,
@@ -1247,11 +1382,41 @@ async fn session_identity_and_execution_history_are_immutable_and_snapshotted() 
             .fetch_one(db.pool())
             .await
             .expect("session snapshot loads");
-    sqlx::query("UPDATE agent_profile SET config_json = '{\"model\":\"changed\"}' WHERE id = ?")
-        .bind(&profile_id)
-        .execute(db.pool())
+    let agent = AgentRepo::get_by_id(&db, "pr2-agent-immutable")
         .await
-        .expect("profile changes");
+        .expect("Agent reloads")
+        .expect("Agent exists");
+    let revised_profile_id = new_uuid_v4();
+    let now = now_rfc3339();
+    AgentProfileRepo::create_and_select_profile(
+        &db,
+        CreateAgentProfile {
+            id: revised_profile_id.clone(),
+            identity_id: "pr2-agent-immutable".to_owned(),
+            backend_kind: "cli".to_owned(),
+            executor_type: "codex".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("changed".to_owned()),
+            reasoning_effort: None,
+            permission_policy: Some("auto".to_owned()),
+            prompt_template: None,
+            capabilities_json: r#"["read"]"#.to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: r#"{"model":"changed"}"#.to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        SelectAgentProfile {
+            identity_id: "pr2-agent-immutable".to_owned(),
+            profile_id: revised_profile_id,
+            expected_version: agent.version,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Agent selects a new immutable profile revision");
     let snapshot_after: String =
         sqlx::query_scalar("SELECT profile_snapshot_json FROM harness_session WHERE id = ?")
             .bind(&session_id)

@@ -122,6 +122,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
+        crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
         if execution.role == crate::workflow::default_roles::REVIEWER
             || matches!(
                 task.task_type.as_str(),
@@ -258,13 +259,11 @@ impl TaskService {
             return Err(error);
         }
 
-        let description = execution_description(&execution, &task, &agent_config);
+        let description = execution_description(&execution, &task);
 
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let assistant_turn_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let usage_provider = super::usage_provider_from_agent_config(&agent_config);
-        let usage_model_fallback = usage_model_fallback(&agent_config);
 
         // Spawn a task that forwards log entries to the event bus
         let event_bus = self.event_bus.clone();
@@ -415,15 +414,23 @@ impl TaskService {
         } else {
             None
         };
-        let cursor_usage_probe = super::spawn_cursor_usage_probe(
-            Arc::clone(&self.db),
-            execution.executor_config_snapshot_json.clone(),
-            execution_id.clone(),
-        );
+        let invocation =
+            super::harness_invocation_for_execution(&self.db, &execution, Some(&workspace.id))
+                .await?;
+        let usage_probe = self.task_executor.clone().and_then(|executor| {
+            super::spawn_account_usage_probe(
+                Arc::clone(&self.db),
+                execution.executor_config_snapshot_json.clone(),
+                execution_id.clone(),
+                executor,
+            )
+        });
         let execution_result = executor
             .execute(ExecutionContext {
+                invocation,
                 task_id: task.id.clone(),
                 execution_id: execution_id.clone(),
+                role: execution.role.clone(),
                 worktree_path: workspace.worktree_path.clone(),
                 description,
                 agent_config,
@@ -433,7 +440,7 @@ impl TaskService {
                 log_sender: Some(log_tx),
             })
             .await;
-        if let Some(probe) = cursor_usage_probe {
+        if let Some(probe) = usage_probe {
             probe.stop().await;
         }
         if let Err(error) = executors::LogWriter::compact(std::path::Path::new(&logs_path)).await {
@@ -486,6 +493,9 @@ impl TaskService {
                     candidate.candidate_key.clone(),
                     candidate.executor_type.to_string(),
                     candidate.config.clone(),
+                    serde_json::to_value(candidate.harness_capabilities.snapshot())
+                        .unwrap_or(Value::Null),
+                    Some(serde_json::to_value(&candidate.effective_policy).unwrap_or(Value::Null)),
                 )
             }),
             attempts: result
@@ -507,6 +517,20 @@ impl TaskService {
             )?,
             None => None,
         };
+        let winner_snapshot = snapshot_update
+            .as_deref()
+            .or(current_execution.executor_config_snapshot_json.as_deref())
+            .map(ToOwned::to_owned);
+        let winner_snapshot_value = winner_snapshot
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok());
+        let usage_provider = winner_snapshot_value
+            .as_ref()
+            .map(super::usage_provider_from_agent_config)
+            .unwrap_or_else(|| "unknown".to_owned());
+        let usage_model_fallback = winner_snapshot_value
+            .as_ref()
+            .and_then(usage_model_fallback);
 
         let now = now_rfc3339();
         let (status, stop_reason, stopped_by, resume_policy, stopped_at) = match result.status {
@@ -567,7 +591,7 @@ impl TaskService {
         if let Some(account_usage) = result.account_usage.as_ref() {
             if let Err(error) = super::persist_account_usage_snapshot(
                 &self.db,
-                current_execution.executor_config_snapshot_json.as_deref(),
+                winner_snapshot.as_deref(),
                 &updated.id,
                 account_usage,
             )
@@ -807,6 +831,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
         if execution.role == crate::workflow::default_roles::REVIEWER
             || matches!(
                 task.task_type.as_str(),
@@ -822,33 +847,32 @@ impl TaskService {
                 ServiceError::invalid_operation("executor config snapshot missing executor_type")
             })?
             .to_owned();
-        let description = execution_description(execution, &task, &executor_config);
+        let description = execution_description(execution, &task);
         let max_turns = self.resolve_max_turns(&task).await?;
+        let invocation =
+            super::harness_invocation_for_execution(&self.db, execution, Some(&workspace.id))
+                .await?;
 
         Ok(api_types::ExecutionStartParams {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
+            role: execution.role.clone(),
             workspace_path: workspace.worktree_path,
             executor_type,
             executor_config,
             prompt: json!({ "description": description }),
+            invocation,
             max_turns,
         })
     }
 }
 
-fn execution_description(execution: &Execution, task: &Task, agent_config: &Value) -> String {
-    let is_shell_executor =
-        agent_config.get("executor_type").and_then(Value::as_str) == Some("shell");
-    if is_shell_executor && execution.role == crate::workflow::default_roles::REVIEWER {
-        r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#.to_owned()
-    } else {
-        execution
-            .summary
-            .clone()
-            .or_else(|| task.description.clone())
-            .unwrap_or_else(|| task.title.clone())
-    }
+fn execution_description(execution: &Execution, task: &Task) -> String {
+    execution
+        .summary
+        .clone()
+        .or_else(|| task.description.clone())
+        .unwrap_or_else(|| task.title.clone())
 }
 
 fn usage_model_fallback(agent_config: &Value) -> Option<String> {

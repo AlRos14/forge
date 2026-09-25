@@ -23,9 +23,9 @@ use axum::{
 use db::ReviewRepo;
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -34,6 +34,15 @@ use tower::ServiceExt;
 const EXECUTOR_SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
 const FOLLOW_UP_SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 const AUDITOR_SESSION_ID: &str = "55555555-5555-4555-8555-555555555555";
+
+fn session_id_for(ctx: &ExecutionContext, start_session_id: &str) -> String {
+    match &ctx.invocation {
+        api_types::HarnessInvocation::Start => start_session_id.to_owned(),
+        api_types::HarnessInvocation::Resume {
+            external_session_id,
+        } => external_session_id.clone(),
+    }
+}
 
 #[tokio::test]
 async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
@@ -114,16 +123,16 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
                 && execution
                     .executor_config_snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(EXECUTOR_SESSION_ID)
+                    .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                    == Some("explicit_harness_session")
         })
-        .expect("coder follow-up with resume_thread_id exists");
+        .expect("coder follow-up with generic HarnessSession continuity exists");
     assert_eq!(
         coder_follow_up
             .executor_config_snapshot
             .as_ref()
-            .expect("coder follow-up records config snapshot")["config"]["resume_thread_id"],
-        EXECUTOR_SESSION_ID
+            .expect("coder follow-up records config snapshot")["dispatch"]["execution_policy"],
+        "explicit_harness_session"
     );
 
     let start = Instant::now();
@@ -228,9 +237,15 @@ impl MergeConflictCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for MergeConflictCodexAdapter {
+impl HarnessAdapter for MergeConflictCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
+    }
+
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -264,12 +279,12 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
         let resolve_follow_up = self.resolve_follow_up;
         let conflict_prepared = Arc::clone(&self.conflict_prepared);
         Box::pin(async move {
-            if ctx.description.contains("FORGE_RESULT:") {
+            if ctx.role == "reviewer" {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some(AUDITOR_SESSION_ID.to_owned()),
+                    agent_session_id: Some(session_id_for(&ctx, AUDITOR_SESSION_ID)),
                     summary: Some("auditor passed the implementation".to_owned()),
                     error: None,
                     usage: None,
@@ -284,7 +299,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some(FOLLOW_UP_SESSION_ID.to_owned()),
+                    agent_session_id: Some(session_id_for(&ctx, FOLLOW_UP_SESSION_ID)),
                     summary: Some("merge conflict follow-up completed".to_owned()),
                     error: None,
                     usage: None,
@@ -307,7 +322,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
                 after_sha: None,
-                agent_session_id: Some(EXECUTOR_SESSION_ID.to_owned()),
+                agent_session_id: Some(session_id_for(&ctx, EXECUTOR_SESSION_ID)),
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
@@ -381,9 +396,15 @@ fn resolve_conflict_in_worktree(worktree_path: &Path) {
 
 struct CompletingCodexAdapter;
 
-impl CodingExecutorAdapter for CompletingCodexAdapter {
+impl HarnessAdapter for CompletingCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
+    }
+
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -417,10 +438,11 @@ impl CodingExecutorAdapter for CompletingCodexAdapter {
             if ctx.description.contains("merge failed due to conflicts") {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
+            let session_id = session_id_for(&ctx, "merge-follow-up-session");
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
                 after_sha: None,
-                agent_session_id: Some("merge-follow-up-session".to_owned()),
+                agent_session_id: Some(session_id),
                 summary: Some("executor completed".to_owned()),
                 error: None,
                 usage: None,
@@ -449,17 +471,14 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
@@ -750,8 +769,8 @@ async fn poll_until_role_follow_up(
                 && execution
                     .executor_config_snapshot
                     .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(EXECUTOR_SESSION_ID)
+                    .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                    == Some("explicit_harness_session")
         }) {
             return executions;
         }

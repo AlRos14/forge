@@ -11,18 +11,19 @@ pub mod log_writer;
 pub mod shell;
 
 pub use adapter::{
-    AdapterExecutor, AdapterRegistry, AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter,
-    DiscoverContext, DiscoveredOptions, ExecutionOverrides, ExecutorKind, FallbackExecutor,
-    DEFAULT_ACCOUNT_COOLDOWN,
+    AdapterExecutor, AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions,
+    ExecutionOverrides, ExecutorKind, FallbackExecutor, HarnessAdapter, HarnessAdapterRegistry,
+    HarnessPolicyInterpretation, UsageObservation, DEFAULT_ACCOUNT_COOLDOWN,
 };
+pub use api_types::{CapabilitySupport, HarnessCapabilities, HarnessInvocation};
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
-    account_key, account_key_for_context, build_ordered_fallback_routing, candidate_key,
-    deserialize_config, merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig,
-    CommandOverrides, CursorConfig, EmbeddedConfig, ExecutorCandidate, ExecutorRouting,
-    GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome,
-    ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1,
-    ROUTING_SNAPSHOT_KEY,
+    account_key, account_key_for_context, candidate_key, merge_overrides, normalize_harness_config,
+    validate_ordered_fallback_routing, validate_same_agent_candidate, ClaudeCodeConfig,
+    CodexConfig, CommandOverrides, CursorConfig, EmbeddedConfig, ExecutorCandidate,
+    ExecutorRouting, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt,
+    RouteAttemptOutcome, ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY,
+    ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
@@ -56,9 +57,12 @@ pub fn is_worktree_read_only(config: &serde_json::Value) -> bool {
 pub struct ExecutionContext {
     pub task_id: String,
     pub execution_id: String,
+    /// Generic TaskRole name for bounded adapter compatibility behavior.
+    pub role: String,
     pub worktree_path: String,
     pub description: String,
     pub agent_config: serde_json::Value,
+    pub invocation: api_types::HarnessInvocation,
     pub logs_path: String,
     pub heartbeat_interval_seconds: u64,
     pub max_turns: Option<u32>,
@@ -127,6 +131,8 @@ pub struct ResolvedExecutorCandidate {
     pub candidate_key: String,
     pub executor_type: ExecutorKind,
     pub config: serde_json::Value,
+    pub harness_capabilities: api_types::HarnessCapabilities,
+    pub effective_policy: api_types::EffectiveExecutionPolicy,
 }
 
 /// Result from an executor run.
@@ -166,6 +172,15 @@ pub enum ExecutionOutcome {
 pub trait TaskExecutor: Send + Sync {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError>;
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
+
+    async fn observe_usage(
+        &self,
+        _kind: ExecutorKind,
+        _config: &serde_json::Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<UsageObservation>, ExecutorError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +205,12 @@ pub enum ExecutorError {
 
     #[error("executor error: {0}")]
     Other(String),
+
+    #[error("unsupported harness capability {capability} ({support:?})")]
+    UnsupportedCapability {
+        capability: String,
+        support: api_types::CapabilitySupport,
+    },
 }
 
 impl ExecutorError {

@@ -22,9 +22,9 @@ use axum::{
 };
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -171,9 +171,15 @@ impl CiReReviewCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for CiReReviewCodexAdapter {
+impl HarnessAdapter for CiReReviewCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
+    }
+
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -207,7 +213,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let allow_follow_up = Arc::clone(&self.allow_follow_up);
         Box::pin(async move {
-            if ctx.description.contains("FORGE_RESULT:") {
+            if ctx.role == "reviewer" {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -247,10 +253,18 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                 std::fs::write(worktree_path.join("file.txt"), "resolved\n")?;
                 run_git(&worktree_path, &["add", "-A"]);
                 run_git(&worktree_path, &["commit", "-m", "resolve merge conflict"]);
+                let session_id = match &ctx.invocation {
+                    api_types::HarnessInvocation::Resume {
+                        external_session_id,
+                    } => external_session_id.clone(),
+                    api_types::HarnessInvocation::Start => {
+                        format!("merge-follow-up-session-{call_index}")
+                    }
+                };
                 Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some(format!("merge-follow-up-session-{call_index}")),
+                    agent_session_id: Some(session_id),
                     summary: Some("coder resolved merge conflict".to_owned()),
                     error: None,
                     usage: None,
@@ -294,17 +308,14 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)

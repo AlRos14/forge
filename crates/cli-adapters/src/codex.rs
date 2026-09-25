@@ -9,9 +9,9 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 #[cfg(unix)]
 use command_group::{Signal, UnixChildExt};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodexConfig, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
+    AvailabilityInfo, AvailabilityStatus, CodexConfig, DiscoverContext, DiscoveredOptions,
+    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
 };
 use protocol::{
     AskForApproval, SandboxMode, ThreadForkParams, ThreadForkResponse, ThreadResumeParams,
@@ -102,7 +102,28 @@ impl CodexAdapter {
     }
 
     fn resolve_config(ctx: &ExecutionContext) -> CodexConfig {
-        serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
+        let mut config: CodexConfig =
+            serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default();
+        crate::command::clear_session_arguments(
+            &mut config.command_overrides,
+            &["--resume", "--resume-thread"],
+            &["--continue"],
+        );
+        match &ctx.invocation {
+            executors::HarnessInvocation::Start => {
+                config.resume_thread_id = None;
+                config.resume_thread_in_place = None;
+                config.resume_fallback_prompt = None;
+            }
+            executors::HarnessInvocation::Resume {
+                external_session_id,
+            } => {
+                config.resume_thread_id = Some(external_session_id.clone());
+                config.resume_thread_in_place = Some(true);
+                config.resume_fallback_prompt = None;
+            }
+        }
+        config
     }
 
     fn build_command(config: &CodexConfig) -> tokio::process::Command {
@@ -313,7 +334,7 @@ impl CodexSessionClient for CodexClient {
 }
 
 #[async_trait]
-impl CodingExecutorAdapter for CodexAdapter {
+impl HarnessAdapter for CodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -324,6 +345,93 @@ impl CodingExecutorAdapter for CodexAdapter {
             .unwrap_or_else(|_| dirs_path("codex"));
 
         availability_from_codex_home(&codex_home)
+    }
+
+    fn detect(&self, config: &Value) -> AvailabilityInfo {
+        let configured_home = config
+            .get("env")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get("CODEX_HOME"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let codex_home = configured_home.unwrap_or_else(|| {
+            std::env::var("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| dirs_path("codex"))
+        });
+        availability_from_codex_home(&codex_home)
+    }
+
+    fn normalize_config(
+        &self,
+        config: &Value,
+        overrides: &executors::ExecutionOverrides,
+    ) -> Result<Value, ExecutorError> {
+        executors::normalize_harness_config::<CodexConfig>(self.kind(), config, overrides)
+    }
+
+    fn capabilities(&self, _config: &Value) -> executors::HarnessCapabilities {
+        use executors::CapabilitySupport as S;
+        crate::harness_capabilities(
+            S::Native,
+            S::Emulated,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Native,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+            S::Unsupported,
+        )
+    }
+
+    fn interpret_execution_policy(&self, config: &Value) -> executors::HarnessPolicyInterpretation {
+        let permission = config
+            .get("permission_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let isolation =
+            config
+                .get("sandbox")
+                .and_then(Value::as_str)
+                .unwrap_or(if permission == "plan" {
+                    "read-only"
+                } else {
+                    "workspace-write"
+                });
+        executors::HarnessPolicyInterpretation {
+            permission_policy: permission.to_owned(),
+            isolation_posture: isolation.to_owned(),
+        }
+    }
+
+    fn executable_name(&self) -> Option<String> {
+        Some("codex".to_owned())
+    }
+
+    async fn observe_usage(
+        &self,
+        config: &Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<executors::UsageObservation>, ExecutorError> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let config = serde_json::from_value::<CodexConfig>(config.clone()).map_err(|error| {
+            ExecutorError::Other(format!("invalid Codex usage config: {error}"))
+        })?;
+        let value = query_account_usage(&config).await?;
+        Ok(Some(executors::UsageObservation {
+            value,
+            source: Some("codex_account_rate_limits".to_owned()),
+        }))
     }
 
     async fn discover_options(
@@ -460,7 +568,7 @@ impl CodexAdapter {
                 // sending the follow-up turn.
                 let resumed_thread_id = match client
                     .thread_resume(ThreadResumeParams::from_start(
-                        resume_thread_id,
+                        resume_thread_id.clone(),
                         Self::thread_start_params(config, &ctx.worktree_path),
                     ))
                     .await
@@ -473,24 +581,17 @@ impl CodexAdapter {
                         })?
                     }
                     Err(error) if is_missing_codex_thread_error(&error) => {
-                        let response = client
-                            .thread_start(Self::thread_start_params(config, &ctx.worktree_path))
-                            .await?;
-                        let thread_id =
-                            response.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
-                                ExecutorError::Other(
-                                    "codex thread/start response missing thread id".to_owned(),
-                                )
-                            })?;
-                        let prompt = config
-                            .resume_fallback_prompt
-                            .clone()
-                            .unwrap_or_else(|| ctx.description.clone());
-                        let turn = client.turn_start(thread_id.clone(), prompt).await?;
-                        return Ok((thread_id, turn.turn_id));
+                        return Err(ExecutorError::Unavailable(format!(
+                            "Codex HarnessSession {resume_thread_id} is unavailable; resume cannot start a fresh thread"
+                        )));
                     }
                     Err(error) => return Err(error),
                 };
+                if resumed_thread_id != resume_thread_id {
+                    return Err(ExecutorError::Unavailable(format!(
+                        "Codex returned thread {resumed_thread_id} for requested HarnessSession {resume_thread_id}"
+                    )));
+                }
                 let turn = client
                     .turn_start(resumed_thread_id.clone(), ctx.description.clone())
                     .await?;
@@ -1010,6 +1111,44 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn generic_resume_uses_exact_thread_and_start_clears_stale_thread_fields() {
+        let stale = serde_json::json!({
+            "resume_thread_id":"old-thread",
+            "resume_thread_in_place":true,
+            "resume_fallback_prompt":"old prompt",
+            "additional_params":["--resume=old-cli-thread", "--continue", "--verbose"]
+        });
+        let start =
+            crate::test_execution_context(executors::HarnessInvocation::Start, stale.clone());
+        let start_config = CodexAdapter::resolve_config(&start);
+        assert!(start_config.resume_thread_id.is_none());
+        assert!(start_config.resume_thread_in_place.is_none());
+        assert!(start_config.resume_fallback_prompt.is_none());
+        assert_eq!(
+            start_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+
+        let resume = crate::test_execution_context(
+            executors::HarnessInvocation::Resume {
+                external_session_id: "exact-thread".to_owned(),
+            },
+            stale,
+        );
+        let resume_config = CodexAdapter::resolve_config(&resume);
+        assert_eq!(
+            resume_config.resume_thread_id.as_deref(),
+            Some("exact-thread")
+        );
+        assert_eq!(resume_config.resume_thread_in_place, Some(true));
+        assert!(resume_config.resume_fallback_prompt.is_none());
+        assert_eq!(
+            resume_config.command_overrides.additional_params,
+            Some(vec!["--verbose".to_owned()])
+        );
+    }
+
+    #[test]
     fn command_builder_uses_codex_default_app_server() {
         let config = CodexConfig {
             permission_policy: Some(PermissionPolicy::Supervised),
@@ -1238,8 +1377,10 @@ mod tests {
             ..CodexConfig::default()
         };
         let ctx = ExecutionContext {
+            invocation: executors::HarnessInvocation::Start,
             task_id: "task-1".to_owned(),
             execution_id: "exec-1".to_owned(),
+            role: "reviewer".to_owned(),
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Review the changes".to_owned(),
             agent_config: json!({}),
@@ -1278,8 +1419,10 @@ mod tests {
             ..CodexConfig::default()
         };
         let ctx = ExecutionContext {
+            invocation: executors::HarnessInvocation::Start,
             task_id: "conversation-1".to_owned(),
             execution_id: "message-1".to_owned(),
+            role: "interactive".to_owned(),
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1314,7 +1457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_conversation_falls_back_to_new_thread_when_source_thread_is_missing() {
+    async fn resume_fails_when_exact_source_thread_is_missing() {
         let mut client = StubCodexSessionClient {
             fail_resume_with_missing_thread: true,
             ..StubCodexSessionClient::default()
@@ -1328,8 +1471,10 @@ mod tests {
             ..CodexConfig::default()
         };
         let ctx = ExecutionContext {
+            invocation: executors::HarnessInvocation::Start,
             task_id: "conversation-1".to_owned(),
             execution_id: "message-1".to_owned(),
+            role: "interactive".to_owned(),
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1339,21 +1484,12 @@ mod tests {
             log_sender: None,
         };
 
-        let (thread_id, turn_id) = CodexAdapter::start_codex_session(&config, &ctx, &mut client)
+        let error = CodexAdapter::start_codex_session(&config, &ctx, &mut client)
             .await
-            .expect("session starts");
+            .expect_err("missing explicit session must fail");
 
-        assert_eq!(thread_id, "fresh-thread");
-        assert_eq!(turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(
-            client.calls,
-            vec!["thread_resume", "thread_start", "turn_start"]
-        );
-        assert_eq!(client.turn_thread_id.as_deref(), Some("fresh-thread"));
-        assert_eq!(
-            client.turn_prompt.as_deref(),
-            Some("Full reconstructed prompt")
-        );
+        assert!(matches!(error, ExecutorError::Unavailable(_)));
+        assert_eq!(client.calls, vec!["thread_resume"]);
     }
 
     #[test]
@@ -1406,8 +1542,10 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
         let adapter = CodexAdapter::new();
         let result = adapter
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: dir.path().display().to_string(),
                 description: "Do the task".to_owned(),
                 agent_config: json!({
@@ -1462,8 +1600,10 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 
         let result = CodexAdapter::new()
             .execute(ExecutionContext {
+                invocation: executors::HarnessInvocation::Start,
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
+                role: "coder".to_owned(),
                 worktree_path: dir.path().display().to_string(),
                 description: "Plan the task".to_owned(),
                 agent_config: json!({

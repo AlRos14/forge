@@ -22,9 +22,9 @@ use axum::{
 };
 use events::EventBus;
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
+    LogStream, LogWriter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -124,7 +124,31 @@ async fn task_review_budget_override_wins_over_project_setting() {
     let start = Instant::now();
     let blocked_task = loop {
         if start.elapsed() > Duration::from_secs(30) {
-            panic!("timed out waiting for blocked metadata to be set");
+            let latest_task: TaskResponse = empty_request(
+                &harness.app,
+                Method::GET,
+                &format!("/api/v1/tasks/{}", created_task.id),
+                StatusCode::OK,
+            )
+            .await;
+            let latest_executions = executions_for_task(&harness.app, &created_task.id).await;
+            let execution_summary = latest_executions
+                .iter()
+                .map(|execution| {
+                    (
+                        &execution.role,
+                        &execution.status,
+                        &execution.error,
+                        &execution.agent_session_id,
+                        &execution.harness_session_id,
+                        execution
+                            .executor_config_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!("timed out waiting for blocked metadata; status={} error={:?} blocked={:?}; executions={execution_summary:#?}", latest_task.status, latest_task.error_annotation, latest_task.blocked);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         let t: TaskResponse = empty_request(
@@ -166,9 +190,9 @@ async fn task_review_budget_override_wins_over_project_setting() {
         latest_coder
             .executor_config_snapshot
             .as_ref()
-            .expect("latest coder records config snapshot")["config"]["resume_thread_id"],
-        "follow-up-session-1",
-        "latest coder follow-up should carry the resumed thread"
+            .expect("latest coder records config snapshot")["dispatch"]["execution_policy"],
+        "explicit_harness_session",
+        "latest coder follow-up should record generic session continuity"
     );
     let blocked = blocked_task
         .blocked
@@ -193,9 +217,15 @@ impl ReviewFailCodexAdapter {
     }
 }
 
-impl CodingExecutorAdapter for ReviewFailCodexAdapter {
+impl HarnessAdapter for ReviewFailCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
+    }
+
+    fn capabilities(&self, _config: &Value) -> api_types::HarnessCapabilities {
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.resume = api_types::CapabilitySupport::Native;
+        capabilities
     }
 
     fn check_availability(&self) -> AvailabilityInfo {
@@ -227,12 +257,13 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
     {
         let executor_calls = Arc::clone(&self.executor_calls);
         Box::pin(async move {
-            if ctx.description.contains("FORGE_RESULT:") {
+            let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
+            if ctx.role == "reviewer" {
                 write_auditor_failure(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
-                    agent_session_id: Some("auditor-session".to_owned()),
+                    agent_session_id: Some(format!("auditor-session-{call_index}")),
                     summary: Some("auditor failed the implementation".to_owned()),
                     error: None,
                     usage: None,
@@ -240,14 +271,17 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 });
             }
 
-            let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
             if call_index > 0 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            let session_id = if call_index == 0 {
-                FIRST_EXECUTOR_SESSION_ID.to_owned()
-            } else {
-                format!("follow-up-session-{call_index}")
+            let session_id = match &ctx.invocation {
+                api_types::HarnessInvocation::Resume {
+                    external_session_id,
+                } => external_session_id.clone(),
+                api_types::HarnessInvocation::Start if call_index == 0 => {
+                    FIRST_EXECUTOR_SESSION_ID.to_owned()
+                }
+                api_types::HarnessInvocation::Start => format!("fresh-session-{call_index}"),
             };
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
@@ -300,17 +334,14 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
@@ -473,8 +504,8 @@ async fn poll_until_coder_follow_up_count(
                     && execution
                         .executor_config_snapshot
                         .as_ref()
-                        .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                        == Some(FIRST_EXECUTOR_SESSION_ID)
+                        .and_then(|snapshot| snapshot["dispatch"]["execution_policy"].as_str())
+                        == Some("explicit_harness_session")
             })
             .count();
         if count >= expected_count {

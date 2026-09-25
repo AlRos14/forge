@@ -12,8 +12,8 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb};
 use executors::{
-    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, LogKind, LogStream,
-    LogWriter, TaskExecutor, TokenUsage,
+    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, LogKind,
+    LogStream, LogWriter, TaskExecutor, TokenUsage,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType,
@@ -747,6 +747,15 @@ impl TaskExecutor for TaskExecutorRouter {
         let embedded_result = self.embedded.cancel(execution_id).await;
         let cli_result = self.cli.cancel(execution_id).await;
         embedded_result.and(cli_result)
+    }
+
+    async fn observe_usage(
+        &self,
+        kind: ExecutorKind,
+        config: &serde_json::Value,
+        cancel: CancellationToken,
+    ) -> std::result::Result<Option<executors::UsageObservation>, ExecutorError> {
+        self.cli.observe_usage(kind, config, cancel).await
     }
 }
 

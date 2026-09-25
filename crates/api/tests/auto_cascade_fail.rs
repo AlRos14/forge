@@ -19,9 +19,8 @@ use axum::{
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use executors::{
-    AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
-    DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind,
+    AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
+    ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -156,7 +155,7 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
 
 struct FailingCodexAdapter;
 
-impl CodingExecutorAdapter for FailingCodexAdapter {
+impl HarnessAdapter for FailingCodexAdapter {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Codex
     }
@@ -220,17 +219,14 @@ struct TestHarness {
     _web_dist_dir: TestDir,
 }
 
-async fn test_app(
-    workspace_root: &Path,
-    adapter: impl CodingExecutorAdapter + 'static,
-) -> TestHarness {
+async fn test_app(workspace_root: &Path, adapter: impl HarnessAdapter + 'static) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let mut registry = executors::AdapterRegistry::new();
+    let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
