@@ -436,7 +436,7 @@ Commands used the same offline Cargo environment, `RUSTFLAGS='-C debuginfo=0'`,
 | Revision | Result |
 | --- | --- |
 | PR3 final formatted tree | 647 passed, 22 failed, 1 ignored; 981.19 seconds |
-| `origin/main` | 505 passed, 152 failed, 1 ignored; 870.62 seconds |
+| `origin/main` + test-only accessor fixes | 505 passed, 152 failed, 1 ignored; 870.62 seconds |
 
 The unmodified `origin/main` services test target did not compile because two
 assertions accessed `.execution` on a returned `db::Execution`. In the
@@ -627,7 +627,7 @@ services failure.
 | `cargo test -p executors --lib -- --test-threads=1` | 64/64 passed on final formatted tree |
 | `cargo test -p services --lib daemon_transport::tests:: -- --test-threads=1` | 15/15 passed on final formatted tree, including connection-generation serialization and exact Resume protocol cases |
 | `cargo test -p api-types --lib harness_capability_tests -- --test-threads=1` | 3/3 passed on final formatted tree |
-| `cargo test -p db --test pr2_execution_session -- --test-threads=1` | PR3: 15/16; main: 1/15. The exact `historical_session_migration_groups_only_coherent_identity` failed on both with the same SQLite foreign-key error. |
+| `cargo test -p db --test pr2_execution_session -- --test-threads=1` | PR3: 15/16; main: 14/15. The exact `historical_session_migration_groups_only_coherent_identity` failed on both with the same SQLite foreign-key error. |
 | `cargo test -p api --test fs_daemon_routing -- --test-threads=1` | PR3: 15/18. Main before the SQL correction: 13/18; main after that correction: 15/18. The same 3 tests fail on all runs while binding localhost with `PermissionDenied`. |
 | `cargo test -p api --test remote_execution_roundtrip -- --test-threads=1` | PR3 and main: 0/4; all four fail binding localhost with `PermissionDenied`. |
 | `cargo test -p api --test daemon_connect -- --test-threads=1` | PR3 workspace run and main: 0/5; all five fail binding localhost with `PermissionDenied`. |
@@ -654,6 +654,7 @@ test command stopped at the first failed integration target, not because of
 disk exhaustion. The task-local Cargo targets and temporary main worktree were
 removed after recording the results. No frontend build/test, Forge runtime,
 real provider invocation, database migration execution, or CI run was done.
+
 ## Static audit results
 
 At the final source audit:
@@ -705,3 +706,4 @@ introduced.
 | PR10 | Remove embedded Agent Host/runtime exception, including its operator policy compatibility path. |
 | PR12 | Final executor/harness public naming and surface cleanup. |
 | PR13 | Remove exact PR2 historical capability fallback and historical policy/snapshot compatibility after safe persistence cleanup. |
+| PR15 | Bind inbound daemon frames and notifications to connection generation; cover stale reconnect races. |

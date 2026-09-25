@@ -225,10 +225,13 @@ was verified against the emitted native CLI mode and is exposed as planning
 support; the generic Purpose and legacy PermissionPolicy mapping remain
 separate.
 
-Verification status: workspace `cargo check` passed before final test-only
-fixes. The TypeScript export test passed. Full workspace tests were attempted,
-but after fixing observed test compile errors, the final run was stopped when
-the filesystem reached 0 bytes free. `cargo clean` removed 33.0 GiB of
-generated artifacts and restored 31 GiB free. No tests completed after the
-final test-source edits; this supplemental audit does not claim behavioral
-verification.
+### Interim verification note (superseded by the exit ledger)
+
+An early workspace-test attempt during implementation exhausted the available
+filesystem; `cargo clean` removed 33.0 GiB of generated artifacts and restored
+31 GiB free. That attempt preceded final test-source edits and is not the final
+verification result. The final branch/base services comparison, focused test
+results, workspace-test stopping point, formatting checks, and TypeScript
+typecheck are recorded in [`pr-3.md`](pr-3.md). The final workspace attempt
+stopped at localhost bind failures also reproduced on `origin/main`, not at a
+disk-space limit.
