@@ -4,6 +4,13 @@ An orchestrator is an Actor acting under the orchestrator Role. The Role
 directs active work across Actors; it is not a super-agent runtime and not a
 continuous reviewer.
 
+PR4's generic Message, Handoff, Proposal, and Decision records provide the
+initial durable collaboration surface. Their events use the existing
+`domain_event` ledger. A Handoff to a Role does not assign a member, and a
+Proposal or Decision does not execute the proposed action. Legacy Agent Host
+and Project OS records remain authoritative for their own data until PR11;
+PR4 does not dual-write them.
+
 ## Responsibilities
 
 An orchestrator may:

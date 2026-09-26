@@ -75,6 +75,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Plan PR4 adds generic, Task-scoped Artifact, Message, Handoff, Proposal, and
+  multi-decider Decision records, with additive V090 persistence, atomic durable
+  domain events, authorized `/api/v1` endpoints, and guarded Project teardown.
+  Legacy vertical data remains authoritative until its named migration; no
+  implicit dual-write or projection is introduced.
 - External CLI integrations now run through one `HarnessAdapter` registry with
   explicit native/emulated/unsupported/unknown support per capability. Executor
   discovery includes additive `harness_capabilities`; winner capabilities are

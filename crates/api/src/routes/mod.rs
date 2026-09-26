@@ -11,10 +11,10 @@ use api_types::{
     TaskRoleResponse, TaskType, WorkspaceResponse,
 };
 use db::{
-    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution,
-    Page, PageRequest, Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo,
-    SortBy, SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo,
-    TransitionLogRepo, Workspace, WorkspaceRepo,
+    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
+    Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo, SortBy, SortOrder,
+    Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo, Workspace,
+    WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +33,7 @@ pub mod agent_chats;
 pub mod agents;
 pub mod auth;
 pub mod clis;
+pub mod collaboration;
 pub mod coordination;
 pub mod daemons;
 pub mod embedded_agents;
@@ -337,7 +338,9 @@ async fn task_response_inner(
         );
     }
     let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
-    let current_workspace_id = workspace_model.as_ref().map(|workspace| workspace.id.clone());
+    let current_workspace_id = workspace_model
+        .as_ref()
+        .map(|workspace| workspace.id.clone());
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
             Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
@@ -1241,9 +1244,7 @@ fn execution_status_response(value: db::ExecutionStatus) -> api_types::Execution
 
 #[cfg(test)]
 mod route_projection_tests {
-    use super::{
-        client_idempotency_key, filter_resume_session_action, scoped_idempotency_key,
-    };
+    use super::{client_idempotency_key, filter_resume_session_action, scoped_idempotency_key};
 
     #[test]
     fn stale_resume_session_recovery_hint_is_removed_from_response_projection() {

@@ -36,6 +36,42 @@ The documentation establishes all INV-001 through INV-037 below. No runtime
 invariant is claimed as enforced by this Plan PR. Later Plan PRs must name the subset
 they enforce and add focused tests before changing the corresponding code.
 
+## Plan PR4 implementation contract
+
+Plan PR4 adds the generic `Artifact`, `Message`, `Handoff`, `Proposal`, and
+`Decision` persistence and `/api/v1` surface. These records are authoritative
+for data created through that generic surface. Existing verticals remain
+authoritative for their own records until their assigned migration. There is
+no implicit projection or dual-write between the two families.
+
+In particular, creating `task_plan_revision`, `agent_chat_message`,
+`agent_handoff`, or `project_decision` does not create a generic record; generic
+writers do not update those legacy tables. Planning migrates in PR7, Review and
+Validation in PR8, Task/gate contracts in PR9, Agent Host and Project OS in
+PR11, and physical legacy cleanup in PR13. Other records listed in the legacy
+dependency audit keep their named migration assignments.
+
+PR4 Artifact provenance is represented by the normalized
+`artifact_execution_producer` relation. PR4 supports an Execution producer
+only; its ActorRef is derived through Execution and is not duplicated on
+Artifact. PR8 may add `artifact_validation_run_producer` additively after
+ValidationRun exists. PR4 creates no nullable FK to a future table and does not
+invent a System Actor.
+
+Message is communication; Handoff addresses work and has a controlled status
+lifecycle but does not assign a Role or create RoleMembership. Proposal records
+an immutable intent and policy evidence, not a command. Decision records one or
+more Human/Agent deciders and an immutable outcome; it does not execute the
+Proposal. Policy references and snapshots are evidence, not executable policy,
+permissions, or authorization.
+
+`domain_event` remains the durable event ledger. Each PR4 record mutation and
+its domain event commit in one transaction; the in-process EventBus is only a
+post-commit notification. Payloads exclude bodies, content, rationales,
+filesystem paths, storage locators, and authorization material. Project teardown
+removes PR4 rows through the guarded Project deletion path; the event ledger
+remains historical evidence under its existing retention contract.
+
 ## Current repository baseline
 
 The Plan PR0 audit was performed against the actual clean local checkout:
@@ -219,18 +255,22 @@ Durable outputs use generic Artifact records. Initial kinds include plan,
 review report, validation report, diff, patch, summary, design document,
 investigation, API contract, and test report.
 
-Artifact provenance uses one mutually exclusive producer reference:
+The target architecture supports producer references as they are introduced by
+their owning Plan PR. PR4 currently supports only an Execution producer through
+the normalized relation `artifact_execution_producer`:
 
 ~~~text
-ArtifactProducer
-  Execution(execution_id)
-  ValidationRun(validation_run_id)
+ArtifactExecutionProducer
+  artifact_id -> Artifact
+  execution_id -> Execution
 ~~~
 
-An Execution-produced Artifact derives its Actor from that Execution. A
-ValidationRun-produced Artifact is deterministic and Actor-free. Artifact does
-not duplicate `producing_actor` alongside these references and does not create
-a fake System Actor for automated validation.
+An Execution-produced Artifact derives its Actor from that Execution. PR8 may
+add an additive `artifact_validation_run_producer` relation for deterministic,
+Actor-free validation output. Artifact does not duplicate `producing_actor`
+alongside these references and does not create a fake System Actor for
+automated validation. PR4 storage is exactly one of inline content or an
+external storage reference; the latter is never a bearer capability.
 
 ### INV-028 — Validation and Review are different
 

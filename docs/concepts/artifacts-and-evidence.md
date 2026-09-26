@@ -8,32 +8,43 @@ Artifact is the generic durable output primitive:
 Artifact
   id
   task_id
-  producer
+  storage_kind: inline | external
+  content xor content_ref
   kind
   content or external/path reference
   metadata
   digest?
   created_at
 
-ArtifactProducer
-  Execution(execution_id)
-  ValidationRun(validation_run_id)
+artifact_execution_producer
+  artifact_id -> Artifact
+  execution_id -> Execution
 ~~~
 
-An Artifact produced by an Actor is attributed through its `Execution`; the
-Actor is derived from that Execution rather than duplicated on the Artifact.
-A deterministic validation report is attributed through its `ValidationRun`
-and therefore has no Actor, HarnessSession, or synthetic System Actor. The
-producer alternatives are mutually exclusive and preserve auditable
-provenance without creating two competing producer truths.
+PR4 supports only an Execution producer. Its Actor is derived through
+`ArtifactExecutionProducer -> Execution -> ActorRef`, not duplicated on the
+Artifact. Deterministic ValidationRun production is deferred to PR8, which may
+add an `artifact_validation_run_producer` relation without rebuilding the
+Artifact table. PR4 does not store a future ValidationRun FK or use a synthetic
+System Actor.
 
 Initial kinds include plan, review report, validation report, diff, patch,
 summary, design document, investigation, API contract, and test report. The
 kind is descriptive; it does not create a separate cognitive subsystem.
 
-Content may remain in an appropriate file/object store while SQLite stores
-metadata, authorization, reference, and digest. A path or external reference
-is never a bearer capability and must be checked against the owning scope.
+Inline content and external `content_ref` are mutually exclusive. Content may
+remain in an appropriate file/object store while SQLite stores metadata,
+authorization, reference, and digest. `content_ref` is an internal locator,
+not a bearer capability; PR4 responses omit it, and every read is authorized
+through Task to Project before Artifact data is returned. Artifact rows,
+producer relations, and producer identity are immutable.
+
+## PR4 authority boundary
+
+Artifacts created through the PR4 generic API are generic authority. Legacy
+planning, review, validation, Project documents, and other verticals remain
+their own authority until their assigned migration. No legacy writer implicitly
+creates an Artifact, and PR4 does not silently project legacy rows.
 
 ## Evidence
 

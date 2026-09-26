@@ -2687,3 +2687,329 @@ enum_strings!(AgentActionExecutionStatus {
     Succeeded => "succeeded",
     Failed => "failed",
 });
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStorageKind {
+    Inline,
+    External,
+}
+
+enum_strings!(ArtifactStorageKind {
+    Inline => "inline",
+    External => "external",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Plan,
+    ReviewReport,
+    ValidationReport,
+    Diff,
+    Patch,
+    Summary,
+    DesignDocument,
+    Investigation,
+    ApiContract,
+    TestReport,
+}
+
+enum_strings!(ArtifactKind {
+    Plan => "plan",
+    ReviewReport => "review_report",
+    ValidationReport => "validation_report",
+    Diff => "diff",
+    Patch => "patch",
+    Summary => "summary",
+    DesignDocument => "design_document",
+    Investigation => "investigation",
+    ApiContract => "api_contract",
+    TestReport => "test_report",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationTargetKind {
+    Actor,
+    Role,
+    Task,
+}
+
+enum_strings!(CollaborationTargetKind {
+    Actor => "actor",
+    Role => "role",
+    Task => "task",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollaborationTarget {
+    Actor(ActorRef),
+    Role(String),
+    Task,
+}
+
+impl CollaborationTarget {
+    pub fn kind(&self) -> CollaborationTargetKind {
+        match self {
+            Self::Actor(_) => CollaborationTargetKind::Actor,
+            Self::Role(_) => CollaborationTargetKind::Role,
+            Self::Task => CollaborationTargetKind::Task,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffIntent {
+    Rework,
+    Delegation,
+    Question,
+    Answer,
+    Investigate,
+    DecisionRequest,
+}
+
+enum_strings!(HandoffIntent {
+    Rework => "rework",
+    Delegation => "delegation",
+    Question => "question",
+    Answer => "answer",
+    Investigate => "investigate",
+    DecisionRequest => "decision_request",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffStatus {
+    Pending,
+    Accepted,
+    Completed,
+    Declined,
+    Cancelled,
+}
+
+enum_strings!(HandoffStatus {
+    Pending => "pending",
+    Accepted => "accepted",
+    Completed => "completed",
+    Declined => "declined",
+    Cancelled => "cancelled",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalTargetKind {
+    Task,
+    Execution,
+    Workspace,
+}
+
+enum_strings!(ProposalTargetKind {
+    Task => "task",
+    Execution => "execution",
+    Workspace => "workspace",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalTarget {
+    pub kind: ProposalTargetKind,
+    /// Task targets use the owning Task id; execution/workspace targets use
+    /// their own ids and are validated against that same Task.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Open,
+    Resolved,
+    Withdrawn,
+    Superseded,
+}
+
+enum_strings!(ProposalStatus {
+    Open => "open",
+    Resolved => "resolved",
+    Withdrawn => "withdrawn",
+    Superseded => "superseded",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionOutcome {
+    Approve,
+    Reject,
+    Supersede,
+}
+
+enum_strings!(DecisionOutcome {
+    Approve => "approve",
+    Reject => "reject",
+    Supersede => "supersede",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub id: String,
+    pub task_id: String,
+    pub kind: ArtifactKind,
+    pub storage_kind: ArtifactStorageKind,
+    pub content: Option<String>,
+    pub content_ref: Option<String>,
+    pub metadata_json: String,
+    pub digest: Option<String>,
+    pub producer_execution_id: String,
+    /// Derived through ArtifactExecutionProducer -> Execution -> ActorRef.
+    pub producer: ActorRef,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateArtifact {
+    pub id: String,
+    pub task_id: String,
+    pub kind: ArtifactKind,
+    pub storage_kind: ArtifactStorageKind,
+    pub content: Option<String>,
+    pub content_ref: Option<String>,
+    pub metadata_json: String,
+    pub digest: Option<String>,
+    pub producer_execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub id: String,
+    pub task_id: String,
+    pub sender: ActorRef,
+    pub target: CollaborationTarget,
+    pub body: String,
+    pub artifact_ids: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMessage {
+    pub id: String,
+    pub task_id: String,
+    pub sender: ActorRef,
+    pub target: CollaborationTarget,
+    pub body: String,
+    pub artifact_ids: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    pub id: String,
+    pub task_id: String,
+    pub created_by: ActorRef,
+    pub source_role_id: Option<String>,
+    pub target: CollaborationTarget,
+    pub intent: HandoffIntent,
+    pub parent_execution_id: Option<String>,
+    pub expected_policy_ref: Option<String>,
+    pub status: HandoffStatus,
+    pub version: i64,
+    pub artifact_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateHandoff {
+    pub id: String,
+    pub task_id: String,
+    pub created_by: ActorRef,
+    pub source_role_id: Option<String>,
+    pub target: CollaborationTarget,
+    pub intent: HandoffIntent,
+    pub parent_execution_id: Option<String>,
+    pub expected_policy_ref: Option<String>,
+    pub artifact_ids: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionHandoff {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: HandoffStatus,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    pub id: String,
+    pub task_id: String,
+    pub proposer: ActorRef,
+    pub target: ProposalTarget,
+    pub action: String,
+    pub reason: String,
+    pub target_version: Option<i64>,
+    pub target_digest: Option<String>,
+    pub required_policy_ref: Option<String>,
+    pub required_policy_version: Option<i64>,
+    pub required_policy_digest: Option<String>,
+    pub content_version: i64,
+    pub status: ProposalStatus,
+    pub supersedes_proposal_id: Option<String>,
+    pub artifact_ids: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProposal {
+    pub id: String,
+    pub task_id: String,
+    pub proposer: ActorRef,
+    pub target: ProposalTarget,
+    pub action: String,
+    pub reason: String,
+    pub target_version: Option<i64>,
+    pub target_digest: Option<String>,
+    pub required_policy_ref: Option<String>,
+    pub required_policy_version: Option<i64>,
+    pub required_policy_digest: Option<String>,
+    pub supersedes_proposal_id: Option<String>,
+    pub artifact_ids: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    pub id: String,
+    pub task_id: String,
+    pub proposal_id: String,
+    pub proposal_version: i64,
+    pub outcome: DecisionOutcome,
+    pub rationale: String,
+    pub policy_ref: Option<String>,
+    pub policy_version: Option<i64>,
+    pub policy_digest: Option<String>,
+    pub actors: Vec<ActorRef>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDecision {
+    pub id: String,
+    pub task_id: String,
+    pub proposal_id: String,
+    pub proposal_version: i64,
+    pub outcome: DecisionOutcome,
+    pub rationale: String,
+    pub policy_ref: Option<String>,
+    pub policy_version: Option<i64>,
+    pub policy_digest: Option<String>,
+    pub actors: Vec<ActorRef>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollaborationWrite<T> {
+    pub record: T,
+    pub event: DomainEvent,
+}

@@ -641,6 +641,62 @@ pub trait ExecutionRepo: Send + Sync {
     ) -> Result<Execution>;
 }
 
+/// Generic PR4 collaboration persistence. Every create/lifecycle operation
+/// writes its durable domain event in the same SQLite transaction and returns
+/// that committed event for post-commit notification.
+#[async_trait]
+pub trait CollaborationRepo: Send + Sync {
+    async fn create_artifact(
+        &self,
+        input: CreateArtifact,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Artifact>>;
+    async fn get_artifact(&self, id: &str) -> Result<Option<Artifact>>;
+    async fn list_artifacts(&self, task_id: &str, page: PageRequest) -> Result<Page<Artifact>>;
+
+    async fn create_message(
+        &self,
+        input: CreateMessage,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Message>>;
+    async fn get_message(&self, id: &str) -> Result<Option<Message>>;
+    async fn list_messages(&self, task_id: &str, page: PageRequest) -> Result<Page<Message>>;
+
+    async fn create_handoff(
+        &self,
+        input: CreateHandoff,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Handoff>>;
+    async fn get_handoff(&self, id: &str) -> Result<Option<Handoff>>;
+    async fn list_handoffs(&self, task_id: &str, page: PageRequest) -> Result<Page<Handoff>>;
+    async fn transition_handoff(
+        &self,
+        input: TransitionHandoff,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Handoff>>;
+
+    async fn create_proposal(
+        &self,
+        input: CreateProposal,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Proposal>>;
+    async fn get_proposal(&self, id: &str) -> Result<Option<Proposal>>;
+    async fn list_proposals(&self, task_id: &str, page: PageRequest) -> Result<Page<Proposal>>;
+    async fn withdraw_proposal(
+        &self,
+        id: &str,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Proposal>>;
+
+    async fn create_decision(
+        &self,
+        input: CreateDecision,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Decision>>;
+    async fn get_decision(&self, id: &str) -> Result<Option<Decision>>;
+    async fn list_decisions(&self, task_id: &str, page: PageRequest) -> Result<Page<Decision>>;
+}
+
 #[async_trait]
 pub trait HarnessSessionRepo: Send + Sync {
     async fn create(&self, input: CreateHarnessSession) -> Result<HarnessSession>;

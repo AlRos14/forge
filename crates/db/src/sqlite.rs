@@ -55,6 +55,7 @@ mod agent;
 mod agent_chat;
 mod analytics;
 mod attention;
+mod collaboration;
 mod commitment;
 mod daemon;
 mod domain_event;

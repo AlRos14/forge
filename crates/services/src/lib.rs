@@ -10,6 +10,7 @@ pub mod agent_chat_turn_worker;
 pub mod agent_service;
 pub mod attention_service;
 pub mod auth_service;
+pub mod collaboration_service;
 pub mod context_manifest;
 pub mod coordination_consumer;
 pub mod coordination_service;
@@ -91,6 +92,10 @@ pub use attention_service::{
     WakeSuppressionReason,
 };
 pub use auth_service::AuthService;
+pub use collaboration_service::{
+    CollaborationActorSource, CollaborationService, CreateArtifactInput, CreateDecisionInput,
+    CreateHandoffInput, CreateMessageInput, CreateProposalInput,
+};
 pub use context_manifest::{
     fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
 };

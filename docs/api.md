@@ -106,6 +106,23 @@ database for historical provenance.
 | PATCH  | `/api/v1/tasks/{id}/task-roles/{role}` | Update TaskRole policy/mode with an expected version |
 | POST   | `/api/v1/tasks/{id}/task-roles/{role}/members` | Add a Human or Agent membership |
 | PATCH  | `/api/v1/tasks/{id}/task-roles/{role}/members/{membership_id}` | Suspend, resume, or end a membership with an expected version |
+| POST   | `/api/v1/tasks/{task_id}/artifacts` | Create an immutable Artifact attributed to a same-Task Execution |
+| GET    | `/api/v1/tasks/{task_id}/artifacts` | List authorized Artifact metadata using an opaque keyset cursor |
+| GET    | `/api/v1/artifacts/{id}` | Read one Task/Project-authorized Artifact (never returns `content_ref`) |
+| POST   | `/api/v1/tasks/{task_id}/messages` | Create an immutable communication Message with optional Artifact links |
+| GET    | `/api/v1/tasks/{task_id}/messages` | List authorized Messages with an opaque keyset cursor |
+| GET    | `/api/v1/messages/{id}` | Read one Task/Project-authorized Message |
+| POST   | `/api/v1/tasks/{task_id}/handoffs` | Create a pending Handoff without assigning a Role or waking an Agent |
+| GET    | `/api/v1/tasks/{task_id}/handoffs` | List authorized Handoffs with an opaque keyset cursor |
+| GET    | `/api/v1/handoffs/{id}` | Read one Task/Project-authorized Handoff |
+| POST   | `/api/v1/handoffs/{id}/status` | Apply an authorized Handoff lifecycle transition with `expected_version` |
+| POST   | `/api/v1/tasks/{task_id}/proposals` | Create an immutable version-1 Proposal; this does not execute its action |
+| GET    | `/api/v1/tasks/{task_id}/proposals` | List authorized Proposals with an opaque keyset cursor |
+| GET    | `/api/v1/proposals/{id}` | Read one Task/Project-authorized Proposal |
+| POST   | `/api/v1/proposals/{id}/withdraw` | Withdraw the Proposal as its authorized proposer |
+| POST   | `/api/v1/tasks/{task_id}/collaboration/decisions` | Record a Human-authored Decision for an open same-Task Proposal |
+| GET    | `/api/v1/tasks/{task_id}/collaboration/decisions` | List authorized Decisions with an opaque keyset cursor |
+| GET    | `/api/v1/decisions/{id}` | Read one Task/Project-authorized Decision |
 | GET    | `/api/v1/tasks/{id}/plan` | Get the current captured plan and immutable revision summaries; reads the persisted artifact, never a caller-supplied filesystem path |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
@@ -263,6 +280,25 @@ snapshot. If no such observation exists, both fields are `null` and
 Cursor's large control prompt is stored transiently in a private runtime
 directory outside the Git worktree and is removed after the execution attempt,
 so it cannot enter task diffs or commits.
+
+## Generic collaboration records (Plan PR4)
+
+The authenticated HTTP user is the Human sender, creator, proposer, or decider;
+request bodies reject actor identity fields. Agent service reads and writes
+must supply a persisted Execution context, from which the ActorRef is derived.
+Every read and write resolves Task to Project authorization before returning
+data. Lists use opaque stable cursors. Artifact lists omit inline content, and
+neither list nor detail responses include the internal `content_ref` locator.
+
+Message is communication only. Handoff status changes do not create or change
+RoleMembership. Proposal policy fields are opaque policy evidence and never
+grant permission or execute the action. Decision records an immutable outcome
+and does not execute the Proposal. These endpoints do not dual-write legacy
+planning, review, Agent Chat/Handoff, or Project Decision tables.
+
+Generic Decision writes, lists, and reads use the `/collaboration/decisions`
+namespace because `/tasks/{task_id}/decisions` is already the legacy planner
+decision-request API; the two records remain separate authorities.
 
 ## Agent identities, bindings, and chats
 

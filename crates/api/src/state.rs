@@ -70,6 +70,7 @@ pub struct AppState {
     pub commitment_service: Arc<CommitmentService>,
     pub agent_inbox_service: Arc<AgentInboxService>,
     pub agent_action_service: Arc<AgentActionService>,
+    pub collaboration_service: Arc<services::CollaborationService>,
     pub daemon_service: Arc<DaemonService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
     pub workflow_template_service:
@@ -187,6 +188,10 @@ impl AppState {
         let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
         let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
         let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
+        let collaboration_service = Arc::new(services::CollaborationService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        ));
         let cli_task_executor: Arc<dyn TaskExecutor> =
             Arc::new(FallbackExecutor::new(Arc::clone(&adapter_registry)));
         let embedded_task_executor = Arc::new(services::EmbeddedTaskExecutor::new(
@@ -302,6 +307,7 @@ impl AppState {
             commitment_service,
             agent_inbox_service,
             agent_action_service,
+            collaboration_service,
             daemon_service,
             daemon_connections,
             workflow_template_service,

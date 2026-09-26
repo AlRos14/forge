@@ -3,6 +3,12 @@
 Validation and review are separate kinds of work and separate sources of
 truth.
 
+PR4 adds generic collaboration primitives but does not migrate the existing
+Review, validation, `review_evidence_bundle`, or `task_decision_*` authorities.
+Those continue to own their legacy data until PR8. PR4 Artifacts can represent
+generic reports created through the new surface, but no legacy review or
+validation writer automatically creates one.
+
 ## Validation
 
 Deterministic validation is represented by a core-controlled `ValidationRun`,
@@ -16,8 +22,10 @@ HarnessSession, or fake System Actor. It records:
 * status and exit code;
 * a log or output reference.
 
-The run produces Evidence and may produce a generic validation-report
-Artifact whose producer is `ValidationRun(run_id)`. Typical checks include
+The future PR8 run produces Evidence and may produce a generic validation-report
+Artifact through a dedicated ValidationRun producer relation. PR4 supports
+only Execution-produced Artifacts; it creates no ValidationRun foreign key.
+Typical checks include
 tests, typecheck, lint, build, security scanners, and required repository
 commands. It is never attributed to a fake Actor or to an Actor Execution.
 

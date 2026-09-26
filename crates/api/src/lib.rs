@@ -477,6 +477,59 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::create_task).get(routes::tasks::list_tasks),
         )
         .route(
+            "/api/v1/tasks/{task_id}/artifacts",
+            post(routes::collaboration::create_artifact)
+                .get(routes::collaboration::list_artifacts),
+        )
+        .route(
+            "/api/v1/artifacts/{id}",
+            get(routes::collaboration::get_artifact),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/messages",
+            post(routes::collaboration::create_message)
+                .get(routes::collaboration::list_messages),
+        )
+        .route(
+            "/api/v1/messages/{id}",
+            get(routes::collaboration::get_message),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/handoffs",
+            post(routes::collaboration::create_handoff)
+                .get(routes::collaboration::list_handoffs),
+        )
+        .route(
+            "/api/v1/handoffs/{id}",
+            get(routes::collaboration::get_handoff),
+        )
+        .route(
+            "/api/v1/handoffs/{id}/status",
+            post(routes::collaboration::transition_handoff),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/proposals",
+            post(routes::collaboration::create_proposal)
+                .get(routes::collaboration::list_proposals),
+        )
+        .route(
+            "/api/v1/proposals/{id}",
+            get(routes::collaboration::get_proposal),
+        )
+        .route(
+            "/api/v1/proposals/{id}/withdraw",
+            post(routes::collaboration::withdraw_proposal),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/collaboration/decisions",
+            post(routes::collaboration::create_decision)
+                .get(routes::collaboration::list_decisions),
+        )
+        .route(
+            "/api/v1/decisions/{id}",
+            get(routes::collaboration::get_decision),
+        )
+        .route(
             "/api/v1/tasks/{id}",
             get(routes::tasks::get_task)
                 .patch(routes::tasks::update_task)
