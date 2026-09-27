@@ -27,13 +27,127 @@ pub enum ArtifactStorageKind {
     External,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, TS, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum CollaborationTarget {
     Actor { actor: ActorRef },
     Role { role_id: String },
     Task,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CollaborationTargetWire {
+    Actor(ActorTargetFields),
+    Role(RoleTargetFields),
+    Task(TaskTargetFields),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActorTargetFields {
+    kind: ActorTargetTag,
+    actor: CollaborationActorRefWire,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActorTargetTag {
+    Actor,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CollaborationActorRefWire {
+    Human(HumanActorRefFields),
+    Agent(AgentActorRefFields),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HumanActorRefFields {
+    kind: HumanActorRefTag,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HumanActorRefTag {
+    Human,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentActorRefFields {
+    kind: AgentActorRefTag,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentActorRefTag {
+    Agent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleTargetFields {
+    kind: RoleTargetTag,
+    role_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoleTargetTag {
+    Role,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskTargetFields {
+    kind: TaskTargetTag,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskTargetTag {
+    Task,
+}
+
+impl<'de> Deserialize<'de> for CollaborationTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match CollaborationTargetWire::deserialize(deserializer)? {
+            CollaborationTargetWire::Actor(fields) => {
+                let _ = fields.kind;
+                Self::Actor {
+                    actor: match fields.actor {
+                        CollaborationActorRefWire::Human(fields) => {
+                            let _ = fields.kind;
+                            ActorRef::Human(fields.id)
+                        }
+                        CollaborationActorRefWire::Agent(fields) => {
+                            let _ = fields.kind;
+                            ActorRef::Agent(fields.id)
+                        }
+                    },
+                }
+            }
+            CollaborationTargetWire::Role(fields) => {
+                let _ = fields.kind;
+                Self::Role {
+                    role_id: fields.role_id,
+                }
+            }
+            CollaborationTargetWire::Task(fields) => {
+                let _ = fields.kind;
+                Self::Task
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -269,6 +383,8 @@ pub struct CollaborationListQuery {
 
 #[cfg(test)]
 mod tests {
+    use crate::ActorRef;
+
     use super::{
         CreateDecisionRequest, CreateMessageRequest, CreateProposalRequest, ProposalTarget,
     };
@@ -301,5 +417,60 @@ mod tests {
 
         let future_target = serde_json::json!({"kind":"work_unit", "id":"wu-1"});
         assert!(serde_json::from_value::<ProposalTarget>(future_target).is_err());
+
+        assert_eq!(
+            serde_json::from_value::<super::CollaborationTarget>(
+                serde_json::json!({"kind":"task"})
+            )
+            .expect("canonical Task target"),
+            super::CollaborationTarget::Task
+        );
+        assert_eq!(
+            serde_json::from_value::<super::CollaborationTarget>(serde_json::json!({
+                "kind":"actor",
+                "actor":{"kind":"human", "id":"user-1"}
+            }))
+            .expect("canonical Actor target"),
+            super::CollaborationTarget::Actor {
+                actor: ActorRef::Human("user-1".to_owned())
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<super::CollaborationTarget>(serde_json::json!({
+                "kind":"role",
+                "role_id":"role-1"
+            }))
+            .expect("canonical Role target"),
+            super::CollaborationTarget::Role {
+                role_id: "role-1".to_owned()
+            }
+        );
+
+        for contradictory in [
+            serde_json::json!({
+                "kind": "task",
+                "actor": {"kind": "human", "id": "user-1"}
+            }),
+            serde_json::json!({
+                "kind": "role",
+                "role_id": "role-1",
+                "actor": {"kind": "human", "id": "user-1"}
+            }),
+            serde_json::json!({
+                "kind": "actor",
+                "actor": {"kind": "human", "id": "user-1"},
+                "role_id": "role-1"
+            }),
+            serde_json::json!({
+                "kind": "actor",
+                "actor": {"kind": "human", "id": "user-1", "extra": true}
+            }),
+        ] {
+            let described = contradictory.clone();
+            assert!(
+                serde_json::from_value::<super::CollaborationTarget>(contradictory).is_err(),
+                "collaboration targets reject contradictory or extra fields: {described}"
+            );
+        }
     }
 }

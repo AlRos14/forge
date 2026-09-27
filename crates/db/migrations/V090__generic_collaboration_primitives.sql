@@ -156,7 +156,10 @@ CREATE TABLE proposal (
     task_id                     TEXT NOT NULL REFERENCES task(id) ON DELETE RESTRICT,
     proposer_actor_kind         TEXT NOT NULL CHECK (proposer_actor_kind IN ('human', 'agent')),
     proposer_actor_id           TEXT NOT NULL CHECK (length(trim(proposer_actor_id)) > 0),
-    target_kind                 TEXT NOT NULL CHECK (target_kind IN ('task', 'execution', 'workspace')),
+    -- Deliberately open at the storage level so future target kinds (for
+    -- example WorkUnit in PR5) can be admitted additively. PR4's insert guard
+    -- below remains closed over the target kinds it validates today.
+    target_kind                 TEXT NOT NULL,
     target_id                   TEXT NOT NULL CHECK (length(trim(target_id)) > 0),
     action                      TEXT NOT NULL CHECK (
                                     length(trim(action)) BETWEEN 1 AND 128
@@ -455,7 +458,8 @@ END;
 
 CREATE TRIGGER proposal_actor_target_guard_insert
 BEFORE INSERT ON proposal
-WHEN (NEW.proposer_actor_kind = 'human' AND NOT EXISTS (
+WHEN NEW.target_kind NOT IN ('task', 'execution', 'workspace')
+  OR (NEW.proposer_actor_kind = 'human' AND NOT EXISTS (
           SELECT 1 FROM user u WHERE u.id = NEW.proposer_actor_id
       ))
   OR (NEW.proposer_actor_kind = 'agent' AND NOT EXISTS (

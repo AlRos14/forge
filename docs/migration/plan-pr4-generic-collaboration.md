@@ -33,12 +33,18 @@ Artifact storage is exactly one of `inline` content or an `external`
 `content_ref`, enforced by a database CHECK. Artifact has no producer actor
 column. PR4 supports exactly one Execution producer through
 `artifact_execution_producer`; its Human/Agent ActorRef is derived through
-Execution. Reads fail closed for missing, dangling, or cross-Task producers.
+Execution. Reads fail closed for a missing producer relation, missing or
+cross-Task Execution, or missing/invalid persisted Execution ActorRef. They do
+not require the referenced Human or Agent to remain live after creation.
 PR8 can add a separate `artifact_validation_run_producer` relation once
 ValidationRun exists. PR4 deliberately creates no FK to that future table.
 
 ActorRef uses the PR1 Human/Agent identity. DB triggers check referenced Users
 and Agent identities, reject `System`, and validate Role/Execution scope.
+These checks validate identity and target existence at insertion. Persisted
+ActorRefs and Proposal targets are historical references: later deletion of a
+User, Agent, or Workspace does not make an otherwise structurally valid record
+unreadable. Proposal targets are not live foreign keys.
 Authenticated HTTP requests derive Human identity from `AuthenticatedUser`;
 the request DTOs contain no sender/proposer/creator/decider identity fields.
 Trusted service callers derive Agent identity from a same-Task persisted
@@ -52,7 +58,12 @@ PR4; `work_unit` is unsupported until PR5. Its content is immutable at
 `content_version = 1`, and material revisions are new linked Proposals.
 Decision is immutable, requires at least one Human/Agent decider, supports
 multiple mixed deciders, and records `approve`, `reject`, or `supersede`.
-Supersede is followed by a new Proposal. Decision never executes action.
+Supersede is followed by a new Proposal. PR4 records deciders and policy
+evidence but does not evaluate whether the decider set satisfies TaskRole
+coordination policy. A deterministic consumer must check that policy before
+executing an action. Decision alone does not grant permission or execute
+action. `Proposal.status = resolved` means an `approve` or `reject` Decision
+exists; the action has not thereby been executed.
 
 Policy references and snapshots are opaque evidence. They are not a DSL,
 permission, authorization result, or bypass; deterministic consumers decide
@@ -63,11 +74,18 @@ WorkUnit/Gate/ValidationRun links, and action execution are not in PR4.
 
 PR4 reuses `domain_event` as the durable event ledger. Each persisted record
 and its creation/lifecycle event commit in the same SQLite transaction.
-EventBus notifications are post-commit only. Event payloads carry bounded IDs,
-kinds, action/outcome/status/version, and safe digests; they exclude Artifact
-content and `content_ref`, Message body, Proposal reason, Decision rationale,
-filesystem paths, workspace handles, prompts, credentials, and authorization
-material.
+EventBus notifications are post-commit only. PR4 payloads contain exactly
+these data fields: `artifact.created` carries `artifact_id`, `task_id`, and
+`kind`; `message.created` carries `message_id`, `task_id`, and `target_kind`;
+`handoff.created` carries `handoff_id`, `task_id`, `intent`, and `target_kind`;
+`handoff.status_changed` carries `handoff_id`, `task_id`, `from_status`,
+`status`, and `version`; `proposal.created` carries `proposal_id`, `task_id`,
+and `target_kind`; `proposal.withdrawn` carries `proposal_id`, `task_id`, and
+`status`; `decision.recorded` carries `decision_id`, `task_id`, `proposal_id`,
+and `outcome`. No payload contains free-form Artifact `digest`, Proposal
+`action`, Artifact content or `content_ref`, Message body, Proposal reason or
+policy references, Decision rationale or policy references, filesystem paths,
+workspace handles, prompts, credentials, or authorization material.
 
 ## API and authorization
 
@@ -84,8 +102,9 @@ requests, and Axum cannot register both parameterized patterns independently.
 The scoped collaboration segment keeps the legacy route and its authority
 unchanged.
 
-Every operation resolves record to Task to Project before authorization. Reads
-by ID do not disclose content or existence to an unauthorized user. Message,
+ID-based reads first resolve only `record id -> task_id`, authorize Actor ->
+Task -> Project, and only then load record semantics. Unauthenticated-by-scope
+IDs do not disclose content, status, corruption, or existence. Message,
 Handoff, Proposal, and Decision grant no membership or privilege. HTTP writes
 derive the Human from auth; the Agent service path accepts only a persisted
 Execution context for reads and writes and checks its Task, ActorRef, and

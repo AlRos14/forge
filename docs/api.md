@@ -286,9 +286,14 @@ so it cannot enter task diffs or commits.
 The authenticated HTTP user is the Human sender, creator, proposer, or decider;
 request bodies reject actor identity fields. Agent service reads and writes
 must supply a persisted Execution context, from which the ActorRef is derived.
-Every read and write resolves Task to Project authorization before returning
-data. Lists use opaque stable cursors. Artifact lists omit inline content, and
-neither list nor detail responses include the internal `content_ref` locator.
+ID-based operations resolve only `record id -> task_id`, authorize the Task's
+Project, and then load and validate record content. An unauthorized ID returns
+404 without exposing record status, version, or structural corruption. Message
+and Handoff targets accept exactly `{"kind":"actor","actor":...}`,
+`{"kind":"role","role_id":"..."}`, or `{"kind":"task"}`; unknown and
+contradictory target fields are rejected. Lists use opaque stable cursors.
+Artifact lists omit inline content, and neither list nor detail responses
+include the internal `content_ref` locator.
 
 Message is communication only. Handoff status changes do not create or change
 RoleMembership. Proposal policy fields are opaque policy evidence and never

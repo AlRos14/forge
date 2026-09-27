@@ -35,12 +35,9 @@ fn encode_collaboration_cursor(created_at: &str, id: &str) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn actor_from_columns(kind: String, id: String, exists: i64) -> Result<ActorRef> {
-    if exists != 1 {
-        return Err(DbError::Check(
-            "collaboration record contains a dangling ActorRef".to_owned(),
-        ));
-    }
+/// Reconstructs the immutable identity recorded at write time. Liveness is
+/// validated by the INSERT guards, not by historical reads.
+fn actor_from_columns(kind: String, id: String) -> Result<ActorRef> {
     let kind = parse_enum::<ActorKind>(kind)?;
     if id.trim().is_empty() {
         return Err(DbError::Check(
@@ -58,14 +55,12 @@ fn target_from_columns(
     actor_kind: Option<String>,
     actor_id: Option<String>,
     role_id: Option<String>,
-    actor_exists: i64,
     role_exists: i64,
 ) -> Result<CollaborationTarget> {
     match parse_enum::<CollaborationTargetKind>(kind)? {
         CollaborationTargetKind::Actor => Ok(CollaborationTarget::Actor(actor_from_columns(
             actor_kind.ok_or_else(|| DbError::Check("actor target kind is missing".to_owned()))?,
             actor_id.ok_or_else(|| DbError::Check("actor target id is missing".to_owned()))?,
-            actor_exists,
         )?)),
         CollaborationTargetKind::Role => {
             if role_exists != 1 {
@@ -102,16 +97,7 @@ fn artifact_select() -> &'static str {
             p.task_id AS producer_task_id,
             e.task_id AS execution_task_id,
             e.actor_kind AS producer_actor_kind,
-            e.actor_id AS producer_actor_id,
-            CASE
-                WHEN e.actor_kind = 'human' AND EXISTS (
-                    SELECT 1 FROM user u WHERE u.id = e.actor_id
-                ) THEN 1
-                WHEN e.actor_kind = 'agent' AND EXISTS (
-                    SELECT 1 FROM agent_identity ai WHERE ai.id = e.actor_id
-                ) THEN 1
-                ELSE 0
-            END AS producer_actor_exists
+            e.actor_id AS producer_actor_id
      FROM artifact a
      LEFT JOIN artifact_execution_producer p ON p.artifact_id = a.id
      LEFT JOIN execution e ON e.id = p.execution_id"
@@ -124,7 +110,6 @@ fn map_artifact(row: SqliteRow) -> Result<Artifact> {
     let execution_task_id: Option<String> = row.try_get("execution_task_id")?;
     let actor_kind: Option<String> = row.try_get("producer_actor_kind")?;
     let actor_id: Option<String> = row.try_get("producer_actor_id")?;
-    let actor_exists: i64 = row.try_get("producer_actor_exists")?;
     if producer_task_id.as_deref() != Some(task_id.as_str())
         || execution_task_id.as_deref() != Some(task_id.as_str())
     {
@@ -137,7 +122,6 @@ fn map_artifact(row: SqliteRow) -> Result<Artifact> {
             .ok_or_else(|| DbError::Check("Artifact producer ActorRef is missing".to_owned()))?,
         actor_id
             .ok_or_else(|| DbError::Check("Artifact producer actor id is missing".to_owned()))?,
-        actor_exists,
     )?;
     Ok(Artifact {
         id: row.try_get("id")?,
@@ -157,24 +141,6 @@ fn map_artifact(row: SqliteRow) -> Result<Artifact> {
 
 fn message_select() -> &'static str {
     "SELECT m.*,
-            CASE
-                WHEN m.sender_actor_kind = 'human' AND EXISTS (
-                    SELECT 1 FROM user u WHERE u.id = m.sender_actor_id
-                ) THEN 1
-                WHEN m.sender_actor_kind = 'agent' AND EXISTS (
-                    SELECT 1 FROM agent_identity ai WHERE ai.id = m.sender_actor_id
-                ) THEN 1
-                ELSE 0
-            END AS sender_actor_exists,
-            CASE
-                WHEN m.target_actor_kind = 'human' AND EXISTS (
-                    SELECT 1 FROM user u WHERE u.id = m.target_actor_id
-                ) THEN 1
-                WHEN m.target_actor_kind = 'agent' AND EXISTS (
-                    SELECT 1 FROM agent_identity ai WHERE ai.id = m.target_actor_id
-                ) THEN 1
-                ELSE 0
-            END AS target_actor_exists,
             CASE WHEN EXISTS (
                 SELECT 1 FROM task_role tr
                 WHERE tr.id = m.target_role_id AND tr.task_id = m.task_id
@@ -204,14 +170,12 @@ async fn map_message(db: &SqliteDb, row: SqliteRow) -> Result<Message> {
     let sender = actor_from_columns(
         row.try_get("sender_actor_kind")?,
         row.try_get("sender_actor_id")?,
-        row.try_get("sender_actor_exists")?,
     )?;
     let target = target_from_columns(
         row.try_get("target_kind")?,
         row.try_get("target_actor_kind")?,
         row.try_get("target_actor_id")?,
         row.try_get("target_role_id")?,
-        row.try_get("target_actor_exists")?,
         row.try_get("target_role_exists")?,
     )?;
     let artifact_ids = message_artifact_ids(db, &id, &task_id).await?;
@@ -228,24 +192,6 @@ async fn map_message(db: &SqliteDb, row: SqliteRow) -> Result<Message> {
 
 fn handoff_select() -> &'static str {
     "SELECT h.*,
-            CASE
-                WHEN h.created_by_actor_kind = 'human' AND EXISTS (
-                    SELECT 1 FROM user u WHERE u.id = h.created_by_actor_id
-                ) THEN 1
-                WHEN h.created_by_actor_kind = 'agent' AND EXISTS (
-                    SELECT 1 FROM agent_identity ai WHERE ai.id = h.created_by_actor_id
-                ) THEN 1
-                ELSE 0
-            END AS creator_actor_exists,
-            CASE
-                WHEN h.target_actor_kind = 'human' AND EXISTS (
-                    SELECT 1 FROM user u WHERE u.id = h.target_actor_id
-                ) THEN 1
-                WHEN h.target_actor_kind = 'agent' AND EXISTS (
-                    SELECT 1 FROM agent_identity ai WHERE ai.id = h.target_actor_id
-                ) THEN 1
-                ELSE 0
-            END AS target_actor_exists,
             CASE WHEN EXISTS (
                 SELECT 1 FROM task_role tr
                 WHERE tr.id = h.target_role_id AND tr.task_id = h.task_id
@@ -290,14 +236,12 @@ async fn map_handoff(db: &SqliteDb, row: SqliteRow) -> Result<Handoff> {
     let created_by = actor_from_columns(
         row.try_get("created_by_actor_kind")?,
         row.try_get("created_by_actor_id")?,
-        row.try_get("creator_actor_exists")?,
     )?;
     let target = target_from_columns(
         row.try_get("target_kind")?,
         row.try_get("target_actor_kind")?,
         row.try_get("target_actor_id")?,
         row.try_get("target_role_id")?,
-        row.try_get("target_actor_exists")?,
         row.try_get("target_role_exists")?,
     )?;
     let artifact_ids = handoff_artifact_ids(db, &id, &task_id).await?;
@@ -320,27 +264,6 @@ async fn map_handoff(db: &SqliteDb, row: SqliteRow) -> Result<Handoff> {
 
 fn proposal_select() -> &'static str {
     "SELECT p.*,
-            CASE
-                WHEN p.proposer_actor_kind = 'human' AND EXISTS (
-                    SELECT 1 FROM user u WHERE u.id = p.proposer_actor_id
-                ) THEN 1
-                WHEN p.proposer_actor_kind = 'agent' AND EXISTS (
-                    SELECT 1 FROM agent_identity ai WHERE ai.id = p.proposer_actor_id
-                ) THEN 1
-                ELSE 0
-            END AS proposer_actor_exists,
-            CASE p.target_kind
-                WHEN 'task' THEN CASE WHEN p.target_id = p.task_id THEN 1 ELSE 0 END
-                WHEN 'execution' THEN CASE WHEN EXISTS (
-                    SELECT 1 FROM execution e
-                    WHERE e.id = p.target_id AND e.task_id = p.task_id
-                ) THEN 1 ELSE 0 END
-                WHEN 'workspace' THEN CASE WHEN EXISTS (
-                    SELECT 1 FROM workspace w
-                    WHERE w.id = p.target_id AND w.task_id = p.task_id
-                ) THEN 1 ELSE 0 END
-                ELSE 0
-            END AS target_exists,
             CASE WHEN p.supersedes_proposal_id IS NULL OR EXISTS (
                 SELECT 1 FROM proposal prior
                 WHERE prior.id = p.supersedes_proposal_id
@@ -369,17 +292,14 @@ async fn proposal_artifact_ids(
 async fn map_proposal(db: &SqliteDb, row: SqliteRow) -> Result<Proposal> {
     let task_id: String = row.try_get("task_id")?;
     let id: String = row.try_get("id")?;
-    if row.try_get::<i64, _>("target_exists")? != 1
-        || row.try_get::<i64, _>("supersedes_exists")? != 1
-    {
+    if row.try_get::<i64, _>("supersedes_exists")? != 1 {
         return Err(DbError::Check(
-            "Proposal target or supersedes reference is missing or cross-Task".to_owned(),
+            "Proposal supersedes reference is missing or cross-Task".to_owned(),
         ));
     }
     let proposer = actor_from_columns(
         row.try_get("proposer_actor_kind")?,
         row.try_get("proposer_actor_id")?,
-        row.try_get("proposer_actor_exists")?,
     )?;
     let target = ProposalTarget {
         kind: parse_enum(row.try_get("target_kind")?)?,
@@ -408,16 +328,7 @@ async fn map_proposal(db: &SqliteDb, row: SqliteRow) -> Result<Proposal> {
 
 async fn decision_actors(db: &SqliteDb, decision_id: &str, task_id: &str) -> Result<Vec<ActorRef>> {
     let rows = sqlx::query(
-        "SELECT da.actor_kind, da.actor_id, da.task_id,
-                CASE
-                    WHEN da.actor_kind = 'human' AND EXISTS (
-                        SELECT 1 FROM user u WHERE u.id = da.actor_id
-                    ) THEN 1
-                    WHEN da.actor_kind = 'agent' AND EXISTS (
-                        SELECT 1 FROM agent_identity ai WHERE ai.id = da.actor_id
-                    ) THEN 1
-                    ELSE 0
-                END AS actor_exists
+        "SELECT da.actor_kind, da.actor_id, da.task_id
          FROM decision_actor da
          WHERE da.decision_id = ? AND da.task_id = ?
          ORDER BY da.actor_kind ASC, da.actor_id ASC",
@@ -439,11 +350,7 @@ async fn decision_actors(db: &SqliteDb, decision_id: &str, task_id: &str) -> Res
                     "Decision actor is attached to a different Task".to_owned(),
                 ));
             }
-            actor_from_columns(
-                row.try_get("actor_kind")?,
-                row.try_get("actor_id")?,
-                row.try_get("actor_exists")?,
-            )
+            actor_from_columns(row.try_get("actor_kind")?, row.try_get("actor_id")?)
         })
         .collect()
 }
@@ -604,6 +511,15 @@ impl CollaborationRepo for SqliteDb {
         Ok(CollaborationWrite { record, event })
     }
 
+    async fn get_artifact_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM artifact WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+
     async fn get_artifact(&self, id: &str) -> Result<Option<Artifact>> {
         get_artifact_row(self, id).await
     }
@@ -681,6 +597,15 @@ impl CollaborationRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         Ok(CollaborationWrite { record, event })
+    }
+
+    async fn get_message_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM message WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
     }
 
     async fn get_message(&self, id: &str) -> Result<Option<Message>> {
@@ -765,6 +690,15 @@ impl CollaborationRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         Ok(CollaborationWrite { record, event })
+    }
+
+    async fn get_handoff_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM handoff WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
     }
 
     async fn get_handoff(&self, id: &str) -> Result<Option<Handoff>> {
@@ -885,6 +819,15 @@ impl CollaborationRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         Ok(CollaborationWrite { record, event })
+    }
+
+    async fn get_proposal_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM proposal WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
     }
 
     async fn get_proposal(&self, id: &str) -> Result<Option<Proposal>> {
@@ -1017,6 +960,15 @@ impl CollaborationRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         Ok(CollaborationWrite { record, event })
+    }
+
+    async fn get_decision_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM decision WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
     }
 
     async fn get_decision(&self, id: &str) -> Result<Option<Decision>> {

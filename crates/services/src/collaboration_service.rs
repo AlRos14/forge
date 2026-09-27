@@ -140,7 +140,6 @@ impl CollaborationService {
                 "artifact_id": id,
                 "task_id": input.task_id,
                 "kind": input.kind.to_string(),
-                "digest": input.digest,
             }),
             &now,
         );
@@ -170,13 +169,15 @@ impl CollaborationService {
         id: &str,
         source: CollaborationActorSource,
     ) -> Result<Artifact> {
-        let record = CollaborationRepo::get_artifact(&*self.db, id)
+        let task_id = CollaborationRepo::get_artifact_task_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("artifact", id.to_owned()))?;
-        self.authorize_source(&record.task_id, &source)
+        self.authorize_source(&task_id, &source)
             .await
             .map_err(|_| not_found("artifact", id.to_owned()))?;
-        Ok(record)
+        CollaborationRepo::get_artifact(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("artifact", id.to_owned()))
     }
 
     pub async fn list_artifacts(
@@ -241,13 +242,15 @@ impl CollaborationService {
         id: &str,
         source: CollaborationActorSource,
     ) -> Result<db::Message> {
-        let record = CollaborationRepo::get_message(&*self.db, id)
+        let task_id = CollaborationRepo::get_message_task_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("message", id.to_owned()))?;
-        self.authorize_source(&record.task_id, &source)
+        self.authorize_source(&task_id, &source)
             .await
             .map_err(|_| not_found("message", id.to_owned()))?;
-        Ok(record)
+        CollaborationRepo::get_message(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("message", id.to_owned()))
     }
 
     pub async fn list_messages(
@@ -361,13 +364,15 @@ impl CollaborationService {
     }
 
     pub async fn get_handoff(&self, id: &str, source: CollaborationActorSource) -> Result<Handoff> {
-        let record = CollaborationRepo::get_handoff(&*self.db, id)
+        let task_id = CollaborationRepo::get_handoff_task_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("handoff", id.to_owned()))?;
-        self.authorize_source(&record.task_id, &source)
+        self.authorize_source(&task_id, &source)
             .await
             .map_err(|_| not_found("handoff", id.to_owned()))?;
-        Ok(record)
+        CollaborationRepo::get_handoff(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("handoff", id.to_owned()))
     }
 
     pub async fn list_handoffs(
@@ -387,10 +392,16 @@ impl CollaborationService {
         expected_version: i64,
         next_status: HandoffStatus,
     ) -> Result<Handoff> {
+        let task_id = CollaborationRepo::get_handoff_task_id(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("handoff", id.to_owned()))?;
+        let (_, actor) = self
+            .authorize_source(&task_id, &source)
+            .await
+            .map_err(|_| not_found("handoff", id.to_owned()))?;
         let existing = CollaborationRepo::get_handoff(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("handoff", id.to_owned()))?;
-        let (_, actor) = self.authorize_source(&existing.task_id, &source).await?;
         let transition_allowed = matches!(
             (existing.status, next_status),
             (HandoffStatus::Pending, HandoffStatus::Accepted)
@@ -473,7 +484,6 @@ impl CollaborationService {
                 "proposal_id": id,
                 "task_id": task.id,
                 "target_kind": input.target.kind.to_string(),
-                "action": input.action,
             }),
             &now,
         );
@@ -507,13 +517,15 @@ impl CollaborationService {
         id: &str,
         source: CollaborationActorSource,
     ) -> Result<Proposal> {
-        let record = CollaborationRepo::get_proposal(&*self.db, id)
+        let task_id = CollaborationRepo::get_proposal_task_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("proposal", id.to_owned()))?;
-        self.authorize_source(&record.task_id, &source)
+        self.authorize_source(&task_id, &source)
             .await
             .map_err(|_| not_found("proposal", id.to_owned()))?;
-        Ok(record)
+        CollaborationRepo::get_proposal(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("proposal", id.to_owned()))
     }
 
     pub async fn list_proposals(
@@ -531,10 +543,16 @@ impl CollaborationService {
         source: CollaborationActorSource,
         id: &str,
     ) -> Result<Proposal> {
+        let task_id = CollaborationRepo::get_proposal_task_id(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("proposal", id.to_owned()))?;
+        let (_, actor) = self
+            .authorize_source(&task_id, &source)
+            .await
+            .map_err(|_| not_found("proposal", id.to_owned()))?;
         let existing = CollaborationRepo::get_proposal(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("proposal", id.to_owned()))?;
-        let (_, actor) = self.authorize_source(&existing.task_id, &source).await?;
         if existing.proposer != actor {
             return Err(not_found("proposal", id.to_owned()));
         }
@@ -569,17 +587,6 @@ impl CollaborationService {
         if deciders.is_empty() {
             return Err(invalid("Decision requires at least one decider"));
         }
-        let proposal = CollaborationRepo::get_proposal(&*self.db, &input.proposal_id)
-            .await?
-            .ok_or_else(|| not_found("proposal", input.proposal_id.clone()))?;
-        if proposal.task_id != input.task_id
-            || proposal.content_version != input.proposal_version
-            || proposal.status != ProposalStatus::Open
-        {
-            return Err(invalid(
-                "Decision Proposal is missing, stale, cross-Task, or already resolved",
-            ));
-        }
         let mut actors = Vec::with_capacity(deciders.len());
         let mut identities = HashSet::new();
         for source in &deciders {
@@ -590,6 +597,17 @@ impl CollaborationService {
         }
         if actors.is_empty() {
             return Err(invalid("Decision requires at least one distinct decider"));
+        }
+        let proposal = CollaborationRepo::get_proposal(&*self.db, &input.proposal_id)
+            .await?
+            .ok_or_else(|| not_found("proposal", input.proposal_id.clone()))?;
+        if proposal.task_id != input.task_id
+            || proposal.content_version != input.proposal_version
+            || proposal.status != ProposalStatus::Open
+        {
+            return Err(invalid(
+                "Decision Proposal is missing, stale, cross-Task, or already resolved",
+            ));
         }
         let initiating_actor = actors[0].clone();
         let id = new_uuid_v4();
@@ -637,13 +655,15 @@ impl CollaborationService {
         id: &str,
         source: CollaborationActorSource,
     ) -> Result<Decision> {
-        let record = CollaborationRepo::get_decision(&*self.db, id)
+        let task_id = CollaborationRepo::get_decision_task_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("decision", id.to_owned()))?;
-        self.authorize_source(&record.task_id, &source)
+        self.authorize_source(&task_id, &source)
             .await
             .map_err(|_| not_found("decision", id.to_owned()))?;
-        Ok(record)
+        CollaborationRepo::get_decision(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("decision", id.to_owned()))
     }
 
     pub async fn list_decisions(

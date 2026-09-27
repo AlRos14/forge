@@ -62,7 +62,10 @@ reviewer's failure.
 
 ## Rework
 
-Request-changes produces a ReviewReport Artifact and a rework Handoff. The
-Handoff targets the selected implementer Actor and exact HarnessSession when
-possible. It may also target a new Actor if orchestration or policy selects
-one. Historical reviewer and implementer Executions remain unchanged.
+Request-changes produces a ReviewReport Artifact and a rework Handoff. A PR4
+Handoff identifies its target Actor, Role, or Task but does not persist the
+recipient's exact HarnessSession. If PR6 or PR8 needs session continuity for
+rework, it must add an explicit additive relation or typed action carrying
+that identity. It must never infer the session from a Role or latest
+Execution lookup. Historical reviewer and implementer Executions remain
+unchanged.

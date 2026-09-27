@@ -68,7 +68,9 @@ permissions, or authorization.
 `domain_event` remains the durable event ledger. Each PR4 record mutation and
 its domain event commit in one transaction; the in-process EventBus is only a
 post-commit notification. Payloads exclude bodies, content, rationales,
-filesystem paths, storage locators, and authorization material. Project teardown
+filesystem paths, storage locators, free-form Artifact digests, free-form
+Proposal actions, policy references, and authorization material. Artifact and
+Proposal records retain those fields for authorized readers. Project teardown
 removes PR4 rows through the guarded Project deletion path; the event ledger
 remains historical evidence under its existing retention contract.
 
@@ -288,8 +290,11 @@ ValidationRun ran. Both may be Gates.
 ### INV-029 — Review feedback is collaboration
 
 Rework is represented by ReviewReport Artifact plus Message or Handoff. Hidden
-prompt rewriting is not the durable rework protocol. Exact implementer session
-continuity is used when possible.
+prompt rewriting is not the durable rework protocol. A PR4 Handoff identifies
+an Actor, Role, or Task target and does not persist the recipient's exact
+HarnessSession. If PR6 or PR8 requires session continuity for rework, it must
+add an explicit additive relation or typed action carrying that identity; it
+must never infer continuity from a Role or latest-Execution lookup.
 
 ### INV-030 — Deterministic authority stays deterministic
 

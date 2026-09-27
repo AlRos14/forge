@@ -651,6 +651,7 @@ pub trait CollaborationRepo: Send + Sync {
         input: CreateArtifact,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Artifact>>;
+    async fn get_artifact_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_artifact(&self, id: &str) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self, task_id: &str, page: PageRequest) -> Result<Page<Artifact>>;
 
@@ -659,6 +660,7 @@ pub trait CollaborationRepo: Send + Sync {
         input: CreateMessage,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Message>>;
+    async fn get_message_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_message(&self, id: &str) -> Result<Option<Message>>;
     async fn list_messages(&self, task_id: &str, page: PageRequest) -> Result<Page<Message>>;
 
@@ -667,6 +669,7 @@ pub trait CollaborationRepo: Send + Sync {
         input: CreateHandoff,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Handoff>>;
+    async fn get_handoff_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_handoff(&self, id: &str) -> Result<Option<Handoff>>;
     async fn list_handoffs(&self, task_id: &str, page: PageRequest) -> Result<Page<Handoff>>;
     async fn transition_handoff(
@@ -680,6 +683,7 @@ pub trait CollaborationRepo: Send + Sync {
         input: CreateProposal,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Proposal>>;
+    async fn get_proposal_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_proposal(&self, id: &str) -> Result<Option<Proposal>>;
     async fn list_proposals(&self, task_id: &str, page: PageRequest) -> Result<Page<Proposal>>;
     async fn withdraw_proposal(
@@ -693,6 +697,7 @@ pub trait CollaborationRepo: Send + Sync {
         input: CreateDecision,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Decision>>;
+    async fn get_decision_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_decision(&self, id: &str) -> Result<Option<Decision>>;
     async fn list_decisions(&self, task_id: &str, page: PageRequest) -> Result<Page<Decision>>;
 }

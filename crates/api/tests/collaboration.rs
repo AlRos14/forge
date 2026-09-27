@@ -226,6 +226,19 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
     assert_eq!(list.items.len(), 1);
     assert!(list.items[0].content.is_none(), "list omits inline content");
 
+    let open_proposal: ProposalResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/proposals", task.id),
+        json!({
+            "target": {"kind": "task", "id": task.id},
+            "action": "remain-open",
+            "reason": "check ID authorization ordering"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
     let outsider: AuthResponse = json_request(
         &harness.app,
         Method::POST,
@@ -247,9 +260,69 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
     )
     .await;
     assert!(!unauthorized.message.contains("private-storage"));
+
+    sqlx::query("DROP TRIGGER artifact_execution_producer_immutable_delete")
+        .execute(harness.state.db.pool())
+        .await
+        .expect("allow deleting producer to model a corrupt persisted Artifact");
+    sqlx::query("DELETE FROM artifact_execution_producer WHERE artifact_id = ?")
+        .bind(&artifact.id)
+        .execute(harness.state.db.pool())
+        .await
+        .expect("corrupt the existing Artifact producer relation");
+
+    let unauthorized_corrupt = empty_request_with_bearer::<api_types::ErrorResponse>(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/artifacts/{}", artifact.id),
+        &outsider.access_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(unauthorized_corrupt.message, unauthorized.message);
+    let owner_sees_corruption = empty_request::<api_types::ErrorResponse>(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/artifacts/{}", artifact.id),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(owner_sees_corruption
+        .message
+        .to_lowercase()
+        .contains("producer"));
+
+    let mut decision_errors = Vec::new();
+    for (proposal_id, proposal_version) in [
+        (open_proposal.id.as_str(), open_proposal.content_version),
+        (open_proposal.id.as_str(), 99),
+        (proposal.id.as_str(), proposal.content_version),
+        ("pr4-api-missing-proposal", 1),
+    ] {
+        let unauthorized_decision = json_request_with_bearer::<api_types::ErrorResponse>(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/collaboration/decisions", task.id),
+            &outsider.access_token,
+            json!({
+                "proposal_id": proposal_id,
+                "proposal_version": proposal_version,
+                "outcome": "approve",
+                "rationale": "outsider must not learn Proposal state"
+            }),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert!(!unauthorized_decision.message.contains("stale"));
+        assert!(!unauthorized_decision.message.contains("resolved"));
+        decision_errors.push(unauthorized_decision.message);
+    }
+    assert!(decision_errors.windows(2).all(|pair| pair[0] == pair[1]));
     for path in [
+        format!("/api/v1/handoffs/{}", handoff.id),
         format!("/api/v1/messages/{}", message.id),
         format!("/api/v1/proposals/{}", proposal.id),
+        format!("/api/v1/proposals/{}", open_proposal.id),
         format!("/api/v1/decisions/{}", decision.id),
     ] {
         let unauthorized = empty_request_with_bearer::<api_types::ErrorResponse>(

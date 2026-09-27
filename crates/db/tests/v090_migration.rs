@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use db::{create_sqlite_pool, now_rfc3339, run_migrations_from};
+use sqlx::Row;
 
 fn copy_migrations_through(limit: i64, destination: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -22,6 +23,28 @@ fn copy_migrations_through(limit: i64, destination: &Path) {
                 .expect("migration copied");
         }
     }
+}
+
+async fn snapshot_row(pool: &sqlx::SqlitePool, table: &str, id: &str) -> String {
+    let table_info = format!("PRAGMA table_info(\"{table}\")");
+    let columns = sqlx::query(&table_info)
+        .fetch_all(pool)
+        .await
+        .expect("table metadata")
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("name").expect("column name"))
+        .collect::<Vec<_>>();
+    let pairs = columns
+        .iter()
+        .map(|column| format!("'{column}', \"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT json_object({pairs}) FROM \"{table}\" WHERE id = ?");
+    sqlx::query_scalar(&query)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("complete row snapshot")
 }
 
 #[tokio::test]
@@ -82,12 +105,78 @@ async fn v090_applies_over_v089_and_preserves_legacy_rows_after_reopen() {
     .execute(&pool)
     .await
     .expect("legacy plan revision");
-    let before: (String, String, String, i64) = sqlx::query_as(
-        "SELECT id, markdown, content_digest, revision FROM task_plan_revision WHERE id = 'v090-plan'",
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES ('v090-legacy-user', 'v090-legacy@example.test', 'fixture', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("legacy chat user");
+    let main_chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE kind = 'account_main' AND account_id = 'v090-legacy-user'",
     )
     .fetch_one(&pool)
     .await
-    .expect("legacy row snapshot");
+    .expect("User insert creates the legacy Main Agent Chat");
+    let project_chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = 'v090-project'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Project insert creates the legacy Project Agent Chat");
+    sqlx::query(
+        "INSERT INTO agent_chat_message (
+             id, chat_id, sequence, author_type, author_id, content, status,
+             correlation_id, source_type, created_at
+         ) VALUES ('v090-legacy-message', ?, 1, 'user',
+                   'v090-legacy-user', 'legacy chat body', 'complete',
+                   'v090-chat-correlation', 'native', ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("legacy Agent Chat message");
+    sqlx::query(
+        "INSERT INTO agent_handoff (
+             id, source_chat_id, target_chat_id, content, correlation_id,
+             dedupe_key, created_at, updated_at
+         ) VALUES ('v090-legacy-handoff', ?, ?,
+                   'legacy handoff body', 'v090-handoff-correlation',
+                   'v090-handoff-dedupe', ?, ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&project_chat_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("legacy Agent Handoff");
+    sqlx::query(
+        "INSERT INTO project_decision (
+             id, project_id, state, decision_class, question, context_json,
+             options_json, selected_outcome, rationale, principal_type,
+             principal_id, authority_basis, authorization_action, explicit_event,
+             authorization_occurred_at, source_refs_json, affected_records_json, created_at
+         ) VALUES ('v090-legacy-decision', 'v090-project', 'active',
+                   'project_implementation', 'legacy question', '{}', '[]',
+                   'keep', 'legacy rationale', 'human', 'v090-legacy-user',
+                   'legacy-authority', 'project.decision.record',
+                   'v090-legacy-event', ?, '[]', '{}', ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("legacy Project Decision");
+    let before_plan = snapshot_row(&pool, "task_plan_revision", "v090-plan").await;
+    let before_chat_message =
+        snapshot_row(&pool, "agent_chat_message", "v090-legacy-message").await;
+    let before_agent_handoff = snapshot_row(&pool, "agent_handoff", "v090-legacy-handoff").await;
+    let before_project_decision =
+        snapshot_row(&pool, "project_decision", "v090-legacy-decision").await;
 
     let migration_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     fs::copy(
@@ -103,13 +192,22 @@ async fn v090_applies_over_v089_and_preserves_legacy_rows_after_reopen() {
     let reopened = create_sqlite_pool(&database_url)
         .await
         .expect("database reopens");
-    let after: (String, String, String, i64) = sqlx::query_as(
-        "SELECT id, markdown, content_digest, revision FROM task_plan_revision WHERE id = 'v090-plan'",
-    )
-    .fetch_one(&reopened)
-    .await
-    .expect("legacy plan remains");
-    assert_eq!(after, before);
+    assert_eq!(
+        snapshot_row(&reopened, "task_plan_revision", "v090-plan").await,
+        before_plan
+    );
+    assert_eq!(
+        snapshot_row(&reopened, "agent_chat_message", "v090-legacy-message").await,
+        before_chat_message
+    );
+    assert_eq!(
+        snapshot_row(&reopened, "agent_handoff", "v090-legacy-handoff").await,
+        before_agent_handoff
+    );
+    assert_eq!(
+        snapshot_row(&reopened, "project_decision", "v090-legacy-decision").await,
+        before_project_decision
+    );
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
         .fetch_one(&reopened)
         .await

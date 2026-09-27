@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentRepo,
-    AgentStatus, ArtifactKind, ArtifactStorageKind, CollaborationRepo, CollaborationTarget,
-    CoordinationMode, CreateAgentIdentity, CreateAgentProfile, CreateArtifact, CreateDomainEvent,
-    CreateRoleMembership, CreateTaskRole, DecisionOutcome, DomainEventRepo, HandoffStatus,
-    ProjectRepo, ProposalTarget, ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus,
-    SqliteDb, TaskRoleRepo,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind,
+    AgentChatMessageAuthorType, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
+    AgentHandoffRepo, AgentRepo, AgentStatus, ArtifactKind, ArtifactStorageKind, CollaborationRepo,
+    CollaborationTarget, CoordinationMode, CreateAgentChatMessage, CreateAgentHandoff,
+    CreateAgentIdentity, CreateAgentProfile, CreateArtifact, CreateDomainEvent,
+    CreateProjectDecision, CreateRoleMembership, CreateTaskRole, CreateWorkspace, DecisionOutcome,
+    DomainEventRepo, HandoffStatus, ProjectOrchestrationRepo, ProjectRepo, ProposalTarget,
+    ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, TaskRoleRepo, UserRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use services::{
@@ -219,13 +222,34 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
                 content: Some("artifact-secret".to_owned()),
                 content_ref: None,
                 metadata_json: r#"{"safe":true}"#.to_owned(),
-                digest: Some("sha256:test".to_owned()),
+                digest: Some("private-storage://digest-secret/path".to_owned()),
             },
         )
         .await
         .expect("inline Artifact");
     assert_eq!(artifact.producer, db::ActorRef::Human(f.user_id.clone()));
     assert_eq!(artifact.producer_execution_id, f.execution_id);
+    let external_artifact = f
+        .service
+        .create_artifact(
+            actor.clone(),
+            CreateArtifactInput {
+                task_id: f.task_id.clone(),
+                producer_execution_id: f.execution_id.clone(),
+                kind: ArtifactKind::TestReport,
+                storage_kind: ArtifactStorageKind::External,
+                content: None,
+                content_ref: Some("private-storage://content-ref-secret/path".to_owned()),
+                metadata_json: "{}".to_owned(),
+                digest: Some("digest-secret".to_owned()),
+            },
+        )
+        .await
+        .expect("external Artifact");
+    assert_eq!(
+        external_artifact.content_ref.as_deref(),
+        Some("private-storage://content-ref-secret/path")
+    );
     let artifact_event: String = sqlx::query_scalar(
         "SELECT payload_json FROM domain_event WHERE entity_type = 'artifact' AND entity_id = ?",
     )
@@ -235,6 +259,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
     .expect("Artifact event");
     assert!(!artifact_event.contains("artifact-secret"));
     assert!(!artifact_event.contains("content_ref"));
+    assert!(!artifact_event.contains("private-storage://digest-secret/path"));
 
     let actor_column: Option<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('artifact') WHERE name = 'actor_id'",
@@ -338,7 +363,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
                 target: CollaborationTarget::Task,
                 intent: db::HandoffIntent::Question,
                 parent_execution_id: Some(f.execution_id.clone()),
-                expected_policy_ref: Some("policy://review".to_owned()),
+                expected_policy_ref: Some("private-policy://handoff-secret".to_owned()),
                 artifact_ids: vec![artifact.id.clone()],
             },
         )
@@ -377,7 +402,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
     .fetch_one(f.db.pool())
     .await
     .expect("Handoff event");
-    assert!(!handoff_event.contains("policy://review"));
+    assert!(!handoff_event.contains("private-policy://handoff-secret"));
     let memberships: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM role_membership")
         .fetch_one(f.db.pool())
         .await
@@ -394,13 +419,13 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
                     kind: ProposalTargetKind::Task,
                     id: f.task_id.clone(),
                 },
-                action: "ship-change".to_owned(),
+                action: "/private/path/action-secret".to_owned(),
                 reason: "proposal-secret".to_owned(),
                 target_version: None,
                 target_digest: None,
-                required_policy_ref: Some("policy://release".to_owned()),
+                required_policy_ref: Some("private-policy://proposal-secret".to_owned()),
                 required_policy_version: Some(3),
-                required_policy_digest: Some("sha256:policy".to_owned()),
+                required_policy_digest: Some("policy-snapshot-secret".to_owned()),
                 supersedes_proposal_id: None,
                 artifact_ids: vec![artifact.id.clone()],
             },
@@ -457,7 +482,9 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
     .await
     .expect("Proposal event");
     assert!(!proposal_event.contains("proposal-secret"));
-    assert!(!proposal_event.contains("policy://release"));
+    assert!(!proposal_event.contains("/private/path/action-secret"));
+    assert!(!proposal_event.contains("private-policy://proposal-secret"));
+    assert!(!proposal_event.contains("policy-snapshot-secret"));
     let decision = f
         .service
         .record_decision(
@@ -467,9 +494,9 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
                 proposal_version: proposal.content_version,
                 outcome: DecisionOutcome::Approve,
                 rationale: "decision-secret".to_owned(),
-                policy_ref: Some("policy://release".to_owned()),
+                policy_ref: Some("private-policy://decision-secret".to_owned()),
                 policy_version: Some(3),
-                policy_digest: Some("sha256:policy".to_owned()),
+                policy_digest: Some("decision-policy-snapshot-secret".to_owned()),
             },
             vec![actor],
         )
@@ -484,7 +511,41 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
     .await
     .expect("Decision event");
     assert!(!decision_event.contains("decision-secret"));
-    assert!(!decision_event.contains("policy://release"));
+    assert!(!decision_event.contains("private-policy://decision-secret"));
+    assert!(!decision_event.contains("decision-policy-snapshot-secret"));
+
+    let event_payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM domain_event
+         WHERE event_type IN (
+             'artifact.created', 'message.created', 'handoff.created',
+             'handoff.status_changed', 'proposal.created', 'proposal.withdrawn',
+             'decision.recorded'
+         )",
+    )
+    .fetch_all(f.db.pool())
+    .await
+    .expect("PR4 payloads");
+    for sensitive in [
+        "artifact-secret",
+        "private-storage://digest-secret/path",
+        "private-storage://content-ref-secret/path",
+        "message-secret",
+        "private-policy://handoff-secret",
+        "/private/path/action-secret",
+        "proposal-secret",
+        "private-policy://proposal-secret",
+        "policy-snapshot-secret",
+        "decision-secret",
+        "private-policy://decision-secret",
+        "decision-policy-snapshot-secret",
+    ] {
+        assert!(
+            event_payloads
+                .iter()
+                .all(|payload| !payload.contains(sensitive)),
+            "PR4 domain events must not contain {sensitive}"
+        );
+    }
     let proposal_immutable = sqlx::query("UPDATE proposal SET action = 'changed' WHERE id = ?")
         .bind(&proposal.id)
         .execute(f.db.pool())
@@ -1031,4 +1092,531 @@ async fn artifact_and_domain_event_rollback_together() {
     assert_eq!(artifact_count, 0);
     assert_eq!(producer_count, 0);
     assert_eq!(event_count, 1, "the pre-existing event remains unchanged");
+}
+
+#[tokio::test]
+async fn historical_collaboration_reads_survive_actor_and_workspace_deletion() {
+    let f = fixture().await;
+    let reader_id = "pr4-history-reader";
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES (?, 'pr4-reader@example.test', 'test', ?, ?)",
+    )
+    .bind(reader_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(f.db.pool())
+    .await
+    .expect("authorized reader user");
+
+    let artifact = f
+        .service
+        .create_artifact(
+            human(&f),
+            CreateArtifactInput {
+                task_id: f.task_id.clone(),
+                producer_execution_id: f.execution_id.clone(),
+                kind: ArtifactKind::Summary,
+                storage_kind: ArtifactStorageKind::Inline,
+                content: Some("historical content".to_owned()),
+                content_ref: None,
+                metadata_json: "{}".to_owned(),
+                digest: None,
+            },
+        )
+        .await
+        .expect("Artifact");
+    let message = f
+        .service
+        .create_message(
+            human(&f),
+            CreateMessageInput {
+                task_id: f.task_id.clone(),
+                target: CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone())),
+                body: "historical message".to_owned(),
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect("Message");
+    let handoff = f
+        .service
+        .create_handoff(
+            human(&f),
+            CreateHandoffInput {
+                task_id: f.task_id.clone(),
+                source_role_id: None,
+                target: CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone())),
+                intent: db::HandoffIntent::Question,
+                parent_execution_id: Some(f.execution_id.clone()),
+                expected_policy_ref: None,
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect("Handoff");
+    let workspace = WorkspaceRepo::create(
+        &*f.db,
+        CreateWorkspace {
+            id: "pr4-history-workspace".to_owned(),
+            task_id: f.task_id.clone(),
+            repo_id: "pr4-repo".to_owned(),
+            worktree_path: "/tmp/pr4-history-workspace".to_owned(),
+            branch: "pr4-history".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Workspace");
+    let workspace_proposal = f
+        .service
+        .create_proposal(
+            human(&f),
+            CreateProposalInput {
+                task_id: f.task_id.clone(),
+                target: ProposalTarget {
+                    kind: ProposalTargetKind::Workspace,
+                    id: workspace.id.clone(),
+                },
+                action: "inspect-workspace".to_owned(),
+                reason: "historical workspace reference".to_owned(),
+                target_version: None,
+                target_digest: None,
+                required_policy_ref: None,
+                required_policy_version: None,
+                required_policy_digest: None,
+                supersedes_proposal_id: None,
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect("Workspace Proposal");
+    let decided_proposal = f
+        .service
+        .create_proposal(
+            human(&f),
+            CreateProposalInput {
+                task_id: f.task_id.clone(),
+                target: ProposalTarget {
+                    kind: ProposalTargetKind::Task,
+                    id: f.task_id.clone(),
+                },
+                action: "record-only".to_owned(),
+                reason: "Decision history fixture".to_owned(),
+                target_version: None,
+                target_digest: None,
+                required_policy_ref: None,
+                required_policy_version: None,
+                required_policy_digest: None,
+                supersedes_proposal_id: None,
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect("Task Proposal");
+    let decision = f
+        .service
+        .record_decision(
+            CreateDecisionInput {
+                task_id: f.task_id.clone(),
+                proposal_id: decided_proposal.id,
+                proposal_version: 1,
+                outcome: DecisionOutcome::Approve,
+                rationale: "recorded only".to_owned(),
+                policy_ref: None,
+                policy_version: None,
+                policy_digest: None,
+            },
+            vec![human(&f)],
+        )
+        .await
+        .expect("Decision");
+
+    assert!(UserRepo::delete_user(&*f.db, &f.user_id)
+        .await
+        .expect("Human deletion succeeds"));
+    WorkspaceRepo::delete(&*f.db, &workspace.id)
+        .await
+        .expect("Workspace reset deletes live target");
+    let reader = CollaborationActorSource::Human(reader_id.to_owned());
+
+    assert_eq!(
+        f.service
+            .get_artifact(&artifact.id, reader.clone())
+            .await
+            .expect("Artifact remains readable")
+            .producer,
+        db::ActorRef::Human(f.user_id.clone())
+    );
+    let message = f
+        .service
+        .get_message(&message.id, reader.clone())
+        .await
+        .expect("Message remains readable");
+    assert_eq!(message.sender, db::ActorRef::Human(f.user_id.clone()));
+    assert_eq!(
+        message.target,
+        CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone()))
+    );
+    let handoff = f
+        .service
+        .get_handoff(&handoff.id, reader.clone())
+        .await
+        .expect("Handoff remains readable");
+    assert_eq!(handoff.created_by, db::ActorRef::Human(f.user_id.clone()));
+    assert_eq!(
+        handoff.target,
+        CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone()))
+    );
+    let proposal = f
+        .service
+        .get_proposal(&workspace_proposal.id, reader.clone())
+        .await
+        .expect("Proposal remains readable after Workspace reset");
+    assert_eq!(proposal.proposer, db::ActorRef::Human(f.user_id.clone()));
+    assert_eq!(proposal.target.id, workspace.id);
+    let proposal_page = f
+        .service
+        .list_proposals(
+            &f.task_id,
+            reader.clone(),
+            db::PageRequest {
+                cursor: None,
+                limit: 10,
+                include_total: true,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Desc,
+            },
+        )
+        .await
+        .expect("proposal list survives a deleted target");
+    assert_eq!(proposal_page.total_count, Some(2));
+    assert!(proposal_page
+        .items
+        .iter()
+        .any(|item| item.id == workspace_proposal.id));
+    assert_eq!(
+        f.service
+            .get_decision(&decision.id, reader)
+            .await
+            .expect("Decision remains readable")
+            .actors,
+        vec![db::ActorRef::Human(f.user_id.clone())]
+    );
+}
+
+#[tokio::test]
+async fn proposal_target_insert_guard_rejects_future_and_unknown_kinds() {
+    let f = fixture().await;
+    let now = now_rfc3339();
+    let workspace = WorkspaceRepo::create(
+        &*f.db,
+        CreateWorkspace {
+            id: "pr4-target-workspace".to_owned(),
+            task_id: f.task_id.clone(),
+            repo_id: "pr4-repo".to_owned(),
+            worktree_path: "/tmp/pr4-target-workspace".to_owned(),
+            branch: "pr4-target".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Workspace");
+    let schema: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'proposal'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .expect("Proposal schema");
+    assert!(!schema.contains("target_kind IN"));
+
+    for (id, kind, target_id) in [
+        ("pr4-target-task", "task", f.task_id.as_str()),
+        ("pr4-target-execution", "execution", f.execution_id.as_str()),
+        (
+            "pr4-target-workspace-valid",
+            "workspace",
+            workspace.id.as_str(),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO proposal (
+                 id, task_id, proposer_actor_kind, proposer_actor_id,
+                 target_kind, target_id, action, reason, status, created_at
+             ) VALUES (?, ?, 'human', ?, ?, ?, 'inspect', 'valid target', 'open', ?)",
+        )
+        .bind(id)
+        .bind(&f.task_id)
+        .bind(&f.user_id)
+        .bind(kind)
+        .bind(target_id)
+        .bind(&now)
+        .execute(f.db.pool())
+        .await
+        .expect("PR4 target kind admitted");
+    }
+    for (id, kind) in [
+        ("pr4-target-work-unit", "work_unit"),
+        ("pr4-target-unknown", "whatever_unknown"),
+    ] {
+        let rejected = sqlx::query(
+            "INSERT INTO proposal (
+                 id, task_id, proposer_actor_kind, proposer_actor_id,
+                 target_kind, target_id, action, reason, status, created_at
+             ) VALUES (?, ?, 'human', ?, ?, 'opaque', 'inspect', 'invalid target', 'open', ?)",
+        )
+        .bind(id)
+        .bind(&f.task_id)
+        .bind(&f.user_id)
+        .bind(kind)
+        .bind(&now)
+        .execute(f.db.pool())
+        .await
+        .expect_err("PR4 insert trigger remains closed");
+        assert!(rejected.to_string().contains("Proposal ActorRef, target"));
+    }
+    assert!(
+        serde_json::from_value::<api_types::ProposalTargetKind>(serde_json::json!("work_unit"))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn collaboration_message_cursor_pages_stably_through_timestamp_ties() {
+    let f = fixture().await;
+    let rows = [
+        ("tie-a", "2026-09-03T00:00:00Z"),
+        ("tie-b", "2026-09-03T00:00:00Z"),
+        ("middle", "2026-09-02T00:00:00Z"),
+        ("old-a", "2026-09-01T00:00:00Z"),
+        ("old-b", "2026-09-01T00:00:00Z"),
+    ];
+    for (id, created_at) in rows {
+        sqlx::query(
+            "INSERT INTO message (
+                 id, task_id, sender_actor_kind, sender_actor_id,
+                 target_kind, body, created_at
+             ) VALUES (?, ?, 'human', ?, 'task', 'page row', ?)",
+        )
+        .bind(id)
+        .bind(&f.task_id)
+        .bind(&f.user_id)
+        .bind(created_at)
+        .execute(f.db.pool())
+        .await
+        .expect("message row");
+    }
+    let page_request = |cursor| db::PageRequest {
+        cursor,
+        limit: 2,
+        include_total: true,
+        sort_by: db::SortBy::CreatedAt,
+        sort_order: db::SortOrder::Desc,
+    };
+    let first = CollaborationRepo::list_messages(&*f.db, &f.task_id, page_request(None))
+        .await
+        .expect("first page");
+    assert_eq!(first.total_count, Some(5));
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tie-b", "tie-a"]
+    );
+    let cursor_1 = first.next_cursor.clone().expect("first next cursor");
+    let second = CollaborationRepo::list_messages(&*f.db, &f.task_id, page_request(Some(cursor_1)))
+        .await
+        .expect("second page");
+    assert_eq!(second.total_count, Some(5));
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["middle", "old-b"]
+    );
+    let cursor_2 = second.next_cursor.clone().expect("second next cursor");
+    let third = CollaborationRepo::list_messages(&*f.db, &f.task_id, page_request(Some(cursor_2)))
+        .await
+        .expect("third page");
+    assert_eq!(third.total_count, Some(5));
+    assert_eq!(
+        third
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old-a"]
+    );
+    assert!(third.next_cursor.is_none());
+
+    let all_ids: Vec<&str> = first
+        .items
+        .iter()
+        .chain(second.items.iter())
+        .chain(third.items.iter())
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(all_ids, vec!["tie-b", "tie-a", "middle", "old-b", "old-a"]);
+    let invalid_cursor = CollaborationRepo::list_messages(
+        &*f.db,
+        &f.task_id,
+        page_request(Some("invalid-cursor".to_owned())),
+    )
+    .await
+    .expect_err("invalid cursor is rejected");
+    assert!(matches!(invalid_cursor, db::DbError::InvalidCursor));
+}
+
+#[tokio::test]
+async fn legacy_production_writers_do_not_project_into_generic_collaboration() {
+    let f = fixture().await;
+    let plan_root = tempfile::tempdir().expect("plan root");
+    let worktree = plan_root.path().join("repo");
+    std::fs::create_dir(&worktree).expect("legacy worktree");
+    std::fs::write(
+        plan_root.path().join("plan.md"),
+        "# Legacy plan\n- [ ] keep legacy\n",
+    )
+    .expect("legacy plan file");
+    services::plan_artifact::capture_plan_revision(
+        &f.db,
+        &f.task_id,
+        &worktree,
+        "approved",
+        Some(&f.execution_id),
+    )
+    .await
+    .expect("legacy planning writer");
+
+    let now = now_rfc3339();
+    let main_chat = AgentChatRepo::get_main_chat(&*f.db, &f.user_id)
+        .await
+        .expect("legacy Main Agent Chat lookup")
+        .expect("legacy Main Agent Chat exists");
+    let project_chat = AgentChatRepo::get_project_chat(&*f.db, &f.project_id)
+        .await
+        .expect("legacy Project Agent Chat lookup")
+        .expect("legacy Project Agent Chat exists");
+    AgentChatMessageRepo::append_agent_chat_message(
+        &*f.db,
+        CreateAgentChatMessage {
+            id: "pr4-legacy-chat-message".to_owned(),
+            chat_id: main_chat.id.clone(),
+            sequence: 1,
+            author_type: AgentChatMessageAuthorType::User,
+            author_id: Some(f.user_id.clone()),
+            content: "legacy Agent Chat message".to_owned(),
+            content_guard_json: "{}".to_owned(),
+            sensitivity: "internal".to_owned(),
+            status: AgentChatMessageStatus::Complete,
+            outcome: None,
+            model: None,
+            profile_id: None,
+            session_id: None,
+            context_manifest_id: None,
+            token_usage_json: None,
+            duration_ms: None,
+            error: None,
+            correlation_id: "pr4-legacy-chat-correlation".to_owned(),
+            causation_id: None,
+            handoff_id: None,
+            source_type: "native".to_owned(),
+            source_id: None,
+            source_message_id: None,
+            source_room_id: None,
+            source_conversation_id: None,
+            source_sequence: None,
+            source_metadata_json: "{}".to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("legacy Agent Chat message writer");
+    AgentHandoffRepo::create_agent_handoff(
+        &*f.db,
+        CreateAgentHandoff {
+            id: "pr4-legacy-agent-handoff".to_owned(),
+            source_chat_id: main_chat.id,
+            target_chat_id: project_chat.id,
+            source_message_id: None,
+            source_turn_job_id: None,
+            author_identity_id: None,
+            content: "legacy Agent Handoff".to_owned(),
+            content_guard_json: "{}".to_owned(),
+            source_revisions_json: "[]".to_owned(),
+            correlation_id: "pr4-legacy-handoff-correlation".to_owned(),
+            causation_id: None,
+            dedupe_key: "pr4-legacy-handoff-dedupe".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("legacy Agent Handoff writer");
+
+    let project = ProjectRepo::get_by_id(&*f.db, &f.project_id)
+        .await
+        .expect("Project lookup")
+        .expect("Project exists");
+    ProjectOrchestrationRepo::append_project_decision(
+        &*f.db,
+        CreateProjectDecision {
+            id: "pr4-legacy-project-decision".to_owned(),
+            project_id: f.project_id.clone(),
+            expected_project_version: project.version,
+            state: "active".to_owned(),
+            decision_class: "project_implementation".to_owned(),
+            question: "legacy Project Decision".to_owned(),
+            context_json: "{}".to_owned(),
+            options_json: "[]".to_owned(),
+            selected_outcome: "keep-legacy".to_owned(),
+            rationale: "legacy decision writer".to_owned(),
+            principal_type: "human".to_owned(),
+            principal_id: f.user_id.clone(),
+            authority_basis: "explicit-user-choice".to_owned(),
+            authorization_action: "project.decision.record".to_owned(),
+            explicit_event: "legacy-explicit-event".to_owned(),
+            authorization_occurred_at: now.clone(),
+            charter_revision_id: None,
+            baseline_revision_id: None,
+            source_refs_json: "[]".to_owned(),
+            affected_records_json: "{}".to_owned(),
+            supersedes_decision_id: None,
+            created_at: now,
+        },
+    )
+    .await
+    .expect("legacy Project Decision writer");
+
+    let legacy_counts = [
+        ("task_plan_revision", "task_plan_revision"),
+        ("agent_chat_message", "agent_chat_message"),
+        ("agent_handoff", "agent_handoff"),
+        ("project_decision", "project_decision"),
+    ];
+    for (table, _) in legacy_counts {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(f.db.pool())
+            .await
+            .expect("legacy rows remain written");
+        assert_eq!(count, 1, "legacy production writer populated {table}");
+    }
+    for table in ["artifact", "message", "handoff", "proposal", "decision"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(f.db.pool())
+            .await
+            .expect("generic table exists");
+        assert_eq!(count, 0, "legacy writer did not project to generic {table}");
+    }
 }
