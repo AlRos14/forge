@@ -110,6 +110,12 @@ impl CollaborationService {
             input.content.as_deref(),
             input.content_ref.as_deref(),
         )?;
+        let producer_task_id = ExecutionRepo::get_task_id(&*self.db, &input.producer_execution_id)
+            .await?
+            .ok_or_else(|| not_found("execution", input.producer_execution_id.clone()))?;
+        if producer_task_id != input.task_id {
+            return Err(not_found("execution", input.producer_execution_id));
+        }
         let execution = ExecutionRepo::get_by_id(&*self.db, &input.producer_execution_id)
             .await?
             .ok_or_else(|| not_found("execution", input.producer_execution_id.clone()))?;
@@ -283,6 +289,12 @@ impl CollaborationService {
                     .await?;
                 }
                 if let Some(execution_id) = input.parent_execution_id.as_deref() {
+                    let parent_task_id = ExecutionRepo::get_task_id(&*self.db, execution_id)
+                        .await?
+                        .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+                    if parent_task_id != task.id {
+                        return Err(not_found("execution", execution_id.to_owned()));
+                    }
                     let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
                         .await?
                         .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
@@ -303,6 +315,12 @@ impl CollaborationService {
                     return Err(invalid(
                         "Agent Handoff parent must be its current Execution",
                     ));
+                }
+                let source_task_id = ExecutionRepo::get_task_id(&*self.db, execution_id)
+                    .await?
+                    .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+                if source_task_id != task.id {
+                    return Err(not_found("execution", execution_id.to_owned()));
                 }
                 let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
                     .await?
@@ -459,12 +477,18 @@ impl CollaborationService {
         }
         self.validate_proposal_target(&task, &input.target).await?;
         if let Some(prior_id) = input.supersedes_proposal_id.as_deref() {
+            let prior_task_id = CollaborationRepo::get_proposal_task_id(&*self.db, prior_id)
+                .await?
+                .ok_or_else(|| not_found("proposal", prior_id.to_owned()))?;
+            if prior_task_id != task.id {
+                return Err(not_found("proposal", prior_id.to_owned()));
+            }
             let prior = CollaborationRepo::get_proposal(&*self.db, prior_id)
                 .await?
                 .ok_or_else(|| not_found("proposal", prior_id.to_owned()))?;
-            if prior.task_id != task.id || prior.status != ProposalStatus::Superseded {
+            if prior.status != ProposalStatus::Superseded {
                 return Err(invalid(
-                    "superseded Proposal must be in the same Task and have a supersede Decision",
+                    "superseded Proposal must have a supersede Decision",
                 ));
             }
         }
@@ -598,16 +622,20 @@ impl CollaborationService {
         if actors.is_empty() {
             return Err(invalid("Decision requires at least one distinct decider"));
         }
+        let proposal_task_id =
+            CollaborationRepo::get_proposal_task_id(&*self.db, &input.proposal_id)
+                .await?
+                .ok_or_else(|| not_found("proposal", input.proposal_id.clone()))?;
+        if proposal_task_id != input.task_id {
+            return Err(not_found("proposal", input.proposal_id));
+        }
         let proposal = CollaborationRepo::get_proposal(&*self.db, &input.proposal_id)
             .await?
             .ok_or_else(|| not_found("proposal", input.proposal_id.clone()))?;
-        if proposal.task_id != input.task_id
-            || proposal.content_version != input.proposal_version
+        if proposal.content_version != input.proposal_version
             || proposal.status != ProposalStatus::Open
         {
-            return Err(invalid(
-                "Decision Proposal is missing, stale, cross-Task, or already resolved",
-            ));
+            return Err(invalid("Decision Proposal is stale or already resolved"));
         }
         let initiating_actor = actors[0].clone();
         let id = new_uuid_v4();
@@ -695,6 +723,12 @@ impl CollaborationService {
                 ActorRef::Human(user_id.clone())
             }
             CollaborationActorSource::Execution(execution_id) => {
+                let execution_task_id = ExecutionRepo::get_task_id(&*self.db, execution_id)
+                    .await?
+                    .ok_or_else(|| not_found("execution", execution_id.clone()))?;
+                if execution_task_id != task.id {
+                    return Err(not_found("execution", execution_id.clone()));
+                }
                 let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
                     .await?
                     .ok_or_else(|| not_found("execution", execution_id.clone()))?;
@@ -711,9 +745,6 @@ impl CollaborationService {
                             .map_err(|_| not_found("execution", execution_id.clone()))?;
                     }
                     ActorRef::Agent(agent_id) => {
-                        if AgentRepo::get_by_id(&*self.db, agent_id).await?.is_none() {
-                            return Err(invalid("Execution ActorRef no longer exists"));
-                        }
                         let role = db::canonical_task_role_name(&execution.role)
                             .ok_or_else(|| invalid("Execution has no addressable TaskRole"))?;
                         if !self
@@ -725,6 +756,9 @@ impl CollaborationService {
                                     .to_owned(),
                             });
                         }
+                        if AgentRepo::get_by_id(&*self.db, agent_id).await?.is_none() {
+                            return Err(invalid("Execution ActorRef no longer exists"));
+                        }
                     }
                 }
                 actor
@@ -734,27 +768,32 @@ impl CollaborationService {
     }
 
     async fn authorize_human_project(&self, project: &Project, user_id: &str) -> Result<()> {
+        let member = ProjectMemberRepo::get_member(&*self.db, &project.id, user_id)
+            .await?
+            .is_some();
+        // This matches the current local-first Project access contract.
+        if project.owner_id.is_some() && project.owner_id.as_deref() != Some(user_id) && !member {
+            return Err(not_found("project", project.id.clone()));
+        }
         if UserRepo::get_user_by_id(&*self.db, user_id)
             .await?
             .is_none()
         {
             return Err(not_found("project", project.id.clone()));
         }
-        let member = ProjectMemberRepo::get_member(&*self.db, &project.id, user_id)
-            .await?
-            .is_some();
-        // This matches the current local-first Project access contract.
-        if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) || member {
-            Ok(())
-        } else {
-            Err(not_found("project", project.id.clone()))
-        }
+        Ok(())
     }
 
     async fn validate_target(&self, task: &Task, target: &CollaborationTarget) -> Result<()> {
         match target {
             CollaborationTarget::Task => Ok(()),
             CollaborationTarget::Role(role_id) => {
+                let role_task_id = TaskRoleRepo::get_task_id(&*self.db, role_id)
+                    .await?
+                    .ok_or_else(|| not_found("task_role", role_id.clone()))?;
+                if role_task_id != task.id {
+                    return Err(not_found("task_role", role_id.clone()));
+                }
                 let role = TaskRoleRepo::get_by_id(&*self.db, role_id)
                     .await?
                     .ok_or_else(|| not_found("task_role", role_id.clone()))?;
@@ -773,9 +812,10 @@ impl CollaborationService {
                         .map_err(|_| not_found("actor", user_id.clone()))
                 }
                 ActorRef::Agent(agent_id) => {
-                    if AgentRepo::get_by_id(&*self.db, agent_id).await?.is_none()
-                        || !self.has_membership(&task.id, actor, None).await?
-                    {
+                    if !self.has_membership(&task.id, actor, None).await? {
+                        return Err(not_found("actor", agent_id.clone()));
+                    }
+                    if AgentRepo::get_by_id(&*self.db, agent_id).await?.is_none() {
                         return Err(not_found("actor", agent_id.clone()));
                     }
                     Ok(())
@@ -792,12 +832,15 @@ impl CollaborationService {
                     "Artifact relationships cannot contain duplicate ids",
                 ));
             }
-            let artifact = CollaborationRepo::get_artifact(&*self.db, id)
+            let artifact_task_id = CollaborationRepo::get_artifact_task_id(&*self.db, id)
                 .await?
                 .ok_or_else(|| not_found("artifact", id.clone()))?;
-            if artifact.task_id != task_id {
+            if artifact_task_id != task_id {
                 return Err(not_found("artifact", id.clone()));
             }
+            CollaborationRepo::get_artifact(&*self.db, id)
+                .await?
+                .ok_or_else(|| not_found("artifact", id.clone()))?;
         }
         Ok(())
     }
@@ -809,6 +852,12 @@ impl CollaborationService {
             }
             ProposalTargetKind::Task => Ok(()),
             ProposalTargetKind::Execution => {
+                let execution_task_id = ExecutionRepo::get_task_id(&*self.db, &target.id)
+                    .await?
+                    .ok_or_else(|| not_found("execution", target.id.clone()))?;
+                if execution_task_id != task.id {
+                    return Err(not_found("execution", target.id.clone()));
+                }
                 let execution = ExecutionRepo::get_by_id(&*self.db, &target.id)
                     .await?
                     .ok_or_else(|| not_found("execution", target.id.clone()))?;
@@ -818,6 +867,12 @@ impl CollaborationService {
                 Ok(())
             }
             ProposalTargetKind::Workspace => {
+                let workspace_task_id = WorkspaceRepo::get_task_id(&*self.db, &target.id)
+                    .await?
+                    .ok_or_else(|| not_found("workspace", target.id.clone()))?;
+                if workspace_task_id != task.id {
+                    return Err(not_found("workspace", target.id.clone()));
+                }
                 let workspace = WorkspaceRepo::get_by_id(&*self.db, &target.id)
                     .await?
                     .ok_or_else(|| not_found("workspace", target.id.clone()))?;

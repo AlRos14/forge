@@ -10,6 +10,15 @@ impl ExecutionRepo for SqliteDb {
         Ok(execution)
     }
 
+    async fn get_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM execution WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>> {
         sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(id)

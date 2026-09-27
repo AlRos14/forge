@@ -21,6 +21,7 @@ struct Fixture {
     db: Arc<SqliteDb>,
     service: CollaborationService,
     project_id: String,
+    repo_id: String,
     task_id: String,
     second_task_id: String,
     user_id: String,
@@ -103,10 +104,136 @@ async fn fixture() -> Fixture {
         service: CollaborationService::new(Arc::clone(&db), Arc::new(EventBus::new(32))),
         db,
         project_id,
+        repo_id,
         task_id,
         second_task_id,
         user_id,
         execution_id,
+    }
+}
+
+struct ForeignProjectFixture {
+    project_id: String,
+    repo_id: String,
+    task_id: String,
+    user_id: String,
+    execution_id: String,
+}
+
+async fn create_foreign_project(f: &Fixture) -> ForeignProjectFixture {
+    let now = now_rfc3339();
+    let project_id = "pr4-project-b".to_owned();
+    let repo_id = "pr4-repo-b".to_owned();
+    let task_id = "pr4-task-b".to_owned();
+    let user_id = "pr4-human-b".to_owned();
+    let execution_id = "pr4-human-execution-b".to_owned();
+
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES (?, 'pr4-b@example.test', 'test', ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(f.db.pool())
+    .await
+    .expect("Project B owner");
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, owner_id, created_at, updated_at)
+         VALUES (?, 'PR4 Project B', '{}', ?, ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(f.db.pool())
+    .await
+    .expect("independent Project B");
+    sqlx::query(
+        "INSERT INTO repo (
+             id, project_id, name, remote_url, local_path, work_mode,
+             default_branch, created_at, updated_at
+         ) VALUES (?, ?, 'test-b', 'https://example.invalid/pr4-b.git', NULL,
+                   'direct_merge', 'main', ?, ?)",
+    )
+    .bind(&repo_id)
+    .bind(&project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(f.db.pool())
+    .await
+    .expect("Project B repo");
+    sqlx::query(
+        "INSERT INTO task (
+             id, project_id, repo_id, title, task_type, status, created_at, updated_at
+         ) VALUES (?, ?, ?, 'Project B Task', 'implementation', 'in_progress', ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&project_id)
+    .bind(&repo_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(f.db.pool())
+    .await
+    .expect("Project B Task");
+    sqlx::query(
+        "INSERT INTO execution (
+             id, task_id, agent_id, role, status, created_at, updated_at,
+             actor_kind, actor_id, purpose
+         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?, 'general')",
+    )
+    .bind(&execution_id)
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&user_id)
+    .execute(f.db.pool())
+    .await
+    .expect("Project B Human Execution");
+
+    ForeignProjectFixture {
+        project_id,
+        repo_id,
+        task_id,
+        user_id,
+        execution_id,
+    }
+}
+
+fn task_proposal(task_id: &str) -> CreateProposalInput {
+    CreateProposalInput {
+        task_id: task_id.to_owned(),
+        target: ProposalTarget {
+            kind: ProposalTargetKind::Task,
+            id: task_id.to_owned(),
+        },
+        action: "record-only".to_owned(),
+        reason: "scope reference test".to_owned(),
+        target_version: None,
+        target_digest: None,
+        required_policy_ref: None,
+        required_policy_version: None,
+        required_policy_digest: None,
+        supersedes_proposal_id: None,
+        artifact_ids: vec![],
+    }
+}
+
+fn decision_input(
+    task_id: &str,
+    proposal_id: &str,
+    proposal_version: i64,
+    outcome: DecisionOutcome,
+) -> CreateDecisionInput {
+    CreateDecisionInput {
+        task_id: task_id.to_owned(),
+        proposal_id: proposal_id.to_owned(),
+        proposal_version,
+        outcome,
+        rationale: "scope reference test".to_owned(),
+        policy_ref: None,
+        policy_version: None,
+        policy_digest: None,
     }
 }
 
@@ -453,13 +580,23 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
         no_deciders,
         services::ServiceError::InvalidOperation { .. }
     ));
+    let foreign = create_foreign_project(&f).await;
+    assert_ne!(f.project_id, foreign.project_id);
+    let proposal_b = f
+        .service
+        .create_proposal(
+            CollaborationActorSource::Human(foreign.user_id.clone()),
+            task_proposal(&foreign.task_id),
+        )
+        .await
+        .expect("Project B principal can create a Proposal in Project B");
     let cross_task_decision = f
         .service
         .record_decision(
             CreateDecisionInput {
-                task_id: f.second_task_id.clone(),
-                proposal_id: proposal.id.clone(),
-                proposal_version: proposal.content_version,
+                task_id: f.task_id.clone(),
+                proposal_id: proposal_b.id,
+                proposal_version: proposal_b.content_version,
                 outcome: DecisionOutcome::Approve,
                 rationale: "cross-task proposal".to_owned(),
                 policy_ref: None,
@@ -472,8 +609,14 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
         .expect_err("Decision cannot target another Task's Proposal");
     assert!(matches!(
         cross_task_decision,
-        services::ServiceError::InvalidOperation { .. }
+        services::ServiceError::NotFound {
+            entity: "proposal",
+            ..
+        }
     ));
+    ProjectRepo::delete(&*f.db, &foreign.project_id)
+        .await
+        .expect("remove the independent Project fixture");
     let proposal_event: String = sqlx::query_scalar(
         "SELECT payload_json FROM domain_event WHERE entity_type = 'proposal' AND entity_id = ?",
     )
@@ -599,6 +742,671 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
             .await
             .expect("FK check");
     assert!(foreign_key_issues.is_empty());
+}
+
+#[tokio::test]
+async fn caller_supplied_collaboration_references_are_scoped_before_semantic_load() {
+    let f = fixture().await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&f.user_id)
+        .bind(&f.project_id)
+        .execute(f.db.pool())
+        .await
+        .expect("Project A owner");
+    let foreign = create_foreign_project(&f).await;
+    assert_ne!(f.project_id, foreign.project_id);
+
+    let unauthorized_project_b = f
+        .service
+        .create_proposal(human(&f), task_proposal(&foreign.task_id))
+        .await
+        .expect_err("User A cannot authorize Project B");
+    assert!(matches!(
+        unauthorized_project_b,
+        services::ServiceError::NotFound { entity: "task", .. }
+    ));
+
+    let proposal_a = f
+        .service
+        .create_proposal(human(&f), task_proposal(&f.task_id))
+        .await
+        .expect("Project A Proposal");
+    let proposal_b_open = f
+        .service
+        .create_proposal(
+            CollaborationActorSource::Human(foreign.user_id.clone()),
+            task_proposal(&foreign.task_id),
+        )
+        .await
+        .expect("Project B principal creates an open Proposal");
+    let proposal_b_resolved = f
+        .service
+        .create_proposal(
+            CollaborationActorSource::Human(foreign.user_id.clone()),
+            task_proposal(&foreign.task_id),
+        )
+        .await
+        .expect("Project B principal creates a resolvable Proposal");
+    f.service
+        .record_decision(
+            decision_input(
+                &foreign.task_id,
+                &proposal_b_resolved.id,
+                proposal_b_resolved.content_version,
+                DecisionOutcome::Approve,
+            ),
+            vec![CollaborationActorSource::Human(foreign.user_id.clone())],
+        )
+        .await
+        .expect("Project B principal resolves its Proposal");
+    let proposal_b_corrupt = f
+        .service
+        .create_proposal(
+            CollaborationActorSource::Human(foreign.user_id.clone()),
+            task_proposal(&foreign.task_id),
+        )
+        .await
+        .expect("Project B principal creates a Proposal to corrupt");
+    sqlx::query("DROP TRIGGER proposal_content_immutable_update")
+        .execute(f.db.pool())
+        .await
+        .expect("allow a malformed persisted Proposal fixture");
+    sqlx::query("UPDATE proposal SET target_kind = 'corrupt-kind' WHERE id = ?")
+        .bind(&proposal_b_corrupt.id)
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt Project B Proposal target kind");
+
+    let mut decision_errors = Vec::new();
+    for (proposal_id, proposal_version) in [
+        ("pr4-missing-proposal", 1),
+        (proposal_b_open.id.as_str(), proposal_b_open.content_version),
+        (proposal_b_open.id.as_str(), 99),
+        (
+            proposal_b_resolved.id.as_str(),
+            proposal_b_resolved.content_version,
+        ),
+        (
+            proposal_b_corrupt.id.as_str(),
+            proposal_b_corrupt.content_version,
+        ),
+    ] {
+        decision_errors.push(
+            f.service
+                .record_decision(
+                    decision_input(
+                        &f.task_id,
+                        proposal_id,
+                        proposal_version,
+                        DecisionOutcome::Approve,
+                    ),
+                    vec![human(&f)],
+                )
+                .await
+                .expect_err("missing and foreign Proposal references are indistinguishable"),
+        );
+    }
+    assert!(decision_errors.iter().all(|error| matches!(
+        error,
+        services::ServiceError::NotFound {
+            entity: "proposal",
+            ..
+        }
+    )));
+
+    let stale_same_task = f
+        .service
+        .record_decision(
+            decision_input(
+                &f.task_id,
+                &proposal_a.id,
+                proposal_a.content_version + 1,
+                DecisionOutcome::Approve,
+            ),
+            vec![human(&f)],
+        )
+        .await
+        .expect_err("same-Task stale version remains semantic");
+    assert!(matches!(
+        stale_same_task,
+        services::ServiceError::InvalidOperation { .. }
+    ));
+    f.service
+        .record_decision(
+            decision_input(
+                &f.task_id,
+                &proposal_a.id,
+                proposal_a.content_version,
+                DecisionOutcome::Approve,
+            ),
+            vec![human(&f)],
+        )
+        .await
+        .expect("resolve same-Task Proposal");
+    let resolved_same_task = f
+        .service
+        .record_decision(
+            decision_input(
+                &f.task_id,
+                &proposal_a.id,
+                proposal_a.content_version,
+                DecisionOutcome::Approve,
+            ),
+            vec![human(&f)],
+        )
+        .await
+        .expect_err("same-Task resolved Proposal remains semantic");
+    assert!(matches!(
+        resolved_same_task,
+        services::ServiceError::InvalidOperation { .. }
+    ));
+
+    for supersedes_id in [
+        "pr4-missing-supersedes-proposal",
+        proposal_b_open.id.as_str(),
+        proposal_b_resolved.id.as_str(),
+        proposal_b_corrupt.id.as_str(),
+    ] {
+        let mut input = task_proposal(&f.task_id);
+        input.supersedes_proposal_id = Some(supersedes_id.to_owned());
+        let error = f
+            .service
+            .create_proposal(human(&f), input)
+            .await
+            .expect_err("missing and foreign supersedes references are not found");
+        assert!(matches!(
+            error,
+            services::ServiceError::NotFound {
+                entity: "proposal",
+                ..
+            }
+        ));
+    }
+    let mut same_task_supersedes = task_proposal(&f.task_id);
+    same_task_supersedes.supersedes_proposal_id = Some(proposal_a.id.clone());
+    let same_task_not_superseded = f
+        .service
+        .create_proposal(human(&f), same_task_supersedes)
+        .await
+        .expect_err("same-Task Proposal without a supersede Decision is semantic");
+    assert!(matches!(
+        same_task_not_superseded,
+        services::ServiceError::InvalidOperation { .. }
+    ));
+
+    let artifact_a = f
+        .service
+        .create_artifact(
+            human(&f),
+            CreateArtifactInput {
+                task_id: f.task_id.clone(),
+                producer_execution_id: f.execution_id.clone(),
+                kind: ArtifactKind::Summary,
+                storage_kind: ArtifactStorageKind::Inline,
+                content: Some("Project A artifact".to_owned()),
+                content_ref: None,
+                metadata_json: "{}".to_owned(),
+                digest: None,
+            },
+        )
+        .await
+        .expect("Project A Artifact");
+    let artifact_b = f
+        .service
+        .create_artifact(
+            CollaborationActorSource::Human(foreign.user_id.clone()),
+            CreateArtifactInput {
+                task_id: foreign.task_id.clone(),
+                producer_execution_id: foreign.execution_id.clone(),
+                kind: ArtifactKind::Summary,
+                storage_kind: ArtifactStorageKind::Inline,
+                content: Some("Project B artifact".to_owned()),
+                content_ref: None,
+                metadata_json: "{}".to_owned(),
+                digest: None,
+            },
+        )
+        .await
+        .expect("Project B principal creates its Artifact");
+
+    for artifact_id in ["pr4-missing-artifact", artifact_b.id.as_str()] {
+        let mut input = task_proposal(&f.task_id);
+        input.artifact_ids = vec![artifact_id.to_owned()];
+        let error = f
+            .service
+            .create_proposal(human(&f), input)
+            .await
+            .expect_err("missing and healthy foreign Artifact references are not found");
+        assert!(matches!(
+            error,
+            services::ServiceError::NotFound {
+                entity: "artifact",
+                ..
+            }
+        ));
+    }
+
+    sqlx::query("DROP TRIGGER artifact_execution_producer_immutable_delete")
+        .execute(f.db.pool())
+        .await
+        .expect("allow corrupt Artifact producer fixtures");
+    for artifact_id in [&artifact_a.id, &artifact_b.id] {
+        sqlx::query("DELETE FROM artifact_execution_producer WHERE artifact_id = ?")
+            .bind(artifact_id)
+            .execute(f.db.pool())
+            .await
+            .expect("corrupt Artifact producer relation");
+    }
+    let foreign_corrupt_artifact = f
+        .service
+        .create_proposal(human(&f), {
+            let mut input = task_proposal(&f.task_id);
+            input.artifact_ids = vec![artifact_b.id.clone()];
+            input
+        })
+        .await
+        .expect_err("foreign Artifact corruption is hidden by Task scope");
+    assert!(matches!(
+        foreign_corrupt_artifact,
+        services::ServiceError::NotFound {
+            entity: "artifact",
+            ..
+        }
+    ));
+    let same_task_corrupt_artifact = f
+        .service
+        .create_proposal(human(&f), {
+            let mut input = task_proposal(&f.task_id);
+            input.artifact_ids = vec![artifact_a.id.clone()];
+            input
+        })
+        .await
+        .expect_err("same-Task Artifact producer corruption fails closed");
+    assert!(matches!(
+        same_task_corrupt_artifact,
+        services::ServiceError::Db(db::DbError::Check(_))
+    ));
+}
+
+#[tokio::test]
+async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first() {
+    let f = fixture().await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&f.user_id)
+        .bind(&f.project_id)
+        .execute(f.db.pool())
+        .await
+        .expect("Project A owner");
+    let foreign = create_foreign_project(&f).await;
+    let now = now_rfc3339();
+    let role_a = TaskRoleRepo::create(
+        &*f.db,
+        CreateTaskRole {
+            id: "pr4-role-a".to_owned(),
+            task_id: f.task_id.clone(),
+            role: "reviewer".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project A Role");
+    let role_b = TaskRoleRepo::create(
+        &*f.db,
+        CreateTaskRole {
+            id: "pr4-role-b".to_owned(),
+            task_id: foreign.task_id.clone(),
+            role: "reviewer".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project B Role");
+    AgentRepo::create_identity_with_profile(
+        &*f.db,
+        db::CreateAgentIdentity {
+            id: "pr4-agent-b".to_owned(),
+            name: "Project B Agent".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(foreign.user_id.clone()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        db::CreateAgentProfile {
+            id: "pr4-agent-profile-b".to_owned(),
+            identity_id: "pr4-agent-b".to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: "test".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("test".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project B Agent without a Project A TaskRole membership");
+    for (workspace_id, task_id, repo_id, path) in [
+        (
+            "pr4-workspace-a",
+            f.task_id.as_str(),
+            f.repo_id.as_str(),
+            "/tmp/pr4-workspace-a",
+        ),
+        (
+            "pr4-workspace-b",
+            foreign.task_id.as_str(),
+            foreign.repo_id.as_str(),
+            "/tmp/pr4-workspace-b",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO workspace (
+                 id, task_id, repo_id, worktree_path, branch, status,
+                 before_sha, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'main', 'ready', NULL, ?, ?)",
+        )
+        .bind(workspace_id)
+        .bind(task_id)
+        .bind(repo_id)
+        .bind(path)
+        .bind(&now)
+        .bind(&now)
+        .execute(f.db.pool())
+        .await
+        .expect("workspace");
+    }
+
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(f.db.pool())
+        .await
+        .expect("permit malformed reference fixtures");
+    sqlx::query("DROP TRIGGER task_role_coordination_mode_guard_update")
+        .execute(f.db.pool())
+        .await
+        .expect("allow a malformed TaskRole fixture");
+    sqlx::query("UPDATE execution SET status = 'corrupt-status' WHERE id = ?")
+        .bind(&foreign.execution_id)
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt foreign Execution status");
+    sqlx::query("UPDATE task_role SET coordination_mode = 'corrupt-mode' WHERE id = ?")
+        .bind(&role_b.id)
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt foreign TaskRole mode");
+    sqlx::query("UPDATE workspace SET status = 'corrupt-status' WHERE id = 'pr4-workspace-b'")
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt foreign Workspace status");
+    sqlx::query("UPDATE agent_identity SET status = 'corrupt-status' WHERE id = 'pr4-agent-b'")
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt foreign Agent status");
+    sqlx::query("UPDATE execution SET status = 'corrupt-status' WHERE id = ?")
+        .bind(&f.execution_id)
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt in-Task Execution status");
+    sqlx::query("UPDATE workspace SET status = 'corrupt-status' WHERE id = 'pr4-workspace-a'")
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt in-Task Workspace status");
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(f.db.pool())
+        .await
+        .expect("restore SQLite checks");
+
+    let foreign_execution_as_producer = f
+        .service
+        .create_artifact(
+            human(&f),
+            CreateArtifactInput {
+                task_id: f.task_id.clone(),
+                producer_execution_id: foreign.execution_id.clone(),
+                kind: ArtifactKind::Summary,
+                storage_kind: ArtifactStorageKind::Inline,
+                content: Some("invalid producer".to_owned()),
+                content_ref: None,
+                metadata_json: "{}".to_owned(),
+                digest: None,
+            },
+        )
+        .await
+        .expect_err("foreign producer is rejected before Execution mapping");
+    assert!(matches!(
+        foreign_execution_as_producer,
+        services::ServiceError::NotFound {
+            entity: "execution",
+            ..
+        }
+    ));
+
+    let foreign_execution_as_parent = f
+        .service
+        .create_handoff(
+            human(&f),
+            CreateHandoffInput {
+                task_id: f.task_id.clone(),
+                source_role_id: None,
+                target: CollaborationTarget::Task,
+                intent: db::HandoffIntent::Question,
+                parent_execution_id: Some(foreign.execution_id.clone()),
+                expected_policy_ref: None,
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect_err("foreign parent Execution is rejected before mapping");
+    assert!(matches!(
+        foreign_execution_as_parent,
+        services::ServiceError::NotFound {
+            entity: "execution",
+            ..
+        }
+    ));
+
+    let foreign_execution_source = f
+        .service
+        .create_message(
+            CollaborationActorSource::Execution(foreign.execution_id.clone()),
+            CreateMessageInput {
+                task_id: f.task_id.clone(),
+                target: CollaborationTarget::Task,
+                body: "foreign source".to_owned(),
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect_err("foreign Execution source is scoped before mapping");
+    assert!(matches!(
+        foreign_execution_source,
+        services::ServiceError::NotFound {
+            entity: "execution",
+            ..
+        }
+    ));
+
+    for source_role_id in ["pr4-missing-source-role", role_b.id.as_str()] {
+        let error = f
+            .service
+            .create_handoff(
+                human(&f),
+                CreateHandoffInput {
+                    task_id: f.task_id.clone(),
+                    source_role_id: Some(source_role_id.to_owned()),
+                    target: CollaborationTarget::Task,
+                    intent: db::HandoffIntent::Question,
+                    parent_execution_id: None,
+                    expected_policy_ref: None,
+                    artifact_ids: vec![],
+                },
+            )
+            .await
+            .expect_err("unknown and foreign source Role use Task-scoped membership");
+        assert!(matches!(
+            error,
+            services::ServiceError::AuthorizationDenied { .. }
+        ));
+    }
+
+    for target in [
+        ProposalTarget {
+            kind: ProposalTargetKind::Execution,
+            id: foreign.execution_id.clone(),
+        },
+        ProposalTarget {
+            kind: ProposalTargetKind::Workspace,
+            id: "pr4-workspace-b".to_owned(),
+        },
+    ] {
+        let mut input = task_proposal(&f.task_id);
+        input.target = target;
+        let error = f
+            .service
+            .create_proposal(human(&f), input)
+            .await
+            .expect_err("foreign target is rejected before semantic mapping");
+        assert!(matches!(error, services::ServiceError::NotFound { .. }));
+    }
+
+    for target in [
+        CollaborationTarget::Role(role_b.id.clone()),
+        CollaborationTarget::Actor(db::ActorRef::Human(foreign.user_id.clone())),
+        CollaborationTarget::Actor(db::ActorRef::Agent("pr4-agent-b".to_owned())),
+    ] {
+        let message_error = f
+            .service
+            .create_message(
+                human(&f),
+                CreateMessageInput {
+                    task_id: f.task_id.clone(),
+                    target: target.clone(),
+                    body: "foreign target".to_owned(),
+                    artifact_ids: vec![],
+                },
+            )
+            .await
+            .expect_err("foreign Message target is rejected before semantic mapping");
+        assert!(matches!(
+            message_error,
+            services::ServiceError::NotFound { .. }
+        ));
+        let handoff_error = f
+            .service
+            .create_handoff(
+                human(&f),
+                CreateHandoffInput {
+                    task_id: f.task_id.clone(),
+                    source_role_id: None,
+                    target,
+                    intent: db::HandoffIntent::Question,
+                    parent_execution_id: None,
+                    expected_policy_ref: None,
+                    artifact_ids: vec![],
+                },
+            )
+            .await
+            .expect_err("foreign Handoff target is rejected before semantic mapping");
+        assert!(matches!(
+            handoff_error,
+            services::ServiceError::NotFound { .. }
+        ));
+    }
+
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(f.db.pool())
+        .await
+        .expect("permit malformed in-Task TaskRole fixture");
+    sqlx::query("UPDATE task_role SET coordination_mode = 'corrupt-mode' WHERE id = ?")
+        .bind(&role_a.id)
+        .execute(f.db.pool())
+        .await
+        .expect("corrupt in-Task TaskRole mode");
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(f.db.pool())
+        .await
+        .expect("restore SQLite checks");
+
+    for (name, error) in [
+        (
+            "Execution",
+            f.service
+                .create_artifact(
+                    human(&f),
+                    CreateArtifactInput {
+                        task_id: f.task_id.clone(),
+                        producer_execution_id: f.execution_id.clone(),
+                        kind: ArtifactKind::Summary,
+                        storage_kind: ArtifactStorageKind::Inline,
+                        content: Some("in-Task producer".to_owned()),
+                        content_ref: None,
+                        metadata_json: "{}".to_owned(),
+                        digest: None,
+                    },
+                )
+                .await
+                .expect_err("in-Task Execution corruption fails closed"),
+        ),
+        (
+            "TaskRole",
+            f.service
+                .create_message(
+                    human(&f),
+                    CreateMessageInput {
+                        task_id: f.task_id.clone(),
+                        target: CollaborationTarget::Role(role_a.id.clone()),
+                        body: "in-Task role".to_owned(),
+                        artifact_ids: vec![],
+                    },
+                )
+                .await
+                .expect_err("in-Task TaskRole corruption fails closed"),
+        ),
+        (
+            "Workspace",
+            f.service
+                .create_proposal(human(&f), {
+                    let mut input = task_proposal(&f.task_id);
+                    input.target = ProposalTarget {
+                        kind: ProposalTargetKind::Workspace,
+                        id: "pr4-workspace-a".to_owned(),
+                    };
+                    input
+                })
+                .await
+                .expect_err("in-Task Workspace corruption fails closed"),
+        ),
+    ] {
+        assert!(
+            matches!(
+                &error,
+                services::ServiceError::Db(db::DbError::InvalidTransition)
+            ),
+            "same-Task corrupt {name} should fail closed: {error:?}"
+        );
+    }
 }
 
 #[tokio::test]

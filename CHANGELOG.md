@@ -62,6 +62,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `implementation`, and `planning_task` migrates to `planning`.
 - Planner and reviewer agents must end with the server-owned `FORGE_RESULT`
   JSON contract. Legacy review verdict markers are no longer accepted.
+- Cross-Task collaboration references supplied to mutations now return the
+  same `404` as missing references before foreign record content is loaded.
+  Same-Task stale lifecycle state and structural corruption continue to fail
+  closed.
 
 - Launching a task no longer offers a "Save changes to agent" checkbox on
   the launch dialog's model/reasoning/policy overrides. Those overrides

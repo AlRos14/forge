@@ -530,6 +530,7 @@ pub struct CompleteDomainEvent {
 #[async_trait]
 pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
+    async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
     async fn set_cleanup_after(
@@ -604,6 +605,7 @@ pub trait RuntimeRepo: Send + Sync {
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
+    async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
     /// Return whether migration evidence explicitly marks this historical
     /// Execution's external session identity as contradictory.  This is a
@@ -2091,6 +2093,7 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
 #[async_trait]
 pub trait TaskRoleRepo: Send + Sync {
     async fn create(&self, input: CreateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn get_task_id(&self, id: &str) -> std::result::Result<Option<String>, crate::DbError>;
     async fn get_by_task_and_role(
         &self,
         task_id: &str,

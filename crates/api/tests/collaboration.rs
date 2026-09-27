@@ -336,4 +336,85 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
         assert!(!unauthorized.message.contains("valid message"));
         assert!(!unauthorized.message.contains("recorded, not executed"));
     }
+
+    let now = db::now_rfc3339();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES ('pr4-api-user-b', 'pr4-api-b@example.test', 'test', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("Project B owner");
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, owner_id, created_at, updated_at)
+         VALUES ('pr4-api-project-b', 'Project B', '{}', 'pr4-api-user-b', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("independent Project B");
+    sqlx::query(
+        "INSERT INTO repo (
+             id, project_id, name, remote_url, local_path, work_mode,
+             default_branch, created_at, updated_at
+         ) VALUES ('pr4-api-repo-b', 'pr4-api-project-b', 'repo-b',
+                   'https://example.invalid/pr4-api-b.git', NULL,
+                   'direct_merge', 'main', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("Project B repo");
+    sqlx::query(
+        "INSERT INTO task (
+             id, project_id, repo_id, title, task_type, status, created_at, updated_at
+         ) VALUES ('pr4-api-task-b', 'pr4-api-project-b', 'pr4-api-repo-b',
+                   'Project B task', 'implementation', 'in_progress', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("Project B Task");
+    sqlx::query(
+        "INSERT INTO proposal (
+             id, task_id, proposer_actor_kind, proposer_actor_id,
+             target_kind, target_id, action, reason, status, created_at
+         ) VALUES (
+             'pr4-api-proposal-b', 'pr4-api-task-b', 'human', 'pr4-api-user-b',
+             'task', 'pr4-api-task-b', 'foreign-action', 'foreign reason', 'open', ?
+         )",
+    )
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("valid Project B Proposal");
+    sqlx::query("DROP TRIGGER proposal_content_immutable_update")
+        .execute(harness.state.db.pool())
+        .await
+        .expect("allow a malformed Project B Proposal fixture");
+    sqlx::query("UPDATE proposal SET target_kind = 'corrupt-kind' WHERE id = 'pr4-api-proposal-b'")
+        .execute(harness.state.db.pool())
+        .await
+        .expect("corrupt Project B Proposal");
+
+    for proposal_id in ["pr4-api-missing-foreign-proposal", "pr4-api-proposal-b"] {
+        let result = raw_json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/collaboration/decisions", task.id),
+            json!({
+                "proposal_id": proposal_id,
+                "proposal_version": 1,
+                "outcome": "approve",
+                "rationale": "foreign Proposal state must stay hidden"
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), StatusCode::NOT_FOUND);
+    }
 }

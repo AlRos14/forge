@@ -20,6 +20,15 @@ impl WorkspaceRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn get_task_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM workspace WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>> {
         sqlx::query("SELECT * FROM workspace WHERE id = ?")
             .bind(id)

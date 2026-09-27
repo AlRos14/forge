@@ -7,6 +7,11 @@ Legacy chats, handoffs, Project Decisions, and memory proposal/decision records
 remain separate authorities until their assigned migration; there is no
 implicit dual-write or silent projection.
 
+Opaque IDs are references, never authority. A mutation checks a referenced
+record's owning Task before loading its semantic content. A missing or
+cross-Task reference is reported as not found; a corrupt same-Task record
+continues to fail closed.
+
 ## Message
 
 A Message communicates between Actor-to-Actor, Actor-to-Role, or a Task scope.

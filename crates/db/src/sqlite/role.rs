@@ -75,6 +75,15 @@ impl TaskRoleRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn get_task_id(&self, id: &str) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM task_role WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     async fn get_by_task_and_role(
         &self,
         task_id: &str,
