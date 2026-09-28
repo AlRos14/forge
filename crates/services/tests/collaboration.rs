@@ -7,9 +7,9 @@ use db::{
     CollaborationTarget, CoordinationMode, CreateAgentChatMessage, CreateAgentHandoff,
     CreateAgentIdentity, CreateAgentProfile, CreateArtifact, CreateDomainEvent,
     CreateProjectDecision, CreateRoleMembership, CreateTaskRole, CreateWorkspace, DecisionOutcome,
-    DomainEventRepo, HandoffStatus, ProjectOrchestrationRepo, ProjectRepo, ProposalTarget,
-    ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, TaskRoleRepo, UserRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    DomainEventRepo, HandoffIntent, HandoffStatus, ProjectOrchestrationRepo, ProjectRepo,
+    ProposalTarget, ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
+    TaskRoleRepo, UserRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use services::{
@@ -333,6 +333,202 @@ fn human(fixture: &Fixture) -> CollaborationActorSource {
     CollaborationActorSource::Human(fixture.user_id.clone())
 }
 
+async fn create_work_unit_reference(fixture: &Fixture, task_id: &str, work_unit_id: &str) {
+    let now = now_rfc3339();
+    TaskRoleRepo::create(
+        &*fixture.db,
+        CreateTaskRole {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            role: "pr5-context".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit TaskRole");
+    sqlx::query(
+        "INSERT INTO work_unit (
+             id, task_id, title, scope, role, created_by_kind, created_by_id,
+             created_at, updated_at
+         ) VALUES (?, ?, 'collaboration context', 'record reference', 'pr5-context',
+                   'human', ?, ?, ?)",
+    )
+    .bind(work_unit_id)
+    .bind(task_id)
+    .bind(&fixture.user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(fixture.db.pool())
+    .await
+    .expect("WorkUnit reference");
+}
+
+#[tokio::test]
+async fn work_unit_collaboration_references_are_scoped_and_decisions_do_not_dispatch() {
+    let f = fixture().await;
+    let work_unit_id = "pr5-collaboration-work-unit";
+    let other_work_unit_id = "pr5-collaboration-work-unit-other-task";
+    create_work_unit_reference(&f, &f.task_id, work_unit_id).await;
+    create_work_unit_reference(&f, &f.second_task_id, other_work_unit_id).await;
+
+    let mut proposal_input = task_proposal(&f.task_id);
+    proposal_input.target = ProposalTarget {
+        kind: ProposalTargetKind::WorkUnit,
+        id: work_unit_id.to_owned(),
+    };
+    let proposal = f
+        .service
+        .create_proposal(human(&f), proposal_input)
+        .await
+        .expect("WorkUnit proposal target is admitted");
+
+    let mut cross_task_input = task_proposal(&f.task_id);
+    cross_task_input.target = ProposalTarget {
+        kind: ProposalTargetKind::WorkUnit,
+        id: other_work_unit_id.to_owned(),
+    };
+    let cross_task_proposal = f
+        .service
+        .create_proposal(human(&f), cross_task_input)
+        .await
+        .expect_err("cross-Task WorkUnit Proposal is hidden");
+    assert!(matches!(
+        cross_task_proposal,
+        services::ServiceError::NotFound {
+            entity: "work_unit",
+            ..
+        }
+    ));
+    let mut missing_work_unit_input = task_proposal(&f.task_id);
+    missing_work_unit_input.target = ProposalTarget {
+        kind: ProposalTargetKind::WorkUnit,
+        id: "pr5-missing-work-unit".to_owned(),
+    };
+    let missing_work_unit_proposal = f
+        .service
+        .create_proposal(human(&f), missing_work_unit_input)
+        .await
+        .expect_err("missing WorkUnit Proposal target is hidden");
+    assert!(matches!(
+        missing_work_unit_proposal,
+        services::ServiceError::NotFound {
+            entity: "work_unit",
+            ..
+        }
+    ));
+
+    let message = f
+        .service
+        .create_message(
+            human(&f),
+            CreateMessageInput {
+                task_id: f.task_id.clone(),
+                target: CollaborationTarget::Task,
+                work_unit_id: Some(work_unit_id.to_owned()),
+                body: "message context stays separate from its Task recipient".to_owned(),
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect("Message can carry WorkUnit context");
+    assert_eq!(message.target, CollaborationTarget::Task);
+    assert_eq!(message.work_unit_id.as_deref(), Some(work_unit_id));
+    let foreign_message = f
+        .service
+        .create_message(
+            human(&f),
+            CreateMessageInput {
+                task_id: f.task_id.clone(),
+                target: CollaborationTarget::Task,
+                work_unit_id: Some(other_work_unit_id.to_owned()),
+                body: "cross-Task context is hidden".to_owned(),
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect_err("Message WorkUnit context is scoped");
+    assert!(matches!(
+        foreign_message,
+        services::ServiceError::NotFound {
+            entity: "work_unit",
+            ..
+        }
+    ));
+
+    let handoff = f
+        .service
+        .create_handoff(
+            human(&f),
+            CreateHandoffInput {
+                task_id: f.task_id.clone(),
+                source_role_id: None,
+                target: CollaborationTarget::Task,
+                work_unit_id: Some(work_unit_id.to_owned()),
+                intent: HandoffIntent::Question,
+                parent_execution_id: Some(f.execution_id.clone()),
+                expected_policy_ref: None,
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect("Handoff can carry WorkUnit context");
+    assert_eq!(handoff.target, CollaborationTarget::Task);
+    assert_eq!(handoff.work_unit_id.as_deref(), Some(work_unit_id));
+    let foreign_handoff = f
+        .service
+        .create_handoff(
+            human(&f),
+            CreateHandoffInput {
+                task_id: f.task_id.clone(),
+                source_role_id: None,
+                target: CollaborationTarget::Task,
+                work_unit_id: Some(other_work_unit_id.to_owned()),
+                intent: HandoffIntent::Question,
+                parent_execution_id: Some(f.execution_id.clone()),
+                expected_policy_ref: None,
+                artifact_ids: vec![],
+            },
+        )
+        .await
+        .expect_err("Handoff WorkUnit context is scoped");
+    assert!(matches!(
+        foreign_handoff,
+        services::ServiceError::NotFound {
+            entity: "work_unit",
+            ..
+        }
+    ));
+
+    f.service
+        .record_decision(
+            decision_input(
+                &f.task_id,
+                &proposal.id,
+                proposal.content_version,
+                DecisionOutcome::Approve,
+            ),
+            vec![human(&f)],
+        )
+        .await
+        .expect("Decision resolves its Proposal only");
+    let status: String = sqlx::query_scalar("SELECT status FROM work_unit WHERE id = ?")
+        .bind(work_unit_id)
+        .fetch_one(f.db.pool())
+        .await
+        .expect("WorkUnit remains stored");
+    let integration_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_unit_integration WHERE work_unit_id = ?")
+            .bind(work_unit_id)
+            .fetch_one(f.db.pool())
+            .await
+            .expect("integration count");
+    assert_eq!(status, "open");
+    assert_eq!(integration_count, 0);
+}
+
 #[tokio::test]
 async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
     let f = fixture().await;
@@ -408,6 +604,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
             actor.clone(),
             CreateMessageInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Task,
                 body: "message-secret".to_owned(),
                 artifact_ids: vec![artifact.id.clone()],
@@ -437,6 +634,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
             actor.clone(),
             CreateMessageInput {
                 task_id: f.second_task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Task,
                 body: "cross-task".to_owned(),
                 artifact_ids: vec![artifact.id.clone()],
@@ -468,6 +666,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
             actor.clone(),
             CreateMessageInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Role(foreign_role.id),
                 body: "cross-task role target".to_owned(),
                 artifact_ids: vec![],
@@ -486,6 +685,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
             actor.clone(),
             CreateHandoffInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 source_role_id: None,
                 target: CollaborationTarget::Task,
                 intent: db::HandoffIntent::Question,
@@ -1209,6 +1409,7 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
             human(&f),
             CreateHandoffInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 source_role_id: None,
                 target: CollaborationTarget::Task,
                 intent: db::HandoffIntent::Question,
@@ -1233,6 +1434,7 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
             CollaborationActorSource::Execution(foreign.execution_id.clone()),
             CreateMessageInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Task,
                 body: "foreign source".to_owned(),
                 artifact_ids: vec![],
@@ -1255,6 +1457,7 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
                 human(&f),
                 CreateHandoffInput {
                     task_id: f.task_id.clone(),
+                    work_unit_id: None,
                     source_role_id: Some(source_role_id.to_owned()),
                     target: CollaborationTarget::Task,
                     intent: db::HandoffIntent::Question,
@@ -1302,6 +1505,7 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
                 human(&f),
                 CreateMessageInput {
                     task_id: f.task_id.clone(),
+                    work_unit_id: None,
                     target: target.clone(),
                     body: "foreign target".to_owned(),
                     artifact_ids: vec![],
@@ -1319,6 +1523,7 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
                 human(&f),
                 CreateHandoffInput {
                     task_id: f.task_id.clone(),
+                    work_unit_id: None,
                     source_role_id: None,
                     target,
                     intent: db::HandoffIntent::Question,
@@ -1376,6 +1581,7 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
                     human(&f),
                     CreateMessageInput {
                         task_id: f.task_id.clone(),
+                        work_unit_id: None,
                         target: CollaborationTarget::Role(role_a.id.clone()),
                         body: "in-Task role".to_owned(),
                         artifact_ids: vec![],
@@ -1521,6 +1727,7 @@ async fn agent_identity_is_derived_from_execution_and_decisions_support_mixed_de
             agent_source.clone(),
             CreateMessageInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone())),
                 body: "Agent-authored communication".to_owned(),
                 artifact_ids: vec![],
@@ -1541,6 +1748,7 @@ async fn agent_identity_is_derived_from_execution_and_decisions_support_mixed_de
             agent_source.clone(),
             CreateMessageInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Role(role_id.clone()),
                 body: "Role-addressed communication".to_owned(),
                 artifact_ids: vec![],
@@ -1625,6 +1833,7 @@ async fn agent_identity_is_derived_from_execution_and_decisions_support_mixed_de
             agent_source.clone(),
             CreateHandoffInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 source_role_id: None,
                 target: CollaborationTarget::Role(role_id.clone()),
                 intent: db::HandoffIntent::Delegation,
@@ -1669,6 +1878,7 @@ async fn agent_identity_is_derived_from_execution_and_decisions_support_mixed_de
             agent_source.clone(),
             CreateHandoffInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 source_role_id: Some(role_id.clone()),
                 target: CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone())),
                 intent: db::HandoffIntent::Question,
@@ -1941,6 +2151,7 @@ async fn historical_collaboration_reads_survive_actor_and_workspace_deletion() {
             human(&f),
             CreateMessageInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 target: CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone())),
                 body: "historical message".to_owned(),
                 artifact_ids: vec![],
@@ -1954,6 +2165,7 @@ async fn historical_collaboration_reads_survive_actor_and_workspace_deletion() {
             human(&f),
             CreateHandoffInput {
                 task_id: f.task_id.clone(),
+                work_unit_id: None,
                 source_role_id: None,
                 target: CollaborationTarget::Actor(db::ActorRef::Human(f.user_id.clone())),
                 intent: db::HandoffIntent::Question,
@@ -2191,8 +2403,10 @@ async fn proposal_target_insert_guard_rejects_future_and_unknown_kinds() {
         assert!(rejected.to_string().contains("Proposal ActorRef, target"));
     }
     assert!(
-        serde_json::from_value::<api_types::ProposalTargetKind>(serde_json::json!("work_unit"))
-            .is_err()
+        serde_json::from_value::<api_types::ProposalTargetKind>(serde_json::json!(
+            "validation_run"
+        ))
+        .is_err()
     );
 }
 

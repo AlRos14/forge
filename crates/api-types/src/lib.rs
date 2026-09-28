@@ -28,6 +28,7 @@ mod requests;
 mod runtime;
 mod settings;
 mod terminal;
+mod work_unit;
 mod workflow;
 
 pub use actor::*;
@@ -56,6 +57,7 @@ pub use requests::*;
 pub use runtime::*;
 pub use settings::*;
 pub use terminal::*;
+pub use work_unit::*;
 pub use workflow::*;
 
 #[test]
@@ -269,6 +271,20 @@ fn export_typescript() {
     TaskGovernanceRequest::export().expect("export TaskGovernanceRequest");
     TransitionSource::export().expect("export TransitionSource");
     TransitionTaskRequest::export().expect("export TransitionTaskRequest");
+    AllocateWorkUnitRequest::export().expect("export AllocateWorkUnitRequest");
+    AddWorkUnitDependencyRequest::export().expect("export AddWorkUnitDependencyRequest");
+    CreateWorkUnitRequest::export().expect("export CreateWorkUnitRequest");
+    UpdateWorkUnitRequest::export().expect("export UpdateWorkUnitRequest");
+    TransitionWorkUnitRequest::export().expect("export TransitionWorkUnitRequest");
+    WorkUnitProvenance::export().expect("export WorkUnitProvenance");
+    WorkUnitProvenanceKind::export().expect("export WorkUnitProvenanceKind");
+    WorkUnitStatus::export().expect("export WorkUnitStatus");
+    WorkUnitDependencyResponse::export().expect("export WorkUnitDependencyResponse");
+    WorkUnitReadinessResponse::export().expect("export WorkUnitReadinessResponse");
+    WorkUnitResponse::export().expect("export WorkUnitResponse");
+    WorkUnitIntegrationRequest::export().expect("export WorkUnitIntegrationRequest");
+    WorkUnitIntegrationResponse::export().expect("export WorkUnitIntegrationResponse");
+    WorkUnitIntegrationOutcome::export().expect("export WorkUnitIntegrationOutcome");
     AuthorType::export().expect("export AuthorType");
     TaskMediaResponse::export().expect("export TaskMediaResponse");
     RecoverTaskRequest::export().expect("export RecoverTaskRequest");
@@ -529,4 +545,18 @@ fn export_typescript() {
     TaskProgressCounts::export().expect("export TaskProgressCounts");
     ValidationResult::export().expect("export ValidationResult");
     VersionedDigest::export().expect("export VersionedDigest");
+    WorkUnitStatus::export().expect("export WorkUnitStatus");
+    WorkUnitProvenanceKind::export().expect("export WorkUnitProvenanceKind");
+    WorkUnitProvenance::export().expect("export WorkUnitProvenance");
+    CreateWorkUnitRequest::export().expect("export CreateWorkUnitRequest");
+    UpdateWorkUnitRequest::export().expect("export UpdateWorkUnitRequest");
+    AllocateWorkUnitRequest::export().expect("export AllocateWorkUnitRequest");
+    TransitionWorkUnitRequest::export().expect("export TransitionWorkUnitRequest");
+    AddWorkUnitDependencyRequest::export().expect("export AddWorkUnitDependencyRequest");
+    WorkUnitDependencyResponse::export().expect("export WorkUnitDependencyResponse");
+    WorkUnitReadinessResponse::export().expect("export WorkUnitReadinessResponse");
+    WorkUnitResponse::export().expect("export WorkUnitResponse");
+    WorkUnitIntegrationRequest::export().expect("export WorkUnitIntegrationRequest");
+    WorkUnitIntegrationOutcome::export().expect("export WorkUnitIntegrationOutcome");
+    WorkUnitIntegrationResponse::export().expect("export WorkUnitIntegrationResponse");
 }

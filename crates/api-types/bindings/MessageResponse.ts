@@ -2,4 +2,4 @@
 import type { ActorRef } from "./ActorRef";
 import type { CollaborationTarget } from "./CollaborationTarget";
 
-export type MessageResponse = { id: string, task_id: string, sender: ActorRef, target: CollaborationTarget, body: string, artifact_ids: Array<string>, created_at: string, };
+export type MessageResponse = { id: string, task_id: string, sender: ActorRef, target: CollaborationTarget, work_unit_id: string | null, body: string, artifact_ids: Array<string>, created_at: string, };

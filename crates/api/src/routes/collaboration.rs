@@ -144,6 +144,7 @@ fn message_response(record: DbMessage) -> MessageResponse {
         task_id: record.task_id,
         sender: actor_to_api(record.sender),
         target: target_to_api(record.target),
+        work_unit_id: record.work_unit_id,
         body: record.body,
         artifact_ids: record.artifact_ids,
         created_at: record.created_at,
@@ -199,6 +200,7 @@ fn handoff_response(record: Handoff) -> HandoffResponse {
         created_by: actor_to_api(record.created_by),
         source_role_id: record.source_role_id,
         target: target_to_api(record.target),
+        work_unit_id: record.work_unit_id,
         intent: handoff_intent_to_api(record.intent),
         parent_execution_id: record.parent_execution_id,
         expected_policy_ref: record.expected_policy_ref,
@@ -216,6 +218,7 @@ fn proposal_target_to_db(value: ApiProposalTarget) -> ProposalTarget {
             ApiProposalTargetKind::Task => ProposalTargetKind::Task,
             ApiProposalTargetKind::Execution => ProposalTargetKind::Execution,
             ApiProposalTargetKind::Workspace => ProposalTargetKind::Workspace,
+            ApiProposalTargetKind::WorkUnit => ProposalTargetKind::WorkUnit,
         },
         id: value.id,
     }
@@ -227,6 +230,7 @@ fn proposal_target_to_api(value: ProposalTarget) -> ApiProposalTarget {
             ProposalTargetKind::Task => ApiProposalTargetKind::Task,
             ProposalTargetKind::Execution => ApiProposalTargetKind::Execution,
             ProposalTargetKind::Workspace => ApiProposalTargetKind::Workspace,
+            ProposalTargetKind::WorkUnit => ApiProposalTargetKind::WorkUnit,
         },
         id: value.id,
     }
@@ -371,6 +375,7 @@ pub async fn create_message(
             CreateMessageInput {
                 task_id,
                 target: target_to_db(body.target),
+                work_unit_id: body.work_unit_id,
                 body: body.body,
                 artifact_ids: body.artifact_ids,
             },
@@ -418,6 +423,7 @@ pub async fn create_handoff(
                 task_id,
                 source_role_id: body.source_role_id,
                 target: target_to_db(body.target),
+                work_unit_id: body.work_unit_id,
                 intent: handoff_intent_to_db(body.intent),
                 parent_execution_id: body.parent_execution_id,
                 expected_policy_ref: body.expected_policy_ref,
