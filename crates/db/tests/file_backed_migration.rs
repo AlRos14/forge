@@ -32,6 +32,123 @@ async fn file_backed_migrations_apply_cleanly() {
 }
 
 #[tokio::test]
+async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
+    let migration_dir = unique_temp_path("pr5-legacy-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir");
+    copy_migrations_up_to(90, &migration_dir);
+
+    let db_path = unique_temp_path("pr5-workspace-preserve").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("baseline through V090");
+    let db = SqliteDb::new(pool.clone());
+    let now = "2026-09-28T00:00:00Z";
+    let project_id = db::new_uuid_v4();
+    let repo_id = db::new_uuid_v4();
+    let task_id = db::new_uuid_v4();
+    let workspace_id = db::new_uuid_v4();
+    db::ProjectRepo::create(
+        &db,
+        db::CreateProject {
+            id: project_id.clone(),
+            name: "Legacy Workspace".into(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .expect("Project");
+    db::RepoRepo::create(
+        &db,
+        db::CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "repo".into(),
+            remote_url: "https://example.invalid/repo.git".into(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".into(),
+            created_at: now.into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .expect("Repo");
+    db::TaskRepo::create(
+        &db,
+        db::CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "legacy task".into(),
+            description: None,
+            task_type: "implementation".into(),
+            status: "todo".into(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .expect("Task");
+    sqlx::query(
+        "INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, before_sha, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)",
+    ).bind(&workspace_id).bind(&task_id).bind(&repo_id)
+        .bind("/legacy/task/worktree").bind("task/legacy").bind("abc123")
+        .bind(now).bind(now).execute(&pool).await.expect("legacy workspace");
+
+    run_migrations(&pool).await.expect("V091 applies");
+    let row: (String, String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT id, worktree_path, branch, status, before_sha FROM workspace WHERE task_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("workspace row remains");
+    assert_eq!(
+        row,
+        (
+            workspace_id.clone(),
+            "/legacy/task/worktree".into(),
+            "task/legacy".into(),
+            "ready".into(),
+            Some("abc123".into())
+        )
+    );
+    let scope: (String, Option<String>) = sqlx::query_as(
+        "SELECT scope_kind, work_unit_id FROM workspace_scope WHERE workspace_id = ?",
+    )
+    .bind(&workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy scope");
+    assert_eq!(scope, ("integration".into(), None));
+    let canonical = db::WorkspaceRepo::get_by_task_id(&db, &task_id)
+        .await
+        .expect("legacy get")
+        .expect("integration workspace");
+    assert_eq!(canonical.id, workspace_id);
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}
+
+#[tokio::test]
 async fn cursor_executor_backfill_runs_when_version_53_was_used_by_old_migration() {
     let migration_dir = unique_temp_path("cursor-backfill-migrations");
     fs::create_dir_all(&migration_dir).expect("temp migration dir creates");

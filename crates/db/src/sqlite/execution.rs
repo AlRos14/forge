@@ -5,7 +5,7 @@ use crate::{now_rfc3339, AgentExecutionStats};
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
         let mut transaction = self.pool.begin().await?;
-        let execution = Self::create_execution_in_tx(&mut transaction, &input).await?;
+        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
         transaction.commit().await?;
         Ok(execution)
     }
@@ -119,7 +119,7 @@ impl ExecutionRepo for SqliteDb {
                            ORDER BY created_at DESC, id DESC
                        ) AS rn
                 FROM execution
-                WHERE task_id IN (",
+                WHERE work_unit_id IS NULL AND task_id IN (",
         );
         let mut separated = query.separated(", ");
         for task_id in task_ids {
@@ -198,6 +198,8 @@ impl ExecutionRepo for SqliteDb {
                 return Err(DbError::InvalidTransition);
             }
         }
+        let requested_status = input.status.clone();
+        let updated_at = input.updated_at.clone();
 
         let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE execution SET ");
         let mut needs_comma = false;
@@ -280,6 +282,30 @@ impl ExecutionRepo for SqliteDb {
                 external_session_id,
                 &now_rfc3339(),
             )
+            .await?;
+        }
+        if execution.work_unit_id.is_some()
+            && execution.status == ExecutionStatus::Running
+            && requested_status.as_ref().is_some_and(|status| {
+                matches!(
+                    status,
+                    ExecutionStatus::Completed
+                        | ExecutionStatus::Failed
+                        | ExecutionStatus::Cancelled
+                )
+            })
+        {
+            sqlx::query(
+                "UPDATE workspace_lease
+                 SET status = 'revoked', revoked_at = ?, version = version + 1,
+                     updated_at = ?
+                 WHERE execution_id = ? AND work_unit_id = ? AND status = 'active'",
+            )
+            .bind(&updated_at)
+            .bind(&updated_at)
+            .bind(&execution.id)
+            .bind(execution.work_unit_id.as_deref())
+            .execute(&mut *transaction)
             .await?;
         }
         let updated = sqlx::query("SELECT * FROM execution WHERE id = ?")

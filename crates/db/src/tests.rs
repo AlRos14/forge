@@ -1460,6 +1460,8 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
                 id: new_uuid_v4(),
                 project_id,
                 task_id,
+                work_unit_id: None,
+                workspace_id: None,
                 task_version: task.version,
                 execution_id: execution.id,
                 operation_idempotency_key: new_uuid_v4(),

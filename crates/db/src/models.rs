@@ -632,6 +632,163 @@ pub enum WorkspaceStatus {
     Cleaned,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkUnitStatus {
+    Open,
+    Completed,
+    Cancelled,
+}
+
+impl fmt::Display for WorkUnitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+impl FromStr for WorkUnitStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "open" => Ok(Self::Open),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(format!("unknown WorkUnit status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnit {
+    pub id: String,
+    pub task_id: String,
+    pub parent_work_unit_id: Option<String>,
+    pub title: String,
+    pub scope: String,
+    pub status: WorkUnitStatus,
+    pub role: String,
+    pub assigned_actor: Option<ActorRef>,
+    pub requires_integration: bool,
+    pub provenance_kind: Option<String>,
+    pub provenance_id: Option<String>,
+    pub created_by: ActorRef,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitDependency {
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub depends_on_work_unit_id: String,
+    pub created_by: ActorRef,
+    pub created_at: String,
+    pub satisfied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkUnitIntegrationOutcome {
+    Running,
+    Success,
+    Conflict,
+    Failed,
+    Rejected,
+}
+
+impl fmt::Display for WorkUnitIntegrationOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Conflict => "conflict",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
+impl FromStr for WorkUnitIntegrationOutcome {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "running" => Ok(Self::Running),
+            "success" => Ok(Self::Success),
+            "conflict" => Ok(Self::Conflict),
+            "failed" => Ok(Self::Failed),
+            "rejected" => Ok(Self::Rejected),
+            other => Err(format!("unknown WorkUnit integration outcome: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitIntegration {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub execution_id: String,
+    pub source_workspace_id: String,
+    pub source_branch: String,
+    pub source_sha: String,
+    pub target_workspace_id: String,
+    pub target_branch: String,
+    pub target_before_sha: String,
+    pub target_after_sha: Option<String>,
+    pub operation_idempotency_key: String,
+    pub outcome: WorkUnitIntegrationOutcome,
+    pub conflict_metadata_json: Option<String>,
+    pub version: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceScopeKind {
+    Integration,
+    WorkUnit,
+}
+
+impl fmt::Display for WorkspaceScopeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Integration => "integration",
+            Self::WorkUnit => "work_unit",
+        })
+    }
+}
+
+impl FromStr for WorkspaceScopeKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "integration" => Ok(Self::Integration),
+            "work_unit" => Ok(Self::WorkUnit),
+            other => Err(format!("unknown Workspace scope: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceScope {
+    pub workspace_id: String,
+    pub task_id: String,
+    pub kind: WorkspaceScopeKind,
+    pub work_unit_id: Option<String>,
+    pub created_at: String,
+}
+
 /// Scheduler-issued authority for one assigned Task/repository operation.
 /// This row is internal: callers receive neither its capability payload nor
 /// any filesystem path or bearer token.
@@ -640,6 +797,10 @@ pub struct WorkspaceLease {
     pub id: String,
     pub project_id: String,
     pub task_id: String,
+    /// Set only for an explicitly WorkUnit-scoped lease. Legacy Task leases
+    /// keep both WorkUnit and Workspace bindings empty.
+    pub work_unit_id: Option<String>,
+    pub workspace_id: Option<String>,
     /// Exact Task revision admitted for this execution attempt.
     pub task_version: i64,
     /// Execution identity for the attempt; a lease cannot be replayed by a
@@ -879,6 +1040,8 @@ pub struct Execution {
     pub error: Option<String>,
     pub executor_config_snapshot_json: Option<String>,
     pub workspace_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub work_unit_version: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2803,12 +2966,14 @@ pub enum ProposalTargetKind {
     Task,
     Execution,
     Workspace,
+    WorkUnit,
 }
 
 enum_strings!(ProposalTargetKind {
     Task => "task",
     Execution => "execution",
     Workspace => "workspace",
+    WorkUnit => "work_unit",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2885,6 +3050,7 @@ pub struct Message {
     pub task_id: String,
     pub sender: ActorRef,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub body: String,
     pub artifact_ids: Vec<String>,
     pub created_at: String,
@@ -2896,6 +3062,7 @@ pub struct CreateMessage {
     pub task_id: String,
     pub sender: ActorRef,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub body: String,
     pub artifact_ids: Vec<String>,
     pub created_at: String,
@@ -2908,6 +3075,7 @@ pub struct Handoff {
     pub created_by: ActorRef,
     pub source_role_id: Option<String>,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub intent: HandoffIntent,
     pub parent_execution_id: Option<String>,
     pub expected_policy_ref: Option<String>,
@@ -2925,6 +3093,7 @@ pub struct CreateHandoff {
     pub created_by: ActorRef,
     pub source_role_id: Option<String>,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub intent: HandoffIntent,
     pub parent_execution_id: Option<String>,
     pub expected_policy_ref: Option<String>,

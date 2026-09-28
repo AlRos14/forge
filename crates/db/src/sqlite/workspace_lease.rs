@@ -29,6 +29,8 @@ fn map_workspace_lease(row: SqliteRow) -> Result<WorkspaceLease> {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
         task_id: row.try_get("task_id")?,
+        work_unit_id: row.try_get("work_unit_id")?,
+        workspace_id: row.try_get("workspace_id")?,
         task_version: row.try_get("task_version")?,
         execution_id: row.try_get("execution_id")?,
         operation_idempotency_key: row.try_get("operation_idempotency_key")?,
@@ -52,7 +54,55 @@ fn map_workspace_lease(row: SqliteRow) -> Result<WorkspaceLease> {
     })
 }
 
-const WORKSPACE_LEASE_COLUMNS: &str = "id, project_id, task_id, task_version, execution_id, operation_idempotency_key, repository_binding_id, base_ref, role, capabilities_json, assigned_principal_type, assigned_principal_id, capability_profile_revision, capability_profile_digest, issuing_principal_type, issuing_principal_id, status, issued_at, expires_at, revoked_at, version, created_at, updated_at";
+const WORKSPACE_LEASE_COLUMNS: &str = "id, project_id, task_id, work_unit_id, workspace_id, task_version, execution_id, operation_idempotency_key, repository_binding_id, base_ref, role, capabilities_json, assigned_principal_type, assigned_principal_id, capability_profile_revision, capability_profile_digest, issuing_principal_type, issuing_principal_id, status, issued_at, expires_at, revoked_at, version, created_at, updated_at";
+
+pub(super) async fn insert_workspace_lease_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: CreateWorkspaceLease,
+) -> Result<WorkspaceLease> {
+    sqlx::query(
+        "INSERT INTO workspace_lease (
+            id, project_id, task_id, work_unit_id, workspace_id, task_version, execution_id,
+            operation_idempotency_key, repository_binding_id, base_ref, role, capabilities_json,
+            assigned_principal_type, assigned_principal_id, capability_profile_revision,
+            capability_profile_digest, issuing_principal_type, issuing_principal_id, status,
+            issued_at, expires_at, revoked_at, version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, 1, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.project_id)
+    .bind(&input.task_id)
+    .bind(input.work_unit_id.as_deref())
+    .bind(input.workspace_id.as_deref())
+    .bind(input.task_version)
+    .bind(&input.execution_id)
+    .bind(&input.operation_idempotency_key)
+    .bind(&input.repository_binding_id)
+    .bind(&input.base_ref)
+    .bind(&input.role)
+    .bind(&input.capabilities_json)
+    .bind(&input.assigned_principal_type)
+    .bind(&input.assigned_principal_id)
+    .bind(&input.capability_profile_revision)
+    .bind(&input.capability_profile_digest)
+    .bind(&input.issuing_principal_type)
+    .bind(&input.issuing_principal_id)
+    .bind(&input.issued_at)
+    .bind(&input.expires_at)
+    .bind(&input.created_at)
+    .bind(&input.updated_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(workspace_lease_write_error)?;
+    map_workspace_lease(
+        sqlx::query(&format!(
+            "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_one(&mut **tx)
+        .await?,
+    )
+}
 
 #[async_trait]
 impl WorkspaceLeaseRepo for SqliteDb {
@@ -68,6 +118,8 @@ impl WorkspaceLeaseRepo for SqliteDb {
             let existing = map_workspace_lease(row)?;
             let same = existing.project_id == input.project_id
                 && existing.task_id == input.task_id
+                && existing.work_unit_id == input.work_unit_id
+                && existing.workspace_id == input.workspace_id
                 && existing.task_version == input.task_version
                 && existing.execution_id == input.execution_id
                 && existing.operation_idempotency_key == input.operation_idempotency_key
@@ -104,6 +156,8 @@ impl WorkspaceLeaseRepo for SqliteDb {
             let existing = map_workspace_lease(row)?;
             let same = existing.project_id == input.project_id
                 && existing.task_id == input.task_id
+                && existing.work_unit_id == input.work_unit_id
+                && existing.workspace_id == input.workspace_id
                 && existing.task_version == input.task_version
                 && existing.execution_id == input.execution_id
                 && existing.repository_binding_id == input.repository_binding_id
@@ -124,18 +178,20 @@ impl WorkspaceLeaseRepo for SqliteDb {
         }
         sqlx::query(
             "INSERT INTO workspace_lease (
-                id, project_id, task_id, task_version, execution_id,
+                id, project_id, task_id, work_unit_id, workspace_id, task_version, execution_id,
                 operation_idempotency_key,
                 repository_binding_id, base_ref, role, capabilities_json,
                 assigned_principal_type, assigned_principal_id,
                 capability_profile_revision, capability_profile_digest,
                 issuing_principal_type, issuing_principal_id, status, issued_at,
                 expires_at, revoked_at, version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, 1, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, 1, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)
         .bind(&input.task_id)
+        .bind(input.work_unit_id.as_deref())
+        .bind(input.workspace_id.as_deref())
         .bind(input.task_version)
         .bind(&input.execution_id)
         .bind(&input.operation_idempotency_key)
@@ -182,9 +238,23 @@ impl WorkspaceLeaseRepo for SqliteDb {
         sqlx::query(&format!(
             "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease
              WHERE task_id = ? AND status = 'active'
+               AND work_unit_id IS NULL
              ORDER BY issued_at DESC, id DESC LIMIT 1"
         ))
         .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?
+        .map(map_workspace_lease)
+        .transpose()
+    }
+
+    async fn get_active_for_work_unit(&self, work_unit_id: &str) -> Result<Option<WorkspaceLease>> {
+        sqlx::query(&format!(
+            "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease
+             WHERE work_unit_id = ? AND status = 'active'
+             ORDER BY issued_at DESC, id DESC LIMIT 1"
+        ))
+        .bind(work_unit_id)
         .fetch_optional(self.pool())
         .await?
         .map(map_workspace_lease)

@@ -3,6 +3,7 @@ use super::*;
 #[async_trait]
 impl WorkspaceRepo for SqliteDb {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, before_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.task_id)
@@ -13,11 +14,24 @@ impl WorkspaceRepo for SqliteDb {
             .bind(input.before_sha.as_deref())
             .bind(&input.created_at)
             .bind(&input.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        WorkspaceRepo::get_by_id(self, &input.id)
-            .await?
-            .ok_or(DbError::NotFound)
+        sqlx::query(
+            "INSERT INTO workspace_scope (workspace_id, task_id, scope_kind, work_unit_id, created_at)
+             VALUES (?, ?, 'integration', NULL, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query("SELECT * FROM workspace WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let workspace = map_workspace(row)?;
+        tx.commit().await?;
+        Ok(workspace)
     }
 
     async fn get_task_id(&self, id: &str) -> Result<Option<String>> {
@@ -39,12 +53,16 @@ impl WorkspaceRepo for SqliteDb {
     }
 
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>> {
-        sqlx::query("SELECT * FROM workspace WHERE task_id = ?")
-            .bind(task_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_workspace)
-            .transpose()
+        sqlx::query(
+            "SELECT w.* FROM workspace w
+             JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id
+             WHERE s.task_id = ? AND s.scope_kind = 'integration'",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_workspace)
+        .transpose()
     }
 
     async fn set_cleanup_after(

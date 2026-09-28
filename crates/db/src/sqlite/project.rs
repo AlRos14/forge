@@ -392,6 +392,22 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM message_work_unit WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM handoff_work_unit WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_integration WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_dependency WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM workspace_scope WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM workspace_lease WHERE project_id = ?",
+            "UPDATE execution SET work_unit_id = NULL, work_unit_version = NULL
+             WHERE work_unit_id IS NOT NULL AND task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM message_artifact WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM handoff_artifact WHERE task_id IN
@@ -445,7 +461,6 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM project_charter WHERE project_id = ?)",
             "DELETE FROM project_charter_revision WHERE charter_id IN
                  (SELECT id FROM project_charter WHERE project_id = ?)",
-            "DELETE FROM workspace_lease WHERE project_id = ?",
             "DELETE FROM project_charter WHERE project_id = ?",
         ] {
             sqlx::query(statement).bind(id).execute(&mut *tx).await?;

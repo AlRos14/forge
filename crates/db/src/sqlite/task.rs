@@ -712,7 +712,7 @@ impl TaskRepo for SqliteDb {
         task.entry_barrier_json = None;
         task.version += 1;
         task.updated_at = input.claimed_at;
-        let execution = Self::create_execution_in_tx(transaction, &input.execution).await?;
+        let execution = Self::create_execution_in_tx(transaction, &input.execution, None).await?;
         Ok(ClaimedTask { task, execution })
     }
 
