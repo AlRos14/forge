@@ -7,10 +7,12 @@ Legacy chats, handoffs, Project Decisions, and memory proposal/decision records
 remain separate authorities until their assigned migration; there is no
 implicit dual-write or silent projection.
 
-Opaque IDs are references, never authority. A mutation checks a referenced
-record's owning Task before loading its semantic content. A missing or
-cross-Task reference is reported as not found; a corrupt same-Task record
-continues to fail closed.
+Opaque IDs are references, never authority. A caller-supplied reference is
+scoped to its owning Task before foreign semantic content, state, or corruption
+is loaded. Missing and cross-Task references are indistinguishable within each
+reference contract. Resource references generally resolve as not found, while
+membership or derived-identity claims may use their uniform authorization or
+contract error. A corrupt same-Task record continues to fail closed.
 
 ## Message
 

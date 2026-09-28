@@ -295,10 +295,12 @@ contradictory target fields are rejected. Lists use opaque stable cursors.
 Artifact lists omit inline content, and neither list nor detail responses
 include the internal `content_ref` locator.
 
-IDs supplied as mutation references are scoped the same way: the owning Task
-is checked before the referenced record is loaded. Missing and cross-Task
-references both return `404`; corruption in an in-Task reference still fails
-closed.
+IDs are references, never authority. IDs supplied as mutation references are
+scoped to the owning Task before foreign semantic content, state, or corruption
+is loaded. Missing and cross-Task references are indistinguishable within each
+reference contract. Resource references generally resolve as not found;
+membership or derived-identity claims may use their uniform authorization or
+contract error. Corruption in an in-Task reference still fails closed.
 
 Message is communication only. Handoff status changes do not create or change
 RoleMembership. Proposal policy fields are opaque policy evidence and never
