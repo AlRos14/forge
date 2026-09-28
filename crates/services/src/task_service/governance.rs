@@ -50,6 +50,100 @@ struct BaselineContext {
 }
 
 impl TaskService {
+    /// Prepare the exact scheduler-issued authority for a repository-mutating
+    /// WorkUnit Execution. The lease row is inserted by the same DB
+    /// transaction that creates the Execution and its durable event.
+    pub(crate) async fn prepare_work_unit_workspace_lease(
+        &self,
+        task: &db::Task,
+        work_unit: &db::WorkUnit,
+        workspace: &db::Workspace,
+        execution: &db::CreateExecution,
+        actor: &db::ActorRef,
+    ) -> Result<CreateWorkspaceLease> {
+        let repo_id = task.repo_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "repository-mutating WorkUnit requires a repository-bound Task",
+            )
+        })?;
+        if work_unit.task_id != task.id
+            || work_unit.role != execution.role
+            || execution.workspace_id.as_deref() != Some(workspace.id.as_str())
+            || execution.actor_ref.as_ref() != Some(actor)
+        {
+            return Err(ServiceError::invalid_operation(
+                "WorkUnit, Execution, Actor, and Workspace lease bindings do not match",
+            ));
+        }
+        self.ensure_task_runnable(task).await?;
+        let canonical_role = canonical_workspace_lease_role(&work_unit.role)?;
+        let db::ActorRef::Agent(principal_id) = actor else {
+            return Err(ServiceError::invalid_operation(
+                "repository WorkUnit leases require an Agent Actor under current repository policy",
+            ));
+        };
+        if execution.agent_id.as_deref() != Some(principal_id.as_str()) {
+            return Err(ServiceError::invalid_operation(
+                "repository WorkUnit Execution agent_id must match its Agent Actor",
+            ));
+        }
+        let target_role = db::canonical_task_role_name(work_unit.role.trim())
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit role is not a TaskRole"))?;
+        let membership_exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_role tr
+                JOIN role_membership rm ON rm.task_role_id = tr.id
+                WHERE tr.task_id = ? AND tr.role = ?
+                  AND rm.actor_kind = ? AND rm.actor_id = ? AND rm.status = 'active'
+            )",
+        )
+        .bind(&task.id)
+        .bind(&target_role)
+        .bind(actor.kind().to_string())
+        .bind(actor.id())
+        .fetch_one(self.db.pool())
+        .await?;
+        if membership_exists == 0 {
+            return Err(ServiceError::conflict(
+                "WorkUnit WorkspaceLease requires an active TaskRole membership",
+            ));
+        }
+        self.ensure_repository_worker_identity(&task.project_id, principal_id)
+            .await?;
+        let (_repo, capability_class, base_ref) = self
+            .workspace_lease_inputs(task, workspace, repo_id)
+            .await?;
+        let issued_at = now_rfc3339();
+        let expires_at =
+            (Utc::now() + ChronoDuration::seconds(WORKSPACE_LEASE_SECONDS)).to_rfc3339();
+        let capabilities_json = serde_json::to_string(std::slice::from_ref(&capability_class))
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        Ok(CreateWorkspaceLease {
+            id: new_uuid_v4(),
+            project_id: task.project_id.clone(),
+            task_id: task.id.clone(),
+            work_unit_id: Some(work_unit.id.clone()),
+            workspace_id: Some(workspace.id.clone()),
+            task_version: task.version,
+            execution_id: execution.id.clone(),
+            operation_idempotency_key: execution.id.clone(),
+            repository_binding_id: repo_id.to_owned(),
+            base_ref,
+            role: canonical_role.to_owned(),
+            capabilities_json,
+            assigned_principal_type: "agent".to_owned(),
+            assigned_principal_id: principal_id.to_owned(),
+            capability_profile_revision: CAPABILITY_PROFILE_REVISION.to_owned(),
+            capability_profile_digest: capability_profile_digest(&capability_class),
+            issuing_principal_type: "system".to_owned(),
+            issuing_principal_id: "task-service-scheduler".to_owned(),
+            issued_at: issued_at.clone(),
+            expires_at,
+            created_at: issued_at.clone(),
+            updated_at: issued_at,
+        })
+    }
+
     /// Reject orchestration identities before any repository workspace is
     /// prepared. The in-transaction lease guard repeats this check at the
     /// authority boundary, but callers use this preflight to avoid leaving a
@@ -671,6 +765,8 @@ impl TaskService {
             id: new_uuid_v4(),
             project_id: task.project_id.clone(),
             task_id: task.id.clone(),
+            work_unit_id: None,
+            workspace_id: None,
             task_version: task.version,
             execution_id: execution_id.to_owned(),
             operation_idempotency_key: execution_id.to_owned(),
@@ -1046,7 +1142,7 @@ impl TaskService {
         .await
         .map_err(db::DbError::from)?;
         let row = sqlx::query(
-            "SELECT id, project_id, task_id, task_version, execution_id,
+            "SELECT id, project_id, task_id, work_unit_id, workspace_id, task_version, execution_id,
                     operation_idempotency_key,
                     repository_binding_id, base_ref, role, capabilities_json,
                     assigned_principal_type, assigned_principal_id,
@@ -1070,6 +1166,36 @@ impl TaskService {
         principal_id: Option<&str>,
         execution_id: &str,
     ) -> Result<db::WorkspaceLease> {
+        let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", workspace.id.clone()))?;
+        if scope.task_id != task.id {
+            return Err(ServiceError::not_found("workspace", workspace.id.clone()));
+        }
+        if scope.kind == db::WorkspaceScopeKind::WorkUnit {
+            return self
+                .verify_active_work_unit_workspace_lease(
+                    task,
+                    workspace,
+                    scope.work_unit_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "WorkUnit Workspace has no WorkUnit identity",
+                        )
+                    })?,
+                    role,
+                    principal_id,
+                    execution_id,
+                )
+                .await;
+        }
+        if !WorkUnitRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Task integration Workspace cannot authorize a WorkUnit Execution",
+            ));
+        }
         let repo_id = task.repo_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("WorkspaceLease requires a repository-backed Task")
         })?;
@@ -1126,6 +1252,132 @@ impl TaskService {
         {
             return Err(ServiceError::invalid_operation(
                 "active WorkspaceLease does not exactly match Task execution authority",
+            ));
+        }
+        Ok(lease)
+    }
+
+    async fn verify_active_work_unit_workspace_lease(
+        &self,
+        task: &db::Task,
+        workspace: &db::Workspace,
+        work_unit_id: &str,
+        role: &str,
+        principal_id: Option<&str>,
+        execution_id: &str,
+    ) -> Result<db::WorkspaceLease> {
+        let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .filter(|unit| unit.task_id == task.id)
+            .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .filter(|execution| execution.task_id == task.id)
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        let role_name = db::canonical_task_role_name(&unit.role)
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit role is not a TaskRole"))?;
+        let db::ActorRef::Agent(agent_id) = execution
+            .actor_ref()
+            .ok_or_else(|| ServiceError::invalid_operation("Execution has no ActorRef"))?
+        else {
+            return Err(ServiceError::invalid_operation(
+                "repository WorkUnit WorkspaceLease requires an Agent Actor",
+            ));
+        };
+        if !unit.requires_integration
+            || unit.status != db::WorkUnitStatus::Open
+            || unit.role != role
+            || execution.work_unit_id.as_deref() != Some(work_unit_id)
+            || execution.work_unit_version != Some(unit.version)
+            || execution.status != ExecutionStatus::Running
+            || execution.role != unit.role
+            || execution.workspace_id.as_deref() != Some(workspace.id.as_str())
+            || execution.agent_id.as_deref() != Some(agent_id.as_str())
+            || principal_id.is_some_and(|principal| principal != agent_id)
+            || unit
+                .assigned_actor
+                .as_ref()
+                .is_some_and(|assigned| assigned != &db::ActorRef::Agent(agent_id.clone()))
+            || workspace.status != WorkspaceStatus::Ready
+        {
+            return Err(ServiceError::invalid_operation(
+                "WorkUnit Execution, allocation, Workspace, and lease principal do not match",
+            ));
+        }
+        self.ensure_task_runnable(task).await?;
+        self.ensure_repository_worker_identity(&task.project_id, &agent_id)
+            .await?;
+        let member: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id
+                WHERE tr.task_id = ? AND tr.role = ?
+                  AND rm.actor_kind = 'agent' AND rm.actor_id = ? AND rm.status = 'active'
+            )",
+        )
+        .bind(&task.id)
+        .bind(&role_name)
+        .bind(&agent_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if member == 0 {
+            return Err(ServiceError::conflict(
+                "WorkUnit WorkspaceLease requires an active TaskRole membership",
+            ));
+        }
+
+        let repo_id = task.repo_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("WorkUnit WorkspaceLease requires a repository Task")
+        })?;
+        let (repo, capability_class, base_ref) = self
+            .workspace_lease_inputs(task, workspace, repo_id)
+            .await?;
+        if repo.project_id != task.project_id {
+            return Err(ServiceError::invalid_operation(
+                "WorkUnit WorkspaceLease repository belongs to another Project",
+            ));
+        }
+        let lease = WorkspaceLeaseRepo::get_active_for_work_unit(&*self.db, work_unit_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "WorkUnit repository Execution requires an active WorkspaceLease",
+                )
+            })?;
+        if workspace_lease_expired(&lease) {
+            if let Err(error) = WorkspaceLeaseRepo::expire(&*self.db, &now_rfc3339(), 500).await {
+                tracing::warn!(lease_id = %lease.id, %error, "failed to expire stale WorkUnit WorkspaceLease");
+            }
+            return Err(ServiceError::invalid_operation(
+                "WorkUnit WorkspaceLease has expired",
+            ));
+        }
+        let capabilities =
+            serde_json::from_str::<Vec<String>>(&lease.capabilities_json).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "invalid WorkUnit WorkspaceLease capability set: {error}"
+                ))
+            })?;
+        let canonical_role = canonical_workspace_lease_role(&unit.role)?;
+        if lease.status != "active"
+            || lease.project_id != task.project_id
+            || lease.task_id != task.id
+            || lease.work_unit_id.as_deref() != Some(work_unit_id)
+            || lease.workspace_id.as_deref() != Some(workspace.id.as_str())
+            || lease.execution_id != execution_id
+            || lease.operation_idempotency_key != execution_id
+            || lease.repository_binding_id != repo_id
+            || lease.base_ref != base_ref
+            || lease.role != canonical_role
+            || lease.issuing_principal_type != "system"
+            || lease.issuing_principal_id != "task-service-scheduler"
+            || lease.assigned_principal_type != "agent"
+            || lease.assigned_principal_id != agent_id
+            || lease.capability_profile_revision != CAPABILITY_PROFILE_REVISION
+            || lease.capability_profile_digest != capability_profile_digest(&capability_class)
+            || capabilities != vec![capability_class]
+        {
+            return Err(ServiceError::invalid_operation(
+                "active WorkspaceLease does not exactly match WorkUnit Execution authority",
             ));
         }
         Ok(lease)
@@ -1303,13 +1555,27 @@ impl TaskService {
         task_id: &str,
         execution_id: &str,
     ) {
-        match WorkspaceLeaseRepo::get_active_for_task(&*self.db, task_id).await {
+        let execution = match ExecutionRepo::get_by_id(&*self.db, execution_id).await {
+            Ok(Some(execution)) if execution.task_id == task_id => execution,
+            Ok(Some(_)) | Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, task_id, execution_id, "failed to load Execution lease binding");
+                return;
+            }
+        };
+        let active_lease = match execution.work_unit_id.as_deref() {
+            Some(work_unit_id) => {
+                WorkspaceLeaseRepo::get_active_for_work_unit(&*self.db, work_unit_id).await
+            }
+            None => WorkspaceLeaseRepo::get_active_for_task(&*self.db, task_id).await,
+        };
+        match active_lease {
             Ok(Some(lease)) if lease.execution_id == execution_id => {
                 self.revoke_workspace_lease(&lease).await
             }
             Ok(Some(lease)) => {
-                // A concurrent retry may already own the Task's active
-                // lease. Never revoke another execution's authority while
+                // A concurrent retry may already own this WorkUnit's next
+                // lease. Never revoke another Execution's authority while
                 // terminalizing this attempt.
                 tracing::debug!(
                     task_id,
@@ -1402,6 +1668,8 @@ fn map_workspace_lease_row(row: sqlx::sqlite::SqliteRow) -> db::WorkspaceLease {
         id: row.get("id"),
         project_id: row.get("project_id"),
         task_id: row.get("task_id"),
+        work_unit_id: row.get("work_unit_id"),
+        workspace_id: row.get("workspace_id"),
         task_version: row.get("task_version"),
         execution_id: row.get("execution_id"),
         operation_idempotency_key: row.get("operation_idempotency_key"),

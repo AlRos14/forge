@@ -590,7 +590,9 @@ impl TaskService {
             .task_executions(task_id)
             .await?
             .into_iter()
-            .find(|execution| execution.status == ExecutionStatus::Running))
+            .find(|execution| {
+                execution.work_unit_id.is_none() && execution.status == ExecutionStatus::Running
+            }))
     }
 
     async fn latest_review(&self, task_id: &str) -> Result<Option<Review>> {

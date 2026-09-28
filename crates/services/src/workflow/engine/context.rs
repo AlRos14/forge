@@ -19,14 +19,17 @@ pub(super) async fn latest_execution_context(
         task_id,
         PageRequest {
             cursor: None,
-            limit: 1,
+            limit: 100,
             include_total: false,
             sort_by: SortBy::CreatedAt,
             sort_order: SortOrder::Desc,
         },
     )
     .await?;
-    Ok(page.items.into_iter().next())
+    Ok(page
+        .items
+        .into_iter()
+        .find(|execution| execution.work_unit_id.is_none()))
 }
 
 pub(super) async fn latest_executor_context(
@@ -45,8 +48,7 @@ pub(super) async fn latest_executor_context(
         },
     )
     .await?;
-    Ok(page
-        .items
-        .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "coder" | "executor")))
+    Ok(page.items.into_iter().find(|execution| {
+        execution.work_unit_id.is_none() && matches!(execution.role.as_str(), "coder" | "executor")
+    }))
 }

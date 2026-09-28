@@ -131,6 +131,7 @@ async fn main() {
         Arc::clone(&event_bus),
         workspace_root.clone(),
     ));
+    cleanup_scheduler.set_workspace_exec_locks(merge_service.workspace_exec_locks());
     let shared_media_cleanup_scheduler = Arc::new(services::SharedMediaCleanupScheduler::new(
         Arc::clone(&db),
         media_storage_root(&effective_config.forge.data_dir),

@@ -16,6 +16,69 @@ pub(crate) async fn prepare_workspace(
     )
 }
 
+/// Prepare the Task's own integration workspace for a WorkUnit operation.
+/// Unlike legacy subtask preparation, this deliberately never reuses a parent
+/// Task workspace: the Task is the one integration authority for its units.
+pub(crate) async fn prepare_integration_workspace_for_work_unit(
+    db: &SqliteDb,
+    workspace_root: &std::path::Path,
+    task: &Task,
+    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+) -> Result<Workspace> {
+    let task_repo_id = task.repo_id.as_deref().ok_or_else(|| {
+        ServiceError::invalid_operation("WorkUnit Task has no repository binding")
+    })?;
+    if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, &task.id).await? {
+        if workspace.repo_id != task_repo_id {
+            return Err(ServiceError::invalid_operation(
+                "Task integration Workspace repository does not match its Task",
+            ));
+        }
+        let repo = RepoRepo::get_by_id(db, &workspace.repo_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+        if repo.project_id != task.project_id {
+            return Err(ServiceError::invalid_operation(
+                "Task integration Workspace repository belongs to another Project",
+            ));
+        }
+        if workspace.status == WorkspaceStatus::Cleaning {
+            return Err(ServiceError::invalid_operation(format!(
+                "Task integration workspace for {} is being cleaned",
+                task.id
+            )));
+        }
+        return match worktree_readiness(Path::new(&workspace.worktree_path)).await {
+            WorktreeReadiness::Ready if workspace.status == WorkspaceStatus::Ready => Ok(workspace),
+            WorktreeReadiness::Ready => {
+                WorkspaceRepo::update_status(
+                    db,
+                    &workspace.id,
+                    WorkspaceStatus::Ready,
+                    None,
+                    &now_rfc3339(),
+                )
+                .await?;
+                WorkspaceRepo::get_by_id(db, &workspace.id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("workspace", workspace.id))
+            }
+            WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
+                recover_missing_worktree(
+                    db,
+                    workspace_root,
+                    task,
+                    &task.id,
+                    workspace,
+                    repo_cache_locks,
+                )
+                .await
+            }
+        };
+    }
+    create_fresh_workspace(db, workspace_root, task, &task.id, repo_cache_locks).await
+}
+
 /// Prepare a workspace and report whether this call won creation ownership.
 /// The ownership bit is consumed by admission-failure cleanup; callers must
 /// never infer it from a racy preflight existence query.
@@ -26,7 +89,9 @@ pub(crate) async fn prepare_workspace_owned(
     task_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<(Workspace, bool)> {
+    ensure_legacy_task_workspace_allowed(db, task_id).await?;
     if let Some(parent_task_id) = task.parent_task_id.as_deref() {
+        ensure_legacy_task_workspace_allowed(db, parent_task_id).await?;
         let Some(workspace) = WorkspaceRepo::get_by_task_id(db, parent_task_id).await? else {
             return Err(ServiceError::parent_workspace_required(parent_task_id));
         };
@@ -375,7 +440,10 @@ async fn create_fresh_workspace(
     Ok(workspace)
 }
 
-async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) -> Result<String> {
+pub(crate) async fn resolve_repo_source(
+    repo: &db::Repo,
+    workspace_root: &std::path::Path,
+) -> Result<String> {
     if let Some(local_path) = repo
         .local_path
         .as_deref()
@@ -424,6 +492,7 @@ pub(super) async fn reset_workspace(
     task: &Task,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<Workspace> {
+    ensure_legacy_task_workspace_allowed(db, &task.id).await?;
     if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, &task.id).await? {
         let repo_id = task
             .repo_id
@@ -484,6 +553,18 @@ pub(super) async fn reset_workspace(
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
 
     create_fresh_workspace(db, workspace_root, &refreshed, &task.id, repo_cache_locks).await
+}
+
+async fn ensure_legacy_task_workspace_allowed(db: &SqliteDb, task_id: &str) -> Result<()> {
+    if !db::WorkUnitRepo::list_by_task(db, task_id)
+        .await?
+        .is_empty()
+    {
+        return Err(ServiceError::invalid_operation(
+            "Task has WorkUnits; repository work must use an explicitly bound WorkUnit Workspace",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn default_workspace_root() -> PathBuf {

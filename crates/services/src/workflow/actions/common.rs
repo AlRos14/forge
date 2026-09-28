@@ -182,7 +182,8 @@ pub(super) async fn has_running_execution_for_roles(
     .await
     .map_err(|error| error.to_string())?;
     Ok(page.items.iter().any(|execution| {
-        execution.status == db::ExecutionStatus::Running
+        execution.work_unit_id.is_none()
+            && execution.status == db::ExecutionStatus::Running
             && roles.iter().any(|role| execution.role == *role)
     }))
 }
@@ -208,9 +209,10 @@ pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execu
     )
     .await
     .ok()?;
-    page.items
-        .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
+    page.items.into_iter().find(|execution| {
+        execution.work_unit_id.is_none()
+            && matches!(execution.role.as_str(), "executor" | "coder" | "worker")
+    })
 }
 
 pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {

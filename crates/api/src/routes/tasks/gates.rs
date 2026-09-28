@@ -173,11 +173,11 @@ async fn ensure_gate_decision_ready(
         },
     )
     .await?;
-    if page
-        .items
-        .iter()
-        .any(|execution| execution.role == role && execution.status == ExecutionStatus::Running)
-    {
+    if page.items.iter().any(|execution| {
+        execution.work_unit_id.is_none()
+            && execution.role == role
+            && execution.status == ExecutionStatus::Running
+    }) {
         return Err(ApiError::invalid_operation_conflict(format!(
             "gate '{}' is still running {role} execution; wait for it to finish before approving or rejecting",
             gate_state.name

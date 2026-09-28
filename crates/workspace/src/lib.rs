@@ -26,6 +26,9 @@ pub enum WorkspaceError {
     #[error("workspace not found")]
     NotFound,
 
+    #[error("workspace identity is not a safe opaque path segment")]
+    InvalidIdentity,
+
     #[error("git error: {0}")]
     Git(#[from] git::GitError),
 
@@ -125,6 +128,177 @@ impl WorkspaceManager {
         }
 
         Ok(worktree_path)
+    }
+
+    /// Create one isolated WorkUnit worktree from an exact recorded base ref.
+    /// The Task, WorkUnit, Workspace, and repository IDs form its path and
+    /// branch identity; user-controlled titles and scope never enter either.
+    pub async fn create_work_unit_worktree(
+        &self,
+        repo_path: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        workspace_id: &str,
+        repo_id: &str,
+        base_ref: &str,
+    ) -> Result<PathBuf> {
+        let branch = work_unit_branch_name(task_id, work_unit_id, workspace_id)?;
+        let path = self.work_unit_path(task_id, work_unit_id, workspace_id, repo_id)?;
+        if fs::try_exists(&path).await? {
+            return Err(WorkspaceError::AlreadyExists);
+        }
+        let parent = path.parent().ok_or(WorkspaceError::InvalidIdentity)?;
+        fs::create_dir_all(parent).await?;
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_path).await)
+        } else {
+            None
+        };
+        let args = [
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &path.to_string_lossy(),
+            base_ref,
+        ];
+        let output = git_command()
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(git::GitError::CommandFailed {
+                command: format!("git {}", args.join(" ")),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
+        }
+        Ok(path)
+    }
+
+    /// Recover a missing WorkUnit worktree from its exact persisted branch.
+    /// A branch belonging to another Workspace identity is rejected.
+    pub async fn recover_work_unit_worktree(
+        &self,
+        repo_path: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        workspace_id: &str,
+        repo_id: &str,
+        existing_branch: &str,
+    ) -> Result<PathBuf> {
+        let expected_branch = work_unit_branch_name(task_id, work_unit_id, workspace_id)?;
+        if existing_branch != expected_branch {
+            return Err(WorkspaceError::InvalidIdentity);
+        }
+        let path = self.work_unit_path(task_id, work_unit_id, workspace_id, repo_id)?;
+        if fs::try_exists(&path).await? {
+            return Err(WorkspaceError::AlreadyExists);
+        }
+        let parent = path.parent().ok_or(WorkspaceError::InvalidIdentity)?;
+        fs::create_dir_all(parent).await?;
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_path).await)
+        } else {
+            None
+        };
+        let _ = git_command()
+            .args(["worktree", "prune"])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        let args = ["worktree", "add", &path.to_string_lossy(), existing_branch];
+        let output = git_command()
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(git::GitError::CommandFailed {
+                command: format!("git {}", args.join(" ")),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
+        }
+        Ok(path)
+    }
+
+    /// Remove only the physical worktree identified by the exact WorkUnit and
+    /// Workspace IDs. Its branch and all sibling worktrees are preserved.
+    pub async fn cleanup_work_unit_worktree(
+        &self,
+        repo_path: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        workspace_id: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let path = self.work_unit_path(task_id, work_unit_id, workspace_id, repo_id)?;
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_path).await)
+        } else {
+            None
+        };
+        if fs::try_exists(&path).await? {
+            let args = ["worktree", "remove", "--force", &path.to_string_lossy()];
+            let output = git_command()
+                .args(args)
+                .current_dir(repo_path)
+                .output()
+                .await?;
+            if !output.status.success() {
+                return Err(git::GitError::CommandFailed {
+                    command: format!("git {}", args.join(" ")),
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                }
+                .into());
+            }
+        }
+        let _ = git_command()
+            .args(["worktree", "prune"])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        Ok(())
+    }
+
+    fn work_unit_path(
+        &self,
+        task_id: &str,
+        work_unit_id: &str,
+        workspace_id: &str,
+        repo_id: &str,
+    ) -> Result<PathBuf> {
+        for value in [task_id, work_unit_id, workspace_id, repo_id] {
+            validate_identity_segment(value)?;
+        }
+        // Keep WorkUnit worktrees outside the legacy Task root. Legacy Task
+        // cleanup removes `root/<task_id>` recursively, so nesting them below
+        // that directory would let a Task-level cleanup erase sibling work.
+        Ok(self
+            .root
+            .join("work_units")
+            .join(task_id)
+            .join(work_unit_id)
+            .join(workspace_id)
+            .join(repo_id))
+    }
+
+    /// Return the deterministic physical path for one exact WorkUnit
+    /// Workspace identity after applying the same opaque-ID validation as
+    /// create/recover/cleanup.
+    pub fn work_unit_worktree_path(
+        &self,
+        task_id: &str,
+        work_unit_id: &str,
+        workspace_id: &str,
+        repo_id: &str,
+    ) -> Result<PathBuf> {
+        self.work_unit_path(task_id, work_unit_id, workspace_id, repo_id)
     }
 
     pub async fn recover_worktree(
@@ -291,6 +465,9 @@ impl WorkspaceManager {
             }
 
             let task_id = entry.file_name().to_string_lossy().to_string();
+            if task_id == "work_units" {
+                continue;
+            }
             if !active_task_ids.contains(&task_id) {
                 orphans.push(task_id);
             }
@@ -314,6 +491,32 @@ impl WorkspaceManager {
 
 pub fn task_branch_name(task_id: &str) -> String {
     format!("task/{}", &task_id[..task_id.len().min(8)])
+}
+
+pub fn work_unit_branch_name(
+    task_id: &str,
+    work_unit_id: &str,
+    workspace_id: &str,
+) -> Result<String> {
+    for value in [task_id, work_unit_id, workspace_id] {
+        validate_identity_segment(value)?;
+    }
+    Ok(format!(
+        "forge/work-unit/{task_id}/{work_unit_id}/{workspace_id}"
+    ))
+}
+
+fn validate_identity_segment(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(WorkspaceError::InvalidIdentity);
+    }
+    Ok(())
 }
 
 fn repo_name(repo_url: &str) -> String {
@@ -445,5 +648,88 @@ mod tests {
 
         manager.cleanup_worktree("task-1").await.unwrap();
         assert!(!fs::try_exists(&task_root).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn work_unit_worktrees_are_distinct_and_cleanup_is_workspace_scoped() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let manager = WorkspaceManager::new(workspace_dir.path().to_path_buf());
+        let repo = repo_path.to_str().unwrap();
+        let integration = manager
+            .create_worktree(repo, "task-a", "HEAD")
+            .await
+            .unwrap();
+        let a = manager
+            .create_work_unit_worktree(repo, "task-a", "unit-a", "workspace-a", "repo-a", "HEAD")
+            .await
+            .unwrap();
+        let b = manager
+            .create_work_unit_worktree(repo, "task-a", "unit-b", "workspace-b", "repo-a", "HEAD")
+            .await
+            .unwrap();
+        let c = manager
+            .create_work_unit_worktree(repo, "task-a", "unit-c", "workspace-c", "repo-a", "HEAD")
+            .await
+            .unwrap();
+
+        assert_ne!(integration, a);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        let branches = git::list_branches(&repo_path).await.unwrap();
+        let branch_a = work_unit_branch_name("task-a", "unit-a", "workspace-a").unwrap();
+        let branch_b = work_unit_branch_name("task-a", "unit-b", "workspace-b").unwrap();
+        let branch_c = work_unit_branch_name("task-a", "unit-c", "workspace-c").unwrap();
+        assert!(branches.branches.contains(&branch_a));
+        assert!(branches.branches.contains(&branch_b));
+        assert!(branches.branches.contains(&branch_c));
+
+        manager
+            .cleanup_work_unit_worktree(repo, "task-a", "unit-a", "workspace-a", "repo-a")
+            .await
+            .unwrap();
+        assert!(!fs::try_exists(&a).await.unwrap());
+        assert!(fs::try_exists(&integration).await.unwrap());
+        assert!(fs::try_exists(&b).await.unwrap());
+        assert!(fs::try_exists(&c).await.unwrap());
+        let branches = git::list_branches(&repo_path).await.unwrap();
+        assert!(branches.branches.contains(&branch_a));
+        assert!(branches.branches.contains(&branch_b));
+        assert!(branches.branches.contains(&branch_c));
+
+        let recovered = manager
+            .recover_work_unit_worktree(
+                repo,
+                "task-a",
+                "unit-a",
+                "workspace-a",
+                "repo-a",
+                &branch_a,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered, a);
+        assert!(fs::try_exists(&b).await.unwrap());
+        assert!(fs::try_exists(&c).await.unwrap());
+        assert!(fs::try_exists(&integration).await.unwrap());
+
+        // Legacy Task-wide cleanup owns only root/<task_id>; WorkUnit paths
+        // live under root/work_units and survive intact.
+        manager.cleanup_worktree("task-a").await.unwrap();
+        assert!(!fs::try_exists(&integration).await.unwrap());
+        assert!(fs::try_exists(&recovered).await.unwrap());
+        assert!(fs::try_exists(&b).await.unwrap());
+        assert!(fs::try_exists(&c).await.unwrap());
+    }
+
+    #[test]
+    fn work_unit_identity_rejects_path_injection_and_uses_full_ids() {
+        let branch_a = work_unit_branch_name("task-a", "unit-a", "workspace-a").unwrap();
+        let branch_b = work_unit_branch_name("task-a", "unit-b", "workspace-b").unwrap();
+        assert_ne!(branch_a, branch_b);
+        assert!(matches!(
+            work_unit_branch_name("../task", "unit-a", "workspace-a"),
+            Err(WorkspaceError::InvalidIdentity)
+        ));
     }
 }

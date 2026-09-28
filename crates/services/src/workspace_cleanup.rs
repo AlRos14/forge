@@ -1,6 +1,9 @@
 use crate::{Result, ServiceError};
 use async_trait::async_trait;
-use db::{now_rfc3339, SqliteDb, WorkspaceRepo};
+use db::{
+    now_rfc3339, RepoRepo, SqliteDb, WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    WorkspaceScopeKind,
+};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use std::{
     path::{Path, PathBuf},
@@ -13,6 +16,7 @@ use tokio::{
     time::{interval, timeout},
 };
 use tracing::info;
+use workspace::RepoCacheLockManager;
 use workspace::{WorkspaceError, WorkspaceManager};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,6 +26,9 @@ pub struct WorkspaceCleanupScheduler {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
+    repo_cache_locks: RwLock<Option<Arc<RepoCacheLockManager>>>,
+    workspace_exec_locks:
+        RwLock<Option<Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>>>,
     terminal_cleanup: RwLock<Option<Arc<dyn WorkspaceCleanupObserver>>>,
 }
 
@@ -36,7 +43,31 @@ impl WorkspaceCleanupScheduler {
             db,
             event_bus,
             workspace_root,
+            repo_cache_locks: RwLock::new(None),
+            workspace_exec_locks: RwLock::new(None),
             terminal_cleanup: RwLock::new(None),
+        }
+    }
+
+    pub fn with_repo_cache_locks(self, locks: Arc<RepoCacheLockManager>) -> Self {
+        if let Ok(mut configured) = self.repo_cache_locks.write() {
+            *configured = Some(locks);
+        }
+        self
+    }
+
+    pub fn set_repo_cache_locks(&self, locks: Arc<RepoCacheLockManager>) {
+        if let Ok(mut configured) = self.repo_cache_locks.write() {
+            *configured = Some(locks);
+        }
+    }
+
+    pub fn set_workspace_exec_locks(
+        &self,
+        locks: Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>,
+    ) {
+        if let Ok(mut configured) = self.workspace_exec_locks.write() {
+            *configured = Some(locks);
         }
     }
 
@@ -129,6 +160,58 @@ impl WorkspaceCleanupScheduler {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id).await?;
+        let lock_key = match scope.as_ref().map(|scope| scope.kind) {
+            Some(WorkspaceScopeKind::Integration) => {
+                Some(format!("task-integration:{}", workspace.task_id))
+            }
+            Some(WorkspaceScopeKind::WorkUnit) => scope
+                .as_ref()
+                .and_then(|scope| scope.work_unit_id.as_ref())
+                .map(|id| format!("work-unit-workspace:{id}")),
+            None => None,
+        };
+        let locks = self
+            .workspace_exec_locks
+            .read()
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "Workspace execution lock configuration poisoned: {error}"
+                ))
+            })?
+            .clone();
+        let _scope_guard = match (locks.as_ref(), lock_key.as_deref()) {
+            (Some(locks), Some(key)) => Some(locks.acquire(key).await),
+            _ => None,
+        };
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        if scope
+            .as_ref()
+            .is_some_and(|scope| scope.kind == WorkspaceScopeKind::Integration)
+            && !WorkUnitRepo::list_by_task(&*self.db, &workspace.task_id)
+                .await?
+                .is_empty()
+        {
+            WorkspaceRepo::set_cleanup_after(&*self.db, workspace_id, None, &now_rfc3339()).await?;
+            return Ok(());
+        }
+        let _workspace_guard = match (locks.as_ref(), scope.as_ref()) {
+            (Some(locks), Some(scope)) if scope.kind == WorkspaceScopeKind::WorkUnit => {
+                Some(locks.acquire(workspace_id).await)
+            }
+            _ => None,
+        };
+        let running_execution: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
+        )
+        .bind(workspace_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if running_execution != 0 {
+            return Ok(());
+        }
         info!(
             workspace_id,
             task_id = %workspace.task_id,
@@ -150,34 +233,62 @@ impl WorkspaceCleanupScheduler {
                 .cleanup_workspace_terminals(workspace_id)
                 .await?;
         }
-        match crate::plan_artifact::capture_plan_revision(
-            &self.db,
-            &workspace.task_id,
-            Path::new(&workspace.worktree_path),
-            "final",
-            None,
-        )
-        .await
-        {
-            Ok(_) | Err(crate::plan_artifact::PlanArtifactError::NotFound) => {}
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
+        if let Some(scope) = scope.filter(|scope| scope.kind == WorkspaceScopeKind::WorkUnit) {
+            let work_unit_id = scope.work_unit_id.ok_or_else(|| {
+                ServiceError::invalid_operation("WorkUnit Workspace has no WorkUnit binding")
+            })?;
+            let work_unit = WorkUnitRepo::get_by_id(&*self.db, &work_unit_id)
+                .await?
+                .filter(|unit| unit.task_id == workspace.task_id)
+                .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.clone()))?;
+            let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+            let repo_path =
+                crate::task_service::workspace::resolve_repo_source(&repo, &self.workspace_root)
+                    .await?;
+            let mut manager = WorkspaceManager::new(self.workspace_root.clone());
+            if let Some(locks) = self
+                .repo_cache_locks
+                .read()
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "Repo cache lock configuration poisoned: {error}"
+                    ))
+                })?
+                .as_ref()
+            {
+                manager = manager.with_repo_cache_locks(Arc::clone(locks));
+            }
+            manager
+                .cleanup_work_unit_worktree(
+                    &repo_path,
+                    &workspace.task_id,
+                    &work_unit.id,
+                    &workspace.id,
+                    &workspace.repo_id,
+                )
+                .await
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        } else {
+            match crate::plan_artifact::capture_plan_revision(
+                &self.db,
+                &workspace.task_id,
+                Path::new(&workspace.worktree_path),
+                "final",
+                None,
+            ).await {
+                Ok(_) | Err(crate::plan_artifact::PlanArtifactError::NotFound) => {}
+                Err(error) => return Err(ServiceError::invalid_operation(format!(
                     "workspace cleanup blocked because the final plan could not be persisted: {error}"
-                )));
+                ))),
             }
-        }
-        let manager = WorkspaceManager::new(self.workspace_root.clone());
-        match manager.cleanup_worktree(&workspace.task_id).await {
-            Ok(()) => {}
-            Err(WorkspaceError::NotFound) => {
-                info!(
-                    workspace_id,
-                    task_id = %workspace.task_id,
-                    "workspace worktree already absent"
-                );
-            }
-            Err(error) => {
-                return Err(crate::ServiceError::invalid_operation(error.to_string()));
+            let manager = WorkspaceManager::new(self.workspace_root.clone());
+            match manager.cleanup_worktree(&workspace.task_id).await {
+                Ok(()) | Err(WorkspaceError::NotFound) => {}
+                Err(error) => {
+                    return Err(crate::ServiceError::invalid_operation(error.to_string()))
+                }
             }
         }
         let now = now_rfc3339();

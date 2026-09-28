@@ -1953,6 +1953,8 @@ mod reviewer_message_tests {
             error: None,
             executor_config_snapshot_json: None,
             workspace_id: None,
+            work_unit_id: None,
+            work_unit_version: None,
             created_at: now.clone(),
             updated_at: now,
         }

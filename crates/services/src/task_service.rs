@@ -20,7 +20,8 @@ use db::{
     PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy,
     SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata,
     TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
-    UpsertExecutionUsage, UserRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    UpsertExecutionUsage, UserRepo, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
+    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{

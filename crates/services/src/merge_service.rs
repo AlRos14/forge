@@ -1,7 +1,7 @@
 use crate::{Result, ServiceError};
 use db::{
     now_rfc3339, Execution, ExecutionRepo, PageRequest, RepoRepo, SortBy, SortOrder, SqliteDb,
-    TaskRepo, WorkMode, WorkspaceRepo,
+    TaskRepo, WorkMode, WorkUnitRepo, WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,13 @@ pub struct MergeService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
+    workspace_exec_locks: Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>,
+}
+
+struct TaskMergeSource {
+    workspace: db::Workspace,
+    execution: Option<Execution>,
+    branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +64,16 @@ impl MergeService {
             db,
             event_bus,
             workspace_root,
+            workspace_exec_locks: Arc::new(
+                crate::workspace_execution_lock::WorkspaceExecutionLockManager::default(),
+            ),
         }
+    }
+
+    pub fn workspace_exec_locks(
+        &self,
+    ) -> Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager> {
+        Arc::clone(&self.workspace_exec_locks)
     }
 
     pub async fn merge(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
@@ -74,20 +90,19 @@ impl MergeService {
                 "subtasks do not merge; only root tasks merge to the default branch",
             ));
         }
-        let execution = latest_executor_execution(&self.db, &task_id).await?;
-        let workspace_id =
-            execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::InvalidOperation {
-                    message: "executor execution missing workspace_id".to_owned(),
-                })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::NotFound {
-                entity: "workspace",
-                id: workspace_id.to_owned(),
-            })?;
+        let source = task_merge_source(&self.db, &task_id).await?;
+        let workspace = &source.workspace;
+        let lock_id = if source.execution.is_none() {
+            format!("task-integration:{task_id}")
+        } else {
+            workspace.id.clone()
+        };
+        let _workspace_guard = self.workspace_exec_locks.acquire(&lock_id).await;
+        if work_unit_integration_is_running(&self.db, &task_id).await? {
+            return Err(ServiceError::invalid_operation(
+                "Task integration is currently incorporating a WorkUnit result",
+            ));
+        }
         let repo_id = task
             .repo_id
             .as_deref()
@@ -99,8 +114,14 @@ impl MergeService {
                 id: repo_id.to_owned(),
             })?;
         if repo.work_mode == WorkMode::PullRequest {
+            drop(_workspace_guard);
             return self.publish_pr(&task_id).await;
         }
+        let _integration_workspace_guard = if source.execution.is_none() {
+            Some(self.workspace_exec_locks.acquire(&workspace.id).await)
+        } else {
+            None
+        };
         let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
         let repo_source = self.resolve_repo_source(&repo).await?;
         let repo_path = Path::new(&repo_source);
@@ -119,56 +140,59 @@ impl MergeService {
 
         let before_sha = git::get_current_sha(repo_path).await?;
         let worktree_sha = git::get_current_sha(worktree_path).await?;
-        ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution.id.clone(),
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: Some(Some(worktree_sha)),
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
+        if let Some(execution) = source.execution.as_ref() {
+            ExecutionRepo::update(
+                &*self.db,
+                db::UpdateExecution {
+                    id: execution.id.clone(),
+                    status: None,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: Some(Some(worktree_sha)),
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+        }
 
         git::checkout_branch(repo_path, &target_branch).await?;
-        let task_branch = workspace::task_branch_name(&task_id);
-        match git::merge_branch_into(repo_path, &task_branch).await {
+        match git::merge_branch_into(repo_path, &source.branch).await {
             Ok(()) => {
                 let after_sha = git::get_current_sha(repo_path).await?;
-                ExecutionRepo::update(
-                    &*self.db,
-                    db::UpdateExecution {
-                        id: execution.id,
-                        status: None,
-                        stop_reason: None,
-                        stopped_by: None,
-                        resume_policy: None,
-                        stopped_at: None,
-                        agent_session_id: None,
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        summary: None,
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: Some(Some(after_sha.clone())),
-                        error: None,
-                        executor_config_snapshot_json: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
+                if let Some(execution) = source.execution.as_ref() {
+                    ExecutionRepo::update(
+                        &*self.db,
+                        db::UpdateExecution {
+                            id: execution.id.clone(),
+                            status: None,
+                            stop_reason: None,
+                            stopped_by: None,
+                            resume_policy: None,
+                            stopped_at: None,
+                            agent_session_id: None,
+                            agent_message_id: None,
+                            last_activity_at: None,
+                            summary: None,
+                            logs_path: None,
+                            before_sha: None,
+                            after_sha: Some(Some(after_sha.clone())),
+                            error: None,
+                            executor_config_snapshot_json: None,
+                            updated_at: now_rfc3339(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(MergeOutcome::Done {
                     before_sha,
                     after_sha,
@@ -199,13 +223,19 @@ impl MergeService {
                 "subtasks do not publish pull requests; only root tasks publish",
             ));
         }
-        let execution = latest_executor_execution(&self.db, &task_id).await?;
-        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation("executor execution missing workspace_id")
-        })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let source = task_merge_source(&self.db, &task_id).await?;
+        let workspace = &source.workspace;
+        let lock_id = if source.execution.is_none() {
+            format!("task-integration:{task_id}")
+        } else {
+            workspace.id.clone()
+        };
+        let _workspace_guard = self.workspace_exec_locks.acquire(&lock_id).await;
+        if work_unit_integration_is_running(&self.db, &task_id).await? {
+            return Err(ServiceError::invalid_operation(
+                "Task integration is currently incorporating a WorkUnit result",
+            ));
+        }
         let repo_id = task
             .repo_id
             .as_deref()
@@ -218,8 +248,13 @@ impl MergeService {
                 "publish_pr requires pull_request work mode",
             ));
         }
+        let _integration_workspace_guard = if source.execution.is_none() {
+            Some(self.workspace_exec_locks.acquire(&workspace.id).await)
+        } else {
+            None
+        };
         let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
-        let source_branch = workspace::task_branch_name(&task_id);
+        let source_branch = source.branch;
         let worktree_path = Path::new(&workspace.worktree_path);
 
         if !git::is_worktree_clean(worktree_path).await? {
@@ -364,10 +399,52 @@ async fn latest_executor_execution(db: &SqliteDb, task_id: &str) -> Result<Execu
     .await?;
     page.items
         .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
+        .find(|execution| {
+            execution.work_unit_id.is_none()
+                && matches!(execution.role.as_str(), "executor" | "coder" | "worker")
+        })
         .ok_or_else(|| ServiceError::InvalidOperation {
             message: format!("task {task_id} has no executor execution"),
         })
+}
+
+async fn task_merge_source(db: &SqliteDb, task_id: &str) -> Result<TaskMergeSource> {
+    if !WorkUnitRepo::list_by_task(db, task_id).await?.is_empty() {
+        let workspace = WorkspaceRepo::get_by_task_id(db, task_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Task with WorkUnits has no integration workspace")
+            })?;
+        return Ok(TaskMergeSource {
+            branch: workspace.branch.clone(),
+            workspace,
+            execution: None,
+        });
+    }
+
+    let execution = latest_executor_execution(db, task_id).await?;
+    let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+        ServiceError::invalid_operation("executor execution missing workspace_id")
+    })?;
+    let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+    Ok(TaskMergeSource {
+        branch: workspace::task_branch_name(task_id),
+        workspace,
+        execution: Some(execution),
+    })
+}
+
+async fn work_unit_integration_is_running(db: &SqliteDb, task_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM work_unit_integration
+         WHERE task_id = ? AND outcome = 'running')",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await?
+        != 0)
 }
 
 fn target_branch(merge_config: &Option<String>, repo_default_branch: &str) -> Result<String> {

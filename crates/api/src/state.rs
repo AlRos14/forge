@@ -71,6 +71,7 @@ pub struct AppState {
     pub agent_inbox_service: Arc<AgentInboxService>,
     pub agent_action_service: Arc<AgentActionService>,
     pub collaboration_service: Arc<services::CollaborationService>,
+    pub work_unit_service: Arc<services::WorkUnitService>,
     pub daemon_service: Arc<DaemonService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
     pub workflow_template_service:
@@ -202,8 +203,17 @@ impl AppState {
             cli_task_executor,
             embedded_task_executor,
         ));
-        let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
+        let workspace_exec_locks = merge_service.workspace_exec_locks();
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+        cleanup_scheduler.set_repo_cache_locks(Arc::clone(&repo_cache_locks));
+        cleanup_scheduler.set_workspace_exec_locks(Arc::clone(&workspace_exec_locks));
+        let work_unit_service = Arc::new(services::WorkUnitService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            workspace_root.clone(),
+            Arc::clone(&repo_cache_locks),
+            Arc::clone(&workspace_exec_locks),
+        ));
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         let workflow_template_service = Arc::new(
@@ -308,6 +318,7 @@ impl AppState {
             agent_inbox_service,
             agent_action_service,
             collaboration_service,
+            work_unit_service,
             daemon_service,
             daemon_connections,
             workflow_template_service,

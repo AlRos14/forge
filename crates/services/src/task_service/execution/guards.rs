@@ -125,7 +125,9 @@ impl TaskService {
         )
         .await?;
         if let Some(running) = page.items.into_iter().find(|execution| {
-            execution.role == "interactive" && execution.status == ExecutionStatus::Running
+            execution.work_unit_id.is_none()
+                && execution.role == "interactive"
+                && execution.status == ExecutionStatus::Running
         }) {
             return Err(ServiceError::invalid_operation(format!(
                 "interactive execution already running: {}",
@@ -141,6 +143,14 @@ impl TaskService {
     /// from creating a failed execution and annotating the Task while the
     /// scheduler's legitimate execution is still running.
     pub(super) async fn ensure_no_running_repository_execution(&self, task: &Task) -> Result<()> {
+        if !db::WorkUnitRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Task has WorkUnits; new Executions must bind an explicit WorkUnit scope",
+            ));
+        }
         if task.repo_id.is_none() {
             return Ok(());
         }

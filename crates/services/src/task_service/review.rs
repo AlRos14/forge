@@ -216,7 +216,8 @@ impl TaskService {
         .items
         .into_iter()
         .any(|execution| {
-            execution.parent_execution_id.as_deref() == Some(review.execution_id.as_str())
+            execution.work_unit_id.is_none()
+                && execution.parent_execution_id.as_deref() == Some(review.execution_id.as_str())
                 && matches!(
                     execution.status,
                     ExecutionStatus::Running | ExecutionStatus::Completed

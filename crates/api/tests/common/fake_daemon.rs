@@ -738,6 +738,8 @@ pub async fn seed_startable_execution_for_daemon(
             id: uuid::Uuid::new_v4().to_string(),
             project_id,
             task_id: task_id.clone(),
+            work_unit_id: None,
+            workspace_id: None,
             task_version: task.version,
             execution_id: execution.id.clone(),
             operation_idempotency_key: execution.id.clone(),

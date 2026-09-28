@@ -125,3 +125,58 @@ async fn test_resolve_execution_actions_targets_current_role() {
         .to_ascii_lowercase();
     assert!(reason.contains("no") && reason.contains("session"));
 }
+
+#[tokio::test]
+async fn task_execution_actions_ignore_work_unit_executions() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        crate::workflow::default_states::IN_PROGRESS,
+    )
+    .await;
+    let agent_id = seed_agent(&db).await;
+    let task_execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        crate::workflow::default_roles::CODER,
+        ExecutionStatus::Completed,
+        None,
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let mut work_unit_execution = task_execution.clone();
+    work_unit_execution.id = new_uuid_v4();
+    work_unit_execution.work_unit_id = Some(new_uuid_v4());
+    work_unit_execution.work_unit_version = Some(1);
+    work_unit_execution.status = ExecutionStatus::Running;
+    work_unit_execution.created_at = "2026-05-02T10:10:00Z".to_owned();
+    let workflow = crate::workflow::default_workflow::default_workflow();
+
+    let actions = crate::task_service::action_resolver::resolve_execution_actions(
+        &task,
+        &workflow,
+        &[task_execution.clone(), work_unit_execution],
+        None,
+    );
+    let stop = actions
+        .iter()
+        .find(|action| action.action == api_types::ExecutionActionKind::StopExecution)
+        .expect("stop action exists");
+    assert!(
+        !stop.enabled,
+        "Task action must not stop an arbitrary WorkUnit"
+    );
+    let reexecute = actions
+        .iter()
+        .find(|action| action.action == api_types::ExecutionActionKind::ReExecute)
+        .expect("re-execute action exists");
+    assert_eq!(
+        reexecute.target_execution_id.as_deref(),
+        Some(task_execution.id.as_str()),
+        "Task retry targets its own historical Execution"
+    );
+}
