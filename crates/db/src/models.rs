@@ -674,12 +674,23 @@ pub struct WorkUnit {
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
-    pub provenance_kind: Option<String>,
-    pub provenance_id: Option<String>,
+    pub provenance: Option<WorkUnitProvenance>,
     pub created_by: ActorRef,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Typed provenance for a WorkUnit. `LegacyActor` represents a V091 Actor
+/// provenance row whose untyped ID could not be resolved unambiguously by
+/// V092; new writes must use `Actor(ActorRef)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkUnitProvenance {
+    Actor(ActorRef),
+    WorkUnit(String),
+    Artifact(String),
+    External(String),
+    LegacyActor(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,6 +738,96 @@ impl FromStr for WorkUnitIntegrationOutcome {
             other => Err(format!("unknown WorkUnit integration outcome: {other}")),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskIntegrationOperationKind {
+    WorkUnitIntegration,
+    TaskMerge,
+    PublishPr,
+    WorkUnitCreate,
+    WorkUnitWorkspacePrepare,
+    IntegrationWorkspaceCleanup,
+}
+
+impl fmt::Display for TaskIntegrationOperationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::WorkUnitIntegration => "work_unit_integration",
+            Self::TaskMerge => "task_merge",
+            Self::PublishPr => "publish_pr",
+            Self::WorkUnitCreate => "work_unit_create",
+            Self::WorkUnitWorkspacePrepare => "work_unit_workspace_prepare",
+            Self::IntegrationWorkspaceCleanup => "integration_workspace_cleanup",
+        })
+    }
+}
+
+impl FromStr for TaskIntegrationOperationKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "work_unit_integration" => Ok(Self::WorkUnitIntegration),
+            "task_merge" => Ok(Self::TaskMerge),
+            "publish_pr" => Ok(Self::PublishPr),
+            "work_unit_create" => Ok(Self::WorkUnitCreate),
+            "work_unit_workspace_prepare" => Ok(Self::WorkUnitWorkspacePrepare),
+            "integration_workspace_cleanup" => Ok(Self::IntegrationWorkspaceCleanup),
+            other => Err(format!("unknown Task integration operation kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskIntegrationOperationStatus {
+    Running,
+    Succeeded,
+    Conflict,
+    Failed,
+    Abandoned,
+}
+
+impl fmt::Display for TaskIntegrationOperationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Conflict => "conflict",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+        })
+    }
+}
+
+impl FromStr for TaskIntegrationOperationStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "conflict" => Ok(Self::Conflict),
+            "failed" => Ok(Self::Failed),
+            "abandoned" => Ok(Self::Abandoned),
+            other => Err(format!(
+                "unknown Task integration operation status: {other}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIntegrationOperation {
+    pub id: String,
+    pub task_id: String,
+    pub kind: TaskIntegrationOperationKind,
+    pub owner_id: String,
+    pub status: TaskIntegrationOperationStatus,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

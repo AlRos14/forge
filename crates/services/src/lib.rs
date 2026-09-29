@@ -60,6 +60,7 @@ pub mod shared_media_cleanup;
 pub mod shutdown;
 pub mod task_diagnostics;
 pub mod task_dispatcher;
+mod task_integration_operation;
 pub mod task_service;
 pub mod terminal_service;
 pub mod types;

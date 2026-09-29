@@ -5,9 +5,9 @@ use db::{
     CreateWorkUnitExecution, CreateWorkUnitIntegration, CreateWorkUnitWorkspace, CreateWorkspace,
     CreateWorkspaceLease, DbError, ExecutionPurpose, ExecutionRepo, ExecutionStatus, ProjectRepo,
     RecordWorkUnitIntegration, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
-    TaskRepo, TaskRoleRepo, UpdateExecution, WorkMode, WorkUnitExecutionRepo,
-    WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    TaskIntegrationOperationRepo, TaskRepo, TaskRoleRepo, UpdateExecution, WorkMode,
+    WorkUnitExecutionRepo, WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 
 async fn database() -> SqliteDb {
@@ -338,8 +338,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             role: "implementer".into(),
             assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
             requires_integration,
-            provenance_kind: None,
-            provenance_id: None,
+            provenance: None,
             created_by: ActorRef::Human(creator.to_owned()),
             created_at: now.clone(),
         };
@@ -356,6 +355,71 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         .await
         .expect("WorkUnit");
     }
+
+    let provenance_id = new_uuid_v4();
+    let provenance = WorkUnitRepo::create(
+        &db,
+        CreateWorkUnit {
+            id: provenance_id.clone(),
+            task_id: task_id.clone(),
+            parent_work_unit_id: None,
+            title: "typed provenance".into(),
+            scope: "retain Actor identity".into(),
+            role: "implementer".into(),
+            assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
+            requires_integration: false,
+            provenance: Some(db::WorkUnitProvenance::Actor(ActorRef::Human(
+                human_id.clone(),
+            ))),
+            created_by: ActorRef::Human(human_id.clone()),
+            created_at: now.clone(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &provenance_id,
+            &task_id,
+            &human_id,
+        ),
+    )
+    .await
+    .expect("typed Actor provenance creates")
+    .record;
+    assert_eq!(
+        provenance.provenance,
+        Some(db::WorkUnitProvenance::Actor(ActorRef::Human(
+            human_id.clone()
+        )))
+    );
+    let invalid_provenance_id = new_uuid_v4();
+    assert!(WorkUnitRepo::create(
+        &db,
+        CreateWorkUnit {
+            id: invalid_provenance_id.clone(),
+            task_id: task_id.clone(),
+            parent_work_unit_id: None,
+            title: "invalid provenance".into(),
+            scope: "must refer to an Actor".into(),
+            role: "implementer".into(),
+            assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
+            requires_integration: false,
+            provenance: Some(db::WorkUnitProvenance::Actor(ActorRef::Agent(
+                new_uuid_v4(),
+            ))),
+            created_by: ActorRef::Human(human_id.clone()),
+            created_at: now.clone(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &invalid_provenance_id,
+            &task_id,
+            &human_id,
+        ),
+    )
+    .await
+    .is_err());
+
     assert!(WorkUnitRepo::allocate(
         &db,
         db::AllocateWorkUnit {
@@ -1086,6 +1150,33 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             .satisfied
     );
 
+    let active_operation = TaskIntegrationOperationRepo::begin(
+        &db,
+        db::CreateTaskIntegrationOperation {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            kind: db::TaskIntegrationOperationKind::TaskMerge,
+            owner_id: "project-teardown-guard".into(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("active Task operation exists");
+    assert!(ProjectRepo::delete(&db, &project_id).await.is_err());
+    let finished_at = now_rfc3339();
+    TaskIntegrationOperationRepo::finish(
+        &db,
+        db::FinishTaskIntegrationOperation {
+            id: active_operation.id,
+            expected_version: active_operation.version,
+            status: db::TaskIntegrationOperationStatus::Abandoned,
+            updated_at: finished_at.clone(),
+            finished_at,
+        },
+    )
+    .await
+    .expect("abandon operation before teardown");
+
     ProjectRepo::delete(&db, &project_id)
         .await
         .expect("guarded teardown");
@@ -1097,4 +1188,11 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             .await
             .expect("count");
     assert_eq!(remaining, 0);
+    let remaining_operations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_integration_operation WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("count operation history");
+    assert_eq!(remaining_operations, 0);
 }

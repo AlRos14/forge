@@ -1,3 +1,4 @@
+use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 use async_trait::async_trait;
 use db::{
@@ -212,13 +213,6 @@ impl WorkspaceCleanupScheduler {
         if running_execution != 0 {
             return Ok(());
         }
-        info!(
-            workspace_id,
-            task_id = %workspace.task_id,
-            worktree_path = %workspace.worktree_path,
-            workspace_root = %self.workspace_root.display(),
-            "cleaning up workspace"
-        );
         let terminal_cleanup = self
             .terminal_cleanup
             .read()
@@ -228,10 +222,45 @@ impl WorkspaceCleanupScheduler {
                 ))
             })?
             .clone();
-        if let Some(terminal_cleanup) = terminal_cleanup {
-            terminal_cleanup
-                .cleanup_workspace_terminals(workspace_id)
-                .await?;
+        let integration_scope = scope
+            .as_ref()
+            .is_some_and(|scope| scope.kind == WorkspaceScopeKind::Integration);
+        if integration_scope {
+            if let Some(terminal_cleanup) = terminal_cleanup.as_ref() {
+                terminal_cleanup
+                    .cleanup_workspace_terminals(workspace_id)
+                    .await?;
+            }
+        }
+        let integration_operation = if integration_scope {
+            Some(
+                TaskIntegrationOperationManager::new(
+                    Arc::clone(&self.db),
+                    self.workspace_root.clone(),
+                )
+                .acquire(
+                    &workspace.task_id,
+                    db::TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
+                    &workspace.id,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        info!(
+            workspace_id,
+            task_id = %workspace.task_id,
+            worktree_path = %workspace.worktree_path,
+            workspace_root = %self.workspace_root.display(),
+            "cleaning up workspace"
+        );
+        if !integration_scope {
+            if let Some(terminal_cleanup) = terminal_cleanup {
+                terminal_cleanup
+                    .cleanup_workspace_terminals(workspace_id)
+                    .await?;
+            }
         }
         if let Some(scope) = scope.filter(|scope| scope.kind == WorkspaceScopeKind::WorkUnit) {
             let work_unit_id = scope.work_unit_id.ok_or_else(|| {
@@ -307,6 +336,11 @@ impl WorkspaceCleanupScheduler {
                 status: "cleaned".to_owned(),
             },
         });
+        if let Some(operation) = integration_operation {
+            operation
+                .finish(db::TaskIntegrationOperationStatus::Succeeded)
+                .await?;
+        }
         Ok(())
     }
 }

@@ -806,8 +806,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
                 role: "implementer".to_owned(),
                 assigned_actor: Some(db::ActorRef::Agent(actor_id.to_owned())),
                 requires_integration: true,
-                provenance_kind: None,
-                provenance_id: None,
+                provenance: None,
                 created_by: db::ActorRef::Agent(actor_id.to_owned()),
                 created_at: now.to_owned(),
             },
@@ -873,7 +872,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         };
         let lease = service
             .prepare_work_unit_workspace_lease(
-                &task,
+                task,
                 &work_unit,
                 &workspace,
                 &execution,

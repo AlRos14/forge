@@ -376,6 +376,22 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
+        let active_integration_operation = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_integration_operation op
+                 JOIN task t ON t.id = op.task_id
+                 WHERE t.project_id = ? AND op.status = 'running'
+             )",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_integration_operation != 0 {
+            return Err(DbError::Check(
+                "Project deletion is blocked by an active Task integration operation".to_owned(),
+            ));
+        }
+
         // Immutable orchestration rows remain protected from individual
         // deletion. Project deletion is the one bounded teardown operation:
         // the transaction installs a Project-scoped guard, removes immutable
@@ -392,6 +408,8 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM task_integration_operation WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM message_work_unit WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM handoff_work_unit WHERE task_id IN

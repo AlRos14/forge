@@ -22,6 +22,67 @@ fn actor_columns(actor: Option<&ActorRef>) -> (Option<String>, Option<String>) {
         .unwrap_or((None, None))
 }
 
+fn provenance_from_columns(
+    kind: Option<String>,
+    id: Option<String>,
+    actor_kind: Option<String>,
+) -> Result<Option<WorkUnitProvenance>> {
+    match (kind, id, actor_kind) {
+        (None, None, None) => Ok(None),
+        (Some(kind), Some(id), actor_kind) => {
+            let provenance = match kind.as_str() {
+                "actor" => match actor_kind {
+                    Some(actor_kind) => {
+                        let actor_kind: ActorKind = parse_enum(actor_kind)?;
+                        WorkUnitProvenance::Actor(match actor_kind {
+                            ActorKind::Human => ActorRef::Human(id),
+                            ActorKind::Agent => ActorRef::Agent(id),
+                        })
+                    }
+                    None => WorkUnitProvenance::LegacyActor(id),
+                },
+                "work_unit" if actor_kind.is_none() => WorkUnitProvenance::WorkUnit(id),
+                "artifact" if actor_kind.is_none() => WorkUnitProvenance::Artifact(id),
+                "external" if actor_kind.is_none() => WorkUnitProvenance::External(id),
+                _ => {
+                    return Err(DbError::Check(
+                        "WorkUnit provenance columns are inconsistent".to_owned(),
+                    ));
+                }
+            };
+            Ok(Some(provenance))
+        }
+        _ => Err(DbError::Check(
+            "WorkUnit provenance columns are incomplete".to_owned(),
+        )),
+    }
+}
+
+fn provenance_columns(
+    provenance: Option<&WorkUnitProvenance>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match provenance {
+        None => (None, None, None),
+        Some(WorkUnitProvenance::Actor(actor)) => (
+            Some("actor".to_owned()),
+            Some(actor.id().to_owned()),
+            Some(actor.kind().to_string()),
+        ),
+        Some(WorkUnitProvenance::WorkUnit(id)) => {
+            (Some("work_unit".to_owned()), Some(id.clone()), None)
+        }
+        Some(WorkUnitProvenance::Artifact(id)) => {
+            (Some("artifact".to_owned()), Some(id.clone()), None)
+        }
+        Some(WorkUnitProvenance::External(id)) => {
+            (Some("external".to_owned()), Some(id.clone()), None)
+        }
+        Some(WorkUnitProvenance::LegacyActor(id)) => {
+            (Some("actor".to_owned()), Some(id.clone()), None)
+        }
+    }
+}
+
 fn map_work_unit(row: SqliteRow) -> Result<WorkUnit> {
     Ok(WorkUnit {
         id: row.try_get("id")?,
@@ -36,8 +97,11 @@ fn map_work_unit(row: SqliteRow) -> Result<WorkUnit> {
             row.try_get("assigned_actor_id")?,
         )?,
         requires_integration: row.try_get::<i64, _>("requires_integration")? != 0,
-        provenance_kind: row.try_get("provenance_kind")?,
-        provenance_id: row.try_get("provenance_id")?,
+        provenance: provenance_from_columns(
+            row.try_get("provenance_kind")?,
+            row.try_get("provenance_id")?,
+            row.try_get("provenance_actor_kind")?,
+        )?,
         created_by: actor_from_columns(
             Some(row.try_get("created_by_kind")?),
             Some(row.try_get("created_by_id")?),
@@ -127,6 +191,8 @@ impl WorkUnitRepo for SqliteDb {
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>> {
         let (assigned_kind, assigned_id) = actor_columns(input.assigned_actor.as_ref());
+        let (provenance_kind, provenance_id, provenance_actor_kind) =
+            provenance_columns(input.provenance.as_ref());
         let created_kind = input.created_by.kind().to_string();
         let created_id = input.created_by.id().to_owned();
         let now = input.created_at.clone();
@@ -135,9 +201,10 @@ impl WorkUnitRepo for SqliteDb {
             "INSERT INTO work_unit (
                 id, task_id, parent_work_unit_id, title, scope, status, role,
                 assigned_actor_kind, assigned_actor_id, requires_integration,
-                provenance_kind, provenance_id, created_by_kind, created_by_id,
+                provenance_kind, provenance_id, provenance_actor_kind,
+                created_by_kind, created_by_id,
                 version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -148,8 +215,9 @@ impl WorkUnitRepo for SqliteDb {
         .bind(assigned_kind.as_deref())
         .bind(assigned_id.as_deref())
         .bind(i64::from(input.requires_integration))
-        .bind(input.provenance_kind.as_deref())
-        .bind(input.provenance_id.as_deref())
+        .bind(provenance_kind.as_deref())
+        .bind(provenance_id.as_deref())
+        .bind(provenance_actor_kind.as_deref())
         .bind(&created_kind)
         .bind(&created_id)
         .bind(&now)

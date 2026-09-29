@@ -11,22 +11,37 @@ pub enum WorkUnitStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum WorkUnitProvenanceKind {
-    Actor,
-    WorkUnit,
-    Artifact,
-    External,
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(export, tag = "kind", rename_all = "snake_case")]
+pub enum WorkUnitProvenance {
+    Actor {
+        actor: ActorRef,
+    },
+    WorkUnit {
+        id: String,
+    },
+    Artifact {
+        id: String,
+    },
+    External {
+        id: String,
+    },
+    /// A V091 record whose untyped Actor ID could not be resolved when V092
+    /// added ActorRef provenance. This response-only form cannot be created.
+    LegacyActor {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct WorkUnitProvenance {
-    pub kind: WorkUnitProvenanceKind,
-    pub id: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(export, tag = "kind", rename_all = "snake_case")]
+pub enum CreateWorkUnitProvenance {
+    Actor { actor: ActorRef },
+    WorkUnit { id: String },
+    Artifact { id: String },
+    External { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -39,7 +54,7 @@ pub struct CreateWorkUnitRequest {
     pub parent_work_unit_id: Option<String>,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
-    pub provenance: Option<WorkUnitProvenance>,
+    pub provenance: Option<CreateWorkUnitProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -158,7 +173,7 @@ pub struct WorkUnitIntegrationResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateWorkUnitRequest, WorkUnitIntegrationRequest};
+    use super::{CreateWorkUnitProvenance, CreateWorkUnitRequest, WorkUnitIntegrationRequest};
 
     #[test]
     fn create_work_unit_request_rejects_authority_and_unknown_fields() {
@@ -181,5 +196,26 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn work_unit_actor_provenance_requires_a_typed_actor_ref() {
+        let valid = serde_json::json!({
+            "kind": "actor",
+            "actor": {"kind": "human", "id": "user-1"}
+        });
+        assert!(serde_json::from_value::<CreateWorkUnitProvenance>(valid).is_ok());
+
+        for invalid in [
+            serde_json::json!({"kind":"actor","id":"user-1"}),
+            serde_json::json!({
+                "kind":"actor",
+                "actor":{"kind":"human","id":"user-1"},
+                "id":"agent-1"
+            }),
+            serde_json::json!({"kind":"legacy_actor","id":"old-id"}),
+        ] {
+            assert!(serde_json::from_value::<CreateWorkUnitProvenance>(invalid).is_err());
+        }
     }
 }

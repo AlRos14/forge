@@ -276,8 +276,8 @@ fn export_typescript() {
     CreateWorkUnitRequest::export().expect("export CreateWorkUnitRequest");
     UpdateWorkUnitRequest::export().expect("export UpdateWorkUnitRequest");
     TransitionWorkUnitRequest::export().expect("export TransitionWorkUnitRequest");
+    CreateWorkUnitProvenance::export().expect("export CreateWorkUnitProvenance");
     WorkUnitProvenance::export().expect("export WorkUnitProvenance");
-    WorkUnitProvenanceKind::export().expect("export WorkUnitProvenanceKind");
     WorkUnitStatus::export().expect("export WorkUnitStatus");
     WorkUnitDependencyResponse::export().expect("export WorkUnitDependencyResponse");
     WorkUnitReadinessResponse::export().expect("export WorkUnitReadinessResponse");
@@ -546,7 +546,7 @@ fn export_typescript() {
     ValidationResult::export().expect("export ValidationResult");
     VersionedDigest::export().expect("export VersionedDigest");
     WorkUnitStatus::export().expect("export WorkUnitStatus");
-    WorkUnitProvenanceKind::export().expect("export WorkUnitProvenanceKind");
+    CreateWorkUnitProvenance::export().expect("export CreateWorkUnitProvenance");
     WorkUnitProvenance::export().expect("export WorkUnitProvenance");
     CreateWorkUnitRequest::export().expect("export CreateWorkUnitRequest");
     UpdateWorkUnitRequest::export().expect("export UpdateWorkUnitRequest");

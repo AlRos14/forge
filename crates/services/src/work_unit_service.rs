@@ -6,8 +6,8 @@ use db::{
     CreateWorkUnitIntegration, Execution, ExecutionRepo, ExecutionStatus,
     RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TransitionWorkUnit, UpdateWorkUnit,
     WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo, WorkUnitIntegration,
-    WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace,
-    WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
+    WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
 use events::EventBus;
 use workspace::{RepoCacheLockManager, WorkspaceManager};
@@ -15,6 +15,7 @@ use workspace::{RepoCacheLockManager, WorkspaceManager};
 use crate::{
     collaboration_service::{CollaborationActorSource, CollaborationService},
     domain_event_service::DomainEventService,
+    task_integration_operation::TaskIntegrationOperationManager,
     task_service::workspace::{prepare_integration_workspace_for_work_unit, resolve_repo_source},
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Result, ServiceError,
@@ -38,7 +39,7 @@ pub struct CreateWorkUnitInput {
     pub parent_work_unit_id: Option<String>,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
-    pub provenance: Option<(String, String)>,
+    pub provenance: Option<WorkUnitProvenance>,
 }
 
 #[derive(Clone)]
@@ -50,6 +51,7 @@ pub struct WorkUnitService {
     workspace_root: PathBuf,
     repo_cache_locks: Arc<RepoCacheLockManager>,
     integration_locks: Arc<WorkspaceExecutionLockManager>,
+    integration_operations: TaskIntegrationOperationManager,
 }
 
 impl WorkUnitService {
@@ -60,6 +62,8 @@ impl WorkUnitService {
         repo_cache_locks: Arc<RepoCacheLockManager>,
         integration_locks: Arc<WorkspaceExecutionLockManager>,
     ) -> Self {
+        let integration_operations =
+            TaskIntegrationOperationManager::new(Arc::clone(&db), workspace_root.clone());
         Self {
             collaboration: CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus)),
             domain_events: DomainEventService::new(Arc::clone(&db), Arc::clone(&event_bus)),
@@ -68,6 +72,7 @@ impl WorkUnitService {
             workspace_root,
             repo_cache_locks,
             integration_locks,
+            integration_operations,
         }
     }
 
@@ -99,6 +104,15 @@ impl WorkUnitService {
             .integration_locks
             .acquire(&format!("task-integration:{}", task.id))
             .await;
+        let operation = self
+            .integration_operations
+            .acquire(
+                &task.id,
+                db::TaskIntegrationOperationKind::WorkUnitCreate,
+                &new_uuid_v4(),
+            )
+            .await?;
+        let result = async {
         let legacy_authority_active: i64 = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM execution e
@@ -144,12 +158,25 @@ impl WorkUnitService {
         if let Some(parent_id) = parent_work_unit_id.as_deref() {
             self.ensure_work_unit_in_task(&task, parent_id).await?;
         }
-        if let Some((kind, id)) = provenance.as_ref() {
-            match kind.as_str() {
-                "work_unit" => {
+        if let Some(provenance) = provenance.as_ref() {
+            match provenance {
+                WorkUnitProvenance::Actor(actor) => {
+                    let exists = match actor {
+                        ActorRef::Human(id) => {
+                            db::UserRepo::get_user_by_id(&*self.db, id).await?.is_some()
+                        }
+                        ActorRef::Agent(id) => {
+                            AgentRepo::get_by_id(&*self.db, id).await?.is_some()
+                        }
+                    };
+                    if !exists {
+                        return Err(invalid("Actor provenance must reference an existing Actor"));
+                    }
+                }
+                WorkUnitProvenance::WorkUnit(id) => {
                     self.ensure_work_unit_in_task(&task, id).await?;
                 }
-                "artifact" => {
+                WorkUnitProvenance::Artifact(id) => {
                     let artifact_task = db::CollaborationRepo::get_artifact_task_id(&*self.db, id)
                         .await?
                         .ok_or_else(|| not_found("artifact", id))?;
@@ -157,14 +184,16 @@ impl WorkUnitService {
                         return Err(not_found("artifact", id));
                     }
                 }
-                _ => {}
+                WorkUnitProvenance::External(_) => {}
+                WorkUnitProvenance::LegacyActor(_) => {
+                    return Err(invalid(
+                        "unresolved historical Actor provenance cannot be written",
+                    ));
+                }
             }
         }
         let id = new_uuid_v4();
         let now = now_rfc3339();
-        let (provenance_kind, provenance_id) = provenance
-            .map(|(kind, id)| (Some(kind), Some(id)))
-            .unwrap_or((None, None));
         let event = self.event(
             "work_unit.created",
             "work_unit",
@@ -185,8 +214,7 @@ impl WorkUnitService {
                 role,
                 assigned_actor,
                 requires_integration,
-                provenance_kind,
-                provenance_id,
+                provenance,
                 created_by: actor,
                 created_at: now,
             },
@@ -195,6 +223,20 @@ impl WorkUnitService {
         .await?;
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
+        }
+        .await;
+        let finish_result = operation
+            .finish(if result.is_ok() {
+                db::TaskIntegrationOperationStatus::Succeeded
+            } else {
+                db::TaskIntegrationOperationStatus::Failed
+            })
+            .await;
+        match (result, finish_result) {
+            (Ok(unit), Ok(())) => Ok(unit),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        }
     }
 
     pub async fn get(
@@ -636,6 +678,15 @@ impl WorkUnitService {
             .integration_locks
             .acquire(&format!("task-integration:{}", task.id))
             .await;
+        let operation = self
+            .integration_operations
+            .acquire(
+                &task.id,
+                db::TaskIntegrationOperationKind::WorkUnitWorkspacePrepare,
+                work_unit_id,
+            )
+            .await?;
+        let result = async {
         let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
             .await?
             .ok_or_else(|| not_found("work_unit", work_unit_id))?;
@@ -674,17 +725,30 @@ impl WorkUnitService {
             {
                 return Err(invalid("Workspace scope does not match WorkUnit"));
             }
-            if matches!(
-                existing.status,
-                WorkspaceStatus::Cleaning | WorkspaceStatus::Cleaned
-            ) {
+            if existing.status == WorkspaceStatus::Cleaning {
                 return Err(invalid(
-                    "WorkUnit workspace is being cleaned or has been cleaned",
+                    "WorkUnit workspace cleanup is still in progress",
+                ));
+            }
+            let branch_exists = git::branch_exists(Path::new(&repo_path), &existing.branch).await?;
+            if existing.status == WorkspaceStatus::Cleaned && !branch_exists {
+                return Err(invalid(
+                    "cleaned WorkUnit Workspace branch is missing; explicit reset or recovery is required",
                 ));
             }
             if Path::new(&existing.worktree_path).exists() {
                 git::get_current_sha(Path::new(&existing.worktree_path)).await?;
-            } else if git::branch_exists(Path::new(&repo_path), &existing.branch).await? {
+                if existing.status == WorkspaceStatus::Cleaned {
+                    let worktree_path = Path::new(&existing.worktree_path);
+                    if git::get_current_branch(worktree_path).await? != existing.branch
+                        || !git::is_worktree_clean(worktree_path).await?
+                    {
+                        return Err(invalid(
+                            "cleaned WorkUnit Workspace does not match its preserved branch; explicit recovery is required",
+                        ));
+                    }
+                }
+            } else if branch_exists {
                 manager
                     .recover_work_unit_worktree(
                         &repo_path,
@@ -783,11 +847,24 @@ impl WorkUnitService {
         WorkspaceRepo::get_by_id(&*self.db, &workspace.id)
             .await?
             .ok_or_else(|| not_found("workspace", workspace.id))
+        }
+        .await;
+        let finish_result = operation
+            .finish(if result.is_ok() {
+                db::TaskIntegrationOperationStatus::Succeeded
+            } else {
+                db::TaskIntegrationOperationStatus::Failed
+            })
+            .await;
+        match (result, finish_result) {
+            (Ok(workspace), Ok(())) => Ok(workspace),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        }
     }
 
     /// Integrate one completed WorkUnit Execution's exact committed SHA into
-    /// the Task integration worktree. A durable running record is the
-    /// cross-process Task lock and makes crash recovery idempotent.
+    /// the Task integration worktree under the durable Task operation claim.
     pub async fn integrate(
         &self,
         source: CollaborationActorSource,
@@ -838,128 +915,287 @@ impl WorkUnitService {
             .after_sha
             .clone()
             .ok_or_else(|| invalid("WorkUnit Execution has no result SHA"))?;
-        let integration_lock_id = format!("task-integration:{}", task.id);
-        let _lock = self.integration_locks.acquire(&integration_lock_id).await;
-        let integration = prepare_integration_workspace_for_work_unit(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            Some(Arc::clone(&self.repo_cache_locks)),
-        )
-        .await?;
-        let _integration_workspace_guard = self.integration_locks.acquire(&integration.id).await;
-        let existing =
+        let previous =
             WorkUnitRepo::get_integration_by_idempotency(&*self.db, &task.id, idempotency_key)
                 .await?;
-        let record = if let Some(existing) = existing {
-            if existing.work_unit_id != work_unit_id
-                || existing.execution_id != execution_id
-                || existing.source_sha != source_sha
-                || existing.source_workspace_id != source_workspace_id
-                || existing.target_workspace_id != integration.id
-            {
-                return Err(db::DbError::IdempotencyConflict.into());
+        if let Some(previous) = previous.as_ref() {
+            validate_integration_replay(
+                previous,
+                work_unit_id,
+                execution_id,
+                &source_sha,
+                &source_workspace_id,
+            )?;
+            if previous.outcome != WorkUnitIntegrationOutcome::Running {
+                return Ok(previous.clone());
             }
-            if existing.outcome != WorkUnitIntegrationOutcome::Running {
-                return Ok(existing);
-            }
-            existing
-        } else {
-            if !git::is_worktree_clean(Path::new(&integration.worktree_path)).await? {
-                return Err(invalid(
-                    "Task integration workspace has uncommitted changes",
-                ));
-            }
-            let target_before_sha =
-                git::get_current_sha(Path::new(&integration.worktree_path)).await?;
-            let id = new_uuid_v4();
-            let now = now_rfc3339();
-            let event = self.event(
-                "work_unit.integration_started", "work_unit_integration", &id, &task, &actor,
-                serde_json::json!({"task_id": task.id, "work_unit_id": work_unit_id, "integration_id": id}), &now,
-            );
-            let write = WorkUnitRepo::begin_integration(
-                &*self.db,
-                CreateWorkUnitIntegration {
-                    id,
-                    task_id: task.id.clone(),
-                    work_unit_id: work_unit_id.to_owned(),
-                    execution_id: execution_id.to_owned(),
-                    source_workspace_id: source_workspace_id.clone(),
-                    source_branch: source_workspace.branch.clone(),
-                    source_sha,
-                    target_workspace_id: integration.id.clone(),
-                    target_branch: integration.branch.clone(),
-                    target_before_sha,
-                    operation_idempotency_key: idempotency_key.to_owned(),
-                    started_at: now.clone(),
-                    created_at: now,
-                },
-                event,
+        }
+
+        let operation_owner = previous
+            .as_ref()
+            .map(|integration| integration.id.clone())
+            .unwrap_or_else(new_uuid_v4);
+        let integration_lock_id = format!("task-integration:{}", task.id);
+        let _local_lock = self.integration_locks.acquire(&integration_lock_id).await;
+        let operation = self
+            .integration_operations
+            .acquire(
+                &task.id,
+                db::TaskIntegrationOperationKind::WorkUnitIntegration,
+                &operation_owner,
             )
             .await?;
-            self.domain_events.publish_committed(&write.event);
-            write.record
-        };
-        let target_path = Path::new(&integration.worktree_path);
-        let interrupted_merge = git::detect_interrupted_merge(target_path)
-            .await
-            .unwrap_or(false);
-        let merge_restored = if interrupted_merge {
-            git::abort_merge(target_path).await.is_ok()
-                && git::get_current_sha(target_path).await? == record.target_before_sha
-        } else {
-            true
-        };
-        if interrupted_merge && !merge_restored {
-            git::restore_worktree(target_path, &record.target_before_sha).await?;
-        }
-        let now = now_rfc3339();
-        let (outcome, after_sha, conflict_metadata) =
-            match git::merge(target_path, &record.source_sha).await {
-                Ok(()) => (
-                    WorkUnitIntegrationOutcome::Success,
-                    Some(git::get_current_sha(target_path).await?),
-                    None,
-                ),
-                Err(git::GitError::MergeConflict { .. }) => {
-                    if git::abort_merge(target_path).await.is_err() {
-                        git::restore_worktree(target_path, &record.target_before_sha).await?;
-                    }
-                    (
-                        WorkUnitIntegrationOutcome::Conflict,
-                        None,
-                        Some(r#"{"kind":"merge_conflict"}"#.to_owned()),
-                    )
+
+        let result = async {
+            let integration = prepare_integration_workspace_for_work_unit(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                Some(Arc::clone(&self.repo_cache_locks)),
+            )
+            .await?;
+            let _integration_workspace_guard =
+                self.integration_locks.acquire(&integration.id).await;
+            let existing =
+                WorkUnitRepo::get_integration_by_idempotency(&*self.db, &task.id, idempotency_key)
+                    .await?;
+            let record = if let Some(existing) = existing {
+                validate_integration_replay(
+                    &existing,
+                    work_unit_id,
+                    execution_id,
+                    &source_sha,
+                    &source_workspace_id,
+                )?;
+                if existing.target_workspace_id != integration.id {
+                    return Err(db::DbError::IdempotencyConflict.into());
                 }
-                Err(_error) => {
-                    if git::abort_merge(target_path).await.is_err() {
-                        git::restore_worktree(target_path, &record.target_before_sha).await?;
-                    }
-                    (
+                if existing.outcome != WorkUnitIntegrationOutcome::Running {
+                    return Ok(existing);
+                }
+                existing
+            } else {
+                let target_path = Path::new(&integration.worktree_path);
+                if !git::is_worktree_clean(target_path).await? {
+                    return Err(invalid(
+                        "Task integration workspace has uncommitted changes",
+                    ));
+                }
+                let target_before_sha = git::get_current_sha(target_path).await?;
+                let now = now_rfc3339();
+                let event = self.event(
+                    "work_unit.integration_started",
+                    "work_unit_integration",
+                    &operation_owner,
+                    &task,
+                    &actor,
+                    serde_json::json!({
+                        "task_id": task.id,
+                        "work_unit_id": work_unit_id,
+                        "integration_id": operation_owner
+                    }),
+                    &now,
+                );
+                let write = WorkUnitRepo::begin_integration(
+                    &*self.db,
+                    CreateWorkUnitIntegration {
+                        id: operation_owner.clone(),
+                        task_id: task.id.clone(),
+                        work_unit_id: work_unit_id.to_owned(),
+                        execution_id: execution_id.to_owned(),
+                        source_workspace_id: source_workspace_id.clone(),
+                        source_branch: source_workspace.branch.clone(),
+                        source_sha: source_sha.clone(),
+                        target_workspace_id: integration.id.clone(),
+                        target_branch: integration.branch.clone(),
+                        target_before_sha,
+                        operation_idempotency_key: idempotency_key.to_owned(),
+                        started_at: now.clone(),
+                        created_at: now,
+                    },
+                    event,
+                )
+                .await?;
+                self.domain_events.publish_committed(&write.event);
+                write.record
+            };
+
+            let target_path = Path::new(&integration.worktree_path);
+            match classify_integration_recovery(target_path, &record).await? {
+                IntegrationRecovery::Materialized(after_sha) => {
+                    self.record_integration_outcome(
+                        &record,
+                        &task,
+                        &actor,
+                        work_unit_id,
+                        WorkUnitIntegrationOutcome::Success,
+                        Some(after_sha),
+                        None,
+                    )
+                    .await
+                }
+                IntegrationRecovery::Mismatch(kind) => {
+                    self.record_integration_outcome(
+                        &record,
+                        &task,
+                        &actor,
+                        work_unit_id,
                         WorkUnitIntegrationOutcome::Failed,
                         None,
-                        Some(r#"{"kind":"git_failure"}"#.to_owned()),
+                        Some(serde_json::json!({ "kind": kind }).to_string()),
                     )
+                    .await
                 }
-            };
-        let event_name = match outcome {
+                IntegrationRecovery::Retry => {
+                    if !git::is_worktree_clean(target_path).await? {
+                        return self
+                            .record_integration_outcome(
+                                &record,
+                                &task,
+                                &actor,
+                                work_unit_id,
+                                WorkUnitIntegrationOutcome::Failed,
+                                None,
+                                Some(r#"{"kind":"target_worktree_dirty"}"#.to_owned()),
+                            )
+                            .await;
+                    }
+                    match git::merge(target_path, &record.source_sha).await {
+                        Ok(()) => {
+                            let after_sha = git::get_current_sha(target_path).await?;
+                            if git::is_worktree_clean(target_path).await? {
+                                self.record_integration_outcome(
+                                    &record,
+                                    &task,
+                                    &actor,
+                                    work_unit_id,
+                                    WorkUnitIntegrationOutcome::Success,
+                                    Some(after_sha),
+                                    None,
+                                )
+                                .await
+                            } else {
+                                self.record_integration_outcome(
+                                    &record,
+                                    &task,
+                                    &actor,
+                                    work_unit_id,
+                                    WorkUnitIntegrationOutcome::Failed,
+                                    None,
+                                    Some(
+                                        r#"{"kind":"target_worktree_dirty_after_merge"}"#
+                                            .to_owned(),
+                                    ),
+                                )
+                                .await
+                            }
+                        }
+                        Err(git::GitError::MergeConflict { .. }) => {
+                            recover_interrupted_merge(target_path, &record).await?;
+                            self.record_integration_outcome(
+                                &record,
+                                &task,
+                                &actor,
+                                work_unit_id,
+                                WorkUnitIntegrationOutcome::Conflict,
+                                None,
+                                Some(r#"{"kind":"merge_conflict"}"#.to_owned()),
+                            )
+                            .await
+                        }
+                        Err(_error) => {
+                            if git::get_merge_head(target_path).await?.is_some() {
+                                recover_interrupted_merge(target_path, &record).await?;
+                            }
+                            let head = git::get_current_sha(target_path).await?;
+                            if head != record.target_before_sha
+                                || !git::is_worktree_clean(target_path).await?
+                            {
+                                self.record_integration_outcome(
+                                    &record,
+                                    &task,
+                                    &actor,
+                                    work_unit_id,
+                                    WorkUnitIntegrationOutcome::Failed,
+                                    None,
+                                    Some(r#"{"kind":"target_head_mismatch"}"#.to_owned()),
+                                )
+                                .await
+                            } else {
+                                self.record_integration_outcome(
+                                    &record,
+                                    &task,
+                                    &actor,
+                                    work_unit_id,
+                                    WorkUnitIntegrationOutcome::Failed,
+                                    None,
+                                    Some(r#"{"kind":"git_failure"}"#.to_owned()),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .await;
+
+        let operation_status = match &result {
+            Ok(record) if record.outcome == WorkUnitIntegrationOutcome::Success => {
+                db::TaskIntegrationOperationStatus::Succeeded
+            }
+            Ok(record) if record.outcome == WorkUnitIntegrationOutcome::Conflict => {
+                db::TaskIntegrationOperationStatus::Conflict
+            }
+            Ok(_) | Err(_) => db::TaskIntegrationOperationStatus::Failed,
+        };
+        let finish_result = operation.finish(operation_status).await;
+        match (result, finish_result) {
+            (Ok(record), Ok(())) => Ok(record),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_integration_outcome(
+        &self,
+        record: &WorkUnitIntegration,
+        task: &Task,
+        actor: &ActorRef,
+        work_unit_id: &str,
+        outcome: WorkUnitIntegrationOutcome,
+        target_after_sha: Option<String>,
+        conflict_metadata_json: Option<String>,
+    ) -> Result<WorkUnitIntegration> {
+        let now = now_rfc3339();
+        let event_type = match outcome {
             WorkUnitIntegrationOutcome::Success => "work_unit.integration_succeeded",
             WorkUnitIntegrationOutcome::Conflict => "work_unit.integration_conflicted",
             _ => "work_unit.integration_failed",
         };
         let event = self.event(
-            event_name, "work_unit_integration", &record.id, &task, &actor,
-            serde_json::json!({"task_id": task.id, "work_unit_id": work_unit_id, "integration_id": record.id, "outcome": outcome.to_string()}), &now,
+            event_type,
+            "work_unit_integration",
+            &record.id,
+            task,
+            actor,
+            serde_json::json!({
+                "task_id": task.id,
+                "work_unit_id": work_unit_id,
+                "integration_id": record.id,
+                "outcome": outcome.to_string()
+            }),
+            &now,
         );
         let write = WorkUnitRepo::record_integration(
             &*self.db,
             RecordWorkUnitIntegration {
-                id: record.id,
+                id: record.id.clone(),
                 expected_version: record.version,
                 outcome,
-                target_after_sha: after_sha,
-                conflict_metadata_json: conflict_metadata,
+                target_after_sha,
+                conflict_metadata_json,
                 finished_at: now.clone(),
                 updated_at: now,
             },
@@ -1008,6 +1244,7 @@ impl WorkUnitService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn event(
         &self,
         event_type: &str,
@@ -1035,6 +1272,94 @@ impl WorkUnitService {
             created_at: now.to_owned(),
         }
     }
+}
+
+enum IntegrationRecovery {
+    Retry,
+    Materialized(String),
+    Mismatch(&'static str),
+}
+
+fn validate_integration_replay(
+    existing: &WorkUnitIntegration,
+    work_unit_id: &str,
+    execution_id: &str,
+    source_sha: &str,
+    source_workspace_id: &str,
+) -> Result<()> {
+    if existing.work_unit_id != work_unit_id
+        || existing.execution_id != execution_id
+        || existing.source_sha != source_sha
+        || existing.source_workspace_id != source_workspace_id
+    {
+        return Err(db::DbError::IdempotencyConflict.into());
+    }
+    Ok(())
+}
+
+async fn classify_integration_recovery(
+    target_path: &Path,
+    record: &WorkUnitIntegration,
+) -> Result<IntegrationRecovery> {
+    if let Some(merge_head) = git::get_merge_head(target_path).await? {
+        if merge_head != record.source_sha {
+            return Ok(IntegrationRecovery::Mismatch(
+                "interrupted_merge_source_mismatch",
+            ));
+        }
+        if git::get_current_sha(target_path).await? != record.target_before_sha {
+            return Ok(IntegrationRecovery::Mismatch("target_head_mismatch"));
+        }
+        recover_interrupted_merge(target_path, record).await?;
+        return Ok(IntegrationRecovery::Retry);
+    }
+
+    let head = git::get_current_sha(target_path).await?;
+    if head == record.target_before_sha {
+        return Ok(IntegrationRecovery::Retry);
+    }
+    if !git::is_worktree_clean(target_path).await? {
+        return Ok(IntegrationRecovery::Mismatch("target_head_mismatch"));
+    }
+    if head == record.source_sha
+        && git::is_ancestor(target_path, &record.target_before_sha, &record.source_sha).await?
+    {
+        return Ok(IntegrationRecovery::Materialized(head));
+    }
+    let parents = git::commit_parents(target_path, &head).await?;
+    if parents.len() == 2
+        && parents[0] == record.target_before_sha
+        && parents[1] == record.source_sha
+    {
+        return Ok(IntegrationRecovery::Materialized(head));
+    }
+    Ok(IntegrationRecovery::Mismatch("target_head_mismatch"))
+}
+
+async fn recover_interrupted_merge(target_path: &Path, record: &WorkUnitIntegration) -> Result<()> {
+    if git::get_merge_head(target_path).await?.as_deref() != Some(&record.source_sha) {
+        return Err(invalid(
+            "interrupted integration merge does not match the pinned source",
+        ));
+    }
+    if git::get_current_sha(target_path).await? != record.target_before_sha {
+        return Err(invalid(
+            "interrupted integration target HEAD changed; recovery is required",
+        ));
+    }
+    git::abort_merge(target_path).await.map_err(|error| {
+        invalid(format!(
+            "interrupted integration merge could not be aborted safely: {error}"
+        ))
+    })?;
+    if git::get_current_sha(target_path).await? != record.target_before_sha
+        || !git::is_worktree_clean(target_path).await?
+    {
+        return Err(invalid(
+            "interrupted integration merge did not restore its pinned clean target",
+        ));
+    }
+    Ok(())
 }
 
 fn not_found(entity: &'static str, id: impl Into<String>) -> ServiceError {
@@ -1095,6 +1420,42 @@ mod tests {
         }
     }
 
+    fn running_repository_execution(
+        task_id: &str,
+        workspace_id: &str,
+        agent_id: &str,
+        before_sha: &str,
+    ) -> db::CreateExecution {
+        let now = now_rfc3339();
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.to_owned()),
+            actor_ref: Some(ActorRef::Agent(agent_id.to_owned())),
+            role: "implementer".to_owned(),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some(before_sha.to_owned()),
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id.to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
     async fn run_git(path: &Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -1118,11 +1479,13 @@ mod tests {
 
     #[tokio::test]
     async fn integration_pins_success_and_aborts_conflict_without_losing_workunit_workspace() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        let temp = TempDir::new().expect("temporary directory");
+        let database_path = temp.path().join("pr5-integration.db");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let pool = create_sqlite_pool(&database_url).await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         let db = Arc::new(SqliteDb::new(pool));
         let event_bus = Arc::new(EventBus::new(16));
-        let temp = TempDir::new().expect("temporary directory");
         let repository_path = temp.path().join("repository");
         std::fs::create_dir_all(&repository_path).expect("repository directory");
         git::init(&repository_path).await.expect("git init");
@@ -1382,8 +1745,7 @@ mod tests {
                     role: "implementer".to_owned(),
                     assigned_actor: Some(ActorRef::Agent(agent_id.to_owned())),
                     requires_integration: true,
-                    provenance_kind: None,
-                    provenance_id: None,
+                    provenance: None,
                     created_by: ActorRef::Human(human_id.to_owned()),
                     created_at: now.clone(),
                 },
@@ -1499,6 +1861,50 @@ mod tests {
             (unit, workspace, execution_id, source_sha)
         }
 
+        async fn begin_running_integration(
+            db: &SqliteDb,
+            task_id: &str,
+            work_unit: &db::WorkUnit,
+            workspace: &db::Workspace,
+            execution_id: &str,
+            source_sha: &str,
+            target: &db::Workspace,
+            target_before_sha: &str,
+            idempotency_key: &str,
+            human_id: &str,
+        ) -> db::WorkUnitIntegration {
+            let integration_id = new_uuid_v4();
+            let now = now_rfc3339();
+            WorkUnitRepo::begin_integration(
+                db,
+                CreateWorkUnitIntegration {
+                    id: integration_id.clone(),
+                    task_id: task_id.to_owned(),
+                    work_unit_id: work_unit.id.clone(),
+                    execution_id: execution_id.to_owned(),
+                    source_workspace_id: workspace.id.clone(),
+                    source_branch: workspace.branch.clone(),
+                    source_sha: source_sha.to_owned(),
+                    target_workspace_id: target.id.clone(),
+                    target_branch: target.branch.clone(),
+                    target_before_sha: target_before_sha.to_owned(),
+                    operation_idempotency_key: idempotency_key.to_owned(),
+                    started_at: now.clone(),
+                    created_at: now,
+                },
+                event(
+                    "work_unit.integration_started",
+                    "work_unit_integration",
+                    &integration_id,
+                    task_id,
+                    human_id,
+                ),
+            )
+            .await
+            .expect("persist running integration before Git")
+            .record
+        }
+
         let (first_unit, first_workspace, first_execution, first_sha) = add_result(
             &db,
             &manager,
@@ -1529,8 +1935,7 @@ mod tests {
                 role: "implementer".to_owned(),
                 assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
                 requires_integration: false,
-                provenance_kind: None,
-                provenance_id: None,
+                provenance: None,
                 created_by: ActorRef::Human(human_id.clone()),
                 created_at: now_rfc3339(),
             },
@@ -1744,6 +2149,330 @@ mod tests {
             before_conflict
         );
 
+        // Hold an integration claim from one service instance. A second
+        // WorkUnitService has a distinct in-process lock manager, and
+        // MergeService has another one; all three must observe the durable
+        // Task operation claim before any integration-workspace mutation.
+        let (recovery_unit, recovery_workspace, recovery_execution, recovery_sha) = add_result(
+            &db,
+            &manager,
+            &repository_path,
+            &task_id,
+            &repo_id,
+            &human_id,
+            &agent_id,
+            "crash before integration Git",
+            "recovery-before.txt",
+            "recover without replaying a completed merge\n",
+            &before_conflict,
+        )
+        .await;
+        let active_operation = service
+            .integration_operations
+            .acquire(
+                &task_id,
+                db::TaskIntegrationOperationKind::WorkUnitIntegration,
+                "cross-service-integration-owner",
+            )
+            .await
+            .expect("first service claims Task integration scope");
+        let durable_claim = db::TaskIntegrationOperationRepo::get_active_for_task(&*db, &task_id)
+            .await
+            .expect("durable claim lookup")
+            .expect("claim is persisted");
+        assert_eq!(
+            durable_claim.kind,
+            db::TaskIntegrationOperationKind::WorkUnitIntegration
+        );
+        // Each service uses a separate pool against the same on-disk database,
+        // plus its own local WorkspaceExecutionLockManager and OS lock handle.
+        let competing_db = Arc::new(SqliteDb::new(
+            create_sqlite_pool(&database_url)
+                .await
+                .expect("independent service database pool"),
+        ));
+        let competing_service = WorkUnitService::new(
+            Arc::clone(&competing_db),
+            Arc::clone(&event_bus),
+            workspace_root.clone(),
+            Arc::new(RepoCacheLockManager::default()),
+            Arc::new(WorkspaceExecutionLockManager::default()),
+        );
+        let integration_head_before_competitors = git::get_current_sha(&integration_path)
+            .await
+            .expect("integration target head before competitors");
+        let competing_integration = competing_service
+            .integrate(
+                CollaborationActorSource::Human(human_id.clone()),
+                &recovery_unit.id,
+                &recovery_execution,
+                "recover-before-git",
+            )
+            .await;
+        assert!(matches!(
+            competing_integration,
+            Err(ServiceError::Conflict(_))
+        ));
+        let merge_service = crate::MergeService::new(
+            Arc::clone(&competing_db),
+            Arc::clone(&event_bus),
+            workspace_root.clone(),
+        );
+        assert!(matches!(
+            merge_service.merge(task_id.clone()).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        RepoRepo::update(
+            &*db,
+            db::UpdateRepo {
+                id: repo_id.clone(),
+                name: None,
+                local_path: None,
+                remote_url: None,
+                work_mode: Some(WorkMode::PullRequest),
+                default_branch: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("switch repo to PR mode for the publication contention path");
+        assert!(matches!(
+            merge_service.publish_pr(task_id.clone()).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert_eq!(
+            git::get_current_sha(&integration_path).await.unwrap(),
+            integration_head_before_competitors,
+            "all competing operations fail before changing integration HEAD"
+        );
+        assert_eq!(
+            db::TaskIntegrationOperationRepo::get_active_for_task(&*db, &task_id)
+                .await
+                .expect("active claim remains queryable")
+                .expect("original claim remains active")
+                .id,
+            durable_claim.id
+        );
+        active_operation
+            .finish(db::TaskIntegrationOperationStatus::Failed)
+            .await
+            .expect("release the test claim durably");
+        let interrupted_owner = competing_service
+            .integration_operations
+            .acquire(
+                &task_id,
+                db::TaskIntegrationOperationKind::WorkUnitIntegration,
+                "simulated-crashed-process",
+            )
+            .await
+            .expect("second operation acquires after normal finish");
+        let interrupted_operation_id: String = sqlx::query_scalar(
+            "SELECT id FROM task_integration_operation WHERE task_id = ? AND status = 'running'",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("interrupted owner row");
+        drop(interrupted_owner);
+        let recovered_owner = service
+            .integration_operations
+            .acquire(
+                &task_id,
+                db::TaskIntegrationOperationKind::TaskMerge,
+                "recovery-after-process-exit",
+            )
+            .await
+            .expect("released process lock permits recovery");
+        let abandoned_status: String =
+            sqlx::query_scalar("SELECT status FROM task_integration_operation WHERE id = ?")
+                .bind(&interrupted_operation_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("previous durable row remains auditable");
+        assert_eq!(abandoned_status, "abandoned");
+        recovered_owner
+            .finish(db::TaskIntegrationOperationStatus::Failed)
+            .await
+            .expect("recovered claim closes");
+        RepoRepo::update(
+            &*db,
+            db::UpdateRepo {
+                id: repo_id.clone(),
+                name: None,
+                local_path: None,
+                remote_url: None,
+                work_mode: Some(WorkMode::DirectMerge),
+                default_branch: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("restore direct merge mode");
+
+        // Simulate a crash after the running integration attempt is persisted
+        // but before Git is touched. Recovery may retry because HEAD is still
+        // the exact recorded target-before SHA.
+        let untouched_attempt = begin_running_integration(
+            &db,
+            &task_id,
+            &recovery_unit,
+            &recovery_workspace,
+            &recovery_execution,
+            &recovery_sha,
+            &integration_workspace,
+            &integration_head_before_competitors,
+            "recover-before-git",
+            &human_id,
+        )
+        .await;
+        let recovered_untouched = service
+            .integrate(
+                CollaborationActorSource::Human(human_id.clone()),
+                &recovery_unit.id,
+                &recovery_execution,
+                "recover-before-git",
+            )
+            .await
+            .expect("retry from the pinned clean target");
+        assert_eq!(recovered_untouched.id, untouched_attempt.id);
+        assert_eq!(
+            recovered_untouched.outcome,
+            WorkUnitIntegrationOutcome::Success
+        );
+
+        // Simulate a crash after Git completed a fast-forward but before the
+        // durable integration result was recorded. Recovery proves the exact
+        // source SHA is already the target and converges to success.
+        let after_untouched = recovered_untouched
+            .target_after_sha
+            .clone()
+            .expect("successful target SHA");
+        let (materialized_unit, materialized_workspace, materialized_execution, materialized_sha) =
+            add_result(
+                &db,
+                &manager,
+                &repository_path,
+                &task_id,
+                &repo_id,
+                &human_id,
+                &agent_id,
+                "Git completed before durable success",
+                "recovery-materialized.txt",
+                "the exact result is already on target\n",
+                &after_untouched,
+            )
+            .await;
+        let materialized_attempt = begin_running_integration(
+            &db,
+            &task_id,
+            &materialized_unit,
+            &materialized_workspace,
+            &materialized_execution,
+            &materialized_sha,
+            &integration_workspace,
+            &after_untouched,
+            "recover-after-git",
+            &human_id,
+        )
+        .await;
+        git::merge(&integration_path, &materialized_sha)
+            .await
+            .expect("previous attempt materializes the exact source commit");
+        let materialized_head = git::get_current_sha(&integration_path)
+            .await
+            .expect("materialized target SHA");
+        let recovered_materialized = service
+            .integrate(
+                CollaborationActorSource::Human(human_id.clone()),
+                &materialized_unit.id,
+                &materialized_execution,
+                "recover-after-git",
+            )
+            .await
+            .expect("materialized merge converges to success");
+        assert_eq!(recovered_materialized.id, materialized_attempt.id);
+        assert_eq!(
+            recovered_materialized.outcome,
+            WorkUnitIntegrationOutcome::Success
+        );
+        assert_eq!(
+            recovered_materialized.target_after_sha.as_deref(),
+            Some(materialized_head.as_str())
+        );
+        let replay_materialized = service
+            .integrate(
+                CollaborationActorSource::Human(human_id.clone()),
+                &materialized_unit.id,
+                &materialized_execution,
+                "recover-after-git",
+            )
+            .await
+            .expect("already recorded materialized result is idempotent");
+        assert_eq!(replay_materialized.id, materialized_attempt.id);
+        assert_eq!(
+            git::get_current_sha(&integration_path).await.unwrap(),
+            materialized_head
+        );
+
+        // An unrelated commit on the integration target cannot be attributed
+        // to this attempt. Recovery records a mismatch and leaves that HEAD
+        // untouched instead of merging on top or resetting it.
+        let (mismatch_unit, mismatch_workspace, mismatch_execution, mismatch_sha) = add_result(
+            &db,
+            &manager,
+            &repository_path,
+            &task_id,
+            &repo_id,
+            &human_id,
+            &agent_id,
+            "unexpected target head",
+            "recovery-mismatch-source.txt",
+            "pinned source\n",
+            &materialized_head,
+        )
+        .await;
+        let mismatch_attempt = begin_running_integration(
+            &db,
+            &task_id,
+            &mismatch_unit,
+            &mismatch_workspace,
+            &mismatch_execution,
+            &mismatch_sha,
+            &integration_workspace,
+            &materialized_head,
+            "recover-unexpected-head",
+            &human_id,
+        )
+        .await;
+        std::fs::write(
+            integration_path.join("unattributed-target.txt"),
+            "external\n",
+        )
+        .expect("external target change");
+        let unexpected_head = git::commit_all(&integration_path, "unattributed target change")
+            .await
+            .expect("external target commit");
+        let mismatch = service
+            .integrate(
+                CollaborationActorSource::Human(human_id.clone()),
+                &mismatch_unit.id,
+                &mismatch_execution,
+                "recover-unexpected-head",
+            )
+            .await
+            .expect("unexpected target fails closed as a durable outcome");
+        assert_eq!(mismatch.id, mismatch_attempt.id);
+        assert_eq!(mismatch.outcome, WorkUnitIntegrationOutcome::Failed);
+        assert!(mismatch
+            .conflict_metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata.contains("target_head_mismatch")));
+        assert_eq!(
+            git::get_current_sha(&integration_path).await.unwrap(),
+            unexpected_head,
+            "recovery never changes an unattributed target head"
+        );
+
         let cleanup = crate::workspace_cleanup::WorkspaceCleanupScheduler::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -1751,6 +2480,176 @@ mod tests {
         )
         .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
         cleanup.set_workspace_exec_locks(Arc::clone(&integration_locks));
+
+        sqlx::query("UPDATE task SET status = 'in_progress', version = version + 1, updated_at = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .expect("Task admits repository Execution");
+        let retryable_unit = service
+            .create(
+                CollaborationActorSource::Human(human_id.clone()),
+                CreateWorkUnitInput {
+                    task_id: task_id.clone(),
+                    title: "recover cleaned WorkUnit workspace".to_owned(),
+                    scope: "preserve branch commits after failed attempt".to_owned(),
+                    role: "implementer".to_owned(),
+                    parent_work_unit_id: None,
+                    assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
+                    requires_integration: true,
+                    provenance: None,
+                },
+            )
+            .await
+            .expect("open repository WorkUnit");
+        let original_workspace = service
+            .prepare_workspace(
+                CollaborationActorSource::Human(human_id.clone()),
+                &retryable_unit.id,
+            )
+            .await
+            .expect("WorkUnit Workspace prepares");
+        let first_attempt = running_repository_execution(
+            &task_id,
+            &original_workspace.id,
+            &agent_id,
+            original_workspace.before_sha.as_deref().unwrap(),
+        );
+        let first_attempt_id = first_attempt.id.clone();
+        service
+            .bind_execution(
+                CollaborationActorSource::Execution(recovery_execution.clone()),
+                &retryable_unit.id,
+                retryable_unit.version,
+                first_attempt,
+            )
+            .await
+            .expect("first exact WorkUnit Execution and lease bind");
+        let first_worktree = Path::new(&original_workspace.worktree_path);
+        std::fs::write(
+            first_worktree.join("kept-commit.txt"),
+            "branch survives cleanup\n",
+        )
+        .expect("WorkUnit change writes");
+        let preserved_commit = git::commit_all(first_worktree, "preserved failed-attempt commit")
+            .await
+            .expect("WorkUnit commit exists on its branch");
+        ExecutionRepo::update(
+            &*db,
+            UpdateExecution {
+                id: first_attempt_id.clone(),
+                status: Some(ExecutionStatus::Failed),
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: Some(Some("simulated worker failure after commit".to_owned())),
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("failed attempt remains historical");
+        cleanup
+            .cleanup_now(original_workspace.id.clone())
+            .await
+            .expect("clean exact WorkUnit worktree");
+        assert!(!first_worktree.exists());
+        assert!(
+            git::branch_exists(&repository_path, &original_workspace.branch)
+                .await
+                .expect("preserved branch lookup")
+        );
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&*db, &original_workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkspaceStatus::Cleaned
+        );
+        let recovered_workspace = service
+            .prepare_workspace(
+                CollaborationActorSource::Human(human_id.clone()),
+                &retryable_unit.id,
+            )
+            .await
+            .expect("Cleaned WorkUnit Workspace recovers from its branch");
+        assert_eq!(recovered_workspace.id, original_workspace.id);
+        assert_eq!(recovered_workspace.branch, original_workspace.branch);
+        assert_eq!(
+            recovered_workspace.before_sha,
+            original_workspace.before_sha
+        );
+        assert_eq!(
+            git::get_current_sha(Path::new(&recovered_workspace.worktree_path))
+                .await
+                .expect("recovered branch head"),
+            preserved_commit
+        );
+        assert_eq!(recovered_workspace.status, WorkspaceStatus::Ready);
+        let retry_attempt = running_repository_execution(
+            &task_id,
+            &recovered_workspace.id,
+            &agent_id,
+            &preserved_commit,
+        );
+        let retry_attempt_id = retry_attempt.id.clone();
+        service
+            .bind_execution(
+                CollaborationActorSource::Execution(recovery_execution.clone()),
+                &retryable_unit.id,
+                retryable_unit.version,
+                retry_attempt,
+            )
+            .await
+            .expect("retry binds to the recovered Workspace");
+        let retry_lease =
+            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+                .await
+                .expect("retried WorkUnit lease lookup")
+                .expect("retry receives exact active lease");
+        assert_eq!(
+            retry_lease.workspace_id.as_deref(),
+            Some(original_workspace.id.as_str())
+        );
+        assert_eq!(retry_lease.execution_id, retry_attempt_id);
+        ExecutionRepo::update(
+            &*db,
+            UpdateExecution {
+                id: retry_attempt_id.clone(),
+                status: Some(ExecutionStatus::Cancelled),
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("retry attempt can stop");
+        cleanup
+            .cleanup_now(recovered_workspace.id.clone())
+            .await
+            .expect("clean recovered exact Workspace");
+
         cleanup
             .cleanup_now(second_workspace.id.clone())
             .await

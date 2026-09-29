@@ -312,6 +312,20 @@ idempotency key; the server pins that Execution's result SHA. Conflict and
 failure outcomes are durable, and the endpoint does not select a conflict
 resolver. Legacy Task workspace readers remain integration-scoped.
 
+WorkUnit provenance is a tagged value. Actor provenance is encoded as
+`{"kind":"actor","actor":{"kind":"human"|"agent","id":"…"}}` and
+is validated against the referenced identity. WorkUnit and Artifact references
+must belong to the same Task; External IDs remain opaque. A legacy V091 Actor
+reference that cannot be resolved unambiguously is returned as
+`{"kind":"legacy_actor","id":"…"}` and is not accepted in create requests.
+
+WorkUnit integration, final Task merge, PR publication, and other exclusive
+integration-workspace operations share one durable per-Task claim. Concurrent
+requests from another service instance receive a conflict while that claim is
+owned. A crash releases the process lock; the next claimant can then mark the
+previous row abandoned and proceed. This claim is local to the Task integration
+workspace and does not serialize independent WorkUnit workspaces.
+
 An Execution start/bind entry point is currently available through the typed
 service path; no WorkUnit scheduler or automatic dispatch endpoint is exposed.
 WorkUnit planning remains separate from legacy Task plans until PR7.

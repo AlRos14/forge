@@ -627,6 +627,29 @@ pub trait WorkUnitRepo: Send + Sync {
     ) -> Result<CollaborationWrite<WorkUnitIntegration>>;
 }
 
+/// Durable, Task-wide exclusive authority for operations that read or mutate
+/// the Task integration workspace. The partial unique index makes `begin`
+/// atomic across independent SQLite connections/processes.
+#[async_trait]
+pub trait TaskIntegrationOperationRepo: Send + Sync {
+    async fn begin(
+        &self,
+        input: CreateTaskIntegrationOperation,
+    ) -> Result<TaskIntegrationOperation>;
+    async fn get_active_for_task(&self, task_id: &str) -> Result<Option<TaskIntegrationOperation>>;
+    /// Called only while holding the Task's OS operation lock. It atomically
+    /// marks a process-dead active row abandoned and installs the replacement.
+    async fn recover_stale_and_begin(
+        &self,
+        input: CreateTaskIntegrationOperation,
+        updated_at: &str,
+    ) -> Result<TaskIntegrationOperation>;
+    async fn finish(
+        &self,
+        input: FinishTaskIntegrationOperation,
+    ) -> Result<TaskIntegrationOperation>;
+}
+
 /// Internal scheduler authority for a Task workspace.  A lease is deliberately
 /// separate from the filesystem-backed `Workspace` row: chat agents never
 /// receive this record, a path, or a bearer token.  The scheduler persists only
@@ -1686,10 +1709,27 @@ pub struct CreateWorkUnit {
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
-    pub provenance_kind: Option<String>,
-    pub provenance_id: Option<String>,
+    pub provenance: Option<WorkUnitProvenance>,
     pub created_by: ActorRef,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskIntegrationOperation {
+    pub id: String,
+    pub task_id: String,
+    pub kind: TaskIntegrationOperationKind,
+    pub owner_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishTaskIntegrationOperation {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: TaskIntegrationOperationStatus,
+    pub updated_at: String,
+    pub finished_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

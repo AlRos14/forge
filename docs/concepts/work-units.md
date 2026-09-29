@@ -15,6 +15,7 @@ WorkUnit
   status
   dependencies
   requires_integration
+  provenance
   created_by
   version
 ~~~
@@ -22,6 +23,12 @@ WorkUnit
 WorkUnits can be created manually, by an orchestrator, from a plan Artifact,
 from an issue, or from another WorkUnit. The source is provenance only; the
 WorkUnit remains independently durable.
+
+Actor provenance records a typed `ActorRef` and must resolve to an existing
+Human or Agent. WorkUnit and Artifact provenance must belong to the same Task.
+External provenance remains an opaque reference. Old V091 Actor references
+that cannot be resolved unambiguously remain readable as `legacy_actor` and
+cannot be written by new requests.
 
 ## Allocation
 
@@ -86,6 +93,21 @@ outcomes. A WorkUnit being complete does not silently merge its changes or
 make another WorkUnit's workspace writable. Existing Task-scoped workspace
 and execution paths remain bounded legacy behavior where they do not select a
 WorkUnit workspace by Task ID.
+
+The integration workspace has one durable `task_integration_operation` claim
+per Task, shared by WorkUnit integration, final Task merge, PR publication, and
+other exclusive operations on that workspace. SQLite atomically admits the
+claim before Git starts. A process-lifetime OS lock lets a later server reclaim
+the row after a crashed process releases the lock; Git does not hold a database
+transaction open. Active terminal sessions on that workspace use matching
+SQLite guards. Recovery retries from the recorded target-before SHA, recognizes
+an exact already-materialized result, and fails closed on an unrelated target
+HEAD without resetting it.
+
+Cleaning a WorkUnit workspace leaves its branch in place. A `Cleaned` workspace
+can be rebuilt with the same Workspace identity from that exact branch. If the
+branch is missing, preparation requires explicit reset or recovery rather than
+rebuilding from an older base and potentially discarding commits.
 
 ## Plan relationship
 

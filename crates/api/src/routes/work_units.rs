@@ -1,8 +1,8 @@
 use api_types::{
-    AddWorkUnitDependencyRequest, AllocateWorkUnitRequest, CreateWorkUnitRequest,
-    TransitionWorkUnitRequest, UpdateWorkUnitRequest, WorkUnitDependencyResponse,
-    WorkUnitIntegrationOutcome, WorkUnitIntegrationRequest, WorkUnitIntegrationResponse,
-    WorkUnitProvenance, WorkUnitProvenanceKind, WorkUnitReadinessResponse, WorkUnitResponse,
+    AddWorkUnitDependencyRequest, AllocateWorkUnitRequest, CreateWorkUnitProvenance,
+    CreateWorkUnitRequest, TransitionWorkUnitRequest, UpdateWorkUnitRequest,
+    WorkUnitDependencyResponse, WorkUnitIntegrationOutcome, WorkUnitIntegrationRequest,
+    WorkUnitIntegrationResponse, WorkUnitProvenance, WorkUnitReadinessResponse, WorkUnitResponse,
     WorkUnitStatus as ApiWorkUnitStatus,
 };
 use axum::{
@@ -70,18 +70,15 @@ fn work_unit_response(unit: WorkUnit, readiness: services::WorkUnitReadiness) ->
         role: unit.role,
         assigned_actor: unit.assigned_actor.map(actor_to_api),
         requires_integration: unit.requires_integration,
-        provenance: unit
-            .provenance_kind
-            .zip(unit.provenance_id)
-            .map(|(kind, id)| WorkUnitProvenance {
-                kind: match kind.as_str() {
-                    "actor" => WorkUnitProvenanceKind::Actor,
-                    "work_unit" => WorkUnitProvenanceKind::WorkUnit,
-                    "artifact" => WorkUnitProvenanceKind::Artifact,
-                    _ => WorkUnitProvenanceKind::External,
-                },
-                id,
-            }),
+        provenance: unit.provenance.map(|provenance| match provenance {
+            db::WorkUnitProvenance::Actor(actor) => WorkUnitProvenance::Actor {
+                actor: actor_to_api(actor),
+            },
+            db::WorkUnitProvenance::WorkUnit(id) => WorkUnitProvenance::WorkUnit { id },
+            db::WorkUnitProvenance::Artifact(id) => WorkUnitProvenance::Artifact { id },
+            db::WorkUnitProvenance::External(id) => WorkUnitProvenance::External { id },
+            db::WorkUnitProvenance::LegacyActor(id) => WorkUnitProvenance::LegacyActor { id },
+        }),
         created_by: actor_to_api(unit.created_by),
         version: unit.version,
         created_at: unit.created_at,
@@ -112,17 +109,13 @@ pub async fn create_work_unit(
     user: AuthenticatedUser,
     Json(body): Json<CreateWorkUnitRequest>,
 ) -> ApiResult<(StatusCode, Json<WorkUnitResponse>)> {
-    let provenance = body.provenance.map(|value| {
-        (
-            match value.kind {
-                WorkUnitProvenanceKind::Actor => "actor",
-                WorkUnitProvenanceKind::WorkUnit => "work_unit",
-                WorkUnitProvenanceKind::Artifact => "artifact",
-                WorkUnitProvenanceKind::External => "external",
-            }
-            .to_owned(),
-            value.id,
-        )
+    let provenance = body.provenance.map(|value| match value {
+        CreateWorkUnitProvenance::Actor { actor } => {
+            db::WorkUnitProvenance::Actor(actor_to_db(actor))
+        }
+        CreateWorkUnitProvenance::WorkUnit { id } => db::WorkUnitProvenance::WorkUnit(id),
+        CreateWorkUnitProvenance::Artifact { id } => db::WorkUnitProvenance::Artifact(id),
+        CreateWorkUnitProvenance::External { id } => db::WorkUnitProvenance::External(id),
     });
     let unit = state
         .work_unit_service

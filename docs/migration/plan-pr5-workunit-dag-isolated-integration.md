@@ -166,6 +166,53 @@ Cleanup retains the Task integration workspace once WorkUnits exist and does
 not capture the legacy plan on that path. An active durable WorkUnit
 integration makes final delivery fail closed.
 
+Every exclusive operation on the Task integration scope also acquires a
+`task_integration_operation` row. Its partial unique index is the atomic
+cross-process claim: only one `running` row can exist per Task, whether the
+owner is integrating a WorkUnit, doing the final Task merge, publishing a PR,
+preparing a WorkUnit workspace, creating a WorkUnit, or cleaning the
+integration workspace. The short SQLite transaction commits the claim before
+Git or provider work begins; it is never held open across those operations. A
+process-lifetime OS file lock is held beside the database (or in the workspace
+root for in-memory databases). It proves whether a persisted owner is still
+alive; a contender must acquire it before marking an old row `abandoned` and
+inserting its own row. Normal completion records `succeeded`, `conflict`, or
+`failed`. A crash releases the OS lock, so the next claimant can recover the
+durable row without a timeout expiring during long Git work. The fixed lock
+file is retained to avoid an unlink/recreate race. Active integration-scope
+terminal sessions and these operations reject each other through SQLite
+guards.
+
+V092 adds this operation ledger and types newly written Actor provenance as an
+`ActorRef`. It backfills old Actor provenance only when its ID resolves to
+exactly one Human or Agent identity. An unresolved or ambiguous V091 value is
+returned as response-only `legacy_actor`; new writes cannot create that form.
+Actor, same-Task WorkUnit, and same-Task Artifact provenance are validated at
+the service and SQLite boundaries. External provenance intentionally remains
+opaque.
+
+Integration recovery classifies the target before any Git mutation. If HEAD is
+still the recorded `target_before_sha`, the merge can run. An interrupted merge
+is aborted only when its `MERGE_HEAD` is the pinned source and target HEAD still
+equals the recorded before SHA; the clean restored state is checked. If HEAD
+already equals the pinned source as a fast-forward from the recorded before
+SHA, or is a two-parent merge commit with exactly the recorded before and
+source commits, the durable attempt converges to success. A different target
+HEAD is recorded as `failed` with `target_head_mismatch` and left untouched.
+PR5 never resets the integration workspace to recover an attempt.
+
+After exact WorkUnit cleanup, `Cleaning` remains unavailable. A `Cleaned`
+WorkUnit workspace can be prepared again in place when its preserved branch
+still exists, retaining its Workspace ID, WorkUnit ID, branch, and scope while
+rebuilding the worktree and setting it to `Ready`. If that exact branch is
+missing, preparation fails with an explicit reset/recovery-required error; it
+does not recreate from the old base SHA and risk losing a prior attempt.
+
+`rejected` remains in the planned/public outcome vocabulary but PR5 does not
+emit it. It is reserved for an explicit policy or user refusal before Git
+mutation; a technical failure or unsafe recovery is `failed`. PR5 adds no
+rejection action or automatic resolution path.
+
 ## Collaboration and events
 
 Proposal may target a same-Task WorkUnit using PR4's resolve-ID, authorize
