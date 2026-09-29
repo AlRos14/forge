@@ -145,3 +145,12 @@ WHEN NEW.status IN ('starting', 'running') AND EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'Task integration workspace has an active exclusive operation');
 END;
+
+-- Task ownership is part of WorkUnit identity. Project teardown deletes the
+-- WorkUnit row and does not need to rebind it to another Task.
+CREATE TRIGGER work_unit_task_binding_immutable
+BEFORE UPDATE OF task_id ON work_unit
+WHEN NEW.task_id IS NOT OLD.task_id
+BEGIN
+    SELECT RAISE(ABORT, 'WorkUnit Task binding is immutable');
+END;

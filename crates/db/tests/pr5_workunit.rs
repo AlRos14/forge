@@ -143,6 +143,131 @@ fn work_unit_lease(binding: WorkUnitLeaseBinding<'_>) -> CreateWorkspaceLease {
 }
 
 #[tokio::test]
+async fn work_unit_task_binding_is_immutable_without_provenance() {
+    let db = database().await;
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+    let task_id = new_uuid_v4();
+    let other_task_id = new_uuid_v4();
+    let human_id = new_uuid_v4();
+
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "PR5 WorkUnit Task binding".into(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            primary_repo_id: None,
+            owner_id: Some(human_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+    db::UserRepo::create_user(
+        &db,
+        &db::User {
+            id: human_id.clone(),
+            email: "task-binding@example.invalid".into(),
+            password_hash: "not-used".into(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Human");
+
+    for id in [&task_id, &other_task_id] {
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: id.clone(),
+                project_id: project_id.clone(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Task".into(),
+                description: None,
+                task_type: "implementation".into(),
+                status: "todo".into(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task");
+        TaskRoleRepo::create(
+            &db,
+            CreateTaskRole {
+                id: new_uuid_v4(),
+                task_id: id.clone(),
+                role: "implementer".into(),
+                coordination_mode: Some(CoordinationMode::Independent),
+                policy_json: "{}".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("TaskRole");
+    }
+
+    let work_unit_id = new_uuid_v4();
+    WorkUnitRepo::create(
+        &db,
+        CreateWorkUnit {
+            id: work_unit_id.clone(),
+            task_id: task_id.clone(),
+            parent_work_unit_id: None,
+            title: "Immutable owner".into(),
+            scope: "Task ownership is historical identity".into(),
+            role: "implementer".into(),
+            assigned_actor: None,
+            requires_integration: false,
+            provenance: None,
+            created_by: ActorRef::Human(human_id.clone()),
+            created_at: now.clone(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &work_unit_id,
+            &task_id,
+            &human_id,
+        ),
+    )
+    .await
+    .expect("WorkUnit without provenance");
+
+    let update = sqlx::query("UPDATE work_unit SET task_id = ? WHERE id = ?")
+        .bind(&other_task_id)
+        .bind(&work_unit_id)
+        .execute(db.pool())
+        .await;
+    assert!(update.is_err(), "direct Task rebinding must fail");
+    assert_eq!(
+        WorkUnitRepo::get_by_id(&db, &work_unit_id)
+            .await
+            .expect("WorkUnit lookup")
+            .expect("WorkUnit remains present")
+            .task_id,
+        task_id,
+        "failed rebinding leaves original Task ownership intact",
+    );
+}
+
+#[tokio::test]
 async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     let db = database().await;
     let now = now_rfc3339();
