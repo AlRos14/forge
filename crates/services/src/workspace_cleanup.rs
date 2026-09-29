@@ -287,6 +287,13 @@ impl WorkspaceCleanupScheduler {
                 )))
             }
         }
+        let manager = WorkspaceManager::new(self.workspace_root.clone());
+        match manager.cleanup_worktree(&workspace.task_id).await {
+            Ok(()) | Err(WorkspaceError::NotFound) => {}
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(error.to_string()));
+            }
+        }
         let now = now_rfc3339();
         let workspace = WorkspaceRepo::mark_cleaned(&*self.db, workspace_id, &now).await?;
         info!(
