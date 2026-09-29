@@ -48,6 +48,7 @@ pub mod product_genesis;
 pub(crate) mod project_actor_scope;
 pub mod project_agent_actions;
 pub mod project_creation;
+pub mod project_deletion;
 pub mod project_documents;
 pub mod project_hooks;
 pub mod project_member_service;

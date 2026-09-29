@@ -26,7 +26,8 @@ use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AssigneeKind, CreateTerminalSession, ExecutionRepo,
     ProjectRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, TaskRoleRepo, TerminalSession,
     TerminalSessionRepo, TerminalSessionStatus as DbTerminalSessionStatus,
-    UpdateTerminalSessionStatus, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    UpdateTerminalSessionStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -38,6 +39,7 @@ use tokio::{
 
 use crate::{
     daemon_transport::{DaemonConnectionRegistry, DaemonTerminalEventHandler},
+    task_integration_operation::TaskIntegrationOperationManager,
     workflow::{effective_role, engine::WorkflowEngine},
     workspace_cleanup::WorkspaceCleanupObserver,
     ServiceError, WorkspaceExecutionLockManager,
@@ -749,9 +751,21 @@ impl TerminalService {
         let workspace = WorkspaceRepo::get_by_task_id(&*self.db, task_id)
             .await?
             .ok_or(ServiceError::TerminalWorkspaceNotReady)?;
+        let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+            .await?
+            .ok_or(ServiceError::TerminalWorkspaceNotReady)?;
+        if scope.kind != WorkspaceScopeKind::Integration || scope.task_id != task_id {
+            return Err(ServiceError::TerminalWorkspaceNotReady);
+        }
         if !self.workspace_ready_for_terminal(&task, &workspace).await? {
             return Err(ServiceError::TerminalWorkspaceNotReady);
         }
+        TaskIntegrationOperationManager::new(
+            Arc::clone(&self.db),
+            self.workspace_root.clone(),
+        )
+        .reconcile_stale(task_id)
+        .await?;
         Ok((task, workspace))
     }
 

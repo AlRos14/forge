@@ -431,7 +431,12 @@ pub async fn delete_project(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    ProjectRepo::delete(&*state.db, &id).await?;
+    services::project_deletion::delete_project(
+        state.db.clone(),
+        state.cleanup_scheduler.workspace_root(),
+        &id,
+    )
+    .await?;
     state.event_bus.publish(ForgeEvent {
         event_type: "project.deleted".to_owned(),
         entity_id: id,

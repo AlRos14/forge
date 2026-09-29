@@ -9,6 +9,8 @@ use db::{
     WorkUnitExecutionRepo, WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus,
     WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
+use std::path::Path;
+use tempfile::TempDir;
 
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
@@ -140,6 +142,419 @@ fn work_unit_lease(binding: WorkUnitLeaseBinding<'_>) -> CreateWorkspaceLease {
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+struct CleanupAdmissionFixture {
+    project_id: String,
+    task_id: String,
+    repo_id: String,
+    human_id: String,
+    agent_id: String,
+    work_unit_id: String,
+    workspace_id: String,
+    task_version: i64,
+}
+
+async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissionFixture {
+    let now = now_rfc3339();
+    let fixture = CleanupAdmissionFixture {
+        project_id: new_uuid_v4(),
+        task_id: new_uuid_v4(),
+        repo_id: new_uuid_v4(),
+        human_id: new_uuid_v4(),
+        agent_id: new_uuid_v4(),
+        work_unit_id: new_uuid_v4(),
+        workspace_id: new_uuid_v4(),
+        task_version: 1,
+    };
+    db::UserRepo::create_user(
+        db,
+        &db::User {
+            id: fixture.human_id.clone(),
+            email: format!("{}@example.invalid", fixture.human_id),
+            password_hash: "unused".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Human");
+    ProjectRepo::create(
+        db,
+        CreateProject {
+            id: fixture.project_id.clone(),
+            name: "WorkUnit cleanup admission".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(fixture.human_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+    RepoRepo::create(
+        db,
+        CreateRepo {
+            id: fixture.repo_id.clone(),
+            project_id: fixture.project_id.clone(),
+            name: "repo".to_owned(),
+            remote_url: "https://example.invalid/repo.git".to_owned(),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Repository");
+    db::AgentRepo::create_identity_with_profile(
+        db,
+        db::CreateAgentIdentity {
+            id: fixture.agent_id.clone(),
+            name: "Cleanup race worker".to_owned(),
+            description: None,
+            max_concurrent_tasks: 4,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(fixture.human_id.clone()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        db::CreateAgentProfile {
+            id: new_uuid_v4(),
+            identity_id: fixture.agent_id.clone(),
+            backend_kind: "cli".to_owned(),
+            executor_type: "codex".to_owned(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Agent");
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: fixture.task_id.clone(),
+            project_id: fixture.project_id.clone(),
+            repo_id: Some(fixture.repo_id.clone()),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Cleanup race".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Task");
+    let role_id = new_uuid_v4();
+    TaskRoleRepo::create(
+        db,
+        CreateTaskRole {
+            id: role_id.clone(),
+            task_id: fixture.task_id.clone(),
+            role: "implementer".to_owned(),
+            coordination_mode: Some(CoordinationMode::Independent),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Task role");
+    RoleMembershipRepo::add(
+        db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role_id,
+            actor_kind: ActorKind::Agent,
+            actor_id: fixture.agent_id.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("role membership");
+    WorkUnitRepo::create(
+        db,
+        CreateWorkUnit {
+            id: fixture.work_unit_id.clone(),
+            task_id: fixture.task_id.clone(),
+            parent_work_unit_id: None,
+            title: "Cleanup race".to_owned(),
+            scope: "Repository work".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(ActorRef::Agent(fixture.agent_id.clone())),
+            requires_integration: true,
+            provenance: None,
+            created_by: ActorRef::Human(fixture.human_id.clone()),
+            created_at: now.clone(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &fixture.work_unit_id,
+            &fixture.task_id,
+            &fixture.human_id,
+        ),
+    )
+    .await
+    .expect("WorkUnit");
+    WorkUnitWorkspaceRepo::create_for_work_unit(
+        db,
+        CreateWorkUnitWorkspace {
+            workspace: CreateWorkspace {
+                id: fixture.workspace_id.clone(),
+                task_id: fixture.task_id.clone(),
+                repo_id: fixture.repo_id.clone(),
+                worktree_path: root.join("worktree").to_string_lossy().into_owned(),
+                branch: format!(
+                    "forge/work-unit/{}/{}/{}",
+                    fixture.task_id, fixture.work_unit_id, fixture.workspace_id
+                ),
+                status: WorkspaceStatus::Ready,
+                before_sha: Some("base-sha".to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            work_unit_id: fixture.work_unit_id.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit Workspace");
+    fixture
+}
+
+fn cleanup_admission_attempt(
+    fixture: &CleanupAdmissionFixture,
+) -> (CreateWorkUnitExecution, CreateDomainEvent) {
+    let execution = running_execution(
+        &fixture.task_id,
+        &fixture.workspace_id,
+        &fixture.agent_id,
+    );
+    let execution_id = execution.id.clone();
+    let task = fixture.task_id.as_str();
+    let lease = work_unit_lease(WorkUnitLeaseBinding {
+        task_id: task,
+        project_id: &fixture.project_id,
+        repo_id: &fixture.repo_id,
+        work_unit_id: &fixture.work_unit_id,
+        workspace_id: &fixture.workspace_id,
+        execution_id: &execution_id,
+        task_version: fixture.task_version,
+        agent_id: &fixture.agent_id,
+    });
+    (
+        CreateWorkUnitExecution {
+            execution,
+            work_unit_id: fixture.work_unit_id.clone(),
+            work_unit_version: 1,
+            workspace_lease: Some(lease),
+        },
+        execution_started_event(task, &execution_id, &fixture.agent_id),
+    )
+}
+
+#[tokio::test]
+async fn execution_admission_wins_over_cleanup_claim_across_sqlite_pools() {
+    let temp = TempDir::new().expect("temporary directory");
+    let database_path = temp.path().join("cleanup-admission.db");
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = create_sqlite_pool(&database_url).await.expect("first pool");
+    run_migrations(&pool).await.expect("migrations");
+    let db = SqliteDb::new(pool);
+    let fixture = cleanup_admission_fixture(&db, temp.path()).await;
+    let competing_pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("independent pool on the same database file");
+    let competing_db = SqliteDb::new(competing_pool);
+    let (attempt, event) = cleanup_admission_attempt(&fixture);
+    let execution_id = attempt.execution.id.clone();
+
+    WorkUnitExecutionRepo::create_for_work_unit(&db, attempt, event)
+        .await
+        .expect("Execution and active lease commit together first");
+    assert!(WorkspaceRepo::claim_work_unit_cleanup(
+        &competing_db,
+        &fixture.workspace_id,
+        &fixture.task_id,
+        &fixture.work_unit_id,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("cleanup claim checks durable authority")
+    .is_none());
+    assert_eq!(
+        WorkspaceRepo::get_by_id(&competing_db, &fixture.workspace_id)
+            .await
+            .expect("workspace lookup")
+            .expect("workspace exists")
+            .status,
+        WorkspaceStatus::Ready
+    );
+
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution_id,
+            status: Some(ExecutionStatus::Failed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("execution stops while lease authority remains active");
+    assert!(WorkspaceRepo::claim_work_unit_cleanup(
+        &competing_db,
+        &fixture.workspace_id,
+        &fixture.task_id,
+        &fixture.work_unit_id,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("active lease still blocks cleanup")
+    .is_none());
+}
+
+#[tokio::test]
+async fn cleanup_claim_wins_and_database_rejects_work_unit_execution_admission() {
+    let temp = TempDir::new().expect("temporary directory");
+    let database_path = temp.path().join("cleanup-claim.db");
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = create_sqlite_pool(&database_url).await.expect("first pool");
+    run_migrations(&pool).await.expect("migrations");
+    let db = SqliteDb::new(pool);
+    let fixture = cleanup_admission_fixture(&db, temp.path()).await;
+    let competing_pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("independent pool on the same database file");
+    let competing_db = SqliteDb::new(competing_pool);
+
+    let claimed = WorkspaceRepo::claim_work_unit_cleanup(
+        &db,
+        &fixture.workspace_id,
+        &fixture.task_id,
+        &fixture.work_unit_id,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("cleanup claim commits")
+    .expect("Ready Workspace has no competing execution or lease");
+    assert_eq!(claimed.status, WorkspaceStatus::Cleaning);
+
+    let (attempt, event) = cleanup_admission_attempt(&fixture);
+    let execution_id = attempt.execution.id.clone();
+    assert!(WorkUnitExecutionRepo::create_for_work_unit(&competing_db, attempt, event)
+        .await
+        .is_err());
+    let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE id = ?")
+        .bind(execution_id)
+        .fetch_one(competing_db.pool())
+        .await
+        .expect("rejected execution count");
+    let lease_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE workspace_id = ? AND status = 'active'")
+        .bind(&fixture.workspace_id)
+        .fetch_one(competing_db.pool())
+        .await
+        .expect("active lease count");
+    assert_eq!(execution_count, 0);
+    assert_eq!(lease_count, 0);
+}
+
+#[tokio::test]
+async fn active_task_operation_blocks_work_unit_cleanup_claim() {
+    let temp = TempDir::new().expect("temporary directory");
+    let db = database().await;
+    let fixture = cleanup_admission_fixture(&db, temp.path()).await;
+    let operation = TaskIntegrationOperationRepo::begin(
+        &db,
+        db::CreateTaskIntegrationOperation {
+            id: new_uuid_v4(),
+            task_id: fixture.task_id.clone(),
+            kind: db::TaskIntegrationOperationKind::WorkUnitWorkspacePrepare,
+            owner_id: fixture.work_unit_id.clone(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("active Task operation");
+
+    assert!(WorkspaceRepo::claim_work_unit_cleanup(
+        &db,
+        &fixture.workspace_id,
+        &fixture.task_id,
+        &fixture.work_unit_id,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("Task operation is in the atomic cleanup admission predicate")
+    .is_none());
+    TaskIntegrationOperationRepo::finish(
+        &db,
+        db::FinishTaskIntegrationOperation {
+            id: operation.id,
+            expected_version: operation.version,
+            status: db::TaskIntegrationOperationStatus::Failed,
+            updated_at: now_rfc3339(),
+            finished_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("operation is closed");
+    assert!(WorkspaceRepo::claim_work_unit_cleanup(
+        &db,
+        &fixture.workspace_id,
+        &fixture.task_id,
+        &fixture.work_unit_id,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("closed Task operation no longer blocks cleanup")
+    .is_some());
 }
 
 #[tokio::test]

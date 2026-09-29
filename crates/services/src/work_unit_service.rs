@@ -2527,6 +2527,19 @@ mod tests {
             .await
             .expect("first exact WorkUnit Execution and lease bind");
         let first_worktree = Path::new(&original_workspace.worktree_path);
+        cleanup
+            .cleanup_now(original_workspace.id.clone())
+            .await
+            .expect("active Execution prevents cleanup admission");
+        assert!(first_worktree.exists());
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&*db, &original_workspace.id)
+                .await
+                .expect("active Workspace lookup")
+                .expect("Workspace remains present")
+                .status,
+            WorkspaceStatus::Ready
+        );
         std::fs::write(
             first_worktree.join("kept-commit.txt"),
             "branch survives cleanup\n",
@@ -2558,11 +2571,46 @@ mod tests {
         )
         .await
         .expect("failed attempt remains historical");
+        let failed_lease = db::WorkspaceLeaseRepo::get_active_for_work_unit(
+            &*db,
+            &retryable_unit.id,
+        )
+        .await
+        .expect("failed attempt lease lookup")
+        .expect("failed attempt lease remains active until runner cleanup");
+        db::WorkspaceLeaseRepo::revoke(
+            &*db,
+            &failed_lease.id,
+            failed_lease.version,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("failed attempt authority is revoked before workspace cleanup");
+        WorkspaceRepo::claim_work_unit_cleanup(
+            &*db,
+            &original_workspace.id,
+            &task_id,
+            &retryable_unit.id,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("durable cleanup claim survives a process restart")
+        .expect("stopped Execution has no active lease authority");
+        assert!(WorkspaceRepo::list_pending_cleanup(&*db, &now_rfc3339())
+            .await
+            .expect("Cleaning Workspaces are recovery candidates")
+            .iter()
+            .any(|pending| pending.id == original_workspace.id));
         cleanup
             .cleanup_now(original_workspace.id.clone())
             .await
-            .expect("clean exact WorkUnit worktree");
+            .expect("resume cleanup from Cleaning while the exact branch exists");
         assert!(!first_worktree.exists());
+        assert!(Path::new(&second_workspace.worktree_path).exists());
+        assert!(integration_path.exists());
+        assert!(git::branch_exists(&repository_path, &second_workspace.branch)
+            .await
+            .expect("sibling branch remains untouched"));
         assert!(
             git::branch_exists(&repository_path, &original_workspace.branch)
                 .await
@@ -2645,15 +2693,50 @@ mod tests {
         )
         .await
         .expect("retry attempt can stop");
+        let retry_lease = db::WorkspaceLeaseRepo::get_active_for_work_unit(
+            &*db,
+            &retryable_unit.id,
+        )
+        .await
+        .expect("retry lease lookup")
+        .expect("retry lease remains active until runner cleanup");
+        db::WorkspaceLeaseRepo::revoke(
+            &*db,
+            &retry_lease.id,
+            retry_lease.version,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("retry authority is revoked before cleanup");
         cleanup
             .cleanup_now(recovered_workspace.id.clone())
             .await
             .expect("clean recovered exact Workspace");
 
+        WorkspaceRepo::claim_work_unit_cleanup(
+            &*db,
+            &second_workspace.id,
+            &task_id,
+            &second_unit.id,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("second sibling cleanup claim commits")
+        .expect("second sibling has no active authority");
+        manager
+            .cleanup_work_unit_worktree(
+                &repository_path.to_string_lossy(),
+                &task_id,
+                &second_unit.id,
+                &second_workspace.id,
+                &repo_id,
+            )
+            .await
+            .expect("simulate process exit after removing only the second worktree");
         cleanup
             .cleanup_now(second_workspace.id.clone())
             .await
-            .expect("exact WorkUnit workspace cleanup");
+            .expect("resume cleanup when the exact branch remains but worktree is gone");
         assert!(!Path::new(&second_workspace.worktree_path).exists());
         assert!(Path::new(&first_workspace.worktree_path).exists());
         assert!(integration_path.exists());
@@ -2670,6 +2753,62 @@ mod tests {
                 .status,
             WorkspaceStatus::Cleaned
         );
+
+        let (missing_branch_unit, missing_branch_workspace, _, _) = add_result(
+            &db,
+            &manager,
+            &repository_path,
+            &task_id,
+            &repo_id,
+            &human_id,
+            &agent_id,
+            "missing cleanup branch",
+            "missing-branch.txt",
+            "preserve or require explicit recovery\n",
+            &base_sha,
+        )
+        .await;
+        WorkspaceRepo::claim_work_unit_cleanup(
+            &*db,
+            &missing_branch_workspace.id,
+            &task_id,
+            &missing_branch_unit.id,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("missing-branch cleanup claim commits")
+        .expect("completed WorkUnit has no active execution or lease");
+        manager
+            .cleanup_work_unit_worktree(
+                &repository_path.to_string_lossy(),
+                &task_id,
+                &missing_branch_unit.id,
+                &missing_branch_workspace.id,
+                &repo_id,
+            )
+            .await
+            .expect("simulate crash after worktree removal");
+        run_git(
+            &repository_path,
+            &["branch", "-D", &missing_branch_workspace.branch],
+        )
+        .await;
+        cleanup
+            .cleanup_now(missing_branch_workspace.id.clone())
+            .await
+            .expect("scheduled cleanup reports a durable recovery-required state");
+        let missing_branch_record = WorkspaceRepo::get_by_id(&*db, &missing_branch_workspace.id)
+            .await
+            .expect("missing-branch workspace lookup")
+            .expect("workspace remains available for explicit recovery");
+        assert_eq!(missing_branch_record.status, WorkspaceStatus::Cleaning);
+        assert!(missing_branch_record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("explicit recovery or reset is required")));
+        assert!(Path::new(&first_workspace.worktree_path).exists());
+        assert!(integration_path.exists());
+
         cleanup
             .schedule(&integration_workspace.id, Duration::ZERO)
             .await

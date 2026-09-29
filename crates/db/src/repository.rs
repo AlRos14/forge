@@ -541,6 +541,25 @@ pub trait WorkspaceRepo: Send + Sync {
         cleanup_after: Option<String>,
         updated_at: &str,
     ) -> Result<Workspace>;
+    /// Atomically claim cleanup for one exact WorkUnit Workspace. Returns
+    /// `None` when its lifecycle or active execution/lease authority prevents
+    /// cleanup from starting.
+    async fn claim_work_unit_cleanup(
+        &self,
+        id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<Workspace>>;
+    /// Complete cleanup only for the exact WorkUnit Workspace currently in
+    /// the durable `cleaning` lifecycle state.
+    async fn finish_work_unit_cleanup(
+        &self,
+        id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        updated_at: &str,
+    ) -> Result<Workspace>;
     async fn mark_cleaned(&self, id: &str, updated_at: &str) -> Result<Workspace>;
     async fn list_pending_cleanup(&self, now: &str) -> Result<Vec<Workspace>>;
     async fn update_status(
@@ -637,6 +656,14 @@ pub trait TaskIntegrationOperationRepo: Send + Sync {
         input: CreateTaskIntegrationOperation,
     ) -> Result<TaskIntegrationOperation>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<TaskIntegrationOperation>>;
+    /// Called only while holding the Task's OS operation lock. It marks the
+    /// current process-dead `running` row abandoned without starting a new
+    /// operation, for consumers that only need stale-state reconciliation.
+    async fn abandon_stale(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<TaskIntegrationOperation>>;
     /// Called only while holding the Task's OS operation lock. It atomically
     /// marks a process-dead active row abandoned and installs the replacement.
     async fn recover_stale_and_begin(

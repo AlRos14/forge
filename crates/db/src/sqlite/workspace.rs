@@ -86,9 +86,96 @@ impl WorkspaceRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn claim_work_unit_cleanup(
+        &self,
+        id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<Workspace>> {
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET status = 'cleaning', cleanup_after = NULL, error = NULL, updated_at = ?
+             WHERE id = ? AND task_id = ? AND status = 'ready'
+               AND EXISTS (
+                   SELECT 1 FROM workspace_scope ws
+                   JOIN work_unit wu ON wu.id = ws.work_unit_id AND wu.task_id = ws.task_id
+                   WHERE ws.workspace_id = workspace.id AND ws.task_id = workspace.task_id
+                     AND ws.scope_kind = 'work_unit' AND ws.work_unit_id = ?
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution e
+                   WHERE e.workspace_id = workspace.id AND e.status = 'running'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM workspace_lease wl
+                   WHERE wl.workspace_id = workspace.id AND wl.status = 'active'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_integration_operation op
+                   WHERE op.task_id = workspace.task_id AND op.status = 'running'
+               )",
+        )
+        .bind(updated_at)
+        .bind(id)
+        .bind(task_id)
+        .bind(work_unit_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Ok(None);
+        }
+        WorkspaceRepo::get_by_id(self, id).await
+    }
+
+    async fn finish_work_unit_cleanup(
+        &self,
+        id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        updated_at: &str,
+    ) -> Result<Workspace> {
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ?
+             WHERE id = ? AND task_id = ? AND status = 'cleaning'
+               AND EXISTS (
+                   SELECT 1 FROM workspace_scope ws
+                   JOIN work_unit wu ON wu.id = ws.work_unit_id AND wu.task_id = ws.task_id
+                   WHERE ws.workspace_id = workspace.id AND ws.task_id = workspace.task_id
+                     AND ws.scope_kind = 'work_unit' AND ws.work_unit_id = ?
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution e
+                   WHERE e.workspace_id = workspace.id AND e.status = 'running'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM workspace_lease wl
+                   WHERE wl.workspace_id = workspace.id AND wl.status = 'active'
+               )",
+        )
+        .bind(updated_at)
+        .bind(id)
+        .bind(task_id)
+        .bind(work_unit_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        WorkspaceRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
     async fn mark_cleaned(&self, id: &str, updated_at: &str) -> Result<Workspace> {
         let result = sqlx::query(
-            "UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ?
+             WHERE id = ? AND EXISTS (
+                 SELECT 1 FROM workspace_scope ws
+                 WHERE ws.workspace_id = workspace.id AND ws.task_id = workspace.task_id
+                   AND ws.scope_kind = 'integration'
+             )",
         )
         .bind(updated_at)
         .bind(id)
@@ -104,7 +191,16 @@ impl WorkspaceRepo for SqliteDb {
 
     async fn list_pending_cleanup(&self, now: &str) -> Result<Vec<Workspace>> {
         let rows = sqlx::query(
-            "SELECT * FROM workspace WHERE cleanup_after IS NOT NULL AND cleanup_after <= ? AND status != 'cleaned' ORDER BY cleanup_after ASC, id ASC",
+            "SELECT * FROM workspace
+             WHERE (status = 'cleaning' AND error IS NULL AND EXISTS (
+                       SELECT 1 FROM workspace_scope ws
+                       WHERE ws.workspace_id = workspace.id
+                         AND ws.task_id = workspace.task_id
+                         AND ws.scope_kind = 'work_unit'
+                   ))
+                OR (cleanup_after IS NOT NULL AND cleanup_after <= ?
+                    AND status NOT IN ('cleaned', 'cleaning'))
+             ORDER BY COALESCE(cleanup_after, updated_at) ASC, id ASC",
         )
         .bind(now)
         .fetch_all(&self.pool)

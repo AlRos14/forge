@@ -161,7 +161,14 @@ Publication, WorkUnit workspace preparation, WorkUnit creation, and
 integration-workspace cleanup share the Task integration lock. Operations that
 touch the integration worktree also take its exact Workspace lock, which is
 shared with Task-level terminals. WorkUnit workspace cleanup and Execution
-admission share the WorkUnit's exact Workspace lock.
+admission share an in-process Workspace lock and a durable SQLite lifecycle
+boundary. Cleanup claims the exact `Ready` Workspace as `Cleaning` only when no
+running Execution, active WorkspaceLease, or Task integration operation exists;
+the Execution admission trigger requires `Ready` in the transaction that
+creates its Execution and lease. Cleanup also holds the existing canonical
+Task operation file lock while reconciling stale Task operations and performing
+Git cleanup; it creates no second Task operation row. This lock serializes
+filesystem effects, while the Workspace lifecycle remains the durable claim.
 Cleanup retains the Task integration workspace once WorkUnits exist and does
 not capture the legacy plan on that path. An active durable WorkUnit
 integration makes final delivery fail closed.
@@ -176,12 +183,15 @@ Git or provider work begins; it is never held open across those operations. A
 process-lifetime OS file lock is held beside the database (or in the workspace
 root for in-memory databases). It proves whether a persisted owner is still
 alive; a contender must acquire it before marking an old row `abandoned` and
-inserting its own row. Normal completion records `succeeded`, `conflict`, or
-`failed`. A crash releases the OS lock, so the next claimant can recover the
-durable row without a timeout expiring during long Git work. The fixed lock
-file is retained to avoid an unlink/recreate race. Active integration-scope
-terminal sessions and these operations reject each other through SQLite
-guards.
+inserting its own row. Terminal admission and Project deletion reconcile stale
+rows under this same lock before relying on the database guard. Normal
+completion records `succeeded`, `conflict`, or `failed`. A crash releases the
+OS lock, so the next claimant or guarded consumer can reconcile the durable row
+without a timeout expiring during long Git work. A claim whose process lock
+cannot be established is abandoned before the original lock error is returned.
+The fixed lock file is retained to avoid an unlink/recreate race. Active
+integration-scope terminal sessions and these operations reject each other
+through SQLite guards.
 
 V092 adds this operation ledger and types newly written Actor provenance as an
 `ActorRef`. It backfills old Actor provenance only when its ID resolves to
@@ -201,12 +211,14 @@ source commits, the durable attempt converges to success. A different target
 HEAD is recorded as `failed` with `target_head_mismatch` and left untouched.
 PR5 never resets the integration workspace to recover an attempt.
 
-After exact WorkUnit cleanup, `Cleaning` remains unavailable. A `Cleaned`
-WorkUnit workspace can be prepared again in place when its preserved branch
-still exists, retaining its Workspace ID, WorkUnit ID, branch, and scope while
-rebuilding the worktree and setting it to `Ready`. If that exact branch is
-missing, preparation fails with an explicit reset/recovery-required error; it
-does not recreate from the old base SHA and risk losing a prior attempt.
+After cleanup claims a WorkUnit Workspace, `Cleaning` remains unavailable to
+new Executions. If the process stops before or during Git cleanup, another
+cleanup pass resumes from the exact persisted branch and never deletes that
+branch. A `Cleaned` WorkUnit workspace can be prepared again in place when its
+preserved branch still exists, retaining its Workspace ID, WorkUnit ID, branch,
+and scope while rebuilding the worktree and setting it to `Ready`. If that
+exact branch is missing, cleanup or preparation fails with an explicit
+reset/recovery-required error; neither recreates from the old base SHA.
 
 `rejected` remains in the planned/public outcome vocabulary but PR5 does not
 emit it. It is reserved for an explicit policy or user refusal before Git

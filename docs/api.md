@@ -322,9 +322,10 @@ reference that cannot be resolved unambiguously is returned as
 WorkUnit integration, final Task merge, PR publication, and other exclusive
 integration-workspace operations share one durable per-Task claim. Concurrent
 requests from another service instance receive a conflict while that claim is
-owned. A crash releases the process lock; the next claimant can then mark the
-previous row abandoned and proceed. This claim is local to the Task integration
-workspace and does not serialize independent WorkUnit workspaces.
+owned. A crash releases the process lock; the next claimant, terminal admission,
+or Project deletion can mark the previous row abandoned while holding that
+same lock. This claim is local to the Task integration workspace and does not
+serialize independent WorkUnit workspace execution.
 
 An Execution start/bind entry point is currently available through the typed
 service path; no WorkUnit scheduler or automatic dispatch endpoint is exposed.

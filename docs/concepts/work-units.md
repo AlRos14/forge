@@ -104,10 +104,21 @@ SQLite guards. Recovery retries from the recorded target-before SHA, recognizes
 an exact already-materialized result, and fails closed on an unrelated target
 HEAD without resetting it.
 
-Cleaning a WorkUnit workspace leaves its branch in place. A `Cleaned` workspace
-can be rebuilt with the same Workspace identity from that exact branch. If the
-branch is missing, preparation requires explicit reset or recovery rather than
-rebuilding from an older base and potentially discarding commits.
+Cleanup atomically claims a `Ready` WorkUnit workspace as `Cleaning` only when
+it has no running Execution or active WorkspaceLease. WorkUnit Execution
+admission requires that exact workspace to remain `Ready`, so SQLite decides
+whether admission or cleanup wins across server processes. Cleanup also holds
+the canonical Task operation file lock while it runs Git cleanup and reconciles
+stale Task operations. The file lock serializes filesystem effects; it does not
+grant cleanup authority.
+
+`Cleaning` can be resumed after a crash. Recovery removes only the exact
+WorkUnit worktree and leaves its branch in place. If the branch is missing or
+the recorded branch/path no longer matches the WorkUnit identity, the workspace
+stays unavailable and requires explicit recovery. A `Cleaned` workspace can be
+rebuilt with the same Workspace identity from that exact branch. Neither path
+recreates content from an older base SHA or changes sibling workspaces,
+branches, or the Task integration workspace.
 
 ## Plan relationship
 

@@ -61,6 +61,40 @@ async fn load_operation(
     map_operation(row)
 }
 
+async fn abandon_running_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    updated_at: &str,
+) -> Result<Option<TaskIntegrationOperation>> {
+    let Some(active) = sqlx::query(
+        "SELECT * FROM task_integration_operation
+         WHERE task_id = ? AND status = 'running'",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let active = map_operation(active)?;
+    let updated = sqlx::query(
+        "UPDATE task_integration_operation
+         SET status = 'abandoned', version = version + 1,
+             updated_at = ?, finished_at = ?
+         WHERE id = ? AND version = ? AND status = 'running'",
+    )
+    .bind(updated_at)
+    .bind(updated_at)
+    .bind(&active.id)
+    .bind(active.version)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(DbError::VersionConflict);
+    }
+    load_operation(tx, &active.id).await.map(Some)
+}
+
 #[async_trait]
 impl TaskIntegrationOperationRepo for SqliteDb {
     async fn begin(
@@ -86,37 +120,24 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         .transpose()
     }
 
+    async fn abandon_stale(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<TaskIntegrationOperation>> {
+        let mut tx = self.pool.begin().await?;
+        let abandoned = abandon_running_in_tx(&mut tx, task_id, updated_at).await?;
+        tx.commit().await?;
+        Ok(abandoned)
+    }
+
     async fn recover_stale_and_begin(
         &self,
         input: CreateTaskIntegrationOperation,
         updated_at: &str,
     ) -> Result<TaskIntegrationOperation> {
         let mut tx = self.pool.begin().await?;
-        if let Some(active) = sqlx::query(
-            "SELECT * FROM task_integration_operation
-             WHERE task_id = ? AND status = 'running'",
-        )
-        .bind(&input.task_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            let active = map_operation(active)?;
-            let updated = sqlx::query(
-                "UPDATE task_integration_operation
-                 SET status = 'abandoned', version = version + 1,
-                     updated_at = ?, finished_at = ?
-                 WHERE id = ? AND version = ? AND status = 'running'",
-            )
-            .bind(updated_at)
-            .bind(updated_at)
-            .bind(&active.id)
-            .bind(active.version)
-            .execute(&mut *tx)
-            .await?;
-            if updated.rows_affected() != 1 {
-                return Err(DbError::VersionConflict);
-            }
-        }
+        abandon_running_in_tx(&mut tx, &input.task_id, updated_at).await?;
         insert_operation(&mut tx, &input).await?;
         let operation = load_operation(&mut tx, &input.id).await?;
         tx.commit().await?;
