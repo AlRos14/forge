@@ -84,6 +84,17 @@ The context builder reads same-Task TaskRole/memberships, WorkUnits and readines
 
 The fixed PR6 v1 runtime policy reference/digest is recorded with each wake. In addition, the TaskRole snapshot schema is version 1: `{}` defaults to automatic Agent dispatch, all four typed actions, at most 16 actions per Execution, and at most four WorkUnit creations. The allowlist can only restrict actions and both numeric values can only lower those limits. PR6 rejects duplicate/unknown action names, unknown fields, malformed values, and unsupported schema versions at dispatch; valid unknown JSON is retained in storage so a future implementation can interpret it, but current PR6 never silently ignores it. Message, Handoff, bounded WorkUnit creation, and Proposal are the supported typed output actions. A Message communicates but grants no authority. A Handoff directs intent toward an existing TaskRole, Actor, or WorkUnit but never changes RoleMembership. An Execution may create at most four WorkUnits, each through `WorkUnitService`, with title ≤512 bytes, scope ≤4096 bytes, and role ≤128 bytes. A WorkUnit-scoped wake may create only a child of that exact WorkUnit; its Messages, Handoffs, and Proposals remain in that same WorkUnit scope. Stable action result IDs make retries idempotent, and created WorkUnits inherit the wake correlation and causation. Creation does not allocate a workspace or start an Execution. A Proposal and Decision record intent/outcome only.
 
+V096 closes the cross-process policy TOCTOU at the effect transaction boundary.
+The shared `domain_event` insert guard maps each reserved action result ID to
+its exact action type and verifies the completed orchestrator Execution, its
+current wake attempt, active membership, current TaskRole version/policy JSON/
+coordination snapshot, same-Task effect, and exact `execution.started`
+correlation/causation. The entity row and event are written by one SQLite
+transaction, so a stale snapshot aborts both. That guard error maps to a
+deterministic PR6 stale-action error and terminal reconciliation fails the old
+wake; it is not a transient retry. Existing completed action replay remains
+idempotent on `execution_id + action_index`, digest, and stable `result_id`.
+
 `stop`, `cancel`, `reassign`, `discard`, `invalidate`, `merge`, and `override` are protected actions. PR6 may record a Proposal with exact target/version/digest and policy reference; it does not turn an approval Decision into an automatic mutation. Any later action executor must recheck the exact Proposal, Decision, target/version/digest, and policy identity. No model-selected exception can bypass the deterministic policy. No raw SQL, arbitrary Git command, or unbounded workspace write is exposed.
 
 PR6 has no direct Harness steering, stopping, or resuming action. Messages and Handoffs preserve communication intent only; the implementation does not report them as native, emulated, queued, or successful live steering. A future typed steering operation must query the exact target Execution's HarnessAdapter capability and preserve each support level distinctly.
@@ -109,7 +120,7 @@ Causation depth is preserved and bounded by the existing 0–16 ledger constrain
 
 ## Tests
 
-Focused `pr6_` tests cover source-event replay/lease competition, event classification and orchestrator no-ping-pong, exact TaskRole/Actor/WorkUnit targeting, Human-vs-Agent dispatch, every coordination mode, capacity retry, fresh Execution/Start semantics, typed collaboration and WorkUnit action idempotency, protected-action fail-closed behavior, TaskDispatcher compatibility, V095 upgrade bootstrap including ambiguous independent targeting, new-Task/member activation, and TaskRole policy snapshot/replay. The service tests use the Harness adapter boundary with a recording executor; they do not prove external daemon, provider, or network behavior.
+Focused `pr6_` tests cover source-event replay/lease competition, event classification and orchestrator no-ping-pong, exact TaskRole/Actor/WorkUnit targeting, Human-vs-Agent dispatch, every coordination mode, capacity retry, fresh Execution/Start semantics, typed collaboration and WorkUnit action idempotency, protected-action fail-closed behavior, TaskDispatcher compatibility, V095 upgrade bootstrap including ambiguous independent targeting, new-Task/member activation, TaskRole policy snapshot/replay, and V096 atomic effect rollback for each typed action mapping. The service tests use the Harness adapter boundary with a recording executor; they do not prove external daemon, provider, or network behavior.
 
 Baseline validation recorded before V095:
 

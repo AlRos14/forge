@@ -20,8 +20,8 @@ use crate::{
     SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
     TaskRoleAssignmentRepo, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
     UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    UpdateTask, UpdateTaskRole, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon,
+    WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -1438,6 +1438,437 @@ async fn seed_pr6_orchestrator_event(
     .await
     .expect("durable event appends");
     (task_id, agent_id, role.id, event)
+}
+
+#[derive(Clone, Copy)]
+enum Pr6ActionEffect {
+    Message,
+    Handoff,
+    WorkUnit,
+    Proposal,
+}
+
+impl Pr6ActionEffect {
+    fn action_type(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Handoff => "handoff",
+            Self::WorkUnit => "work_unit",
+            Self::Proposal => "proposal",
+        }
+    }
+
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::Message => "message.created",
+            Self::Handoff => "handoff.created",
+            Self::WorkUnit => "work_unit.created",
+            Self::Proposal => "proposal.created",
+        }
+    }
+
+    fn entity_type(self) -> &'static str {
+        self.action_type()
+    }
+}
+
+async fn write_pr6_action_effect(
+    db: &SqliteDb,
+    effect: Pr6ActionEffect,
+    result_id: &str,
+    task_id: &str,
+    role_id: &str,
+    actor_id: &str,
+    execution_id: &str,
+    start_event: &crate::DomainEvent,
+) -> crate::Result<()> {
+    let now = now_rfc3339();
+    let mut transaction = db.pool().begin().await?;
+    match effect {
+        Pr6ActionEffect::Message => {
+            sqlx::query(
+                "INSERT INTO message (
+                    id, task_id, sender_actor_kind, sender_actor_id, target_kind,
+                    target_actor_kind, target_actor_id, target_role_id, body, created_at
+                 ) VALUES (?, ?, 'agent', ?, 'task', NULL, NULL, NULL, 'message', ?)",
+            )
+            .bind(result_id)
+            .bind(task_id)
+            .bind(actor_id)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        Pr6ActionEffect::Handoff => {
+            sqlx::query(
+                "INSERT INTO handoff (
+                    id, task_id, created_by_actor_kind, created_by_actor_id,
+                    source_role_id, target_kind, target_actor_kind, target_actor_id,
+                    target_role_id, intent, parent_execution_id, expected_policy_ref,
+                    status, version, created_at, updated_at
+                 ) VALUES (?, ?, 'agent', ?, ?, 'task', NULL, NULL, NULL,
+                           'question', ?, 'forge.orchestrator.wake-policy',
+                           'pending', 1, ?, ?)",
+            )
+            .bind(result_id)
+            .bind(task_id)
+            .bind(actor_id)
+            .bind(role_id)
+            .bind(execution_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        Pr6ActionEffect::WorkUnit => {
+            sqlx::query(
+                "INSERT INTO work_unit (
+                    id, task_id, title, scope, status, role, requires_integration,
+                    created_by_kind, created_by_id, version, created_at, updated_at
+                 ) VALUES (?, ?, 'action result', 'bounded test scope', 'open',
+                           'orchestrator', 0, 'agent', ?, 1, ?, ?)",
+            )
+            .bind(result_id)
+            .bind(task_id)
+            .bind(actor_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        Pr6ActionEffect::Proposal => {
+            sqlx::query(
+                "INSERT INTO proposal (
+                    id, task_id, proposer_actor_kind, proposer_actor_id,
+                    target_kind, target_id, action, reason, target_version,
+                    status, created_at
+                 ) VALUES (?, ?, 'agent', ?, 'task', ?, 'merge', 'test proposal',
+                           1, 'open', ?)",
+            )
+            .bind(result_id)
+            .bind(task_id)
+            .bind(actor_id)
+            .bind(task_id)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+
+    let event = crate::CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: effect.event_type().to_owned(),
+        entity_type: effect.entity_type().to_owned(),
+        entity_id: result_id.to_owned(),
+        actor_type: "agent".to_owned(),
+        actor_id: Some(actor_id.to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: task_id.to_owned(),
+        correlation_id: start_event.correlation_id.clone(),
+        causation_id: Some(start_event.id.clone()),
+        causation_depth: start_event.causation_depth + 1,
+        dedupe_key: None,
+        payload_json: "{}".to_owned(),
+        created_at: now,
+    };
+    if let Err(error) = DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await {
+        transaction.rollback().await?;
+        return Err(error.into());
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
+    let db = sqlite_db().await;
+    let (task_id, agent_id, role_id, source_event) = seed_pr6_orchestrator_event(&db).await;
+    let now = now_rfc3339();
+    let wake_id = new_uuid_v4();
+    OrchestratorWakeRepo::admit_orchestrator_wake(
+        &db,
+        CreateOrchestratorWake {
+            id: wake_id.clone(),
+            event_id: source_event.id.clone(),
+            event_sequence: source_event.sequence,
+            task_id: task_id.clone(),
+            task_role_id: role_id.clone(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            work_unit_id: None,
+            correlation_id: source_event.correlation_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+            policy_version: 1,
+            policy_digest: "digest-v1".to_owned(),
+            task_role_version: 1,
+            task_role_policy_json: "{}".to_owned(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("wake admits under the initial TaskRole snapshot");
+    OrchestratorWakeRepo::claim_orchestrator_wake(
+        &db,
+        ClaimOrchestratorWake {
+            lease_owner: "pr6-effect-guard".to_owned(),
+            now: now.clone(),
+            leased_until: "2026-10-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("wake claim succeeds")
+    .expect("wake is leased");
+    let execution_id = new_uuid_v4();
+    let attempt = OrchestratorWakeRepo::reserve_orchestrator_wake_execution(
+        &db,
+        crate::ReserveOrchestratorWakeExecution {
+            wake_id: wake_id.clone(),
+            lease_owner: "pr6-effect-guard".to_owned(),
+            execution_id: execution_id.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("exact attempt reserves");
+    let started_event_id = new_uuid_v4();
+    ExecutionRepo::create_orchestrator_execution(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            role: "orchestrator".to_owned(),
+            purpose: Some(crate::ExecutionPurpose::Orchestrate),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(r#"{"actions":[]}"#.to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some("{}".to_owned()),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        &wake_id,
+        attempt.attempt_number,
+        "pr6-effect-guard",
+        CreateDomainEvent {
+            id: started_event_id,
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: source_event.correlation_id.clone(),
+            causation_id: Some(source_event.id),
+            causation_depth: 1,
+            dedupe_key: Some(format!("execution.started:{execution_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Execution start and provenance event are durable");
+    OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+        &db,
+        crate::TransitionOrchestratorWakeExecution {
+            wake_id: wake_id.clone(),
+            attempt_number: attempt.attempt_number,
+            execution_id: execution_id.clone(),
+            lease_owner: None,
+            expected_state: Some("reserved".to_owned()),
+            state: "running".to_owned(),
+            last_error: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("attempt is running");
+    OrchestratorWakeRepo::transition_orchestrator_wake(
+        &db,
+        crate::TransitionOrchestratorWake {
+            id: wake_id.clone(),
+            expected_state: Some(crate::OrchestratorWakeState::Leased),
+            lease_owner: None,
+            state: crate::OrchestratorWakeState::Running,
+            available_at: None,
+            current_attempt: None,
+            last_error: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("wake enters terminal reconciliation state");
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution_id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("exact orchestrator Execution completes");
+    let start_event =
+        DomainEventRepo::get_event_by_dedupe(&db, &format!("execution.started:{execution_id}"))
+            .await
+            .expect("start event lookup succeeds")
+            .expect("exact start event exists");
+
+    let effects = [
+        Pr6ActionEffect::Message,
+        Pr6ActionEffect::Handoff,
+        Pr6ActionEffect::WorkUnit,
+        Pr6ActionEffect::Proposal,
+    ];
+    let result_ids = effects.map(|_| new_uuid_v4());
+    for (index, effect) in effects.into_iter().enumerate() {
+        OrchestratorWakeRepo::reserve_orchestrator_action(
+            &db,
+            ReserveOrchestratorAction {
+                execution_id: execution_id.clone(),
+                action_index: index as i64,
+                action_type: effect.action_type().to_owned(),
+                action_digest: format!("digest-{index}"),
+                result_id: result_ids[index].clone(),
+                now: now.clone(),
+            },
+        )
+        .await
+        .expect("typed action reserves under current policy");
+    }
+    for (effect, result_id) in effects.into_iter().zip(result_ids.iter()) {
+        write_pr6_action_effect(
+            &db,
+            effect,
+            result_id,
+            &task_id,
+            &role_id,
+            &agent_id,
+            &execution_id,
+            &start_event,
+        )
+        .await
+        .expect("current TaskRole snapshot permits effect and event atomically");
+    }
+
+    let stale_result_ids = effects.map(|_| new_uuid_v4());
+    for (index, effect) in effects.into_iter().enumerate() {
+        OrchestratorWakeRepo::reserve_orchestrator_action(
+            &db,
+            ReserveOrchestratorAction {
+                execution_id: execution_id.clone(),
+                action_index: (index + effects.len()) as i64,
+                action_type: effect.action_type().to_owned(),
+                action_digest: format!("stale-digest-{index}"),
+                result_id: stale_result_ids[index].clone(),
+                now: now.clone(),
+            },
+        )
+        .await
+        .expect("second typed action set is reserved while policy P1 is current");
+    }
+    TaskRoleRepo::update(
+        &db,
+        UpdateTaskRole {
+            id: role_id.clone(),
+            expected_version: 1,
+            coordination_mode: None,
+            policy_json: Some(r#"{"allowed_actions":["message"]}"#.to_owned()),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("TaskRole changes to policy P2 after admission");
+
+    for (effect, result_id) in effects.into_iter().zip(stale_result_ids.iter()) {
+        let error = write_pr6_action_effect(
+            &db,
+            effect,
+            result_id,
+            &task_id,
+            &role_id,
+            &agent_id,
+            &execution_id,
+            &start_event,
+        )
+        .await
+        .expect_err("stale snapshot aborts the effect transaction");
+        assert!(matches!(error, DbError::StaleOrchestratorAction));
+        let effect_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE id = ?",
+            effect.entity_type()
+        ))
+        .bind(result_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("effect rollback is visible");
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE entity_id = ? AND event_type = ?",
+        )
+        .bind(result_id)
+        .bind(effect.event_type())
+        .fetch_one(db.pool())
+        .await
+        .expect("event rollback is visible");
+        assert_eq!(
+            effect_count,
+            0,
+            "stale {} row rolls back",
+            effect.action_type()
+        );
+        assert_eq!(
+            event_count,
+            0,
+            "stale {} event rolls back",
+            effect.action_type()
+        );
+    }
+
+    let normal_message_id = new_uuid_v4();
+    write_pr6_action_effect(
+        &db,
+        Pr6ActionEffect::Message,
+        &normal_message_id,
+        &task_id,
+        &role_id,
+        &agent_id,
+        &execution_id,
+        &start_event,
+    )
+    .await
+    .expect("ordinary Agent Message without an orchestrator_action remains writable");
 }
 
 #[tokio::test]

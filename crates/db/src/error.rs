@@ -16,6 +16,9 @@ pub enum DbError {
     #[error("idempotency key conflicts with a different mutation")]
     IdempotencyConflict,
 
+    #[error("orchestrator action authority became stale before its effect was written")]
+    StaleOrchestratorAction,
+
     #[error("a Task integration operation is already active")]
     TaskIntegrationOperationBusy,
 

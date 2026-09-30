@@ -67,6 +67,16 @@ match that snapshot. A TaskRole-change event uses the current mode's targeting
 rules and does not turn an ambiguous independent or partitioned role update
 into a generic fanout.
 
+V096 also rechecks the exact TaskRole version, policy JSON, coordination mode,
+active membership, wake attempt, Execution, and event provenance inside the
+same SQLite transaction that writes a typed action's Message, Handoff,
+WorkUnit, or Proposal. The `domain_event` insert is the shared guard boundary;
+if the snapshot became stale after action reservation, the guard aborts and the
+entity row and event roll back together. That deterministic stale-authority
+error fails the old wake rather than entering transient retries. Human and
+ordinary Agent writes without a matching `orchestrator_action.result_id` do not
+enter this guard.
+
 ## Responsibilities
 
 The following responsibility and wake lists describe the target architecture;
