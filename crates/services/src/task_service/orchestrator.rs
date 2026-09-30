@@ -1,4 +1,5 @@
 use super::*;
+use crate::orchestrator_runtime::TaskRoleOrchestratorPolicy;
 use db::{
     ActorKind, ActorRef, CreateDomainEvent, CreateExecution, DomainEventRepo, OrchestratorWake,
     OrchestratorWakeExecution, OrchestratorWakeRepo, RoleMembershipRepo, RoleMembershipStatus,
@@ -44,9 +45,21 @@ impl TaskService {
         let role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
-        if role.task_id != execution.task_id || role.role != "orchestrator" {
+        if role.task_id != execution.task_id
+            || role.role != "orchestrator"
+            || role.coordination_mode != wake.coordination_mode
+            || role.version != wake.task_role_version
+            || role.policy_json != wake.task_role_policy_json
+        {
             return Err(ServiceError::invalid_operation(
-                "orchestrator Execution TaskRole binding is invalid",
+                "orchestrator Execution TaskRole version or policy binding is invalid",
+            ));
+        }
+        let policy = TaskRoleOrchestratorPolicy::parse(&role.policy_json)
+            .map_err(ServiceError::invalid_operation)?;
+        if !policy.permits_automatic_orchestration() {
+            return Err(ServiceError::invalid_operation(
+                "TaskRole policy disables automatic Agent orchestration",
             ));
         }
         let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
@@ -85,9 +98,21 @@ impl TaskService {
         let task_role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
-        if task_role.task_id != task.id || task_role.role != "orchestrator" {
+        if task_role.task_id != task.id
+            || task_role.role != "orchestrator"
+            || task_role.coordination_mode != wake.coordination_mode
+            || task_role.version != wake.task_role_version
+            || task_role.policy_json != wake.task_role_policy_json
+        {
             return Err(ServiceError::invalid_operation(
-                "orchestrator wake no longer resolves to its exact TaskRole",
+                "orchestrator wake no longer resolves to its exact TaskRole policy snapshot",
+            ));
+        }
+        let policy = TaskRoleOrchestratorPolicy::parse(&task_role.policy_json)
+            .map_err(ServiceError::invalid_operation)?;
+        if !policy.permits_automatic_orchestration() {
+            return Err(ServiceError::invalid_operation(
+                "TaskRole policy disables automatic Agent orchestration",
             ));
         }
         let memberships = RoleMembershipRepo::list_by_role(&*self.db, &task_role.id, false).await?;
@@ -175,6 +200,8 @@ impl TaskService {
             "policy_ref": wake.policy_ref,
             "policy_version": wake.policy_version,
             "policy_digest": wake.policy_digest,
+            "task_role_version": wake.task_role_version,
+            "task_role_policy_json": wake.task_role_policy_json,
         });
         snapshot = serde_json::to_string(&snapshot_value)
             .map_err(|_| ServiceError::invalid_operation("failed to freeze orchestrator config"))?;

@@ -139,11 +139,23 @@ impl TaskRoleRepo for SqliteDb {
         let policy_json = input.policy_json.unwrap_or(current.policy_json);
         let result = sqlx::query(
             "UPDATE task_role
-             SET coordination_mode = ?, policy_json = ?, version = version + 1, updated_at = ?
+             SET coordination_mode = ?, policy_json = ?,
+                 version = version + CASE
+                     WHEN coordination_mode IS NOT ? OR policy_json IS NOT ? THEN 1
+                     ELSE 0
+                 END,
+                 updated_at = CASE
+                     WHEN coordination_mode IS NOT ? OR policy_json IS NOT ? THEN ?
+                     ELSE updated_at
+                 END
              WHERE id = ? AND version = ?",
         )
-        .bind(coordination_mode)
-        .bind(policy_json)
+        .bind(coordination_mode.clone())
+        .bind(policy_json.clone())
+        .bind(coordination_mode.clone())
+        .bind(policy_json.clone())
+        .bind(coordination_mode.clone())
+        .bind(policy_json.clone())
         .bind(&input.updated_at)
         .bind(&input.id)
         .bind(input.expected_version)

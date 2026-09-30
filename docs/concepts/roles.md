@@ -76,6 +76,43 @@ WorkspaceLease; adding another Actor to the same TaskRole does not grant that
 Actor access to the existing workspace, lease, terminal, or repository write
 scope.
 
-Role policy can constrain capacity, independence, approval, or disruptive
-actions. It must remain a small deterministic policy representation rather than
-a general workflow language.
+Role policy is a small deterministic JSON object, not a general workflow
+language. The target architecture may eventually use it for capacity,
+independence, approval, and disruptive-action constraints. PR6 currently
+understands only the following TaskRole policy:
+
+~~~json
+{
+  "schema_version": 1,
+  "automatic_orchestration": true,
+  "allowed_actions": ["message", "handoff", "create_work_unit", "proposal"],
+  "max_actions_per_execution": 16,
+  "max_work_unit_creations_per_execution": 4
+}
+~~~
+
+Every field is optional. `{}` means schema version 1, automatic Agent
+orchestration enabled, every PR6 action allowed, and the limits shown above.
+`automatic_orchestration: false` prevents automatic Agent dispatch; a Human
+orchestrator still receives durable `awaiting_human` work. `allowed_actions`
+can only restrict the four typed PR6 actions. The two numeric limits can be
+lowered but not raised above 16 actions or 4 WorkUnit creations per Execution.
+The Agent's current execution capacity is still enforced by the existing
+capacity check; PR6 does not interpret a per-Role `capacity` field.
+
+PR6 rejects duplicate action names, malformed values, unsupported schema
+versions, and unknown fields when it evaluates the policy. The API and database
+continue to preserve any valid JSON object, but an unknown field such as
+`capacity`, `approval`, or `independence` makes PR6 fail the wake closed rather
+than silently ignore that constraint. Invalid JSON and non-object values still
+fail at write time.
+
+A wake snapshots the TaskRole version and exact `policy_json` in addition to
+the fixed PR6 runtime policy identity. Dispatch requires the current TaskRole
+version, policy JSON, and coordination mode to match that snapshot. Before
+each action and replay, PR6 rechecks the same snapshot and applies the action
+allowlist and limits in deterministic code. A TaskRole policy or coordination
+change makes an already admitted wake fail closed. A durable TaskRole-change
+event gives the new policy an opportunity only where current coordination mode
+provides an unambiguous target; PR6 does not turn an ambiguous independent or
+partitioned role update into a generic fanout.

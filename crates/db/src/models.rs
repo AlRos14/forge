@@ -525,6 +525,8 @@ pub struct OrchestratorWake {
     pub policy_ref: String,
     pub policy_version: i64,
     pub policy_digest: String,
+    pub task_role_version: i64,
+    pub task_role_policy_json: String,
     pub state: OrchestratorWakeState,
     pub available_at: String,
     pub lease_owner: Option<String>,

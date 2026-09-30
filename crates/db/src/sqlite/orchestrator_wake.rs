@@ -7,9 +7,10 @@ impl OrchestratorWakeRepo for SqliteDb {
             "INSERT INTO orchestrator_wake (
                 id, event_id, event_sequence, task_id, task_role_id,
                 coordination_mode, actor_kind, actor_id, work_unit_id, correlation_id, causation_id,
-                causation_depth, policy_ref, policy_version, policy_digest, state,
+                causation_depth, policy_ref, policy_version, policy_digest,
+                task_role_version, task_role_policy_json, state,
                 available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
              ON CONFLICT(event_id, task_id, actor_kind, actor_id) DO NOTHING",
         )
         .bind(&input.id)
@@ -27,6 +28,8 @@ impl OrchestratorWakeRepo for SqliteDb {
         .bind(&input.policy_ref)
         .bind(input.policy_version)
         .bind(&input.policy_digest)
+        .bind(input.task_role_version)
+        .bind(&input.task_role_policy_json)
         .bind(&input.available_at)
         .bind(&input.created_at)
         .bind(&input.updated_at)
@@ -375,6 +378,8 @@ fn map_orchestrator_wake(row: &SqliteRow) -> std::result::Result<OrchestratorWak
         policy_ref: row.try_get("policy_ref")?,
         policy_version: row.try_get("policy_version")?,
         policy_digest: row.try_get("policy_digest")?,
+        task_role_version: row.try_get("task_role_version")?,
+        task_role_policy_json: row.try_get("task_role_policy_json")?,
         state: row.try_get::<String, _>("state")?.parse().map_err(|_| {
             sqlx::Error::ColumnDecode {
                 index: "state".to_owned(),

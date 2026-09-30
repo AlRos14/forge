@@ -20,6 +20,23 @@ the wake and checked again before dispatch; ambiguous or stale targeting fails
 closed. `collaborative` may wake every active member, while `partitioned` and
 `independent` dispatch only from explicit allocation or addressing evidence.
 
+Task creation, TaskRole policy/mode changes, and canonical membership writes
+also append real durable events inside their SQLite mutation transaction.
+An empty TaskRole is not eligible; adding or reactivating a member is the
+activation event. This includes compatibility writers because the database
+triggers observe the canonical rows. EventBus-only Task notifications are not
+authority.
+
+V095 performs a one-time current-state reconciliation for existing, non-
+terminal Tasks with eligible orchestrator members. It appends typed
+`orchestrator.bootstrap_reconciled` events after the V094 cursor high-water
+mark, without recreating historical Task events or replaying the old event
+archive. Collaborative and independent targets follow their current mode;
+partitioned targets require an exact active Actor allocation to an
+orchestrator WorkUnit. The stable role/Actor/WorkUnit dedupe key and the normal
+domain-event receipt/wake lease path make migration retry and concurrent
+consumers idempotent.
+
 An Agent wake creates a fresh `purpose=orchestrate` Execution and uses a
 read-only Harness Start. PR6 does not infer or resume a previous session. A
 Human wake stays durable as pending Human work and creates no HarnessSession.
@@ -39,6 +56,15 @@ WorkUnit is an orchestrator action, not a wake signal; completion, readiness,
 allocation changes, and explicitly addressed collaboration can wake eligible
 members. Unsupported event producers remain deferred to their lifecycle owner
 rather than being promoted from EventBus-only signals.
+
+PR6 reads the TaskRole policy using a small versioned schema documented in
+[Roles and memberships](roles.md). `{}` keeps the current PR6 defaults.
+Unknown fields and versions fail closed. The wake captures the TaskRole version
+and exact JSON separately from the fixed runtime policy digest; dispatch and
+each action replay require the current TaskRole policy and coordination mode to
+match that snapshot. A TaskRole-change event uses the current mode's targeting
+rules and does not turn an ambiguous independent or partitioned role update
+into a generic fanout.
 
 ## Responsibilities
 

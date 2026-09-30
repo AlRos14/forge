@@ -580,6 +580,8 @@ pub struct CreateOrchestratorWake {
     pub policy_ref: String,
     pub policy_version: i64,
     pub policy_digest: String,
+    pub task_role_version: i64,
+    pub task_role_policy_json: String,
     pub available_at: String,
     pub created_at: String,
     pub updated_at: String,
