@@ -80,7 +80,24 @@ WITH bootstrap_target AS (
     JOIN role_membership AS member
       ON member.task_role_id = role.id AND member.status = 'active'
     WHERE role.role = 'orchestrator'
-      AND role.coordination_mode IN ('collaborative', 'independent')
+      AND role.coordination_mode = 'collaborative'
+
+    UNION ALL
+
+    SELECT role.id, role.task_id, role.coordination_mode,
+           member.actor_kind, member.actor_id, NULL
+    FROM task_role AS role
+    JOIN task AS task ON task.id = role.task_id AND task.deleted_at IS NULL
+                       AND task.status NOT IN ('done', 'cancelled')
+    JOIN role_membership AS member
+      ON member.task_role_id = role.id AND member.status = 'active'
+    WHERE role.role = 'orchestrator'
+      AND role.coordination_mode = 'independent'
+      AND 1 = (
+          SELECT COUNT(*) FROM role_membership AS active_member
+          WHERE active_member.task_role_id = role.id
+            AND active_member.status = 'active'
+      )
 
     UNION ALL
 

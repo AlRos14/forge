@@ -31,7 +31,8 @@ V095 performs a one-time current-state reconciliation for existing, non-
 terminal Tasks with eligible orchestrator members. It appends typed
 `orchestrator.bootstrap_reconciled` events after the V094 cursor high-water
 mark, without recreating historical Task events or replaying the old event
-archive. Collaborative and independent targets follow their current mode;
+archive. Collaborative targets fan out to active members; independent targets
+are materialized only when one active member makes the target unambiguous;
 partitioned targets require an exact active Actor allocation to an
 orchestrator WorkUnit. The stable role/Actor/WorkUnit dedupe key and the normal
 domain-event receipt/wake lease path make migration retry and concurrent

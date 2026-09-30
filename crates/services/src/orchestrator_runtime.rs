@@ -3065,6 +3065,23 @@ mod tests {
         )
         .await;
 
+        let independent_unique_task =
+            test_task(&database, &project_id, "Independent unique pre-cutover").await;
+        let independent_unique_role = test_orchestrator_role(
+            &database,
+            &independent_unique_task,
+            Some(CoordinationMode::Independent),
+            "{}",
+        )
+        .await;
+        test_membership(
+            &database,
+            &independent_unique_role,
+            &human_a,
+            RoleMembershipStatus::Active,
+        )
+        .await;
+
         let partitioned_task = test_task(&database, &project_id, "Partitioned pre-cutover").await;
         let partitioned_role = test_orchestrator_role(
             &database,
@@ -3142,9 +3159,18 @@ mod tests {
         .await
         .expect("bootstrap events are durable");
         assert_eq!(
-            seeded_events, 5,
-            "collaborative and independent target each active member; partitioned requires assignment"
+            seeded_events, 4,
+            "collaborative fans out; independent requires a unique member; partitioned requires assignment"
         );
+        let ambiguous_independent_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'orchestrator.bootstrap_reconciled' AND entity_id = ?",
+        )
+        .bind(&independent_role)
+        .fetch_one(database.pool())
+        .await
+        .expect("ambiguous independent role is not bootstrapped");
+        assert_eq!(ambiguous_independent_events, 0);
         let cursor_after_upgrade: i64 = sqlx::query_scalar(
             "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = 'task-orchestrator-wakes'",
         )
@@ -3163,9 +3189,9 @@ mod tests {
             .run_once(20)
             .await
             .expect("bootstrap obligations run through the durable wake consumer");
-        assert_eq!(reconciled.processed_events, 5);
-        assert_eq!(reconciled.admitted_wakes, 5);
-        assert_eq!(reconciled.dispatched_wakes, 5);
+        assert_eq!(reconciled.processed_events, 4);
+        assert_eq!(reconciled.admitted_wakes, 4);
+        assert_eq!(reconciled.dispatched_wakes, 4);
 
         let mode_counts: Vec<(String, i64)> = sqlx::query_as(
             "SELECT tr.coordination_mode, COUNT(*)
@@ -3180,7 +3206,7 @@ mod tests {
             mode_counts,
             vec![
                 ("collaborative".to_owned(), 2),
-                ("independent".to_owned(), 2),
+                ("independent".to_owned(), 1),
                 ("partitioned".to_owned(), 1),
             ]
         );
@@ -3190,7 +3216,7 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .expect("Human bootstrap work stays pending");
-        assert_eq!(pending_human, 5);
+        assert_eq!(pending_human, 4);
         let executions: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE role = 'orchestrator'")
                 .fetch_one(database.pool())
@@ -3210,7 +3236,7 @@ mod tests {
             .fetch_one(database.pool())
             .await
             .expect("wake count remains stable");
-        assert_eq!(wake_count, 5);
+        assert_eq!(wake_count, 4);
     }
 
     #[derive(Clone)]
