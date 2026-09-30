@@ -8,6 +8,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- WorkUnit provenance now encodes Actor identity as a typed `ActorRef` and
+  validates that the referenced Actor exists. V091 Actor provenance that cannot
+  be resolved unambiguously remains visible as response-only `legacy_actor`
+  data; new requests cannot create that legacy form.
+- Exclusive operations on the Task integration workspace now use a durable
+  per-Task claim. Other server processes receive a conflict while integration,
+  final merge, publication, or another exclusive integration-workspace
+  operation is active.
+
 - New Execution snapshots no longer write harness-native resume flags such as
   `resume_thread_id` or `resume_session_id` into config. Continuity is expressed
   by the existing `harness_session_id` relation and a runtime-only generic

@@ -2,4 +2,4 @@
 import type { CollaborationTarget } from "./CollaborationTarget";
 import type { HandoffIntent } from "./HandoffIntent";
 
-export type CreateHandoffRequest = { source_role_id: string | null, target: CollaborationTarget, intent: HandoffIntent, parent_execution_id: string | null, expected_policy_ref: string | null, artifact_ids: Array<string>, };
+export type CreateHandoffRequest = { source_role_id: string | null, target: CollaborationTarget, work_unit_id: string | null, intent: HandoffIntent, parent_execution_id: string | null, expected_policy_ref: string | null, artifact_ids: Array<string>, };

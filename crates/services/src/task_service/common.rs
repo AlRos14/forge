@@ -15,7 +15,11 @@ impl TaskService {
             },
         )
         .await?;
-        if let Some(execution) = page.items.into_iter().next() {
+        if let Some(execution) = page
+            .items
+            .into_iter()
+            .find(|execution| execution.work_unit_id.is_none())
+        {
             return Ok(execution);
         }
 
@@ -32,7 +36,11 @@ impl TaskService {
             },
         )
         .await?;
-        if let Some(execution) = page.items.into_iter().next() {
+        if let Some(execution) = page
+            .items
+            .into_iter()
+            .find(|execution| execution.work_unit_id.is_none())
+        {
             return Ok(execution);
         }
 
@@ -49,9 +57,12 @@ impl TaskService {
             },
         )
         .await?;
-        page.items.into_iter().next().ok_or_else(|| {
-            ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
-        })
+        page.items
+            .into_iter()
+            .find(|execution| execution.work_unit_id.is_none())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
+            })
     }
 
     pub(super) async fn latest_review_for_task(&self, task_id: &str) -> Result<Review> {

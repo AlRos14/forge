@@ -477,6 +477,38 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::create_task).get(routes::tasks::list_tasks),
         )
         .route(
+            "/api/v1/tasks/{task_id}/work-units",
+            post(routes::work_units::create_work_unit).get(routes::work_units::list_work_units),
+        )
+        .route(
+            "/api/v1/work-units/{id}",
+            get(routes::work_units::get_work_unit).patch(routes::work_units::update_work_unit),
+        )
+        .route(
+            "/api/v1/work-units/{id}/allocation",
+            post(routes::work_units::allocate_work_unit),
+        )
+        .route(
+            "/api/v1/work-units/{id}/status",
+            post(routes::work_units::transition_work_unit),
+        )
+        .route(
+            "/api/v1/work-units/{id}/dependencies",
+            get(routes::work_units::list_dependencies),
+        )
+        .route(
+            "/api/v1/work-units/{id}/dependencies/{prerequisite_id}",
+            post(routes::work_units::add_dependency).delete(routes::work_units::remove_dependency),
+        )
+        .route(
+            "/api/v1/work-units/{id}/readiness",
+            get(routes::work_units::readiness),
+        )
+        .route(
+            "/api/v1/work-units/{id}/integrations",
+            post(routes::work_units::integrate),
+        )
+        .route(
             "/api/v1/tasks/{task_id}/artifacts",
             post(routes::collaboration::create_artifact)
                 .get(routes::collaboration::list_artifacts),

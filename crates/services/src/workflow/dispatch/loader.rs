@@ -155,7 +155,7 @@ async fn latest_terminal_execution_for_exact_role(
         role,
         PageRequest {
             cursor: None,
-            limit: 1,
+            limit: 100,
             include_total: false,
             sort_by: SortBy::CreatedAt,
             sort_order: SortOrder::Desc,
@@ -163,11 +163,12 @@ async fn latest_terminal_execution_for_exact_role(
     )
     .await?;
 
-    Ok(page.items.into_iter().next().filter(|execution| {
-        matches!(
-            execution.status,
-            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-        )
+    Ok(page.items.into_iter().find(|execution| {
+        execution.work_unit_id.is_none()
+            && matches!(
+                execution.status,
+                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+            )
     }))
 }
 

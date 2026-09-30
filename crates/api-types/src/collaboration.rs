@@ -180,6 +180,7 @@ pub enum ProposalTargetKind {
     Task,
     Execution,
     Workspace,
+    WorkUnit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -246,6 +247,7 @@ pub struct ArtifactResponse {
 pub struct CreateMessageRequest {
     pub target: CollaborationTarget,
     pub body: String,
+    pub work_unit_id: Option<String>,
     #[serde(default)]
     pub artifact_ids: Vec<String>,
 }
@@ -258,6 +260,7 @@ pub struct MessageResponse {
     pub task_id: String,
     pub sender: ActorRef,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub body: String,
     pub artifact_ids: Vec<String>,
     pub created_at: String,
@@ -269,6 +272,7 @@ pub struct MessageResponse {
 pub struct CreateHandoffRequest {
     pub source_role_id: Option<String>,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub intent: HandoffIntent,
     pub parent_execution_id: Option<String>,
     pub expected_policy_ref: Option<String>,
@@ -285,6 +289,7 @@ pub struct HandoffResponse {
     pub created_by: ActorRef,
     pub source_role_id: Option<String>,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub intent: HandoffIntent,
     pub parent_execution_id: Option<String>,
     pub expected_policy_ref: Option<String>,
@@ -415,7 +420,7 @@ mod tests {
         });
         assert!(serde_json::from_value::<CreateDecisionRequest>(decision).is_err());
 
-        let future_target = serde_json::json!({"kind":"work_unit", "id":"wu-1"});
+        let future_target = serde_json::json!({"kind":"validation_run", "id":"run-1"});
         assert!(serde_json::from_value::<ProposalTarget>(future_target).is_err());
 
         assert_eq!(

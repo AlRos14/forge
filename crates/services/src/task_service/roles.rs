@@ -707,7 +707,8 @@ impl TaskService {
         )
         .await?;
         Ok(page.items.into_iter().find(|execution| {
-            execution.status == ExecutionStatus::Running
+            execution.work_unit_id.is_none()
+                && execution.status == ExecutionStatus::Running
                 && (execution.role == role_name || execution.role == "executor")
         }))
     }

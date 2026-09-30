@@ -1350,7 +1350,8 @@ impl EmbeddedAgentService {
                 .items
                 .into_iter()
                 .any(|execution| {
-                    execution.status == ExecutionStatus::Running
+                    execution.work_unit_id.is_none()
+                        && execution.status == ExecutionStatus::Running
                         && execution.agent_id.as_deref() == Some(identity.id.as_str())
                         && if role == "reviewer" {
                             execution.role == default_roles::REVIEWER

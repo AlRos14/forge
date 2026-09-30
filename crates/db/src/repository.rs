@@ -532,11 +532,32 @@ pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
+    /// Legacy Task-scoped lookup. Returns only the canonical integration
+    /// workspace; WorkUnit workspaces are always addressed explicitly.
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
     async fn set_cleanup_after(
         &self,
         id: &str,
         cleanup_after: Option<String>,
+        updated_at: &str,
+    ) -> Result<Workspace>;
+    /// Atomically claim cleanup for one exact WorkUnit Workspace. Returns
+    /// `None` when its lifecycle or active execution/lease authority prevents
+    /// cleanup from starting.
+    async fn claim_work_unit_cleanup(
+        &self,
+        id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<Workspace>>;
+    /// Complete cleanup only for the exact WorkUnit Workspace currently in
+    /// the durable `cleaning` lifecycle state.
+    async fn finish_work_unit_cleanup(
+        &self,
+        id: &str,
+        task_id: &str,
+        work_unit_id: &str,
         updated_at: &str,
     ) -> Result<Workspace>;
     async fn mark_cleaned(&self, id: &str, updated_at: &str) -> Result<Workspace>;
@@ -551,6 +572,111 @@ pub trait WorkspaceRepo: Send + Sync {
     async fn delete(&self, id: &str) -> Result<()>;
 }
 
+#[async_trait]
+pub trait WorkUnitWorkspaceRepo: Send + Sync {
+    async fn get_scope_by_id(&self, id: &str) -> Result<Option<WorkspaceScope>>;
+    async fn get_by_work_unit_id(&self, work_unit_id: &str) -> Result<Option<Workspace>>;
+    async fn create_for_work_unit(&self, input: CreateWorkUnitWorkspace) -> Result<Workspace>;
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<Workspace>>;
+}
+
+#[async_trait]
+pub trait WorkUnitExecutionRepo: Send + Sync {
+    async fn create_for_work_unit(
+        &self,
+        input: CreateWorkUnitExecution,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Execution>>;
+}
+
+#[async_trait]
+pub trait WorkUnitRepo: Send + Sync {
+    async fn create(
+        &self,
+        input: CreateWorkUnit,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
+    /// Scope-only lookup for the auth-before-load boundary.
+    async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnit>>;
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<WorkUnit>>;
+    async fn update(
+        &self,
+        input: UpdateWorkUnit,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
+    async fn allocate(
+        &self,
+        input: AllocateWorkUnit,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
+    async fn transition(
+        &self,
+        input: TransitionWorkUnit,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
+    async fn list_dependencies(&self, id: &str) -> Result<Vec<WorkUnitDependency>>;
+    async fn list_active_execution_ids(&self, id: &str) -> Result<Vec<String>>;
+    async fn add_dependency(
+        &self,
+        input: AddWorkUnitDependency,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnitDependency>>;
+    async fn remove_dependency(
+        &self,
+        input: RemoveWorkUnitDependency,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
+    async fn list_integrations(&self, id: &str) -> Result<Vec<WorkUnitIntegration>>;
+    async fn get_integration_by_id(&self, id: &str) -> Result<Option<WorkUnitIntegration>>;
+    async fn get_integration_by_idempotency(
+        &self,
+        task_id: &str,
+        key: &str,
+    ) -> Result<Option<WorkUnitIntegration>>;
+    async fn begin_integration(
+        &self,
+        input: CreateWorkUnitIntegration,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnitIntegration>>;
+    async fn record_integration(
+        &self,
+        input: RecordWorkUnitIntegration,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnitIntegration>>;
+}
+
+/// Durable, Task-wide exclusive authority for operations that read or mutate
+/// the Task integration workspace. The partial unique index makes `begin`
+/// atomic across independent SQLite connections/processes.
+#[async_trait]
+pub trait TaskIntegrationOperationRepo: Send + Sync {
+    async fn begin(
+        &self,
+        input: CreateTaskIntegrationOperation,
+    ) -> Result<TaskIntegrationOperation>;
+    async fn get_active_for_task(&self, task_id: &str) -> Result<Option<TaskIntegrationOperation>>;
+    /// Called only while holding the Task's OS operation lock. It marks the
+    /// current process-dead `running` row abandoned without starting a new
+    /// operation, for consumers that only need stale-state reconciliation.
+    async fn abandon_stale(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<TaskIntegrationOperation>>;
+    /// Called only while holding the Task's OS operation lock. It atomically
+    /// marks a process-dead active row abandoned and installs the replacement.
+    async fn recover_stale_and_begin(
+        &self,
+        input: CreateTaskIntegrationOperation,
+        updated_at: &str,
+    ) -> Result<TaskIntegrationOperation>;
+    async fn finish(
+        &self,
+        input: FinishTaskIntegrationOperation,
+    ) -> Result<TaskIntegrationOperation>;
+}
+
 /// Internal scheduler authority for a Task workspace.  A lease is deliberately
 /// separate from the filesystem-backed `Workspace` row: chat agents never
 /// receive this record, a path, or a bearer token.  The scheduler persists only
@@ -560,6 +686,7 @@ pub trait WorkspaceLeaseRepo: Send + Sync {
     async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkspaceLease>>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<WorkspaceLease>>;
+    async fn get_active_for_work_unit(&self, work_unit_id: &str) -> Result<Option<WorkspaceLease>>;
     async fn revoke(
         &self,
         id: &str,
@@ -1594,10 +1721,132 @@ pub struct CreateWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitWorkspace {
+    pub workspace: CreateWorkspace,
+    pub work_unit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnit {
+    pub id: String,
+    pub task_id: String,
+    pub parent_work_unit_id: Option<String>,
+    pub title: String,
+    pub scope: String,
+    pub role: String,
+    pub assigned_actor: Option<ActorRef>,
+    pub requires_integration: bool,
+    pub provenance: Option<WorkUnitProvenance>,
+    pub created_by: ActorRef,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskIntegrationOperation {
+    pub id: String,
+    pub task_id: String,
+    pub kind: TaskIntegrationOperationKind,
+    pub owner_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishTaskIntegrationOperation {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: TaskIntegrationOperationStatus,
+    pub updated_at: String,
+    pub finished_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateWorkUnit {
+    pub id: String,
+    pub expected_version: i64,
+    pub title: Option<String>,
+    pub scope: Option<String>,
+    pub parent_work_unit_id: Option<Option<String>>,
+    pub requires_integration: Option<bool>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocateWorkUnit {
+    pub id: String,
+    pub expected_version: i64,
+    pub role: String,
+    pub assigned_actor: Option<ActorRef>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionWorkUnit {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: WorkUnitStatus,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddWorkUnitDependency {
+    pub work_unit_id: String,
+    pub depends_on_work_unit_id: String,
+    pub expected_version: i64,
+    pub created_by: ActorRef,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveWorkUnitDependency {
+    pub work_unit_id: String,
+    pub depends_on_work_unit_id: String,
+    pub expected_version: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitExecution {
+    pub execution: CreateExecution,
+    pub work_unit_id: String,
+    pub work_unit_version: i64,
+    pub workspace_lease: Option<CreateWorkspaceLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitIntegration {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub execution_id: String,
+    pub source_workspace_id: String,
+    pub source_branch: String,
+    pub source_sha: String,
+    pub target_workspace_id: String,
+    pub target_branch: String,
+    pub target_before_sha: String,
+    pub operation_idempotency_key: String,
+    pub started_at: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordWorkUnitIntegration {
+    pub id: String,
+    pub expected_version: i64,
+    pub outcome: WorkUnitIntegrationOutcome,
+    pub target_after_sha: Option<String>,
+    pub conflict_metadata_json: Option<String>,
+    pub finished_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkspaceLease {
     pub id: String,
     pub project_id: String,
     pub task_id: String,
+    pub work_unit_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub task_version: i64,
     pub execution_id: String,
     pub operation_idempotency_key: String,

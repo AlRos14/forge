@@ -127,6 +127,10 @@ pub async fn get_current_sha(worktree_path: &Path) -> Result<String> {
     run_git(worktree_path, &["rev-parse", "HEAD"]).await
 }
 
+pub async fn get_current_branch(worktree_path: &Path) -> Result<String> {
+    run_git(worktree_path, &["symbolic-ref", "--short", "HEAD"]).await
+}
+
 /// Check if the worktree has no uncommitted changes.
 pub async fn is_worktree_clean(worktree_path: &Path) -> Result<bool> {
     let output = run_git(worktree_path, &["status", "--porcelain"]).await?;
@@ -209,19 +213,74 @@ pub async fn abort_merge(worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Detect if there is an interrupted merge.
-pub async fn detect_interrupted_merge(worktree_path: &Path) -> Result<bool> {
-    // For worktrees, .git is a file pointing to the actual git dir.
-    // Check via git rev-parse instead.
-    let result = Command::new("git")
-        .args(["rev-parse", "--verify", "MERGE_HEAD"])
+/// Return the exact SHA recorded in `MERGE_HEAD`, if Git has an interrupted
+/// merge in this worktree.
+pub async fn get_merge_head(worktree_path: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--quiet", "--verify", "MERGE_HEAD"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .output()
         .await?;
-    Ok(result.status.success())
+    if output.status.success() {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Ok((!sha.is_empty()).then_some(sha));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(GitError::CommandFailed {
+        command: "git rev-parse --quiet --verify MERGE_HEAD".to_owned(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// Read the direct parent SHAs for an exact commit object.
+pub async fn commit_parents(repo_path: &Path, commit_sha: &str) -> Result<Vec<String>> {
+    let output = run_git(repo_path, &["rev-list", "--parents", "-n", "1", commit_sha]).await?;
+    let mut fields = output.split_whitespace();
+    let _commit = fields.next().ok_or_else(|| GitError::CommandFailed {
+        command: format!("git rev-list --parents -n 1 {commit_sha}"),
+        stdout: output.clone(),
+        stderr: "Git returned no commit identity".to_owned(),
+    })?;
+    Ok(fields.map(str::to_owned).collect())
+}
+
+/// Check ancestry without treating Git's normal exit code 1 as an error.
+pub async fn is_ancestor(
+    repo_path: &Path,
+    ancestor_sha: &str,
+    descendant_sha: &str,
+) -> Result<bool> {
+    let args = ["merge-base", "--is-ancestor", ancestor_sha, descendant_sha];
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    Err(GitError::CommandFailed {
+        command: format!("git {}", args.join(" ")),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// Detect if there is an interrupted merge.
+pub async fn detect_interrupted_merge(worktree_path: &Path) -> Result<bool> {
+    Ok(get_merge_head(worktree_path).await?.is_some())
 }
 
 /// Get diff between a base SHA and HEAD.
@@ -612,6 +671,7 @@ mod tests {
             .await
             .unwrap();
         commit_all(&wt2, "branch b change").await.unwrap();
+        assert_eq!(get_merge_head(&wt2).await.unwrap(), None);
 
         // Merge branch-a into branch-b should conflict
         let result = merge(&wt2, "branch-a").await;
@@ -620,12 +680,14 @@ mod tests {
         // Detect interrupted merge
         let has_merge = detect_interrupted_merge(&wt2).await.unwrap();
         assert!(has_merge);
+        assert!(get_merge_head(&wt2).await.unwrap().is_some());
 
         // Abort merge
         abort_merge(&wt2).await.unwrap();
 
         let has_merge_after = detect_interrupted_merge(&wt2).await.unwrap();
         assert!(!has_merge_after);
+        assert_eq!(get_merge_head(&wt2).await.unwrap(), None);
 
         // Cleanup
         remove_worktree(&repo_path, &wt1).await.unwrap();

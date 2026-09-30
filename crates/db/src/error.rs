@@ -16,6 +16,9 @@ pub enum DbError {
     #[error("idempotency key conflicts with a different mutation")]
     IdempotencyConflict,
 
+    #[error("a Task integration operation is already active")]
+    TaskIntegrationOperationBusy,
+
     #[error("task version conflict: expected {expected}, actual {actual}")]
     TaskVersionConflict { expected: i64, actual: i64 },
 

@@ -1460,8 +1460,10 @@ impl TaskService {
                 .map(str::to_owned)
         }) {
             if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? {
-                if let Some(agent_id) = execution.agent_id {
-                    return Ok(agent_id);
+                if execution.work_unit_id.is_none() {
+                    if let Some(agent_id) = execution.agent_id {
+                        return Ok(agent_id);
+                    }
                 }
             }
         }
@@ -1480,6 +1482,7 @@ impl TaskService {
         .await?;
         page.items
             .into_iter()
+            .filter(|execution| execution.work_unit_id.is_none())
             .find_map(|execution| execution.agent_id)
             .ok_or_else(|| {
                 ServiceError::invalid_operation(
@@ -2287,6 +2290,9 @@ async fn latest_resumable_interactive_exact_role(
     )
     .await?;
     for execution in page.items {
+        if execution.work_unit_id.is_some() {
+            continue;
+        }
         if !matches!(
             execution.status,
             ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled

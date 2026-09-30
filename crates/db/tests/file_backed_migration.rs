@@ -5,8 +5,10 @@ use db::{
     AgentRepo, AgentSessionRepo, AgentStatus, CreateAgent, CreateAgentAction,
     CreateAgentCommitment, CreateAgentContextScope, CreateAgentInboxItem, CreateAgentLcmTimeline,
     CreateAgentSession, CreateContextManifest, CreateContextManifestSource, CreateDomainEvent,
-    CreateForgeMemorySourceBinding, CreateTask, DomainEventRepo, MemoryItem,
-    ScopedMemoryRepository, SqliteDb, TaskRepo, User, UserRepo,
+    CreateForgeMemorySourceBinding, CreateProject, CreateTask, CreateTaskIntegrationOperation,
+    DomainEventRepo, MemoryItem, ProjectRepo, ScopedMemoryRepository, SqliteDb,
+    TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
+    TaskRepo, User, UserRepo,
 };
 use std::{
     fs,
@@ -23,12 +25,346 @@ fn unique_temp_path(name: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn file_backed_migrations_apply_cleanly() {
+async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_pools() {
     let db_path = unique_temp_path("migtest").with_extension("db");
     let _ = std::fs::remove_file(&db_path);
     let url = format!("sqlite://{}", db_path.display());
     let pool = create_sqlite_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
+
+    let db = SqliteDb::new(pool.clone());
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    let task_id = db::new_uuid_v4();
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Durable Task operation claim".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: None,
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "integration target".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Task");
+
+    // Separate SQLite pools stand in for independent service processes. Both
+    // submit their claim concurrently; the partial unique index admits one.
+    let second_pool = create_sqlite_pool(&url).await.expect("second pool");
+    let second_db = SqliteDb::new(second_pool.clone());
+    let first_claim = CreateTaskIntegrationOperation {
+        id: db::new_uuid_v4(),
+        task_id: task_id.clone(),
+        kind: TaskIntegrationOperationKind::WorkUnitIntegration,
+        owner_id: "integration-attempt-a".to_owned(),
+        created_at: db::now_rfc3339(),
+    };
+    let second_claim = CreateTaskIntegrationOperation {
+        id: db::new_uuid_v4(),
+        task_id: task_id.clone(),
+        kind: TaskIntegrationOperationKind::TaskMerge,
+        owner_id: "merge-attempt-b".to_owned(),
+        created_at: db::now_rfc3339(),
+    };
+    let (first, second) = tokio::join!(
+        TaskIntegrationOperationRepo::begin(&db, first_claim),
+        TaskIntegrationOperationRepo::begin(&second_db, second_claim),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let rejected = if first.is_err() {
+        first.err()
+    } else {
+        second.err()
+    };
+    assert!(matches!(
+        rejected,
+        Some(db::DbError::TaskIntegrationOperationBusy)
+    ));
+    let active = TaskIntegrationOperationRepo::get_active_for_task(&db, &task_id)
+        .await
+        .expect("active operation query")
+        .expect("one durable active claim");
+    assert_eq!(active.status, TaskIntegrationOperationStatus::Running);
+}
+
+#[tokio::test]
+async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
+    let migration_dir = unique_temp_path("pr5-legacy-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir");
+    copy_migrations_up_to(90, &migration_dir);
+
+    let db_path = unique_temp_path("pr5-workspace-preserve").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("baseline through V090");
+    let db = SqliteDb::new(pool.clone());
+    let now = "2026-09-28T00:00:00Z";
+    let project_id = db::new_uuid_v4();
+    let repo_id = db::new_uuid_v4();
+    let task_id = db::new_uuid_v4();
+    let workspace_id = db::new_uuid_v4();
+    db::ProjectRepo::create(
+        &db,
+        db::CreateProject {
+            id: project_id.clone(),
+            name: "Legacy Workspace".into(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .expect("Project");
+    db::RepoRepo::create(
+        &db,
+        db::CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "repo".into(),
+            remote_url: "https://example.invalid/repo.git".into(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".into(),
+            created_at: now.into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .expect("Repo");
+    db::TaskRepo::create(
+        &db,
+        db::CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "legacy task".into(),
+            description: None,
+            task_type: "implementation".into(),
+            status: "todo".into(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .expect("Task");
+    sqlx::query(
+        "INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, before_sha, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)",
+    ).bind(&workspace_id).bind(&task_id).bind(&repo_id)
+        .bind("/legacy/task/worktree").bind("task/legacy").bind("abc123")
+        .bind(now).bind(now).execute(&pool).await.expect("legacy workspace");
+
+    let human_id = db::new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES (?, ?, 'test-hash', 'Migration Actor', ?, ?)",
+    )
+    .bind(&human_id)
+    .bind(format!("{}@example.invalid", human_id))
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy provenance Human exists");
+    let ambiguous_actor_id = db::new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES (?, ?, 'test-hash', 'Ambiguous Migration Actor', ?, ?)",
+    )
+    .bind(&ambiguous_actor_id)
+    .bind(format!("{}@example.invalid", ambiguous_actor_id))
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("ambiguous provenance Human exists");
+    AgentRepo::create(
+        &SqliteDb::new(pool.clone()),
+        CreateAgent {
+            id: ambiguous_actor_id.clone(),
+            name: "Ambiguous Migration Actor".to_owned(),
+            description: None,
+            executor_type: "null".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("same ID can exist in independent legacy Actor tables");
+
+    // Apply V091 separately so this fixture represents a real database that
+    // has already stored untyped Actor provenance before V092 is installed.
+    copy_migrations_up_to(91, &migration_dir);
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("V091 applies");
+
+    let role_id = db::new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO task_role (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at)
+         VALUES (?, ?, 'executor', NULL, '{}', 1, ?, ?)",
+    )
+    .bind(&role_id)
+    .bind(&task_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("WorkUnit Role exists");
+
+    let known_actor_work_unit_id = db::new_uuid_v4();
+    let unresolved_actor_work_unit_id = db::new_uuid_v4();
+    let ambiguous_actor_work_unit_id = db::new_uuid_v4();
+    for (work_unit_id, provenance_id) in [
+        (&known_actor_work_unit_id, human_id.as_str()),
+        (&unresolved_actor_work_unit_id, "missing-legacy-actor"),
+        (&ambiguous_actor_work_unit_id, ambiguous_actor_id.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO work_unit
+                (id, task_id, title, scope, status, role, requires_integration,
+                 provenance_kind, provenance_id, created_by_kind, created_by_id,
+                 version, created_at, updated_at)
+             VALUES (?, ?, 'legacy provenance', 'migration fixture', 'open', 'executor', 1,
+                     'actor', ?, 'human', ?, 1, ?, ?)",
+        )
+        .bind(work_unit_id)
+        .bind(&task_id)
+        .bind(provenance_id)
+        .bind(&human_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("V091 WorkUnit with untyped Actor provenance inserts");
+    }
+
+    copy_migrations_up_to(92, &migration_dir);
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("V092 applies");
+    let row: (String, String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT id, worktree_path, branch, status, before_sha FROM workspace WHERE task_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("workspace row remains");
+    assert_eq!(
+        row,
+        (
+            workspace_id.clone(),
+            "/legacy/task/worktree".into(),
+            "task/legacy".into(),
+            "ready".into(),
+            Some("abc123".into())
+        )
+    );
+    let scope: (String, Option<String>) = sqlx::query_as(
+        "SELECT scope_kind, work_unit_id FROM workspace_scope WHERE workspace_id = ?",
+    )
+    .bind(&workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy scope");
+    assert_eq!(scope, ("integration".into(), None));
+    let canonical = db::WorkspaceRepo::get_by_task_id(&db, &task_id)
+        .await
+        .expect("legacy get")
+        .expect("integration workspace");
+    assert_eq!(canonical.id, workspace_id);
+
+    let known = db::WorkUnitRepo::get_by_id(&db, &known_actor_work_unit_id)
+        .await
+        .expect("known provenance loads")
+        .expect("known WorkUnit exists");
+    assert_eq!(
+        known.provenance,
+        Some(db::WorkUnitProvenance::Actor(db::ActorRef::Human(
+            human_id.clone()
+        )))
+    );
+    let unresolved = db::WorkUnitRepo::get_by_id(&db, &unresolved_actor_work_unit_id)
+        .await
+        .expect("unresolved provenance loads")
+        .expect("unresolved WorkUnit exists");
+    assert_eq!(
+        unresolved.provenance,
+        Some(db::WorkUnitProvenance::LegacyActor(
+            "missing-legacy-actor".to_owned()
+        ))
+    );
+    let ambiguous = db::WorkUnitRepo::get_by_id(&db, &ambiguous_actor_work_unit_id)
+        .await
+        .expect("ambiguous provenance loads")
+        .expect("ambiguous WorkUnit exists");
+    assert_eq!(
+        ambiguous.provenance,
+        Some(db::WorkUnitProvenance::LegacyActor(ambiguous_actor_id))
+    );
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
 }
 
 #[tokio::test]

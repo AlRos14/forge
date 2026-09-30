@@ -36,6 +36,7 @@ pub struct CreateArtifactInput {
 pub struct CreateMessageInput {
     pub task_id: String,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub body: String,
     pub artifact_ids: Vec<String>,
 }
@@ -45,6 +46,7 @@ pub struct CreateHandoffInput {
     pub task_id: String,
     pub source_role_id: Option<String>,
     pub target: CollaborationTarget,
+    pub work_unit_id: Option<String>,
     pub intent: HandoffIntent,
     pub parent_execution_id: Option<String>,
     pub expected_policy_ref: Option<String>,
@@ -206,6 +208,8 @@ impl CollaborationService {
             return Err(invalid("Message body must not be empty"));
         }
         self.validate_target(&task, &input.target).await?;
+        self.validate_work_unit_context(&task, input.work_unit_id.as_deref())
+            .await?;
         self.validate_artifact_links(&task.id, &input.artifact_ids)
             .await?;
         let id = new_uuid_v4();
@@ -222,6 +226,7 @@ impl CollaborationService {
                 "message_id": id,
                 "task_id": task.id,
                 "target_kind": input.target.kind().to_string(),
+                "work_unit_id": input.work_unit_id.clone(),
             }),
             &now,
         );
@@ -232,6 +237,7 @@ impl CollaborationService {
                 task_id: task.id,
                 sender,
                 target: input.target,
+                work_unit_id: input.work_unit_id,
                 body: input.body,
                 artifact_ids: input.artifact_ids,
                 created_at: now,
@@ -276,6 +282,8 @@ impl CollaborationService {
     ) -> Result<Handoff> {
         let (task, created_by) = self.authorize_source(&input.task_id, &source).await?;
         self.validate_target(&task, &input.target).await?;
+        self.validate_work_unit_context(&task, input.work_unit_id.as_deref())
+            .await?;
         self.validate_artifact_links(&task.id, &input.artifact_ids)
             .await?;
         let (source_role_id, parent_execution_id) = match &source {
@@ -357,6 +365,7 @@ impl CollaborationService {
                 "task_id": task.id,
                 "intent": input.intent.to_string(),
                 "target_kind": input.target.kind().to_string(),
+                "work_unit_id": input.work_unit_id.clone(),
             }),
             &now,
         );
@@ -368,6 +377,7 @@ impl CollaborationService {
                 created_by,
                 source_role_id,
                 target: input.target,
+                work_unit_id: input.work_unit_id,
                 intent: input.intent,
                 parent_execution_id,
                 expected_policy_ref: input.expected_policy_ref,
@@ -704,7 +714,7 @@ impl CollaborationService {
         Ok(CollaborationRepo::list_decisions(&*self.db, task_id, page).await?)
     }
 
-    async fn authorize_source(
+    pub(crate) async fn authorize_source(
         &self,
         task_id: &str,
         source: &CollaborationActorSource,
@@ -824,6 +834,27 @@ impl CollaborationService {
         }
     }
 
+    async fn validate_work_unit_context(
+        &self,
+        task: &Task,
+        work_unit_id: Option<&str>,
+    ) -> Result<()> {
+        let Some(work_unit_id) = work_unit_id else {
+            return Ok(());
+        };
+        let work_unit_task_id = db::WorkUnitRepo::get_task_id(&*self.db, work_unit_id)
+            .await?
+            .ok_or_else(|| not_found("work_unit", work_unit_id.to_owned()))?;
+        if work_unit_task_id != task.id {
+            return Err(not_found("work_unit", work_unit_id.to_owned()));
+        }
+        db::WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .filter(|work_unit| work_unit.task_id == task.id)
+            .ok_or_else(|| not_found("work_unit", work_unit_id.to_owned()))?;
+        Ok(())
+    }
+
     async fn validate_artifact_links(&self, task_id: &str, ids: &[String]) -> Result<()> {
         let mut unique = HashSet::new();
         for id in ids {
@@ -879,6 +910,19 @@ impl CollaborationService {
                 if workspace.task_id != task.id {
                     return Err(not_found("workspace", target.id.clone()));
                 }
+                Ok(())
+            }
+            ProposalTargetKind::WorkUnit => {
+                let work_unit_task_id = db::WorkUnitRepo::get_task_id(&*self.db, &target.id)
+                    .await?
+                    .ok_or_else(|| not_found("work_unit", target.id.clone()))?;
+                if work_unit_task_id != task.id {
+                    return Err(not_found("work_unit", target.id.clone()));
+                }
+                db::WorkUnitRepo::get_by_id(&*self.db, &target.id)
+                    .await?
+                    .filter(|work_unit| work_unit.task_id == task.id)
+                    .ok_or_else(|| not_found("work_unit", target.id.clone()))?;
                 Ok(())
             }
         }

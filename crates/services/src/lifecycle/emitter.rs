@@ -304,7 +304,11 @@ impl LifecycleEventEmitter {
         )
         .await?;
 
-        let executions = page.items;
+        let executions = page
+            .items
+            .into_iter()
+            .filter(|execution| execution.work_unit_id.is_none())
+            .collect::<Vec<_>>();
         let fallback = executions.first().cloned();
 
         Ok(executions

@@ -4,4 +4,4 @@ import type { CollaborationTarget } from "./CollaborationTarget";
 import type { HandoffIntent } from "./HandoffIntent";
 import type { HandoffStatus } from "./HandoffStatus";
 
-export type HandoffResponse = { id: string, task_id: string, created_by: ActorRef, source_role_id: string | null, target: CollaborationTarget, intent: HandoffIntent, parent_execution_id: string | null, expected_policy_ref: string | null, status: HandoffStatus, version: bigint, artifact_ids: Array<string>, created_at: string, updated_at: string, };
+export type HandoffResponse = { id: string, task_id: string, created_by: ActorRef, source_role_id: string | null, target: CollaborationTarget, work_unit_id: string | null, intent: HandoffIntent, parent_execution_id: string | null, expected_policy_ref: string | null, status: HandoffStatus, version: bigint, artifact_ids: Array<string>, created_at: string, updated_at: string, };

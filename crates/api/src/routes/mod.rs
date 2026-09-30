@@ -68,6 +68,7 @@ pub mod scoped_memory;
 pub mod settings;
 pub mod tasks;
 pub mod terminals;
+pub mod work_units;
 pub mod workflow;
 pub mod workflow_templates;
 pub mod workspaces;
@@ -425,7 +426,10 @@ async fn task_response_inner(
             .as_ref()
             .or(error_blocking_annotation);
         let mut resumable_execution_ids = HashSet::new();
-        for execution in &executions {
+        for execution in executions
+            .iter()
+            .filter(|execution| execution.work_unit_id.is_none())
+        {
             let expected_agent_id = match execution.actor_ref() {
                 Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
                 _ => None,
@@ -634,25 +638,25 @@ async fn task_execution_observability(
                   END) - CAST(strftime('%s', created_at) AS INTEGER),
                  0), 0)), 0)
               FROM task_executions) AS total_runtime_seconds,
-             (SELECT id FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_execution_id,
-             (SELECT role FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_role,
-             (SELECT created_at FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_started_at,
+             (SELECT id FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_execution_id,
+             (SELECT role FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_role,
+             (SELECT created_at FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_started_at,
              (SELECT max(COALESCE(
                  CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER),
                  0), 0)
-              FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_elapsed_seconds,
-             (SELECT id FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_id,
-             (SELECT status FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_status,
-             (SELECT role FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_role,
-             (SELECT created_at FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_started_at,
-             (SELECT stopped_at FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_stopped_at,
+              FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_elapsed_seconds,
+             (SELECT id FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_id,
+             (SELECT status FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_status,
+             (SELECT role FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_role,
+             (SELECT created_at FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_started_at,
+             (SELECT stopped_at FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_stopped_at,
              (SELECT max(COALESCE(
                  (CASE
                      WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
                      ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
                   END) - CAST(strftime('%s', created_at) AS INTEGER),
                  0), 0)
-              FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds,
+              FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds,
              usage_totals.total_input_tokens,
              usage_totals.total_output_tokens,
              usage_totals.total_cache_read_tokens,

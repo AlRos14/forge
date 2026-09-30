@@ -1,6 +1,10 @@
+use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 use async_trait::async_trait;
-use db::{now_rfc3339, SqliteDb, WorkspaceRepo};
+use db::{
+    now_rfc3339, RepoRepo, SqliteDb, WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    WorkspaceScopeKind,
+};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use std::{
     path::{Path, PathBuf},
@@ -13,6 +17,7 @@ use tokio::{
     time::{interval, timeout},
 };
 use tracing::info;
+use workspace::RepoCacheLockManager;
 use workspace::{WorkspaceError, WorkspaceManager};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,6 +27,9 @@ pub struct WorkspaceCleanupScheduler {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
+    repo_cache_locks: RwLock<Option<Arc<RepoCacheLockManager>>>,
+    workspace_exec_locks:
+        RwLock<Option<Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>>>,
     terminal_cleanup: RwLock<Option<Arc<dyn WorkspaceCleanupObserver>>>,
 }
 
@@ -36,7 +44,31 @@ impl WorkspaceCleanupScheduler {
             db,
             event_bus,
             workspace_root,
+            repo_cache_locks: RwLock::new(None),
+            workspace_exec_locks: RwLock::new(None),
             terminal_cleanup: RwLock::new(None),
+        }
+    }
+
+    pub fn with_repo_cache_locks(self, locks: Arc<RepoCacheLockManager>) -> Self {
+        if let Ok(mut configured) = self.repo_cache_locks.write() {
+            *configured = Some(locks);
+        }
+        self
+    }
+
+    pub fn set_repo_cache_locks(&self, locks: Arc<RepoCacheLockManager>) {
+        if let Ok(mut configured) = self.repo_cache_locks.write() {
+            *configured = Some(locks);
+        }
+    }
+
+    pub fn set_workspace_exec_locks(
+        &self,
+        locks: Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>,
+    ) {
+        if let Ok(mut configured) = self.workspace_exec_locks.write() {
+            *configured = Some(locks);
         }
     }
 
@@ -129,13 +161,67 @@ impl WorkspaceCleanupScheduler {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        info!(
-            workspace_id,
-            task_id = %workspace.task_id,
-            worktree_path = %workspace.worktree_path,
-            workspace_root = %self.workspace_root.display(),
-            "cleaning up workspace"
-        );
+        let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id).await?;
+        let lock_key = match scope.as_ref().map(|scope| scope.kind) {
+            Some(WorkspaceScopeKind::Integration) => {
+                Some(format!("task-integration:{}", workspace.task_id))
+            }
+            Some(WorkspaceScopeKind::WorkUnit) => scope
+                .as_ref()
+                .and_then(|scope| scope.work_unit_id.as_ref())
+                .map(|id| format!("work-unit-workspace:{id}")),
+            None => None,
+        };
+        let locks = self
+            .workspace_exec_locks
+            .read()
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "Workspace execution lock configuration poisoned: {error}"
+                ))
+            })?
+            .clone();
+        let _scope_guard = match (locks.as_ref(), lock_key.as_deref()) {
+            (Some(locks), Some(key)) => Some(locks.acquire(key).await),
+            _ => None,
+        };
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        if let Some(scope) = scope
+            .as_ref()
+            .filter(|scope| scope.kind == WorkspaceScopeKind::WorkUnit)
+        {
+            let _workspace_guard = match locks.as_ref() {
+                Some(locks) => Some(locks.acquire(workspace_id).await),
+                None => None,
+            };
+            let work_unit_id = scope.work_unit_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation("WorkUnit Workspace has no WorkUnit binding")
+            })?;
+            return self
+                .cleanup_work_unit_workspace(workspace_id, &workspace.task_id, work_unit_id)
+                .await;
+        }
+        if scope
+            .as_ref()
+            .is_some_and(|scope| scope.kind == WorkspaceScopeKind::Integration)
+            && !WorkUnitRepo::list_by_task(&*self.db, &workspace.task_id)
+                .await?
+                .is_empty()
+        {
+            WorkspaceRepo::set_cleanup_after(&*self.db, workspace_id, None, &now_rfc3339()).await?;
+            return Ok(());
+        }
+        let running_execution: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
+        )
+        .bind(workspace_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if running_execution != 0 {
+            return Ok(());
+        }
         let terminal_cleanup = self
             .terminal_cleanup
             .read()
@@ -145,10 +231,45 @@ impl WorkspaceCleanupScheduler {
                 ))
             })?
             .clone();
-        if let Some(terminal_cleanup) = terminal_cleanup {
-            terminal_cleanup
-                .cleanup_workspace_terminals(workspace_id)
-                .await?;
+        let integration_scope = scope
+            .as_ref()
+            .is_some_and(|scope| scope.kind == WorkspaceScopeKind::Integration);
+        if integration_scope {
+            if let Some(terminal_cleanup) = terminal_cleanup.as_ref() {
+                terminal_cleanup
+                    .cleanup_workspace_terminals(workspace_id)
+                    .await?;
+            }
+        }
+        let integration_operation = if integration_scope {
+            Some(
+                TaskIntegrationOperationManager::new(
+                    Arc::clone(&self.db),
+                    self.workspace_root.clone(),
+                )
+                .acquire(
+                    &workspace.task_id,
+                    db::TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
+                    &workspace.id,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        info!(
+            workspace_id,
+            task_id = %workspace.task_id,
+            worktree_path = %workspace.worktree_path,
+            workspace_root = %self.workspace_root.display(),
+            "cleaning up workspace"
+        );
+        if !integration_scope {
+            if let Some(terminal_cleanup) = terminal_cleanup {
+                terminal_cleanup
+                    .cleanup_workspace_terminals(workspace_id)
+                    .await?;
+            }
         }
         match crate::plan_artifact::capture_plan_revision(
             &self.db,
@@ -163,21 +284,14 @@ impl WorkspaceCleanupScheduler {
             Err(error) => {
                 return Err(ServiceError::invalid_operation(format!(
                     "workspace cleanup blocked because the final plan could not be persisted: {error}"
-                )));
+                )))
             }
         }
         let manager = WorkspaceManager::new(self.workspace_root.clone());
         match manager.cleanup_worktree(&workspace.task_id).await {
-            Ok(()) => {}
-            Err(WorkspaceError::NotFound) => {
-                info!(
-                    workspace_id,
-                    task_id = %workspace.task_id,
-                    "workspace worktree already absent"
-                );
-            }
+            Ok(()) | Err(WorkspaceError::NotFound) => {}
             Err(error) => {
-                return Err(crate::ServiceError::invalid_operation(error.to_string()));
+                return Err(ServiceError::invalid_operation(error.to_string()));
             }
         }
         let now = now_rfc3339();
@@ -186,17 +300,238 @@ impl WorkspaceCleanupScheduler {
             workspace_id = %workspace.id,
             "workspace cleaned"
         );
+        self.publish_workspace_cleaned(&workspace);
+        if let Some(operation) = integration_operation {
+            operation
+                .finish(db::TaskIntegrationOperationStatus::Succeeded)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_work_unit_workspace(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+    ) -> Result<()> {
+        let process_locks = TaskIntegrationOperationManager::new(
+            Arc::clone(&self.db),
+            self.workspace_root.clone(),
+        );
+        let Some(_process_guard) = process_locks
+            .try_work_unit_cleanup_task_lock(task_id)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let Some(mut workspace) = WorkspaceRepo::get_by_id(&*self.db, workspace_id).await? else {
+            return Ok(());
+        };
+        if workspace.task_id != task_id {
+            return Err(ServiceError::invalid_operation(
+                "WorkUnit Workspace Task binding changed during cleanup",
+            ));
+        }
+        let scope_matches = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
+            .await?
+            .is_some_and(|scope| {
+                scope.kind == WorkspaceScopeKind::WorkUnit
+                    && scope.task_id == task_id
+                    && scope.work_unit_id.as_deref() == Some(work_unit_id)
+            });
+        if !scope_matches {
+            return Err(
+                ServiceError::invalid_operation(
+                    "WorkUnit Workspace cleanup identity does not match its durable scope",
+                ),
+            );
+        }
+        let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .filter(|unit| unit.task_id == task_id)
+            .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+
+        match workspace.status {
+            db::WorkspaceStatus::Ready => {
+                let Some(claimed) = WorkspaceRepo::claim_work_unit_cleanup(
+                    &*self.db,
+                    workspace_id,
+                    task_id,
+                    work_unit_id,
+                    &now_rfc3339(),
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                workspace = claimed;
+            }
+            db::WorkspaceStatus::Cleaning => {}
+            db::WorkspaceStatus::Cleaned => return Ok(()),
+            db::WorkspaceStatus::Creating | db::WorkspaceStatus::Error => return Ok(()),
+        }
+
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+        let repo_path =
+            crate::task_service::workspace::resolve_repo_source(&repo, &self.workspace_root)
+                .await?;
+        let mut manager = WorkspaceManager::new(self.workspace_root.clone());
+        if let Some(locks) = self
+            .repo_cache_locks
+            .read()
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "Repo cache lock configuration poisoned: {error}"
+                ))
+            })?
+            .as_ref()
+        {
+            manager = manager.with_repo_cache_locks(Arc::clone(locks));
+        }
+
+        let expected_branch = workspace::work_unit_branch_name(task_id, work_unit_id, workspace_id)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let expected_path = manager
+            .work_unit_worktree_path(task_id, work_unit_id, workspace_id, &workspace.repo_id)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        if workspace.branch != expected_branch
+            || Path::new(&workspace.worktree_path) != expected_path.as_path()
+        {
+            return Err(self
+                .record_work_unit_cleanup_error(
+                    workspace_id,
+                    "WorkUnit Workspace cleanup identity differs from its exact branch or worktree path; explicit recovery is required",
+                )
+                .await);
+        }
+        let branch_exists = match git::branch_exists(&repo_path, &workspace.branch).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                return Err(self
+                    .record_work_unit_cleanup_error(
+                        workspace_id,
+                        format!("could not verify the exact WorkUnit branch: {error}"),
+                    )
+                    .await)
+            }
+        };
+        if !branch_exists {
+            return Err(self
+                .record_work_unit_cleanup_error(
+                    workspace_id,
+                    format!(
+                        "WorkUnit Workspace branch {} is missing; explicit recovery or reset is required",
+                        workspace.branch
+                    ),
+                )
+                .await);
+        }
+        if tokio::fs::try_exists(&expected_path).await? {
+            let current_branch = match git::get_current_branch(&expected_path).await {
+                Ok(branch) => branch,
+                Err(error) => {
+                    return Err(self
+                        .record_work_unit_cleanup_error(
+                            workspace_id,
+                            format!(
+                                "could not confirm the WorkUnit worktree branch; explicit recovery is required: {error}"
+                            ),
+                        )
+                        .await)
+                }
+            };
+            if current_branch != workspace.branch {
+                return Err(self
+                    .record_work_unit_cleanup_error(
+                        workspace_id,
+                        format!(
+                            "WorkUnit Workspace path is attached to unexpected branch {current_branch}; explicit recovery is required"
+                        ),
+                    )
+                    .await);
+            }
+        }
+
+        if let Some(terminal_cleanup) = self
+            .terminal_cleanup
+            .read()
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "Workspace cleanup terminal handler lock poisoned: {error}"
+                ))
+            })?
+            .clone()
+        {
+            terminal_cleanup
+                .cleanup_workspace_terminals(workspace_id)
+                .await?;
+        }
+        if let Err(error) = manager
+            .cleanup_work_unit_worktree(
+                &repo_path,
+                task_id,
+                &work_unit.id,
+                workspace_id,
+                &workspace.repo_id,
+            )
+            .await
+        {
+            return Err(self
+                .record_work_unit_cleanup_error(
+                    workspace_id,
+                    format!("WorkUnit Git cleanup failed and remains recoverable: {error}"),
+                )
+                .await);
+        }
+        let cleaned = WorkspaceRepo::finish_work_unit_cleanup(
+            &*self.db,
+            workspace_id,
+            task_id,
+            work_unit_id,
+            &now_rfc3339(),
+        )
+        .await?;
+        self.publish_workspace_cleaned(&cleaned);
+        Ok(())
+    }
+
+    async fn record_work_unit_cleanup_error(
+        &self,
+        workspace_id: &str,
+        message: impl Into<String>,
+    ) -> ServiceError {
+        let message = message.into();
+        match WorkspaceRepo::update_status(
+            &*self.db,
+            workspace_id,
+            db::WorkspaceStatus::Cleaning,
+            Some(message.clone()),
+            &now_rfc3339(),
+        )
+        .await
+        {
+            Ok(_) => ServiceError::invalid_operation(message),
+            Err(error) => ServiceError::invalid_operation(format!(
+                "{message}; could not persist the cleanup recovery detail: {error}"
+            )),
+        }
+    }
+
+    fn publish_workspace_cleaned(&self, workspace: &db::Workspace) {
         self.event_bus.publish(ForgeEvent {
             event_type: "workspace.cleaned".to_owned(),
             entity_id: workspace.id.clone(),
             timestamp: event_timestamp(),
             context: EventContext::WorkspaceCleaned {
-                workspace_id: workspace.id,
-                task_id: workspace.task_id,
+                workspace_id: workspace.id.clone(),
+                task_id: workspace.task_id.clone(),
                 status: "cleaned".to_owned(),
             },
         });
-        Ok(())
     }
 }
 

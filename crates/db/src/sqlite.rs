@@ -1,17 +1,18 @@
 use crate::{
     new_uuid_v4, AccountMainAgentBinding, AccountMainAgentBindingRepo, ActorKind, ActorRef,
-    AdmitAgentChatTurn, AdmitAgentHandoff, AdmittedAgentChatTurn, AdmittedAgentHandoff, Agent,
-    AgentAction, AgentActionApproval, AgentActionExecution, AgentActionListQuery, AgentActionRepo,
-    AgentChat, AgentChatInstructionRevision, AgentChatMessage, AgentChatMessageListQuery,
-    AgentChatMessageRepo, AgentChatRepo, AgentChatSourceRef, AgentChatTransactionRepo,
-    AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentCommitment,
-    AgentCommitmentEvidence, AgentCommitmentLifecycle, AgentCommitmentListQuery,
-    AgentCommitmentRepo, AgentCommitmentStatus, AgentCommitmentTransfer, AgentHandoff,
-    AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery, AgentInboxRepo, AgentListQuery,
-    AgentProfile, AgentProfileRepo, AgentQuestion, AgentQuestionListQuery, AgentRepo, AgentStatus,
-    AgentTaskListQuery, AnswerAgentQuestion, AttentionConsumerHealth, AttentionListQuery,
-    AttentionProjection, AttentionRepo, CancelAgentChatTurn, CiStepStats, ClaimDomainEvents,
-    ClaimTask, ClaimedTask, CompleteAgentChatTurn, CompleteAgentCommitment, CompleteDomainEvent,
+    AddWorkUnitDependency, AdmitAgentChatTurn, AdmitAgentHandoff, AdmittedAgentChatTurn,
+    AdmittedAgentHandoff, Agent, AgentAction, AgentActionApproval, AgentActionExecution,
+    AgentActionListQuery, AgentActionRepo, AgentChat, AgentChatInstructionRevision,
+    AgentChatMessage, AgentChatMessageListQuery, AgentChatMessageRepo, AgentChatRepo,
+    AgentChatSourceRef, AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo,
+    AgentChatTurnState, AgentCommitment, AgentCommitmentEvidence, AgentCommitmentLifecycle,
+    AgentCommitmentListQuery, AgentCommitmentRepo, AgentCommitmentStatus, AgentCommitmentTransfer,
+    AgentHandoff, AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery, AgentInboxRepo,
+    AgentListQuery, AgentProfile, AgentProfileRepo, AgentQuestion, AgentQuestionListQuery,
+    AgentRepo, AgentStatus, AgentTaskListQuery, AllocateWorkUnit, AnswerAgentQuestion,
+    AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
+    CancelAgentChatTurn, CiStepStats, ClaimDomainEvents, ClaimTask, ClaimedTask,
+    CollaborationWrite, CompleteAgentChatTurn, CompleteAgentCommitment, CompleteDomainEvent,
     CompletedAgentChatTurn, CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction,
     CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage,
     CreateAgentChatTurnJob, CreateAgentCommitment, CreateAgentCommitmentEvidence,
@@ -21,28 +22,35 @@ use crate::{
     CreateProject, CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
     CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
     CreateProjectReleaseMediaPin, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
-    CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession,
-    CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent,
-    DomainEventRepo, EventConsumerCursor, Execution, ExecutionRepo, ExecutionStatus,
-    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, FailAgentChatTurn, HarnessSession,
-    HarnessSessionRepo, HarnessSessionStatus, IntegrationRepo, MediaAsset, ModelTokenBreakdown,
-    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, PrMetadata,
-    PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAgentBinding,
-    ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
-    ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment, ProjectMediaTombstone,
-    ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary, ProjectTokenStats,
-    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo, Result, Review,
-    ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, SelectAgentProfile,
-    SharedMediaRepo, Skill, SkillRepo, SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder,
-    Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery,
-    TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
-    TerminalSessionStatus, TransferAgentCommitment, UpdateAgent, UpdateAgentAction,
-    UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem,
-    UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution, UpdateHarnessSession,
-    UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
-    UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
-    UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth, UpsertDaemon, UpsertExecutionUsage,
-    Workspace, WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    CreateTaskComment, CreateTaskExternalLink, CreateTaskIntegrationOperation, CreateTaskMedia,
+    CreateTerminalSession, CreateWorkUnit, CreateWorkUnitExecution, CreateWorkUnitIntegration,
+    CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError,
+    DomainEvent, DomainEventRepo, EventConsumerCursor, Execution, ExecutionRepo, ExecutionStatus,
+    ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo, FailAgentChatTurn,
+    FinishTaskIntegrationOperation, HarnessSession, HarnessSessionRepo, HarnessSessionStatus,
+    IntegrationRepo, MediaAsset, ModelTokenBreakdown, Notification, NotificationListQuery,
+    NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
+    PrProviderConfigRepo, Project, ProjectAgentBinding, ProjectAgentBindingRepo,
+    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
+    ProjectIntegration, ProjectMediaAttachment, ProjectMediaTombstone, ProjectReleaseMediaPin,
+    ProjectRepo, ProjectReviewSummary, ProjectTokenStats, RecordWorkUnitIntegration,
+    RemoveWorkUnitDependency, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo,
+    RepoRepo, Result, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo,
+    SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo,
+    SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task, TaskComment,
+    TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskIntegrationOperation,
+    TaskIntegrationOperationRepo, TaskIntegrationOperationStatus, TaskListQuery, TaskMedia,
+    TaskMediaRepo, TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
+    TerminalSessionStatus, TransferAgentCommitment, TransitionWorkUnit, UpdateAgent,
+    UpdateAgentAction, UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment,
+    UpdateAgentInboxItem, UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution,
+    UpdateHarnessSession, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
+    UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
+    UpdateTaskStatus, UpdateTerminalSessionStatus, UpdateWorkUnit, UpsertAttentionConsumerHealth,
+    UpsertDaemon, UpsertExecutionUsage, WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo,
+    WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -90,10 +98,12 @@ mod system_setting;
 mod task;
 mod task_comment;
 mod task_dependency;
+mod task_integration_operation;
 mod task_media;
 mod task_move;
 mod task_terminal_session;
 mod user_auth;
+mod work_unit;
 mod workflow;
 mod workspace;
 mod workspace_lease;
@@ -219,6 +229,19 @@ fn check_error(error: sqlx::Error) -> DbError {
         }
     }
     error.into()
+}
+
+fn execution_insert_error(error: sqlx::Error) -> DbError {
+    if let sqlx::Error::Database(database_error) = &error {
+        if database_error
+            .message()
+            .to_ascii_lowercase()
+            .contains("agent reached concurrent execution capacity")
+        {
+            return DbError::AgentAtCapacity;
+        }
+    }
+    check_error(error)
 }
 
 fn map_project(row: SqliteRow) -> Result<Project> {
@@ -477,6 +500,8 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
         error: row.try_get("error")?,
         executor_config_snapshot_json: row.try_get("executor_config_snapshot_json")?,
         workspace_id: row.try_get("workspace_id")?,
+        work_unit_id: row.try_get("work_unit_id")?,
+        work_unit_version: row.try_get("work_unit_version")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -602,6 +627,7 @@ impl SqliteDb {
     async fn create_execution_in_tx(
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
+        work_unit: Option<(&str, i64)>,
     ) -> Result<Execution> {
         // The service performs a read-only admission check before preparing a
         // workspace.  Recheck the authoritative Charter/baseline receipt in
@@ -703,7 +729,7 @@ impl SqliteDb {
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -730,10 +756,13 @@ impl SqliteDb {
         .bind(input.error.as_deref())
         .bind(input.executor_config_snapshot_json.as_deref())
         .bind(input.workspace_id.as_deref())
+        .bind(work_unit.map(|(work_unit_id, _)| work_unit_id))
+        .bind(work_unit.map(|(_, work_unit_version)| work_unit_version))
         .bind(&input.created_at)
         .bind(&input.updated_at)
         .execute(&mut **transaction)
-        .await?;
+        .await
+        .map_err(execution_insert_error)?;
 
         let row = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&input.id)

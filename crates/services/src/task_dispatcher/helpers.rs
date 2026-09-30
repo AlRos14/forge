@@ -125,7 +125,7 @@ pub(super) async fn latest_stopped_execution_blocks_dispatch(
         role_name,
         PageRequest {
             cursor: None,
-            limit: 1,
+            limit: 100,
             include_total: false,
             sort_by: SortBy::CreatedAt,
             sort_order: SortOrder::Desc,
@@ -133,7 +133,11 @@ pub(super) async fn latest_stopped_execution_blocks_dispatch(
     )
     .await?;
 
-    let Some(execution) = page.items.into_iter().next() else {
+    let Some(execution) = page
+        .items
+        .into_iter()
+        .find(|execution| execution.work_unit_id.is_none())
+    else {
         return Ok(false);
     };
     if execution.status == ExecutionStatus::Running {
@@ -164,7 +168,8 @@ pub(super) async fn has_running_execution_for_roles(
     )
     .await?;
     Ok(page.items.iter().any(|execution| {
-        execution.status == ExecutionStatus::Running
+        execution.work_unit_id.is_none()
+            && execution.status == ExecutionStatus::Running
             && roles.iter().any(|role| execution.role == *role)
     }))
 }

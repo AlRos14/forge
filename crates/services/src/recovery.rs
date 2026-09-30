@@ -443,7 +443,7 @@ impl HeartbeatMonitor {
             )
             .await?;
 
-            revoke_active_workspace_lease(&self.db, &updated.task_id).await;
+            revoke_active_workspace_lease(&self.db, &updated.id).await;
 
             self.publish(ForgeEvent {
                 event_type: "execution.stalled".to_owned(),
@@ -715,23 +715,41 @@ async fn expire_workspace_leases(
     Ok(expired_count)
 }
 
-async fn revoke_active_workspace_lease(db: &SqliteDb, task_id: &str) {
-    match WorkspaceLeaseRepo::get_active_for_task(db, task_id).await {
-        Ok(Some(lease)) => {
+async fn revoke_active_workspace_lease(db: &SqliteDb, execution_id: &str) {
+    let execution = match ExecutionRepo::get_by_id(db, execution_id).await {
+        Ok(Some(execution)) => execution,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, execution_id, "failed to load Execution lease binding");
+            return;
+        }
+    };
+    let lease_result = match execution.work_unit_id.as_deref() {
+        Some(work_unit_id) => WorkspaceLeaseRepo::get_active_for_work_unit(db, work_unit_id).await,
+        None => WorkspaceLeaseRepo::get_active_for_task(db, &execution.task_id).await,
+    };
+    match lease_result {
+        Ok(Some(lease)) if lease.execution_id == execution_id => {
             if let Err(error) =
                 WorkspaceLeaseRepo::revoke(db, &lease.id, lease.version, &now_rfc3339()).await
             {
                 tracing::warn!(
-                    task_id,
+                    execution_id,
                     lease_id = %lease.id,
                     %error,
                     "failed to revoke WorkspaceLease at recovery terminal boundary"
                 );
             }
         }
+        Ok(Some(_)) => {
+            tracing::debug!(
+                execution_id,
+                "leaving another Execution's WorkspaceLease active"
+            );
+        }
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(task_id, %error, "failed to load WorkspaceLease at recovery terminal boundary")
+            tracing::warn!(%error, execution_id, "failed to load WorkspaceLease at recovery terminal boundary")
         }
     }
 }
@@ -825,7 +843,9 @@ async fn recover_task(
     // A cancelled attempt must never retain its repository authority. If the
     // recovery policy later schedules a retry, it receives a fresh execution
     // identity and lease through TaskService admission.
-    revoke_active_workspace_lease(db, &task.id).await;
+    for execution in &cancelled {
+        revoke_active_workspace_lease(db, &execution.execution_id).await;
+    }
 
     if cancelled.is_empty() {
         return Ok(RecoverTaskOutcome {
@@ -1203,7 +1223,7 @@ pub(crate) async fn fail_execution_daemon_disconnected(
     )
     .await?;
 
-    revoke_active_workspace_lease(db, &updated.task_id).await;
+    revoke_active_workspace_lease(db, &updated.id).await;
 
     event_bus.publish(ForgeEvent {
         event_type: "execution.daemon_disconnected".to_owned(),

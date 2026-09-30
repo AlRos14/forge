@@ -100,6 +100,17 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
+| POST   | `/api/v1/tasks/{task_id}/work-units` | Create a WorkUnit with Task-local scope, Role, optional Actor allocation, and provenance |
+| GET    | `/api/v1/tasks/{task_id}/work-units` | List authorized WorkUnits for one Task |
+| GET    | `/api/v1/work-units/{id}` | Read a WorkUnit and derived readiness |
+| PATCH  | `/api/v1/work-units/{id}` | Update permitted scope fields with `expected_version` |
+| POST   | `/api/v1/work-units/{id}/allocation` | Allocate or reallocate the WorkUnit Role/Actor with `expected_version` |
+| POST   | `/api/v1/work-units/{id}/status` | Complete or cancel an open WorkUnit with `expected_version` |
+| GET    | `/api/v1/work-units/{id}/dependencies` | List same-Task prerequisites and satisfaction state |
+| POST   | `/api/v1/work-units/{id}/dependencies/{prerequisite_id}` | Add a same-Task DAG edge with `expected_version` |
+| DELETE | `/api/v1/work-units/{id}/dependencies/{prerequisite_id}` | Remove a same-Task DAG edge with `expected_version` in the request body |
+| GET    | `/api/v1/work-units/{id}/readiness` | Inspect derived runnable, active, dependency, and integration state |
+| POST   | `/api/v1/work-units/{id}/integrations` | Explicitly integrate the exact completed Execution result using `execution_id` and `idempotency_key` |
 | GET    | `/api/v1/tasks/{id}` | Get task |
 | GET    | `/api/v1/tasks/{id}/task-roles` | Get TaskRole records and current membership/history |
 | POST   | `/api/v1/tasks/{id}/task-roles` | Create a TaskRole with an explicit coordination mode |
@@ -281,7 +292,46 @@ Cursor's large control prompt is stored transiently in a private runtime
 directory outside the Git worktree and is removed after the execution attempt,
 so it cannot enter task diffs or commits.
 
-## Generic collaboration records (Plan PR4)
+## WorkUnits (Plan PR5)
+
+WorkUnits own concrete executable scope, allocation, and Task-local dependency
+edges. `scope` is coordination context; it does not restrict filesystem paths.
+Role membership remains separate and only establishes eligibility. Allocation
+changes and all WorkUnit mutations use optimistic versions.
+
+Dependencies point from a dependent WorkUnit to its prerequisite. A prerequisite
+is satisfied when it is completed and either does not require repository
+integration or has a successful durable integration record. Readiness is
+derived; it does not dispatch or wake a worker. An Execution failure leaves an
+open WorkUnit available for another historical attempt.
+
+The Task workspace is the integration target. WorkUnit workspaces have explicit
+Workspace IDs and separate Git branches. Completion never merges implicitly.
+The integration request names the exact completed Execution and an operation
+idempotency key; the server pins that Execution's result SHA. Conflict and
+failure outcomes are durable, and the endpoint does not select a conflict
+resolver. Legacy Task workspace readers remain integration-scoped.
+
+WorkUnit provenance is a tagged value. Actor provenance is encoded as
+`{"kind":"actor","actor":{"kind":"human"|"agent","id":"…"}}` and
+is validated against the referenced identity. WorkUnit and Artifact references
+must belong to the same Task; External IDs remain opaque. A legacy V091 Actor
+reference that cannot be resolved unambiguously is returned as
+`{"kind":"legacy_actor","id":"…"}` and is not accepted in create requests.
+
+WorkUnit integration, final Task merge, PR publication, and other exclusive
+integration-workspace operations share one durable per-Task claim. Concurrent
+requests from another service instance receive a conflict while that claim is
+owned. A crash releases the process lock; the next claimant, terminal admission,
+or Project deletion can mark the previous row abandoned while holding that
+same lock. This claim is local to the Task integration workspace and does not
+serialize independent WorkUnit workspace execution.
+
+An Execution start/bind entry point is currently available through the typed
+service path; no WorkUnit scheduler or automatic dispatch endpoint is exposed.
+WorkUnit planning remains separate from legacy Task plans until PR7.
+
+## Generic collaboration records (Plan PR4, extended by PR5)
 
 The authenticated HTTP user is the Human sender, creator, proposer, or decider;
 request bodies reject actor identity fields. Agent service reads and writes
@@ -291,7 +341,9 @@ Project, and then load and validate record content. An unauthorized ID returns
 404 without exposing record status, version, or structural corruption. Message
 and Handoff targets accept exactly `{"kind":"actor","actor":...}`,
 `{"kind":"role","role_id":"..."}`, or `{"kind":"task"}`; unknown and
-contradictory target fields are rejected. Lists use opaque stable cursors.
+contradictory target fields are rejected. Message and Handoff may include an
+optional `work_unit_id` as contextual association; it does not change the
+recipient target or grant authority. Lists use opaque stable cursors.
 Artifact lists omit inline content, and neither list nor detail responses
 include the internal `content_ref` locator.
 
@@ -305,7 +357,8 @@ contract error. Corruption in an in-Task reference still fails closed.
 Message is communication only. Handoff status changes do not create or change
 RoleMembership. Proposal policy fields are opaque policy evidence and never
 grant permission or execute the action. Decision records an immutable outcome
-and does not execute the Proposal. These endpoints do not dual-write legacy
+and does not execute the Proposal. Proposal targets may additionally name a
+same-Task WorkUnit. These endpoints do not dual-write legacy
 planning, review, Agent Chat/Handoff, or Project Decision tables.
 
 Generic Decision writes, lists, and reads use the `/collaboration/decisions`

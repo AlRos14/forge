@@ -31,6 +31,13 @@ pub fn resolve_execution_actions_with_session_state(
     blocking_annotation: Option<&TaskBlockingAnnotation>,
     resumable_execution_ids: Option<&HashSet<String>>,
 ) -> Vec<ExecutionAction> {
+    // This resolver describes Task-level legacy actions. WorkUnit executions
+    // have separate workspace and readiness authority, so they must not be
+    // used as the Task's running/latest/retry context.
+    let task_executions = executions
+        .iter()
+        .filter(|execution| execution.work_unit_id.is_none())
+        .collect::<Vec<_>>();
     let is_terminal = workflow.state_kind(&task.status) == Some(StateKind::Terminal);
     let current_state = workflow
         .states
@@ -43,8 +50,9 @@ pub fn resolve_execution_actions_with_session_state(
             .or_else(|| (state.kind == StateKind::Active).then_some("assignee"))
     });
 
-    let running_executions: Vec<&db::Execution> = executions
+    let running_executions: Vec<&db::Execution> = task_executions
         .iter()
+        .copied()
         .filter(|execution| execution_status(execution) == ExecutionStatus::Running)
         .collect();
     let has_running_execution = !running_executions.is_empty();
@@ -52,12 +60,14 @@ pub fn resolve_execution_actions_with_session_state(
         .iter()
         .any(|execution| execution.role == INTERACTIVE_ROLE);
 
-    let latest_non_running_execution = executions
+    let latest_non_running_execution = task_executions
         .iter()
+        .copied()
         .filter(|execution| execution_status(execution) != ExecutionStatus::Running)
         .max_by(|left, right| left.created_at.cmp(&right.created_at));
-    let latest_resumable_execution = executions
+    let latest_resumable_execution = task_executions
         .iter()
+        .copied()
         .filter(|execution| {
             execution_status(execution) != ExecutionStatus::Running
                 && has_resumable_session(execution, resumable_execution_ids)
@@ -67,8 +77,9 @@ pub fn resolve_execution_actions_with_session_state(
     let blocked_execution = blocking_annotation
         .and_then(|annotation| annotation.blocked_execution_id.as_deref())
         .and_then(|execution_id| {
-            executions
+            task_executions
                 .iter()
+                .copied()
                 .find(|execution| execution.id == execution_id)
         });
     let has_resume_recovery_action = blocking_annotation.is_some_and(|annotation| {
@@ -85,8 +96,9 @@ pub fn resolve_execution_actions_with_session_state(
     let retry_budget_exhausted_reason = blocking_annotation.and_then(retry_budget_exhausted_reason);
 
     let re_execute_target = effective_role.and_then(|role| {
-        executions
+        task_executions
             .iter()
+            .copied()
             .filter(|execution| {
                 execution_status(execution) != ExecutionStatus::Running && execution.role == role
             })
@@ -302,6 +314,8 @@ mod tests {
             error: None,
             executor_config_snapshot_json: None,
             workspace_id: None,
+            work_unit_id: None,
+            work_unit_version: None,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
         }

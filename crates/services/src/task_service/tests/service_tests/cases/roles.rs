@@ -724,6 +724,342 @@ async fn membership_does_not_transfer_workspace_lease_authority() {
 }
 
 #[tokio::test]
+async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_independently() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_a.clone()))
+        .await
+        .expect("Agent A joins implementer");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
+        .await
+        .expect("Agent B joins implementer");
+
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task loads")
+        .expect("Task exists");
+    let now = now_rfc3339();
+    fn make_work_unit_test_event(
+        task_id: &str,
+        now: &str,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        actor_id: &str,
+    ) -> db::CreateDomainEvent {
+        db::CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: event_type.to_owned(),
+            entity_type: entity_type.to_owned(),
+            entity_id: entity_id.to_owned(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(actor_id.to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.to_owned(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: serde_json::json!({
+                "task_id": task_id,
+                "entity_id": entity_id,
+                "work_unit_id": entity_id,
+            })
+            .to_string(),
+            created_at: now.to_owned(),
+        }
+    }
+
+    async fn create_running_work_unit(
+        database: &db::SqliteDb,
+        service: &TaskService,
+        task: &db::Task,
+        repo_id: &str,
+        actor_id: &str,
+        now: &str,
+    ) -> (db::WorkUnit, db::Workspace, String) {
+        let work_unit_id = new_uuid_v4();
+        let work_unit = db::WorkUnitRepo::create(
+            database,
+            db::CreateWorkUnit {
+                id: work_unit_id.clone(),
+                task_id: task.id.clone(),
+                parent_work_unit_id: None,
+                title: "isolated execution".to_owned(),
+                scope: "test scope".to_owned(),
+                role: "implementer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Agent(actor_id.to_owned())),
+                requires_integration: true,
+                provenance: None,
+                created_by: db::ActorRef::Agent(actor_id.to_owned()),
+                created_at: now.to_owned(),
+            },
+            make_work_unit_test_event(
+                &task.id,
+                now,
+                "work_unit.created",
+                "work_unit",
+                &work_unit_id,
+                actor_id,
+            ),
+        )
+        .await
+        .expect("WorkUnit creates")
+        .record;
+        let workspace_id = new_uuid_v4();
+        let workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
+            database,
+            db::CreateWorkUnitWorkspace {
+                workspace: db::CreateWorkspace {
+                    id: workspace_id.clone(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.to_owned(),
+                    worktree_path: format!("/tmp/pr5/{workspace_id}"),
+                    branch: format!("work-unit/{workspace_id}"),
+                    status: db::WorkspaceStatus::Ready,
+                    before_sha: Some("base-sha".to_owned()),
+                    created_at: now.to_owned(),
+                    updated_at: now.to_owned(),
+                },
+                work_unit_id: work_unit_id.clone(),
+            },
+        )
+        .await
+        .expect("WorkUnit Workspace creates");
+        let execution_id = new_uuid_v4();
+        let execution = db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(actor_id.to_owned()),
+            actor_ref: Some(db::ActorRef::Agent(actor_id.to_owned())),
+            role: "implementer".to_owned(),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            status: db::ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some("base-sha".to_owned()),
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        };
+        let lease = service
+            .prepare_work_unit_workspace_lease(
+                task,
+                &work_unit,
+                &workspace,
+                &execution,
+                &db::ActorRef::Agent(actor_id.to_owned()),
+            )
+            .await
+            .expect("exact WorkUnit lease prepares");
+        db::WorkUnitExecutionRepo::create_for_work_unit(
+            database,
+            db::CreateWorkUnitExecution {
+                execution,
+                work_unit_id: work_unit.id.clone(),
+                work_unit_version: work_unit.version,
+                workspace_lease: Some(lease),
+            },
+            make_work_unit_test_event(
+                &task.id,
+                now,
+                "execution.started",
+                "execution",
+                &execution_id,
+                actor_id,
+            ),
+        )
+        .await
+        .expect("WorkUnit Execution and Lease bind");
+        (work_unit, workspace, execution_id)
+    }
+
+    let (unit_a, workspace_a, execution_a) =
+        create_running_work_unit(&db, &service, &task, &repo_id, &agent_a, &now).await;
+    let (unit_b, workspace_b, execution_b) =
+        create_running_work_unit(&db, &service, &task, &repo_id, &agent_b, &now).await;
+    assert_ne!(workspace_a.id, workspace_b.id);
+    let lease_a = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_a.id)
+        .await
+        .expect("A lease loads")
+        .expect("A lease is active");
+    let lease_b = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_b.id)
+        .await
+        .expect("B lease loads")
+        .expect("B lease is active");
+    assert_ne!(lease_a.id, lease_b.id);
+    assert_eq!(
+        lease_a.workspace_id.as_deref(),
+        Some(workspace_a.id.as_str())
+    );
+    assert_eq!(
+        lease_b.workspace_id.as_deref(),
+        Some(workspace_b.id.as_str())
+    );
+
+    assert!(service
+        .verify_active_workspace_lease(
+            &task,
+            &workspace_a,
+            "implementer",
+            Some(&agent_a),
+            &execution_a,
+        )
+        .await
+        .is_ok());
+    assert!(service
+        .verify_active_workspace_lease(
+            &task,
+            &workspace_a,
+            "implementer",
+            Some(&agent_b),
+            &execution_a,
+        )
+        .await
+        .is_err());
+    assert!(service
+        .verify_active_workspace_lease(
+            &task,
+            &workspace_b,
+            "implementer",
+            Some(&agent_b),
+            &execution_a,
+        )
+        .await
+        .is_err());
+
+    let competing_execution_id = new_uuid_v4();
+    let competing_execution = db::CreateExecution {
+        id: competing_execution_id.clone(),
+        task_id: task.id.clone(),
+        agent_id: Some(agent_a.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent_a.clone())),
+        role: "implementer".to_owned(),
+        purpose: Some(db::ExecutionPurpose::Implement),
+        status: db::ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        harness_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: Some("base-sha".to_owned()),
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_a.id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let competing_lease = service
+        .prepare_work_unit_workspace_lease(
+            &task,
+            &unit_a,
+            &workspace_a,
+            &competing_execution,
+            &db::ActorRef::Agent(agent_a.clone()),
+        )
+        .await
+        .expect("competing exact lease can be prepared before admission");
+    let competing_admission = db::WorkUnitExecutionRepo::create_for_work_unit(
+        &*db,
+        db::CreateWorkUnitExecution {
+            execution: competing_execution,
+            work_unit_id: unit_a.id.clone(),
+            work_unit_version: unit_a.version,
+            workspace_lease: Some(competing_lease),
+        },
+        make_work_unit_test_event(
+            &task.id,
+            &now,
+            "execution.started",
+            "execution",
+            &competing_execution_id,
+            &agent_a,
+        ),
+    )
+    .await;
+    assert!(
+        competing_admission.is_err(),
+        "one WorkUnit cannot admit two mutable Executions at once"
+    );
+
+    db::ExecutionRepo::update(
+        &*db,
+        db::UpdateExecution {
+            id: execution_a.clone(),
+            status: Some(db::ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: Some(Some("result-a".to_owned())),
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("A Execution completes");
+    service
+        .revoke_active_workspace_lease_for_execution(&task.id, &execution_a)
+        .await;
+    assert!(
+        db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_a.id)
+            .await
+            .expect("A lease reloads")
+            .is_none()
+    );
+    assert_eq!(
+        db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_b.id)
+            .await
+            .expect("B lease reloads")
+            .expect("B lease remains active")
+            .execution_id,
+        execution_b
+    );
+}
+
+#[tokio::test]
 async fn actor_validation_requires_project_human_and_rejects_sentinel() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

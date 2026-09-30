@@ -164,6 +164,20 @@ async fn message_artifact_ids(
     .await?)
 }
 
+async fn message_work_unit_id(
+    db: &SqliteDb,
+    message_id: &str,
+    task_id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT work_unit_id FROM message_work_unit WHERE message_id = ? AND task_id = ?",
+    )
+    .bind(message_id)
+    .bind(task_id)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
 async fn map_message(db: &SqliteDb, row: SqliteRow) -> Result<Message> {
     let task_id: String = row.try_get("task_id")?;
     let id: String = row.try_get("id")?;
@@ -179,11 +193,13 @@ async fn map_message(db: &SqliteDb, row: SqliteRow) -> Result<Message> {
         row.try_get("target_role_exists")?,
     )?;
     let artifact_ids = message_artifact_ids(db, &id, &task_id).await?;
+    let work_unit_id = message_work_unit_id(db, &id, &task_id).await?;
     Ok(Message {
         id,
         task_id,
         sender,
         target,
+        work_unit_id,
         body: row.try_get("body")?,
         artifact_ids,
         created_at: row.try_get("created_at")?,
@@ -223,6 +239,20 @@ async fn handoff_artifact_ids(
     .await?)
 }
 
+async fn handoff_work_unit_id(
+    db: &SqliteDb,
+    handoff_id: &str,
+    task_id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT work_unit_id FROM handoff_work_unit WHERE handoff_id = ? AND task_id = ?",
+    )
+    .bind(handoff_id)
+    .bind(task_id)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
 async fn map_handoff(db: &SqliteDb, row: SqliteRow) -> Result<Handoff> {
     let task_id: String = row.try_get("task_id")?;
     let id: String = row.try_get("id")?;
@@ -245,12 +275,14 @@ async fn map_handoff(db: &SqliteDb, row: SqliteRow) -> Result<Handoff> {
         row.try_get("target_role_exists")?,
     )?;
     let artifact_ids = handoff_artifact_ids(db, &id, &task_id).await?;
+    let work_unit_id = handoff_work_unit_id(db, &id, &task_id).await?;
     Ok(Handoff {
         id,
         task_id,
         created_by,
         source_role_id: row.try_get("source_role_id")?,
         target,
+        work_unit_id,
         intent: parse_enum(row.try_get("intent")?)?,
         parent_execution_id: row.try_get("parent_execution_id")?,
         expected_policy_ref: row.try_get("expected_policy_ref")?,
@@ -591,6 +623,11 @@ impl CollaborationRepo for SqliteDb {
         .bind(input.created_at)
         .execute(&mut *tx)
         .await?;
+        if let Some(work_unit_id) = input.work_unit_id.as_deref() {
+            sqlx::query("INSERT INTO message_work_unit (message_id, task_id, work_unit_id) VALUES (?, ?, ?)")
+                .bind(&input.id).bind(&input.task_id).bind(work_unit_id)
+                .execute(&mut *tx).await?;
+        }
         let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
         tx.commit().await?;
         let record = get_message_row(self, &input.id)
@@ -684,6 +721,11 @@ impl CollaborationRepo for SqliteDb {
         .bind(&input.created_at)
         .execute(&mut *tx)
         .await?;
+        if let Some(work_unit_id) = input.work_unit_id.as_deref() {
+            sqlx::query("INSERT INTO handoff_work_unit (handoff_id, task_id, work_unit_id) VALUES (?, ?, ?)")
+                .bind(&input.id).bind(&input.task_id).bind(work_unit_id)
+                .execute(&mut *tx).await?;
+        }
         let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
         tx.commit().await?;
         let record = get_handoff_row(self, &input.id)
