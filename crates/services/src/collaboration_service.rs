@@ -3,10 +3,11 @@ use std::{collections::HashSet, sync::Arc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, Artifact, ArtifactKind, ArtifactStorageKind,
     CollaborationRepo, CollaborationTarget, CreateArtifact, CreateDecision, CreateDomainEvent,
-    CreateHandoff, CreateMessage, CreateProposal, Decision, DecisionOutcome, ExecutionRepo,
-    Handoff, HandoffIntent, HandoffStatus, Page, PageRequest, Project, ProjectMemberRepo,
-    ProjectRepo, Proposal, ProposalStatus, ProposalTarget, ProposalTargetKind, RoleMembershipRepo,
-    RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo, UserRepo, WorkspaceRepo,
+    CreateHandoff, CreateMessage, CreateProposal, Decision, DecisionOutcome, DomainEventRepo,
+    ExecutionPurpose, ExecutionRepo, Handoff, HandoffIntent, HandoffStatus, Page, PageRequest,
+    Project, ProjectMemberRepo, ProjectRepo, Proposal, ProposalStatus, ProposalTarget,
+    ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo,
+    TaskRoleRepo, UserRepo, WorkspaceRepo,
 };
 use events::EventBus;
 
@@ -136,21 +137,24 @@ impl CollaborationService {
         }
         let id = new_uuid_v4();
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "artifact.created",
-                entity_type: "artifact",
-                entity_id: &id,
-                task_id: &input.task_id,
-            },
-            &actor,
-            serde_json::json!({
-                "artifact_id": id,
-                "task_id": input.task_id,
-                "kind": input.kind.to_string(),
-            }),
-            &now,
-        );
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "artifact.created",
+                    entity_type: "artifact",
+                    entity_id: &id,
+                    task_id: &input.task_id,
+                },
+                &actor,
+                serde_json::json!({
+                    "artifact_id": id,
+                    "task_id": input.task_id,
+                    "kind": input.kind.to_string(),
+                }),
+                &now,
+            )
+            .await?;
         let write = CollaborationRepo::create_artifact(
             &*self.db,
             CreateArtifact {
@@ -203,6 +207,16 @@ impl CollaborationService {
         source: CollaborationActorSource,
         input: CreateMessageInput,
     ) -> Result<db::Message> {
+        self.create_message_with_id(source, input, new_uuid_v4())
+            .await
+    }
+
+    pub(crate) async fn create_message_with_id(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateMessageInput,
+        id: String,
+    ) -> Result<db::Message> {
         let (task, sender) = self.authorize_source(&input.task_id, &source).await?;
         if input.body.trim().is_empty() {
             return Err(invalid("Message body must not be empty"));
@@ -212,39 +226,58 @@ impl CollaborationService {
             .await?;
         self.validate_artifact_links(&task.id, &input.artifact_ids)
             .await?;
-        let id = new_uuid_v4();
+        if let Some(existing) = CollaborationRepo::get_message(&*self.db, &id).await? {
+            if message_matches(&existing, &task.id, &sender, &input) {
+                return Ok(existing);
+            }
+            return Err(invalid(
+                "Message idempotency key conflicts with an existing record",
+            ));
+        }
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "message.created",
-                entity_type: "message",
-                entity_id: &id,
-                task_id: &task.id,
-            },
-            &sender,
-            serde_json::json!({
-                "message_id": id,
-                "task_id": task.id,
-                "target_kind": input.target.kind().to_string(),
-                "work_unit_id": input.work_unit_id.clone(),
-            }),
-            &now,
-        );
-        let write = CollaborationRepo::create_message(
-            &*self.db,
-            CreateMessage {
-                id,
-                task_id: task.id,
-                sender,
-                target: input.target,
-                work_unit_id: input.work_unit_id,
-                body: input.body,
-                artifact_ids: input.artifact_ids,
-                created_at: now,
-            },
-            event,
-        )
-        .await?;
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "message.created",
+                    entity_type: "message",
+                    entity_id: &id,
+                    task_id: &task.id,
+                },
+                &sender,
+                serde_json::json!({
+                    "message_id": id,
+                    "task_id": task.id,
+                    "target_kind": input.target.kind().to_string(),
+                    "work_unit_id": input.work_unit_id.clone(),
+                }),
+                &now,
+            )
+            .await?;
+        let expected = CreateMessage {
+            id,
+            task_id: task.id,
+            sender,
+            target: input.target,
+            work_unit_id: input.work_unit_id,
+            body: input.body,
+            artifact_ids: input.artifact_ids,
+            created_at: now,
+        };
+        let write =
+            match CollaborationRepo::create_message(&*self.db, expected.clone(), event).await {
+                Ok(write) => write,
+                Err(error) => {
+                    if let Some(existing) =
+                        CollaborationRepo::get_message(&*self.db, &expected.id).await?
+                    {
+                        if message_matches_record(&existing, &expected) {
+                            return Ok(existing);
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
     }
@@ -279,6 +312,16 @@ impl CollaborationService {
         &self,
         source: CollaborationActorSource,
         input: CreateHandoffInput,
+    ) -> Result<Handoff> {
+        self.create_handoff_with_id(source, input, new_uuid_v4())
+            .await
+    }
+
+    pub(crate) async fn create_handoff_with_id(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateHandoffInput,
+        id: String,
     ) -> Result<Handoff> {
         let (task, created_by) = self.authorize_source(&input.task_id, &source).await?;
         self.validate_target(&task, &input.target).await?;
@@ -350,43 +393,62 @@ impl CollaborationService {
                 (Some(task_role.id), Some(execution.id))
             }
         };
-        let id = new_uuid_v4();
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "handoff.created",
-                entity_type: "handoff",
-                entity_id: &id,
-                task_id: &task.id,
-            },
-            &created_by,
-            serde_json::json!({
-                "handoff_id": id,
-                "task_id": task.id,
-                "intent": input.intent.to_string(),
-                "target_kind": input.target.kind().to_string(),
-                "work_unit_id": input.work_unit_id.clone(),
-            }),
-            &now,
-        );
-        let write = CollaborationRepo::create_handoff(
-            &*self.db,
-            CreateHandoff {
-                id,
-                task_id: task.id,
-                created_by,
-                source_role_id,
-                target: input.target,
-                work_unit_id: input.work_unit_id,
-                intent: input.intent,
-                parent_execution_id,
-                expected_policy_ref: input.expected_policy_ref,
-                artifact_ids: input.artifact_ids,
-                created_at: now,
-            },
-            event,
-        )
-        .await?;
+        let expected = CreateHandoff {
+            id,
+            task_id: task.id,
+            created_by,
+            source_role_id,
+            target: input.target,
+            work_unit_id: input.work_unit_id,
+            intent: input.intent,
+            parent_execution_id,
+            expected_policy_ref: input.expected_policy_ref,
+            artifact_ids: input.artifact_ids,
+            created_at: now.clone(),
+        };
+        if let Some(existing) = CollaborationRepo::get_handoff(&*self.db, &expected.id).await? {
+            if handoff_matches_record(&existing, &expected) {
+                return Ok(existing);
+            }
+            return Err(invalid(
+                "Handoff idempotency key conflicts with an existing record",
+            ));
+        }
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "handoff.created",
+                    entity_type: "handoff",
+                    entity_id: &expected.id,
+                    task_id: &expected.task_id,
+                },
+                &expected.created_by,
+                serde_json::json!({
+                    "handoff_id": expected.id,
+                    "task_id": expected.task_id,
+                    "intent": expected.intent.to_string(),
+                    "target_kind": expected.target.kind().to_string(),
+                    "work_unit_id": expected.work_unit_id,
+                }),
+                &now,
+            )
+            .await?;
+        let write =
+            match CollaborationRepo::create_handoff(&*self.db, expected.clone(), event).await {
+                Ok(write) => write,
+                Err(error) => {
+                    if let Some(existing) =
+                        CollaborationRepo::get_handoff(&*self.db, &expected.id).await?
+                    {
+                        if handoff_matches_record(&existing, &expected) {
+                            return Ok(existing);
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
     }
@@ -444,23 +506,26 @@ impl CollaborationService {
         self.authorize_handoff_transition(&existing, &actor, next_status)
             .await?;
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "handoff.status_changed",
-                entity_type: "handoff",
-                entity_id: id,
-                task_id: &existing.task_id,
-            },
-            &actor,
-            serde_json::json!({
-                "handoff_id": id,
-                "task_id": existing.task_id,
-                "from_status": existing.status.to_string(),
-                "status": next_status.to_string(),
-                "version": existing.version + 1,
-            }),
-            &now,
-        );
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "handoff.status_changed",
+                    entity_type: "handoff",
+                    entity_id: id,
+                    task_id: &existing.task_id,
+                },
+                &actor,
+                serde_json::json!({
+                    "handoff_id": id,
+                    "task_id": existing.task_id,
+                    "from_status": existing.status.to_string(),
+                    "status": next_status.to_string(),
+                    "version": existing.version + 1,
+                }),
+                &now,
+            )
+            .await?;
         let write = CollaborationRepo::transition_handoff(
             &*self.db,
             db::TransitionHandoff {
@@ -480,6 +545,16 @@ impl CollaborationService {
         &self,
         source: CollaborationActorSource,
         input: CreateProposalInput,
+    ) -> Result<Proposal> {
+        self.create_proposal_with_id(source, input, new_uuid_v4())
+            .await
+    }
+
+    pub(crate) async fn create_proposal_with_id(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateProposalInput,
+        id: String,
     ) -> Result<Proposal> {
         let (task, proposer) = self.authorize_source(&input.task_id, &source).await?;
         if input.action.trim().is_empty() {
@@ -504,44 +579,63 @@ impl CollaborationService {
         }
         self.validate_artifact_links(&task.id, &input.artifact_ids)
             .await?;
-        let id = new_uuid_v4();
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "proposal.created",
-                entity_type: "proposal",
-                entity_id: &id,
-                task_id: &task.id,
-            },
-            &proposer,
-            serde_json::json!({
-                "proposal_id": id,
-                "task_id": task.id,
-                "target_kind": input.target.kind.to_string(),
-            }),
-            &now,
-        );
-        let write = CollaborationRepo::create_proposal(
-            &*self.db,
-            CreateProposal {
-                id,
-                task_id: task.id,
-                proposer,
-                target: input.target,
-                action: input.action,
-                reason: input.reason,
-                target_version: input.target_version,
-                target_digest: input.target_digest,
-                required_policy_ref: input.required_policy_ref,
-                required_policy_version: input.required_policy_version,
-                required_policy_digest: input.required_policy_digest,
-                supersedes_proposal_id: input.supersedes_proposal_id,
-                artifact_ids: input.artifact_ids,
-                created_at: now,
-            },
-            event,
-        )
-        .await?;
+        let expected = CreateProposal {
+            id,
+            task_id: task.id,
+            proposer,
+            target: input.target,
+            action: input.action,
+            reason: input.reason,
+            target_version: input.target_version,
+            target_digest: input.target_digest,
+            required_policy_ref: input.required_policy_ref,
+            required_policy_version: input.required_policy_version,
+            required_policy_digest: input.required_policy_digest,
+            supersedes_proposal_id: input.supersedes_proposal_id,
+            artifact_ids: input.artifact_ids,
+            created_at: now.clone(),
+        };
+        if let Some(existing) = CollaborationRepo::get_proposal(&*self.db, &expected.id).await? {
+            if proposal_matches_record(&existing, &expected) {
+                return Ok(existing);
+            }
+            return Err(invalid(
+                "Proposal idempotency key conflicts with an existing record",
+            ));
+        }
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "proposal.created",
+                    entity_type: "proposal",
+                    entity_id: &expected.id,
+                    task_id: &expected.task_id,
+                },
+                &expected.proposer,
+                serde_json::json!({
+                    "proposal_id": expected.id,
+                    "task_id": expected.task_id,
+                    "target_kind": expected.target.kind.to_string(),
+                }),
+                &now,
+            )
+            .await?;
+        let write =
+            match CollaborationRepo::create_proposal(&*self.db, expected.clone(), event).await {
+                Ok(write) => write,
+                Err(error) => {
+                    if let Some(existing) =
+                        CollaborationRepo::get_proposal(&*self.db, &expected.id).await?
+                    {
+                        if proposal_matches_record(&existing, &expected) {
+                            return Ok(existing);
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
     }
@@ -591,21 +685,24 @@ impl CollaborationService {
             return Err(not_found("proposal", id.to_owned()));
         }
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "proposal.withdrawn",
-                entity_type: "proposal",
-                entity_id: id,
-                task_id: &existing.task_id,
-            },
-            &actor,
-            serde_json::json!({
-                "proposal_id": id,
-                "task_id": existing.task_id,
-                "status": "withdrawn",
-            }),
-            &now,
-        );
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "proposal.withdrawn",
+                    entity_type: "proposal",
+                    entity_id: id,
+                    task_id: &existing.task_id,
+                },
+                &actor,
+                serde_json::json!({
+                    "proposal_id": id,
+                    "task_id": existing.task_id,
+                    "status": "withdrawn",
+                }),
+                &now,
+            )
+            .await?;
         let write = CollaborationRepo::withdraw_proposal(&*self.db, id, event).await?;
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
@@ -650,22 +747,28 @@ impl CollaborationService {
         let initiating_actor = actors[0].clone();
         let id = new_uuid_v4();
         let now = now_rfc3339();
-        let event = self.event(
-            EventScope {
-                event_type: "decision.recorded",
-                entity_type: "decision",
-                entity_id: &id,
-                task_id: &input.task_id,
-            },
-            &initiating_actor,
-            serde_json::json!({
-                "decision_id": id,
-                "task_id": input.task_id,
-                "proposal_id": input.proposal_id,
-                "outcome": input.outcome.to_string(),
-            }),
-            &now,
-        );
+        let source = deciders
+            .first()
+            .ok_or_else(|| invalid("Decision requires a decider"))?;
+        let event = self
+            .event_from_source(
+                source,
+                EventScope {
+                    event_type: "decision.recorded",
+                    entity_type: "decision",
+                    entity_id: &id,
+                    task_id: &input.task_id,
+                },
+                &initiating_actor,
+                serde_json::json!({
+                    "decision_id": id,
+                    "task_id": input.task_id,
+                    "proposal_id": input.proposal_id,
+                    "outcome": input.outcome.to_string(),
+                }),
+                &now,
+            )
+            .await?;
         let write = CollaborationRepo::create_decision(
             &*self.db,
             CreateDecision {
@@ -1011,14 +1114,54 @@ impl CollaborationService {
         }))
     }
 
-    fn event(
+    async fn event_from_source(
         &self,
+        source: &CollaborationActorSource,
         scope: EventScope<'_>,
         actor: &ActorRef,
         payload: serde_json::Value,
         now: &str,
-    ) -> CreateDomainEvent {
-        CreateDomainEvent {
+    ) -> Result<CreateDomainEvent> {
+        let mut correlation_id = new_uuid_v4();
+        let mut causation_id = None;
+        let mut causation_depth = 0;
+        if let CollaborationActorSource::Execution(execution_id) = source {
+            let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+                .await?
+                .ok_or_else(|| not_found("execution", execution_id.clone()))?;
+            if execution.task_id != scope.task_id || execution.actor_ref() != Some(actor.clone()) {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "collaboration event source does not match its exact Task Actor"
+                        .to_owned(),
+                });
+            }
+            if execution.role == "orchestrator"
+                && execution.purpose == Some(ExecutionPurpose::Orchestrate)
+            {
+                let start_event = DomainEventRepo::get_event_by_dedupe(
+                    &*self.db,
+                    &format!("execution.started:{}", execution.id),
+                )
+                .await?
+                .filter(|event| {
+                    event.entity_type == "execution"
+                        && event.entity_id == execution.id
+                        && event.scope_type == "task"
+                        && event.scope_id == scope.task_id
+                })
+                .ok_or_else(|| {
+                    invalid("orchestrator action has no durable Execution start event")
+                })?;
+                let depth = start_event.causation_depth.saturating_add(1);
+                if depth > 16 {
+                    return Err(invalid("orchestrator action exceeds causation depth limit"));
+                }
+                correlation_id = start_event.correlation_id;
+                causation_id = Some(start_event.id);
+                causation_depth = depth;
+            }
+        }
+        Ok(CreateDomainEvent {
             id: new_uuid_v4(),
             event_type: scope.event_type.to_owned(),
             entity_type: scope.entity_type.to_owned(),
@@ -1027,13 +1170,13 @@ impl CollaborationService {
             actor_id: Some(actor.id().to_owned()),
             scope_type: "task".to_owned(),
             scope_id: scope.task_id.to_owned(),
-            correlation_id: new_uuid_v4(),
-            causation_id: None,
-            causation_depth: 0,
+            correlation_id,
+            causation_id,
+            causation_depth,
             dedupe_key: None,
             payload_json: payload.to_string(),
             created_at: now.to_owned(),
-        }
+        })
     }
 }
 
@@ -1053,6 +1196,61 @@ fn validate_artifact_storage(
             "Artifact storage requires exactly one of inline content or external content_ref",
         )),
     }
+}
+
+fn message_matches(
+    existing: &db::Message,
+    task_id: &str,
+    sender: &ActorRef,
+    input: &CreateMessageInput,
+) -> bool {
+    existing.task_id == task_id
+        && existing.sender == *sender
+        && existing.target == input.target
+        && existing.work_unit_id == input.work_unit_id
+        && existing.body == input.body
+        && existing.artifact_ids == input.artifact_ids
+}
+
+fn message_matches_record(existing: &db::Message, input: &CreateMessage) -> bool {
+    existing.id == input.id
+        && existing.task_id == input.task_id
+        && existing.sender == input.sender
+        && existing.target == input.target
+        && existing.work_unit_id == input.work_unit_id
+        && existing.body == input.body
+        && existing.artifact_ids == input.artifact_ids
+}
+
+fn handoff_matches_record(existing: &Handoff, input: &CreateHandoff) -> bool {
+    existing.id == input.id
+        && existing.task_id == input.task_id
+        && existing.created_by == input.created_by
+        && existing.source_role_id == input.source_role_id
+        && existing.target == input.target
+        && existing.work_unit_id == input.work_unit_id
+        && existing.intent == input.intent
+        && existing.parent_execution_id == input.parent_execution_id
+        && existing.expected_policy_ref == input.expected_policy_ref
+        && existing.status == HandoffStatus::Pending
+        && existing.artifact_ids == input.artifact_ids
+}
+
+fn proposal_matches_record(existing: &Proposal, input: &CreateProposal) -> bool {
+    existing.id == input.id
+        && existing.task_id == input.task_id
+        && existing.proposer == input.proposer
+        && existing.target == input.target
+        && existing.action == input.action
+        && existing.reason == input.reason
+        && existing.target_version == input.target_version
+        && existing.target_digest == input.target_digest
+        && existing.required_policy_ref == input.required_policy_ref
+        && existing.required_policy_version == input.required_policy_version
+        && existing.required_policy_digest == input.required_policy_digest
+        && existing.supersedes_proposal_id == input.supersedes_proposal_id
+        && existing.status == ProposalStatus::Open
+        && existing.artifact_ids == input.artifact_ids
 }
 
 fn not_found(entity: &'static str, id: String) -> ServiceError {

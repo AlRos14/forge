@@ -415,7 +415,12 @@ impl HeartbeatMonitor {
             }
 
             let now = now_rfc3339();
-            let updated = ExecutionRepo::update(
+            let event = crate::task_service::execution_stalled_domain_event(
+                &execution,
+                &stale_before,
+                &now,
+            );
+            let (updated, committed_event) = ExecutionRepo::update_with_event(
                 &*self.db,
                 UpdateExecution {
                     id: execution.id.clone(),
@@ -440,8 +445,10 @@ impl HeartbeatMonitor {
                     executor_config_snapshot_json: None,
                     updated_at: now,
                 },
+                event,
             )
             .await?;
+            crate::DomainEventService::publish_committed_hint(&self.event_bus, &committed_event);
 
             revoke_active_workspace_lease(&self.db, &updated.id).await;
 
@@ -643,7 +650,12 @@ async fn expire_workspace_leases(
         }
 
         let now = now_rfc3339();
-        let updated = match ExecutionRepo::update(
+        let event = crate::task_service::execution_stalled_domain_event(
+            &execution,
+            &lease.expires_at,
+            &now,
+        );
+        let updated = match ExecutionRepo::update_with_event(
             db,
             UpdateExecution {
                 id: execution.id.clone(),
@@ -666,10 +678,14 @@ async fn expire_workspace_leases(
                 executor_config_snapshot_json: None,
                 updated_at: now,
             },
+            event,
         )
         .await
         {
-            Ok(updated) => updated,
+            Ok((updated, committed_event)) => {
+                crate::DomainEventService::publish_committed_hint(event_bus, &committed_event);
+                updated
+            }
             Err(error) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -1088,15 +1104,21 @@ pub(crate) async fn cancel_running_executions(
             execution_id: execution.id.clone(),
             resumable_external_session_id,
         };
-        if ExecutionRepo::update(
+        let now = now_rfc3339();
+        let event = crate::task_service::execution_status_domain_event(
+            &execution,
+            &ExecutionStatus::Cancelled,
+            &now,
+        );
+        if ExecutionRepo::update_with_event(
             db,
             UpdateExecution {
-                id: execution.id,
+                id: execution.id.clone(),
                 status: Some(ExecutionStatus::Cancelled),
                 stop_reason: Some(Some(stop_reason.clone())),
                 stopped_by: Some(Some(stopped_by.display())),
                 resume_policy: Some(Some(resume_policy.clone())),
-                stopped_at: Some(Some(now_rfc3339())),
+                stopped_at: Some(Some(now.clone())),
                 agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
@@ -1106,8 +1128,9 @@ pub(crate) async fn cancel_running_executions(
                 after_sha: None,
                 error: Some(Some("Recovered".to_owned())),
                 executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
+                updated_at: now,
             },
+            event,
         )
         .await
         .is_ok()
@@ -1200,7 +1223,12 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         reconciliation_reason,
     } = input;
     let now = now_rfc3339();
-    let updated = ExecutionRepo::update(
+    let event = crate::task_service::execution_status_domain_event(
+        execution,
+        &ExecutionStatus::Failed,
+        &now,
+    );
+    let (updated, committed_event) = ExecutionRepo::update_with_event(
         db,
         UpdateExecution {
             id: execution.id.clone(),
@@ -1220,8 +1248,10 @@ pub(crate) async fn fail_execution_daemon_disconnected(
             executor_config_snapshot_json: None,
             updated_at: now,
         },
+        event,
     )
     .await?;
+    crate::DomainEventService::publish_committed_hint(event_bus, &committed_event);
 
     revoke_active_workspace_lease(db, &updated.id).await;
 

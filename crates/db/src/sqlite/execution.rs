@@ -1,5 +1,5 @@
 use super::*;
-use crate::{now_rfc3339, AgentExecutionStats};
+use crate::{now_rfc3339, AgentExecutionStats, ExecutionPurpose};
 
 #[async_trait]
 impl ExecutionRepo for SqliteDb {
@@ -8,6 +8,85 @@ impl ExecutionRepo for SqliteDb {
         let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
         transaction.commit().await?;
         Ok(execution)
+    }
+
+    async fn create_with_event(
+        &self,
+        input: CreateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)> {
+        let mut transaction = self.pool.begin().await?;
+        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
+        let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
+        Ok((execution, event))
+    }
+
+    async fn create_orchestrator_execution(
+        &self,
+        input: CreateExecution,
+        wake_id: &str,
+        attempt_number: i64,
+        lease_owner: &str,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)> {
+        let Some(ActorRef::Agent(agent_id)) = input.actor_ref.as_ref() else {
+            return Err(DbError::Check(
+                "automatic orchestrator Execution requires an Agent ActorRef".to_owned(),
+            ));
+        };
+        if input.role != "orchestrator"
+            || input.purpose != Some(ExecutionPurpose::Orchestrate)
+            || input.workspace_id.is_some()
+            || event.event_type != "execution.started"
+            || event.entity_type != "execution"
+            || event.entity_id != input.id
+            || event.scope_type != "task"
+            || event.scope_id != input.task_id
+            || event.actor_type != "agent"
+            || event.actor_id.as_deref() != Some(agent_id.as_str())
+        {
+            return Err(DbError::Check(
+                "orchestrator Execution must be workspace-free with exact role and purpose"
+                    .to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let admitted: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM orchestrator_wake w
+                JOIN orchestrator_wake_execution x ON x.wake_id = w.id
+                WHERE w.id = ? AND w.task_id = ? AND w.actor_kind = 'agent'
+                  AND w.actor_id = ? AND w.task_role_id = (
+                      SELECT id FROM task_role WHERE task_id = w.task_id
+                        AND role = 'orchestrator'
+                  )
+                  AND w.state = 'leased' AND w.lease_owner = ?
+                  AND EXISTS (
+                      SELECT 1 FROM role_membership rm
+                      WHERE rm.task_role_id = w.task_role_id
+                        AND rm.actor_kind = 'agent' AND rm.actor_id = w.actor_id
+                        AND rm.status = 'active'
+                  )
+                  AND x.attempt_number = ? AND x.execution_id = ?
+                  AND x.state = 'reserved'
+            )",
+        )
+        .bind(wake_id)
+        .bind(&input.task_id)
+        .bind(agent_id)
+        .bind(lease_owner)
+        .bind(attempt_number)
+        .bind(&input.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if admitted == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
+        let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
+        Ok((execution, event))
     }
 
     async fn get_task_id(&self, id: &str) -> Result<Option<String>> {
@@ -186,135 +265,21 @@ impl ExecutionRepo for SqliteDb {
 
     async fn update(&self, input: UpdateExecution) -> Result<Execution> {
         let mut transaction = self.pool.begin().await?;
-        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
-            .bind(&input.id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .map(super::map_execution)
-            .transpose()?
-            .ok_or(DbError::NotFound)?;
-        if let Some(status) = input.status.as_ref() {
-            if !execution_transition_allowed(&execution.status, status) {
-                return Err(DbError::InvalidTransition);
-            }
-        }
-        let requested_status = input.status.clone();
-        let updated_at = input.updated_at.clone();
-
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE execution SET ");
-        let mut needs_comma = false;
-        macro_rules! push_assignment {
-            ($column:literal, $value:expr) => {{
-                if needs_comma {
-                    query.push(", ");
-                }
-                needs_comma = true;
-                query.push($column).push(" = ").push_bind($value);
-            }};
-        }
-        if let Some(status) = input.status {
-            push_assignment!("status", status.to_string());
-        }
-        let legacy_session_update = input.agent_session_id.clone();
-        if matches!(legacy_session_update.as_ref(), Some(None))
-            && execution.harness_session_id.is_none()
-        {
-            push_assignment!("agent_session_id", None::<String>);
-        }
-        if let Some(agent_message_id) = input.agent_message_id {
-            push_assignment!("agent_message_id", agent_message_id);
-        }
-        if let Some(last_activity_at) = input.last_activity_at {
-            push_assignment!("last_activity_at", last_activity_at);
-        }
-        if let Some(summary) = input.summary {
-            push_assignment!("summary", summary);
-        }
-        if let Some(logs_path) = input.logs_path {
-            push_assignment!("logs_path", logs_path);
-        }
-        if let Some(before_sha) = input.before_sha {
-            push_assignment!("before_sha", before_sha);
-        }
-        if let Some(after_sha) = input.after_sha {
-            push_assignment!("after_sha", after_sha);
-        }
-        if let Some(error) = input.error {
-            push_assignment!("error", error);
-        }
-        if let Some(executor_config_snapshot_json) = input.executor_config_snapshot_json {
-            // An explicit HarnessSession remains resumable after a failed or
-            // cancelled Execution. Preserve the immutable executor snapshot
-            // needed to reconstruct that continuity; cleanup remains valid
-            // for rows that have no generic session authority.
-            if executor_config_snapshot_json.is_some() || execution.harness_session_id.is_none() {
-                push_assignment!(
-                    "executor_config_snapshot_json",
-                    executor_config_snapshot_json
-                );
-            }
-        }
-        if let Some(stop_reason) = input.stop_reason {
-            push_assignment!("stop_reason", stop_reason.map(|value| value.to_string()));
-        }
-        if let Some(stopped_by) = input.stopped_by {
-            push_assignment!("stopped_by", stopped_by);
-        }
-        if let Some(resume_policy) = input.resume_policy {
-            push_assignment!(
-                "resume_policy",
-                resume_policy.map(|value| value.to_string())
-            );
-        }
-        if let Some(stopped_at) = input.stopped_at {
-            push_assignment!("stopped_at", stopped_at);
-        }
-        if needs_comma {
-            query.push(", ");
-        }
-        query.push("updated_at = ").push_bind(input.updated_at);
-        query.push(" WHERE id = ").push_bind(&input.id);
-        query.build().execute(&mut *transaction).await?;
-        if let Some(Some(external_session_id)) = legacy_session_update.as_ref() {
-            bind_external_session_in_tx(
-                &mut transaction,
-                &input.id,
-                external_session_id,
-                &now_rfc3339(),
-            )
-            .await?;
-        }
-        if execution.work_unit_id.is_some()
-            && execution.status == ExecutionStatus::Running
-            && requested_status.as_ref().is_some_and(|status| {
-                matches!(
-                    status,
-                    ExecutionStatus::Completed
-                        | ExecutionStatus::Failed
-                        | ExecutionStatus::Cancelled
-                )
-            })
-        {
-            sqlx::query(
-                "UPDATE workspace_lease
-                 SET status = 'revoked', revoked_at = ?, version = version + 1,
-                     updated_at = ?
-                 WHERE execution_id = ? AND work_unit_id = ? AND status = 'active'",
-            )
-            .bind(&updated_at)
-            .bind(&updated_at)
-            .bind(&execution.id)
-            .bind(execution.work_unit_id.as_deref())
-            .execute(&mut *transaction)
-            .await?;
-        }
-        let updated = sqlx::query("SELECT * FROM execution WHERE id = ?")
-            .bind(&input.id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map(super::map_execution)??;
+        let updated = update_execution_in_tx(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(updated)
+    }
+
+    async fn update_with_event(
+        &self,
+        input: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)> {
+        let mut transaction = self.pool.begin().await?;
+        let updated = update_execution_in_tx(&mut transaction, input).await?;
+        let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
+        Ok((updated, event))
     }
 
     async fn update_last_activity_at(&self, id: &str, timestamp: &str) -> Result<()> {
@@ -431,6 +396,131 @@ impl ExecutionRepo for SqliteDb {
         transaction.commit().await?;
         Ok(execution)
     }
+}
+
+async fn update_execution_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    input: UpdateExecution,
+) -> Result<Execution> {
+    let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+        .bind(&input.id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .map(super::map_execution)
+        .transpose()?
+        .ok_or(DbError::NotFound)?;
+    if let Some(status) = input.status.as_ref() {
+        if !execution_transition_allowed(&execution.status, status) {
+            return Err(DbError::InvalidTransition);
+        }
+    }
+    let requested_status = input.status.clone();
+    let updated_at = input.updated_at.clone();
+
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE execution SET ");
+    let mut needs_comma = false;
+    macro_rules! push_assignment {
+        ($column:literal, $value:expr) => {{
+            if needs_comma {
+                query.push(", ");
+            }
+            needs_comma = true;
+            query.push($column).push(" = ").push_bind($value);
+        }};
+    }
+    if let Some(status) = input.status {
+        push_assignment!("status", status.to_string());
+    }
+    let legacy_session_update = input.agent_session_id.clone();
+    if matches!(legacy_session_update.as_ref(), Some(None))
+        && execution.harness_session_id.is_none()
+    {
+        push_assignment!("agent_session_id", None::<String>);
+    }
+    if let Some(agent_message_id) = input.agent_message_id {
+        push_assignment!("agent_message_id", agent_message_id);
+    }
+    if let Some(last_activity_at) = input.last_activity_at {
+        push_assignment!("last_activity_at", last_activity_at);
+    }
+    if let Some(summary) = input.summary {
+        push_assignment!("summary", summary);
+    }
+    if let Some(logs_path) = input.logs_path {
+        push_assignment!("logs_path", logs_path);
+    }
+    if let Some(before_sha) = input.before_sha {
+        push_assignment!("before_sha", before_sha);
+    }
+    if let Some(after_sha) = input.after_sha {
+        push_assignment!("after_sha", after_sha);
+    }
+    if let Some(error) = input.error {
+        push_assignment!("error", error);
+    }
+    if let Some(executor_config_snapshot_json) = input.executor_config_snapshot_json {
+        // Keep the immutable snapshot whenever an explicit HarnessSession
+        // may be used by recovery or a future explicit Resume operation.
+        if executor_config_snapshot_json.is_some() || execution.harness_session_id.is_none() {
+            push_assignment!(
+                "executor_config_snapshot_json",
+                executor_config_snapshot_json
+            );
+        }
+    }
+    if let Some(stop_reason) = input.stop_reason {
+        push_assignment!("stop_reason", stop_reason.map(|value| value.to_string()));
+    }
+    if let Some(stopped_by) = input.stopped_by {
+        push_assignment!("stopped_by", stopped_by);
+    }
+    if let Some(resume_policy) = input.resume_policy {
+        push_assignment!(
+            "resume_policy",
+            resume_policy.map(|value| value.to_string())
+        );
+    }
+    if let Some(stopped_at) = input.stopped_at {
+        push_assignment!("stopped_at", stopped_at);
+    }
+    if needs_comma {
+        query.push(", ");
+    }
+    query.push("updated_at = ").push_bind(input.updated_at);
+    query.push(" WHERE id = ").push_bind(&input.id);
+    query.build().execute(&mut **transaction).await?;
+    if let Some(Some(external_session_id)) = legacy_session_update.as_ref() {
+        bind_external_session_in_tx(transaction, &input.id, external_session_id, &now_rfc3339())
+            .await?;
+    }
+    if execution.work_unit_id.is_some()
+        && execution.status == ExecutionStatus::Running
+        && requested_status.as_ref().is_some_and(|status| {
+            matches!(
+                status,
+                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+            )
+        })
+    {
+        sqlx::query(
+            "UPDATE workspace_lease
+             SET status = 'revoked', revoked_at = ?, version = version + 1,
+                 updated_at = ?
+             WHERE execution_id = ? AND work_unit_id = ? AND status = 'active'",
+        )
+        .bind(&updated_at)
+        .bind(&updated_at)
+        .bind(&execution.id)
+        .bind(execution.work_unit_id.as_deref())
+        .execute(&mut **transaction)
+        .await?;
+    }
+    let updated = sqlx::query("SELECT * FROM execution WHERE id = ?")
+        .bind(&input.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map(super::map_execution)??;
+    Ok(updated)
 }
 
 async fn bind_external_session_in_tx(

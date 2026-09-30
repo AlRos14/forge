@@ -1593,6 +1593,17 @@ impl TaskService {
         &self,
         execution: &db::Execution,
     ) -> Result<Option<db::WorkspaceLease>> {
+        if execution.role == "orchestrator"
+            && execution.purpose == Some(db::ExecutionPurpose::Orchestrate)
+        {
+            if execution.workspace_id.is_some() {
+                return Err(ServiceError::invalid_operation(
+                    "orchestrator Execution cannot receive a mutable WorkspaceLease",
+                ));
+            }
+            self.validate_orchestrator_execution(execution).await?;
+            return Ok(None);
+        }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;

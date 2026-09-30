@@ -1,21 +1,24 @@
 use crate::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4, ActorKind,
     AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo, AgentSessionRepo,
-    AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimTask, CompareAndMoveTask,
-    CompleteDomainEvent, CreateAgent, CreateAgentContextScope, CreateAgentIdentity,
-    CreateAgentProfile, CreateAgentSession, CreateDomainEvent, CreateExecution, CreateProject,
+    AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimOrchestratorWake,
+    ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CoordinationMode, CreateAgent,
+    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
+    CreateDomainEvent, CreateExecution, CreateOrchestratorWake, CreateProject,
     CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
     CreateProjectCharterRevisionAtomically, CreateProjectMember,
-    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateSkill, CreateTask,
-    CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace, CreateWorkspaceLease,
-    CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo,
-    ExecutionStatus, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind,
-    MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity, MoveTaskPersistence,
-    NotificationListQuery, NotificationRepo, PageRequest, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
-    ReviewRepo, ReviewStatus, RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile,
-    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery,
-    TaskRepo, TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateRoleMembership,
+    CreateSkill, CreateTask, CreateTaskRole, CreateTaskRoleAssignment, CreateTerminalSession,
+    CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError,
+    DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryAccessQuery, MemoryConfidence,
+    MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType,
+    MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery, NotificationRepo,
+    OrchestratorWakeRepo, PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo,
+    ProjectOrchestrationRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
+    ReserveOrchestratorAction, ReviewRepo, ReviewStatus, RoleMembershipRepo, RoleMembershipStatus,
+    RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo, SortBy, SortOrder,
+    SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    TaskRoleAssignmentRepo, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
     UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill,
     UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
     WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
@@ -1369,6 +1372,555 @@ async fn seed_task(
         .expect("role assignment creates");
     }
     task_id
+}
+
+async fn seed_pr6_orchestrator_event(
+    db: &SqliteDb,
+) -> (String, String, String, crate::DomainEvent) {
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(db).await;
+    let task_id = seed_task(
+        db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "todo".to_owned(),
+        "PR6 task",
+    )
+    .await;
+    let now = now_rfc3339();
+    let role = TaskRoleRepo::create(
+        db,
+        CreateTaskRole {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role: "orchestrator".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("orchestrator TaskRole creates");
+    RoleMembershipRepo::add(
+        db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role.id.clone(),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("orchestrator membership creates");
+    let event = DomainEventRepo::append_event(
+        db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "task.created".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task_id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some(new_uuid_v4()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: serde_json::json!({"task_id": task_id}).to_string(),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("durable event appends");
+    (task_id, agent_id, role.id, event)
+}
+
+#[tokio::test]
+async fn pr6_wake_admission_is_deduplicated_and_lease_expiry_is_retryable() {
+    let db = sqlite_db().await;
+    let (task_id, agent_id, role_id, event) = seed_pr6_orchestrator_event(&db).await;
+    let now = "2026-09-30T12:00:00Z";
+    let unauthorized = ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            role: "orchestrator".to_owned(),
+            purpose: Some(crate::ExecutionPurpose::Orchestrate),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some("{}".to_owned()),
+            workspace_id: None,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        unauthorized.is_err(),
+        "workspace-free orchestrator Execution needs a durable wake"
+    );
+
+    let create = |id: String| CreateOrchestratorWake {
+        id,
+        event_id: event.id.clone(),
+        event_sequence: event.sequence,
+        task_id: task_id.clone(),
+        task_role_id: role_id.clone(),
+        coordination_mode: Some(CoordinationMode::Collaborative),
+        actor_kind: ActorKind::Agent,
+        actor_id: agent_id.clone(),
+        work_unit_id: None,
+        correlation_id: event.correlation_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+        policy_version: 1,
+        policy_digest: "digest-v1".to_owned(),
+        available_at: now.to_owned(),
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
+    let first_id = new_uuid_v4();
+    assert!(
+        OrchestratorWakeRepo::admit_orchestrator_wake(&db, create(first_id.clone()))
+            .await
+            .expect("first admission succeeds")
+    );
+    assert!(
+        !OrchestratorWakeRepo::admit_orchestrator_wake(&db, create(new_uuid_v4()))
+            .await
+            .expect("replay admission succeeds")
+    );
+
+    let claim = |owner: &str, time: &str, lease: &str| ClaimOrchestratorWake {
+        lease_owner: owner.to_owned(),
+        now: time.to_owned(),
+        leased_until: lease.to_owned(),
+    };
+    let leased = OrchestratorWakeRepo::claim_orchestrator_wake(
+        &db,
+        claim("process-a", now, "2026-09-30T12:01:00Z"),
+    )
+    .await
+    .expect("claim succeeds")
+    .expect("wake is claimed");
+    assert_eq!(leased.id, first_id);
+    assert!(OrchestratorWakeRepo::claim_orchestrator_wake(
+        &db,
+        claim("process-b", now, "2026-09-30T12:01:00Z"),
+    )
+    .await
+    .expect("concurrent claim query succeeds")
+    .is_none());
+
+    let retried = OrchestratorWakeRepo::claim_orchestrator_wake(
+        &db,
+        claim("process-b", "2026-09-30T12:01:01Z", "2026-09-30T12:02:01Z"),
+    )
+    .await
+    .expect("expired lease can be reclaimed")
+    .expect("wake remains pending for recovery");
+    assert_eq!(retried.id, first_id);
+    assert_eq!(retried.lease_owner.as_deref(), Some("process-b"));
+}
+
+#[tokio::test]
+async fn pr6_cross_task_event_cannot_admit_an_orchestrator_wake() {
+    let db = sqlite_db().await;
+    let (task_id, agent_id, _, event) = seed_pr6_orchestrator_event(&db).await;
+    let source_task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("source task loads")
+        .expect("source task exists");
+    let second_task_id = new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: second_task_id.clone(),
+            project_id: source_task.project_id,
+            repo_id: source_task.repo_id,
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Different Task scope".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("second task creates");
+    let second_role_id = new_uuid_v4();
+    TaskRoleRepo::create(
+        &db,
+        CreateTaskRole {
+            id: second_role_id.clone(),
+            task_id: second_task_id.clone(),
+            role: "orchestrator".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("second TaskRole creates");
+    RoleMembershipRepo::add(
+        &db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: second_role_id.clone(),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("same Actor also holds the second Task role");
+
+    let result = OrchestratorWakeRepo::admit_orchestrator_wake(
+        &db,
+        CreateOrchestratorWake {
+            id: new_uuid_v4(),
+            event_id: event.id,
+            event_sequence: event.sequence,
+            task_id: second_task_id,
+            task_role_id: second_role_id,
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id,
+            work_unit_id: None,
+            correlation_id: event.correlation_id,
+            causation_id: None,
+            causation_depth: 0,
+            policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+            policy_version: 1,
+            policy_digest: "digest-v1".to_owned(),
+            available_at: now_rfc3339(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "durable event scope must exactly match the wake Task"
+    );
+}
+
+#[tokio::test]
+async fn pr6_two_sqlite_pools_compete_for_event_and_wake_authority() {
+    let directory = tempfile::tempdir().expect("temporary database directory creates");
+    let database_url = format!("sqlite://{}", directory.path().join("pr6.sqlite").display());
+    let pool_a = create_sqlite_pool(&database_url)
+        .await
+        .expect("first process pool creates");
+    run_migrations(&pool_a)
+        .await
+        .expect("first process migrates the shared database");
+    let db_a = SqliteDb::new(pool_a);
+    let db_b = SqliteDb::new(
+        create_sqlite_pool(&database_url)
+            .await
+            .expect("second process pool opens the same database"),
+    );
+    let (task_id, agent_id, role_id, event) = seed_pr6_orchestrator_event(&db_a).await;
+    sqlx::query(
+        "UPDATE event_consumer_cursor
+         SET last_sequence = ?, version = version + 1
+         WHERE consumer_name = 'task-orchestrator-wakes'",
+    )
+    .bind(event.sequence - 1)
+    .execute(db_a.pool())
+    .await
+    .expect("consumer cursor starts immediately before the target event");
+
+    let event_claim = |owner: &str, now: &str, until: &str| ClaimDomainEvents {
+        consumer_name: "task-orchestrator-wakes".to_owned(),
+        lease_owner: owner.to_owned(),
+        now: now.to_owned(),
+        leased_until: until.to_owned(),
+        limit: 1,
+    };
+    let (claim_a, claim_b) = tokio::join!(
+        DomainEventRepo::claim_event_batch(
+            &db_a,
+            event_claim("process-a", "2026-09-30T12:00:00Z", "2026-09-30T12:01:00Z"),
+        ),
+        DomainEventRepo::claim_event_batch(
+            &db_b,
+            event_claim("process-b", "2026-09-30T12:00:00Z", "2026-09-30T12:01:00Z"),
+        ),
+    );
+    let claim_a = claim_a.expect("first process claims or observes another lease");
+    let claim_b = claim_b.expect("second process claims or observes another lease");
+    assert_ne!(claim_a.is_empty(), claim_b.is_empty());
+    assert_eq!(claim_a.len() + claim_b.len(), 1);
+    assert_eq!(claim_a.first().or(claim_b.first()).unwrap().id, event.id);
+
+    let retry = DomainEventRepo::claim_event_batch(
+        &db_b,
+        event_claim("process-b", "2026-09-30T12:01:01Z", "2026-09-30T12:02:01Z"),
+    )
+    .await
+    .expect("expired source-event lease can be reclaimed");
+    assert_eq!(retry.first().unwrap().id, event.id);
+
+    let now = "2026-09-30T12:02:00Z";
+    let wake_id = new_uuid_v4();
+    assert!(OrchestratorWakeRepo::admit_orchestrator_wake(
+        &db_a,
+        CreateOrchestratorWake {
+            id: wake_id.clone(),
+            event_id: event.id.clone(),
+            event_sequence: event.sequence,
+            task_id,
+            task_role_id: role_id,
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id,
+            work_unit_id: None,
+            correlation_id: event.correlation_id,
+            causation_id: None,
+            causation_depth: 0,
+            policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+            policy_version: 1,
+            policy_digest: "digest-v1".to_owned(),
+            available_at: now.to_owned(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("wake admission succeeds"));
+    let wake_claim = |owner: &str, now: &str, until: &str| ClaimOrchestratorWake {
+        lease_owner: owner.to_owned(),
+        now: now.to_owned(),
+        leased_until: until.to_owned(),
+    };
+    let (claim_a, claim_b) = tokio::join!(
+        OrchestratorWakeRepo::claim_orchestrator_wake(
+            &db_a,
+            wake_claim("process-a", now, "2026-09-30T12:03:00Z"),
+        ),
+        OrchestratorWakeRepo::claim_orchestrator_wake(
+            &db_b,
+            wake_claim("process-b", now, "2026-09-30T12:03:00Z"),
+        ),
+    );
+    let claim_a = claim_a.expect("first wake claim succeeds");
+    let claim_b = claim_b.expect("second wake claim succeeds");
+    assert_ne!(claim_a.is_none(), claim_b.is_none());
+    assert_eq!(claim_a.as_ref().or(claim_b.as_ref()).unwrap().id, wake_id);
+}
+
+#[tokio::test]
+async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
+    let db = sqlite_db().await;
+    let (task_id, agent_id, role_id, source_event) = seed_pr6_orchestrator_event(&db).await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    let wake_id = new_uuid_v4();
+    OrchestratorWakeRepo::admit_orchestrator_wake(
+        &db,
+        CreateOrchestratorWake {
+            id: wake_id.clone(),
+            event_id: source_event.id.clone(),
+            event_sequence: source_event.sequence,
+            task_id: task_id.clone(),
+            task_role_id: role_id,
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            work_unit_id: None,
+            correlation_id: source_event.correlation_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+            policy_version: 1,
+            policy_digest: "digest-v1".to_owned(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("wake admission succeeds");
+    OrchestratorWakeRepo::claim_orchestrator_wake(
+        &db,
+        ClaimOrchestratorWake {
+            lease_owner: "pr6-action-test".to_owned(),
+            now: now.clone(),
+            leased_until: "2026-10-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("wake claim succeeds")
+    .expect("wake is claimed");
+    let attempt = OrchestratorWakeRepo::reserve_orchestrator_wake_execution(
+        &db,
+        crate::ReserveOrchestratorWakeExecution {
+            wake_id: wake_id.clone(),
+            lease_owner: "pr6-action-test".to_owned(),
+            execution_id: execution_id.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("Execution attempt reservation succeeds");
+    let started_event_id = new_uuid_v4();
+    let (_execution, _) = ExecutionRepo::create_orchestrator_execution(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(crate::ExecutionPurpose::Orchestrate),
+            role: "orchestrator".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(r#"{"actions":[]}"#.to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some("{}".to_owned()),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        &wake_id,
+        attempt.attempt_number,
+        "pr6-action-test",
+        CreateDomainEvent {
+            id: started_event_id,
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: source_event.correlation_id,
+            causation_id: Some(source_event.id),
+            causation_depth: 1,
+            dedupe_key: Some(format!("execution.started:{execution_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("exact leased wake creates its orchestrate Execution");
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution_id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(Some(r#"{"actions":[]}"#.to_owned())),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("completed Execution can be used for action replay authority");
+    assert_eq!(attempt.state, "reserved");
+
+    let reserve = |digest: &str, result_id: String| ReserveOrchestratorAction {
+        execution_id: execution_id.clone(),
+        action_index: 0,
+        action_type: "message".to_owned(),
+        action_digest: digest.to_owned(),
+        result_id,
+        now: now.clone(),
+    };
+    let result_id = new_uuid_v4();
+    let first = OrchestratorWakeRepo::reserve_orchestrator_action(
+        &db,
+        reserve("digest-a", result_id.clone()),
+    )
+    .await
+    .expect("action reserves");
+    let replay =
+        OrchestratorWakeRepo::reserve_orchestrator_action(&db, reserve("digest-a", new_uuid_v4()))
+            .await
+            .expect("same action replay returns its reservation");
+    assert_eq!(first.result_id, result_id);
+    assert_eq!(replay.result_id, result_id);
+    assert!(matches!(
+        OrchestratorWakeRepo::reserve_orchestrator_action(&db, reserve("digest-b", new_uuid_v4()))
+            .await,
+        Err(DbError::IdempotencyConflict)
+    ));
+
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("Task remains readable before bounded teardown")
+        .expect("Task exists");
+    ProjectRepo::delete(&db, &task.project_id)
+        .await
+        .expect("guarded Project teardown removes PR6 wake history in dependency order");
+    for table in [
+        "orchestrator_wake",
+        "orchestrator_wake_execution",
+        "orchestrator_action",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .expect("PR6 teardown count reads");
+        assert_eq!(count, 0, "Project teardown clears {table}");
+    }
 }
 
 async fn seed_workspace_for_task(db: &SqliteDb, task_id: &str, repo_id: &str) -> String {

@@ -215,7 +215,16 @@ impl TaskService {
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
-        let execution = ExecutionRepo::update(
+        let current = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        let failed_at = now_rfc3339();
+        let event = super::super::execution_status_domain_event(
+            &current,
+            &ExecutionStatus::Failed,
+            &failed_at,
+        );
+        let (execution, committed_event) = ExecutionRepo::update_with_event(
             &*self.db,
             db::UpdateExecution {
                 id: execution_id.to_owned(),
@@ -235,11 +244,13 @@ impl TaskService {
                 after_sha: None,
                 error: Some(Some(error)),
                 executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
+                updated_at: failed_at,
             },
+            event,
         )
         .await
         .map_err(ServiceError::from)?;
+        self.publish_committed_domain_event(&committed_event);
         self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
             .await;
         super::publish_terminal_execution_event(self, &execution);

@@ -52,6 +52,12 @@ use crate::{
     WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
     WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
 };
+use crate::{
+    ClaimOrchestratorWake, CoordinationMode, CreateOrchestratorWake, OrchestratorActionRecord,
+    OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
+    ReserveOrchestratorAction, ReserveOrchestratorWakeExecution, TransitionOrchestratorWake,
+    TransitionOrchestratorWakeExecution,
+};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -81,6 +87,7 @@ mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
+mod orchestrator_wake;
 mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;

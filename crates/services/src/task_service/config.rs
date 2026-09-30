@@ -725,6 +725,7 @@ pub(crate) fn recompute_effective_policy_for_route_winner(
 
 pub(super) async fn create_failed_execution_record(
     db: &SqliteDb,
+    event_bus: &events::EventBus,
     task_id: &str,
     agent: &Agent,
     workspace: &Workspace,
@@ -734,37 +735,36 @@ pub(super) async fn create_failed_execution_record(
     error: String,
 ) -> Result<()> {
     let now = now_rfc3339();
-    ExecutionRepo::create(
-        db,
-        CreateExecution {
-            id: execution_id.to_owned(),
-            task_id: task_id.to_owned(),
-            agent_id: Some(agent.id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(purpose),
-            harness_session_id: None,
-            role: role.to_owned(),
-            status: ExecutionStatus::Failed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: Some(error),
-            executor_config_snapshot_json: None,
-            workspace_id: Some(workspace.id.clone()),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await?;
+    let execution = CreateExecution {
+        id: execution_id.to_owned(),
+        task_id: task_id.to_owned(),
+        agent_id: Some(agent.id.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+        purpose: Some(purpose),
+        harness_session_id: None,
+        role: role.to_owned(),
+        status: ExecutionStatus::Failed,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: Some(error),
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace.id.clone()),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let event = super::execution_domain_event(&execution, "execution.failed");
+    let (_, committed_event) = ExecutionRepo::create_with_event(db, execution, event).await?;
+    crate::DomainEventService::publish_committed_hint(event_bus, &committed_event);
     Ok(())
 }
 

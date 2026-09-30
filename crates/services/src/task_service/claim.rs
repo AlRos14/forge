@@ -134,6 +134,7 @@ impl TaskService {
                     Err(error) => {
                         create_failed_execution_record(
                             &self.db,
+                            &self.event_bus,
                             &task_id,
                             agent,
                             &workspace,
