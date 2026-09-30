@@ -1768,7 +1768,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
         .await
         .expect("typed action reserves under current policy");
     }
-    for (effect, result_id) in effects.into_iter().zip(result_ids.iter()) {
+    for (index, (effect, result_id)) in effects.into_iter().zip(result_ids.iter()).enumerate() {
         write_pr6_action_effect(
             &db,
             effect,
@@ -1781,7 +1781,63 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
         )
         .await
         .expect("current TaskRole snapshot permits effect and event atomically");
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM orchestrator_action WHERE execution_id = ? AND action_index = ?",
+        )
+        .bind(&execution_id)
+        .bind(index as i64)
+        .fetch_one(db.pool())
+        .await
+        .expect("effect transaction commits its action receipt");
+        assert_eq!(
+            state,
+            "completed",
+            "{} effect, event, and receipt commit together",
+            effect.action_type()
+        );
     }
+
+    let orphaned_receipt_id = new_uuid_v4();
+    OrchestratorWakeRepo::reserve_orchestrator_action(
+        &db,
+        ReserveOrchestratorAction {
+            execution_id: execution_id.clone(),
+            action_index: effects.len() as i64,
+            action_type: "message".to_owned(),
+            action_digest: "crash-after-effect".to_owned(),
+            result_id: orphaned_receipt_id.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("recovery action reserves under P1");
+    sqlx::query("DROP TRIGGER pr6_orchestrator_action_effect_receipt")
+        .execute(db.pool())
+        .await
+        .expect("simulate the old V096-only receipt boundary");
+    sqlx::query("DELETE FROM _migration WHERE version = 97")
+        .execute(db.pool())
+        .await
+        .expect("allow V097 receipt recovery to run once more");
+    write_pr6_action_effect(
+        &db,
+        Pr6ActionEffect::Message,
+        &orphaned_receipt_id,
+        &task_id,
+        &role_id,
+        &agent_id,
+        &execution_id,
+        &start_event,
+    )
+    .await
+    .expect("V096 commits a valid effect while the separate receipt trigger is absent");
+    let orphan_state: String =
+        sqlx::query_scalar("SELECT state FROM orchestrator_action WHERE result_id = ?")
+            .bind(&orphaned_receipt_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("pre-recovery action state loads");
+    assert_eq!(orphan_state, "reserved");
 
     let stale_result_ids = effects.map(|_| new_uuid_v4());
     for (index, effect) in effects.into_iter().enumerate() {
@@ -1789,7 +1845,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             &db,
             ReserveOrchestratorAction {
                 execution_id: execution_id.clone(),
-                action_index: (index + effects.len()) as i64,
+                action_index: (index + effects.len() + 1) as i64,
                 action_type: effect.action_type().to_owned(),
                 action_digest: format!("stale-digest-{index}"),
                 result_id: stale_result_ids[index].clone(),
@@ -1811,6 +1867,17 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
     )
     .await
     .expect("TaskRole changes to policy P2 after admission");
+
+    crate::run_migrations(db.pool())
+        .await
+        .expect("V097 repairs the committed V096 effect receipt");
+    let recovered_state: String =
+        sqlx::query_scalar("SELECT state FROM orchestrator_action WHERE result_id = ?")
+            .bind(&orphaned_receipt_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("recovered action state loads");
+    assert_eq!(recovered_state, "completed");
 
     for (effect, result_id) in effects.into_iter().zip(stale_result_ids.iter()) {
         let error = write_pr6_action_effect(
@@ -1854,6 +1921,13 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             "stale {} event rolls back",
             effect.action_type()
         );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM orchestrator_action WHERE result_id = ?")
+                .bind(result_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("rejected action receipt remains reserved");
+        assert_eq!(state, "reserved");
     }
 
     let normal_message_id = new_uuid_v4();

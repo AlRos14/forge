@@ -327,23 +327,33 @@ impl OrchestratorWakeRepo for SqliteDb {
         Ok(record)
     }
 
-    async fn complete_orchestrator_action(
+    async fn get_orchestrator_action(
         &self,
         execution_id: &str,
         action_index: i64,
-        updated_at: &str,
-    ) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE orchestrator_action
-             SET state = 'completed', updated_at = ?
-             WHERE execution_id = ? AND action_index = ? AND state = 'reserved'",
+    ) -> Result<Option<OrchestratorActionRecord>> {
+        let row = sqlx::query(
+            "SELECT execution_id, action_index, action_type, action_digest,
+                    result_id, state, created_at, updated_at
+             FROM orchestrator_action WHERE execution_id = ? AND action_index = ?",
         )
-        .bind(updated_at)
         .bind(execution_id)
         .bind(action_index)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        row.map(|row| {
+            Ok(OrchestratorActionRecord {
+                execution_id: row.try_get("execution_id")?,
+                action_index: row.try_get("action_index")?,
+                action_type: row.try_get("action_type")?,
+                action_digest: row.try_get("action_digest")?,
+                result_id: row.try_get("result_id")?,
+                state: row.try_get("state")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .transpose()
     }
 }
 

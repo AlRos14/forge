@@ -413,16 +413,15 @@ pub trait OrchestratorWakeRepo: Send + Sync {
         &self,
         input: TransitionOrchestratorWakeExecution,
     ) -> Result<bool>;
+    async fn get_orchestrator_action(
+        &self,
+        execution_id: &str,
+        action_index: i64,
+    ) -> Result<Option<OrchestratorActionRecord>>;
     async fn reserve_orchestrator_action(
         &self,
         input: ReserveOrchestratorAction,
     ) -> Result<OrchestratorActionRecord>;
-    async fn complete_orchestrator_action(
-        &self,
-        execution_id: &str,
-        action_index: i64,
-        updated_at: &str,
-    ) -> Result<bool>;
 }
 
 #[async_trait]

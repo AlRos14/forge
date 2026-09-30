@@ -1673,7 +1673,6 @@ impl OrchestratorRuntime {
                 "completed orchestrator wake has an unsupported policy reference or digest",
             ));
         }
-        let role_policy = self.validate_current_role_policy(wake).await?;
         let response_text = execution.summary.as_deref().ok_or_else(|| {
             invalid_action("completed orchestrator Execution has no action response")
         })?;
@@ -1686,21 +1685,53 @@ impl OrchestratorRuntime {
             serde_json::from_str::<OrchestratorResponse>(response_text).map_err(|_| {
                 invalid_action("orchestrator response is not the required JSON action envelope")
             })?;
-        validate_action_policy(&role_policy, &response.actions)?;
+        // Validate this immutable output against the policy snapshot that
+        // admitted the wake. Completed receipts are historical facts; replay
+        // recognizes them before consulting current TaskRole authority.
+        let snapshot_policy = TaskRoleOrchestratorPolicy::parse(&wake.task_role_policy_json)
+            .map_err(invalid_action)?;
+        validate_action_policy(&snapshot_policy, &response.actions)?;
         let collaboration =
             CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let work_units = self.task_service.orchestrator_work_unit_service();
         for (index, action) in response.actions.into_iter().enumerate() {
-            let current_policy = self.validate_current_role_policy(wake).await?;
+            let action_json = serde_json::to_vec(&action)
+                .map_err(|_| invalid_action("orchestrator action cannot be serialized"))?;
+            let action_digest = hex::encode(sha2::Sha256::digest(&action_json));
+            let action_type = action.action_type();
+            if self
+                .completed_action_receipt_matches(
+                    &execution.id,
+                    index as i64,
+                    action_type,
+                    &action_digest,
+                )
+                .await?
+            {
+                continue;
+            }
+            let current_policy = match self.validate_current_role_policy(wake).await {
+                Ok(policy) => policy,
+                Err(error) => {
+                    if self
+                        .completed_action_receipt_matches(
+                            &execution.id,
+                            index as i64,
+                            action_type,
+                            &action_digest,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             if !current_policy.permits(&action) {
                 return Err(invalid_action(
                     "TaskRole policy no longer permits this orchestrator action",
                 ));
             }
-            let action_json = serde_json::to_vec(&action)
-                .map_err(|_| invalid_action("orchestrator action cannot be serialized"))?;
-            let action_digest = hex::encode(sha2::Sha256::digest(&action_json));
-            let action_type = action.action_type();
             let now = now_rfc3339();
             let record = OrchestratorWakeRepo::reserve_orchestrator_action(
                 &*self.db,
@@ -1708,7 +1739,7 @@ impl OrchestratorRuntime {
                     execution_id: execution.id.clone(),
                     action_index: index as i64,
                     action_type: action_type.to_owned(),
-                    action_digest,
+                    action_digest: action_digest.clone(),
                     result_id: new_uuid_v4(),
                     now: now.clone(),
                 },
@@ -1717,7 +1748,23 @@ impl OrchestratorRuntime {
             if record.state == "completed" {
                 continue;
             }
-            let current_policy = self.validate_current_role_policy(wake).await?;
+            let current_policy = match self.validate_current_role_policy(wake).await {
+                Ok(policy) => policy,
+                Err(error) => {
+                    if self
+                        .completed_action_receipt_matches(
+                            &execution.id,
+                            index as i64,
+                            action_type,
+                            &action_digest,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             if !current_policy.permits(&action) {
                 return Err(invalid_action(
                     "TaskRole policy changed before the orchestrator action was applied",
@@ -1892,15 +1939,40 @@ impl OrchestratorRuntime {
                         .await?;
                 }
             }
-            OrchestratorWakeRepo::complete_orchestrator_action(
-                &*self.db,
-                &execution.id,
-                index as i64,
-                &now_rfc3339(),
-            )
-            .await?;
+            if !self
+                .completed_action_receipt_matches(
+                    &execution.id,
+                    index as i64,
+                    action_type,
+                    &action_digest,
+                )
+                .await?
+            {
+                return Err(invalid_action(
+                    "orchestrator effect did not atomically complete its action receipt",
+                ));
+            }
         }
         Ok(())
+    }
+
+    async fn completed_action_receipt_matches(
+        &self,
+        execution_id: &str,
+        action_index: i64,
+        action_type: &str,
+        action_digest: &str,
+    ) -> Result<bool> {
+        let Some(record) =
+            OrchestratorWakeRepo::get_orchestrator_action(&*self.db, execution_id, action_index)
+                .await?
+        else {
+            return Ok(false);
+        };
+        if record.action_type != action_type || record.action_digest != action_digest {
+            return Err(db::DbError::IdempotencyConflict.into());
+        }
+        Ok(record.state == "completed")
     }
 
     async fn validate_current_role_policy(
@@ -2991,12 +3063,24 @@ mod tests {
         assert_eq!(executions, 0);
     }
 
-    #[tokio::test]
-    async fn pr6_reserved_action_losing_policy_race_fails_its_completed_wake() {
+    struct Pr6CompletedExecutionFixture {
+        database: Arc<db::SqliteDb>,
+        event_bus: Arc<EventBus>,
+        runtime: OrchestratorRuntime,
+        wake: db::OrchestratorWake,
+        execution: db::Execution,
+        task_id: String,
+        task_role_id: String,
+        terminal_event: db::DomainEvent,
+    }
+
+    async fn completed_pr6_execution_fixture(
+        actions: Vec<OrchestratorAction>,
+    ) -> Pr6CompletedExecutionFixture {
         use db::{
             AgentStatus, CreateAgent, CreateDomainEvent, CreateExecution, CreateRoleMembership,
             DomainEventRepo, ExecutionRepo, ExecutionStatus, OrchestratorWakeRepo,
-            ReserveOrchestratorAction, RoleMembershipRepo, TaskRoleRepo, UpdateTaskRole,
+            RoleMembershipRepo, UpdateExecution,
         };
 
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -3005,16 +3089,16 @@ mod tests {
         db::run_migrations(&pool).await.expect("schema migrates");
         let database = Arc::new(db::SqliteDb::new(pool));
         let event_bus = Arc::new(EventBus::new(8));
-        let human_id = test_user(&database, "Action policy race owner").await;
+        let human_id = test_user(&database, "Action receipt fixture owner").await;
         let project_id = test_project(&database, &human_id).await;
-        let task_id = test_task(&database, &project_id, "Action policy race").await;
+        let task_id = test_task(&database, &project_id, "Action receipt fixture").await;
+        let actor_id = new_uuid_v4();
         let now = now_rfc3339();
-        let agent_id = new_uuid_v4();
-        AgentRepo::create(
+        db::AgentRepo::create(
             &*database,
             CreateAgent {
-                id: agent_id.clone(),
-                name: "PR6 action race Agent".to_owned(),
+                id: actor_id.clone(),
+                name: "PR6 action receipt Agent".to_owned(),
                 description: None,
                 executor_type: "codex".to_owned(),
                 model: None,
@@ -3040,7 +3124,7 @@ mod tests {
         )
         .await
         .expect("Agent Actor creates");
-        let role_id = test_orchestrator_role(
+        let task_role_id = test_orchestrator_role(
             &database,
             &task_id,
             Some(CoordinationMode::Collaborative),
@@ -3051,9 +3135,9 @@ mod tests {
             &*database,
             CreateRoleMembership {
                 id: new_uuid_v4(),
-                task_role_id: role_id.clone(),
+                task_role_id: task_role_id.clone(),
                 actor_kind: ActorKind::Agent,
-                actor_id: agent_id.clone(),
+                actor_id: actor_id.clone(),
                 status: RoleMembershipStatus::Active,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -3082,12 +3166,14 @@ mod tests {
         )
         .await
         .expect("durable source event appends");
-        let task_service = Arc::new(TaskService::new(
+        let runtime = OrchestratorRuntime::new(
             Arc::clone(&database),
             Arc::clone(&event_bus),
-        ));
-        let runtime =
-            OrchestratorRuntime::new(Arc::clone(&database), Arc::clone(&event_bus), task_service);
+            Arc::new(TaskService::new(
+                Arc::clone(&database),
+                Arc::clone(&event_bus),
+            )),
+        );
         assert_eq!(
             runtime
                 .admit_signal(
@@ -3109,14 +3195,13 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .expect("exact wake id loads");
-        let lease_owner = "pr6-action-policy-race";
-        let claim_now = now_rfc3339();
+        let lease_owner = "pr6-action-receipt-fixture";
         OrchestratorWakeRepo::claim_orchestrator_wake(
             &*database,
             db::ClaimOrchestratorWake {
                 lease_owner: lease_owner.to_owned(),
-                now: claim_now,
-                leased_until: "2026-10-01T00:00:00Z".to_owned(),
+                now: now_rfc3339(),
+                leased_until: "2099-01-01T00:00:00Z".to_owned(),
             },
         )
         .await
@@ -3134,23 +3219,29 @@ mod tests {
         )
         .await
         .expect("exact wake attempt reserves");
-        let message_action = OrchestratorAction::Message {
-            target: ActionTarget::Task,
-            work_unit_id: None,
-            body: "A stable action result".to_owned(),
+        let start_event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(actor_id.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: source_event.correlation_id.clone(),
+            causation_id: Some(source_event.id.clone()),
+            causation_depth: 1,
+            dedupe_key: Some(format!("execution.started:{execution_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
         };
-        let action_digest = hex::encode(sha2::Sha256::digest(
-            serde_json::to_vec(&message_action).expect("message action serializes"),
-        ));
-        let action_response = json!({"actions": [message_action]}).to_string();
-        let start_event_id = new_uuid_v4();
         ExecutionRepo::create_orchestrator_execution(
             &*database,
             CreateExecution {
                 id: execution_id.clone(),
                 task_id: task_id.clone(),
-                agent_id: Some(agent_id.clone()),
-                actor_ref: Some(ActorRef::Agent(agent_id.clone())),
+                agent_id: Some(actor_id.clone()),
+                actor_ref: Some(ActorRef::Agent(actor_id.clone())),
                 role: "orchestrator".to_owned(),
                 purpose: Some(ExecutionPurpose::Orchestrate),
                 status: ExecutionStatus::Running,
@@ -3163,7 +3254,7 @@ mod tests {
                 harness_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
-                summary: Some(action_response),
+                summary: Some(json!({ "actions": actions }).to_string()),
                 logs_path: None,
                 before_sha: None,
                 after_sha: None,
@@ -3176,22 +3267,7 @@ mod tests {
             &wake_id,
             attempt.attempt_number,
             lease_owner,
-            CreateDomainEvent {
-                id: start_event_id.clone(),
-                event_type: "execution.started".to_owned(),
-                entity_type: "execution".to_owned(),
-                entity_id: execution_id.clone(),
-                actor_type: "agent".to_owned(),
-                actor_id: Some(agent_id.clone()),
-                scope_type: "task".to_owned(),
-                scope_id: task_id.clone(),
-                correlation_id: source_event.correlation_id.clone(),
-                causation_id: Some(source_event.id.clone()),
-                causation_depth: 1,
-                dedupe_key: Some(format!("execution.started:{execution_id}")),
-                payload_json: "{}".to_owned(),
-                created_at: now.clone(),
-            },
+            start_event.clone(),
         )
         .await
         .expect("exact orchestrator Execution starts");
@@ -3226,10 +3302,10 @@ mod tests {
             },
         )
         .await
-        .expect("wake enters terminal reconciliation state"));
+        .expect("wake enters running state"));
         ExecutionRepo::update(
             &*database,
-            db::UpdateExecution {
+            UpdateExecution {
                 id: execution_id.clone(),
                 status: Some(ExecutionStatus::Completed),
                 stop_reason: None,
@@ -3250,24 +3326,119 @@ mod tests {
         )
         .await
         .expect("orchestrator Execution completes");
-        let action_result_id = new_uuid_v4();
-        OrchestratorWakeRepo::reserve_orchestrator_action(
+        let start_event = DomainEventRepo::get_event_by_dedupe(
             &*database,
-            ReserveOrchestratorAction {
-                execution_id: execution_id.clone(),
-                action_index: 0,
-                action_type: "message".to_owned(),
-                action_digest,
-                result_id: action_result_id.clone(),
-                now: now.clone(),
+            &format!("execution.started:{execution_id}"),
+        )
+        .await
+        .expect("start event lookup succeeds")
+        .expect("exact start event exists");
+        let terminal_event = DomainEventRepo::append_event(
+            &*database,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "execution.completed".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: execution_id.clone(),
+                actor_type: "agent".to_owned(),
+                actor_id: Some(actor_id.clone()),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: source_event.correlation_id.clone(),
+                causation_id: Some(start_event.id.clone()),
+                causation_depth: 2,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
             },
         )
         .await
-        .expect("typed action reserves with its stable result id under P1");
+        .expect("execution completion event appends before action replay");
+        let execution = ExecutionRepo::get_by_id(&*database, &execution_id)
+            .await
+            .expect("Execution lookup succeeds")
+            .expect("completed Execution exists");
+        let wake = OrchestratorWakeRepo::get_orchestrator_wake(&*database, &wake_id)
+            .await
+            .expect("wake lookup succeeds")
+            .expect("wake exists");
+        Pr6CompletedExecutionFixture {
+            database,
+            event_bus,
+            runtime,
+            wake,
+            execution,
+            task_id,
+            task_role_id,
+            terminal_event,
+        }
+    }
+
+    #[tokio::test]
+    async fn pr6_effect_commit_completes_receipt_before_policy_change_and_pending_action_fails_closed(
+    ) {
+        use db::{OrchestratorWakeRepo, ReserveOrchestratorAction, TaskRoleRepo, UpdateTaskRole};
+
+        let first_action = OrchestratorAction::Message {
+            target: ActionTarget::Task,
+            work_unit_id: None,
+            body: "committed under policy P1".to_owned(),
+        };
+        let pending_action = OrchestratorAction::Message {
+            target: ActionTarget::Task,
+            work_unit_id: None,
+            body: "must not apply under policy P2".to_owned(),
+        };
+        let fixture =
+            completed_pr6_execution_fixture(vec![first_action.clone(), pending_action.clone()])
+                .await;
+        let action_digest = hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&first_action).expect("first action serializes"),
+        ));
+        let result_id = new_uuid_v4();
+        OrchestratorWakeRepo::reserve_orchestrator_action(
+            &*fixture.database,
+            ReserveOrchestratorAction {
+                execution_id: fixture.execution.id.clone(),
+                action_index: 0,
+                action_type: "message".to_owned(),
+                action_digest,
+                result_id: result_id.clone(),
+                now: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("action reserves under P1");
+        CollaborationService::new(
+            Arc::clone(&fixture.database),
+            Arc::clone(&fixture.event_bus),
+        )
+        .create_message_with_id(
+            CollaborationActorSource::Execution(fixture.execution.id.clone()),
+            CreateMessageInput {
+                task_id: fixture.task_id.clone(),
+                target: db::CollaborationTarget::Task,
+                work_unit_id: None,
+                body: "committed under policy P1".to_owned(),
+                artifact_ids: Vec::new(),
+            },
+            result_id.clone(),
+        )
+        .await
+        .expect("effect and event commit under the current P1 snapshot");
+        let receipt_state: String = sqlx::query_scalar(
+            "SELECT state FROM orchestrator_action WHERE execution_id = ? AND action_index = 0",
+        )
+        .bind(&fixture.execution.id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("action receipt is queryable immediately after the effect commit");
+        assert_eq!(receipt_state, "completed");
+
         TaskRoleRepo::update(
-            &*database,
+            &*fixture.database,
             UpdateTaskRole {
-                id: role_id,
+                id: fixture.task_role_id.clone(),
                 expected_version: 1,
                 coordination_mode: None,
                 policy_json: Some(r#"{"allowed_actions":["proposal"]}"#.to_owned()),
@@ -3275,16 +3446,115 @@ mod tests {
             },
         )
         .await
-        .expect("TaskRole changes from P1 to P2");
+        .expect("TaskRole changes to P2 after the effect transaction");
+
+        assert!(fixture
+            .runtime
+            .reconcile_orchestrator_terminal(&fixture.terminal_event)
+            .await
+            .expect("replayed terminal event is reconciled"));
+        let wake =
+            OrchestratorWakeRepo::get_orchestrator_wake(&*fixture.database, &fixture.wake.id)
+                .await
+                .expect("wake lookup succeeds")
+                .expect("wake persists");
+        assert_eq!(wake.state, OrchestratorWakeState::Failed);
+        assert!(wake.last_error.as_deref().is_some_and(
+            |error| error.contains("TaskRole version, coordination, or policy changed")
+        ));
+
+        let action_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM orchestrator_action WHERE execution_id = ?")
+                .bind(&fixture.execution.id)
+                .fetch_one(fixture.database.pool())
+                .await
+                .expect("action ledger count loads");
+        assert_eq!(
+            action_rows, 1,
+            "the pending action is not reserved under P2"
+        );
+        let first_effects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message WHERE id = ?")
+            .bind(&result_id)
+            .fetch_one(fixture.database.pool())
+            .await
+            .expect("committed effect remains durable");
+        assert_eq!(first_effects, 1);
+        let pending_effects: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message WHERE task_id = ? AND body = ?")
+                .bind(&fixture.task_id)
+                .bind("must not apply under policy P2")
+                .fetch_one(fixture.database.pool())
+                .await
+                .expect("pending action effect count loads");
+        assert_eq!(pending_effects, 0);
+        let first_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'message.created' AND entity_id = ?",
+        )
+        .bind(&result_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("committed event remains durable");
+        assert_eq!(first_events, 1);
+    }
+
+    #[tokio::test]
+    async fn pr6_reserved_action_losing_policy_race_fails_its_completed_wake() {
+        use db::{
+            DomainEventRepo, OrchestratorWakeRepo, ReserveOrchestratorAction, TaskRoleRepo,
+            UpdateTaskRole,
+        };
+
+        let action = OrchestratorAction::Message {
+            target: ActionTarget::Task,
+            work_unit_id: None,
+            body: "A stable action result".to_owned(),
+        };
+        let fixture = completed_pr6_execution_fixture(vec![action.clone()]).await;
+        let action_digest = hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&action).expect("message action serializes"),
+        ));
+        let result_id = new_uuid_v4();
+        OrchestratorWakeRepo::reserve_orchestrator_action(
+            &*fixture.database,
+            ReserveOrchestratorAction {
+                execution_id: fixture.execution.id.clone(),
+                action_index: 0,
+                action_type: "message".to_owned(),
+                action_digest,
+                result_id: result_id.clone(),
+                now: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("typed action reserves under P1");
+        TaskRoleRepo::update(
+            &*fixture.database,
+            UpdateTaskRole {
+                id: fixture.task_role_id.clone(),
+                expected_version: 1,
+                coordination_mode: None,
+                policy_json: Some(r#"{"allowed_actions":["proposal"]}"#.to_owned()),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("TaskRole changes to P2 before the effect transaction");
 
         let start_event = DomainEventRepo::get_event_by_dedupe(
-            &*database,
-            &format!("execution.started:{execution_id}"),
+            &*fixture.database,
+            &format!("execution.started:{}", fixture.execution.id),
         )
         .await
         .expect("start event lookup succeeds")
-        .expect("start event exists");
-        let mut transaction = database
+        .expect("exact start event exists");
+        let actor_id = fixture
+            .execution
+            .actor_id
+            .as_deref()
+            .expect("orchestrator Execution has its exact Actor id");
+        let mut transaction = fixture
+            .database
             .pool()
             .begin()
             .await
@@ -3295,90 +3565,71 @@ mod tests {
                 target_actor_kind, target_actor_id, target_role_id, body, created_at
              ) VALUES (?, ?, 'agent', ?, 'task', NULL, NULL, NULL, 'stale output', ?)",
         )
-        .bind(&action_result_id)
-        .bind(&task_id)
-        .bind(&agent_id)
-        .bind(&now)
+        .bind(&result_id)
+        .bind(&fixture.task_id)
+        .bind(actor_id)
+        .bind(now_rfc3339())
         .execute(&mut *transaction)
         .await
         .expect("effect row inserts before its guarded event");
-        let stale_event = CreateDomainEvent {
+        let stale_event = db::CreateDomainEvent {
             id: new_uuid_v4(),
             event_type: "message.created".to_owned(),
             entity_type: "message".to_owned(),
-            entity_id: action_result_id.clone(),
+            entity_id: result_id.clone(),
             actor_type: "agent".to_owned(),
-            actor_id: Some(agent_id.clone()),
+            actor_id: Some(actor_id.to_owned()),
             scope_type: "task".to_owned(),
-            scope_id: task_id.clone(),
+            scope_id: fixture.task_id.clone(),
             correlation_id: start_event.correlation_id,
             causation_id: Some(start_event.id),
             causation_depth: 2,
             dedupe_key: None,
             payload_json: "{}".to_owned(),
-            created_at: now.clone(),
+            created_at: now_rfc3339(),
         };
         let guard_error =
-            DomainEventRepo::append_event_in_tx(&*database, &mut transaction, &stale_event)
+            DomainEventRepo::append_event_in_tx(&*fixture.database, &mut transaction, &stale_event)
                 .await
-                .expect_err("the policy guard rejects the output in its effect transaction");
+                .expect_err("the policy guard rejects output in its effect transaction");
         transaction
             .rollback()
             .await
             .expect("rejected effect transaction rolls back");
         assert!(matches!(guard_error, db::DbError::StaleOrchestratorAction));
         let effect_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message WHERE id = ?")
-            .bind(&action_result_id)
-            .fetch_one(database.pool())
+            .bind(&result_id)
+            .fetch_one(fixture.database.pool())
             .await
             .expect("rolled-back effect count loads");
         let event_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM domain_event WHERE event_type = 'message.created' AND entity_id = ?",
         )
-        .bind(&action_result_id)
-        .fetch_one(database.pool())
+        .bind(&result_id)
+        .fetch_one(fixture.database.pool())
         .await
         .expect("rolled-back event count loads");
         assert_eq!(effect_count, 0);
         assert_eq!(event_count, 0);
 
-        let terminal_event = DomainEventRepo::append_event(
-            &*database,
-            CreateDomainEvent {
-                id: new_uuid_v4(),
-                event_type: "execution.completed".to_owned(),
-                entity_type: "execution".to_owned(),
-                entity_id: execution_id.clone(),
-                actor_type: "agent".to_owned(),
-                actor_id: Some(agent_id),
-                scope_type: "task".to_owned(),
-                scope_id: task_id,
-                correlation_id: source_event.correlation_id,
-                causation_id: Some(start_event_id),
-                causation_depth: 2,
-                dedupe_key: None,
-                payload_json: "{}".to_owned(),
-                created_at: now_rfc3339(),
-            },
-        )
-        .await
-        .expect("terminal event appends");
-        assert!(runtime
-            .reconcile_orchestrator_terminal(&terminal_event)
+        assert!(fixture
+            .runtime
+            .reconcile_orchestrator_terminal(&fixture.terminal_event)
             .await
             .expect("stale completed wake reconciles deterministically"));
-        let wake = OrchestratorWakeRepo::get_orchestrator_wake(&*database, &wake_id)
-            .await
-            .expect("wake lookup succeeds")
-            .expect("wake remains durable");
+        let wake =
+            OrchestratorWakeRepo::get_orchestrator_wake(&*fixture.database, &fixture.wake.id)
+                .await
+                .expect("wake lookup succeeds")
+                .expect("wake remains durable");
         assert_eq!(wake.state, OrchestratorWakeState::Failed);
-        assert!(wake.last_error.as_deref().is_some_and(
-            |error| error.contains("TaskRole version, coordination, or policy changed")
-        ));
+        assert!(wake.last_error.as_deref().is_some_and(|error| {
+            error.contains("TaskRole version, coordination, or policy changed")
+        }));
         let action_state: String =
             sqlx::query_scalar("SELECT state FROM orchestrator_action WHERE result_id = ?")
-                .bind(&action_result_id)
-                .fetch_one(database.pool())
+                .bind(&result_id)
+                .fetch_one(fixture.database.pool())
                 .await
                 .expect("stale action reservation remains auditable");
         assert_eq!(action_state, "reserved");
@@ -3393,7 +3644,10 @@ mod tests {
             let entry = entry.expect("migration entry reads");
             let filename = entry.file_name();
             let filename = filename.to_string_lossy();
-            if filename.starts_with("V095__") || filename.starts_with("V096__") {
+            if filename.starts_with("V095__")
+                || filename.starts_with("V096__")
+                || filename.starts_with("V097__")
+            {
                 continue;
             }
             std::fs::copy(entry.path(), pre_v095.path().join(filename.as_ref()))
@@ -4178,13 +4432,10 @@ mod tests {
         )
         .await
         .expect("current action policy changes after the first replay");
-        assert!(
-            runtime
-                .apply_completed_actions(&execution, &wake)
-                .await
-                .is_err(),
-            "completed action replay cannot use a changed policy snapshot"
-        );
+        runtime
+            .apply_completed_actions(&execution, &wake)
+            .await
+            .expect("completed action receipts remain no-ops after policy changes");
         let work_units_after_policy_change = WorkUnitRepo::list_by_task(&*database, &task_id)
             .await
             .expect("WorkUnit state remains queryable");

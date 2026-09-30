@@ -95,6 +95,19 @@ deterministic PR6 stale-action error and terminal reconciliation fails the old
 wake; it is not a transient retry. Existing completed action replay remains
 idempotent on `execution_id + action_index`, digest, and stable `result_id`.
 
+V097 extends that same transaction boundary to the action receipt. An
+`AFTER INSERT ON domain_event` trigger marks the matching reserved
+`orchestrator_action` completed before the effect transaction commits; the
+separate Rust completion write is removed. A replay first recognizes a
+completed receipt against the immutable wake snapshot and does not reauthorize
+an effect that already happened. It still validates current TaskRole authority
+for every reserved or not-yet-reserved action, so policy changes stop later
+effects in the same Execution. The migration repairs matching orphaned
+receipts only when their event was recorded after V096 was applied and its
+exact effect/event provenance matches the V096 guard. This preserves valid
+effects from databases interrupted between V096's transaction commit and the
+old separate receipt update.
+
 `stop`, `cancel`, `reassign`, `discard`, `invalidate`, `merge`, and `override` are protected actions. PR6 may record a Proposal with exact target/version/digest and policy reference; it does not turn an approval Decision into an automatic mutation. Any later action executor must recheck the exact Proposal, Decision, target/version/digest, and policy identity. No model-selected exception can bypass the deterministic policy. No raw SQL, arbitrary Git command, or unbounded workspace write is exposed.
 
 PR6 has no direct Harness steering, stopping, or resuming action. Messages and Handoffs preserve communication intent only; the implementation does not report them as native, emulated, queued, or successful live steering. A future typed steering operation must query the exact target Execution's HarnessAdapter capability and preserve each support level distinctly.
@@ -109,7 +122,7 @@ PR6 has no direct Harness steering, stopping, or resuming action. Messages and H
 | After Execution row creation, before recording `start_requested` | The exact row and `reserved` attempt are durable. Retry reads the same row and proceeds with its first Start request. |
 | After recording `start_requested`, before the Harness call returns | The outcome is ambiguous, including a crash just before the call. Recovery marks the attempt `uncertain` and never issues a second Start for that Execution. If it remains running without activity, the existing stalled-Execution recovery emits a durable terminal event, which retries the wake with a new Execution. |
 | After Harness Start is accepted, before the caller records `running` | The durable attempt is still `start_requested`; lease expiry makes the wake `uncertain` and does not issue another Start. The exact Execution's later terminal event can reconcile it. |
-| After orchestrator action output, before action receipt/wake completion | `orchestrator_action` stores one UUIDv4 result ID per Execution/action index and verifies the action digest. Collaboration replay with that ID returns only the same existing record; mismatched output fails closed. |
+| After orchestrator action output, before action receipt/wake completion | V097 commits the effect, its `domain_event`, and `orchestrator_action.state = completed` in one SQLite transaction. A crash after that commit leaves an exact completed receipt for replay; a later TaskRole change does not reinterpret the effect, while any following pending action still fails closed. |
 | Before source/wake completion | The source event receipt and wake execution/action state are independently replayable; no source is acknowledged before admission is durable. |
 
 Causation depth is preserved and bounded by the existing 0–16 ledger constraint. A wake is admitted only when there is room for its Execution-start event and one collaboration output within that ceiling. Classification excludes `purpose=orchestrate` lifecycle before depth is considered. Self Actor events are suppressed; only explicit targeted collaboration may cross between orchestrators. `1 event = 1 Actor wake` is the initial durable grouping rule.
@@ -120,7 +133,7 @@ Causation depth is preserved and bounded by the existing 0–16 ledger constrain
 
 ## Tests
 
-Focused `pr6_` tests cover source-event replay/lease competition, event classification and orchestrator no-ping-pong, exact TaskRole/Actor/WorkUnit targeting, Human-vs-Agent dispatch, every coordination mode, capacity retry, fresh Execution/Start semantics, typed collaboration and WorkUnit action idempotency, protected-action fail-closed behavior, TaskDispatcher compatibility, V095 upgrade bootstrap including ambiguous independent targeting, new-Task/member activation, TaskRole policy snapshot/replay, and V096 atomic effect rollback for each typed action mapping. The service tests use the Harness adapter boundary with a recording executor; they do not prove external daemon, provider, or network behavior.
+Focused `pr6_` tests cover source-event replay/lease competition, event classification and orchestrator no-ping-pong, exact TaskRole/Actor/WorkUnit targeting, Human-vs-Agent dispatch, every coordination mode, capacity retry, fresh Execution/Start semantics, typed collaboration and WorkUnit action idempotency, protected-action fail-closed behavior, TaskDispatcher compatibility, V095 upgrade bootstrap including ambiguous independent targeting, new-Task/member activation, TaskRole policy snapshot/replay, V096 atomic effect rollback for each typed action mapping, and V097 effect/event/receipt atomicity plus changed-policy replay. The service tests use the Harness adapter boundary with a recording executor; they do not prove external daemon, provider, or network behavior.
 
 Baseline validation recorded before V095:
 

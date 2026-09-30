@@ -61,9 +61,11 @@ rather than being promoted from EventBus-only signals.
 PR6 reads the TaskRole policy using a small versioned schema documented in
 [Roles and memberships](roles.md). `{}` keeps the current PR6 defaults.
 Unknown fields and versions fail closed. The wake captures the TaskRole version
-and exact JSON separately from the fixed runtime policy digest; dispatch and
-each action replay require the current TaskRole policy and coordination mode to
-match that snapshot. A TaskRole-change event uses the current mode's targeting
+and exact JSON separately from the fixed runtime policy digest. Dispatch and
+every pending action require the current TaskRole policy and coordination mode
+to match that snapshot. A completed action receipt is historical evidence and
+remains a no-op on replay even if the TaskRole changes later; pending actions
+still fail closed. A TaskRole-change event uses the current mode's targeting
 rules and does not turn an ambiguous independent or partitioned role update
 into a generic fanout.
 
@@ -73,7 +75,12 @@ same SQLite transaction that writes a typed action's Message, Handoff,
 WorkUnit, or Proposal. The `domain_event` insert is the shared guard boundary;
 if the snapshot became stale after action reservation, the guard aborts and the
 entity row and event roll back together. That deterministic stale-authority
-error fails the old wake rather than entering transient retries. Human and
+error fails the old wake rather than entering transient retries. V097 completes
+the matching `orchestrator_action` receipt from that same domain-event insert,
+so effect, event, and receipt commit or roll back together. Replay still uses
+`execution_id + action_index`, digest, and stable `result_id`; a completed
+receipt skips current TaskRole validation because it cannot create a new effect,
+while every pending action revalidates that authority before writing. Human and
 ordinary Agent writes without a matching `orchestrator_action.result_id` do not
 enter this guard.
 
