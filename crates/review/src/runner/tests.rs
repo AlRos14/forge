@@ -201,7 +201,6 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             priority: 0,
             task_state_config: Some(task_state_config),
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },

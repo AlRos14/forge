@@ -191,7 +191,7 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
     }
 }
 
-const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
 const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
@@ -454,7 +454,6 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         task_state_config: row.try_get("task_state_config")?,
         merge_config: row.try_get("merge_config")?,
         metadata_json: row.try_get("metadata_json")?,
-        plan: row.try_get("plan")?,
         error_annotation: row.try_get("error_annotation")?,
         blocked_json: row.try_get("blocked_json")?,
         failed_json: row.try_get("failed_json")?,

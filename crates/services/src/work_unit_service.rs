@@ -1663,7 +1663,6 @@ mod tests {
                 subtask_order: None,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },

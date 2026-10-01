@@ -407,8 +407,9 @@ impl TaskService {
                 &task.id,
                 &agent_id,
                 role,
-                crate::task_service::execution::execution_purpose_for_task_type(
+                crate::task_service::execution::execution_purpose_for_workflow_state(
                     &task.task_type,
+                    &task.status,
                     role,
                 ),
                 context.unwrap_or_else(|| "Resume task work.".to_owned()),

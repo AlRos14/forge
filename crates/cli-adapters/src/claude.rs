@@ -41,6 +41,7 @@ struct RunningProcess {
 struct StreamResult {
     cancelled: bool,
     agent_session_id: Option<String>,
+    assistant_output: Option<String>,
     summary: Option<String>,
     usage: Option<executors::TokenUsage>,
     availability: AvailabilitySignals,
@@ -165,13 +166,9 @@ impl ClaudeCodeAdapter {
             &["--resume"],
             &["--continue"],
         );
-        match &ctx.invocation {
-            executors::HarnessInvocation::Start => config.resume_session_id = None,
-            executors::HarnessInvocation::Resume {
-                external_session_id,
-            } => {
-                config.resume_session_id = Some(external_session_id.clone());
-            }
+        config.resume_session_id = ctx.invocation.external_session_id().map(str::to_owned);
+        if ctx.invocation.is_planning() {
+            config.plan = Some(true);
         }
         config
     }
@@ -380,6 +377,7 @@ impl ClaudeCodeAdapter {
                         after_sha: None,
                         agent_session_id: agent_session_id.clone(),
                         summary: stream.summary,
+                        assistant_output: stream.assistant_output,
                         error: Some(error.to_string()),
                         usage: stream.usage,
                         ..Default::default()
@@ -394,6 +392,7 @@ impl ClaudeCodeAdapter {
             status,
             after_sha,
             agent_session_id,
+            assistant_output: stream.assistant_output,
             summary: stream.summary,
             error,
             usage: stream.usage,
@@ -635,6 +634,7 @@ async fn stream_child_output(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut agent_session_id = None;
+    let mut assistant_output = None;
     let mut summary = None;
     let mut usage: Option<executors::TokenUsage> = None;
     let mut availability = AvailabilitySignals::default();
@@ -682,6 +682,7 @@ async fn stream_child_output(
                                 &mut writer,
                                 entry,
                                 &mut agent_session_id,
+                                &mut assistant_output,
                                 &mut summary,
                                 &mut usage,
                             ).await?;
@@ -732,6 +733,7 @@ async fn stream_child_output(
     Ok(StreamResult {
         cancelled,
         agent_session_id,
+        assistant_output,
         summary,
         usage,
         availability,
@@ -742,6 +744,7 @@ async fn write_normalized_entry(
     writer: &mut LogWriter,
     entry: NormalizedEntry,
     agent_session_id: &mut Option<String>,
+    assistant_output: &mut Option<String>,
     summary: &mut Option<String>,
     usage: &mut Option<executors::TokenUsage>,
 ) -> Result<(), ExecutorError> {
@@ -784,6 +787,12 @@ async fn write_normalized_entry(
             set_first_session_id(writer, agent_session_id, session_id).await?;
             if payload.get("type").and_then(|v| v.as_str()) == Some("result") {
                 *usage = extract_usage_from_result(&payload);
+                if payload.get("is_error").and_then(Value::as_bool) != Some(true) {
+                    *assistant_output = payload
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
             }
             writer
                 .write(LogKind::SessionInfo, LogStream::Main, payload)
@@ -1431,6 +1440,29 @@ mod tests {
         assert_eq!(
             ClaudeCodeAdapter::new().capabilities(&normalized).planning,
             executors::CapabilitySupport::Native
+        );
+    }
+
+    #[test]
+    fn planning_invocation_selects_claude_native_plan_mode() {
+        let ctx = crate::test_execution_context(
+            executors::HarnessInvocation::Planning {
+                external_session_id: None,
+            },
+            serde_json::json!({ "permission_policy": "auto" }),
+        );
+        let config = ClaudeCodeAdapter::resolve_config(&ctx);
+        assert_eq!(config.plan, Some(true));
+
+        let command = ClaudeCodeAdapter::build_command(&config, None);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--permission-mode", "plan"])
         );
     }
 

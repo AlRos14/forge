@@ -25,6 +25,28 @@ impl TaskService {
         prompt: String,
         dispatch_metadata: Option<Value>,
     ) -> Result<Execution> {
+        self.dispatch_initial_role_execution_with_artifacts(
+            task_id,
+            agent_id,
+            role,
+            purpose,
+            prompt,
+            Vec::new(),
+            dispatch_metadata,
+        )
+        .await
+    }
+
+    pub async fn dispatch_initial_role_execution_with_artifacts(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        role: &str,
+        purpose: ExecutionPurpose,
+        prompt: String,
+        input_artifact_ids: Vec<String>,
+        dispatch_metadata: Option<Value>,
+    ) -> Result<Execution> {
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         validate_required("role", role)?;
@@ -67,7 +89,7 @@ impl TaskService {
         }
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
@@ -96,6 +118,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                input_artifact_ids,
             )
             .await?;
 
@@ -786,6 +809,7 @@ impl TaskService {
             &task.status,
             state_config,
             Some(selection.execution_policy.as_str()),
+            Some(&parent_execution.id),
             &workflow,
         )
         .await?;
@@ -803,16 +827,23 @@ impl TaskService {
         } else {
             task
         };
+        let artifact_input_ids = self
+            .inherit_plan_artifact_inputs(&parent_execution.id, &task.id)
+            .await?;
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(agent.id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
                     purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
-                        execution_purpose_for_task_type(&task.task_type, &parent_execution.role)
+                        execution_purpose_for_workflow_state(
+                            &task.task_type,
+                            &task.status,
+                            &parent_execution.role,
+                        )
                     })),
                     harness_session_id: None,
                     role: parent_execution.role.clone(),
@@ -836,6 +867,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                artifact_input_ids,
             )
             .await?;
 
@@ -974,7 +1006,6 @@ impl TaskService {
                 description: None,
                 priority: None,
                 merge_config: None,
-                plan: None,
                 error_annotation: Some(Some(annotation)),
                 blocked_json: None,
                 failed_json: None,

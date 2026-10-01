@@ -121,7 +121,6 @@ impl TaskService {
                 description: None,
                 priority: None,
                 merge_config: None,
-                plan: None,
                 error_annotation: Some(Some(annotation.to_string())),
                 blocked_json: None,
                 failed_json: None,

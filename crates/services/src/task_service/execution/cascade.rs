@@ -324,17 +324,24 @@ impl TaskService {
                     .await?,
                 )
             };
+            let artifact_input_ids = self
+                .inherit_plan_artifact_inputs(&execution.id, &task.id)
+                .await?;
             let execution_id = new_uuid_v4();
             let now = now_rfc3339();
             let resumed = self
-                .create_running_execution(
+                .create_running_execution_with_artifact_inputs(
                     CreateExecution {
                         id: execution_id.clone(),
                         task_id: task.id.clone(),
                         agent_id: Some(agent_id.clone()),
                         actor_ref: Some(db::ActorRef::Agent(agent_id)),
                         purpose: Some(execution.purpose.clone().unwrap_or_else(|| {
-                            execution_purpose_for_task_type(&task.task_type, &execution.role)
+                            execution_purpose_for_workflow_state(
+                                &task.task_type,
+                                &task.status,
+                                &execution.role,
+                            )
                         })),
                         harness_session_id,
                         role: execution.role.clone(),
@@ -351,12 +358,10 @@ impl TaskService {
                         agent_message_id: None,
                         last_activity_at: None,
                         summary: Some(prompt),
-                        logs_path: Some(execution_logs_path(
-                            &self.workspace_root,
-                            &task.project_id,
-                            &task.id,
-                            &execution_id,
-                        )),
+                        // Keep Artifact inputs insertable in the creation
+                        // transaction; the runner/remote log writer assigns
+                        // the durable path before producing output.
+                        logs_path: None,
                         before_sha: execution.before_sha.clone(),
                         after_sha: None,
                         error: None,
@@ -366,6 +371,7 @@ impl TaskService {
                         updated_at: now,
                     },
                     false,
+                    artifact_input_ids,
                 )
                 .await?;
 
@@ -1463,7 +1469,6 @@ impl TaskService {
                         description: None,
                         priority: None,
                         merge_config: None,
-                        plan: None,
                         error_annotation: Some(Some(annotation.to_string())),
                         blocked_json: Some(Some(blocked_meta.to_string())),
                         failed_json: Some(None),

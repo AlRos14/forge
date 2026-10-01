@@ -77,6 +77,20 @@ pub fn effective_role(state: &StateDefinition) -> Option<&str> {
     None
 }
 
+pub(crate) fn auto_cascades_on_unassigned_role(state: &StateDefinition) -> bool {
+    let explicitly_configured = state
+        .hooks
+        .after_enter
+        .iter()
+        .any(|hook| hook.action == "auto_cascade_on_unassigned_role");
+    let gate_allows_skip = state.kind != StateKind::Gate
+        || state
+            .gate_config
+            .as_ref()
+            .is_some_and(|config| config.optional_when_unassigned());
+    explicitly_configured && gate_allows_skip
+}
+
 #[cfg(test)]
 mod tests {
     use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind};

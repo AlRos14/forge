@@ -48,6 +48,31 @@ pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> Ex
     }
 }
 
+/// Resolve purpose from the workflow operation at dispatch time. The default
+/// planning state is an explicit Plan operation; a planner role in another
+/// state does not turn that Execution into planning.
+pub(crate) fn execution_purpose_for_workflow_state(
+    task_type: &str,
+    state_name: &str,
+    role: &str,
+) -> ExecutionPurpose {
+    match state_name.trim().to_ascii_lowercase().as_str() {
+        "planning" => ExecutionPurpose::Plan,
+        "review" => ExecutionPurpose::Review,
+        "validation" => ExecutionPurpose::Validate,
+        "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
+        _ => match task_type.trim().to_ascii_lowercase().as_str() {
+            "planning" => ExecutionPurpose::Plan,
+            "review" => ExecutionPurpose::Review,
+            "validation" => ExecutionPurpose::Validate,
+            "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
+            "implementation" => ExecutionPurpose::Implement,
+            _ if role.trim().eq_ignore_ascii_case("planner") => ExecutionPurpose::General,
+            _ => execution_purpose_for_role(role),
+        },
+    }
+}
+
 /// Resolve explicit generic continuity. A referenced HarnessSession is the
 /// authority for new rows; the legacy execution.agent_session_id fallback is
 /// only available to historical rows that have not yet been materialized.
@@ -286,8 +311,15 @@ pub async fn harness_invocation_for_execution(
     execution: &Execution,
     workspace_id: Option<&str>,
 ) -> Result<api_types::HarnessInvocation> {
+    let is_planning = execution.purpose == Some(ExecutionPurpose::Plan);
     let Some(harness_session_id) = execution.harness_session_id.as_deref() else {
-        return Ok(api_types::HarnessInvocation::Start);
+        return Ok(if is_planning {
+            api_types::HarnessInvocation::Planning {
+                external_session_id: None,
+            }
+        } else {
+            api_types::HarnessInvocation::Start
+        });
     };
     let Some(session) = db::HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
         return Err(ServiceError::invalid_operation(
@@ -299,7 +331,13 @@ pub async fn harness_invocation_for_execution(
         // New Agent Executions receive a pending session row before dispatch.
         // That row is the destination for the session created by Start, not a
         // request to Resume an external session that does not exist yet.
-        return Ok(api_types::HarnessInvocation::Start);
+        return Ok(if is_planning {
+            api_types::HarnessInvocation::Planning {
+                external_session_id: None,
+            }
+        } else {
+            api_types::HarnessInvocation::Start
+        });
     }
     let external_session_id =
         resumable_external_session(db, execution, execution.agent_id.as_deref(), workspace_id)
@@ -309,8 +347,14 @@ pub async fn harness_invocation_for_execution(
             "explicit HarnessSession is not resumable under its historical capability evidence",
         )
             })?;
-    Ok(api_types::HarnessInvocation::Resume {
-        external_session_id,
+    Ok(if is_planning {
+        api_types::HarnessInvocation::Planning {
+            external_session_id: Some(external_session_id),
+        }
+    } else {
+        api_types::HarnessInvocation::Resume {
+            external_session_id,
+        }
     })
 }
 
@@ -903,142 +947,6 @@ async fn persist_account_usage_probe(
             );
         }
         Ok(None) | Err(_) => {}
-    }
-}
-
-pub(super) async fn set_planning_awaiting_review_metadata(
-    db: &SqliteDb,
-    task: &Task,
-    execution_id: Option<&str>,
-    awaiting: bool,
-) -> Result<Task> {
-    let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
-    })?;
-    if awaiting {
-        metadata
-            .extra
-            .insert("awaiting_human".to_owned(), json!(true));
-        metadata
-            .extra
-            .insert("awaiting_human_reason".to_owned(), json!("plan_review"));
-        metadata.extra.insert(
-            "planning_completed_at".to_owned(),
-            Value::String(now_rfc3339()),
-        );
-        if let Some(execution_id) = execution_id {
-            metadata.extra.insert(
-                "planning_execution_id".to_owned(),
-                Value::String(execution_id.to_owned()),
-            );
-        }
-    } else if metadata
-        .extra
-        .get("awaiting_human_reason")
-        .and_then(Value::as_str)
-        == Some("plan_review")
-    {
-        metadata.extra.remove("awaiting_human");
-        metadata.extra.remove("awaiting_human_reason");
-        metadata.extra.remove("planning_completed_at");
-        metadata.extra.remove("planning_execution_id");
-    } else {
-        return Ok(task.clone());
-    }
-
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
-    TaskRepo::get_by_id(db, &task.id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
-}
-
-pub(super) async fn persist_planner_result(
-    db: &SqliteDb,
-    task: &Task,
-    execution: &Execution,
-) -> Result<&'static str> {
-    let payload = execution
-        .summary
-        .as_deref()
-        .unwrap_or_default()
-        .lines()
-        .rev()
-        .find_map(|line| line.trim().strip_prefix("FORGE_RESULT: "));
-    let Some(payload) = payload else {
-        return Err(ServiceError::invalid_operation(
-            "planner structured result missing",
-        ));
-    };
-    let value: Value = serde_json::from_str(payload).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "planner structured result is invalid JSON: {error}"
-        ))
-    })?;
-    if value.get("schema_version").and_then(Value::as_i64) != Some(1) {
-        return Err(ServiceError::invalid_operation(
-            "planner structured result version is unsupported",
-        ));
-    }
-    match value.get("kind").and_then(Value::as_str) {
-        Some("plan_ready") => {
-            let workspace = WorkspaceRepo::get_by_task_id(db, &task.id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation("planner completed without a workspace")
-                })?;
-            crate::plan_artifact::capture_plan_revision(
-                db,
-                &task.id,
-                std::path::Path::new(&workspace.worktree_path),
-                "planner_ready",
-                Some(&execution.id),
-            )
-            .await
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            Ok("plan_review")
-        }
-        Some("decision_request") => {
-            let scope = value
-                .get("authority_scope")
-                .and_then(Value::as_str)
-                .unwrap_or("task");
-            if !matches!(scope, "task" | "project_scope" | "policy" | "risk") {
-                return Err(ServiceError::invalid_operation(
-                    "planner decision authority_scope is invalid",
-                ));
-            }
-            let questions = value
-                .get("questions")
-                .filter(|value| {
-                    value.as_array().is_some_and(|items| {
-                        !items.is_empty()
-                            && items.iter().all(|item| {
-                                item.as_object().is_some_and(|question| {
-                                    question
-                                        .get("question")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|text| !text.trim().is_empty())
-                                })
-                            })
-                    })
-                })
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation("planner decision request requires questions")
-                })?;
-            sqlx::query(
-                "INSERT OR IGNORE INTO task_decision_request
-                 (id, task_id, execution_id, role, authority_scope, questions_json, context, status, created_at)
-                 VALUES (?, ?, ?, 'planner', ?, ?, ?, 'pending', ?)",
-            )
-            .bind(new_uuid_v4()).bind(&task.id).bind(&execution.id).bind(scope)
-            .bind(questions.to_string())
-            .bind(value.get("context").and_then(Value::as_str))
-            .bind(now_rfc3339()).execute(db.pool()).await?;
-            Ok("decision_request")
-        }
-        _ => Err(ServiceError::invalid_operation(
-            "planner structured result kind is invalid",
-        )),
     }
 }
 

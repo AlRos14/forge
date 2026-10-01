@@ -451,7 +451,6 @@ pub(super) async fn persist_merge_error(
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(annotation.to_string())),
             blocked_json: None,
             failed_json: None,
@@ -499,7 +498,6 @@ pub(super) async fn block_task(
                 description: None,
                 priority: None,
                 merge_config: None,
-                plan: None,
                 error_annotation: None,
                 blocked_json: Some(Some(blocked_meta.to_string())),
                 failed_json: Some(None),
@@ -633,14 +631,21 @@ async fn bind_review_evidence(
         .task_diff(&ctx.task_id)
         .await
         .map_err(|error| format!("review evidence diff unavailable: {error}"))?;
-    let plan = sqlx::query(
-        "SELECT id, content_digest FROM task_plan_revision WHERE task_id = ? ORDER BY revision DESC LIMIT 1",
-    ).bind(&ctx.task_id).fetch_optional(ctx.db.pool()).await.map_err(|error| error.to_string())?;
-    use sqlx::Row;
-    let plan_revision_id = plan.as_ref().map(|row| row.get::<String, _>("id"));
-    let plan_digest = plan
-        .as_ref()
-        .map(|row| row.get::<String, _>("content_digest"));
+    let plan_artifacts =
+        crate::plan_artifact::plan_artifacts_for_execution(&ctx.db, &ctx.task_id, execution_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    let plan_evidence = plan_artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "artifact_id": artifact.id,
+                "content_digest": artifact.digest,
+                "producer_execution_id": artifact.producer_execution_id,
+                "producer": artifact.producer,
+            })
+        })
+        .collect::<Vec<_>>();
     let diff_digest = hex::encode(Sha256::digest(diff.diff.as_bytes()));
     let bundle_id = new_uuid_v4();
     let existing_details: Value = serde_json::from_str(&review.step_results_json)
@@ -659,8 +664,8 @@ async fn bind_review_evidence(
     .bind(&review.id)
     .bind(&ctx.task_id)
     .bind(execution_id)
-    .bind(plan_revision_id.as_deref())
-    .bind(plan_digest.as_deref())
+    .bind(None::<&str>)
+    .bind(None::<&str>)
     .bind(&diff.base_sha)
     .bind(&diff.head_sha)
     .bind(&diff.diff)
@@ -673,8 +678,7 @@ async fn bind_review_evidence(
     let mut details = existing_details;
     details["evidence"] = json!({
         "bundle_id": bundle_id,
-        "plan_revision_id": plan_revision_id,
-        "plan_digest": plan_digest,
+        "plan_artifacts": plan_evidence,
         "base_sha": diff.base_sha,
         "head_sha": diff.head_sha,
         "diff_digest": diff_digest,

@@ -845,6 +845,14 @@ pub trait ExecutionRepo: Send + Sync {
         input: CreateExecution,
         event: CreateDomainEvent,
     ) -> Result<(Execution, DomainEvent)>;
+    /// Create a Running Execution, its immutable Artifact inputs, and the
+    /// `execution.started` ledger event as one durable boundary.
+    async fn create_with_artifact_inputs_and_event(
+        &self,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
     async fn create_orchestrator_execution(
         &self,
         input: CreateExecution,
@@ -906,9 +914,38 @@ pub trait CollaborationRepo: Send + Sync {
         input: CreateArtifact,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Artifact>>;
+    /// Persist one immutable output Artifact for an Execution. The database's
+    /// `(execution_id, kind)` key makes same-result retries idempotent across
+    /// connections and processes.
+    async fn create_execution_artifact_output(
+        &self,
+        input: CreateArtifact,
+        event: CreateDomainEvent,
+    ) -> Result<ExecutionArtifactOutputWrite>;
+    async fn get_execution_artifact_output(
+        &self,
+        execution_id: &str,
+        kind: ArtifactKind,
+    ) -> Result<Option<Artifact>>;
+    async fn pin_execution_artifact_input(
+        &self,
+        execution_id: &str,
+        artifact_id: &str,
+        created_at: &str,
+    ) -> Result<ExecutionArtifactInput>;
+    async fn list_execution_artifact_inputs(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<ExecutionArtifactInput>>;
     async fn get_artifact_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_artifact(&self, id: &str) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self, task_id: &str, page: PageRequest) -> Result<Page<Artifact>>;
+    async fn list_artifacts_by_kind(
+        &self,
+        task_id: &str,
+        kind: ArtifactKind,
+        page: PageRequest,
+    ) -> Result<Page<Artifact>>;
 
     async fn create_message(
         &self,
@@ -2072,7 +2109,6 @@ pub struct CreateTask {
     pub subtask_order: Option<i64>,
     pub task_state_config: Option<String>,
     pub merge_config: Option<String>,
-    pub plan: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2085,7 +2121,6 @@ pub struct UpdateTask {
     pub description: Option<Option<String>>,
     pub priority: Option<i64>,
     pub merge_config: Option<Option<String>>,
-    pub plan: Option<Option<String>>,
     pub error_annotation: Option<Option<String>>,
     pub blocked_json: Option<Option<String>>,
     pub failed_json: Option<Option<String>>,

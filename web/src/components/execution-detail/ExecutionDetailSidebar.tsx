@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { ArrowBendUpLeft, Check, Clock, Copy, GitBranch, Info, Play, Spinner, StopCircle } from '@phosphor-icons/react'
 
-import { PlanChecklist } from '@/components/plan-checklist'
 import { ExecutionObservabilitySection } from '@/components/execution-detail/ExecutionObservabilitySection'
 import { ExecutionStatusBadge } from '@/components/execution-detail/ExecutionStatusBadge'
 import { formatDate, formatRelativeDate, shortHash } from '@/components/execution-detail/execution-detail-format'
@@ -86,10 +85,6 @@ export function ExecutionDetailSidebar({
   onNavigateParent: (taskId: string, executionId: string) => void
   actions?: SidebarActions
 }) {
-  const remainingPlanItems = execution?.plan_progress?.remaining ?? 0
-  const completedWithOpenPlan =
-    execution?.status === 'completed' && execution.role !== 'planner' && remainingPlanItems > 0
-
   const hasActions = Boolean(actions?.onStop || actions?.onContinue)
 
   return (
@@ -167,28 +162,6 @@ export function ExecutionDetailSidebar({
               executorType={executorType}
               accountUsage={accountUsage}
             />
-
-            {execution.plan_progress || execution.plan_artifact ? (
-              <>
-                <Separator />
-                <section>
-                  {completedWithOpenPlan ? (
-                    <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
-                      <p className="font-semibold">Task Still In Progress</p>
-                      <p className="mt-1">
-                        This {productTerm('run').toLowerCase()} completed, but {remainingPlanItems} plan checklist{' '}
-                        {remainingPlanItems === 1 ? 'item is' : 'items are'} still unchecked. The
-                        current {productTerm('phase').toLowerCase()} will not move to review until the checklist is complete.
-                      </p>
-                    </div>
-                  ) : null}
-                  <PlanChecklist
-                    progress={execution.plan_progress}
-                    artifact={execution.plan_artifact}
-                  />
-                </section>
-              </>
-            ) : null}
 
             <Separator />
 

@@ -33,13 +33,6 @@ impl TaskService {
             // executor profile; they do not bypass the baseline/lease gate.
             self.ensure_task_runnable(&task).await?;
         }
-        self.ensure_planning_plan_ready_before_leaving(
-            &task,
-            &new_status,
-            &workflow,
-            options.rejection,
-        )
-        .await?;
         self.cancel_active_execution_for_user_transition(
             &task,
             &new_status,
@@ -111,14 +104,6 @@ impl TaskService {
             task =
                 TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
         }
-        if previous_status == crate::workflow::default_states::PLANNING
-            && (task.status != crate::workflow::default_states::PLANNING || options.rejection)
-        {
-            task = super::execution::set_planning_awaiting_review_metadata(
-                &self.db, &task, None, false,
-            )
-            .await?;
-        }
         if previous_status == crate::workflow::default_states::REVIEW
             && task.status != crate::workflow::default_states::REVIEW
         {
@@ -134,7 +119,6 @@ impl TaskService {
                     description: None,
                     priority: None,
                     merge_config: None,
-                    plan: None,
                     error_annotation: Some(None),
                     blocked_json: None,
                     failed_json: None,
@@ -164,101 +148,6 @@ impl TaskService {
             task,
             review: result.review,
         })
-    }
-
-    pub(super) async fn ensure_planning_plan_ready_before_leaving(
-        &self,
-        task: &Task,
-        new_status: &TaskStatus,
-        workflow: &api_types::WorkflowDefinition,
-        rejection: bool,
-    ) -> Result<()> {
-        if task.status != crate::workflow::default_states::PLANNING
-            || new_status == crate::workflow::default_states::PLANNING
-            || workflow.cancellation_state.as_deref() == Some(new_status.as_str())
-            || rejection
-        {
-            return Ok(());
-        }
-
-        let planning_state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == crate::workflow::default_states::PLANNING);
-        if planning_state
-            .and_then(|state| state.gate_config.as_ref())
-            .is_some_and(|gate_config| gate_config.optional_when_unassigned())
-        {
-            let planner_assigned =
-                match crate::task_service::current_role_memberships_authoritative(
-                    &self.db,
-                    &task.id,
-                    crate::workflow::default_roles::PLANNER,
-                )
-                .await?
-                {
-                    Some(memberships) => memberships
-                        .iter()
-                        .any(|membership| membership.status == db::RoleMembershipStatus::Active),
-                    None => TaskRoleAssignmentRepo::get_by_task_and_role(
-                        &*self.db,
-                        &task.id,
-                        crate::workflow::default_roles::PLANNER,
-                    )
-                    .await?
-                    .is_some_and(|assignment| {
-                        assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
-                    }),
-                };
-            if !planner_assigned {
-                return Ok(());
-            }
-        }
-
-        let Some(workspace) = WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await? else {
-            return Err(ServiceError::invalid_operation(
-                "planning cannot be approved before a plan artifact exists",
-            ));
-        };
-
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
-                return Err(ServiceError::invalid_operation(
-                    "planning cannot be approved before a plan artifact exists",
-                ));
-            }
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "planning plan artifact is unreadable: {error}"
-                )));
-            }
-        };
-        let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
-        if summary.total == 0 {
-            return Err(ServiceError::invalid_operation(
-                "planning cannot be approved before the plan has checklist items",
-            ));
-        }
-
-        crate::plan_artifact::capture_plan_revision(
-            &self.db,
-            &task.id,
-            std::path::Path::new(&workspace.worktree_path),
-            "planner_ready",
-            None,
-        )
-        .await
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "planning plan artifact could not be persisted: {error}"
-            ))
-        })?;
-
-        Ok(())
     }
 
     pub async fn is_awaiting_human(&self, task_id: impl Into<String>) -> Result<bool> {
@@ -777,7 +666,6 @@ async fn clear_manual_advance_error_annotation(
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(None),
             blocked_json: None,
             failed_json: None,

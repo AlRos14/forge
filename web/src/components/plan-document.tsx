@@ -10,12 +10,6 @@ export function PlanDocument({
   artifact: PlanArtifactDetail
   className?: string
 }) {
-  const metadata = [
-    artifact.revision != null ? `Revision ${artifact.revision}` : null,
-    artifact.checkpoint,
-    artifact.content_digest?.slice(0, 12),
-  ].filter(Boolean)
-
   return (
     <section
       aria-label="Task plan"
@@ -23,9 +17,36 @@ export function PlanDocument({
     >
       <div className="border-b bg-muted/20 px-4 py-3">
         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Plan</p>
-        {metadata.length > 0 ? (
-          <p className="mt-1 font-mono text-micro text-muted-foreground">{metadata.join(' · ')}</p>
-        ) : null}
+        <dl className="mt-2 grid gap-x-5 gap-y-1 text-micro text-muted-foreground sm:grid-cols-2">
+          <div className="min-w-0">
+            <dt className="inline">Artifact </dt>
+            <dd className="inline break-all font-mono" title={artifact.artifact_id}>
+              {artifact.artifact_id}
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="inline">Producer </dt>
+            <dd className="inline break-all font-mono">
+              {artifact.producer.kind}:{artifact.producer.id}
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="inline">Execution </dt>
+            <dd className="inline break-all font-mono" title={artifact.producer_execution_id}>
+              {artifact.producer_execution_id}
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="inline">Created </dt>
+            <dd className="inline">{artifact.created_at}</dd>
+          </div>
+          {artifact.content_digest ? (
+            <div className="min-w-0 sm:col-span-2">
+              <dt className="inline">SHA-256 </dt>
+              <dd className="inline break-all font-mono">{artifact.content_digest}</dd>
+            </div>
+          ) : null}
+        </dl>
       </div>
 
       {artifact.warnings.length > 0 ? (

@@ -84,7 +84,6 @@ pub(crate) struct UpdateTaskParams {
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) priority: Option<i64>,
-    pub(crate) plan: Option<String>,
     pub(crate) version: i64,
 }
 

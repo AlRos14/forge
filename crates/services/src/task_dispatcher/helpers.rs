@@ -39,21 +39,6 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     )
 }
 
-pub(super) fn auto_cascades_on_unassigned_role(state: &api_types::StateDefinition) -> bool {
-    if !state
-        .gate_config
-        .as_ref()
-        .is_some_and(|config| config.optional_when_unassigned())
-    {
-        return false;
-    }
-    state
-        .hooks
-        .after_enter
-        .iter()
-        .any(|hook| hook.action == "auto_cascade_on_unassigned_role")
-}
-
 pub(super) fn role_assignment_unassigned(assignment: Option<&db::TaskRoleAssignment>) -> bool {
     !assignment.is_some_and(|assignment| {
         assignment.assignee_type.is_some() && assignment.assignee_id.is_some()

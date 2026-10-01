@@ -92,7 +92,7 @@
     },
     {
       "name": "planning",
-      "kind": "gate",
+      "kind": "active",
       "column": "In Progress",
       "canonical_phase": "working",
       "display_name": "Planning",
@@ -126,16 +126,9 @@
         ]
       },
       "cleanup": null,
-      "gate_config": {
-        "reject_target": "planning",
-        "max_rejections": 2,
-        "approve_label": "Approve plan",
-        "reject_label": "Reject plan",
-        "requires_user_approval": true,
-        "optional_when_unassigned": true
-      },
+      "gate_config": null,
       "dispatch": {
-        "builder": "planner.default.v2",
+        "builder": "generic.default.v2",
         "execution_policy": null,
         "prompt": null
       },
@@ -143,15 +136,6 @@
         "accept": {
           "to": "in_progress",
           "dispatch": null
-        },
-        "reject": {
-          "to": "planning",
-          "dispatch": null
-        }
-      },
-      "config": {
-        "prompt": {
-          "user_append": ""
         }
       }
     },
@@ -166,12 +150,6 @@
         "before_exit": [
           {
             "action": "subtask_sequence_complete",
-            "params": {},
-            "applies_to": "all",
-            "on_failure": "block"
-          },
-          {
-            "action": "require_plan_checklist_complete",
             "params": {},
             "applies_to": "all",
             "on_failure": "block"

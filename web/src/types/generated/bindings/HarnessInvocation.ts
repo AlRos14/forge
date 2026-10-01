@@ -3,4 +3,4 @@
 /**
  * Runtime-only request to begin a harness run or continue one exact session.
  */
-export type HarnessInvocation = { "type": "start" } | { "type": "resume", external_session_id: string, };
+export type HarnessInvocation = { "type": "start" } | { "type": "resume", external_session_id: string, } | { "type": "planning", external_session_id: string | null, };

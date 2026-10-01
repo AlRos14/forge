@@ -177,7 +177,6 @@ async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annot
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -266,7 +265,6 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&stale_annotation).expect("annotation serializes"),
             )),
@@ -401,7 +399,6 @@ async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_a
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -550,7 +547,6 @@ async fn test_failed_task_supersedes_blocking_annotation() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -633,7 +629,6 @@ async fn test_annotation_hook_details_surface_as_failing_step() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -692,7 +687,6 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
                 description: None,
                 priority: None,
                 merge_config: None,
-                plan: None,
                 error_annotation: None,
                 blocked_json: Some(Some(
                     json!({
@@ -756,7 +750,6 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: Some(Some(
                 json!({
@@ -802,7 +795,7 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
 }
 
 #[tokio::test]
-async fn test_derive_workflow_exception_failed_planner_offers_retry() {
+async fn test_derive_workflow_exception_does_not_offer_planner_specific_retry() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
@@ -834,21 +827,10 @@ async fn test_derive_workflow_exception_failed_planner_offers_retry() {
         None,
         Some(&execution),
         &remaining_retries,
-    )
-    .expect("workflow exception derives");
+    );
 
-    assert_eq!(exception.exception_type, "planner_failed");
-    assert!(exception.message.contains("WorkspaceLease"));
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
+    assert!(
+        exception.is_none(),
+        "failed planning does not create a bespoke planner retry exception"
+    );
 }

@@ -1,8 +1,9 @@
 use super::*;
 use crate::{
-    Artifact, CollaborationRepo, CollaborationTarget, CollaborationTargetKind, CollaborationWrite,
-    CreateArtifact, CreateDecision, CreateHandoff, CreateMessage, CreateProposal, Decision,
-    DecisionOutcome, Handoff, Message, Proposal, ProposalTarget, TransitionHandoff,
+    Artifact, ArtifactKind, CollaborationRepo, CollaborationTarget, CollaborationTargetKind,
+    CollaborationWrite, CreateArtifact, CreateDecision, CreateHandoff, CreateMessage,
+    CreateProposal, Decision, DecisionOutcome, ExecutionArtifactInput,
+    ExecutionArtifactOutputWrite, Handoff, Message, Proposal, ProposalTarget, TransitionHandoff,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +34,55 @@ fn encode_collaboration_cursor(created_at: &str, id: &str) -> Result<String> {
     })
     .map_err(|_| DbError::InvalidCursor)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(super) async fn pin_execution_artifact_input_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    execution_id: &str,
+    artifact_id: &str,
+    created_at: &str,
+) -> Result<ExecutionArtifactInput> {
+    let artifact = sqlx::query("SELECT task_id, digest FROM artifact WHERE id = ?")
+        .bind(artifact_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let task_id: String = artifact.try_get("task_id")?;
+    let digest: Option<String> = artifact.try_get("digest")?;
+    sqlx::query(
+        "INSERT INTO execution_artifact_input
+         (execution_id, artifact_id, task_id, digest, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(execution_id, artifact_id) DO NOTHING",
+    )
+    .bind(execution_id)
+    .bind(artifact_id)
+    .bind(&task_id)
+    .bind(&digest)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT execution_id, artifact_id, task_id, digest, created_at
+         FROM execution_artifact_input WHERE execution_id = ? AND artifact_id = ?",
+    )
+    .bind(execution_id)
+    .bind(artifact_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let record = ExecutionArtifactInput {
+        execution_id: row.try_get("execution_id")?,
+        artifact_id: row.try_get("artifact_id")?,
+        task_id: row.try_get("task_id")?,
+        digest: row.try_get("digest")?,
+        created_at: row.try_get("created_at")?,
+    };
+    if record.task_id != task_id || record.digest != digest {
+        return Err(DbError::Check(
+            "Execution input Artifact binding conflicts with persisted provenance".to_owned(),
+        ));
+    }
+    Ok(record)
 }
 
 /// Reconstructs the immutable identity recorded at write time. Liveness is
@@ -435,6 +485,55 @@ async fn get_artifact_row(db: &SqliteDb, id: &str) -> Result<Option<Artifact>> {
         .transpose()
 }
 
+async fn list_artifact_page(
+    db: &SqliteDb,
+    task_id: &str,
+    kind: Option<ArtifactKind>,
+    page: PageRequest,
+) -> Result<Page<Artifact>> {
+    let cursor = decode_collaboration_cursor(&page.cursor)?;
+    let mut query = format!("{} WHERE a.task_id = ?", artifact_select());
+    if kind.is_some() {
+        query.push_str(" AND a.kind = ?");
+    }
+    if cursor.is_some() {
+        query.push_str(" AND (a.created_at < ? OR (a.created_at = ? AND a.id < ?))");
+    }
+    query.push_str(" ORDER BY a.created_at DESC, a.id DESC LIMIT ?");
+    let mut statement = sqlx::query(&query).bind(task_id);
+    if let Some(kind) = kind {
+        statement = statement.bind(kind.to_string());
+    }
+    if let Some(cursor) = cursor {
+        statement = statement
+            .bind(cursor.created_at.clone())
+            .bind(cursor.created_at)
+            .bind(cursor.id);
+    }
+    let rows = statement
+        .bind(page.limit.clamp(1, 100) + 1)
+        .fetch_all(db.pool())
+        .await?;
+    let items = rows
+        .into_iter()
+        .map(map_artifact)
+        .collect::<Result<Vec<_>>>()?;
+    let total = if page.include_total {
+        let mut query = "SELECT COUNT(*) FROM artifact WHERE task_id = ?".to_owned();
+        if kind.is_some() {
+            query.push_str(" AND kind = ?");
+        }
+        let mut statement = sqlx::query_scalar::<_, i64>(&query).bind(task_id);
+        if let Some(kind) = kind {
+            statement = statement.bind(kind.to_string());
+        }
+        Some(statement.fetch_one(db.pool()).await?)
+    } else {
+        None
+    };
+    finish_page(items, &page, |item| (&item.created_at, &item.id), total)
+}
+
 async fn get_message_row(db: &SqliteDb, id: &str) -> Result<Option<Message>> {
     let sql = format!("{} WHERE m.id = ?", message_select());
     match sqlx::query(&sql).bind(id).fetch_optional(db.pool()).await? {
@@ -543,6 +642,150 @@ impl CollaborationRepo for SqliteDb {
         Ok(CollaborationWrite { record, event })
     }
 
+    async fn create_execution_artifact_output(
+        &self,
+        input: CreateArtifact,
+        event: CreateDomainEvent,
+    ) -> Result<ExecutionArtifactOutputWrite> {
+        let expected = input.clone();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.producer_execution_id)
+        .bind(&input.task_id)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO execution_artifact_output
+             (execution_id, artifact_id, task_id, kind, digest, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(execution_id, kind) DO NOTHING",
+        )
+        .bind(&input.producer_execution_id)
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(input.kind.to_string())
+        .bind(&input.digest)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if inserted == 0 {
+            tx.rollback().await?;
+            let existing = self
+                .get_execution_artifact_output(&expected.producer_execution_id, expected.kind)
+                .await?
+                .ok_or(DbError::VersionConflict)?;
+            if existing.task_id != expected.task_id
+                || existing.kind != expected.kind
+                || existing.storage_kind != expected.storage_kind
+                || existing.content != expected.content
+                || existing.content_ref != expected.content_ref
+                || existing.metadata_json != expected.metadata_json
+                || existing.digest != expected.digest
+                || existing.producer_execution_id != expected.producer_execution_id
+            {
+                return Err(DbError::Check(
+                    "Execution already has a different output Artifact of this kind".to_owned(),
+                ));
+            }
+            return Ok(ExecutionArtifactOutputWrite {
+                artifact: existing,
+                event: None,
+            });
+        }
+
+        sqlx::query(
+            "INSERT INTO artifact (
+                id, task_id, kind, storage_kind, content, content_ref,
+                metadata_json, digest, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(input.kind.to_string())
+        .bind(input.storage_kind.to_string())
+        .bind(&input.content)
+        .bind(&input.content_ref)
+        .bind(&input.metadata_json)
+        .bind(&input.digest)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        let artifact = get_artifact_row(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        Ok(ExecutionArtifactOutputWrite {
+            artifact,
+            event: Some(event),
+        })
+    }
+
+    async fn get_execution_artifact_output(
+        &self,
+        execution_id: &str,
+        kind: ArtifactKind,
+    ) -> Result<Option<Artifact>> {
+        let artifact_id: Option<String> = sqlx::query_scalar(
+            "SELECT artifact_id FROM execution_artifact_output
+             WHERE execution_id = ? AND kind = ?",
+        )
+        .bind(execution_id)
+        .bind(kind.to_string())
+        .fetch_optional(self.pool())
+        .await?;
+        match artifact_id {
+            Some(artifact_id) => get_artifact_row(self, &artifact_id).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn pin_execution_artifact_input(
+        &self,
+        execution_id: &str,
+        artifact_id: &str,
+        created_at: &str,
+    ) -> Result<ExecutionArtifactInput> {
+        let mut tx = self.pool.begin().await?;
+        let record =
+            pin_execution_artifact_input_in_tx(&mut tx, execution_id, artifact_id, created_at)
+                .await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    async fn list_execution_artifact_inputs(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<ExecutionArtifactInput>> {
+        let rows = sqlx::query(
+            "SELECT execution_id, artifact_id, task_id, digest, created_at
+             FROM execution_artifact_input WHERE execution_id = ?
+             ORDER BY created_at ASC, artifact_id ASC",
+        )
+        .bind(execution_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ExecutionArtifactInput {
+                    execution_id: row.try_get("execution_id")?,
+                    artifact_id: row.try_get("artifact_id")?,
+                    task_id: row.try_get("task_id")?,
+                    digest: row.try_get("digest")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
     async fn get_artifact_task_id(&self, id: &str) -> Result<Option<String>> {
         Ok(
             sqlx::query_scalar("SELECT task_id FROM artifact WHERE id = ?")
@@ -557,33 +800,16 @@ impl CollaborationRepo for SqliteDb {
     }
 
     async fn list_artifacts(&self, task_id: &str, page: PageRequest) -> Result<Page<Artifact>> {
-        let cursor = decode_collaboration_cursor(&page.cursor)?;
-        let mut query = format!("{} WHERE a.task_id = ?", artifact_select());
-        if cursor.is_some() {
-            query.push_str(" AND (a.created_at < ? OR (a.created_at = ? AND a.id < ?))");
-        }
-        query.push_str(" ORDER BY a.created_at DESC, a.id DESC LIMIT ?");
-        let mut statement = sqlx::query(&query).bind(task_id);
-        if let Some(cursor) = cursor {
-            statement = statement
-                .bind(cursor.created_at.clone())
-                .bind(cursor.created_at)
-                .bind(cursor.id);
-        }
-        let rows = statement
-            .bind(page.limit.clamp(1, 100) + 1)
-            .fetch_all(self.pool())
-            .await?;
-        let items = rows
-            .into_iter()
-            .map(map_artifact)
-            .collect::<Result<Vec<_>>>()?;
-        let total = if page.include_total {
-            Some(total_for_task(self, "artifact", task_id).await?)
-        } else {
-            None
-        };
-        finish_page(items, &page, |item| (&item.created_at, &item.id), total)
+        list_artifact_page(self, task_id, None, page).await
+    }
+
+    async fn list_artifacts_by_kind(
+        &self,
+        task_id: &str,
+        kind: ArtifactKind,
+        page: PageRequest,
+    ) -> Result<Page<Artifact>> {
+        list_artifact_page(self, task_id, Some(kind), page).await
     }
 
     async fn create_message(

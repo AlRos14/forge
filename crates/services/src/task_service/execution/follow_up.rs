@@ -303,12 +303,6 @@ fn dispatch_role_follow_up_impl(
             .await?
         };
         let execution_id = new_uuid_v4();
-        let logs_path = execution_logs_path(
-            &service.workspace_root,
-            &task.project_id,
-            &task_id,
-            &execution_id,
-        );
         // Establish the final Task state/version before minting the
         // execution-scoped WorkspaceLease. A transition after issuance would
         // immediately make the exact-version authority stale.
@@ -330,7 +324,6 @@ fn dispatch_role_follow_up_impl(
                     description: None,
                     priority: None,
                     merge_config: None,
-                    plan: None,
                     blocked_json: None,
                     failed_json: None,
                     task_state_config: None,
@@ -351,9 +344,12 @@ fn dispatch_role_follow_up_impl(
             task
         };
         service.ensure_task_runnable(&task).await?;
+        let artifact_input_ids = service
+            .inherit_plan_artifact_inputs(&supplied_parent_execution.id, &task_id)
+            .await?;
         let now = now_rfc3339();
         let execution = service
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: execution_id.clone(),
                     task_id: task_id.clone(),
@@ -378,7 +374,9 @@ fn dispatch_role_follow_up_impl(
                     agent_message_id: None,
                     last_activity_at: None,
                     summary: Some(prompt),
-                    logs_path: Some(logs_path),
+                    // Pin exact Artifact inputs before start_execution records
+                    // its log path and launches the adapter.
+                    logs_path: None,
                     before_sha: None,
                     after_sha: None,
                     error: None,
@@ -388,6 +386,7 @@ fn dispatch_role_follow_up_impl(
                     updated_at: now,
                 },
                 false,
+                artifact_input_ids,
             )
             .await?;
 

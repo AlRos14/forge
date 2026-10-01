@@ -78,6 +78,7 @@ import type {
   Review,
   ReviewDecisionResponse,
   Task,
+  TaskPlanHistoryResponse,
   TaskMediaResponse,
   TaskDecisionRequestResponse,
   TaskRoleAssignmentResponse,
@@ -369,6 +370,14 @@ export function useTaskQuery(taskId: string) {
   return useQuery({
     queryKey: qk.task(taskId),
     queryFn: () => apiFetch<Task>(`/tasks/${taskId}`),
+  })
+}
+
+export function useTaskPlanQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskPlan(taskId),
+    queryFn: () => apiFetch<TaskPlanHistoryResponse>(`/tasks/${taskId}/plan`),
+    enabled: Boolean(taskId),
   })
 }
 

@@ -10,12 +10,11 @@ pub async fn delete_project(
     workspace_root: &Path,
     project_id: &str,
 ) -> crate::Result<()> {
-    let task_ids = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM task WHERE project_id = ? ORDER BY id",
-    )
-    .bind(project_id)
-    .fetch_all(db.pool())
-    .await?;
+    let task_ids =
+        sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE project_id = ? ORDER BY id")
+            .bind(project_id)
+            .fetch_all(db.pool())
+            .await?;
     let operations =
         TaskIntegrationOperationManager::new(Arc::clone(&db), workspace_root.to_path_buf());
     for task_id in task_ids {
@@ -29,8 +28,8 @@ pub async fn delete_project(
 mod tests {
     use super::*;
     use db::{
-        create_sqlite_pool, now_rfc3339, run_migrations, CreateProject, CreateTask,
-        ProjectRepo, TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskRepo,
+        create_sqlite_pool, now_rfc3339, run_migrations, CreateProject, CreateTask, ProjectRepo,
+        TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskRepo,
     };
     use tempfile::TempDir;
 
@@ -76,7 +75,6 @@ mod tests {
                 priority: 0,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },

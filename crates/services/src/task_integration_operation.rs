@@ -40,8 +40,7 @@ impl TaskIntegrationOperationManager {
             Ok(operation) => match self.try_process_lock(task_id).await {
                 Ok(Ok(file)) => {
                     let active = match TaskIntegrationOperationRepo::get_active_for_task(
-                        &*self.db,
-                        task_id,
+                        &*self.db, task_id,
                     )
                     .await
                     {
@@ -268,8 +267,8 @@ mod tests {
     use super::*;
     use db::{
         create_sqlite_pool, run_migrations, CreateProject, CreateRepo, CreateTask,
-        CreateTerminalSession, CreateWorkspace, ProjectRepo, RepoRepo, TaskIntegrationOperationKind,
-        TaskIntegrationOperationStatus, TaskRepo, TerminalSessionRepo, UserRepo, WorkMode,
+        CreateTerminalSession, CreateWorkspace, ProjectRepo, RepoRepo,
+        TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo, UserRepo, WorkMode,
         WorkspaceRepo, WorkspaceStatus,
     };
     use std::path::Path;
@@ -358,7 +357,6 @@ mod tests {
                 priority: 0,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -410,10 +408,8 @@ mod tests {
         let db_fixture = fixture("sqlite::memory:", temp.path()).await;
         let lock_root_file = temp.path().join("not-a-directory");
         std::fs::write(&lock_root_file, "file blocks lock directory").expect("write file");
-        let manager = TaskIntegrationOperationManager::new(
-            Arc::clone(&db_fixture.db),
-            lock_root_file,
-        );
+        let manager =
+            TaskIntegrationOperationManager::new(Arc::clone(&db_fixture.db), lock_root_file);
 
         let error = match manager
             .acquire(
@@ -426,7 +422,9 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("filesystem lock setup should fail"),
         };
-        assert!(error.to_string().contains("could not prepare Task integration operation lock"));
+        assert!(error
+            .to_string()
+            .contains("could not prepare Task integration operation lock"));
         assert!(TaskIntegrationOperationRepo::get_active_for_task(
             &*db_fixture.db,
             &db_fixture.task_id,
@@ -434,13 +432,12 @@ mod tests {
         .await
         .expect("active operation lookup")
         .is_none());
-        let statuses: Vec<String> = sqlx::query_scalar(
-            "SELECT status FROM task_integration_operation WHERE task_id = ?",
-        )
-        .bind(&db_fixture.task_id)
-        .fetch_all(db_fixture.db.pool())
-        .await
-        .expect("operation history");
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM task_integration_operation WHERE task_id = ?")
+                .bind(&db_fixture.task_id)
+                .fetch_all(db_fixture.db.pool())
+                .await
+                .expect("operation history");
         assert_eq!(statuses, vec!["abandoned"]);
     }
 
@@ -458,13 +455,12 @@ mod tests {
             .reconcile_stale(&db_fixture.task_id)
             .await
             .expect("free canonical process lock proves stale owner");
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM task_integration_operation WHERE id = ?",
-        )
-        .bind(&active.id)
-        .fetch_one(db_fixture.db.pool())
-        .await
-        .expect("durable operation history");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM task_integration_operation WHERE id = ?")
+                .bind(&active.id)
+                .fetch_one(db_fixture.db.pool())
+                .await
+                .expect("durable operation history");
         assert_eq!(status, "abandoned");
     }
 
@@ -489,17 +485,13 @@ mod tests {
         )
         .await
         .expect("live owner holds the canonical process lock");
-        let active = TaskIntegrationOperationRepo::get_active_for_task(
-            &*db_fixture.db,
-            &db_fixture.task_id,
-        )
-        .await
-        .expect("active operation lookup")
-        .expect("operation remains running");
-        let reconciler = TaskIntegrationOperationManager::new(
-            competing_db,
-            temp.path().to_path_buf(),
-        );
+        let active =
+            TaskIntegrationOperationRepo::get_active_for_task(&*db_fixture.db, &db_fixture.task_id)
+                .await
+                .expect("active operation lookup")
+                .expect("operation remains running");
+        let reconciler =
+            TaskIntegrationOperationManager::new(competing_db, temp.path().to_path_buf());
 
         assert!(matches!(
             reconciler.reconcile_stale(&db_fixture.task_id).await,
@@ -524,29 +516,26 @@ mod tests {
         let temp = TempDir::new().expect("temporary directory");
         let db_fixture = fixture("sqlite::memory:", temp.path()).await;
         let active = begin_operation(&db_fixture.db, &db_fixture.task_id).await;
-        let terminal = || {
-            CreateTerminalSession {
-                id: new_uuid_v4(),
-                task_id: db_fixture.task_id.clone(),
-                workspace_id: db_fixture.workspace_id.clone(),
-                daemon_id: None,
-                created_by_user_id: db_fixture.user_id.clone(),
-                rows: 24,
-                cols: 80,
-                created_at: now_rfc3339(),
-            }
+        let terminal = || CreateTerminalSession {
+            id: new_uuid_v4(),
+            task_id: db_fixture.task_id.clone(),
+            workspace_id: db_fixture.workspace_id.clone(),
+            daemon_id: None,
+            created_by_user_id: db_fixture.user_id.clone(),
+            rows: 24,
+            cols: 80,
+            created_at: now_rfc3339(),
         };
 
-        assert!(TerminalSessionRepo::create_terminal_session(&*db_fixture.db, terminal())
+        assert!(
+            TerminalSessionRepo::create_terminal_session(&*db_fixture.db, terminal())
+                .await
+                .is_err()
+        );
+        TaskIntegrationOperationManager::new(Arc::clone(&db_fixture.db), temp.path().to_path_buf())
+            .reconcile_stale(&db_fixture.task_id)
             .await
-            .is_err());
-        TaskIntegrationOperationManager::new(
-            Arc::clone(&db_fixture.db),
-            temp.path().to_path_buf(),
-        )
-        .reconcile_stale(&db_fixture.task_id)
-        .await
-        .expect("dead operation owner is abandoned");
+            .expect("dead operation owner is abandoned");
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT status FROM task_integration_operation WHERE id = ?",
@@ -577,10 +566,8 @@ mod tests {
             Arc::clone(&db_fixture.db),
             temp.path().to_path_buf(),
         );
-        let contender = TaskIntegrationOperationManager::new(
-            competing_db,
-            temp.path().to_path_buf(),
-        );
+        let contender =
+            TaskIntegrationOperationManager::new(competing_db, temp.path().to_path_buf());
 
         let (reconcile_result, acquire_result) = tokio::join!(
             reconciler.reconcile_stale(&db_fixture.task_id),
@@ -590,13 +577,13 @@ mod tests {
                 "new-operation-owner",
             ),
         );
-        assert!(reconcile_result.is_ok() || matches!(reconcile_result, Err(ServiceError::Conflict(_))));
-        let active = TaskIntegrationOperationRepo::get_active_for_task(
-            &*db_fixture.db,
-            &db_fixture.task_id,
-        )
-        .await
-        .expect("active operation lookup");
+        assert!(
+            reconcile_result.is_ok() || matches!(reconcile_result, Err(ServiceError::Conflict(_)))
+        );
+        let active =
+            TaskIntegrationOperationRepo::get_active_for_task(&*db_fixture.db, &db_fixture.task_id)
+                .await
+                .expect("active operation lookup");
         let running_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM task_integration_operation
              WHERE task_id = ? AND status = 'running'",
@@ -606,13 +593,12 @@ mod tests {
         .await
         .expect("running operation count");
         assert!(running_count <= 1);
-        let original_status: String = sqlx::query_scalar(
-            "SELECT status FROM task_integration_operation WHERE id = ?",
-        )
-        .bind(&original.id)
-        .fetch_one(db_fixture.db.pool())
-        .await
-        .expect("original operation status");
+        let original_status: String =
+            sqlx::query_scalar("SELECT status FROM task_integration_operation WHERE id = ?")
+                .bind(&original.id)
+                .fetch_one(db_fixture.db.pool())
+                .await
+                .expect("original operation status");
         assert_eq!(original_status, "abandoned");
         match acquire_result {
             Ok(owner) => {

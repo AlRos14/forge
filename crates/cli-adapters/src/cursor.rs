@@ -149,14 +149,7 @@ impl CursorAdapter {
             &["--resume", "--session"],
             &["--continue"],
         );
-        match &ctx.invocation {
-            executors::HarnessInvocation::Start => config.resume_session_id = None,
-            executors::HarnessInvocation::Resume {
-                external_session_id,
-            } => {
-                config.resume_session_id = Some(external_session_id.clone());
-            }
-        }
+        config.resume_session_id = ctx.invocation.external_session_id().map(str::to_owned);
         config
     }
 

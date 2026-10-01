@@ -5,9 +5,9 @@ use crate::{
             AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
             CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
             DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
-            PropagateDoneToSubtasks, RequireCleanWorktree, RequirePlanChecklistComplete,
-            RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
-            SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
+            PropagateDoneToSubtasks, RequireCleanWorktree, RequireUpstreamRolesCompleted,
+            RunBeforeWorkHooks, RunCiSteps, RunMerge, SatisfyDependents, ScheduleWorkspaceCleanup,
+            SubtaskSequenceComplete,
         },
         HookAction,
     },
@@ -32,7 +32,6 @@ pub fn is_known_action(name: &str) -> bool {
             | "check_merge_fix_budget"
             | "check_retry_budget"
             | "require_clean_worktree"
-            | "require_plan_checklist_complete"
             | "dependency_gate"
             | "dispatch_executor"
             | "dispatch_fix_agent"
@@ -61,7 +60,6 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "check_merge_fix_budget" => Box::new(CheckMergeFixBudget),
         "check_retry_budget" => Box::new(CheckRetryBudget),
         "require_clean_worktree" => Box::new(RequireCleanWorktree),
-        "require_plan_checklist_complete" => Box::new(RequirePlanChecklistComplete),
         "dependency_gate" => Box::new(DependencyGate),
         "dispatch_executor" => Box::new(DispatchExecutor),
         "dispatch_fix_agent" => Box::new(DispatchFixAgent),

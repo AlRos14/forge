@@ -115,7 +115,6 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
                 "title": { "type": "string" },
                 "description": { "type": "string" },
                 "priority": { "type": "integer" },
-                "plan": { "type": "string" },
                 "version": { "type": "integer" }
             }),
             &["task_id", "version"],

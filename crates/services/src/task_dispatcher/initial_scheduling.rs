@@ -165,7 +165,7 @@ impl TaskDispatcher {
                     if !memberships
                         .iter()
                         .any(|membership| membership.status == db::RoleMembershipStatus::Active)
-                        && helpers::auto_cascades_on_unassigned_role(target_state)
+                        && crate::workflow::auto_cascades_on_unassigned_role(target_state)
                     {
                         cursor_state = target_state.name.clone();
                         target_kinds = vec![StateKind::Active];
@@ -195,13 +195,15 @@ impl TaskDispatcher {
                         }
                         Some(assignment)
                             if helpers::role_assignment_unassigned(Some(&assignment))
-                                && helpers::auto_cascades_on_unassigned_role(target_state) =>
+                                && crate::workflow::auto_cascades_on_unassigned_role(
+                                    target_state,
+                                ) =>
                         {
                             cursor_state = target_state.name.clone();
                             target_kinds = vec![StateKind::Active];
                         }
                         Some(_) => return Ok(None),
-                        None if helpers::auto_cascades_on_unassigned_role(target_state) => {
+                        None if crate::workflow::auto_cascades_on_unassigned_role(target_state) => {
                             cursor_state = target_state.name.clone();
                             target_kinds = vec![StateKind::Active];
                         }

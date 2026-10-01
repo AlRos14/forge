@@ -69,8 +69,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `discovery`, `review`, and `validation`. Hierarchy is represented only by
   `parent_task_id`; existing `task` and `sub_task` rows migrate to
   `implementation`, and `planning_task` migrates to `planning`.
-- Planner and reviewer agents must end with the server-owned `FORGE_RESULT`
-  JSON contract. Legacy review verdict markers are no longer accepted.
+- Reviewer agents must end with the server-owned `FORGE_RESULT` JSON contract.
+  Legacy review verdict markers are no longer accepted.
+- Planning now uses ordinary `purpose=plan` Executions and immutable generic
+  Plan Artifacts. REST/MCP no longer write `Task.plan`, the plan endpoint is a
+  read-only Artifact history projection (`artifacts`, replacing plan
+  revisions/current checkpoint fields). Task/Execution response plan fields
+  now expose Artifact projection where applicable; checklist progress is not
+  attached to Execution summaries. The planner-specific approval, checklist
+  gate, `Retry Planning` exception, and `FORGE_RESULT plan_ready` protocol are
+  removed. Persisted workflow definitions ignore the retired checklist hook
+  when resolved. Existing V081 rows remain as history; V098 migrates only rows
+  with verifiable Execution/Actor provenance.
+- Answering a historical V082 TaskDecisionRequest no longer resumes the
+  planner. New Actor questions belong to generic collaboration Handoffs.
 - Caller-supplied collaboration references are scoped to their owning Task
   before foreign semantic content, state, or corruption is loaded. Missing and
   cross-Task references are indistinguishable within each reference contract:
@@ -101,11 +113,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   discovery includes additive `harness_capabilities`; winner capabilities are
   preserved in Execution and HarnessSession snapshots. No schema migration was
   needed.
-- Durable, immutable Task plan revisions survive Workspace cleanup, expose the
-  full Markdown and revision digest through `GET /api/v1/tasks/{id}/plan`, and
-  bind review evidence to the exact plan and git head.
-- Task-scoped decision requests pause planning for principal-bound answers;
-  Project/policy/risk questions require a Project Decision and reconciliation.
+- Generic Plan Artifacts survive Workspace cleanup and expose full Markdown,
+  immutable Artifact identity, producer Execution/Actor, and digest through
+  `GET /api/v1/tasks/{id}/plan`. Review evidence names exact Plan Artifact
+  identities where available.
 - Agent account-usage snapshots are available at
   `GET /api/v1/agents/{id}/usage`; Cursor refresh uses its interactive `/usage`
   command through a bounded PTY without starting a model turn, while Codex

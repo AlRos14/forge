@@ -270,7 +270,6 @@ async fn manual_transition_clears_executor_failure_annotation() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(annotation.to_string())),
             blocked_json: None,
             failed_json: None,

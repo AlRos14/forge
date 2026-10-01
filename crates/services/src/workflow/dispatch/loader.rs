@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
-    ExecutionRepo, ExecutionStatus, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo,
-    TaskRepo, TransitionLogRepo,
+    Artifact, ExecutionRepo, ExecutionStatus, PageRequest, ReviewRepo, SortBy, SortOrder,
+    TaskCommentRepo, TaskRepo, TransitionLogRepo,
 };
 use executors::LogKind;
 use serde_json::Value;
@@ -20,6 +20,7 @@ pub async fn load_agent_dispatch_context(
     state_name: &str,
     state_config: Value,
     execution_policy: Option<&str>,
+    causing_execution_id: Option<&str>,
     workflow: &WorkflowDefinition,
 ) -> Result<AgentDispatchContext> {
     let task = TaskRepo::get_by_id(&*db, task_id, false)
@@ -62,11 +63,17 @@ pub async fn load_agent_dispatch_context(
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
-    let plan = match crate::plan_artifact::latest_plan_for_task(&db, task_id).await {
-        Ok(Some(plan)) => Some(plan.markdown),
-        Ok(None) => task.plan.clone(),
-        Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
+    let plan_artifacts = match causing_execution_id {
+        Some(execution_id) => {
+            crate::plan_artifact::plan_artifacts_for_execution(&db, task_id, execution_id).await?
+        }
+        None => Vec::new(),
     };
+    let plan_artifact_ids = plan_artifacts
+        .iter()
+        .map(|artifact| artifact.id.clone())
+        .collect::<Vec<_>>();
+    let plan = render_plan_context(&plan_artifacts);
     let review_evidence = if role == crate::workflow::default_roles::REVIEWER {
         match crate::DiffService::new(Arc::clone(&db))
             .task_diff(task_id)
@@ -90,6 +97,7 @@ pub async fn load_agent_dispatch_context(
         transition_log,
         comments,
         plan,
+        plan_artifact_ids,
         review_evidence,
         prior_reviews,
         parent_task,
@@ -101,6 +109,33 @@ pub async fn load_agent_dispatch_context(
         latest_review_execution_id: latest_review_context.execution_id,
         latest_review_logs_path: latest_review_context.logs_path,
     })
+}
+
+fn render_plan_context(artifacts: &[Artifact]) -> Option<String> {
+    if artifacts.is_empty() {
+        return None;
+    }
+    Some(
+        artifacts
+            .iter()
+            .map(|artifact| {
+                let actor = match &artifact.producer {
+                    db::ActorRef::Human(id) => format!("human:{id}"),
+                    db::ActorRef::Agent(id) => format!("agent:{id}"),
+                };
+                format!(
+                    "Plan Artifact {}\nDigest: {}\nProducer Execution: {}\nProducer Actor: {}\nCreated: {}\n\n{}",
+                    artifact.id,
+                    artifact.digest.as_deref().unwrap_or("unavailable"),
+                    artifact.producer_execution_id,
+                    actor,
+                    artifact.created_at,
+                    artifact.content.as_deref().unwrap_or("[content unavailable]")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n"),
+    )
 }
 
 fn should_resume_latest_target_role_thread(execution_policy: Option<&str>) -> bool {
@@ -375,7 +410,6 @@ mod tests {
                 subtask_order: None,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -400,7 +434,6 @@ mod tests {
                 subtask_order: Some(0),
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now,
             },

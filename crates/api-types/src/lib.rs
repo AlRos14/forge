@@ -368,7 +368,6 @@ fn export_typescript() {
     AgentUsageResponse::export().expect("export AgentUsageResponse");
     RecentErrorSummary::export().expect("export RecentErrorSummary");
     PlanArtifactDetail::export().expect("export PlanArtifactDetail");
-    TaskPlanRevisionSummary::export().expect("export TaskPlanRevisionSummary");
     TaskPlanHistoryResponse::export().expect("export TaskPlanHistoryResponse");
     PlanChecklistItem::export().expect("export PlanChecklistItem");
     AnswerTaskDecisionRequest::export().expect("export AnswerTaskDecisionRequest");

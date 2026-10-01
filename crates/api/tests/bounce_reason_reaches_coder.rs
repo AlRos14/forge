@@ -62,6 +62,7 @@ async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
         default_states::IN_PROGRESS,
         json!({}),
         Some("new_execution"),
+        None,
         &workflow,
     )
     .await
@@ -170,7 +171,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },

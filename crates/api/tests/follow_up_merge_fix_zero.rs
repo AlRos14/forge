@@ -281,7 +281,6 @@ async fn seed_review_task_with_executor(
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },

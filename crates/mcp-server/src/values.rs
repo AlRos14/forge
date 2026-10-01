@@ -55,7 +55,6 @@ pub(crate) fn task_value(task: Task) -> Value {
         "status": task.status.to_string(),
         "priority": task.priority,
         "merge_config": json_string(task.merge_config),
-        "plan": task.plan,
         "error_annotation": json_string(task.error_annotation),
         "deleted_at": task.deleted_at,
         "version": task.version,

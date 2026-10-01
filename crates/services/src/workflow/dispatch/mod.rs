@@ -10,7 +10,6 @@ use crate::workflow::default_roles;
 pub mod coder_prompt;
 pub mod generic_prompt;
 pub mod loader;
-pub mod planner_prompt;
 pub mod reviewer_prompt;
 pub mod worker_prompt;
 
@@ -24,7 +23,6 @@ pub const BUILDER_ID_WORKER_AUTONOMOUS_V1: &str = "worker.autonomous.v1";
 pub const BUILDER_ID_WORKER_REVIEW_FIX_V1: &str = "worker.review_fix.v1";
 pub const BUILDER_ID_WORKER_MERGE_FIX_V1: &str = "worker.merge_fix.v1";
 pub const BUILDER_ID_REVIEWER_DEFAULT_V2: &str = "reviewer.default.v2";
-pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
 pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
 
 pub(crate) const MANAGED_EXECUTION_CONTRACT: &str = "\
@@ -48,6 +46,7 @@ pub struct AgentDispatchContext {
     pub transition_log: Vec<db::TransitionLog>,
     pub comments: Vec<db::TaskComment>,
     pub plan: Option<String>,
+    pub plan_artifact_ids: Vec<String>,
     pub review_evidence: Option<String>,
     pub prior_reviews: Vec<db::Review>,
     pub parent_task: Option<db::Task>,
@@ -102,7 +101,7 @@ static DEFAULT_ROLE_BUILDERS: OnceLock<DefaultRoleBuilderMap> = OnceLock::new();
 fn registry() -> &'static BuilderRegistry {
     PROMPT_BUILDERS.get_or_init(|| {
         let mut builders: HashMap<String, Arc<dyn PromptBuilder>> = HashMap::new();
-        let defaults: [Arc<dyn PromptBuilder>; 9] = [
+        let defaults: [Arc<dyn PromptBuilder>; 8] = [
             Arc::new(coder_prompt::CoderImplementationPromptBuilder),
             Arc::new(coder_prompt::CoderReviewFixPromptBuilder),
             Arc::new(coder_prompt::CoderMergeFixPromptBuilder),
@@ -110,7 +109,6 @@ fn registry() -> &'static BuilderRegistry {
             Arc::new(worker_prompt::WorkerReviewFixPromptBuilder),
             Arc::new(worker_prompt::WorkerMergeFixPromptBuilder),
             Arc::new(reviewer_prompt::ReviewerPromptBuilder),
-            Arc::new(planner_prompt::PlannerPromptBuilder),
             Arc::new(generic_prompt::GenericPromptBuilder),
         ];
 
@@ -132,10 +130,6 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
             (
                 default_roles::REVIEWER.to_string(),
                 BUILDER_ID_REVIEWER_DEFAULT_V2.to_string(),
-            ),
-            (
-                default_roles::PLANNER.to_string(),
-                BUILDER_ID_PLANNER_DEFAULT_V2.to_string(),
             ),
             (
                 default_roles::WORKER.to_string(),
@@ -230,12 +224,6 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             label: "Reviewer (Default)",
             compatible_role_hints: &[default_roles::REVIEWER],
             description: "Read-only review prompt with pass/fail verdict instructions.",
-        },
-        PromptBuilderRegistryEntry {
-            id: BUILDER_ID_PLANNER_DEFAULT_V2,
-            label: "Planner (Default)",
-            compatible_role_hints: &[default_roles::PLANNER],
-            description: "Planning prompt for structured implementation plans.",
         },
         PromptBuilderRegistryEntry {
             id: BUILDER_ID_GENERIC_DEFAULT_V2,
@@ -374,7 +362,7 @@ pub(crate) fn default_tool_names(role: &str) -> Vec<String> {
             "run_tests".to_string(),
             "comment".to_string(),
         ],
-        default_roles::PLANNER => vec!["read_files".to_string(), "write_plan".to_string()],
+        default_roles::PLANNER => vec!["read_files".to_string()],
         _ => Vec::new(),
     }
 }

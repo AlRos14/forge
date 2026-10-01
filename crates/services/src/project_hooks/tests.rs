@@ -546,7 +546,6 @@ async fn seed_task(db: &SqliteDb, project_id: &str, status: &str, is_automation:
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },

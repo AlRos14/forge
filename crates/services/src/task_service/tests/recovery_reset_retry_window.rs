@@ -1,6 +1,5 @@
 use super::helpers::*;
 use super::*;
-use db::CreateTransitionLog;
 
 #[tokio::test]
 async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
@@ -138,7 +137,7 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
 }
 
 #[tokio::test]
-async fn test_reset_retry_window_reenters_planning_for_a_fresh_planner_run() {
+async fn test_reset_retry_window_does_not_treat_active_planning_as_a_gate() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -150,35 +149,9 @@ async fn test_reset_retry_window_reenters_planning_for_a_fresh_planner_run() {
         crate::workflow::default_states::PLANNING,
     )
     .await;
-    seed_role_assignment(
-        &db,
-        &task.id,
-        crate::workflow::default_roles::PLANNER,
-        Some("agent-planner"),
-    )
-    .await;
-    for reason in ["first rejection", "second rejection", "third rejection"] {
-        TransitionLogRepo::insert(
-            &*db,
-            CreateTransitionLog {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                from_state: crate::workflow::default_states::PLANNING.to_owned(),
-                to_state: crate::workflow::default_states::PLANNING.to_owned(),
-                trigger_name: Some("reject".to_owned()),
-                triggered_by: api_types::Actor::user(api_types::UserActionSource::Api).display(),
-                trigger_reason: reason.to_owned(),
-                hook_results_json: None,
-                rejection: true,
-                created_at: now_rfc3339(),
-            },
-        )
-        .await
-        .expect("planning rejection log creates");
-    }
     let task = set_retry_exhausted_metadata(&db, &task).await;
 
-    let recovered = service
+    let error = service
         .recover_task(
             task.id.clone(),
             api_types::RecoveryAction::ResetRetryWindow,
@@ -186,33 +159,23 @@ async fn test_reset_retry_window_reenters_planning_for_a_fresh_planner_run() {
             None,
         )
         .await
-        .expect("reset retry window succeeds");
+        .expect_err("an active planning Execution has no plan retry window");
 
-    assert_eq!(recovered.status, crate::workflow::default_states::PLANNING);
-    assert_eq!(recovered.blocked_json, None);
+    assert!(error
+        .to_string()
+        .contains("state planning is not a retry-budget gate"));
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(current.status, crate::workflow::default_states::PLANNING);
+    assert!(current.blocked_json.is_some());
     let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
         .await
         .expect("transition logs reload");
-    assert!(logs.iter().any(|log| {
-        log.trigger_name.as_deref() == Some("reset_retry_window")
-            && log.from_state == crate::workflow::default_states::PLANNING
-            && log.to_state == crate::workflow::default_states::PLANNING
-    }));
-    let reset_at = logs
+    assert!(!logs
         .iter()
-        .find(|log| log.trigger_name.as_deref() == Some("reset_retry_window"))
-        .map(|log| log.created_at.clone())
-        .expect("reset marker timestamp");
-    assert!(
-        logs.iter().any(|log| {
-            log.trigger_name.as_deref() != Some("reset_retry_window")
-                && log.from_state == crate::workflow::default_states::PLANNING
-                && log.to_state == crate::workflow::default_states::PLANNING
-                && !log.rejection
-                && log.created_at >= reset_at
-        }),
-        "reset retry window should re-enter planning after writing the budget marker"
-    );
+        .any(|log| log.trigger_name.as_deref() == Some("reset_retry_window")));
 }
 
 #[tokio::test]

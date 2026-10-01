@@ -760,12 +760,9 @@ impl TerminalService {
         if !self.workspace_ready_for_terminal(&task, &workspace).await? {
             return Err(ServiceError::TerminalWorkspaceNotReady);
         }
-        TaskIntegrationOperationManager::new(
-            Arc::clone(&self.db),
-            self.workspace_root.clone(),
-        )
-        .reconcile_stale(task_id)
-        .await?;
+        TaskIntegrationOperationManager::new(Arc::clone(&self.db), self.workspace_root.clone())
+            .reconcile_stale(task_id)
+            .await?;
         Ok((task, workspace))
     }
 
@@ -1744,7 +1741,6 @@ mod tests {
                 subtask_order: None,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },

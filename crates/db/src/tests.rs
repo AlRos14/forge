@@ -25,6 +25,7 @@ use crate::{
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sqlx::Row;
 
 fn page(limit: i64) -> PageRequest {
     PageRequest {
@@ -1348,7 +1349,6 @@ async fn seed_task(
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -2079,7 +2079,6 @@ async fn pr6_cross_task_event_cannot_admit_an_orchestrator_wake() {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
         },
@@ -2725,7 +2724,6 @@ async fn prebaseline_discovery_task_is_admitted_to_running_execution() {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -3177,7 +3175,6 @@ async fn seed_ordered_task(
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: created_at.to_owned(),
             updated_at: created_at.to_owned(),
         },
@@ -3430,7 +3427,6 @@ async fn task_list_filters_by_search_query() {
             description: Some(Some("Needle lives in this description".to_owned())),
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
@@ -4585,7 +4581,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             priority: 10,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -4606,6 +4601,11 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     )
     .await
     .expect("role assignment creates");
+    sqlx::query("UPDATE task SET plan = 'Map rows manually' WHERE id = ?")
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("legacy Task.plan fixture is stored");
     let task = TaskRepo::update(
         &db,
         UpdateTask {
@@ -4615,7 +4615,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             description: None,
             priority: Some(20),
             merge_config: None,
-            plan: Some(Some("Map rows manually".to_owned())),
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
@@ -4627,6 +4626,13 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     .await
     .expect("task updates");
     assert_eq!(task.version, 2);
+    let preserved_legacy_plan: Option<String> =
+        sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("physical legacy plan field remains");
+    assert_eq!(preserved_legacy_plan.as_deref(), Some("Map rows manually"));
 
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
@@ -5169,7 +5175,6 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -5200,7 +5205,6 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
@@ -5444,7 +5448,6 @@ async fn task_claim_rejects_active_entry_barrier() {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -5777,6 +5780,224 @@ async fn seed_user(db: &SqliteDb) -> String {
     };
     UserRepo::create_user(db, &user).await.expect("seed user");
     id
+}
+
+#[tokio::test]
+async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_authorship() {
+    use sha2::Digest as _;
+
+    let migration_dir = tempfile::tempdir().expect("migration directory creates");
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source_dir).expect("migration source reads") {
+        let path = entry.expect("migration entry reads").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("migration filename is UTF-8");
+        let version = filename
+            .strip_prefix('V')
+            .and_then(|version| version.split_once("__"))
+            .and_then(|(version, _)| version.parse::<i64>().ok())
+            .expect("migration name has a version");
+        if version < 98 {
+            std::fs::copy(&path, migration_dir.path().join(filename))
+                .expect("legacy migration copies");
+        }
+    }
+
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    crate::run_migrations_from(&pool, migration_dir.path())
+        .await
+        .expect("database migrates through V097");
+    let db = SqliteDb::new(pool);
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "todo".to_owned(),
+        "Legacy plan migration",
+    )
+    .await;
+    let user_id = seed_user(&db).await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(crate::ExecutionPurpose::Plan),
+            harness_session_id: None,
+            role: "planner".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("real Plan Execution creates");
+
+    let markdown = "# Durable plan\n- [ ] implement\n";
+    let digest = hex::encode(sha2::Sha256::digest(markdown.as_bytes()));
+    let approved_markdown = markdown.to_owned();
+    for (id, revision, checkpoint, content, content_digest, source_execution_id) in [
+        (
+            "legacy-planner-ready",
+            1_i64,
+            "planner_ready",
+            markdown,
+            digest.as_str(),
+            Some(execution_id.as_str()),
+        ),
+        (
+            "legacy-approved",
+            2_i64,
+            "approved",
+            approved_markdown.as_str(),
+            digest.as_str(),
+            None,
+        ),
+        (
+            "legacy-no-author",
+            3_i64,
+            "final",
+            "# Unattributed\n",
+            "unattributed-digest",
+            None,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO task_plan_revision (
+                id, task_id, revision, checkpoint, markdown, content_digest,
+                checklist_json, warnings_json, source_execution_id, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, '[]', '[]', ?, ?)",
+        )
+        .bind(id)
+        .bind(&task_id)
+        .bind(revision)
+        .bind(checkpoint)
+        .bind(content)
+        .bind(content_digest)
+        .bind(source_execution_id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("legacy plan revision inserts");
+    }
+    sqlx::query(
+        "INSERT INTO task_plan_approval (
+            id, task_id, plan_revision_id, content_digest, principal_type,
+            principal_id, decision, reason, created_at
+         ) VALUES ('legacy-approval-event', ?, 'legacy-approved', ?, 'user', ?, 'approved', NULL, ?)",
+    )
+    .bind(&task_id)
+    .bind(&digest)
+    .bind(user_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("legacy approval remains historical data");
+
+    std::fs::copy(
+        source_dir.join("V098__planning_execution_artifacts.sql"),
+        migration_dir
+            .path()
+            .join("V098__planning_execution_artifacts.sql"),
+    )
+    .expect("V098 migration copies");
+    crate::run_migrations_from(db.pool(), migration_dir.path())
+        .await
+        .expect("V098 converts verified plan history in the migration transaction");
+
+    let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_revision")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy revisions remain");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_approval")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy approvals remain");
+    assert_eq!(revisions, 3);
+    assert_eq!(approvals, 1);
+
+    let migrated_id: String = sqlx::query_scalar(
+        "SELECT artifact_id FROM legacy_task_plan_artifact_migration
+         WHERE plan_revision_id = 'legacy-planner-ready'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("planner result mapping exists");
+    let approved_id: String = sqlx::query_scalar(
+        "SELECT artifact_id FROM legacy_task_plan_artifact_migration
+         WHERE plan_revision_id = 'legacy-approved'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("approval mapping exists");
+    assert_eq!(migrated_id, approved_id, "approval maps to authored output");
+
+    let migrated = sqlx::query(
+        "SELECT a.task_id, a.kind, a.content, a.digest,
+                p.execution_id, e.actor_kind, e.actor_id
+         FROM artifact a
+         JOIN artifact_execution_producer p ON p.artifact_id = a.id
+         JOIN execution e ON e.id = p.execution_id
+         WHERE a.id = ?",
+    )
+    .bind(&migrated_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("generic Artifact loads");
+    assert_eq!(migrated.get::<String, _>("task_id"), task_id);
+    assert_eq!(migrated.get::<String, _>("kind"), "plan");
+    assert_eq!(migrated.get::<String, _>("content"), markdown);
+    assert_eq!(migrated.get::<String, _>("digest"), digest);
+    assert_eq!(migrated.get::<String, _>("execution_id"), execution_id);
+    assert_eq!(migrated.get::<String, _>("actor_kind"), "agent");
+    assert_eq!(migrated.get::<String, _>("actor_id"), agent_id);
+
+    let statuses: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT plan_revision_id, migration_status, artifact_id
+         FROM legacy_task_plan_artifact_migration ORDER BY plan_revision_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("migration audit loads");
+    assert_eq!(statuses[0].0, "legacy-approved");
+    assert_eq!(statuses[0].1, "mapped_duplicate");
+    assert_eq!(statuses[0].2.as_deref(), Some(migrated_id.as_str()));
+    assert_eq!(statuses[1].0, "legacy-no-author");
+    assert_eq!(statuses[1].1, "source_execution_missing");
+    assert!(
+        statuses[1].2.is_none(),
+        "unattributed content gets no fake producer"
+    );
+    assert_eq!(statuses[2].0, "legacy-planner-ready");
+    assert_eq!(statuses[2].1, "migrated");
 }
 
 #[tokio::test]

@@ -14,7 +14,7 @@ Use needs_human only for missing product, policy, scope, or risk authority. Miss
 
 const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:
-- Must remain read-only, inspect the exact diff, approved plan revision, and actual CI evidence, produce structured findings, and end with one FORGE_RESULT line.
+- Must remain read-only, inspect the exact diff, any plan Artifact supplied to this Execution, and actual CI evidence, produce structured findings, and end with one FORGE_RESULT line.
 - Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
 - Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, multiple result lines.";
 
@@ -86,7 +86,7 @@ impl PromptBuilder for ReviewerPromptBuilder {
         }
 
         if let Some(plan) = ctx.plan.as_deref() {
-            user.push_str("\nApproved implementation plan:\n");
+            user.push_str("\nPlan Artifact supplied to this Execution:\n");
             user.push_str(plan);
             user.push('\n');
         }

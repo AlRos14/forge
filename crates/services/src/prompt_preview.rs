@@ -50,6 +50,7 @@ pub async fn preview_effective_prompt(
         &preview_state.name,
         state_config,
         Some(selection.execution_policy.as_str()),
+        None,
         &workflow,
     )
     .await?;

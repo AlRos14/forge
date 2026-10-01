@@ -9,7 +9,7 @@ mod subtasks;
 pub use dispatch::{DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder};
 pub use gates::{
     AutoCascadeOnUnassignedRole, CheckRetryBudget, DependencyGate, RequireCleanWorktree,
-    RequirePlanChecklistComplete, RequireUpstreamRolesCompleted,
+    RequireUpstreamRolesCompleted,
 };
 pub use lifecycle::{
     AutoCascadeOnCompletion, CleanupWorkspaceNow, PublishTaskBlocked, RunBeforeWorkHooks,

@@ -93,24 +93,11 @@ async fn transition_rejects_invalid_move_and_cancel_is_idempotent() {
 }
 
 #[tokio::test]
-async fn transition_from_planning_requires_plan_checklist_but_allows_unchecked_work() {
+async fn transition_from_planning_does_not_require_plan_approval_or_checklist() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let mut workflow = crate::workflow::default_workflow::default_workflow();
-    let planning = workflow
-        .states
-        .iter_mut()
-        .find(|state| state.name == crate::workflow::default_states::PLANNING)
-        .expect("planning state exists");
-    planning
-        .gate_config
-        .as_mut()
-        .expect("planning gate config exists")
-        .requires_user_approval = Some(true);
-    update_project_workflow(&db, &project_id, &workflow).await;
-
     let task = seed_task_with_status(
         &db,
         &project_id,
@@ -138,11 +125,15 @@ async fn transition_from_planning_requires_plan_checklist_but_allows_unchecked_w
     )
     .await
     .expect("workspace creates");
-    std::fs::write(
-        workspace_dir.join("plan.md"),
-        "- [x] inspect\n- [ ] verify\n",
-    )
-    .expect("plan writes");
+    let plan = seed_incomplete_plan_artifact(&db, &task.id).await;
+    assert_eq!(plan.content.as_deref(), Some("- [ ] inspect\n"));
+    let projected = crate::plan_artifact::list_plan_artifacts(&db, &task.id)
+        .await
+        .expect("plan presentation loads");
+    assert!(
+        !projected[0].items[0].checked,
+        "checklist remains incomplete"
+    );
 
     let result = service
         .transition(
@@ -151,16 +142,27 @@ async fn transition_from_planning_requires_plan_checklist_but_allows_unchecked_w
             task.version,
         )
         .await
-        .expect("planning can be approved with pending implementation items");
+        .expect("incomplete plan checklist does not gate leaving planning");
 
     assert_eq!(
         result.task.status,
         crate::workflow::default_states::IN_PROGRESS
     );
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_approval")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy plan approvals count");
+    assert_eq!(approvals, 0);
+    let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_revision")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy plan revisions count");
+    assert_eq!(revisions, 0);
+    assert_eq!(plan.producer_execution_id.len(), 36);
 }
 
 #[tokio::test]
-async fn transition_from_active_work_requires_complete_plan_checklist() {
+async fn transition_from_active_work_ignores_unchecked_plan_checklist() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -193,36 +195,15 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
     )
     .await
     .expect("workspace creates");
-    std::fs::write(
-        workspace_dir.join("plan.md"),
-        "- [x] inspect\n- [ ] verify\n",
-    )
-    .expect("plan writes");
-
-    let result = service
-        .transition(
-            task.id.clone(),
-            crate::workflow::default_states::REVIEW.to_owned(),
-            task.version,
-        )
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(ServiceError::GuardRejection { guard, reason })
-            if guard == "require_plan_checklist_complete"
-                && reason.contains("unchecked item")
-    ));
-
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+    let plan = seed_incomplete_plan_artifact(&db, &task.id).await;
+    assert_eq!(plan.content.as_deref(), Some("- [ ] inspect\n"));
+    let projected = crate::plan_artifact::list_plan_artifacts(&db, &task.id)
         .await
-        .expect("task loads")
-        .expect("task exists");
-    std::fs::write(
-        workspace_dir.join("plan.md"),
-        "- [x] inspect\n- [x] verify\n",
-    )
-    .expect("plan updates");
+        .expect("plan presentation loads");
+    assert!(
+        !projected[0].items[0].checked,
+        "checklist remains incomplete"
+    );
 
     let result = service
         .transition(
@@ -231,9 +212,54 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
             task.version,
         )
         .await
-        .expect("complete plan allows work stop");
+        .expect("incomplete Markdown checklist does not block lifecycle");
 
-    assert_eq!(result.task.status, crate::workflow::default_states::MERGING);
+    assert_ne!(
+        result.task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+}
+
+async fn seed_incomplete_plan_artifact(db: &Arc<db::SqliteDb>, task_id: &str) -> db::Artifact {
+    let agent_id = seed_agent(db).await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    db::ExecutionRepo::create(
+        &**db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id)),
+            purpose: Some(db::ExecutionPurpose::Plan),
+            harness_session_id: None,
+            role: "planner".to_owned(),
+            status: db::ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("incomplete checklist fixture".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Plan Execution creates");
+    crate::CollaborationService::new(Arc::clone(db), Arc::new(EventBus::new(8)))
+        .create_plan_artifact_from_execution(&execution_id, "- [ ] inspect\n")
+        .await
+        .expect("generic Plan Artifact creates")
 }
 
 #[tokio::test]

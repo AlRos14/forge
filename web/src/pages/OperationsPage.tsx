@@ -3,7 +3,6 @@ import { ArrowClockwise, CheckCircle, Pulse, WarningCircle } from '@phosphor-ico
 import type { ReactNode } from 'react'
 import { useOperationsStatusQuery, useRefreshOperationsMutation } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
-import { PlanChecklist } from '@/components/plan-checklist'
 import { PolicyBadge } from '@/components/policy-badge'
 import {
   formatCostUsd,
@@ -229,7 +228,6 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
               </div>
             </div>
 
-            <PlanChecklist progress={execution.plan_progress} />
           </div>
         ))}
       </div>

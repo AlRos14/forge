@@ -42,29 +42,17 @@ impl TaskExecutor for NoDiffExecutor {
     }
 }
 
-struct PlannerReadyExecutor;
+struct PlanOutputExecutor;
 
 #[async_trait]
-impl TaskExecutor for PlannerReadyExecutor {
+impl TaskExecutor for PlanOutputExecutor {
     async fn execute(
         &self,
-        ctx: ExecutionContext,
+        _ctx: ExecutionContext,
     ) -> std::result::Result<ExecutionResult, ExecutorError> {
-        let plan_path = std::path::Path::new(&ctx.worktree_path)
-            .parent()
-            .expect("worktree has workspace parent")
-            .join("plan.md");
-        std::fs::write(plan_path, "- [x] verify plan\n")
-            .map_err(|error| ExecutorError::Other(error.to_string()))?;
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,
-            after_sha: None,
-            agent_session_id: None,
-            summary: Some(
-                "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"plan_ready\"}".to_owned(),
-            ),
-            error: None,
-            usage: None,
+            assistant_output: Some("- [x] verify plan\n".to_owned()),
             ..Default::default()
         })
     }
@@ -370,7 +358,6 @@ async fn seed_task_with_status(
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },
@@ -425,7 +412,6 @@ async fn seed_subtask_with_status(
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },

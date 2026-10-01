@@ -481,6 +481,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             status: Some("failed".to_owned()),
             agent_session_id: None,
             summary: None,
+            assistant_output: None,
             after_sha: None,
             usage: None,
             account_usage: None,

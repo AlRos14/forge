@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo,
-    DaemonStatus, ExecutionRepo, ExecutionStatus, PageRequest, RepoRepo, ResumePolicy, ReviewRepo,
-    ReviewStatus, SortBy, SortOrder, StopReason, TaskRepo, TaskRoleAssignmentRepo,
-    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon,
+    DaemonStatus, ExecutionRepo, ExecutionStatus, RepoRepo, ResumePolicy, ReviewRepo, ReviewStatus,
+    StopReason, TaskRepo, TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject, UpdateTask,
+    UpsertDaemon,
 };
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
 use tempfile::TempDir;
@@ -234,7 +234,6 @@ async fn seed_task(
             priority,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },
@@ -271,7 +270,6 @@ async fn set_review_ci_config(db: &db::SqliteDb, task: &Task) -> Task {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
@@ -282,32 +280,6 @@ async fn set_review_ci_config(db: &db::SqliteDb, task: &Task) -> Task {
     )
     .await
     .expect("task review config updates")
-}
-
-async fn set_planning_gate_auto_approval(db: &db::SqliteDb, project_id: &str) {
-    let mut workflow = crate::workflow::default_workflow::default_workflow();
-    let planning = workflow
-        .states
-        .iter_mut()
-        .find(|state| state.name == crate::workflow::default_states::PLANNING)
-        .expect("default workflow has planning state");
-    planning
-        .gate_config
-        .as_mut()
-        .expect("planning has gate config")
-        .requires_user_approval = Some(false);
-    let workflow_definition =
-        serde_json::to_string(&workflow).expect("workflow serializes for test");
-    sqlx::query(
-            "UPDATE project SET workflow_definition = ?, workflow_template_name = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(workflow_definition)
-        .bind("no-user-approval")
-        .bind(now_rfc3339())
-        .bind(project_id)
-        .execute(db.pool())
-        .await
-        .expect("project workflow updates");
 }
 
 async fn seed_running_review(
@@ -644,7 +616,7 @@ async fn dispatcher_check_once_does_not_dispatch_after_stop() {
 }
 
 #[tokio::test]
-async fn dispatcher_skips_unassigned_planning_gate_before_coder_dispatch() {
+async fn dispatcher_skips_optional_unassigned_planning_stage_before_coder_dispatch() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
@@ -763,68 +735,7 @@ async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
 }
 
 #[tokio::test]
-async fn dispatcher_enters_unassigned_auto_planning_gate_before_coder_dispatch() {
-    let db = Arc::new(sqlite_db().await);
-    let repo_dir = TempDir::new().expect("repo dir creates");
-    let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
-    set_planning_gate_auto_approval(&db, &project_id).await;
-    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "auto plan", "todo", 1).await;
-    assign_role(
-        &db,
-        &task.id,
-        crate::workflow::default_roles::CODER,
-        &agent_id,
-    )
-    .await;
-    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
-
-    assert_eq!(dispatched, 1);
-    let updated = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(updated.status, "in_progress");
-    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("execution spawned in time")
-        .expect("execution context received");
-    assert_eq!(execution_ctx.task_id, task.id);
-    let executions = ExecutionRepo::list_by_task_and_role(
-        &*db,
-        &task.id,
-        crate::workflow::default_roles::CODER,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Asc,
-        },
-    )
-    .await
-    .expect("executions load");
-    assert_eq!(executions.items.len(), 1);
-    assert_eq!(
-        executions.items[0].agent_id.as_deref(),
-        Some(agent_id.as_str())
-    );
-    let transitions = TransitionLogRepo::list_by_task(&*db, &task.id)
-        .await
-        .expect("transition logs load");
-    assert!(transitions
-        .iter()
-        .any(|entry| entry.from_state == "todo" && entry.to_state == "planning"));
-    assert!(transitions
-        .iter()
-        .any(|entry| entry.from_state == "planning" && entry.to_state == "in_progress"));
-}
-
-#[tokio::test]
-async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_gate() {
+async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_stage() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
@@ -1147,7 +1058,6 @@ async fn dispatcher_skips_auto_restart_for_user_cancelled_execution() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(manual_stop)),
             blocked_json: None,
             failed_json: None,
@@ -1398,7 +1308,6 @@ async fn dispatcher_skips_active_task_with_blocking_annotation() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(blocked)),
             blocked_json: None,
             failed_json: None,

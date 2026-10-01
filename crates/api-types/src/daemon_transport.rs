@@ -175,6 +175,10 @@ pub struct ExecutionTerminalNotification {
     pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Complete assistant result. Older daemons may omit it; Plan Executions
+    /// that report success require this full output before they can complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,8 +337,8 @@ pub struct DaemonErrorPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonErrorPayload, DaemonFrame, ExecutionStartParams, RemoteResolvedCandidate,
-        TerminalOutputNotification,
+        DaemonErrorPayload, DaemonFrame, ExecutionStartParams, ExecutionTerminalNotification,
+        RemoteResolvedCandidate, TerminalOutputNotification,
     };
     use crate::HarnessInvocation;
     use serde::Deserialize;
@@ -561,5 +565,22 @@ mod tests {
         assert_eq!(decoded.session_id, "term-1");
         assert_eq!(decoded.data, "hello\r\n");
         assert_eq!(decoded.ts, "2026-05-20T00:00:00Z");
+    }
+
+    #[test]
+    fn terminal_notification_accepts_legacy_daemon_without_full_output() {
+        let legacy_payload = serde_json::json!({
+            "execution_id": "execution-legacy",
+            "exit_code": 0,
+            "signal": null,
+            "error": null,
+            "ts": "2026-05-20T00:00:00Z",
+            "summary": "bounded summary"
+        });
+        let notification: ExecutionTerminalNotification =
+            serde_json::from_value(legacy_payload).expect("legacy terminal payload deserializes");
+
+        assert_eq!(notification.summary.as_deref(), Some("bounded summary"));
+        assert!(notification.assistant_output.is_none());
     }
 }

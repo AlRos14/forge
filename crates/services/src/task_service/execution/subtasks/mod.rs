@@ -629,7 +629,6 @@ mod tests {
             task_state_config: None,
             merge_config: None,
             metadata_json: None,
-            plan: None,
             error_annotation: None,
             blocked_json: None,
             failed_json: None,

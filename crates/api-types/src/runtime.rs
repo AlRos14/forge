@@ -208,6 +208,29 @@ pub enum HarnessInvocation {
     Resume {
         external_session_id: String,
     },
+    /// A planning Execution whose Harness owns the plan loop. The optional
+    /// session id pins continuation to one exact planning session.
+    Planning {
+        external_session_id: Option<String>,
+    },
+}
+
+impl HarnessInvocation {
+    pub fn is_planning(&self) -> bool {
+        matches!(self, Self::Planning { .. })
+    }
+
+    pub fn external_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Resume {
+                external_session_id,
+            } => Some(external_session_id),
+            Self::Planning {
+                external_session_id,
+            } => external_session_id.as_deref(),
+            Self::Start => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

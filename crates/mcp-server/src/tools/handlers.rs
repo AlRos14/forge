@@ -618,7 +618,6 @@ pub(super) async fn forge_update_task(
             description: params.description.map(Some),
             priority: params.priority,
             merge_config: None,
-            plan: params.plan.map(Some),
             error_annotation: None,
             blocked_json: None,
             failed_json: None,

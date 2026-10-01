@@ -171,6 +171,7 @@ async fn direct_prompt_for_accept_to_planning(
         &target_state.name,
         target_state.config.clone(),
         Some(selection.execution_policy.as_str()),
+        None,
         &workflow,
     )
     .await

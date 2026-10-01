@@ -25,7 +25,6 @@ async fn hook_test_does_not_transition_or_create_execution() {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },
