@@ -324,10 +324,13 @@ impl TaskService {
                     .await?,
                 )
             };
+            let artifact_input_ids = self
+                .inherit_plan_artifact_inputs(&execution.id, &task.id)
+                .await?;
             let execution_id = new_uuid_v4();
             let now = now_rfc3339();
             let resumed = self
-                .create_running_execution(
+                .create_running_execution_with_artifact_inputs(
                     CreateExecution {
                         id: execution_id.clone(),
                         task_id: task.id.clone(),
@@ -355,12 +358,10 @@ impl TaskService {
                         agent_message_id: None,
                         last_activity_at: None,
                         summary: Some(prompt),
-                        logs_path: Some(execution_logs_path(
-                            &self.workspace_root,
-                            &task.project_id,
-                            &task.id,
-                            &execution_id,
-                        )),
+                        // Keep Artifact inputs insertable in the creation
+                        // transaction; the runner/remote log writer assigns
+                        // the durable path before producing output.
+                        logs_path: None,
                         before_sha: execution.before_sha.clone(),
                         after_sha: None,
                         error: None,
@@ -370,6 +371,7 @@ impl TaskService {
                         updated_at: now,
                     },
                     false,
+                    artifact_input_ids,
                 )
                 .await?;
 

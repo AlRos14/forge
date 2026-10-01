@@ -344,9 +344,12 @@ fn dispatch_role_follow_up_impl(
             task
         };
         service.ensure_task_runnable(&task).await?;
+        let artifact_input_ids = service
+            .inherit_plan_artifact_inputs(&supplied_parent_execution.id, &task_id)
+            .await?;
         let now = now_rfc3339();
         let execution = service
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: execution_id.clone(),
                     task_id: task_id.clone(),
@@ -383,25 +386,9 @@ fn dispatch_role_follow_up_impl(
                     updated_at: now,
                 },
                 false,
+                artifact_input_ids,
             )
             .await?;
-
-        if let Err(error) = service
-            .inherit_plan_artifact_inputs(&supplied_parent_execution.id, &execution.id, &task_id)
-            .await
-        {
-            if let Err(mark_error) = service
-                .fail_execution_before_dispatch(&execution.id, error.to_string())
-                .await
-            {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    %mark_error,
-                    "failed to terminalize follow-up after Artifact input pin rejection"
-                );
-            }
-            return Err(error);
-        }
 
         tracing::info!(
             task_id = %task_id,

@@ -845,6 +845,14 @@ pub trait ExecutionRepo: Send + Sync {
         input: CreateExecution,
         event: CreateDomainEvent,
     ) -> Result<(Execution, DomainEvent)>;
+    /// Create a Running Execution, its immutable Artifact inputs, and the
+    /// `execution.started` ledger event as one durable boundary.
+    async fn create_with_artifact_inputs_and_event(
+        &self,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
     async fn create_orchestrator_execution(
         &self,
         input: CreateExecution,

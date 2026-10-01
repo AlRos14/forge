@@ -2,6 +2,75 @@ use super::super::*;
 use api_types::ActorRef;
 use db::{CollaborationRepo, CoordinationMode, TaskRoleRepo};
 
+async fn create_remote_execution_fixture(
+    db: &db::SqliteDb,
+    task_id: &str,
+    agent_id: &str,
+    purpose: db::ExecutionPurpose,
+) -> Execution {
+    let now = now_rfc3339();
+    db::ExecutionRepo::create(
+        db,
+        db::CreateExecution {
+            id: db::new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.to_owned()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
+            purpose: Some(purpose.clone()),
+            harness_session_id: None,
+            role: if purpose == db::ExecutionPurpose::Plan {
+                "planner".to_owned()
+            } else {
+                "coder".to_owned()
+            },
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("remote Execution fixture creates")
+}
+
+fn completed_remote_notification(
+    execution_id: &str,
+    assistant_output: Option<&str>,
+) -> api_types::ExecutionTerminalNotification {
+    api_types::ExecutionTerminalNotification {
+        execution_id: execution_id.to_owned(),
+        exit_code: Some(0),
+        signal: None,
+        error: None,
+        ts: now_rfc3339(),
+        status: Some("completed".to_owned()),
+        agent_session_id: None,
+        summary: Some("short summary only".to_owned()),
+        assistant_output: assistant_output.map(str::to_owned),
+        after_sha: None,
+        usage: None,
+        account_usage: None,
+        failure_class: None,
+        retry_at: None,
+        resolved_candidate: None,
+        route_attempts: None,
+    }
+}
+
 #[tokio::test]
 async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     let db = Arc::new(sqlite_db().await);
@@ -666,6 +735,321 @@ async fn plan_artifact_output_is_idempotent_across_sqlite_connections() {
             .expect("plan Artifacts count");
     assert_eq!(output_count, 1);
     assert_eq!(artifact_count, 1);
+}
+
+#[tokio::test]
+async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
+    let database_dir = TempDir::new().expect("database temp dir creates");
+    let database_url = format!(
+        "sqlite://{}",
+        database_dir.path().join("start-inputs.db").display()
+    );
+    let first_pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("first pool creates");
+    db::run_migrations(&first_pool)
+        .await
+        .expect("migrations run");
+    let first_db = Arc::new(db::SqliteDb::new(first_pool));
+    let second_db = Arc::new(db::SqliteDb::new(
+        db::create_sqlite_pool(&database_url)
+            .await
+            .expect("second pool creates"),
+    ));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&first_db).await;
+    let agent_id = seed_agent(&first_db).await;
+    let task = seed_task_with_status(&first_db, &project_id, &repo_id, "planning".to_owned()).await;
+    let producer_id = db::new_uuid_v4();
+    db::ExecutionRepo::create(
+        &*first_db,
+        db::CreateExecution {
+            id: producer_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Plan),
+            harness_session_id: None,
+            role: "planner".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Plan producer Execution creates");
+    let artifact =
+        crate::CollaborationService::new(Arc::clone(&first_db), Arc::new(EventBus::new(8)))
+            .create_plan_artifact_from_execution(&producer_id, "# Selected plan\n")
+            .await
+            .expect("Plan Artifact creates");
+
+    let execution_id = db::new_uuid_v4();
+    let input = db::CreateExecution {
+        id: execution_id.clone(),
+        task_id: task.id.clone(),
+        agent_id: Some(agent_id.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+        purpose: Some(db::ExecutionPurpose::Implement),
+        harness_session_id: None,
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: Some(producer_id),
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: Some("uses selected plan".to_owned()),
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+    };
+    let event = crate::task_service::execution_domain_event(&input, "execution.started");
+
+    // Hold a read snapshot on another pool across the write. It sees neither
+    // half until that transaction is released and a fresh snapshot begins.
+    let mut observer = second_db.pool().begin().await.expect("observer begins");
+    let before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&execution_id)
+    .fetch_one(&mut *observer)
+    .await
+    .expect("observer establishes snapshot");
+    assert_eq!(before, 0);
+
+    db::ExecutionRepo::create_with_artifact_inputs_and_event(
+        &*first_db,
+        input,
+        vec![artifact.id.clone()],
+        event,
+    )
+    .await
+    .expect("Execution, input, and event commit");
+
+    let snapshot_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&execution_id)
+    .fetch_one(&mut *observer)
+    .await
+    .expect("old snapshot remains readable");
+    let snapshot_input_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_artifact_input WHERE execution_id = ?")
+            .bind(&execution_id)
+            .fetch_one(&mut *observer)
+            .await
+            .expect("old snapshot input count loads");
+    assert_eq!(snapshot_event_count, 0);
+    assert_eq!(snapshot_input_count, 0);
+    observer.rollback().await.expect("old snapshot closes");
+
+    let committed_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&execution_id)
+    .fetch_one(second_db.pool())
+    .await
+    .expect("committed event loads from second pool");
+    let committed_inputs =
+        db::CollaborationRepo::list_execution_artifact_inputs(&*second_db, &execution_id)
+            .await
+            .expect("committed inputs load from second pool");
+    assert_eq!(committed_event_count, 1);
+    assert_eq!(committed_inputs.len(), 1);
+    assert_eq!(committed_inputs[0].artifact_id, artifact.id);
+    assert_eq!(committed_inputs[0].digest, artifact.digest);
+
+    let failed_execution_id = db::new_uuid_v4();
+    let failed_input = db::CreateExecution {
+        id: failed_execution_id.clone(),
+        task_id: task.id.clone(),
+        agent_id: Some(agent_id.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent_id)),
+        purpose: Some(db::ExecutionPurpose::Implement),
+        harness_session_id: None,
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+    };
+    let failed_event =
+        crate::task_service::execution_domain_event(&failed_input, "execution.started");
+    let result = db::ExecutionRepo::create_with_artifact_inputs_and_event(
+        &*first_db,
+        failed_input,
+        vec![artifact.id, "missing-artifact".to_owned()],
+        failed_event,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an invalid second input rejects the whole write"
+    );
+    assert!(
+        db::ExecutionRepo::get_by_id(&*second_db, &failed_execution_id)
+            .await
+            .expect("failed Execution lookup succeeds")
+            .is_none()
+    );
+    let failed_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&failed_execution_id)
+    .fetch_one(second_db.pool())
+    .await
+    .expect("failed start event count loads");
+    let failed_input_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_artifact_input WHERE execution_id = ?")
+            .bind(&failed_execution_id)
+            .fetch_one(second_db.pool())
+            .await
+            .expect("failed input count loads");
+    assert_eq!(failed_event_count, 0);
+    assert_eq!(failed_input_count, 0);
+}
+
+#[tokio::test]
+async fn remote_plan_completion_materializes_output_before_terminal_state_and_reuses_on_retry() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "planning".to_owned()).await;
+    let execution =
+        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+    let full_output = "# Complete plan\n- Inspect the migration\n- Verify recovery\n";
+    let notification = completed_remote_notification(&execution.id, Some(full_output));
+
+    let completed = service
+        .complete_remote_execution(notification.clone(), None)
+        .await
+        .expect("remote Plan Execution completes with its full output");
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(completed.summary.as_deref(), Some("short summary only"));
+    let artifact = db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &execution.id,
+        db::ArtifactKind::Plan,
+    )
+    .await
+    .expect("Plan output lookup succeeds")
+    .expect("remote Plan output is materialized");
+    assert_eq!(artifact.content.as_deref(), Some(full_output));
+    assert_eq!(artifact.producer_execution_id, execution.id);
+    assert_eq!(artifact.producer, db::ActorRef::Agent(agent_id));
+
+    service
+        .complete_remote_execution(notification, None)
+        .await
+        .expect("same remote terminal notification retries");
+    let retry_artifact = db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &execution.id,
+        db::ArtifactKind::Plan,
+    )
+    .await
+    .expect("retried Plan output lookup succeeds")
+    .expect("retry reuses the output");
+    assert_eq!(retry_artifact.id, artifact.id);
+    let artifact_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'artifact.created' AND entity_id = ?",
+    )
+    .bind(&artifact.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Artifact event count loads");
+    let terminal_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.completed' AND entity_id = ?",
+    )
+    .bind(&execution.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("terminal event count loads");
+    assert_eq!(artifact_event_count, 1);
+    assert_eq!(terminal_event_count, 1);
+}
+
+#[tokio::test]
+async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_unchanged() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "planning".to_owned()).await;
+    let plan_execution =
+        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+
+    let error = service
+        .complete_remote_execution(
+            completed_remote_notification(&plan_execution.id, None),
+            None,
+        )
+        .await
+        .expect_err("summary alone cannot complete a remote Plan Execution");
+    assert!(error.to_string().contains("complete assistant result"));
+    let still_running = db::ExecutionRepo::get_by_id(&*db, &plan_execution.id)
+        .await
+        .expect("Plan Execution lookup succeeds")
+        .expect("Plan Execution remains persisted");
+    assert_eq!(still_running.status, ExecutionStatus::Running);
+    assert!(db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &plan_execution.id,
+        db::ArtifactKind::Plan,
+    )
+    .await
+    .expect("missing Plan output lookup succeeds")
+    .is_none());
+
+    let implementation =
+        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Implement)
+            .await;
+    let completed = service
+        .complete_remote_execution(
+            completed_remote_notification(&implementation.id, None),
+            None,
+        )
+        .await
+        .expect("non-Plan remote Execution still completes without full assistant output");
+    assert_eq!(completed.status, ExecutionStatus::Completed);
 }
 
 #[tokio::test]

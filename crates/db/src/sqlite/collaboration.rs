@@ -36,6 +36,55 @@ fn encode_collaboration_cursor(created_at: &str, id: &str) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+pub(super) async fn pin_execution_artifact_input_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    execution_id: &str,
+    artifact_id: &str,
+    created_at: &str,
+) -> Result<ExecutionArtifactInput> {
+    let artifact = sqlx::query("SELECT task_id, digest FROM artifact WHERE id = ?")
+        .bind(artifact_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let task_id: String = artifact.try_get("task_id")?;
+    let digest: Option<String> = artifact.try_get("digest")?;
+    sqlx::query(
+        "INSERT INTO execution_artifact_input
+         (execution_id, artifact_id, task_id, digest, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(execution_id, artifact_id) DO NOTHING",
+    )
+    .bind(execution_id)
+    .bind(artifact_id)
+    .bind(&task_id)
+    .bind(&digest)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT execution_id, artifact_id, task_id, digest, created_at
+         FROM execution_artifact_input WHERE execution_id = ? AND artifact_id = ?",
+    )
+    .bind(execution_id)
+    .bind(artifact_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let record = ExecutionArtifactInput {
+        execution_id: row.try_get("execution_id")?,
+        artifact_id: row.try_get("artifact_id")?,
+        task_id: row.try_get("task_id")?,
+        digest: row.try_get("digest")?,
+        created_at: row.try_get("created_at")?,
+    };
+    if record.task_id != task_id || record.digest != digest {
+        return Err(DbError::Check(
+            "Execution input Artifact binding conflicts with persisted provenance".to_owned(),
+        ));
+    }
+    Ok(record)
+}
+
 /// Reconstructs the immutable identity recorded at write time. Liveness is
 /// validated by the INSERT guards, not by historical reads.
 fn actor_from_columns(kind: String, id: String) -> Result<ActorRef> {
@@ -705,46 +754,9 @@ impl CollaborationRepo for SqliteDb {
         created_at: &str,
     ) -> Result<ExecutionArtifactInput> {
         let mut tx = self.pool.begin().await?;
-        let artifact = sqlx::query("SELECT task_id, digest FROM artifact WHERE id = ?")
-            .bind(artifact_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let task_id: String = artifact.try_get("task_id")?;
-        let digest: Option<String> = artifact.try_get("digest")?;
-        sqlx::query(
-            "INSERT INTO execution_artifact_input
-             (execution_id, artifact_id, task_id, digest, created_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(execution_id, artifact_id) DO NOTHING",
-        )
-        .bind(execution_id)
-        .bind(artifact_id)
-        .bind(&task_id)
-        .bind(&digest)
-        .bind(created_at)
-        .execute(&mut *tx)
-        .await?;
-        let row = sqlx::query(
-            "SELECT execution_id, artifact_id, task_id, digest, created_at
-             FROM execution_artifact_input WHERE execution_id = ? AND artifact_id = ?",
-        )
-        .bind(execution_id)
-        .bind(artifact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let record = ExecutionArtifactInput {
-            execution_id: row.try_get("execution_id")?,
-            artifact_id: row.try_get("artifact_id")?,
-            task_id: row.try_get("task_id")?,
-            digest: row.try_get("digest")?,
-            created_at: row.try_get("created_at")?,
-        };
-        if record.task_id != task_id || record.digest != digest {
-            return Err(DbError::Check(
-                "Execution input Artifact binding conflicts with persisted provenance".to_owned(),
-            ));
-        }
+        let record =
+            pin_execution_artifact_input_in_tx(&mut tx, execution_id, artifact_id, created_at)
+                .await?;
         tx.commit().await?;
         Ok(record)
     }

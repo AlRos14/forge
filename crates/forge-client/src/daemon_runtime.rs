@@ -421,6 +421,7 @@ async fn run_execution_task(
             status: Some("failed".to_owned()),
             agent_session_id: None,
             summary: None,
+            assistant_output: None,
             after_sha: None,
             usage: None,
             account_usage: None,
@@ -529,6 +530,7 @@ fn terminal_notification_from_result(
         status: Some(status.to_owned()),
         agent_session_id: result.agent_session_id,
         summary: result.summary,
+        assistant_output: result.assistant_output,
         after_sha: result.after_sha,
         usage: result.usage.map(|usage| RemoteTokenUsage {
             input_tokens: usage.input_tokens,
@@ -793,6 +795,25 @@ mod tests {
         async fn cancel(&self, _execution_id: &str) -> Result<(), ExecutorError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn terminal_notification_transmits_full_assistant_output_separately_from_summary() {
+        let notification = terminal_notification_from_result(
+            "execution-plan".to_owned(),
+            ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                assistant_output: Some("# Full plan\nDetailed steps\n".to_owned()),
+                summary: Some("short summary".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            notification.assistant_output.as_deref(),
+            Some("# Full plan\nDetailed steps\n")
+        );
+        assert_eq!(notification.summary.as_deref(), Some("short summary"));
     }
 
     #[tokio::test]

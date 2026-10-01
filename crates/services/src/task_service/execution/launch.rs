@@ -89,7 +89,7 @@ impl TaskService {
         }
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
@@ -118,29 +118,9 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                input_artifact_ids,
             )
             .await?;
-
-        let collaboration =
-            crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        for artifact_id in input_artifact_ids {
-            if let Err(error) = collaboration
-                .pin_execution_artifact_input(&execution.id, &artifact_id)
-                .await
-            {
-                if let Err(mark_error) = self
-                    .fail_execution_before_dispatch(&execution.id, error.to_string())
-                    .await
-                {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %mark_error,
-                        "failed to terminalize Execution after Artifact input pin rejection"
-                    );
-                }
-                return Err(error);
-            }
-        }
 
         tracing::info!(
             task_id = %task.id,
@@ -847,9 +827,12 @@ impl TaskService {
         } else {
             task
         };
+        let artifact_input_ids = self
+            .inherit_plan_artifact_inputs(&parent_execution.id, &task.id)
+            .await?;
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
@@ -884,25 +867,9 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                artifact_input_ids,
             )
             .await?;
-
-        if let Err(error) = self
-            .inherit_plan_artifact_inputs(&parent_execution.id, &execution.id, &task.id)
-            .await
-        {
-            if let Err(mark_error) = self
-                .fail_execution_before_dispatch(&execution.id, error.to_string())
-                .await
-            {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    %mark_error,
-                    "failed to terminalize re-execution after Artifact input pin rejection"
-                );
-            }
-            return Err(error);
-        }
 
         tracing::info!(
             task_id = %task.id,

@@ -124,9 +124,9 @@ Planning invocation and capability evidence are explicit. The successful
 assistant result is captured in full and materialized directly; the harness is
 not given a Forge-authored tool-call script. If recovery finds an already
 materialized output for that Execution, it completes from that Artifact
-without running another model turn. A successful result without complete
-assistant output fails rather than consulting a file or generating a second
-protocol.
+without running another model turn. A successful local or remote Plan result
+without complete assistant output fails rather than consulting a file or
+generating a second protocol.
 
 `CollaborationService::start_human_plan_execution` requires the real Human to
 hold the Task's planner Role and creates a running Human Plan Execution.
@@ -134,6 +134,39 @@ hold the Task's planner Role and creates a running Human Plan Execution.
 creates/reuses the Plan Artifact, and completes the same Execution. A caller
 must not create an Agent id or HarnessSession to represent the Human. A public
 Human planning editor is not introduced here; that surface is owned by PR12.
+
+## P2 independent-review fixes
+
+Creating a Running Execution with initial Artifact inputs now inserts the
+Execution, validates and pins every same-Task Artifact with its stored digest,
+and appends `execution.started` in one SQLite transaction. Initial dispatch,
+re-execution, follow-up, cascade retry, and recovery pass their exact selected
+Artifact ids into that operation. An invalid input rolls back the Execution,
+all input rows, and the start event. Other SQLite connections see the complete
+input set whenever they can see the committed start event. The EventBus publish
+remains post-commit. Repository-backed dispatch keeps the existing
+WorkspaceLease check before returning to the caller and starting the runner;
+lease issuance itself remains in its existing service flow.
+
+Remote terminal notifications now carry `assistant_output` separately from
+the bounded `summary`. The optional serde-defaulted field keeps older daemon
+payloads readable. A remote Plan Execution requires non-empty full output,
+commits or reuses its exact Plan Artifact, and only then records the terminal
+Execution status and event. A crash after Artifact materialization leaves the
+Execution Running; replay with identical output reuses the `(execution_id,
+kind)` output binding without another Artifact or creation event. Different
+replay content fails closed. An older daemon's completed Plan notification
+without full output leaves the Execution Running and creates no Artifact.
+Non-Plan remote completion does not require `assistant_output`.
+
+Focused microfix validation used the shared Cargo target. The transaction
+boundary test, both remote Plan completion tests, old-daemon deserialization,
+generated binding check, and daemon output-producer test passed. A supplementary
+`subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_follow_up`
+filter failed at its existing `lease-backed subtask follow-up exists`
+assertion. Its fixture has no resumable `HarnessSession`, so it exits through
+the no-session guard before the Artifact-input retry caller; it does not
+exercise either P2 invariant. No broader suite was run.
 
 ## PR13 cleanup inventory
 

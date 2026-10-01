@@ -22,6 +22,40 @@ impl ExecutionRepo for SqliteDb {
         Ok((execution, event))
     }
 
+    async fn create_with_artifact_inputs_and_event(
+        &self,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)> {
+        if input.status != ExecutionStatus::Running
+            || event.event_type != "execution.started"
+            || event.entity_type != "execution"
+            || event.entity_id != input.id
+            || event.scope_type != "task"
+            || event.scope_id != input.task_id
+        {
+            return Err(DbError::Check(
+                "Artifact inputs require the matching Running Execution start event".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
+        for artifact_id in artifact_input_ids {
+            super::collaboration::pin_execution_artifact_input_in_tx(
+                &mut transaction,
+                &input.id,
+                &artifact_id,
+                &input.created_at,
+            )
+            .await?;
+        }
+        let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
+        Ok((execution, event))
+    }
+
     async fn create_orchestrator_execution(
         &self,
         input: CreateExecution,

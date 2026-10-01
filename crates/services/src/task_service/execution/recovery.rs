@@ -539,6 +539,9 @@ impl TaskService {
                 })?,
             )
         };
+        let artifact_input_ids = self
+            .inherit_plan_artifact_inputs(&blocked_execution.id, &task.id)
+            .await?;
         let updated_snapshot = if let Some(ctx) = context.as_deref() {
             let mut snap: serde_json::Value =
                 serde_json::from_str(&updated_snapshot).map_err(|e| {
@@ -573,7 +576,7 @@ impl TaskService {
         self.ensure_task_runnable(&updated_task).await?;
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: updated_task.id.clone(),
@@ -619,6 +622,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                artifact_input_ids,
             )
             .await?;
         self.publish(ForgeEvent {
@@ -776,6 +780,7 @@ impl TaskService {
         let state_config = state.config.clone();
         let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
+        let context_parent_execution_id = page.items.first().map(|execution| execution.id.clone());
         let dispatch_ctx = load_agent_dispatch_context(
             Arc::clone(&self.db),
             &task.id,
@@ -783,7 +788,7 @@ impl TaskService {
             &task.status,
             state_config,
             Some(selection.execution_policy.as_str()),
-            page.items.first().map(|execution| execution.id.as_str()),
+            context_parent_execution_id.as_deref(),
             &workflow,
         )
         .await?;
@@ -816,9 +821,16 @@ impl TaskService {
         .await?;
         // Clear recovery state before issuing an exact-version WorkspaceLease.
         let recovered = self.clear_blocking_metadata(&task.id).await?;
+        let artifact_input_ids = match context_parent_execution_id.as_deref() {
+            Some(parent_execution_id) => {
+                self.inherit_plan_artifact_inputs(parent_execution_id, &recovered.id)
+                    .await?
+            }
+            None => Vec::new(),
+        };
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_artifact_inputs(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: recovered.id.clone(),
@@ -850,6 +862,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                artifact_input_ids,
             )
             .await?;
         self.spawn_recovery_execution(

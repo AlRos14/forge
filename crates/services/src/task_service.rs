@@ -428,6 +428,20 @@ impl TaskService {
         input: CreateExecution,
         workspace_created_by_attempt: bool,
     ) -> Result<Execution> {
+        self.create_running_execution_with_artifact_inputs(
+            input,
+            workspace_created_by_attempt,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn create_running_execution_with_artifact_inputs(
+        &self,
+        input: CreateExecution,
+        workspace_created_by_attempt: bool,
+        artifact_input_ids: Vec<String>,
+    ) -> Result<Execution> {
         let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
             let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
                 .await?
@@ -454,7 +468,14 @@ impl TaskService {
         // an active scheduler grant.
         let event = execution_domain_event(&input, "execution.started");
         let (execution, committed_event) =
-            match ExecutionRepo::create_with_event(&*self.db, input.clone(), event).await {
+            match ExecutionRepo::create_with_artifact_inputs_and_event(
+                &*self.db,
+                input.clone(),
+                artifact_input_ids,
+                event,
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(error) => {
                     if workspace_created_by_attempt {
@@ -502,26 +523,15 @@ impl TaskService {
     pub(crate) async fn inherit_plan_artifact_inputs(
         &self,
         parent_execution_id: &str,
-        child_execution_id: &str,
         task_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let artifacts = crate::plan_artifact::plan_artifacts_for_execution(
             &self.db,
             task_id,
             parent_execution_id,
         )
         .await?;
-        if artifacts.is_empty() {
-            return Ok(());
-        }
-        let collaboration =
-            crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        for artifact in artifacts {
-            collaboration
-                .pin_execution_artifact_input(child_execution_id, &artifact.id)
-                .await?;
-        }
-        Ok(())
+        Ok(artifacts.into_iter().map(|artifact| artifact.id).collect())
     }
 
     fn publish_committed_domain_event(&self, event: &db::DomainEvent) {
@@ -619,6 +629,20 @@ impl TaskService {
         } else {
             "failed"
         });
+        if current_execution.purpose == Some(ExecutionPurpose::Plan) && outcome == "completed" {
+            let assistant_output = notification
+                .assistant_output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty())
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "completed remote Plan Execution did not return a complete assistant result",
+                    )
+                })?;
+            crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                .create_plan_artifact_from_execution(&current_execution.id, assistant_output)
+                .await?;
+        }
         let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) = match outcome {
             "completed" => (
                 ExecutionStatus::Completed,
