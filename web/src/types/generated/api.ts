@@ -635,8 +635,6 @@ export interface Execution {
   stopped_at?: string | null
   executor_config_snapshot?: Record<string, unknown> | null
   workspace_id?: string | null
-  plan_progress?: PlanProgressSummary | null
-  plan_artifact?: PlanArtifactDetail | null
   usage?: ExecutionUsage[] | null
   account_usage?: Record<string, unknown> | null
   created_at: string
@@ -887,7 +885,6 @@ export interface UpdateTaskRequest {
   description?: string | null
   priority?: number
   merge_config?: Record<string, unknown> | null
-  plan?: string
   parent_task_id?: string | null
   version: number
 }
@@ -1107,6 +1104,7 @@ export interface HarnessCapabilities {
 export type HarnessInvocation =
   | { type: 'start' }
   | { type: 'resume'; external_session_id: string }
+  | { type: 'planning'; external_session_id: string | null }
 
 export interface AgentAvailability {
   available: boolean
@@ -1584,7 +1582,6 @@ export interface ActiveExecutionSummary {
   token_totals: TokenTotalsSummary | null
   rate_limit_snapshot: Record<string, unknown> | null
   effective_policy: EffectiveExecutionPolicy | null
-  plan_progress: PlanProgressSummary | null
 }
 
 export interface DaemonPressureSummary {
@@ -1687,14 +1684,19 @@ export interface PlanProgressSummary {
 }
 
 export interface PlanArtifactDetail {
-  revision_id: string | null
-  revision: number | null
-  checkpoint: string | null
+  artifact_id: string
+  task_id: string
+  producer_execution_id: string
+  producer: ActorRef
   content_digest: string | null
   markdown: string
   items: PlanChecklistItem[]
   warnings: string[]
-  last_modified: string | null
+  created_at: string
+}
+
+export interface TaskPlanHistoryResponse {
+  artifacts: PlanArtifactDetail[]
 }
 
 export interface AgentUsageResponse {

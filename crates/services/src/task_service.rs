@@ -146,7 +146,10 @@ pub struct TransitionOptions {
     pub defer_dispatch_seconds: Option<i64>,
 }
 
-fn execution_domain_event(input: &CreateExecution, event_type: &str) -> CreateDomainEvent {
+pub(crate) fn execution_domain_event(
+    input: &CreateExecution,
+    event_type: &str,
+) -> CreateDomainEvent {
     let actor = input.actor_ref.as_ref();
     CreateDomainEvent {
         id: new_uuid_v4(),
@@ -496,6 +499,31 @@ impl TaskService {
         Ok(execution)
     }
 
+    pub(crate) async fn inherit_plan_artifact_inputs(
+        &self,
+        parent_execution_id: &str,
+        child_execution_id: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        let artifacts = crate::plan_artifact::plan_artifacts_for_execution(
+            &self.db,
+            task_id,
+            parent_execution_id,
+        )
+        .await?;
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+        let collaboration =
+            crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        for artifact in artifacts {
+            collaboration
+                .pin_execution_artifact_input(child_execution_id, &artifact.id)
+                .await?;
+        }
+        Ok(())
+    }
+
     fn publish_committed_domain_event(&self, event: &db::DomainEvent) {
         crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
             .publish_committed(event);
@@ -786,25 +814,6 @@ impl TaskService {
                     %error,
                     "failed to clear execution retry metadata"
                 );
-            }
-            if updated.role == crate::workflow::default_roles::PLANNER
-                && task.status == crate::workflow::default_states::PLANNING
-            {
-                if let Err(error) = execution::set_planning_awaiting_review_metadata(
-                    &self.db,
-                    &task,
-                    Some(&updated.id),
-                    true,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to mark planning awaiting review"
-                    );
-                }
             }
         } else if updated.status == ExecutionStatus::Failed
             && executor_unavailable

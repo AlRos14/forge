@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::workflow::engine::WorkflowEngine;
 use services::{
-    plan_artifact::{latest_plan_for_task, read_plan_for_workspace, PlanArtifactError},
     task_diagnostics::{derive_workflow_exception, derive_workflow_health},
     task_service::action_resolver::resolve_execution_actions_with_session_state,
 };
@@ -343,21 +342,7 @@ async fn task_response_inner(
         .as_ref()
         .map(|workspace| workspace.id.clone());
     let (plan_progress, plan_artifact) = if include_actions {
-        match workspace_model.as_ref() {
-            Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
-            None => match latest_plan_for_task(db, &task.id).await {
-                Ok(Some(artifact)) => {
-                    let parsed = services::plan_artifact::parse_plan_markdown(&artifact.markdown);
-                    (
-                        Some(services::plan_artifact::to_plan_progress_summary(&parsed)),
-                        Some(artifact),
-                    )
-                }
-                Ok(None) => (None, None),
-                Err(PlanArtifactError::DbError(error)) => return Err(ApiError::from(error)),
-                Err(_) => (None, None),
-            },
-        }
+        plan_artifact_response(db, &task.id).await?
     } else {
         (None, None)
     };
@@ -918,8 +903,6 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
             .executor_config_snapshot_json
             .map(parse_json_value),
         workspace_id: execution.workspace_id,
-        plan_progress: None,
-        plan_artifact: None,
         usage: None,
         account_usage: None,
         created_at: execution.created_at,
@@ -927,44 +910,31 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
     }
 }
 
-pub async fn execution_response_with_plan(
+pub async fn execution_response_with_usage(
     db: &db::SqliteDb,
     execution: Execution,
 ) -> ApiResult<ExecutionResponse> {
-    let workspace_id = execution.workspace_id.clone();
     let execution_id = execution.id.clone();
     let mut response = execution_response(execution);
     response.account_usage = execution_account_usage(db, &execution_id).await?;
-    if let Some(workspace_id) = workspace_id {
-        let (plan_progress, plan_artifact) = plan_artifact_response(db, &workspace_id).await?;
-        response.plan_progress = plan_progress;
-        response.plan_artifact = plan_artifact;
-    }
     Ok(response)
 }
 
 async fn plan_artifact_response(
     db: &db::SqliteDb,
-    workspace_id: &str,
+    task_id: &str,
 ) -> ApiResult<(
     Option<api_types::PlanProgressSummary>,
     Option<api_types::PlanArtifactDetail>,
 )> {
-    match read_plan_for_workspace(db, workspace_id).await {
-        Ok(Some((progress, artifact))) => Ok((Some(progress), Some(artifact))),
-        Ok(None) | Err(PlanArtifactError::WorkspaceNotFound { .. }) => Ok((None, None)),
-        Err(PlanArtifactError::DbError(error)) => Err(ApiError::from(error)),
-        Err(error) => Ok((
-            Some(api_types::PlanProgressSummary {
-                total: 0,
-                completed: 0,
-                remaining: 0,
-                available: false,
-                warnings: vec![error.to_string()],
-            }),
-            None,
-        )),
-    }
+    let Some(artifact) = services::plan_artifact::latest_plan_artifact(db, task_id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok((None, None));
+    };
+    let progress = services::plan_artifact::to_plan_progress_summary(&artifact);
+    Ok((Some(progress), Some(artifact)))
 }
 
 async fn execution_account_usage(

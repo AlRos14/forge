@@ -10,6 +10,7 @@ use db::{
     TaskRoleRepo, UserRepo, WorkspaceRepo,
 };
 use events::EventBus;
+use sha2::{Digest, Sha256};
 
 use crate::{domain_event_service::DomainEventService, Result, ServiceError};
 
@@ -125,6 +126,24 @@ impl CollaborationService {
         if execution.task_id != input.task_id || execution.actor_ref().as_ref() != Some(&actor) {
             return Err(not_found("execution", input.producer_execution_id));
         }
+        if input.kind == ArtifactKind::Plan
+            && (execution.purpose != Some(ExecutionPurpose::Plan)
+                || input.storage_kind != ArtifactStorageKind::Inline
+                || input
+                    .content
+                    .as_deref()
+                    .is_none_or(|content| content.trim().is_empty())
+                || input.digest.as_deref().is_none_or(|digest| {
+                    digest
+                        != hex::encode(Sha256::digest(
+                            input.content.as_deref().unwrap_or_default().as_bytes(),
+                        ))
+                }))
+        {
+            return Err(invalid(
+                "Plan Artifact requires inline content, its exact digest, and a Plan Execution producer",
+            ));
+        }
         if matches!(&source, CollaborationActorSource::Execution(id) if id != &execution.id) {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Artifact producer must be the authenticated Execution".to_owned(),
@@ -155,25 +174,264 @@ impl CollaborationService {
                 &now,
             )
             .await?;
-        let write = CollaborationRepo::create_artifact(
+        let create = CreateArtifact {
+            id,
+            task_id: input.task_id,
+            kind: input.kind,
+            storage_kind: input.storage_kind,
+            content: input.content,
+            content_ref: input.content_ref,
+            metadata_json: input.metadata_json,
+            digest: input.digest,
+            producer_execution_id: execution.id,
+            created_at: now,
+        };
+        if create.kind == ArtifactKind::Plan {
+            let write =
+                CollaborationRepo::create_execution_artifact_output(&*self.db, create, event)
+                    .await?;
+            if let Some(event) = write.event.as_ref() {
+                self.domain_events.publish_committed(event);
+            }
+            return Ok(write.artifact);
+        }
+        let write = CollaborationRepo::create_artifact(&*self.db, create, event).await?;
+        self.domain_events.publish_committed(&write.event);
+        Ok(write.record)
+    }
+
+    /// Start a Human-authored Plan Execution. The caller must hold the
+    /// planner TaskRole; the row has a real Human ActorRef and no
+    /// HarnessSession.
+    pub async fn start_human_plan_execution(
+        &self,
+        task_id: &str,
+        user_id: &str,
+    ) -> Result<db::Execution> {
+        let source = CollaborationActorSource::Human(user_id.to_owned());
+        let (task, actor) = self.authorize_source(task_id, &source).await?;
+        if !self
+            .has_role_name_membership(&task.id, &actor, "planner")
+            .await?
+        {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Human Actor does not hold the planner TaskRole".to_owned(),
+            });
+        }
+        let now = now_rfc3339();
+        let input = db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id,
+            agent_id: None,
+            actor_ref: Some(ActorRef::Human(user_id.to_owned())),
+            role: "planner".to_owned(),
+            purpose: Some(ExecutionPurpose::Plan),
+            status: db::ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some(now.clone()),
+            summary: Some("Human plan authoring".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let event = crate::task_service::execution_domain_event(&input, "execution.started");
+        let (execution, committed_event) =
+            ExecutionRepo::create_with_event(&*self.db, input, event).await?;
+        self.domain_events.publish_committed(&committed_event);
+        Ok(execution)
+    }
+
+    /// Complete one Human plan operation. Repeating the same content returns
+    /// the same output Artifact and does not attribute the Artifact to a later
+    /// approver or create another Execution.
+    pub async fn complete_human_plan_execution(
+        &self,
+        execution_id: &str,
+        user_id: &str,
+        markdown: &str,
+    ) -> Result<Artifact> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+        if execution.actor_ref() != Some(ActorRef::Human(user_id.to_owned()))
+            || execution.harness_session_id.is_some()
+            || execution.agent_id.is_some()
+            || execution.purpose != Some(ExecutionPurpose::Plan)
+        {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Human plan completion must match its Human Plan Execution".to_owned(),
+            });
+        }
+        let source = CollaborationActorSource::Human(user_id.to_owned());
+        self.authorize_source(&execution.task_id, &source).await?;
+        let artifact = self
+            .create_plan_artifact_from_execution(execution_id, markdown)
+            .await?;
+        if execution.status == db::ExecutionStatus::Running {
+            let now = now_rfc3339();
+            let event = crate::task_service::execution_status_domain_event(
+                &execution,
+                &db::ExecutionStatus::Completed,
+                &now,
+            );
+            let (_, committed_event) = ExecutionRepo::update_with_event(
+                &*self.db,
+                db::UpdateExecution {
+                    id: execution.id,
+                    status: Some(db::ExecutionStatus::Completed),
+                    stop_reason: Some(None),
+                    stopped_by: Some(None),
+                    resume_policy: Some(None),
+                    stopped_at: Some(None),
+                    agent_session_id: Some(None),
+                    agent_message_id: Some(None),
+                    last_activity_at: Some(Some(now.clone())),
+                    summary: Some(Some("Human plan saved".to_owned())),
+                    logs_path: Some(None),
+                    before_sha: Some(None),
+                    after_sha: Some(None),
+                    error: Some(None),
+                    executor_config_snapshot_json: Some(None),
+                    updated_at: now,
+                },
+                event,
+            )
+            .await?;
+            self.domain_events.publish_committed(&committed_event);
+        } else if execution.status != db::ExecutionStatus::Completed {
+            return Err(ServiceError::invalid_operation(
+                "Human Plan Execution must be running or completed",
+            ));
+        }
+        Ok(artifact)
+    }
+
+    /// Materialize the full result of one exact Plan Execution. The generic
+    /// output binding serializes competing retries and returns the existing
+    /// Artifact only when the complete result is identical.
+    pub async fn create_plan_artifact_from_execution(
+        &self,
+        execution_id: &str,
+        markdown: &str,
+    ) -> Result<Artifact> {
+        if markdown.trim().is_empty() {
+            return Err(invalid("Plan Execution result must contain content"));
+        }
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+        if execution.purpose != Some(ExecutionPurpose::Plan)
+            || !matches!(
+                execution.status,
+                db::ExecutionStatus::Running | db::ExecutionStatus::Completed
+            )
+        {
+            return Err(invalid(
+                "Plan Artifact producer must be a running or completed Plan Execution",
+            ));
+        }
+        let actor = execution
+            .actor_ref()
+            .ok_or_else(|| invalid("Plan Execution has no persisted ActorRef"))?;
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| not_found("task", execution.task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| not_found("project", task.project_id.clone()))?;
+        match &actor {
+            ActorRef::Human(user_id) => self.authorize_human_project(&project, user_id).await?,
+            ActorRef::Agent(agent_id) => {
+                if AgentRepo::get_by_id(&*self.db, agent_id).await?.is_none() {
+                    return Err(invalid("Plan Execution ActorRef no longer exists"));
+                }
+            }
+        }
+
+        let source = CollaborationActorSource::Execution(execution.id.clone());
+        let id = new_uuid_v4();
+        let now = now_rfc3339();
+        let digest = hex::encode(Sha256::digest(markdown.as_bytes()));
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "artifact.created",
+                    entity_type: "artifact",
+                    entity_id: &id,
+                    task_id: &execution.task_id,
+                },
+                &actor,
+                serde_json::json!({
+                    "artifact_id": id,
+                    "task_id": execution.task_id,
+                    "kind": "plan",
+                }),
+                &now,
+            )
+            .await?;
+        let write = CollaborationRepo::create_execution_artifact_output(
             &*self.db,
             CreateArtifact {
                 id,
-                task_id: input.task_id,
-                kind: input.kind,
-                storage_kind: input.storage_kind,
-                content: input.content,
-                content_ref: input.content_ref,
-                metadata_json: input.metadata_json,
-                digest: input.digest,
+                task_id: execution.task_id,
+                kind: ArtifactKind::Plan,
+                storage_kind: ArtifactStorageKind::Inline,
+                content: Some(markdown.to_owned()),
+                content_ref: None,
+                metadata_json: "{}".to_owned(),
+                digest: Some(digest),
                 producer_execution_id: execution.id,
                 created_at: now,
             },
             event,
         )
         .await?;
-        self.domain_events.publish_committed(&write.event);
-        Ok(write.record)
+        if let Some(event) = write.event.as_ref() {
+            self.domain_events.publish_committed(event);
+        }
+        Ok(write.artifact)
+    }
+
+    pub async fn pin_execution_artifact_input(
+        &self,
+        execution_id: &str,
+        artifact_id: &str,
+    ) -> Result<db::ExecutionArtifactInput> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+        if execution.status != db::ExecutionStatus::Running || execution.logs_path.is_some() {
+            return Err(ServiceError::invalid_operation(
+                "Execution Artifact inputs must be pinned before dispatch starts",
+            ));
+        }
+        let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
+            .await?
+            .ok_or_else(|| not_found("artifact", artifact_id.to_owned()))?;
+        if artifact.task_id != execution.task_id {
+            return Err(not_found("artifact", artifact_id.to_owned()));
+        }
+        let binding = CollaborationRepo::pin_execution_artifact_input(
+            &*self.db,
+            execution_id,
+            artifact_id,
+            &now_rfc3339(),
+        )
+        .await?;
+        Ok(binding)
     }
 
     pub async fn get_artifact(

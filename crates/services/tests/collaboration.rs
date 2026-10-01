@@ -2501,26 +2501,8 @@ async fn collaboration_message_cursor_pages_stably_through_timestamp_ties() {
 }
 
 #[tokio::test]
-async fn legacy_production_writers_do_not_project_into_generic_collaboration() {
+async fn project_os_legacy_writers_do_not_project_into_generic_collaboration() {
     let f = fixture().await;
-    let plan_root = tempfile::tempdir().expect("plan root");
-    let worktree = plan_root.path().join("repo");
-    std::fs::create_dir(&worktree).expect("legacy worktree");
-    std::fs::write(
-        plan_root.path().join("plan.md"),
-        "# Legacy plan\n- [ ] keep legacy\n",
-    )
-    .expect("legacy plan file");
-    services::plan_artifact::capture_plan_revision(
-        &f.db,
-        &f.task_id,
-        &worktree,
-        "approved",
-        Some(&f.execution_id),
-    )
-    .await
-    .expect("legacy planning writer");
-
     let now = now_rfc3339();
     let main_chat = AgentChatRepo::get_main_chat(&*f.db, &f.user_id)
         .await
@@ -2622,7 +2604,6 @@ async fn legacy_production_writers_do_not_project_into_generic_collaboration() {
     .expect("legacy Project Decision writer");
 
     let legacy_counts = [
-        ("task_plan_revision", "task_plan_revision"),
         ("agent_chat_message", "agent_chat_message"),
         ("agent_handoff", "agent_handoff"),
         ("project_decision", "project_decision"),

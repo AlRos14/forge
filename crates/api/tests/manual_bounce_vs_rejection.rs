@@ -178,7 +178,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },

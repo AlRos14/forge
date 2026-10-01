@@ -375,7 +375,6 @@ async fn runtime_session_rotation_restart_preserves_scope_timeline_and_isolation
             subtask_order: None,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },

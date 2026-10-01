@@ -74,6 +74,19 @@ Proposal records retain those fields for authorized readers. Project teardown
 removes PR4 rows through the guarded Project deletion path; the event ledger
 remains historical evidence under its existing retention contract.
 
+## Plan PR7 implementation status
+
+V098 makes planning outputs generic immutable Artifacts and exact Execution
+inputs. The unique `(execution_id, kind)` output relation makes retries return
+the same Artifact, while `execution_artifact_input` pins a same-Task Artifact
+and digest before a downstream Execution starts. Plan Artifact provenance is
+derived from its real Human or Agent Plan Execution. V081 revision and approval
+rows remain preserved as history and are no longer read or written by planning,
+workflow gates, REST plan projection, or review evidence selection. V098 maps
+only rows whose source Execution has a verifiable same-Task Human/Agent Actor;
+unattributable and ambiguous rows retain an explicit audit status and no
+invented producer. Physical table and column removal remains Plan PR13.
+
 ## Current repository baseline
 
 The Plan PR0 audit was performed against the actual clean local checkout:
@@ -360,7 +373,7 @@ must repeat the search at its own HEAD.
 | Special review runtime | review table from V006; crates/review runner/auditor/follow_up; service error and orchestration paths; API/UI review actions; review evidence V084 | Plan PR8 emits validation Evidence and review Executions/Artifacts; Plan PR13 drops special review persistence/runtime |
 | Forge-owned cognition | forge-agent-host crate, agent-runtime dependency, embedded_agent_service, embedded_task_executor, native/typed tools, startup wiring in forge-cli/api/services | Plan PR10 extracts legitimate credential/process infrastructure, migrates adapters, then removes agent-host |
 | Main Agent/Project Agent/Project OS | V061–V075 rooms, chats, bindings, genesis, memory, commitments, attention, project charter/baseline, and related services/routes/MCP/UI | Plan PR11 moves useful durable behavior onto generic actors/collaboration/artifacts, then Plan PR12 removes obsolete surfaces |
-| Bespoke plan persistence | V081 task_plan_revision/task_plan_approval; plan capture routes, services, UI, review binding, and prompt builders | Plan PR7 treats plan output as Artifact and removes canonical-plan authority after readers/writers move |
+| Bespoke plan persistence | V081 task_plan_revision/task_plan_approval remain preserved; PR7 stops runtime authority and records V098 provenance migration audit | Plan PR13 owns physical V081 table/column cleanup after all consumers move |
 | Project documents and milestone governance | V076 project charter/document/decision/baseline/milestone/release records and orchestration services | Preserve only generic Artifact/Evidence/Gate value; reconcile with the new Task-scoped model during Plan PRs 4, 8, 9, and 11 |
 | Workspace and Git isolation | workspace, git, daemon, workspace lease records, execution launch/recovery, and integration paths | Preserve and extend in Plan PR5; no replacement that permits shared writable trees |
 | Events and projections | domain_event, events EventBus, SSE routes, attention/mission projections, execution/task event consumers | Plan PRs 4, 6, 9, and 12 update the vocabulary; durable events remain authoritative |

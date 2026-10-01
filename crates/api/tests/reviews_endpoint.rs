@@ -226,7 +226,6 @@ async fn seed_review(db: &db::SqliteDb, step_results_json: String) -> String {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },

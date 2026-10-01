@@ -11,7 +11,7 @@ use services::ServiceError;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, execution_response_with_plan, execution_usage_response, page_request,
+        execution_response, execution_response_with_usage, execution_usage_response, page_request,
         paginated, task_response, task_usage_summary_response, workspace_response, ListParams,
     },
     state::AppState,
@@ -34,7 +34,7 @@ pub async fn get_execution(
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id))?;
     Ok(Json(
-        execution_response_with_plan(&state.db, execution).await?,
+        execution_response_with_usage(&state.db, execution).await?,
     ))
 }
 

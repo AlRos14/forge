@@ -25,6 +25,28 @@ impl TaskService {
         prompt: String,
         dispatch_metadata: Option<Value>,
     ) -> Result<Execution> {
+        self.dispatch_initial_role_execution_with_artifacts(
+            task_id,
+            agent_id,
+            role,
+            purpose,
+            prompt,
+            Vec::new(),
+            dispatch_metadata,
+        )
+        .await
+    }
+
+    pub async fn dispatch_initial_role_execution_with_artifacts(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        role: &str,
+        purpose: ExecutionPurpose,
+        prompt: String,
+        input_artifact_ids: Vec<String>,
+        dispatch_metadata: Option<Value>,
+    ) -> Result<Execution> {
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         validate_required("role", role)?;
@@ -98,6 +120,27 @@ impl TaskService {
                 workspace_created_by_attempt,
             )
             .await?;
+
+        let collaboration =
+            crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        for artifact_id in input_artifact_ids {
+            if let Err(error) = collaboration
+                .pin_execution_artifact_input(&execution.id, &artifact_id)
+                .await
+            {
+                if let Err(mark_error) = self
+                    .fail_execution_before_dispatch(&execution.id, error.to_string())
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %mark_error,
+                        "failed to terminalize Execution after Artifact input pin rejection"
+                    );
+                }
+                return Err(error);
+            }
+        }
 
         tracing::info!(
             task_id = %task.id,
@@ -786,6 +829,7 @@ impl TaskService {
             &task.status,
             state_config,
             Some(selection.execution_policy.as_str()),
+            Some(&parent_execution.id),
             &workflow,
         )
         .await?;
@@ -812,7 +856,11 @@ impl TaskService {
                     agent_id: Some(agent.id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
                     purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
-                        execution_purpose_for_task_type(&task.task_type, &parent_execution.role)
+                        execution_purpose_for_workflow_state(
+                            &task.task_type,
+                            &task.status,
+                            &parent_execution.role,
+                        )
                     })),
                     harness_session_id: None,
                     role: parent_execution.role.clone(),
@@ -838,6 +886,23 @@ impl TaskService {
                 workspace_created_by_attempt,
             )
             .await?;
+
+        if let Err(error) = self
+            .inherit_plan_artifact_inputs(&parent_execution.id, &execution.id, &task.id)
+            .await
+        {
+            if let Err(mark_error) = self
+                .fail_execution_before_dispatch(&execution.id, error.to_string())
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %mark_error,
+                    "failed to terminalize re-execution after Artifact input pin rejection"
+                );
+            }
+            return Err(error);
+        }
 
         tracing::info!(
             task_id = %task.id,
@@ -974,7 +1039,6 @@ impl TaskService {
                 description: None,
                 priority: None,
                 merge_config: None,
-                plan: None,
                 error_annotation: Some(Some(annotation)),
                 blocked_json: None,
                 failed_json: None,

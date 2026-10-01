@@ -173,7 +173,6 @@ pub(super) async fn seed_task_with_status_at(
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: timestamp.to_owned(),
             updated_at: timestamp.to_owned(),
         },
@@ -352,7 +351,6 @@ pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> 
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),

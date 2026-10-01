@@ -157,6 +157,144 @@ async fn planning_gate_approval_conflicts_while_planner_execution_is_running() {
 }
 
 #[tokio::test]
+async fn human_approval_keeps_the_exact_generic_plan_artifact() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let _: Value = json_request_with_bearer(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        &admin_jwt(),
+        json!({ "definition": plan_approval_workflow() }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let task: TaskResponse = json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        &admin_jwt(),
+        json!({ "title": "Review a plan", "description": "keep its authorship" }),
+        StatusCode::OK,
+    )
+    .await;
+    let moved: TransitionTaskResponse = json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/transition", task.id),
+        &admin_jwt(),
+        json!({ "status": "planning", "version": task.version, "reason": "plan first" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    harness
+        ._state
+        .task_service
+        .create_task_role(
+            &task.id,
+            "planner",
+            db::CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("planner role creates");
+    harness
+        ._state
+        .task_service
+        .add_task_role_member(
+            &task.id,
+            "planner",
+            api_types::ActorRef::Human("test-user-id".to_owned()),
+        )
+        .await
+        .expect("Human planner membership creates");
+
+    let collaboration = services::CollaborationService::new(
+        Arc::clone(&harness._state.db),
+        Arc::clone(&harness.event_bus),
+    );
+    let human_execution = collaboration
+        .start_human_plan_execution(&task.id, "test-user-id")
+        .await
+        .expect("Human Plan Execution starts");
+    let artifact = collaboration
+        .complete_human_plan_execution(&human_execution.id, "test-user-id", "- [ ] review only\n")
+        .await
+        .expect("Human Plan Artifact is produced");
+    assert_eq!(artifact.producer_execution_id, human_execution.id);
+    assert_eq!(
+        artifact.producer,
+        db::ActorRef::Human("test-user-id".to_owned())
+    );
+
+    // A stale physical value is retained for PR13 cleanup, but it is not a
+    // source for the API projection or gate behavior.
+    sqlx::query("UPDATE task SET plan = ? WHERE id = ?")
+        .bind("legacy stale plan")
+        .bind(&task.id)
+        .execute(harness._state.db.pool())
+        .await
+        .expect("legacy Task.plan fixture is written");
+    let before_approval: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(harness._state.db.pool())
+            .await
+            .expect("Plan Artifact count loads before approval");
+
+    let approved: TaskResponse = json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/gates/planning/approve", task.id),
+        &admin_jwt(),
+        json!({ "version": moved.task.version, "reason": "continue" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(approved.status, "in_progress");
+    assert_eq!(
+        approved
+            .plan_artifact
+            .as_ref()
+            .map(|value| value.artifact_id.as_str()),
+        Some(artifact.id.as_str())
+    );
+
+    let history: Value = json_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/plan", task.id),
+        &admin_jwt(),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(history["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(history["artifacts"][0]["artifact_id"], artifact.id);
+    assert_eq!(
+        history["artifacts"][0]["producer_execution_id"],
+        human_execution.id
+    );
+
+    let after_approval: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(harness._state.db.pool())
+            .await
+            .expect("Plan Artifact count loads after approval");
+    let legacy_approvals: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_approval WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(harness._state.db.pool())
+            .await
+            .expect("legacy approval count loads");
+    assert_eq!(after_approval, before_approval);
+    assert_eq!(legacy_approvals, 0);
+}
+
+#[tokio::test]
 #[ignore = "Planner execution spawning/completion is not wired to the role dispatch event yet; this documents the expected future cascade to in_progress."]
 async fn planner_completion_cascades_to_in_progress() {
     assert!(
@@ -173,6 +311,19 @@ fn planning_workflow() -> Value {
             state("planning", "gate", "planner", json!({
                 "on_enter": [{ "action": "dispatch_role_agent", "params": {}, "applies_to": "all", "on_failure": "log" }]
             }), trigger("in_progress")),
+            state("in_progress", "active", Value::Null, json!({}), trigger("done")),
+            state("done", "terminal", Value::Null, json!({}), json!({}))
+        ],
+        "cancellation_state": null
+    })
+}
+
+fn plan_approval_workflow() -> Value {
+    json!({
+        "roles": [{ "name": "planner", "display_name": "Planner", "description": "Plans" }],
+        "states": [
+            state("todo", "initial", Value::Null, json!({}), trigger("planning")),
+            state("planning", "gate", "planner", json!({}), trigger("in_progress")),
             state("in_progress", "active", Value::Null, json!({}), trigger("done")),
             state("done", "terminal", Value::Null, json!({}), json!({}))
         ],

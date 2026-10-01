@@ -42,7 +42,6 @@ pub struct UpdateTaskRequest {
     pub description: Option<String>,
     pub priority: Option<i64>,
     pub merge_config: Option<Value>,
-    pub plan: Option<String>,
     pub task_state_config: Option<Value>,
     #[serde(default)]
     pub parent_task_id: Option<Option<String>>,

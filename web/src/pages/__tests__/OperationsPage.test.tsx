@@ -71,13 +71,6 @@ const degradedStatus: OperatorStatusResponse = {
         scoped_tools: ['shell'],
         mcp_servers: [],
       },
-      plan_progress: {
-        total: 4,
-        completed: 2,
-        remaining: 2,
-        available: true,
-        warnings: [],
-      },
     },
   ],
   blocked_tasks: [

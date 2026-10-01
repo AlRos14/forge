@@ -40,7 +40,7 @@ impl TaskService {
                 ..TaskMetadata::default()
             };
             let metadata_json = metadata.to_json();
-            sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, priority, subtask_order, task_state_config, merge_config, metadata_json, plan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, priority, subtask_order, task_state_config, merge_config, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(&task_id)
                 .bind(&parent.project_id)
                 .bind(parent.repo_id.as_deref())
@@ -56,7 +56,6 @@ impl TaskService {
                 .bind(Option::<&str>::None)
                 .bind(Option::<&str>::None)
                 .bind(metadata_json.as_deref())
-                .bind(Option::<&str>::None)
                 .bind(&now)
                 .bind(&now)
                 .execute(&mut *transaction)

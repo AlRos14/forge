@@ -212,6 +212,7 @@ impl TaskDispatcher {
             &state.name,
             state_config,
             Some(selection.execution_policy.as_str()),
+            None,
             workflow,
         )
         .await?;
@@ -230,8 +231,9 @@ impl TaskDispatcher {
                 &task.id,
                 &agent.id,
                 role_name,
-                crate::task_service::execution::execution_purpose_for_task_type(
+                crate::task_service::execution::execution_purpose_for_workflow_state(
                     &task.task_type,
+                    &state.name,
                     role_name,
                 ),
                 prompt.user,

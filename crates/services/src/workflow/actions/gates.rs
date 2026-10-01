@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-use db::{TaskDependencyRepo, TransitionLog, TransitionLogRepo, WorkspaceRepo};
+use db::{TaskDependencyRepo, TransitionLog, TransitionLogRepo};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
 };
 
-use super::common::{block_task, get_role_assignment, task, workspace_id};
+use super::common::{block_task, get_role_assignment, task};
 
 pub struct AutoCascadeOnUnassignedRole;
 
@@ -190,60 +190,6 @@ impl HookAction for CheckRetryBudget {
             "retry budget check passed"
         );
         HookResult::Ok
-    }
-}
-
-pub struct RequirePlanChecklistComplete;
-
-#[async_trait]
-impl HookAction for RequirePlanChecklistComplete {
-    async fn execute(&self, ctx: &HookContext) -> HookResult {
-        let Some(workspace_id) = workspace_id(ctx).await else {
-            return HookResult::Skipped {
-                reason: "no workspace".to_string(),
-            };
-        };
-        let workspace = match WorkspaceRepo::get_by_id(&*ctx.db, &workspace_id).await {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => {
-                return HookResult::Skipped {
-                    reason: format!("workspace not found: {workspace_id}"),
-                };
-            }
-            Err(error) => {
-                return HookResult::Failed {
-                    reason: format!("workspace unavailable: {error}"),
-                };
-            }
-        };
-
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
-                return HookResult::Skipped {
-                    reason: "no plan checklist".to_string(),
-                };
-            }
-            Err(error) => {
-                return HookResult::Failed {
-                    reason: format!("plan checklist unreadable: {error}"),
-                };
-            }
-        };
-        let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
-        if summary.total == 0 || summary.remaining == 0 {
-            return HookResult::Ok;
-        }
-
-        HookResult::Failed {
-            reason: format!(
-                "Plan checklist incomplete: {} unchecked item(s) remain in ../plan.md. Continue working on the unchecked items, then update completed items to `- [x]` before stopping.",
-                summary.remaining
-            ),
-        }
     }
 }
 

@@ -41,7 +41,6 @@ async fn event_bus_creates_notification_and_api_manages_inbox() {
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now,
         },

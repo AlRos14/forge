@@ -108,7 +108,11 @@ impl TaskService {
         }
         let previous_status = task.status.clone();
         let role = target_role.clone().unwrap_or_else(|| "executor".to_owned());
-        let purpose = super::execution::execution_purpose_for_task_type(&task.task_type, &role);
+        let purpose = super::execution::execution_purpose_for_workflow_state(
+            &task.task_type,
+            &target_status,
+            &role,
+        );
         let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
             &self.db,
             &self.workspace_root,

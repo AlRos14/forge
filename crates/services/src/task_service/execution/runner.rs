@@ -443,35 +443,67 @@ impl TaskService {
         } else {
             None
         };
-        let invocation = super::harness_invocation_for_execution(
-            &self.db,
-            &execution,
-            execution.workspace_id.as_deref(),
-        )
-        .await?;
-        let usage_probe = self.task_executor.clone().and_then(|executor| {
-            super::spawn_account_usage_probe(
-                Arc::clone(&self.db),
-                execution.executor_config_snapshot_json.clone(),
-                execution_id.clone(),
-                executor,
+        let existing_plan_output = if execution.purpose == Some(ExecutionPurpose::Plan) {
+            db::CollaborationRepo::get_execution_artifact_output(
+                &*self.db,
+                &execution.id,
+                db::ArtifactKind::Plan,
             )
-        });
-        let execution_result = executor
-            .execute(ExecutionContext {
-                invocation,
-                task_id: task.id.clone(),
-                execution_id: execution_id.clone(),
-                role: execution.role.clone(),
-                worktree_path: workspace.worktree_path.clone(),
-                description,
-                agent_config,
-                logs_path: logs_path.clone(),
-                heartbeat_interval_seconds: 30,
-                max_turns,
-                log_sender: Some(log_tx),
+            .await?
+        } else {
+            None
+        };
+        let invocation = if existing_plan_output.is_some() {
+            api_types::HarnessInvocation::Start
+        } else {
+            super::harness_invocation_for_execution(
+                &self.db,
+                &execution,
+                execution.workspace_id.as_deref(),
+            )
+            .await?
+        };
+        let usage_probe = if existing_plan_output.is_some() {
+            None
+        } else {
+            self.task_executor.clone().and_then(|executor| {
+                super::spawn_account_usage_probe(
+                    Arc::clone(&self.db),
+                    execution.executor_config_snapshot_json.clone(),
+                    execution_id.clone(),
+                    executor,
+                )
             })
-            .await;
+        };
+        let execution_result = if let Some(artifact) = existing_plan_output.as_ref() {
+            let content = artifact.content.clone().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "persisted Plan Artifact output has no inline content",
+                )
+            })?;
+            Ok(executors::ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                assistant_output: Some(content.clone()),
+                summary: Some(content),
+                ..Default::default()
+            })
+        } else {
+            executor
+                .execute(ExecutionContext {
+                    invocation,
+                    task_id: task.id.clone(),
+                    execution_id: execution_id.clone(),
+                    role: execution.role.clone(),
+                    worktree_path: workspace.worktree_path.clone(),
+                    description,
+                    agent_config,
+                    logs_path: logs_path.clone(),
+                    heartbeat_interval_seconds: 30,
+                    max_turns,
+                    log_sender: Some(log_tx),
+                })
+                .await
+        };
         if let Some(probe) = usage_probe {
             probe.stop().await;
         }
@@ -510,6 +542,39 @@ impl TaskService {
                 "execution dispatch already stopped externally"
             );
             return Ok(current_execution);
+        }
+
+        if current_execution.purpose == Some(ExecutionPurpose::Plan)
+            && result.status == ExecutionOutcome::Completed
+            && existing_plan_output.is_none()
+        {
+            let output = result
+                .assistant_output
+                .as_deref()
+                .filter(|content| !content.trim().is_empty());
+            match output {
+                Some(output) => {
+                    if let Err(error) = crate::CollaborationService::new(
+                        Arc::clone(&self.db),
+                        Arc::clone(&self.event_bus),
+                    )
+                    .create_plan_artifact_from_execution(&current_execution.id, output)
+                    .await
+                    {
+                        result.status = ExecutionOutcome::Failed;
+                        result.error = Some(format!(
+                            "completed Plan Execution result could not be materialized: {error}"
+                        ));
+                    }
+                }
+                None => {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error = Some(
+                        "completed Plan Execution did not return a complete assistant result"
+                            .to_owned(),
+                    );
+                }
+            }
         }
 
         let executor_unavailable =
@@ -685,53 +750,6 @@ impl TaskService {
                     %error,
                     "failed to clear execution retry metadata"
                 );
-            }
-            if updated.role == crate::workflow::default_roles::PLANNER
-                && task.status == crate::workflow::default_states::PLANNING
-            {
-                let awaiting_reason =
-                    match super::persist_planner_result(&self.db, &task, &updated).await {
-                        Ok(reason) => reason,
-                        Err(error) => {
-                            tracing::warn!(task_id = %task.id, execution_id = %updated.id, %error,
-                            "planner result protocol failed");
-                            "planner_protocol_error"
-                        }
-                    };
-                if let Err(error) = super::set_planning_awaiting_review_metadata(
-                    &self.db,
-                    &task,
-                    Some(&updated.id),
-                    true,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to mark planning awaiting review"
-                    );
-                }
-                if awaiting_reason != "plan_review" {
-                    if let Ok(Some(current)) = TaskRepo::get_by_id(&*self.db, &task.id, false).await
-                    {
-                        if let Ok(mut metadata) =
-                            TaskMetadata::parse(current.metadata_json.as_deref())
-                        {
-                            metadata
-                                .extra
-                                .insert("awaiting_human_reason".to_owned(), json!(awaiting_reason));
-                            let _ = TaskRepo::set_metadata_json(
-                                &*self.db,
-                                &task.id,
-                                metadata.to_json(),
-                                &now_rfc3339(),
-                            )
-                            .await;
-                        }
-                    }
-                }
             }
         } else if updated.status == ExecutionStatus::Failed && max_turns_exceeded {
             if let Err(error) = self

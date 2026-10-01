@@ -279,7 +279,6 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: Some(Some(
                 json!({

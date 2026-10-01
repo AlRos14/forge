@@ -179,7 +179,6 @@ pub async fn update_task(
             description: request.description.map(Some),
             priority: request.priority,
             merge_config: serialize_json(request.merge_config)?.map(Some),
-            plan: request.plan.map(Some),
             error_annotation: None,
             blocked_json: None,
             failed_json: None,

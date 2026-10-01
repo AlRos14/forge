@@ -12,9 +12,10 @@ const progress: PlanProgressSummary = {
 }
 
 const artifact: PlanArtifactDetail = {
-  revision_id: 'revision-1',
-  revision: 1,
-  checkpoint: 'approved',
+  artifact_id: 'artifact-1',
+  task_id: 'task-1',
+  producer_execution_id: 'execution-1',
+  producer: { kind: 'human', id: 'user-1' },
   content_digest: 'sha256:plan',
   markdown: '- [x] Prepare rollout\n  - [x] Validate daemon health\n  - [ ] Clear cleanup backlog',
   items: [
@@ -23,7 +24,7 @@ const artifact: PlanArtifactDetail = {
     { checked: false, label: 'Clear cleanup backlog', nesting_level: 1, line_number: 3 },
   ],
   warnings: [],
-  last_modified: '2026-04-29T12:00:00Z',
+  created_at: '2026-04-29T12:00:00Z',
 }
 
 describe('PlanChecklist', () => {

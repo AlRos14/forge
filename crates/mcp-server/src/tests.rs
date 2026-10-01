@@ -339,7 +339,6 @@ async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: 
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
@@ -1414,8 +1413,14 @@ fn forge_update_task_updates_mutable_fields() {
         assert_eq!(result["title"], "Updated MCP");
         assert_eq!(result["description"], "changed");
         assert_eq!(result["priority"], 9);
-        assert_eq!(result["plan"], "test it");
+        assert!(result.get("plan").is_none());
         assert_eq!(result["version"], 2);
+        let stored_plan: Option<String> = sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
+            .bind(&task.id)
+            .fetch_one(state.db.pool())
+            .await
+            .expect("legacy Task.plan field remains readable for migration diagnostics");
+        assert!(stored_plan.is_none(), "MCP cannot write legacy Task.plan");
     });
 }
 
@@ -1730,7 +1735,6 @@ fn forge_create_sub_tasks_nested_rejected() {
                 subtask_order: Some(0),
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now,
             },

@@ -190,7 +190,6 @@ impl TaskService {
             priority: priority.unwrap_or(0),
             task_state_config,
             merge_config: serialize_config(merge_config)?,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -309,7 +308,6 @@ impl TaskService {
             priority: 0,
             task_state_config,
             merge_config: serialize_config(merge_config)?,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         };

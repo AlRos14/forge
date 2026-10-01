@@ -70,7 +70,7 @@ async fn lifecycle_database_fixture_covers_current_legacy_state_graph() {
     let workflow = default_workflow();
     let expected_statuses = [
         ("fixture-task-backlog", "backlog", StateKind::Backlog),
-        ("fixture-task-planning", "planning", StateKind::Gate),
+        ("fixture-task-planning", "planning", StateKind::Active),
         ("fixture-task-active", "in_progress", StateKind::Active),
         ("fixture-task-review", "review", StateKind::Gate),
         (
@@ -103,13 +103,7 @@ async fn lifecycle_database_fixture_covers_current_legacy_state_graph() {
                 (WorkflowTrigger::Reject, "cancelled"),
             ][..],
         ),
-        (
-            "planning",
-            &[
-                (WorkflowTrigger::Accept, "in_progress"),
-                (WorkflowTrigger::Reject, "planning"),
-            ][..],
-        ),
+        ("planning", &[(WorkflowTrigger::Accept, "in_progress")][..]),
         ("in_progress", &[(WorkflowTrigger::Accept, "review")][..]),
         (
             "review",

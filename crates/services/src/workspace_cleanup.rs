@@ -271,22 +271,6 @@ impl WorkspaceCleanupScheduler {
                     .await?;
             }
         }
-        match crate::plan_artifact::capture_plan_revision(
-            &self.db,
-            &workspace.task_id,
-            Path::new(&workspace.worktree_path),
-            "final",
-            None,
-        )
-        .await
-        {
-            Ok(_) | Err(crate::plan_artifact::PlanArtifactError::NotFound) => {}
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "workspace cleanup blocked because the final plan could not be persisted: {error}"
-                )))
-            }
-        }
         let manager = WorkspaceManager::new(self.workspace_root.clone());
         match manager.cleanup_worktree(&workspace.task_id).await {
             Ok(()) | Err(WorkspaceError::NotFound) => {}
@@ -315,10 +299,8 @@ impl WorkspaceCleanupScheduler {
         task_id: &str,
         work_unit_id: &str,
     ) -> Result<()> {
-        let process_locks = TaskIntegrationOperationManager::new(
-            Arc::clone(&self.db),
-            self.workspace_root.clone(),
-        );
+        let process_locks =
+            TaskIntegrationOperationManager::new(Arc::clone(&self.db), self.workspace_root.clone());
         let Some(_process_guard) = process_locks
             .try_work_unit_cleanup_task_lock(task_id)
             .await?
@@ -342,11 +324,9 @@ impl WorkspaceCleanupScheduler {
                     && scope.work_unit_id.as_deref() == Some(work_unit_id)
             });
         if !scope_matches {
-            return Err(
-                ServiceError::invalid_operation(
-                    "WorkUnit Workspace cleanup identity does not match its durable scope",
-                ),
-            );
+            return Err(ServiceError::invalid_operation(
+                "WorkUnit Workspace cleanup identity does not match its durable scope",
+            ));
         }
         let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
             .await?
@@ -639,7 +619,6 @@ mod tests {
                 priority: 0,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -716,7 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_persists_final_plan_before_removing_workspace() {
+    async fn cleanup_removes_workspace_without_legacy_plan_write() {
         let db = sqlite_db().await;
         let event_bus = Arc::new(EventBus::new(16));
         let temp = TempDir::new().expect("temp dir creates");
@@ -731,11 +710,6 @@ mod tests {
             "# Final plan\n\n- [x] Implement\n- [x] Verify\n",
         )
         .expect("plan writes");
-        let task_id: String = sqlx::query_scalar("SELECT task_id FROM workspace WHERE id = ?")
-            .bind(&workspace_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("workspace task loads");
         let scheduler =
             WorkspaceCleanupScheduler::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
 
@@ -745,15 +719,12 @@ mod tests {
             .expect("cleanup succeeds");
 
         assert!(!plan_path.exists());
-        let persisted: (String, String) = sqlx::query_as(
-            "SELECT checkpoint, markdown FROM task_plan_revision WHERE task_id = ? ORDER BY revision DESC LIMIT 1",
-        )
-        .bind(task_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("final plan revision persists");
-        assert_eq!(persisted.0, "final");
-        assert!(persisted.1.contains("- [x] Verify"));
+        let legacy_revision_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_revision")
+                .fetch_one(db.pool())
+                .await
+                .expect("legacy plan table remains queryable");
+        assert_eq!(legacy_revision_count, 0);
     }
 
     #[tokio::test]

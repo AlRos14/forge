@@ -53,27 +53,6 @@ export function taskHasError(task: Task): boolean {
   return !isStaleBlockingAnnotation(task)
 }
 
-export function getTaskWorkflowWarning(
-  task: TaskResponse,
-): { title: string; message: string } | null {
-  const remaining = task.plan_progress?.remaining ?? 0
-  const latest = task.execution_observability
-  if (
-    task.status !== 'in_progress' ||
-    remaining <= 0 ||
-    latest?.active_execution_id ||
-    latest?.latest_execution_status !== 'completed'
-  ) {
-    return null
-  }
-
-  const itemLabel = remaining === 1 ? 'item is' : 'items are'
-  return {
-    title: 'Plan checklist still open',
-    message: `${remaining} checklist ${itemLabel} unchecked. The latest execution completed, but the task will stay in progress until the checklist is complete.`,
-  }
-}
-
 export function isTaskBlocked(task: TaskResponse): boolean {
   if (task.blocked) return true
   return Boolean(getBlockingAnnotation(task))

@@ -103,7 +103,6 @@ pub struct ActiveExecutionSummary {
     #[ts(type = "Record<string, unknown> | null")]
     pub rate_limit_snapshot: Option<serde_json::Value>,
     pub effective_policy: Option<EffectiveExecutionPolicy>,
-    pub plan_progress: Option<PlanProgressSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -208,31 +207,21 @@ pub struct RecentErrorSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct PlanArtifactDetail {
-    pub revision_id: Option<String>,
-    pub revision: Option<i64>,
-    pub checkpoint: Option<String>,
+    pub artifact_id: String,
+    pub task_id: String,
+    pub producer_execution_id: String,
+    pub producer: crate::ActorRef,
     pub content_digest: Option<String>,
     pub markdown: String,
     pub items: Vec<PlanChecklistItem>,
     pub warnings: Vec<String>,
-    pub last_modified: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct TaskPlanRevisionSummary {
-    pub id: String,
-    pub revision: i64,
-    pub checkpoint: String,
-    pub content_digest: String,
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskPlanHistoryResponse {
-    pub current: Option<PlanArtifactDetail>,
-    pub revisions: Vec<TaskPlanRevisionSummary>,
+    pub artifacts: Vec<PlanArtifactDetail>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

@@ -336,7 +336,6 @@ async fn seed_awaiting_human_review_with_passed_flag(
                 .to_string(),
             ),
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },

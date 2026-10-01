@@ -177,7 +177,6 @@ async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annot
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -266,7 +265,6 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&stale_annotation).expect("annotation serializes"),
             )),
@@ -401,7 +399,6 @@ async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_a
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -550,7 +547,6 @@ async fn test_failed_task_supersedes_blocking_annotation() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -633,7 +629,6 @@ async fn test_annotation_hook_details_surface_as_failing_step() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(
                 serde_json::to_string(&annotation).expect("annotation serializes"),
             )),
@@ -692,7 +687,6 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
                 description: None,
                 priority: None,
                 merge_config: None,
-                plan: None,
                 error_annotation: None,
                 blocked_json: Some(Some(
                     json!({
@@ -756,7 +750,6 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: Some(Some(
                 json!({

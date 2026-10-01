@@ -303,12 +303,6 @@ fn dispatch_role_follow_up_impl(
             .await?
         };
         let execution_id = new_uuid_v4();
-        let logs_path = execution_logs_path(
-            &service.workspace_root,
-            &task.project_id,
-            &task_id,
-            &execution_id,
-        );
         // Establish the final Task state/version before minting the
         // execution-scoped WorkspaceLease. A transition after issuance would
         // immediately make the exact-version authority stale.
@@ -330,7 +324,6 @@ fn dispatch_role_follow_up_impl(
                     description: None,
                     priority: None,
                     merge_config: None,
-                    plan: None,
                     blocked_json: None,
                     failed_json: None,
                     task_state_config: None,
@@ -378,7 +371,9 @@ fn dispatch_role_follow_up_impl(
                     agent_message_id: None,
                     last_activity_at: None,
                     summary: Some(prompt),
-                    logs_path: Some(logs_path),
+                    // Pin exact Artifact inputs before start_execution records
+                    // its log path and launches the adapter.
+                    logs_path: None,
                     before_sha: None,
                     after_sha: None,
                     error: None,
@@ -390,6 +385,23 @@ fn dispatch_role_follow_up_impl(
                 false,
             )
             .await?;
+
+        if let Err(error) = service
+            .inherit_plan_artifact_inputs(&supplied_parent_execution.id, &execution.id, &task_id)
+            .await
+        {
+            if let Err(mark_error) = service
+                .fail_execution_before_dispatch(&execution.id, error.to_string())
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %mark_error,
+                    "failed to terminalize follow-up after Artifact input pin rejection"
+                );
+            }
+            return Err(error);
+        }
 
         tracing::info!(
             task_id = %task_id,

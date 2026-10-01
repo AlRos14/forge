@@ -15,7 +15,7 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task> {
-        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
+        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(input.repo_id.as_deref())
@@ -32,7 +32,6 @@ impl TaskRepo for SqliteDb {
             .bind(input.task_state_config.as_deref())
             .bind(input.merge_config.as_deref())
             .bind(Option::<&str>::None)
-            .bind(input.plan.as_deref())
             .bind(&input.created_at)
             .bind(&input.updated_at)
             .bind(&input.project_id)
@@ -376,9 +375,6 @@ impl TaskRepo for SqliteDb {
         if let Some(merge_config) = input.merge_config {
             task.merge_config = merge_config;
         }
-        if let Some(plan) = input.plan {
-            task.plan = plan;
-        }
         if let Some(error_annotation) = input.error_annotation {
             task.error_annotation = error_annotation;
         }
@@ -417,8 +413,6 @@ impl TaskRepo for SqliteDb {
             .push_bind(task.priority)
             .push(", merge_config = ")
             .push_bind(task.merge_config.as_deref())
-            .push(", plan = ")
-            .push_bind(task.plan.as_deref())
             .push(", error_annotation = ")
             .push_bind(task.error_annotation.as_deref());
         if set_blocked_json || clear_blocked_json {

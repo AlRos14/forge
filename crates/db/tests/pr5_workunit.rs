@@ -270,7 +270,6 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
             priority: 0,
             task_state_config: None,
             merge_config: None,
-            plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -359,11 +358,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
 fn cleanup_admission_attempt(
     fixture: &CleanupAdmissionFixture,
 ) -> (CreateWorkUnitExecution, CreateDomainEvent) {
-    let execution = running_execution(
-        &fixture.task_id,
-        &fixture.workspace_id,
-        &fixture.agent_id,
-    );
+    let execution = running_execution(&fixture.task_id, &fixture.workspace_id, &fixture.agent_id);
     let execution_id = execution.id.clone();
     let task = fixture.task_id.as_str();
     let lease = work_unit_lease(WorkUnitLeaseBinding {
@@ -488,19 +483,23 @@ async fn cleanup_claim_wins_and_database_rejects_work_unit_execution_admission()
 
     let (attempt, event) = cleanup_admission_attempt(&fixture);
     let execution_id = attempt.execution.id.clone();
-    assert!(WorkUnitExecutionRepo::create_for_work_unit(&competing_db, attempt, event)
-        .await
-        .is_err());
+    assert!(
+        WorkUnitExecutionRepo::create_for_work_unit(&competing_db, attempt, event)
+            .await
+            .is_err()
+    );
     let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE id = ?")
         .bind(execution_id)
         .fetch_one(competing_db.pool())
         .await
         .expect("rejected execution count");
-    let lease_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE workspace_id = ? AND status = 'active'")
-        .bind(&fixture.workspace_id)
-        .fetch_one(competing_db.pool())
-        .await
-        .expect("active lease count");
+    let lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_lease WHERE workspace_id = ? AND status = 'active'",
+    )
+    .bind(&fixture.workspace_id)
+    .fetch_one(competing_db.pool())
+    .await
+    .expect("active lease count");
     assert_eq!(execution_count, 0);
     assert_eq!(lease_count, 0);
 }
@@ -615,7 +614,6 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
                 subtask_order: None,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -797,7 +795,6 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
                 subtask_order: None,
                 task_state_config: None,
                 merge_config: None,
-                plan: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },

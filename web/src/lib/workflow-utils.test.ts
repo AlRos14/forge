@@ -4,7 +4,6 @@ import {
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
-  getTaskWorkflowWarning,
   outgoingWorkflowEdges,
   taskTypes,
   taskHasError,
@@ -179,36 +178,4 @@ describe('task interruption annotations', () => {
     expect(getStaleBlockingAnnotation(task)).toBeNull()
   })
 
-  it('warns when completed coder work cannot leave in-progress with an open plan', () => {
-    const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
-    task.plan_progress = {
-      total: 10,
-      completed: 6,
-      remaining: 4,
-      available: true,
-      warnings: [],
-    }
-
-    expect(getTaskWorkflowWarning(task)?.message).toContain('4 checklist items are unchecked')
-  })
-
-  it('does not warn while an execution is still running', () => {
-    const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
-    task.plan_progress = {
-      total: 10,
-      completed: 6,
-      remaining: 4,
-      available: true,
-      warnings: [],
-    }
-    task.execution_observability = {
-      ...task.execution_observability!,
-      active_execution_id: 'execution-running',
-      latest_execution_status: 'running',
-    }
-
-    expect(getTaskWorkflowWarning(task)).toBeNull()
-  })
 })

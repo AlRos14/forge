@@ -133,6 +133,7 @@ impl HookAction for DispatchRoleAgent {
                     &ctx.to_state,
                     ctx.state_config.clone(),
                     Some(selection.execution_policy.as_str()),
+                    ctx.execution_id.as_deref(),
                     &ctx.workflow,
                 )
                 .await
@@ -226,8 +227,9 @@ impl HookAction for DispatchRoleAgent {
                             parent_execution_id,
                             prompt.user,
                             trigger,
-                            crate::task_service::execution::execution_purpose_for_task_type(
+                            crate::task_service::execution::execution_purpose_for_workflow_state(
                                 &current_task.task_type,
+                                &current_task.status,
                                 role_name,
                             ),
                         )
@@ -329,15 +331,17 @@ impl HookAction for DispatchRoleAgent {
                 }
 
                 match service
-                    .dispatch_initial_role_execution_with_metadata(
+                    .dispatch_initial_role_execution_with_artifacts(
                         &ctx.task_id,
                         &agent.id,
                         role_name,
-                        crate::task_service::execution::execution_purpose_for_task_type(
+                        crate::task_service::execution::execution_purpose_for_workflow_state(
                             &current_task.task_type,
+                            &current_task.status,
                             role_name,
                         ),
                         prompt.user,
+                        dispatch_ctx.plan_artifact_ids.clone(),
                         Some(dispatch_metadata),
                     )
                     .await

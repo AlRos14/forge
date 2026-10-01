@@ -428,6 +428,10 @@ impl ProjectRepo for SqliteDb {
             "DELETE FROM workspace_scope WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM workspace_lease WHERE project_id = ?",
+            "DELETE FROM execution_artifact_input WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM execution_artifact_output WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "UPDATE execution SET work_unit_id = NULL, work_unit_version = NULL
              WHERE work_unit_id IS NOT NULL AND task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
@@ -439,6 +443,9 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM proposal_artifact WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM legacy_task_plan_artifact_migration WHERE plan_revision_id IN
+                 (SELECT r.id FROM task_plan_revision r JOIN task t ON t.id = r.task_id
+                  WHERE t.project_id = ?)",
             "DELETE FROM decision_actor WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM artifact_execution_producer WHERE task_id IN

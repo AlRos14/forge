@@ -3,8 +3,8 @@ use std::{path::Path, sync::Arc};
 use api_types::{
     ActiveExecutionSummary, AgentPressureSummary, BlockedTaskSummary, DaemonIssueSummary,
     DaemonPressureSummary, EffectiveExecutionPolicy, OperatorSeverity, OperatorStatusResponse,
-    PlanProgressSummary, RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary,
-    UsageSummary, WorkspaceCleanupSummary,
+    RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary, UsageSummary,
+    WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::SqliteDb;
@@ -12,11 +12,7 @@ use executors::{LogKind, LogReader};
 use serde_json::Value;
 use sqlx::{sqlite::SqliteRow, Row};
 
-use crate::{
-    agent_capacity::daemon_session_cap_from_labels,
-    plan_artifact::{read_plan_artifact, to_plan_progress_summary, PlanArtifactError},
-    ServiceError,
-};
+use crate::{agent_capacity::daemon_session_cap_from_labels, ServiceError};
 
 pub struct OperatorStatusService {
     db: Arc<SqliteDb>,
@@ -119,10 +115,6 @@ impl OperatorStatusService {
             let effective_policy =
                 effective_policy(snapshot_json.as_deref(), workspace_path.as_deref());
             let rate_limit_snapshot = rate_limit_snapshot(snapshot_json.as_deref());
-            let plan_progress = match workspace_path.clone() {
-                Some(workspace_path) => plan_progress(workspace_path).await?,
-                None => None,
-            };
             let log_snapshot =
                 execution_log_snapshot(row.try_get::<Option<String>, _>("logs_path")?).await;
             let token_totals = token_totals_from_row(&row)?;
@@ -148,7 +140,6 @@ impl OperatorStatusService {
                 token_totals,
                 rate_limit_snapshot,
                 effective_policy,
-                plan_progress,
             });
         }
 
@@ -727,32 +718,6 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn plan_progress(
-    workspace_path: String,
-) -> Result<Option<PlanProgressSummary>, ServiceError> {
-    tokio::task::spawn_blocking(move || plan_progress_blocking(&workspace_path))
-        .await
-        .map_err(|error| ServiceError::InvalidOperation {
-            message: format!("plan progress worker failed: {error}"),
-        })?
-}
-
-fn plan_progress_blocking(
-    workspace_path: &str,
-) -> Result<Option<PlanProgressSummary>, ServiceError> {
-    match read_plan_artifact(std::path::Path::new(workspace_path), None) {
-        Ok(artifact) => Ok(Some(to_plan_progress_summary(&artifact))),
-        Err(PlanArtifactError::NotFound) => Ok(None),
-        Err(error) => Ok(Some(PlanProgressSummary {
-            total: 0,
-            completed: 0,
-            remaining: 0,
-            available: false,
-            warnings: vec![error.to_string()],
-        })),
-    }
-}
-
 fn is_missing_table(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(database_error) => database_error.message().contains("no such table"),
@@ -768,10 +733,7 @@ mod tests {
     //! and assert the fields you care about. Tests are independent (in-memory SQLite per test).
 
     use super::*;
-    use std::fs;
-
     use db::{create_sqlite_pool, new_uuid_v4, run_migrations};
-    use tempfile::tempdir;
 
     async fn test_service() -> (Arc<SqliteDb>, OperatorStatusService) {
         let pool = create_sqlite_pool("sqlite::memory:")
@@ -960,50 +922,6 @@ mod tests {
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
         assert_eq!(status.active_executions.len(), 1);
         assert_eq!(status.active_executions[0].task_id, task_id);
-    }
-
-    #[tokio::test]
-    async fn running_execution_reports_plan_progress() {
-        let workspace_parent = tempdir().expect("tempdir creates");
-        let workspace_root = workspace_parent.path().join("worktree");
-        fs::create_dir_all(&workspace_root).expect("workspace dir creates");
-        fs::write(
-            workspace_parent.path().join("plan.md"),
-            "- [x] Task one\n- [x] Task two\n- [x] Task three\n- [ ] Task four\n- [ ] Task five\n",
-        )
-        .expect("plan writes");
-
-        let (db, service) = test_service().await;
-        let task_id = insert_task(&db, "in_progress").await;
-        let execution_id = insert_execution(&db, &task_id, "running", None, Utc::now()).await;
-        let cleanup_after = (Utc::now() + Duration::hours(1)).to_rfc3339();
-        let workspace_id = insert_workspace_at_path(
-            &db,
-            &task_id,
-            "ready",
-            &cleanup_after,
-            workspace_root.to_str().expect("workspace path is utf-8"),
-        )
-        .await;
-
-        sqlx::query("UPDATE execution SET workspace_id = ? WHERE id = ?")
-            .bind(&workspace_id)
-            .bind(&execution_id)
-            .execute(db.pool())
-            .await
-            .expect("execution workspace updates");
-
-        let status = service.compute_status().await.expect("status computes");
-
-        assert_eq!(status.active_executions.len(), 1);
-        let progress = status.active_executions[0]
-            .plan_progress
-            .as_ref()
-            .expect("plan progress exists");
-        assert_eq!(progress.total, 5);
-        assert_eq!(progress.completed, 3);
-        assert_eq!(progress.remaining, 2);
-        assert!(progress.available);
     }
 
     #[tokio::test]

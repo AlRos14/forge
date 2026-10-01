@@ -2,7 +2,6 @@ import type { InterruptionMetadata, Task } from '@/types/generated'
 import {
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
-  getTaskWorkflowWarning,
 } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
 
@@ -51,7 +50,6 @@ function InterruptionBanner({
 
 export function TaskBlockingBanner({ task }: { task: Task }) {
   const staleAnnotation = getStaleBlockingAnnotation(task)
-  const workflowWarning = getTaskWorkflowWarning(task)
   if (task.status === 'cancelled') return null
 
   if (task.failed) {
@@ -77,17 +75,6 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
               {staleAnnotation.blocked_execution_id}
             </p>
           ) : null}
-        </div>
-      </section>
-    )
-  }
-
-  if (workflowWarning) {
-    return (
-      <section className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
-        <div className="space-y-1.5">
-          <p className="text-sm font-semibold">{workflowWarning.title}</p>
-          <p className="text-sm">{workflowWarning.message}</p>
         </div>
       </section>
     )

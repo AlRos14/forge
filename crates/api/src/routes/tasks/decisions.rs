@@ -93,14 +93,9 @@ pub async fn answer_task_decision(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    state.task_service.dispatch_role_follow_up(
-        &task_id,
-        services::workflow::default_roles::PLANNER,
-        execution_id,
-        format!("The authorized user answered the pending questions:\n{}\n\nRevise the plan and emit a new FORGE_RESULT.", request.answers),
-        "decision_answered",
-        db::ExecutionPurpose::Plan,
-    ).await?;
+    // V082 TaskDecisionRequest rows are legacy question records. New planning
+    // results no longer create them, and answering one must not silently start
+    // another Plan Execution. New Actor questions use generic Handoffs.
     let updated = sqlx::query(
         "SELECT id, task_id, execution_id, role, authority_scope, questions_json,
                 context, status, created_at FROM task_decision_request WHERE id = ?",

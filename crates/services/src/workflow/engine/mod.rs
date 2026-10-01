@@ -409,7 +409,6 @@ impl WorkflowEngine {
                     description: None,
                     priority: None,
                     merge_config: None,
-                    plan: None,
                     error_annotation: Some(None),
                     blocked_json: Some(None),
                     failed_json: None,
@@ -1886,7 +1885,7 @@ fn semantic_default_workflow(task_type: &str) -> WorkflowDefinition {
         state.dispatch = Some(WorkflowDispatch {
             builder: Some(
                 if task_type == "planning" {
-                    "planner.default.v2"
+                    "generic.default.v2"
                 } else {
                     "worker.autonomous.v1"
                 }
@@ -1969,7 +1968,6 @@ mod resolve_workflow_tests {
             task_state_config: None,
             merge_config: None,
             metadata_json: None,
-            plan: None,
             blocked_json: None,
             failed_json: None,
             error_annotation: None,

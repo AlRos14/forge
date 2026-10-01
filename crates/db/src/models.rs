@@ -1099,7 +1099,6 @@ pub struct Task {
     pub task_state_config: Option<String>,
     pub merge_config: Option<String>,
     pub metadata_json: Option<String>,
-    pub plan: Option<String>,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub failed_json: Option<String>,
@@ -3217,6 +3216,23 @@ pub struct CreateArtifact {
     pub metadata_json: String,
     pub digest: Option<String>,
     pub producer_execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionArtifactOutputWrite {
+    pub artifact: Artifact,
+    /// Present only when this call committed the new Artifact and its event.
+    /// Replays return the existing exact Artifact without emitting a second event.
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionArtifactInput {
+    pub execution_id: String,
+    pub artifact_id: String,
+    pub task_id: String,
+    pub digest: Option<String>,
     pub created_at: String,
 }
 

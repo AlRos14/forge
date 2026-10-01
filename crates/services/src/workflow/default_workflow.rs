@@ -85,7 +85,7 @@ pub fn default_workflow() -> WorkflowDefinition {
         ),
         state(
             default_states::PLANNING,
-            StateKind::Gate,
+            StateKind::Active,
             "In Progress",
             "Planning",
             Some(default_roles::PLANNER),
@@ -105,10 +105,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             Some(default_roles::CODER),
             CanonicalPhase::Working,
             StateHooks {
-                before_exit: vec![
-                    blocking_hook("subtask_sequence_complete"),
-                    blocking_hook("require_plan_checklist_complete"),
-                ],
+                before_exit: vec![blocking_hook("subtask_sequence_complete")],
                 before_enter: vec![blocking_hook("run_before_work_hooks")],
                 on_enter: vec![hook("dispatch_role_agent")],
                 ..StateHooks::default()
@@ -203,34 +200,14 @@ pub fn default_workflow() -> WorkflowDefinition {
         }
         if state.name == default_states::PLANNING {
             state.dispatch = Some(WorkflowDispatch {
-                builder: Some("planner.default.v2".to_string()),
+                builder: Some("generic.default.v2".to_string()),
                 execution_policy: None,
                 prompt: None,
-            });
-            state.config = json!({
-                "prompt": {
-                    "user_append": ""
-                }
-            });
-            state.gate_config = Some(GateConfig {
-                reject_target: Some(default_states::PLANNING.to_string()),
-                max_rejections: Some(2),
-                approve_label: Some("Approve plan".to_string()),
-                reject_label: Some("Reject plan".to_string()),
-                requires_user_approval: Some(true),
-                optional_when_unassigned: Some(true),
             });
             state.triggers.insert(
                 WorkflowTrigger::Accept,
                 WorkflowTriggerDefinition {
                     to: default_states::IN_PROGRESS.to_string(),
-                    dispatch: None,
-                },
-            );
-            state.triggers.insert(
-                WorkflowTrigger::Reject,
-                WorkflowTriggerDefinition {
-                    to: default_states::PLANNING.to_string(),
                     dispatch: None,
                 },
             );
@@ -486,20 +463,6 @@ pub fn default_workflow() -> WorkflowDefinition {
                 binding: WorkflowConfigBinding::GateConfig {
                     state: default_states::MERGING.to_string(),
                     field: "max_rejections".to_string(),
-                },
-            },
-            WorkflowConfigField {
-                id: "planner_prompt_instructions".to_string(),
-                label: "Planner prompt instructions".to_string(),
-                description: Some(
-                    "Extra instructions appended to planner dispatch prompts.".to_string(),
-                ),
-                value_type: WorkflowConfigValueType::Text,
-                min: None,
-                default_value: Some(json!("")),
-                binding: WorkflowConfigBinding::StateConfig {
-                    state: default_states::PLANNING.to_string(),
-                    path: vec!["prompt".to_string(), "user_append".to_string()],
                 },
             },
             WorkflowConfigField {

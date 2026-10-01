@@ -109,19 +109,14 @@ impl CodexAdapter {
             &["--resume", "--resume-thread"],
             &["--continue"],
         );
-        match &ctx.invocation {
-            executors::HarnessInvocation::Start => {
-                config.resume_thread_id = None;
-                config.resume_thread_in_place = None;
-                config.resume_fallback_prompt = None;
-            }
-            executors::HarnessInvocation::Resume {
-                external_session_id,
-            } => {
-                config.resume_thread_id = Some(external_session_id.clone());
-                config.resume_thread_in_place = Some(true);
-                config.resume_fallback_prompt = None;
-            }
+        if let Some(external_session_id) = ctx.invocation.external_session_id() {
+            config.resume_thread_id = Some(external_session_id.to_owned());
+            config.resume_thread_in_place = Some(true);
+            config.resume_fallback_prompt = None;
+        } else {
+            config.resume_thread_id = None;
+            config.resume_thread_in_place = None;
+            config.resume_fallback_prompt = None;
         }
         config
     }
@@ -1586,7 +1581,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"root-turn"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"agentMessage","text":"Child review complete"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":false,"error":{"message":"child failed"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"agentMessage","text":"Root plan ready\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"plan_ready\"}"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"agentMessage","text":"Root plan ready"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn"}}}'
 "#,
         )
@@ -1620,10 +1615,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 
         assert_eq!(result.status, ExecutionOutcome::Completed);
         assert_eq!(result.agent_session_id.as_deref(), Some("root-thread"));
-        assert_eq!(
-            result.summary.as_deref(),
-            Some("Root plan ready\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"plan_ready\"}")
-        );
+        assert_eq!(result.summary.as_deref(), Some("Root plan ready"));
         assert_eq!(result.error, None);
 
         let logs = fs::read_to_string(dir.path().join("codex.jsonl")).expect("logs written");

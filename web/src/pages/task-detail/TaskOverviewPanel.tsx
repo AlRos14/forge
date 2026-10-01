@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { FastForwardIcon as FastForward } from '@phosphor-icons/react'
 import { toast } from 'sonner'
-import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
+import { useMembersQuery, useProjectAgentsQuery, useTaskPlanQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanDocument } from '@/components/plan-document'
 import { TaskDecisionRequests } from '@/components/task-decision-requests'
@@ -175,6 +175,8 @@ export function TaskOverviewPanel({
   const [rejectReasonDraft, setRejectReasonDraft] = useState('')
 
   const projectId = task?.project_id ?? ''
+  const { data: planHistory } = useTaskPlanQuery(task?.id ?? '')
+  const planArtifacts = planHistory?.artifacts ?? (task?.plan_artifact ? [task.plan_artifact] : [])
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
   const workflowExceptionActions = task?.workflow_exception?.actions ?? []
@@ -463,9 +465,16 @@ export function TaskOverviewPanel({
             <TaskPrSummaryCard task={task} />
             <TaskDecisionRequests taskId={task.id} />
 
-            {task.plan_artifact ? (
+            {planArtifacts.length > 0 ? (
               <div id="task-plan" className="scroll-mt-4">
-                <PlanDocument artifact={task.plan_artifact} />
+                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Plan Artifacts
+                </p>
+                <div className="space-y-3">
+                  {planArtifacts.map((artifact) => (
+                    <PlanDocument key={artifact.artifact_id} artifact={artifact} />
+                  ))}
+                </div>
               </div>
             ) : null}
 

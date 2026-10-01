@@ -78,9 +78,9 @@ export function PlanChecklist({
 
       {expanded && (
         <div className="border-t px-3 pb-3 pt-2 space-y-2">
-          {artifact?.revision ? (
+          {artifact ? (
             <p className="font-mono text-micro text-muted-foreground">
-              Revision {artifact.revision} · {artifact.checkpoint} · {artifact.content_digest?.slice(0, 12)}
+              Artifact {artifact.artifact_id} · {artifact.producer.kind}:{artifact.producer.id}
             </p>
           ) : null}
           {warnings.length > 0 ? (

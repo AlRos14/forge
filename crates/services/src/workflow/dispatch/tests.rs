@@ -4,11 +4,10 @@ use crate::workflow::{
     default_roles, default_states,
     dispatch::{
         apply_prompt_overrides, build_effective_prompt, effective_prompt_selection,
-        generic_prompt::GenericPromptBuilder, planner_prompt::PlannerPromptBuilder,
-        resolve_prompt_builder, reviewer_prompt::ReviewerPromptBuilder, AgentDispatchContext,
-        DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
-        BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2,
-        BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2,
+        generic_prompt::GenericPromptBuilder, resolve_prompt_builder,
+        reviewer_prompt::ReviewerPromptBuilder, AgentDispatchContext, DispatchIntent,
+        PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2, BUILDER_ID_CODER_MERGE_FIX_V2,
+        BUILDER_ID_CODER_REVIEW_FIX_V2, BUILDER_ID_GENERIC_DEFAULT_V2,
         BUILDER_ID_REVIEWER_DEFAULT_V2, BUILDER_ID_WORKER_AUTONOMOUS_V1,
         BUILDER_ID_WORKER_MERGE_FIX_V1, BUILDER_ID_WORKER_REVIEW_FIX_V1,
     },
@@ -33,7 +32,6 @@ fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
         task_state_config: None,
         merge_config: None,
         metadata_json: None,
-        plan: None,
         error_annotation: None,
         blocked_json: None,
         failed_json: None,
@@ -75,6 +73,7 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         transition_log: Vec::new(),
         comments: Vec::new(),
         plan: Some("1. Load context\n2. Build prompt".to_string()),
+        plan_artifact_ids: Vec::new(),
         review_evidence: None,
         prior_reviews: Vec::new(),
         parent_task: None,
@@ -129,15 +128,6 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
                 "Reviewer boundary:",
                 "Must remain read-only",
                 "Must not edit files, stage changes, commit changes",
-            ],
-        ),
-        (
-            BUILDER_ID_PLANNER_DEFAULT_V2,
-            default_roles::PLANNER,
-            vec![
-                "Planner boundary:",
-                "Must investigate enough to produce an executable plan",
-                "Must not modify code or mark implementation items done",
             ],
         ),
         (
@@ -442,79 +432,16 @@ fn reviewer_prompt_reads_ci_steps_from_review_config() {
 }
 
 #[test]
-fn planner_prompt_includes_parent_task_context() {
-    let mut ctx = fake_context(default_roles::PLANNER);
-    ctx.parent_task = Some(fake_task(
-        "parent-task",
-        "Parent workflow task",
-        Some("Parent description for planning context."),
-    ));
-
-    let prompt = PlannerPromptBuilder.build(&ctx);
-
-    assert!(prompt.user.contains("Parent task"));
-    assert!(prompt.user.contains("Parent workflow task"));
-    assert!(prompt
-        .user
-        .contains("Parent description for planning context."));
-}
-
-#[test]
-fn planner_prompt_includes_current_plan_latest_rejection_and_comments() {
+fn planner_role_uses_generic_prompt_without_a_plan_protocol() {
     let mut ctx = fake_context(default_roles::PLANNER);
     ctx.state_name = default_states::PLANNING.to_owned();
-    ctx.plan = Some("# Existing plan\n\n- Preserve the provider boundary.".to_owned());
-    ctx.transition_log = vec![
-        db::TransitionLog {
-            id: "transition-old".to_owned(),
-            task_id: ctx.task.id.clone(),
-            from_state: default_states::PLANNING.to_owned(),
-            to_state: default_states::PLANNING.to_owned(),
-            trigger_name: Some("reject".to_owned()),
-            triggered_by: "user:api".to_owned(),
-            trigger_reason: "gate rejected: old feedback".to_owned(),
-            hook_results_json: None,
-            rejection: true,
-            created_at: "2026-04-17T00:00:00Z".to_owned(),
-        },
-        db::TransitionLog {
-            id: "transition-latest".to_owned(),
-            task_id: ctx.task.id.clone(),
-            from_state: default_states::PLANNING.to_owned(),
-            to_state: default_states::PLANNING.to_owned(),
-            trigger_name: Some("reject".to_owned()),
-            triggered_by: "user:api".to_owned(),
-            trigger_reason: "gate rejected: keep canonical identity separate".to_owned(),
-            hook_results_json: None,
-            rejection: true,
-            created_at: "2026-04-17T00:01:00Z".to_owned(),
-        },
-    ];
-    ctx.comments = vec![db::TaskComment {
-        id: "comment-1".to_owned(),
-        task_id: ctx.task.id.clone(),
-        author_type: db::CommentAuthorType::User,
-        author_id: Some("user-1".to_owned()),
-        author_name: "Alejandro".to_owned(),
-        content: "Keep the phases independently testable.".to_owned(),
-        created_at: "2026-04-17T00:02:00Z".to_owned(),
-        updated_at: "2026-04-17T00:02:00Z".to_owned(),
-    }];
-
-    let prompt = PlannerPromptBuilder.build(&ctx);
-
-    assert!(prompt.user.contains("Current plan to revise:"));
-    assert!(prompt.user.contains("Preserve the provider boundary."));
-    assert!(prompt
-        .user
-        .contains("User feedback from the latest rejected plan:"));
-    assert!(prompt
-        .user
-        .contains("gate rejected: keep canonical identity separate"));
-    assert!(!prompt.user.contains("gate rejected: old feedback"));
-    assert!(prompt
-        .user
-        .contains("Alejandro: Keep the phases independently testable."));
+    let selection = effective_prompt_selection(default_roles::PLANNER, None, None);
+    assert_eq!(selection.builder_id, BUILDER_ID_GENERIC_DEFAULT_V2);
+    let prompt = resolve_prompt_builder(&selection.builder_id).build(&ctx);
+    assert!(prompt.user.contains("\"role\": \"planner\""));
+    assert!(!prompt.system.contains("write_plan"));
+    assert!(!prompt.user.contains("FORGE_RESULT"));
+    assert!(!prompt.user.contains("plan.md"));
 }
 
 #[test]
@@ -536,7 +463,7 @@ fn generic_prompt_dumps_core_context_for_unknown_role() {
 #[test]
 fn prompt_overrides_replace_and_append_from_state_config() {
     let prompt = apply_prompt_overrides(
-        resolve_prompt_builder(BUILDER_ID_PLANNER_DEFAULT_V2)
+        resolve_prompt_builder(BUILDER_ID_GENERIC_DEFAULT_V2)
             .build(&fake_context(default_roles::PLANNER)),
         &json!({
             "system": "Use the project planning rubric.",
@@ -553,7 +480,7 @@ fn prompt_overrides_replace_and_append_from_state_config() {
     assert!(prompt
         .user
         .starts_with("Workflow note: split risky work first."));
-    assert!(prompt.user.contains("Plan task: Add dispatch context"));
+    assert!(prompt.user.contains("\"title\": \"Add dispatch context\""));
     assert!(prompt.user.contains("Return concise checklist updates."));
 }
 

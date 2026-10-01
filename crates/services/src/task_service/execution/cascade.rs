@@ -334,7 +334,11 @@ impl TaskService {
                         agent_id: Some(agent_id.clone()),
                         actor_ref: Some(db::ActorRef::Agent(agent_id)),
                         purpose: Some(execution.purpose.clone().unwrap_or_else(|| {
-                            execution_purpose_for_task_type(&task.task_type, &execution.role)
+                            execution_purpose_for_workflow_state(
+                                &task.task_type,
+                                &task.status,
+                                &execution.role,
+                            )
                         })),
                         harness_session_id,
                         role: execution.role.clone(),
@@ -1463,7 +1467,6 @@ impl TaskService {
                         description: None,
                         priority: None,
                         merge_config: None,
-                        plan: None,
                         error_annotation: Some(Some(annotation.to_string())),
                         blocked_json: Some(Some(blocked_meta.to_string())),
                         failed_json: Some(None),

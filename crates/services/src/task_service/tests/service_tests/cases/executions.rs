@@ -1,6 +1,6 @@
 use super::super::*;
 use api_types::ActorRef;
-use db::{CoordinationMode, TaskRoleRepo};
+use db::{CollaborationRepo, CoordinationMode, TaskRoleRepo};
 
 #[tokio::test]
 async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
@@ -311,16 +311,17 @@ async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
 }
 
 #[tokio::test]
-async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
+async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(PlannerReadyExecutor))
+        .with_task_executor(Arc::new(PlanOutputExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    let human_id = seed_human_user(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
@@ -328,6 +329,31 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
         crate::workflow::default_states::PLANNING.to_owned(),
     )
     .await;
+    service
+        .create_task_role(
+            &task.id,
+            crate::workflow::default_roles::PLANNER,
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("planner TaskRole creates");
+    service
+        .add_task_role_member(
+            &task.id,
+            crate::workflow::default_roles::PLANNER,
+            ActorRef::Agent(agent_id.clone()),
+        )
+        .await
+        .expect("Agent planner membership creates");
+    service
+        .add_task_role_member(
+            &task.id,
+            crate::workflow::default_roles::PLANNER,
+            ActorRef::Human(human_id.clone()),
+        )
+        .await
+        .expect("Human planner membership creates");
 
     let execution = service
         .dispatch_initial_role_execution(
@@ -338,7 +364,7 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
             "plan the task".to_owned(),
         )
         .await
-        .expect("planner dispatch succeeds");
+        .expect("Plan Execution dispatch succeeds");
 
     let completed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
@@ -353,58 +379,276 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
         }
     })
     .await
-    .expect("planner execution completes");
-    let task = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    .expect("Plan Execution completes");
+    assert_eq!(completed.purpose, Some(db::ExecutionPurpose::Plan));
+    assert_eq!(
+        completed.actor_ref(),
+        Some(db::ActorRef::Agent(agent_id.clone()))
+    );
+
+    let first = CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &completed.id,
+        db::ArtifactKind::Plan,
+    )
+    .await
+    .expect("Plan output loads")
+    .expect("Plan output exists");
+    assert_eq!(first.task_id, task.id);
+    assert_eq!(first.producer_execution_id, completed.id);
+    assert_eq!(first.producer, db::ActorRef::Agent(agent_id.clone()));
+    assert_eq!(first.content.as_deref(), Some("- [x] verify plan\n"));
+
+    let downstream = db::ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            purpose: Some(db::ExecutionPurpose::Implement),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(completed.id.clone()),
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("Implement from the selected plan".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("downstream Execution creates");
+    let collaboration = crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    collaboration
+        .pin_execution_artifact_input(&downstream.id, &first.id)
+        .await
+        .expect("downstream input pins exact Artifact");
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&downstream.id)
+        .execute(db.pool())
+        .await
+        .expect("downstream fixture completes");
+
+    let second_execution = service
+        .dispatch_initial_role_execution(
+            &task.id,
+            &agent_id,
+            crate::workflow::default_roles::PLANNER,
+            db::ExecutionPurpose::Plan,
+            "plan the task again".to_owned(),
+        )
+        .await
+        .expect("second Plan Execution dispatches");
+    let second_execution = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+            let current = ExecutionRepo::get_by_id(&*db, &second_execution.id)
                 .await
-                .expect("task loads")
-                .expect("task exists");
-            let metadata = task.metadata().expect("metadata parses");
-            if metadata
-                .extra
-                .get("awaiting_human_reason")
-                .and_then(Value::as_str)
-                == Some("plan_review")
-            {
-                break task;
+                .expect("second Execution loads")
+                .expect("second Execution exists");
+            if current.status == ExecutionStatus::Completed {
+                break current;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("planner completion marks task awaiting plan review");
-    let metadata = task.metadata().expect("metadata parses");
-    assert_eq!(
-        metadata
-            .extra
-            .get("awaiting_human_reason")
-            .and_then(Value::as_str),
-        Some("plan_review")
-    );
-    assert_eq!(
-        metadata
-            .extra
-            .get("planning_execution_id")
-            .and_then(Value::as_str),
-        Some(completed.id.as_str())
-    );
-    assert!(service
-        .is_awaiting_human(task.id.clone())
-        .await
-        .expect("awaiting human resolves"));
+    .expect("second Plan Execution completes");
+    let second = CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &second_execution.id,
+        db::ArtifactKind::Plan,
+    )
+    .await
+    .expect("second Plan output loads")
+    .expect("second Plan output exists");
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.content.as_deref(), Some("- [x] verify plan\n"));
+    assert_eq!(second.producer_execution_id, second_execution.id);
 
-    let approved = service
+    let retry = collaboration
+        .create_plan_artifact_from_execution(&completed.id, "- [x] verify plan\n")
+        .await
+        .expect("same Plan output retry succeeds");
+    assert_eq!(retry.id, first.id);
+
+    let pinned = CollaborationRepo::list_execution_artifact_inputs(&*db, &downstream.id)
+        .await
+        .expect("pinned inputs load");
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].artifact_id, first.id);
+    assert_eq!(pinned[0].digest, first.digest);
+
+    let human_execution = collaboration
+        .start_human_plan_execution(&task.id, &human_id)
+        .await
+        .expect("Human Plan Execution starts");
+    assert_eq!(human_execution.purpose, Some(db::ExecutionPurpose::Plan));
+    assert_eq!(
+        human_execution.actor_ref(),
+        Some(db::ActorRef::Human(human_id.clone()))
+    );
+    assert!(human_execution.agent_id.is_none());
+    assert!(human_execution.harness_session_id.is_none());
+    let human_artifact = collaboration
+        .complete_human_plan_execution(
+            &human_execution.id,
+            &human_id,
+            "- [ ] Human-authored plan\n",
+        )
+        .await
+        .expect("Human Plan Execution completes");
+    assert_eq!(human_artifact.task_id, task.id);
+    assert_eq!(human_artifact.producer_execution_id, human_execution.id);
+    assert_eq!(human_artifact.producer, db::ActorRef::Human(human_id));
+
+    let artifact_count_before_legacy_human_approval: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Plan Artifact count loads before lifecycle transition");
+    let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task loads before lifecycle transition")
+        .expect("Task exists");
+    let transitioned = service
         .transition(
             task.id.clone(),
             crate::workflow::default_states::IN_PROGRESS.to_owned(),
-            task.version,
+            current_task.version,
         )
         .await
-        .expect("planning approval succeeds");
-    let metadata = approved.task.metadata().expect("metadata parses");
-    assert!(metadata.extra.get("awaiting_human").is_none());
-    assert!(metadata.extra.get("awaiting_human_reason").is_none());
+        .expect("Human continuation does not require a plan approval gate");
+    assert_eq!(
+        transitioned.task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+    let artifact_count_after_legacy_human_approval: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Plan Artifact count loads after lifecycle transition");
+    assert_eq!(
+        artifact_count_after_legacy_human_approval, artifact_count_before_legacy_human_approval,
+        "Human lifecycle continuation does not clone or rewrite the plan"
+    );
+
+    let revision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_revision")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy revisions count");
+    let approval_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_approval")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy approvals count");
+    assert_eq!(revision_count, 0);
+    assert_eq!(approval_count, 0);
+    let legacy_task_plan: Option<String> = sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("physical legacy Task.plan field remains");
+    assert!(legacy_task_plan.is_none());
+}
+
+#[tokio::test]
+async fn plan_artifact_output_is_idempotent_across_sqlite_connections() {
+    let database_dir = TempDir::new().expect("database temp dir creates");
+    let database_url = format!("sqlite://{}", database_dir.path().join("pr7.db").display());
+    let first_pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("first pool creates");
+    db::run_migrations(&first_pool)
+        .await
+        .expect("migrations run");
+    let first_db = Arc::new(db::SqliteDb::new(first_pool));
+    let second_db = Arc::new(db::SqliteDb::new(
+        db::create_sqlite_pool(&database_url)
+            .await
+            .expect("second pool creates"),
+    ));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&first_db).await;
+    let agent_id = seed_agent(&first_db).await;
+    let task = seed_task_with_status(&first_db, &project_id, &repo_id, "planning".to_owned()).await;
+    let now = now_rfc3339();
+    let execution_id = db::new_uuid_v4();
+    db::ExecutionRepo::create(
+        &*first_db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(db::ExecutionPurpose::Plan),
+            harness_session_id: None,
+            role: "planner".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("plan complete".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Plan Execution creates");
+
+    let first_service =
+        crate::CollaborationService::new(Arc::clone(&first_db), Arc::new(EventBus::new(8)));
+    let second_service =
+        crate::CollaborationService::new(Arc::clone(&second_db), Arc::new(EventBus::new(8)));
+    let markdown = "# Same exact plan\n";
+    let (first, second) = tokio::join!(
+        first_service.create_plan_artifact_from_execution(&execution_id, markdown),
+        second_service.create_plan_artifact_from_execution(&execution_id, markdown),
+    );
+    let first = first.expect("first process materializes the output");
+    let second = second.expect("second process observes the same output");
+    assert_eq!(first.id, second.id);
+
+    let output_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_artifact_output
+         WHERE execution_id = ? AND kind = 'plan'",
+    )
+    .bind(&execution_id)
+    .fetch_one(first_db.pool())
+    .await
+    .expect("one output binding remains");
+    let artifact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+            .bind(&task.id)
+            .fetch_one(first_db.pool())
+            .await
+            .expect("plan Artifacts count");
+    assert_eq!(output_count, 1);
+    assert_eq!(artifact_count, 1);
 }
 
 #[tokio::test]
@@ -2151,7 +2395,6 @@ async fn follow_up_execution_on_blocked_task() {
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: None,
             blocked_json: Some(Some(
                 r#"{"reason":"test block","created_at":"2026-04-28T00:00:00Z","kind":"ci_failed"}"#
@@ -2605,7 +2848,6 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
             description: None,
             priority: None,
             merge_config: None,
-            plan: None,
             error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
@@ -2672,63 +2914,6 @@ impl TaskExecutor for PendingExecutor {
 }
 
 #[tokio::test]
-async fn executor_completion_guard_rejection_follows_up_before_blocking() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service =
-        TaskService::new(Arc::clone(&db), event_bus).with_task_executor(Arc::new(PendingExecutor));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let workspace = seed_workspace_with_plan(&db, &task, "- [ ] finish implementation\n").await;
-    let execution =
-        seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
-
-    service
-        .maybe_cascade_executor_completion(&execution.id)
-        .await
-        .expect("guard rejection dispatches follow-up");
-
-    let executions = ExecutionRepo::list_by_task(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 20,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .expect("executions load");
-    let resumed = executions
-        .items
-        .iter()
-        .find(|candidate| candidate.status == ExecutionStatus::Running)
-        .expect("lease-backed follow-up exists");
-    assert_eq!(
-        resumed.parent_execution_id.as_deref(),
-        Some(execution.id.as_str())
-    );
-    let execution = ExecutionRepo::get_by_id(&*db, &resumed.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution.status, ExecutionStatus::Running);
-    assert!(execution.summary.as_deref().is_some_and(|summary| {
-        summary.contains("Workflow guard failed: require_plan_checklist_complete")
-    }));
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let metadata = task.metadata().expect("metadata parses");
-    assert_eq!(metadata.extra["workflow_guard_retry_count"], json!(1));
-    assert!(task.blocked_json.is_none());
-}
-
-#[tokio::test]
 async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_follow_up() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -2790,53 +2975,6 @@ async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_fol
     let metadata = task.metadata().expect("metadata parses");
     assert!(metadata.extra.get("workflow_guard_retry_count").is_none());
     assert!(task.blocked_json.is_none());
-}
-
-#[tokio::test]
-async fn executor_completion_guard_rejection_blocks_when_retry_budget_exhausted() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let task = TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: Some(Some(r#"{"retry_budgets":{"execution":0}}"#.to_owned())),
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task config updates");
-    let workspace = seed_workspace_with_plan(&db, &task, "- [ ] finish implementation\n").await;
-    let execution =
-        seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
-
-    service
-        .maybe_cascade_executor_completion(&execution.id)
-        .await
-        .expect("guard rejection blocks after exhausted budget");
-
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let blocked = task.blocked_json.expect("task blocked");
-    assert!(blocked.contains("workflow_guard_rejected"));
-    let annotation = task.error_annotation.expect("annotation recorded");
-    assert!(annotation.contains("require_plan_checklist_complete"));
 }
 
 #[tokio::test]

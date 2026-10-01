@@ -329,7 +329,8 @@ serialize independent WorkUnit workspace execution.
 
 An Execution start/bind entry point is currently available through the typed
 service path; no WorkUnit scheduler or automatic dispatch endpoint is exposed.
-WorkUnit planning remains separate from legacy Task plans until PR7.
+A WorkUnit may reference an exact generic Plan Artifact, but it does not contain
+or synchronize plan content.
 
 ## Generic collaboration records (Plan PR4, extended by PR5)
 
@@ -604,18 +605,24 @@ harness-bound identity and explicit failover contract.
 
 Task evidence routes:
 
-- `GET /api/v1/tasks/{id}/plan` returns the latest immutable full-Markdown plan
-  plus its revision history. Filesystem source paths are never exposed.
-- `GET /api/v1/tasks/{id}/decisions` lists planner/reviewer decision requests.
-- `POST /api/v1/tasks/{id}/decisions/{request_id}/answer` records a
-  principal-bound Task answer and resumes the planner. Project-scope, policy,
-  and risk requests must instead be resolved through a Project Decision and
-  baseline reconciliation.
+- `GET /api/v1/tasks/{id}/plan` is a read-only compatibility projection over
+  generic `Artifact(kind=plan)` records. It returns up to 100 Artifacts in
+  newest-first order, each with its exact Artifact id, producer Execution and
+  Actor, digest, timestamp, full Markdown, and derived checklist display data.
+  It does not expose legacy revision or approval state. A displayed newest
+  Artifact is not an implicit input selection for another Execution; consumers
+  pin the exact Artifact they receive.
+- `GET /api/v1/tasks/{id}/decisions` may return historical V082
+  TaskDecisionRequests. New planning Executions do not create these records.
+  Answering a historical request records the Human answer without resuming or
+  creating a planner Execution. New Actor questions use generic collaboration
+  Handoffs with `question` or `answer` intent.
 
-Review responses include the immutable evidence bundle identity, bound plan
-revision/digest, base/head SHA, diff digest, fresh-session provenance, actual CI
-results, and the structured reviewer result. A changed head makes the verdict
-stale and prevents an automatic pass.
+Review responses include the immutable evidence bundle identity, any exact
+Plan Artifact ids/digests supplied to the review Execution, base/head SHA, diff
+digest, fresh-session provenance, actual CI results, and the structured
+reviewer result. A changed head makes the verdict stale and prevents an
+automatic pass.
 
 Bindings are authority, not identity ownership. An account has at most one
 active Main Agent binding and an operational Project has exactly one active

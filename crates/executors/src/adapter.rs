@@ -262,6 +262,28 @@ impl AdapterExecutor {
     }
 }
 
+fn require_planning_capability(
+    capabilities: &api_types::HarnessCapabilities,
+    invocation: &api_types::HarnessInvocation,
+) -> Result<(), ExecutorError> {
+    if !invocation.is_planning() {
+        return Ok(());
+    }
+    if !capabilities.planning.is_available() {
+        return Err(ExecutorError::UnsupportedCapability {
+            capability: "planning".to_owned(),
+            support: capabilities.planning,
+        });
+    }
+    if invocation.external_session_id().is_some() && !capabilities.resume.is_available() {
+        return Err(ExecutorError::UnsupportedCapability {
+            capability: "resume".to_owned(),
+            support: capabilities.resume,
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TaskExecutor for AdapterExecutor {
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
@@ -286,11 +308,17 @@ impl TaskExecutor for AdapterExecutor {
         let execution_config = config.clone();
         ctx.agent_config = invocation_config;
         let invocation = ctx.invocation.clone();
-        let mut result = match invocation {
-            api_types::HarnessInvocation::Start => adapter.start(ctx).await?,
-            api_types::HarnessInvocation::Resume {
-                external_session_id,
-            } => adapter.resume(ctx, &external_session_id).await?,
+        require_planning_capability(&capabilities, &invocation)?;
+        let mut result = if invocation.is_planning() {
+            adapter.execute(ctx).await?
+        } else {
+            match invocation {
+                api_types::HarnessInvocation::Start => adapter.start(ctx).await?,
+                api_types::HarnessInvocation::Resume {
+                    external_session_id,
+                } => adapter.resume(ctx, &external_session_id).await?,
+                api_types::HarnessInvocation::Planning { .. } => unreachable!(),
+            }
         };
         result.resolved_candidate = Some(ResolvedExecutorCandidate {
             candidate_key,
@@ -527,7 +555,13 @@ impl FallbackExecutor {
 #[async_trait]
 impl TaskExecutor for FallbackExecutor {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-        let is_resume = matches!(&ctx.invocation, api_types::HarnessInvocation::Resume { .. });
+        let is_resume = matches!(
+            &ctx.invocation,
+            api_types::HarnessInvocation::Resume { .. }
+                | api_types::HarnessInvocation::Planning {
+                    external_session_id: Some(_)
+                }
+        );
         let candidates = self.route(&ctx, !is_resume)?;
         let cancelled = self.cancellation_flag(&ctx.execution_id);
         let single_candidate = candidates.len() == 1;
@@ -624,11 +658,19 @@ impl TaskExecutor for FallbackExecutor {
 
                 let mut candidate_ctx = ctx.clone();
                 candidate_ctx.agent_config = invocation_config;
-                let attempt = match candidate_ctx.invocation.clone() {
-                    api_types::HarnessInvocation::Start => adapter.start(candidate_ctx).await,
-                    api_types::HarnessInvocation::Resume {
-                        external_session_id,
-                    } => adapter.resume(candidate_ctx, &external_session_id).await,
+                let invocation = candidate_ctx.invocation.clone();
+                let capabilities = &candidate.harness_capabilities;
+                require_planning_capability(capabilities, &invocation)?;
+                let attempt = if invocation.is_planning() {
+                    adapter.execute(candidate_ctx).await
+                } else {
+                    match invocation {
+                        api_types::HarnessInvocation::Start => adapter.start(candidate_ctx).await,
+                        api_types::HarnessInvocation::Resume {
+                            external_session_id,
+                        } => adapter.resume(candidate_ctx, &external_session_id).await,
+                        api_types::HarnessInvocation::Planning { .. } => unreachable!(),
+                    }
                 };
                 writer = crate::LogWriter::new(
                     std::path::Path::new(&ctx.logs_path),
@@ -664,7 +706,7 @@ impl TaskExecutor for FallbackExecutor {
                             candidate_key: candidate.candidate_key.clone(),
                             executor_type: candidate.kind.clone(),
                             config: candidate.config.clone(),
-                            harness_capabilities: candidate.harness_capabilities.clone(),
+                            harness_capabilities: capabilities.clone(),
                             effective_policy: candidate.effective_policy.clone(),
                         });
                         result.route_attempts = std::mem::take(&mut attempts);
@@ -968,6 +1010,33 @@ mod tests {
             .expect("dispatch succeeds");
 
         assert_eq!(result.status, ExecutionOutcome::Completed);
+    }
+
+    #[test]
+    fn planning_requires_an_explicit_native_or_emulated_capability() {
+        let invocation = api_types::HarnessInvocation::Planning {
+            external_session_id: None,
+        };
+        let mut capabilities = api_types::HarnessCapabilities::unknown();
+        capabilities.planning = api_types::CapabilitySupport::Native;
+        assert!(require_planning_capability(&capabilities, &invocation).is_ok());
+
+        capabilities.planning = api_types::CapabilitySupport::Emulated;
+        assert!(require_planning_capability(&capabilities, &invocation).is_ok());
+
+        for support in [
+            api_types::CapabilitySupport::Unsupported,
+            api_types::CapabilitySupport::Unknown,
+        ] {
+            capabilities.planning = support;
+            assert!(matches!(
+                require_planning_capability(&capabilities, &invocation),
+                Err(ExecutorError::UnsupportedCapability {
+                    capability,
+                    support: actual,
+                }) if capability == "planning" && actual == support
+            ));
+        }
     }
 
     #[test]

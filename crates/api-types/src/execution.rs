@@ -270,8 +270,6 @@ pub struct ExecutionResponse {
     pub stopped_at: Option<String>,
     pub executor_config_snapshot: Option<Value>,
     pub workspace_id: Option<String>,
-    pub plan_progress: Option<PlanProgressSummary>,
-    pub plan_artifact: Option<PlanArtifactDetail>,
     pub usage: Option<Vec<ExecutionUsageResponse>>,
     #[serde(default)]
     pub account_usage: Option<Value>,

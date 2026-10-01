@@ -117,13 +117,6 @@ impl TaskService {
                 .await;
         }
 
-        self.ensure_planning_plan_ready_before_leaving(
-            &source_task,
-            &request.target_status,
-            &workflow,
-            false,
-        )
-        .await?;
         self.cancel_active_execution_for_user_transition(
             &source_task,
             &request.target_status,
@@ -202,12 +195,6 @@ impl TaskService {
             task =
                 TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
         }
-        if previous_status == default_states::PLANNING && task.status != default_states::PLANNING {
-            task = super::execution::set_planning_awaiting_review_metadata(
-                &self.db, &task, None, false,
-            )
-            .await?;
-        }
         if previous_status == default_states::REVIEW && task.status != default_states::REVIEW {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
         }
@@ -221,7 +208,6 @@ impl TaskService {
                     description: None,
                     priority: None,
                     merge_config: None,
-                    plan: None,
                     error_annotation: Some(None),
                     blocked_json: None,
                     failed_json: None,
