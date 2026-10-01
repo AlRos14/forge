@@ -743,7 +743,10 @@ impl TaskService {
                 );
             }
         }
-        ExecutionRepo::update(
+        let now = now_rfc3339();
+        let event =
+            super::execution_status_domain_event(execution, &ExecutionStatus::Cancelled, &now);
+        let (_, committed_event) = ExecutionRepo::update_with_event(
             &*self.db,
             db::UpdateExecution {
                 id: execution.id.clone(),
@@ -751,7 +754,7 @@ impl TaskService {
                 stop_reason: Some(Some(stop_reason)),
                 stopped_by: Some(Some(actor.display())),
                 resume_policy: Some(Some(resume_policy)),
-                stopped_at: Some(Some(now_rfc3339())),
+                stopped_at: Some(Some(now.clone())),
                 // Manual user stops retain the session and executor snapshot so the
                 // task façade can resume the same worker thread. An explicit generic
                 // HarnessSession also retains both across lifecycle cancellation;
@@ -766,11 +769,13 @@ impl TaskService {
                 after_sha: None,
                 error: Some(Some(reason.to_owned())),
                 executor_config_snapshot_json: (!preserve_harness_context).then_some(None),
-                updated_at: now_rfc3339(),
+                updated_at: now,
             },
+            event,
         )
         .await
         .map_err(|error| ServiceError::invalid_operation(format!("cancel failed: {error}")))?;
+        self.publish_committed_domain_event(&committed_event);
         self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
             .await;
         self.publish(ForgeEvent {

@@ -390,6 +390,41 @@ pub trait DomainEventRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait OrchestratorWakeRepo: Send + Sync {
+    /// Insert one obligation for the exact source event, TaskRole, and Actor.
+    /// A uniqueness hit is an idempotent replay and returns `false`.
+    async fn admit_orchestrator_wake(&self, input: CreateOrchestratorWake) -> Result<bool>;
+    async fn claim_orchestrator_wake(
+        &self,
+        input: ClaimOrchestratorWake,
+    ) -> Result<Option<OrchestratorWake>>;
+    async fn get_orchestrator_wake(&self, id: &str) -> Result<Option<OrchestratorWake>>;
+    async fn get_orchestrator_wake_by_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<(OrchestratorWake, OrchestratorWakeExecution)>>;
+    async fn reserve_orchestrator_wake_execution(
+        &self,
+        input: ReserveOrchestratorWakeExecution,
+    ) -> Result<OrchestratorWakeExecution>;
+    async fn transition_orchestrator_wake(&self, input: TransitionOrchestratorWake)
+        -> Result<bool>;
+    async fn transition_orchestrator_wake_execution(
+        &self,
+        input: TransitionOrchestratorWakeExecution,
+    ) -> Result<bool>;
+    async fn get_orchestrator_action(
+        &self,
+        execution_id: &str,
+        action_index: i64,
+    ) -> Result<Option<OrchestratorActionRecord>>;
+    async fn reserve_orchestrator_action(
+        &self,
+        input: ReserveOrchestratorAction,
+    ) -> Result<OrchestratorActionRecord>;
+}
+
+#[async_trait]
 pub trait AttentionRepo: Send + Sync {
     async fn list_attention(&self, query: AttentionListQuery) -> Result<Page<AttentionProjection>>;
     async fn get_attention(&self, id: &str) -> Result<Option<AttentionProjection>>;
@@ -525,6 +560,79 @@ pub struct CompleteDomainEvent {
     pub event_id: String,
     pub dedupe_key: String,
     pub completed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOrchestratorWake {
+    pub id: String,
+    pub event_id: String,
+    pub event_sequence: i64,
+    pub task_id: String,
+    pub task_role_id: String,
+    pub coordination_mode: Option<CoordinationMode>,
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+    pub work_unit_id: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub policy_ref: String,
+    pub policy_version: i64,
+    pub policy_digest: String,
+    pub task_role_version: i64,
+    pub task_role_policy_json: String,
+    pub available_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimOrchestratorWake {
+    pub lease_owner: String,
+    pub now: String,
+    pub leased_until: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReserveOrchestratorWakeExecution {
+    pub wake_id: String,
+    pub lease_owner: String,
+    pub execution_id: String,
+    pub now: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionOrchestratorWake {
+    pub id: String,
+    pub expected_state: Option<OrchestratorWakeState>,
+    pub lease_owner: Option<String>,
+    pub state: OrchestratorWakeState,
+    pub available_at: Option<String>,
+    pub current_attempt: Option<Option<i64>>,
+    pub last_error: Option<Option<String>>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionOrchestratorWakeExecution {
+    pub wake_id: String,
+    pub attempt_number: i64,
+    pub execution_id: String,
+    pub lease_owner: Option<String>,
+    pub expected_state: Option<String>,
+    pub state: String,
+    pub last_error: Option<Option<String>>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReserveOrchestratorAction {
+    pub execution_id: String,
+    pub action_index: i64,
+    pub action_type: String,
+    pub action_digest: String,
+    pub result_id: String,
+    pub now: String,
 }
 
 #[async_trait]
@@ -732,6 +840,19 @@ pub trait RuntimeRepo: Send + Sync {
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
+    async fn create_with_event(
+        &self,
+        input: CreateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
+    async fn create_orchestrator_execution(
+        &self,
+        input: CreateExecution,
+        wake_id: &str,
+        attempt_number: i64,
+        lease_owner: &str,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
     /// Return whether migration evidence explicitly marks this historical
@@ -749,6 +870,11 @@ pub trait ExecutionRepo: Send + Sync {
     ) -> Result<Page<Execution>>;
     async fn count_by_task_and_role(&self, task_id: &str, role: &str) -> Result<i64>;
     async fn update(&self, input: UpdateExecution) -> Result<Execution>;
+    async fn update_with_event(
+        &self,
+        input: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
     async fn update_last_activity_at(&self, id: &str, timestamp: &str) -> Result<()>;
     async fn list_stalled_running(&self, stale_before: &str) -> Result<Vec<Execution>>;
     async fn list_running(&self) -> Result<Vec<Execution>>;

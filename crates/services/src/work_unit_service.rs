@@ -81,6 +81,15 @@ impl WorkUnitService {
         source: CollaborationActorSource,
         input: CreateWorkUnitInput,
     ) -> Result<WorkUnit> {
+        self.create_with_id(source, input, new_uuid_v4()).await
+    }
+
+    pub(crate) async fn create_with_id(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        id: String,
+    ) -> Result<WorkUnit> {
         let CreateWorkUnitInput {
             task_id,
             title,
@@ -95,6 +104,23 @@ impl WorkUnitService {
             .collaboration
             .authorize_source(&task_id, &source)
             .await?;
+        if let Some(existing) = WorkUnitRepo::get_by_id(&*self.db, &id).await? {
+            if existing.task_id == task_id
+                && existing.title == title
+                && existing.scope == scope
+                && existing.role == role
+                && existing.parent_work_unit_id == parent_work_unit_id
+                && existing.assigned_actor == assigned_actor
+                && existing.requires_integration == requires_integration
+                && existing.provenance == provenance
+                && existing.created_by == actor
+            {
+                return Ok(existing);
+            }
+            return Err(ServiceError::conflict(
+                "WorkUnit idempotency key conflicts with an existing record",
+            ));
+        }
         if requires_integration && task.repo_id.is_none() {
             return Err(invalid(
                 "repository WorkUnit requires a repository-bound Task",
@@ -192,9 +218,8 @@ impl WorkUnitService {
                 }
             }
         }
-        let id = new_uuid_v4();
         let now = now_rfc3339();
-        let event = self.event(
+        let mut event = self.event(
             "work_unit.created",
             "work_unit",
             &id,
@@ -203,6 +228,39 @@ impl WorkUnitService {
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": 1, "status": "open"}),
             &now,
         );
+        if let CollaborationActorSource::Execution(execution_id) = &source {
+            let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+                .await?
+                .ok_or_else(|| not_found("execution", execution_id.clone()))?;
+            if execution.task_id != task.id || execution.actor_ref() != Some(actor.clone()) {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "WorkUnit action source does not match its exact Task Actor".to_owned(),
+                });
+            }
+            if execution.role == "orchestrator"
+                && execution.purpose == Some(db::ExecutionPurpose::Orchestrate)
+            {
+                let start_event = db::DomainEventRepo::get_event_by_dedupe(
+                    &*self.db,
+                    &format!("execution.started:{}", execution.id),
+                )
+                .await?
+                .filter(|event| {
+                    event.entity_type == "execution"
+                        && event.entity_id == execution.id
+                        && event.scope_type == "task"
+                        && event.scope_id == task.id
+                })
+                .ok_or_else(|| invalid("orchestrator WorkUnit action has no durable Execution start event"))?;
+                let causation_depth = start_event.causation_depth.saturating_add(1);
+                if causation_depth > 16 {
+                    return Err(invalid("orchestrator WorkUnit action exceeds causation depth limit"));
+                }
+                event.correlation_id = start_event.correlation_id;
+                event.causation_id = Some(start_event.id);
+                event.causation_depth = causation_depth;
+            }
+        }
         let write = WorkUnitRepo::create(
             &*self.db,
             CreateWorkUnit {
@@ -2571,13 +2629,11 @@ mod tests {
         )
         .await
         .expect("failed attempt remains historical");
-        let failed_lease = db::WorkspaceLeaseRepo::get_active_for_work_unit(
-            &*db,
-            &retryable_unit.id,
-        )
-        .await
-        .expect("failed attempt lease lookup")
-        .expect("failed attempt lease remains active until runner cleanup");
+        let failed_lease =
+            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+                .await
+                .expect("failed attempt lease lookup")
+                .expect("failed attempt lease remains active until runner cleanup");
         db::WorkspaceLeaseRepo::revoke(
             &*db,
             &failed_lease.id,
@@ -2608,9 +2664,11 @@ mod tests {
         assert!(!first_worktree.exists());
         assert!(Path::new(&second_workspace.worktree_path).exists());
         assert!(integration_path.exists());
-        assert!(git::branch_exists(&repository_path, &second_workspace.branch)
-            .await
-            .expect("sibling branch remains untouched"));
+        assert!(
+            git::branch_exists(&repository_path, &second_workspace.branch)
+                .await
+                .expect("sibling branch remains untouched")
+        );
         assert!(
             git::branch_exists(&repository_path, &original_workspace.branch)
                 .await
@@ -2693,21 +2751,14 @@ mod tests {
         )
         .await
         .expect("retry attempt can stop");
-        let retry_lease = db::WorkspaceLeaseRepo::get_active_for_work_unit(
-            &*db,
-            &retryable_unit.id,
-        )
-        .await
-        .expect("retry lease lookup")
-        .expect("retry lease remains active until runner cleanup");
-        db::WorkspaceLeaseRepo::revoke(
-            &*db,
-            &retry_lease.id,
-            retry_lease.version,
-            &now_rfc3339(),
-        )
-        .await
-        .expect("retry authority is revoked before cleanup");
+        let retry_lease =
+            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+                .await
+                .expect("retry lease lookup")
+                .expect("retry lease remains active until runner cleanup");
+        db::WorkspaceLeaseRepo::revoke(&*db, &retry_lease.id, retry_lease.version, &now_rfc3339())
+            .await
+            .expect("retry authority is revoked before cleanup");
         cleanup
             .cleanup_now(recovered_workspace.id.clone())
             .await

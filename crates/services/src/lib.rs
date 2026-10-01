@@ -42,6 +42,7 @@ pub mod oauth_service;
 pub mod operating_skills;
 pub mod operator_status;
 pub mod operator_status_emitter;
+pub mod orchestrator_runtime;
 pub mod plan_artifact;
 pub mod pr_service;
 pub mod product_genesis;
@@ -179,6 +180,7 @@ pub use operating_skills::{
 };
 pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
+pub use orchestrator_runtime::{OrchestratorRun, OrchestratorRuntime};
 pub use product_genesis::{
     render_product_genesis_prompt, validate_genesis_transition, GenesisLifecycleError,
     GenesisPromptContext, NewProductGenesisSession, ProductGenesisService, ProductGenesisStart,

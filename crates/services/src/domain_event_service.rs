@@ -106,7 +106,13 @@ impl DomainEventService {
     /// Call this only after the transaction containing `event` has committed.
     /// The bus payload intentionally excludes the authoritative event body.
     pub fn publish_committed(&self, event: &DomainEvent) {
-        self.event_bus.publish(ForgeEvent {
+        Self::publish_committed_hint(&self.event_bus, event);
+    }
+
+    /// Mirror a committed row as a bounded hint when the caller owns a
+    /// borrowed EventBus rather than the full service.
+    pub fn publish_committed_hint(event_bus: &EventBus, event: &DomainEvent) {
+        event_bus.publish(ForgeEvent {
             event_type: "domain_event.committed".to_owned(),
             entity_id: event.id.clone(),
             timestamp: event.created_at.clone(),

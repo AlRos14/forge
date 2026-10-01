@@ -497,6 +497,71 @@ pub struct DomainEvent {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorWakeState {
+    Pending,
+    Leased,
+    Running,
+    AwaitingHuman,
+    Completed,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorWake {
+    pub id: String,
+    pub event_id: String,
+    pub event_sequence: i64,
+    pub task_id: String,
+    pub task_role_id: String,
+    pub coordination_mode: Option<CoordinationMode>,
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+    pub work_unit_id: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub policy_ref: String,
+    pub policy_version: i64,
+    pub policy_digest: String,
+    pub task_role_version: i64,
+    pub task_role_policy_json: String,
+    pub state: OrchestratorWakeState,
+    pub available_at: String,
+    pub lease_owner: Option<String>,
+    pub lease_until: Option<String>,
+    pub attempt_count: i64,
+    pub current_attempt: Option<i64>,
+    pub last_error: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorWakeExecution {
+    pub wake_id: String,
+    pub attempt_number: i64,
+    pub execution_id: String,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorActionRecord {
+    pub execution_id: String,
+    pub action_index: i64,
+    pub action_type: String,
+    pub action_digest: String,
+    pub result_id: String,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Rebuildable, durable Attention materialization.  The source event and
 /// dedupe key keep this row derived; the lifecycle columns are the only
 /// operator-owned state and use optimistic versions for concurrent clients.
@@ -2056,6 +2121,16 @@ macro_rules! enum_strings {
         }
     };
 }
+
+enum_strings!(OrchestratorWakeState {
+    Pending => "pending",
+    Leased => "leased",
+    Running => "running",
+    AwaitingHuman => "awaiting_human",
+    Completed => "completed",
+    Failed => "failed",
+    Uncertain => "uncertain",
+});
 
 enum_strings!(WorkMode {
     DirectMerge => "direct_merge",

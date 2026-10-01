@@ -408,7 +408,8 @@ impl WorkspaceCleanupScheduler {
                 )
                 .await);
         }
-        let branch_exists = match git::branch_exists(&repo_path, &workspace.branch).await {
+        let branch_exists = match git::branch_exists(Path::new(&repo_path), &workspace.branch).await
+        {
             Ok(exists) => exists,
             Err(error) => {
                 return Err(self
@@ -430,7 +431,18 @@ impl WorkspaceCleanupScheduler {
                 )
                 .await);
         }
-        if tokio::fs::try_exists(&expected_path).await? {
+        let worktree_exists = match tokio::fs::try_exists(&expected_path).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                return Err(self
+                    .record_work_unit_cleanup_error(
+                        workspace_id,
+                        format!("could not inspect the WorkUnit worktree path: {error}"),
+                    )
+                    .await)
+            }
+        };
+        if worktree_exists {
             let current_branch = match git::get_current_branch(&expected_path).await {
                 Ok(branch) => branch,
                 Err(error) => {
@@ -456,7 +468,7 @@ impl WorkspaceCleanupScheduler {
             }
         }
 
-        if let Some(terminal_cleanup) = self
+        let terminal_cleanup = self
             .terminal_cleanup
             .read()
             .map_err(|error| {
@@ -464,8 +476,8 @@ impl WorkspaceCleanupScheduler {
                     "Workspace cleanup terminal handler lock poisoned: {error}"
                 ))
             })?
-            .clone()
-        {
+            .clone();
+        if let Some(terminal_cleanup) = terminal_cleanup {
             terminal_cleanup
                 .cleanup_workspace_terminals(workspace_id)
                 .await?;

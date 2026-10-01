@@ -11,7 +11,9 @@ use std::{
 // Keep this module's source revisioned when adding a migration: include_dir's
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
-// migration after the initial build). V091 adds WorkUnit DAG/integration records.
+// migration after the initial build). V095 adds orchestrator bootstrap and
+// TaskRole policy snapshots; V096 guards typed-action effects; V097 commits the
+// action receipt with each effect.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

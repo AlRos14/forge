@@ -129,6 +129,12 @@ impl TaskDispatcher {
             let Some(role_name) = crate::workflow::effective_role(target_state) else {
                 return Ok(None);
             };
+            // PR6 owns orchestrator cognition through durable domain-event
+            // wakes. The workflow dispatcher remains responsible for the
+            // legacy planning/review/execution roles until their named PRs.
+            if role_name == "orchestrator" {
+                return Ok(None);
+            }
             match crate::task_service::current_role_memberships_authoritative(
                 &self.db, &task.id, role_name,
             )

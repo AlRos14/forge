@@ -14,14 +14,15 @@ use ::workspace::{RepoCacheLockManager, WorkspaceManager};
 use api_types::{Actor, ActorRef, ProjectSettings, UserActionSource};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
-    CommentAuthorType, CreateExecution, CreateTask, CreateTaskComment, CreateTaskRoleAssignment,
-    CreateWorkspace, CreateWorkspaceLease, DbError, Execution, ExecutionPurpose, ExecutionRepo,
-    ExecutionStatus, ExecutionUsageRepo, HarnessSession, HarnessSessionRepo, HarnessSessionStatus,
-    PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy,
-    SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata,
-    TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo,
-    UpsertExecutionUsage, UserRepo, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    CommentAuthorType, CreateDomainEvent, CreateExecution, CreateTask, CreateTaskComment,
+    CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DbError, Execution,
+    ExecutionPurpose, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
+    HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, Review,
+    ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment,
+    TaskCommentRepo, TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment,
+    TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo, UpsertExecutionUsage, UserRepo,
+    WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -52,6 +53,7 @@ mod lifecycle_test;
 pub(crate) mod logs;
 mod memberships;
 mod move_task;
+mod orchestrator;
 mod reorder_subtasks;
 mod review;
 mod review_config;
@@ -142,6 +144,122 @@ pub struct TransitionOptions {
     pub triggered_by: Actor,
     pub rejection: bool,
     pub defer_dispatch_seconds: Option<i64>,
+}
+
+fn execution_domain_event(input: &CreateExecution, event_type: &str) -> CreateDomainEvent {
+    let actor = input.actor_ref.as_ref();
+    CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: event_type.to_owned(),
+        entity_type: "execution".to_owned(),
+        entity_id: input.id.clone(),
+        actor_type: actor
+            .map(|actor| actor.kind().to_string())
+            .unwrap_or_else(|| "system".to_owned()),
+        actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: input.task_id.clone(),
+        correlation_id: input.id.clone(),
+        causation_id: input.parent_execution_id.clone(),
+        causation_depth: if input.parent_execution_id.is_some() {
+            1
+        } else {
+            0
+        },
+        dedupe_key: Some(format!("{event_type}:{}", input.id)),
+        payload_json: serde_json::json!({
+            "execution_id": input.id,
+            "task_id": input.task_id,
+            "role": input.role,
+            "purpose": input.purpose.as_ref().map(ToString::to_string),
+            "actor_kind": actor.as_ref().map(|actor| actor.kind().to_string()),
+            "actor_id": actor.map(|actor| actor.id()),
+            "work_unit_id": null,
+        })
+        .to_string(),
+        created_at: input.created_at.clone(),
+    }
+}
+
+pub(crate) fn execution_status_domain_event(
+    execution: &Execution,
+    status: &ExecutionStatus,
+    created_at: &str,
+) -> CreateDomainEvent {
+    let event_type = match status {
+        ExecutionStatus::Running => "execution.started",
+        ExecutionStatus::Completed => "execution.completed",
+        ExecutionStatus::Failed => "execution.failed",
+        ExecutionStatus::Cancelled => "execution.cancelled",
+    };
+    let snapshot = execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or(Value::Null);
+    let wake = snapshot.get("pr6_orchestrator_wake");
+    let actor = execution.actor_ref();
+    let correlation_id = wake
+        .and_then(|value| value.get("correlation_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| execution.id.clone());
+    let causation_id = wake
+        .and_then(|value| value.get("execution_started_event_id"))
+        .or_else(|| wake.and_then(|value| value.get("event_id")))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| execution.parent_execution_id.clone());
+    let causation_depth = wake
+        .and_then(|value| value.get("causation_depth"))
+        .and_then(Value::as_i64)
+        .map(|depth| depth.saturating_add(2).min(16))
+        .unwrap_or_else(|| i64::from(execution.parent_execution_id.is_some()));
+    CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: event_type.to_owned(),
+        entity_type: "execution".to_owned(),
+        entity_id: execution.id.clone(),
+        actor_type: actor
+            .as_ref()
+            .map(|actor| actor.kind().to_string())
+            .unwrap_or_else(|| "system".to_owned()),
+        actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: execution.task_id.clone(),
+        correlation_id,
+        causation_id,
+        causation_depth,
+        dedupe_key: Some(format!("{event_type}:{}", execution.id)),
+        payload_json: serde_json::json!({
+            "execution_id": execution.id,
+            "task_id": execution.task_id,
+            "role": execution.role,
+            "purpose": execution.purpose.as_ref().map(ToString::to_string),
+            "actor_kind": actor.as_ref().map(|actor| actor.kind().to_string()),
+            "actor_id": execution.actor_id,
+            "work_unit_id": execution.work_unit_id,
+            "status": status.to_string(),
+        })
+        .to_string(),
+        created_at: created_at.to_owned(),
+    }
+}
+
+pub(crate) fn execution_stalled_domain_event(
+    execution: &Execution,
+    stale_before: &str,
+    created_at: &str,
+) -> CreateDomainEvent {
+    let mut event = execution_status_domain_event(execution, &ExecutionStatus::Failed, created_at);
+    event.event_type = "execution.stalled".to_owned();
+    event.dedupe_key = Some(format!("execution.stalled:{}", execution.id));
+    let mut payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+    if let Some(payload) = payload.as_object_mut() {
+        payload.insert("stale_before".to_owned(), json!(stale_before));
+    }
+    event.payload_json = payload.to_string();
+    event
 }
 
 impl From<i64> for TransitionOptions {
@@ -331,19 +449,21 @@ impl TaskService {
         // that attempt first, then issue the authority; a rejected lease is
         // immediately terminalized so no running execution can exist without
         // an active scheduler grant.
-        let execution = match ExecutionRepo::create(&*self.db, input.clone()).await {
-            Ok(execution) => execution,
-            Err(error) => {
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace_by_id(
-                        &input.task_id,
-                        input.workspace_id.as_deref(),
-                    )
-                    .await;
+        let event = execution_domain_event(&input, "execution.started");
+        let (execution, committed_event) =
+            match ExecutionRepo::create_with_event(&*self.db, input.clone(), event).await {
+                Ok(result) => result,
+                Err(error) => {
+                    if workspace_created_by_attempt {
+                        self.cleanup_fresh_execution_workspace_by_id(
+                            &input.task_id,
+                            input.workspace_id.as_deref(),
+                        )
+                        .await;
+                    }
+                    return Err(error.into());
                 }
-                return Err(error.into());
-            }
-        };
+            };
         if let Some((task, workspace)) = repository_context.as_ref() {
             if let Err(error) = self
                 .issue_workspace_lease(
@@ -372,7 +492,13 @@ impl TaskService {
                 return Err(error);
             }
         }
+        self.publish_committed_domain_event(&committed_event);
         Ok(execution)
+    }
+
+    fn publish_committed_domain_event(&self, event: &db::DomainEvent) {
+        crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .publish_committed(event);
     }
 
     pub(crate) async fn cleanup_fresh_execution_workspace(
@@ -569,7 +695,10 @@ impl TaskService {
 
         let execution_id = notification.execution_id.clone();
         let terminal_ts = notification.ts.clone();
-        let updated = ExecutionRepo::update(
+        let updated_at = now_rfc3339();
+        let lifecycle_event =
+            execution_status_domain_event(&current_execution, &status, &updated_at);
+        let (updated, committed_event) = ExecutionRepo::update_with_event(
             &*self.db,
             db::UpdateExecution {
                 id: execution_id,
@@ -587,10 +716,12 @@ impl TaskService {
                 after_sha: notification.after_sha.map(Some),
                 error,
                 executor_config_snapshot_json: snapshot_update.map(Some),
-                updated_at: now_rfc3339(),
+                updated_at,
             },
+            lifecycle_event,
         )
         .await?;
+        self.publish_committed_domain_event(&committed_event);
 
         if updated.status != ExecutionStatus::Running {
             self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)

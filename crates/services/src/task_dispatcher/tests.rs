@@ -483,6 +483,136 @@ async fn build_dispatcher(
 }
 
 #[tokio::test]
+async fn pr6_task_dispatcher_skips_orchestrator_and_keeps_worker_review_paths() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+    let repo_id = new_uuid_v4();
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        if state.name == crate::workflow::default_states::PLANNING
+            || state.name == crate::workflow::default_states::IN_PROGRESS
+        {
+            state.role = Some("orchestrator".to_owned());
+        }
+    }
+    let mut legacy_worker = workflow
+        .states
+        .iter()
+        .find(|state| state.name == crate::workflow::default_states::IN_PROGRESS)
+        .expect("active state exists")
+        .clone();
+    legacy_worker.name = "legacy_worker".to_owned();
+    legacy_worker.display_name = "Legacy worker".to_owned();
+    legacy_worker.role = Some(crate::workflow::default_roles::CODER.to_owned());
+    workflow.states.push(legacy_worker);
+    let default_branch = setup_git_repo(repo_dir.path());
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "PR6 TaskDispatcher coexistence".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: serde_json::to_string(&workflow).expect("workflow serializes"),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project creates with PR6 test workflow");
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "forge".to_owned(),
+            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("repository creates");
+    ProjectRepo::update(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id.clone())),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Project primary repository is set");
+    let agent_id = seed_agent(&*db, 2, DaemonStatus::Online, AgentStatus::Idle).await;
+    let initial_orchestrator = seed_task(&*db, &project_id, &repo_id, "high", "todo", 1).await;
+    let active_orchestrator =
+        seed_task(&*db, &project_id, &repo_id, "active", "in_progress", 0).await;
+    let legacy_worker = seed_task(&*db, &project_id, &repo_id, "active", "legacy_worker", 0).await;
+    let legacy_reviewer = seed_task(&*db, &project_id, &repo_id, "review", "review", 0).await;
+    assign_role(
+        &*db,
+        &legacy_worker.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    assign_role(
+        &*db,
+        &legacy_reviewer.id,
+        crate::workflow::default_roles::REVIEWER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 2);
+    for task in [&initial_orchestrator, &active_orchestrator] {
+        assert_eq!(
+            ExecutionRepo::count_by_task_and_role(&*db, &task.id, "orchestrator")
+                .await
+                .expect("orchestrator execution count loads"),
+            0,
+        );
+    }
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &initial_orchestrator.id, false)
+            .await
+            .expect("initial Task loads")
+            .expect("initial Task exists")
+            .status,
+        "todo",
+    );
+    let mut legacy_roles = Vec::new();
+    for _ in 0..2 {
+        legacy_roles.push(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("legacy execution starts in time")
+                .expect("legacy execution context arrives")
+                .role,
+        );
+    }
+    legacy_roles.sort();
+    assert_eq!(
+        legacy_roles,
+        vec![
+            crate::workflow::default_roles::CODER.to_owned(),
+            crate::workflow::default_roles::REVIEWER.to_owned(),
+        ],
+    );
+}
+
+#[tokio::test]
 async fn dispatcher_check_once_does_not_dispatch_after_stop() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");

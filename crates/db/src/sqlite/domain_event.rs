@@ -72,6 +72,9 @@ impl DomainEventRepo for SqliteDb {
                 }
                 return Ok(event);
             }
+            Err(error) if is_stale_orchestrator_action_error(&error) => {
+                return Err(DbError::StaleOrchestratorAction)
+            }
             Err(error) => return Err(error.into()),
         }
 
@@ -349,6 +352,14 @@ impl DomainEventRepo for SqliteDb {
         transaction.commit().await?;
         Ok(inserted)
     }
+}
+
+fn is_stale_orchestrator_action_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.message() == "PR6_STALE_ORCHESTRATOR_ACTION"
+    )
 }
 
 fn event_semantics_match(input: &CreateDomainEvent, existing: &DomainEvent) -> bool {

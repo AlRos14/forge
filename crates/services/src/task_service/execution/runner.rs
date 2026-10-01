@@ -100,21 +100,48 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let workspace_id = execution
-            .workspace_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        self.verify_active_workspace_lease(
-            &task,
-            &workspace,
-            &execution.role,
-            execution.agent_id.as_deref(),
-            &execution.id,
-        )
-        .await?;
+        let orchestrator_execution = execution.role == "orchestrator"
+            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
+        let workspace = if orchestrator_execution {
+            self.validate_orchestrator_execution(&execution).await?;
+            let path = self.orchestrator_context_path(&execution.id);
+            std::fs::create_dir_all(&path).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "failed to create isolated orchestrator context: {error}"
+                ))
+            })?;
+            Workspace {
+                id: format!("orchestrator:{}", execution.id),
+                task_id: task.id.clone(),
+                repo_id: task.repo_id.clone().unwrap_or_default(),
+                worktree_path: path.to_string_lossy().into_owned(),
+                branch: "orchestrator-read-only".to_owned(),
+                status: WorkspaceStatus::Ready,
+                before_sha: None,
+                cleanup_after: None,
+                error: None,
+                created_at: execution.created_at.clone(),
+                updated_at: execution.updated_at.clone(),
+            }
+        } else {
+            let workspace_id = execution
+                .workspace_id
+                .as_deref()
+                .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            self.verify_active_workspace_lease(
+                &task,
+                &workspace,
+                &execution.role,
+                execution.agent_id.as_deref(),
+                &execution.id,
+            )
+            .await?;
+            workspace
+        };
+        let workspace_id = workspace.id.as_str();
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -409,14 +436,19 @@ impl TaskService {
             }
         });
 
-        let read_only_head = if executors::is_worktree_read_only(&agent_config) {
+        let read_only_head = if execution.workspace_id.is_some()
+            && executors::is_worktree_read_only(&agent_config)
+        {
             Some(git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?)
         } else {
             None
         };
-        let invocation =
-            super::harness_invocation_for_execution(&self.db, &execution, Some(&workspace.id))
-                .await?;
+        let invocation = super::harness_invocation_for_execution(
+            &self.db,
+            &execution,
+            execution.workspace_id.as_deref(),
+        )
+        .await?;
         let usage_probe = self.task_executor.clone().and_then(|executor| {
             super::spawn_account_usage_probe(
                 Arc::clone(&self.db),
@@ -562,7 +594,9 @@ impl TaskService {
             "execution dispatch completed"
         );
 
-        let updated = ExecutionRepo::update(
+        let lifecycle_event =
+            super::super::execution_status_domain_event(&current_execution, &status, &now);
+        let (updated, committed_event) = ExecutionRepo::update_with_event(
             &*self.db,
             db::UpdateExecution {
                 id: execution_id,
@@ -582,8 +616,12 @@ impl TaskService {
                 executor_config_snapshot_json: snapshot_update.map(Some),
                 updated_at: now_rfc3339(),
             },
+            lifecycle_event,
         )
         .await?;
+
+        crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .publish_committed(&committed_event);
 
         self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)
             .await;
@@ -817,13 +855,27 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let workspace_id = execution
-            .workspace_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let workspace_path = if execution.role == "orchestrator"
+            && execution.purpose == Some(ExecutionPurpose::Orchestrate)
+        {
+            self.validate_orchestrator_execution(execution).await?;
+            let path = self.orchestrator_context_path(&execution.id);
+            std::fs::create_dir_all(&path).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "failed to create isolated orchestrator context: {error}"
+                ))
+            })?;
+            path.to_string_lossy().into_owned()
+        } else {
+            let workspace_id = execution
+                .workspace_id
+                .as_deref()
+                .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
+            WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?
+                .worktree_path
+        };
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -849,15 +901,18 @@ impl TaskService {
             .to_owned();
         let description = execution_description(execution, &task);
         let max_turns = self.resolve_max_turns(&task).await?;
-        let invocation =
-            super::harness_invocation_for_execution(&self.db, execution, Some(&workspace.id))
-                .await?;
+        let invocation = super::harness_invocation_for_execution(
+            &self.db,
+            execution,
+            execution.workspace_id.as_deref(),
+        )
+        .await?;
 
         Ok(api_types::ExecutionStartParams {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             role: execution.role.clone(),
-            workspace_path: workspace.worktree_path,
+            workspace_path,
             executor_type,
             executor_config,
             prompt: json!({ "description": description }),

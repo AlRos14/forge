@@ -827,6 +827,13 @@ record and does not affect other members. A membership does not grant a
 workspace, terminal, or lease: those still require the concrete execution and
 existing workspace-authority checks.
 
+TaskRole `policy` is stored as a JSON object. PR6 supports optional
+`schema_version: 1`, `automatic_orchestration`, `allowed_actions`,
+`max_actions_per_execution`, and `max_work_unit_creations_per_execution`;
+omitting all fields (`{}`) uses the PR6 defaults. Unknown policy keys or schema
+versions remain stored but cause PR6 dispatch to fail closed. See
+[Roles and memberships](concepts/roles.md) for field semantics and limits.
+
 ## Agent execution options
 
 The two `discovered-options` endpoints return the adapter's selectable

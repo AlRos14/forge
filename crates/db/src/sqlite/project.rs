@@ -408,6 +408,13 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM orchestrator_action WHERE execution_id IN
+                 (SELECT e.id FROM execution e JOIN task t ON t.id = e.task_id WHERE t.project_id = ?)",
+            "DELETE FROM orchestrator_wake_execution WHERE wake_id IN
+                 (SELECT id FROM orchestrator_wake WHERE task_id IN
+                   (SELECT id FROM task WHERE project_id = ?))",
+            "DELETE FROM orchestrator_wake WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_integration_operation WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM message_work_unit WHERE task_id IN
