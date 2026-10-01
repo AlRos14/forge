@@ -161,12 +161,14 @@ Non-Plan remote completion does not require `assistant_output`.
 
 Focused microfix validation used the shared Cargo target. The transaction
 boundary test, both remote Plan completion tests, old-daemon deserialization,
-generated binding check, and daemon output-producer test passed. A supplementary
-`subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_follow_up`
-filter failed at its existing `lease-backed subtask follow-up exists`
-assertion. Its fixture has no resumable `HarnessSession`, so it exits through
-the no-session guard before the Artifact-input retry caller; it does not
-exercise either P2 invariant. No broader suite was run.
+generated binding check, and daemon output-producer test passed. The existing
+subtask guard test had a stale fixture: it supplied only a synthetic legacy
+session id for a `shell` Agent, which is not resumable under the durable
+HarnessSession contract. Its fixture now uses an active `codex` HarnessSession
+and a parent Execution pinned to a Plan Artifact, and asserts the retry pins
+that same Artifact identity and digest. The focused
+`subtask_sequence_guard_rejection_resumes_coder_with_exact_plan_artifact_input`
+filter passes with this fixture. No broader suite was run.
 
 ## PR13 cleanup inventory
 

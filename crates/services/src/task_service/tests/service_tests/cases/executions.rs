@@ -3315,18 +3315,100 @@ impl TaskExecutor for PendingExecutor {
 }
 
 #[tokio::test]
-async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_follow_up() {
+async fn subtask_sequence_guard_rejection_resumes_coder_with_exact_plan_artifact_input() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service =
         TaskService::new(Arc::clone(&db), event_bus).with_task_executor(Arc::new(PendingExecutor));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     let _subtask = seed_subtask_with_status(&db, &task, "child", "todo".to_owned(), 0).await;
     let workspace = seed_workspace_with_plan(&db, &task, "- [x] parent work\n").await;
-    let execution =
-        seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
+
+    let plan_execution =
+        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+    let plan_artifact =
+        crate::CollaborationService::new(Arc::clone(&db), Arc::new(EventBus::new(8)))
+            .create_plan_artifact_from_execution(&plan_execution.id, "# Exact task plan\n")
+            .await
+            .expect("Plan Artifact creates");
+
+    let mut harness_capabilities = api_types::HarnessCapabilities::unknown();
+    harness_capabilities.resume = api_types::CapabilitySupport::Native;
+    let harness_session_id = db::new_uuid_v4();
+    let now = now_rfc3339();
+    db::HarnessSessionRepo::create(
+        &*db,
+        db::CreateHarnessSession {
+            id: harness_session_id.clone(),
+            agent_id: agent_id.clone(),
+            harness_kind: "codex".to_owned(),
+            external_session_id: Some("test-session".to_owned()),
+            profile_id: None,
+            profile_snapshot_json: json!({
+                "executor_type": "codex",
+                "config": {},
+                "credential_ref": null
+            })
+            .to_string(),
+            capabilities_snapshot_json: serde_json::to_string(&harness_capabilities.snapshot())
+                .expect("HarnessSession capabilities serialize"),
+            workspace_id: Some(workspace.id.clone()),
+            status: db::HarnessSessionStatus::Active,
+            predecessor_session_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity_at: Some(now.clone()),
+        },
+    )
+    .await
+    .expect("active HarnessSession creates");
+
+    let parent_input = db::CreateExecution {
+        id: db::new_uuid_v4(),
+        task_id: task.id.clone(),
+        agent_id: Some(agent_id.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+        purpose: Some(db::ExecutionPurpose::Implement),
+        harness_session_id: Some(harness_session_id.clone()),
+        role: crate::workflow::default_roles::CODER.to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: Some("test-session".to_owned()),
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: Some("implemented the change".to_owned()),
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: Some(
+            r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
+        ),
+        workspace_id: Some(workspace.id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let execution = db::ExecutionRepo::create_with_artifact_inputs_and_event(
+        &*db,
+        parent_input.clone(),
+        vec![plan_artifact.id.clone()],
+        crate::task_service::execution_domain_event(&parent_input, "execution.started"),
+    )
+    .await
+    .expect("parent Execution and exact Plan input create atomically")
+    .0;
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .expect("parent Execution completes");
 
     service
         .maybe_cascade_executor_completion(&execution.id)
@@ -3360,6 +3442,10 @@ async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_fol
         .expect("execution loads")
         .expect("execution exists");
     assert_eq!(execution.status, ExecutionStatus::Running);
+    assert_eq!(
+        execution.harness_session_id.as_deref(),
+        Some(harness_session_id.as_str())
+    );
     assert!(
         execution
             .summary
@@ -3368,6 +3454,12 @@ async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_fol
         "execution summary should contain subtask prompt, got: {:?}",
         execution.summary
     );
+    let pinned_inputs = db::CollaborationRepo::list_execution_artifact_inputs(&*db, &execution.id)
+        .await
+        .expect("resumed Execution Artifact inputs load");
+    assert_eq!(pinned_inputs.len(), 1);
+    assert_eq!(pinned_inputs[0].artifact_id, plan_artifact.id);
+    assert_eq!(pinned_inputs[0].digest, plan_artifact.digest);
 
     let task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
@@ -3478,49 +3570,6 @@ async fn seed_workspace_with_plan(db: &SqliteDb, task: &Task, plan: &str) -> Wor
     )
     .await
     .expect("workspace creates")
-}
-
-async fn seed_completed_coder_execution(
-    db: &SqliteDb,
-    task: &Task,
-    agent_id: &str,
-    workspace_id: Option<&str>,
-) -> Execution {
-    let now = now_rfc3339();
-    ExecutionRepo::create(
-        db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.to_owned()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: crate::workflow::default_roles::CODER.to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("implemented the change".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: workspace_id.map(str::to_owned),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("execution creates")
 }
 
 #[tokio::test]
