@@ -381,6 +381,36 @@ async fn default_workflow_allows_user_to_leave_planning() {
     assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
 }
 
+#[test]
+fn workflow_resolution_removes_retired_plan_checklist_hook() {
+    let mut workflow = default_workflow::default_workflow();
+    let planning = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == default_states::PLANNING)
+        .expect("planning state exists");
+    planning.hooks.before_exit.push(HookSpec {
+        action: "require_plan_checklist_complete".to_owned(),
+        params: json!({}),
+        applies_to: HookAudience::All,
+        on_failure: FailurePolicy::Block,
+    });
+    let serialized = serde_json::to_string(&workflow).expect("workflow serializes");
+
+    let resolved = WorkflowEngine::resolve_workflow(&serialized);
+    let planning = resolved
+        .states
+        .iter()
+        .find(|state| state.name == default_states::PLANNING)
+        .expect("resolved planning state exists");
+    assert!(planning.hooks.before_exit.is_empty());
+    assert!(planning
+        .hooks
+        .before_enter
+        .iter()
+        .any(|hook| hook.action == "run_before_work_hooks"));
+}
+
 #[tokio::test]
 async fn default_workflow_allows_user_to_start_work_from_todo() {
     let db = Arc::new(sqlite_db().await);
@@ -455,7 +485,7 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
     assert!(transition_logs.iter().any(|log| {
         log.from_state == default_states::PLANNING
             && log.to_state == default_states::IN_PROGRESS
-            && log.trigger_reason == "gate skipped: no planner role assigned"
+            && log.trigger_reason == "optional planner stage skipped: no role member assigned"
             && !log.rejection
     }));
 }
@@ -1568,124 +1598,6 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
     assert!(!transition_logs
         .iter()
         .any(|entry| { entry.from_state == "review" && entry.to_state == "needs_help" }));
-}
-
-#[tokio::test]
-async fn planning_gate_reject_back_to_itself() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let task_id = new_uuid_v4();
-    let workflow = default_workflow::default_workflow();
-    let now = now_rfc3339();
-    let project_id = new_uuid_v4();
-    let repo_id = new_uuid_v4();
-
-    ProjectRepo::create(
-        &*db,
-        CreateProject {
-            id: project_id.clone(),
-            name: "Default".to_owned(),
-            settings: "{}".to_owned(),
-            workflow_definition: serde_json::to_string(&workflow).unwrap(),
-            primary_repo_id: None,
-            owner_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("project creates");
-    RepoRepo::create(
-        &*db,
-        CreateRepo {
-            id: repo_id.clone(),
-            project_id: project_id.clone(),
-            name: "repo".to_owned(),
-            remote_url: "https://example.com/repo.git".to_owned(),
-            local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
-            default_branch: "main".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("repo creates");
-    ProjectRepo::update(
-        &*db,
-        UpdateProject {
-            id: project_id.clone(),
-            name: None,
-            settings: None,
-            primary_repo_id: Some(Some(repo_id.clone())),
-            paused_at: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("project primary repo updates");
-    TaskRepo::create(
-        &*db,
-        CreateTask {
-            id: task_id.clone(),
-            project_id: project_id.clone(),
-            repo_id: Some(repo_id),
-            parent_task_id: None,
-            subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
-            title: "planning reject".to_owned(),
-            description: None,
-            task_type: "implementation".to_owned(),
-            status: default_states::TODO.to_owned(),
-            is_automation: false,
-            priority: 0,
-            task_state_config: None,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("task creates");
-    assign_user_role(&db, &task_id, default_roles::PLANNER).await;
-    let eng = engine(Arc::clone(&db), Arc::clone(&event_bus));
-
-    let current_task = TaskRepo::get_by_id(&*db, &task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let result = eng
-        .transition(
-            &task_id,
-            default_states::PLANNING,
-            current_task.version,
-            &workflow,
-            &api_types::Actor::user(api_types::UserActionSource::Test),
-            "enter planning",
-            false,
-        )
-        .await
-        .expect("todo → planning");
-    assert_eq!(result.task.status, default_states::PLANNING);
-
-    let current_task = TaskRepo::get_by_id(&*db, &task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let result = eng
-        .transition(
-            &task_id,
-            default_states::PLANNING,
-            current_task.version,
-            &workflow,
-            &api_types::Actor::user(api_types::UserActionSource::Test),
-            "gate rejected",
-            true,
-        )
-        .await
-        .expect("planning rejects back to itself");
-    assert_eq!(result.task.status, default_states::PLANNING);
 }
 
 #[tokio::test]

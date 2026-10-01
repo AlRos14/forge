@@ -1,8 +1,10 @@
+use api_types::StateKind;
 use async_trait::async_trait;
 use db::{TaskDependencyRepo, TransitionLog, TransitionLogRepo};
 
 use crate::workflow::{
-    default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
+    auto_cascades_on_unassigned_role, default_states, effective_role, engine::WorkflowEngine,
+    HookAction, HookContext, HookResult,
 };
 
 use super::common::{block_task, get_role_assignment, task};
@@ -27,13 +29,9 @@ impl HookAction for AutoCascadeOnUnassignedRole {
                 reason: "state has no role".to_string(),
             };
         };
-        if !state
-            .gate_config
-            .as_ref()
-            .is_some_and(|config| config.optional_when_unassigned())
-        {
+        if !auto_cascades_on_unassigned_role(state) {
             return HookResult::Skipped {
-                reason: format!("{role_name} role is required"),
+                reason: format!("{role_name} stage is required"),
             };
         }
         let assignment = match get_role_assignment(ctx, role_name).await {
@@ -64,7 +62,11 @@ impl HookAction for AutoCascadeOnUnassignedRole {
         match target {
             Some(to) => HookResult::Cascade {
                 to,
-                reason: format!("gate skipped: no {role_name} role assigned"),
+                reason: if state.kind == StateKind::Gate {
+                    format!("gate skipped: no {role_name} role assigned")
+                } else {
+                    format!("optional {role_name} stage skipped: no role member assigned")
+                },
             },
             None => HookResult::Skipped {
                 reason: format!("no active transition for unassigned {role_name} role"),

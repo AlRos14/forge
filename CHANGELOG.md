@@ -77,9 +77,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   revisions/current checkpoint fields). Task/Execution response plan fields
   now expose Artifact projection where applicable; checklist progress is not
   attached to Execution summaries. The planner-specific approval, checklist
-  gate, and `FORGE_RESULT plan_ready` protocol are removed. Existing V081 rows
-  remain as history; V098 migrates only rows with verifiable Execution/Actor
-  provenance.
+  gate, `Retry Planning` exception, and `FORGE_RESULT plan_ready` protocol are
+  removed. Persisted workflow definitions ignore the retired checklist hook
+  when resolved. Existing V081 rows remain as history; V098 migrates only rows
+  with verifiable Execution/Actor provenance.
 - Answering a historical V082 TaskDecisionRequest no longer resumes the
   planner. New Actor questions belong to generic collaboration Handoffs.
 - Caller-supplied collaboration references are scoped to their owning Task

@@ -79,6 +79,8 @@ pub enum BoardMoveOutcome {
 }
 
 impl WorkflowEngine {
+    const RETIRED_PLAN_CHECKLIST_HOOK: &'static str = "require_plan_checklist_complete";
+
     #[tracing::instrument(
         skip(self, workflow),
         fields(
@@ -557,11 +559,30 @@ impl WorkflowEngine {
 
     pub fn resolve_workflow(workflow_definition_json: &str) -> WorkflowDefinition {
         let raw = workflow_definition_json.trim();
-        if raw.is_empty() || raw == "{}" {
-            return default_workflow::default_workflow();
+        let mut workflow = if raw.is_empty() || raw == "{}" {
+            default_workflow::default_workflow()
+        } else {
+            serde_json::from_str(raw).unwrap_or_else(|_| default_workflow::default_workflow())
+        };
+        for state in &mut workflow.states {
+            let hooks = &mut state.hooks;
+            hooks
+                .before_exit
+                .retain(|hook| hook.action != Self::RETIRED_PLAN_CHECKLIST_HOOK);
+            hooks
+                .on_exit
+                .retain(|hook| hook.action != Self::RETIRED_PLAN_CHECKLIST_HOOK);
+            hooks
+                .before_enter
+                .retain(|hook| hook.action != Self::RETIRED_PLAN_CHECKLIST_HOOK);
+            hooks
+                .on_enter
+                .retain(|hook| hook.action != Self::RETIRED_PLAN_CHECKLIST_HOOK);
+            hooks
+                .after_enter
+                .retain(|hook| hook.action != Self::RETIRED_PLAN_CHECKLIST_HOOK);
         }
-
-        serde_json::from_str(raw).unwrap_or_else(|_| default_workflow::default_workflow())
+        workflow
     }
 
     pub fn resolve_subtask_workflow() -> WorkflowDefinition {
@@ -1878,10 +1899,6 @@ fn semantic_default_workflow(task_type: &str) -> WorkflowDefinition {
             }
             .to_owned(),
         );
-        state
-            .hooks
-            .before_exit
-            .retain(|hook| hook.action != "require_plan_checklist_complete");
         state.dispatch = Some(WorkflowDispatch {
             builder: Some(
                 if task_type == "planning" {

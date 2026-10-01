@@ -322,6 +322,20 @@ async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors(
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let human_id = seed_human_user(&db).await;
+    let now = now_rfc3339();
+    ProjectMemberRepo::add_member(
+        &*db,
+        CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: human_id.clone(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Human Project membership creates");
     let task = seed_task_with_status(
         &db,
         &project_id,
@@ -529,7 +543,10 @@ async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors(
         .transition(
             task.id.clone(),
             crate::workflow::default_states::IN_PROGRESS.to_owned(),
-            current_task.version,
+            (
+                current_task.version,
+                Some("continue after Human planning".to_owned()),
+            ),
         )
         .await
         .expect("Human continuation does not require a plan approval gate");

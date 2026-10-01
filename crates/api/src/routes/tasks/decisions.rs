@@ -27,7 +27,7 @@ pub async fn answer_task_decision(
     Json(request): Json<AnswerTaskDecisionRequest>,
 ) -> ApiResult<Json<TaskDecisionRequestResponse>> {
     let row = sqlx::query(
-        "SELECT id, task_id, execution_id, role, authority_scope, questions_json,
+        "SELECT id, task_id, role, authority_scope, questions_json,
                 context, status, created_at
          FROM task_decision_request WHERE id = ? AND task_id = ?",
     )
@@ -66,7 +66,6 @@ pub async fn answer_task_decision(
             "answers must be a non-empty object with a value for every question",
         ));
     }
-    let execution_id: String = row.get("execution_id");
     let now = now_rfc3339();
     let mut tx = state.db.pool().begin().await?;
     let claimed = sqlx::query(

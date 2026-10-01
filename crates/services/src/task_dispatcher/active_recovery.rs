@@ -113,7 +113,7 @@ impl TaskDispatcher {
         if role_name == "orchestrator" {
             return Ok(false);
         }
-        if state.kind == StateKind::Gate && helpers::auto_cascades_on_unassigned_role(state) {
+        if crate::workflow::auto_cascades_on_unassigned_role(state) {
             let role_unassigned = match crate::task_service::current_role_memberships_authoritative(
                 &self.db, &task.id, role_name,
             )

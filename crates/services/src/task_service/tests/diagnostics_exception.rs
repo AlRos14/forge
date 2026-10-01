@@ -795,7 +795,7 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
 }
 
 #[tokio::test]
-async fn test_derive_workflow_exception_failed_planner_offers_retry() {
+async fn test_derive_workflow_exception_does_not_offer_planner_specific_retry() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
@@ -827,21 +827,10 @@ async fn test_derive_workflow_exception_failed_planner_offers_retry() {
         None,
         Some(&execution),
         &remaining_retries,
-    )
-    .expect("workflow exception derives");
+    );
 
-    assert_eq!(exception.exception_type, "planner_failed");
-    assert!(exception.message.contains("WorkspaceLease"));
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
+    assert!(
+        exception.is_none(),
+        "failed planning does not create a bespoke planner retry exception"
+    );
 }

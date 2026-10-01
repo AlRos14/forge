@@ -294,15 +294,6 @@ async fn human_approval_keeps_the_exact_generic_plan_artifact() {
     assert_eq!(legacy_approvals, 0);
 }
 
-#[tokio::test]
-#[ignore = "Planner execution spawning/completion is not wired to the role dispatch event yet; this documents the expected future cascade to in_progress."]
-async fn planner_completion_cascades_to_in_progress() {
-    assert!(
-        true,
-        "cascade portion intentionally ignored until role execution is wired"
-    );
-}
-
 fn planning_workflow() -> Value {
     json!({
         "roles": [{ "name": "planner", "display_name": "Planner", "description": "Plans" }],
@@ -371,6 +362,21 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed Human planning user");
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await

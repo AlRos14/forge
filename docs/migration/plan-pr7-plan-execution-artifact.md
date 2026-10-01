@@ -1,6 +1,7 @@
 # Plan PR7 — Planning Execution and generic Plan Artifact
 
-Status: implementation on `feat/plan-pr7-plan-execution-artifact`, based on
+Status: ready for independent review on
+`feat/plan-pr7-plan-execution-artifact`, based on
 `27acb8cb1096eda099dcbc1a233d5e0251f1aece`. This branch is not merged.
 
 ## Authority
@@ -75,7 +76,10 @@ The PR7 scan and changes cover these paths:
 - `task_plan_revision` and `task_plan_approval` have no planning, gate, or
   review evidence writers. The default planning state is Active; its approval,
   rejection loop, plan-specific awaiting-human metadata, and checklist gate are
-  removed. Generic gates remain owned by the transitional workflow until PR9.
+  removed. Workflow resolution filters the retired checklist hook from
+  previously stored workflow definitions so it cannot block a transition as an
+  unknown action. Generic gates remain owned by the transitional workflow
+  until PR9.
 - `Task.plan` is removed as a repository/service/API/MCP writer and from the
   runtime Task model. The `forge_update_task` schema has no `plan` property.
   Legacy values in the physical column are retained but never used as
@@ -88,10 +92,11 @@ The PR7 scan and changes cover these paths:
 - `PlannerPromptBuilder`, the `planner.default.v2` builder, the required
   `../plan.md` script, `write_plan`, `PLAN_ARTIFACT_AGENT_INSTRUCTION`,
   `FORGE_RESULT plan_ready`, planner result persistence, and planner-specific
-  retries/rejections are removed. The HarnessAdapter capability declaration
-  decides whether planning is native/emulated/unsupported. Claude Code selects
-  its native Plan mode; explicit `emulated` capability remains allowed;
-  `unsupported` and `unknown` fail before dispatch without silent fallback.
+  `Retry Planning`/rejection handling are removed. The HarnessAdapter capability declaration
+  decides whether planning is native/emulated/unsupported. Claude Code
+  selects its native Plan mode; explicit `emulated` capability remains
+  allowed; `unsupported` and `unknown` fail before dispatch without silent
+  fallback.
 - The V082 TaskDecisionRequest planner producer is removed with the old result
   parser. Historical request rows remain readable/answerable as records, but
   answering one no longer starts a planner Execution. New Actor questions use
@@ -142,25 +147,14 @@ retention and migration preconditions are satisfied; PR7 does not drop tables.
 
 ## Validation
 
-Focused checks completed before the requested Cargo cleanup:
+Focused validation after the requested Cargo cleanup:
 
-- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target pnpm --dir web generate:types`
-  (the Rust exporter test passed and generated bindings were updated).
-- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_authorship`
-  (V098 migration test before the final SQL guard was tightened to require a
-  persisted Human/Agent Actor; that final predicate was statically reviewed but
-  not retested under Cargo).
-- PASS — `pnpm --dir web exec vitest run src/components/__tests__/PlanDocument.test.tsx src/components/__tests__/PlanChecklist.test.tsx`
-  (2 files, 6 tests).
-- PASS — `pnpm --dir web typecheck`.
-- PASS — `git diff --check`, focused `rustfmt --check` on modified Rust files,
-  and JSON parsing of `crates/services/tests/fixtures/default_strict_workflow.json`.
-
-The services filter `cargo test -p services plan -j 2` did not finish. An
-earlier attempt reported Rust compile errors that were corrected; the next
-attempt remained blocked waiting for Cargo's build lock and was stopped when
-the user requested reclaiming Rust/Cargo disk space. Therefore the final
-services compile and tests are unverified. Focused API Rust tests and the
-harness capability tests were not run. No full workspace tests or release
-build were run. At the user's request, `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo clean`
-removed 43,548 files and reclaimed 40 GiB; no Cargo command has been run since.
+- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p db pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_authorship -j 2` (V098 final actor-provenance trigger and legacy mapping).
+- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p services plan -j 2` (19 tests, including Agent/Human provenance, immutable revisions, exact downstream pinning, cross-connection idempotency, no V081 writes, no checklist gate, and removal of the bespoke planner retry exception).
+- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p services workflow_resolution_removes_retired_plan_checklist_hook -j 2` (one test; stored workflows cannot reactivate checklist blocking).
+- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p executors planning_requires_an_explicit_native_or_emulated_capability -j 2` (native/emulated accepted, unsupported/unknown fail closed).
+- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p cli-adapters planning -j 2` (2 Claude native planning tests).
+- PASS — `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p api --test planning_gate -j 2` (3 tests; generic Gate continuation preserves the exact Human-authored Artifact, creates no duplicate, and writes no V081 approval; an initial unseeded-user fixture failure was corrected before the passing rerun).
+- PASS — `pnpm --dir web exec vitest run src/components/__tests__/PlanDocument.test.tsx src/components/__tests__/PlanChecklist.test.tsx` (2 files, 6 tests), `pnpm --dir web typecheck`, and `pnpm --dir web generate:types` (completed before the requested Cargo cleanup; no web source changed afterwards).
+- PASS — `rustfmt --edition 2021 --check` on modified Rust files and `git diff --check`.
+- NOT RUN — full workspace tests and release build. `cargo clean` was run earlier at the user's request, removing 43,548 files and reclaiming 40 GiB; all subsequent Cargo commands used the existing `/home/alejandro/Proyectos/forge/target` with debug symbols and incremental compilation disabled.

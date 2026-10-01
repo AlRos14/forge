@@ -431,6 +431,55 @@ async fn build_role_dispatch_harness(
     }
 }
 
+async fn build_non_review_gate_dispatch_harness(
+    task_id: &str,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+) -> DispatchHarness {
+    let gate_name = "approval_gate";
+    let role = "approver";
+    let mut harness = build_role_dispatch_harness(
+        task_id,
+        default_states::TODO,
+        gate_name,
+        role,
+        agent_id,
+        max_concurrent_tasks,
+    )
+    .await;
+    let mut workflow = (*harness.ctx.workflow).clone();
+    let mut gate = workflow
+        .states
+        .iter()
+        .find(|state| state.name == default_states::IN_PROGRESS)
+        .expect("active state exists")
+        .clone();
+    gate.name = gate_name.to_owned();
+    gate.kind = api_types::StateKind::Gate;
+    gate.role = Some(role.to_owned());
+    gate.gate_config = Some(api_types::GateConfig {
+        reject_target: Some(default_states::IN_PROGRESS.to_owned()),
+        max_rejections: Some(2),
+        approve_label: None,
+        reject_label: None,
+        requires_user_approval: Some(true),
+        optional_when_unassigned: Some(false),
+    });
+    gate.triggers.clear();
+    gate.triggers.insert(
+        api_types::WorkflowTrigger::Accept,
+        api_types::WorkflowTriggerDefinition {
+            to: default_states::IN_PROGRESS.to_owned(),
+            dispatch: None,
+        },
+    );
+    workflow.states.push(gate.clone());
+    harness.ctx.to_state = gate_name.to_owned();
+    harness.ctx.gate_config = gate.gate_config;
+    harness.ctx.workflow = Arc::new(workflow);
+    harness
+}
+
 async fn build_no_repo_dispatch_harness(
     task_id: &str,
     agent_id: &str,
@@ -564,6 +613,28 @@ async fn build_test_ctx(
         execution_id: None,
         state_config: json!({}),
     }
+}
+
+fn add_upstream_gate(ctx: &mut HookContext, gate_name: &str, role: &str) {
+    let mut workflow = (*ctx.workflow).clone();
+    let mut gate = workflow
+        .states
+        .iter()
+        .find(|state| state.name == default_states::REVIEW)
+        .expect("review template exists")
+        .clone();
+    gate.name = gate_name.to_owned();
+    gate.role = Some(role.to_owned());
+    gate.triggers.clear();
+    gate.triggers.insert(
+        api_types::WorkflowTrigger::Accept,
+        api_types::WorkflowTriggerDefinition {
+            to: ctx.to_state.clone(),
+            dispatch: None,
+        },
+    );
+    workflow.states.push(gate);
+    ctx.workflow = Arc::new(workflow);
 }
 
 #[tokio::test]
@@ -1339,35 +1410,37 @@ async fn auto_cascade_review_failure_budget_blocks_with_metadata() {
 }
 
 #[tokio::test]
-async fn require_upstream_roles_completed_fails_when_planner_assigned_without_planning_log() {
-    let ctx = build_test_ctx(
-        "task-upstream-missing-planning",
-        default_states::TODO,
+async fn require_upstream_roles_completed_fails_when_upstream_gate_was_not_entered() {
+    let mut ctx = build_test_ctx(
+        "task-upstream-missing-gate",
+        "approval_gate",
         default_states::IN_PROGRESS,
-        Some((default_roles::PLANNER, "agent-planner-missing-log")),
+        Some(("approver", "agent-approver-missing-gate")),
     )
     .await;
+    add_upstream_gate(&mut ctx, "approval_gate", "approver");
 
     let result = RequireUpstreamRolesCompleted.execute(&ctx).await;
 
     match result {
         HookResult::Failed { reason } => {
-            assert!(reason.contains(default_roles::PLANNER));
-            assert!(reason.contains(default_states::PLANNING));
+            assert!(reason.contains("approver"));
+            assert!(reason.contains("approval_gate"));
         }
         other => panic!("expected failed result, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn require_upstream_roles_completed_ok_when_no_planner_assigned() {
-    let ctx = build_test_ctx(
-        "task-upstream-no-planner",
-        default_states::TODO,
+async fn require_upstream_roles_completed_ok_when_upstream_gate_has_no_assignee() {
+    let mut ctx = build_test_ctx(
+        "task-upstream-no-gate-assignee",
+        "approval_gate",
         default_states::IN_PROGRESS,
         None,
     )
     .await;
+    add_upstream_gate(&mut ctx, "approval_gate", "approver");
 
     let result = RequireUpstreamRolesCompleted.execute(&ctx).await;
 
@@ -1375,19 +1448,20 @@ async fn require_upstream_roles_completed_ok_when_no_planner_assigned() {
 }
 
 #[tokio::test]
-async fn require_upstream_roles_completed_ok_when_planning_log_exists() {
-    let ctx = build_test_ctx(
-        "task-upstream-planning-log",
-        default_states::TODO,
+async fn require_upstream_roles_completed_ok_when_upstream_gate_entry_is_logged() {
+    let mut ctx = build_test_ctx(
+        "task-upstream-gate-log",
+        "approval_gate",
         default_states::IN_PROGRESS,
-        Some((default_roles::PLANNER, "agent-planner-with-log")),
+        Some(("approver", "agent-approver-with-gate-log")),
     )
     .await;
+    add_upstream_gate(&mut ctx, "approval_gate", "approver");
     seed_transition_log(
         &ctx.db,
         &ctx.task_id,
         default_states::TODO,
-        default_states::PLANNING,
+        "approval_gate",
         false,
     )
     .await;
@@ -1481,24 +1555,17 @@ async fn dispatch_role_agent_initial_dispatch_creates_execution_with_capacity() 
 }
 
 #[tokio::test]
-async fn planning_rejection_budget_allows_revision_at_configured_limit() {
-    let agent_id = "agent-planner-budget-limit";
-    let mut harness = build_role_dispatch_harness(
-        "task-planner-budget-limit",
-        default_states::PLANNING,
-        default_states::PLANNING,
-        default_roles::PLANNER,
-        agent_id,
-        1,
-    )
-    .await;
+async fn non_review_gate_rejection_budget_allows_dispatch_at_configured_limit() {
+    let agent_id = "agent-approver-budget-limit";
+    let mut harness =
+        build_non_review_gate_dispatch_harness("task-approver-budget-limit", agent_id, 1).await;
     let ctx = harness.ctx.clone();
     for _ in 0..2 {
         seed_transition_log(
             &ctx.db,
             &ctx.task_id,
-            default_states::PLANNING,
-            default_states::PLANNING,
+            "approval_gate",
+            "approval_gate",
             true,
         )
         .await;
@@ -1520,7 +1587,7 @@ async fn planning_rejection_budget_allows_revision_at_configured_limit() {
         .expect("task exists");
     assert!(task.blocked_json.is_none());
     assert_eq!(
-        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::PLANNER)
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, "approver")
             .await
             .expect("execution count loads"),
         1
@@ -1528,24 +1595,17 @@ async fn planning_rejection_budget_allows_revision_at_configured_limit() {
 }
 
 #[tokio::test]
-async fn exceeded_planning_rejection_budget_blocks_without_dispatching() {
-    let agent_id = "agent-planner-budget-exhausted";
-    let mut harness = build_role_dispatch_harness(
-        "task-planner-budget-exhausted",
-        default_states::PLANNING,
-        default_states::PLANNING,
-        default_roles::PLANNER,
-        agent_id,
-        1,
-    )
-    .await;
+async fn exhausted_non_review_gate_budget_blocks_without_dispatching() {
+    let agent_id = "agent-approver-budget-exhausted";
+    let mut harness =
+        build_non_review_gate_dispatch_harness("task-approver-budget-exhausted", agent_id, 1).await;
     let ctx = harness.ctx.clone();
     for _ in 0..3 {
         seed_transition_log(
             &ctx.db,
             &ctx.task_id,
-            default_states::PLANNING,
-            default_states::PLANNING,
+            "approval_gate",
+            "approval_gate",
             true,
         )
         .await;
@@ -1566,7 +1626,7 @@ async fn exceeded_planning_rejection_budget_blocks_without_dispatching() {
             .is_err()
     );
     assert_eq!(
-        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::PLANNER)
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, "approver")
             .await
             .expect("execution count loads"),
         0

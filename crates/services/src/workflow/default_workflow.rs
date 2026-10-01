@@ -517,6 +517,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn planning_is_an_active_execution_stage_without_a_plan_gate() {
+        let workflow = default_workflow();
+        let planning = workflow
+            .states
+            .iter()
+            .find(|state| state.name == default_states::PLANNING)
+            .expect("planning stage exists");
+
+        assert_eq!(planning.kind, StateKind::Active);
+        assert_eq!(planning.role.as_deref(), Some(default_roles::PLANNER));
+        assert!(planning.gate_config.is_none());
+        assert_eq!(
+            planning
+                .dispatch
+                .as_ref()
+                .and_then(|dispatch| dispatch.builder.as_deref()),
+            Some("generic.default.v2")
+        );
+    }
+
+    #[test]
     fn merge_failed_completion_re_reviews_before_merge() {
         let workflow = default_workflow();
 

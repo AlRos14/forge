@@ -86,6 +86,10 @@ workflow gates, REST plan projection, or review evidence selection. V098 maps
 only rows whose source Execution has a verifiable same-Task Human/Agent Actor;
 unattributable and ambiguous rows retain an explicit audit status and no
 invented producer. Physical table and column removal remains Plan PR13.
+The workflow resolver also discards the retired checklist hook from previously
+stored workflow definitions, and failed Plan Executions no longer create a
+planner-specific retry exception; general workflow and execution recovery stay
+with their owning migration plans.
 
 ## Current repository baseline
 
