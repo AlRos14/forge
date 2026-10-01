@@ -1,58 +1,6 @@
 use super::*;
 
 impl TaskService {
-    pub async fn dispatch_follow_up(
-        &self,
-        task_id: &str,
-        review_outcome: ::review::ReviewOutcome,
-        parent_execution_id: String,
-    ) -> Result<Execution> {
-        validate_required("task_id", task_id)?;
-        validate_required("parent_execution_id", &parent_execution_id)?;
-
-        let (trigger, prompt) = match &review_outcome {
-            ::review::ReviewOutcome::Passed => {
-                return Err(ServiceError::invalid_operation(
-                    "cannot dispatch follow-up for a passed review",
-                ));
-            }
-            ::review::ReviewOutcome::PassedCiOnly => {
-                return Err(ServiceError::invalid_operation(
-                    "cannot dispatch follow-up for a passed CI-only review",
-                ));
-            }
-            ::review::ReviewOutcome::AuditorFailed { reason } => {
-                let diff = self.best_effort_git_diff(task_id).await;
-                (
-                    "review_failed",
-                    ::review::follow_up::render_review_fail_prompt(reason, &diff),
-                )
-            }
-            ::review::ReviewOutcome::CiFailed { failing_steps } => (
-                "ci_failed",
-                ::review::follow_up::render_ci_fail_prompt(failing_steps),
-            ),
-            ::review::ReviewOutcome::MergeConflict {
-                conflict_paths,
-                conflict_summary,
-            } => (
-                "merge_failed",
-                ::review::follow_up::render_merge_conflict_prompt(conflict_paths, conflict_summary),
-            ),
-        };
-        dispatch_role_follow_up_impl(
-            self.clone(),
-            task_id.to_owned(),
-            crate::workflow::default_roles::CODER.to_owned(),
-            parent_execution_id,
-            prompt,
-            trigger.to_owned(),
-            ExecutionPurpose::Implement,
-            None,
-        )
-        .await
-    }
-
     pub async fn dispatch_role_follow_up(
         &self,
         task_id: &str,

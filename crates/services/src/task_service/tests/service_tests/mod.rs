@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent,
     CreateProjectAgentBinding, CreateProjectMember, CreateTask, DaemonRepo, DaemonStatus,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceProjectAgentBinding, UpdateProject,
-    UpsertDaemon,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceProjectAgentBinding, ReviewRepo,
+    ReviewStatus, UpdateProject, UpsertDaemon,
 };
 use executors::{ExecutionResult, ExecutorError};
 use sqlx::Row;

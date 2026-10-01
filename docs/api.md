@@ -144,14 +144,22 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
 | POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
 | POST   | `/api/v1/tasks/{id}/submit` | Fire the current active state's `accept` trigger |
-| POST   | `/api/v1/tasks/{id}/request-changes` | Reject the current review/gate and resume its configured worker path |
-| POST   | `/api/v1/tasks/{id}/approve` | Approve an awaiting-human review or an approval-required gate |
+| POST   | `/api/v1/tasks/{id}/request-changes` | Request changes on supported workflow gates; task-level Review decisions use an exact Review Execution |
+| POST   | `/api/v1/tasks/{id}/approve` | Approve supported workflow gates; task-level Review decisions use an exact Review Execution |
 | POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
-| POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
+| POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns the Task projection without a legacy Review authority |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
 | POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
-| POST   | `/api/v1/tasks/{id}/review` | Re-run the CI steps without changing state |
+| POST   | `/api/v1/tasks/{id}/review` | Start a Human reviewer Execution for the assigned Human reviewer |
+| GET    | `/api/v1/tasks/{id}/reviews` | List reviewer Executions and their exact ReviewReport Artifacts (display projection) |
+| GET    | `/api/v1/reviews/{execution_id}` | Read one exact reviewer Execution and its ReviewReport Artifact |
+| POST   | `/api/v1/reviews/{execution_id}` | Submit a structured Human ReviewReport to that exact Human reviewer Execution |
+| POST   | `/api/v1/tasks/{id}/gates/review/approve` | Compatibility adapter: submit PASS to the caller's one running Human reviewer Execution when Task version matches |
+| POST   | `/api/v1/tasks/{id}/gates/review/reject` | Compatibility adapter: submit request-changes to the caller's one running Human reviewer Execution when Task version matches |
+| GET    | `/api/v1/tasks/{id}/validations` | List exact ValidationRuns for a Task |
+| GET    | `/api/v1/validations/{id}` | Read one exact ValidationRun, its Evidence IDs, and optional validation-report Artifact ID |
+| GET    | `/api/v1/evidence/{id}` | Read exact deterministic Evidence and its producing ValidationRun ID |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
 | POST   | `/api/v1/tasks/{id}/comments` | Create task comment |
@@ -255,6 +263,28 @@ database for historical provenance.
 | PATCH  | `/api/v1/notifications/{id}/read` | Mark one notification read |
 | GET    | `/api/v1/events` | Server-sent events stream |
 | POST   | `/mcp` | MCP JSON-RPC endpoint |
+
+## Review and deterministic validation (Plan PR8)
+
+Review is a cognitive result: a Human or Agent Actor performs an Execution with
+`role=reviewer` and `purpose=review`, and its exact `review_report` Artifact is
+the output authority. Human reports are submitted to one exact Human reviewer
+Execution. The older `/api/v1/tasks/{id}/review/{approve,reject}` URLs remain
+retired and return `409`; clients should submit reports to
+`/api/v1/reviews/{execution_id}`. The generic
+`/api/v1/tasks/{id}/gates/review/{approve,reject}` URLs remain as a bounded
+adapter: they require one running Human reviewer Execution for the caller and
+the matching Task version, then produce a ReviewReport on that exact Execution.
+They never write a legacy Review row.
+
+Deterministic checks are separate ValidationRuns. Each response exposes the
+exact Task, check/command identity, Workspace, commit and working-tree snapshot,
+status, exit code, Evidence IDs, and optional validation-report Artifact ID.
+Neither a passed ValidationRun nor a passing ReviewReport implies the other
+result exists. The Task review list is a UI projection; durable consumers must
+retain the returned Execution, Artifact, ValidationRun, and Evidence IDs.
+See [the PR8 migration record](migration/plan-pr8-review-validation-evidence.md)
+for provenance, idempotency, and legacy-data details.
 
 Agent usage is stored as the provider's JSON payload. Codex snapshots include
 the primary and secondary rate-limit windows returned by the app server. Cursor

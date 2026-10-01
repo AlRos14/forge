@@ -9,8 +9,41 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
+        self.transition_inner(task_id.into(), new_status, options.into(), None)
+            .await
+    }
+
+    pub(crate) async fn transition_caused_by_execution(
+        &self,
+        task_id: impl Into<String>,
+        new_status: TaskStatus,
+        options: TransitionOptions,
+        causing_execution_id: &str,
+    ) -> Result<TransitionResult> {
         let task_id = task_id.into();
-        let options = options.into();
+        let cause = ExecutionRepo::get_by_id(&*self.db, causing_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", causing_execution_id.to_owned()))?;
+        if cause.task_id != task_id
+            || cause.role != crate::workflow::default_roles::REVIEWER
+            || cause.purpose != Some(ExecutionPurpose::Review)
+            || cause.status != ExecutionStatus::Completed
+        {
+            return Err(ServiceError::invalid_operation(
+                "Review rework transition requires its exact completed reviewer Execution",
+            ));
+        }
+        self.transition_inner(task_id, new_status, options, Some(causing_execution_id))
+            .await
+    }
+
+    async fn transition_inner(
+        &self,
+        task_id: String,
+        new_status: TaskStatus,
+        options: TransitionOptions,
+        causing_execution_id: Option<&str>,
+    ) -> Result<TransitionResult> {
         let trigger_reason = options.reason.unwrap_or_else(|| "user action".to_owned());
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -63,18 +96,34 @@ impl TaskService {
         let defer_dispatch_until = options
             .defer_dispatch_seconds
             .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
-        let result = engine
-            .transition_with_deferred_dispatch(
-                &task_id,
-                &new_status,
-                options.version,
-                &workflow,
-                &options.triggered_by,
-                &trigger_reason,
-                options.rejection,
-                defer_dispatch_until,
-            )
-            .await?;
+        let result = if let Some(causing_execution_id) = causing_execution_id {
+            engine
+                .transition_with_execution_cause(
+                    &task_id,
+                    &new_status,
+                    options.version,
+                    &workflow,
+                    &options.triggered_by,
+                    &trigger_reason,
+                    options.rejection,
+                    defer_dispatch_until,
+                    causing_execution_id,
+                )
+                .await?
+        } else {
+            engine
+                .transition_with_deferred_dispatch(
+                    &task_id,
+                    &new_status,
+                    options.version,
+                    &workflow,
+                    &options.triggered_by,
+                    &trigger_reason,
+                    options.rejection,
+                    defer_dispatch_until,
+                )
+                .await?
+        };
         let mut task = result.task;
         if was_blocked {
             self.publish(ForgeEvent {
@@ -93,16 +142,6 @@ impl TaskService {
                 previous_reason = ?blocked_previous_reason,
                 "blocked metadata cleared by transition"
             );
-        }
-        if should_clear_review_passed_at(
-            &workflow,
-            &previous_status,
-            &task.status,
-            options.rejection,
-            &options.triggered_by,
-        ) {
-            task =
-                TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
         }
         if previous_status == crate::workflow::default_states::REVIEW
             && task.status != crate::workflow::default_states::REVIEW
@@ -171,14 +210,26 @@ impl TaskService {
             return Ok(true);
         }
         if task.status == crate::workflow::default_states::REVIEW {
-            let latest_review = ReviewRepo::list_by_task(&*self.db, &task_id)
-                .await?
-                .into_iter()
-                .max_by_key(|review| review.attempt_number);
-            if latest_review
-                .as_ref()
-                .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-            {
+            let executions = ExecutionRepo::list_by_task(
+                &*self.db,
+                &task_id,
+                PageRequest {
+                    cursor: None,
+                    limit: 100,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc,
+                },
+            )
+            .await?;
+            if executions.items.iter().any(|execution| {
+                execution.role == crate::workflow::default_roles::REVIEWER
+                    && execution.purpose == Some(ExecutionPurpose::Review)
+                    && execution
+                        .actor_ref()
+                        .is_some_and(|actor| matches!(actor, db::ActorRef::Human(_)))
+                    && execution.status == ExecutionStatus::Running
+            }) {
                 return Ok(true);
             }
         }
@@ -713,41 +764,6 @@ pub(super) fn should_clear_transient_error_annotation(task: &Task) -> bool {
     task.error_annotation
         .as_deref()
         .is_some_and(is_transient_error_annotation)
-}
-
-pub(super) fn should_clear_review_passed_at(
-    workflow: &api_types::WorkflowDefinition,
-    from: &str,
-    to: &str,
-    rejection: bool,
-    actor: &Actor,
-) -> bool {
-    let from_kind = workflow.state_kind(from);
-    let to_kind = workflow.state_kind(to);
-
-    if matches!(from_kind, Some(api_types::StateKind::Gate)) && rejection {
-        return true;
-    }
-    if matches!(from_kind, Some(api_types::StateKind::Custom))
-        && matches!(
-            to_kind,
-            Some(api_types::StateKind::Initial | api_types::StateKind::Active)
-        )
-    {
-        return true;
-    }
-    if actor.is_user() {
-        let from_is_work = matches!(
-            from_kind,
-            Some(api_types::StateKind::Active | api_types::StateKind::Gate)
-        );
-        let to_is_work = matches!(
-            to_kind,
-            Some(api_types::StateKind::Active | api_types::StateKind::Gate)
-        );
-        return from_is_work && !to_is_work;
-    }
-    false
 }
 
 #[cfg(test)]

@@ -405,6 +405,169 @@ impl CollaborationService {
         Ok(write.artifact)
     }
 
+    /// Parse the harness transport marker into the exact immutable ReviewReport
+    /// output for one reviewer Execution. The transport line is never itself a
+    /// domain verdict; only the resulting Artifact is authoritative.
+    pub async fn create_review_report_from_execution(
+        &self,
+        execution_id: &str,
+        assistant_output: &str,
+    ) -> Result<Artifact> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+        if execution.role != "reviewer"
+            || execution.purpose != Some(ExecutionPurpose::Review)
+            || !matches!(
+                execution.status,
+                db::ExecutionStatus::Running | db::ExecutionStatus::Completed
+            )
+        {
+            return Err(invalid(
+                "ReviewReport producer must be a running or completed reviewer Review Execution",
+            ));
+        }
+        let actor = execution
+            .actor_ref()
+            .ok_or_else(|| invalid("Review Execution has no persisted ActorRef"))?;
+        let structured = parse_review_result(assistant_output)?;
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| not_found("task", execution.task_id.clone()))?;
+
+        let artifact_inputs =
+            CollaborationRepo::list_execution_artifact_inputs(&*self.db, execution_id).await?;
+        let evidence_inputs =
+            db::ValidationRunRepo::list_execution_evidence_inputs(&*self.db, execution_id).await?;
+        let mut considered = Vec::new();
+        let mut seen = HashSet::new();
+        for reference in structured.evidence_considered {
+            let reference = reference.as_object().ok_or_else(|| {
+                invalid("ReviewReport evidence_considered entries must be exact reference objects")
+            })?;
+            let artifact_id = reference
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str);
+            let evidence_id = reference
+                .get("evidence_id")
+                .and_then(serde_json::Value::as_str);
+            if artifact_id.is_some() == evidence_id.is_some() {
+                return Err(invalid(
+                    "ReviewReport evidence reference must name exactly one Artifact or Evidence",
+                ));
+            }
+            if let Some(artifact_id) = artifact_id {
+                if !seen.insert(("artifact", artifact_id.to_owned())) {
+                    return Err(invalid(
+                        "ReviewReport contains a duplicate Artifact reference",
+                    ));
+                }
+                let input = artifact_inputs
+                    .iter()
+                    .find(|input| input.artifact_id == artifact_id)
+                    .ok_or_else(|| {
+                        invalid("ReviewReport references an Artifact not pinned to this Execution")
+                    })?;
+                let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
+                    .await?
+                    .ok_or_else(|| invalid("pinned ReviewReport Artifact input is missing"))?;
+                considered.push(serde_json::json!({
+                    "artifact_id": input.artifact_id,
+                    "digest": input.digest,
+                    "kind": artifact.kind,
+                }));
+            }
+            if let Some(evidence_id) = evidence_id {
+                if !seen.insert(("evidence", evidence_id.to_owned())) {
+                    return Err(invalid(
+                        "ReviewReport contains a duplicate Evidence reference",
+                    ));
+                }
+                let input = evidence_inputs
+                    .iter()
+                    .find(|input| input.evidence_id == evidence_id)
+                    .ok_or_else(|| {
+                        invalid("ReviewReport references Evidence not pinned to this Execution")
+                    })?;
+                let evidence = db::ValidationRunRepo::get_evidence(&*self.db, evidence_id)
+                    .await?
+                    .ok_or_else(|| invalid("pinned ReviewReport Evidence input is missing"))?;
+                considered.push(serde_json::json!({
+                    "evidence_id": input.evidence_id,
+                    "digest": input.digest,
+                    "kind": evidence.kind,
+                    "validation_run_id": evidence.producer_validation_run_id,
+                }));
+            }
+        }
+
+        let content = serde_json::json!({
+            "kind": "review_report",
+            "verdict": structured.verdict,
+            "criteria": structured.criteria,
+            "summary": structured.summary,
+            "findings": structured.findings,
+            "questions": structured.questions,
+            "evidence_considered": considered,
+            "subject": {
+                "task_id": task.id,
+                "review_execution_id": execution.id,
+                "workspace_id": execution.workspace_id,
+                "base_commit_sha": execution.before_sha,
+                "head_commit_sha": execution.after_sha,
+            },
+        })
+        .to_string();
+        let digest = hex::encode(Sha256::digest(content.as_bytes()));
+        let source = CollaborationActorSource::Execution(execution.id.clone());
+        let id = new_uuid_v4();
+        let now = now_rfc3339();
+        let event = self
+            .event_from_source(
+                &source,
+                EventScope {
+                    event_type: "artifact.created",
+                    entity_type: "artifact",
+                    entity_id: &id,
+                    task_id: &execution.task_id,
+                },
+                &actor,
+                serde_json::json!({
+                    "artifact_id": id,
+                    "task_id": execution.task_id,
+                    "kind": "review_report",
+                    "review_execution_id": execution.id,
+                }),
+                &now,
+            )
+            .await?;
+        let write = CollaborationRepo::create_execution_artifact_output(
+            &*self.db,
+            CreateArtifact {
+                id,
+                task_id: execution.task_id,
+                kind: ArtifactKind::ReviewReport,
+                storage_kind: ArtifactStorageKind::Inline,
+                content: Some(content),
+                content_ref: None,
+                metadata_json: serde_json::json!({
+                    "schema_version": 1,
+                    "review_execution_id": execution.id,
+                })
+                .to_string(),
+                digest: Some(digest),
+                producer_execution_id: execution.id,
+                created_at: now,
+            },
+            event,
+        )
+        .await?;
+        if let Some(event) = write.event.as_ref() {
+            self.domain_events.publish_committed(event);
+        }
+        Ok(write.artifact)
+    }
+
     pub async fn pin_execution_artifact_input(
         &self,
         execution_id: &str,
@@ -1438,6 +1601,77 @@ impl CollaborationService {
     }
 }
 
+struct ParsedReviewResult {
+    verdict: &'static str,
+    criteria: Vec<serde_json::Value>,
+    summary: String,
+    findings: Vec<serde_json::Value>,
+    questions: Vec<serde_json::Value>,
+    evidence_considered: Vec<serde_json::Value>,
+}
+
+fn parse_review_result(output: &str) -> Result<ParsedReviewResult> {
+    let marker_lines = output
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.trim()
+                .strip_prefix("FORGE_RESULT:")
+                .map(|payload| (index, payload.trim()))
+        })
+        .collect::<Vec<_>>();
+    let last_nonempty_line = output
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| (!line.trim().is_empty()).then_some(index))
+        .last();
+    if marker_lines.len() != 1
+        || marker_lines.first().map(|(index, _)| *index) != last_nonempty_line
+    {
+        return Err(invalid(
+            "review assistant output must end with exactly one FORGE_RESULT line",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(marker_lines[0].1)
+        .map_err(|_| invalid("FORGE_RESULT review payload is not valid JSON"))?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64)
+        != Some(1)
+        || value.get("kind").and_then(serde_json::Value::as_str) != Some("review")
+    {
+        return Err(invalid("FORGE_RESULT has an unsupported review contract"));
+    }
+    let verdict = match value.get("verdict").and_then(serde_json::Value::as_str) {
+        Some("pass") => "pass",
+        Some("fail") => "request_changes",
+        Some("needs_human") => "questions",
+        _ => return Err(invalid("FORGE_RESULT review verdict is invalid")),
+    };
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .ok_or_else(|| invalid("FORGE_RESULT review summary is required"))?
+        .to_owned();
+    let array = |key: &str, optional: bool| -> Result<Vec<serde_json::Value>> {
+        match value.get(key) {
+            Some(serde_json::Value::Array(values)) => Ok(values.clone()),
+            None if optional => Ok(Vec::new()),
+            _ => Err(invalid(&format!("FORGE_RESULT {key} must be an array"))),
+        }
+    };
+    Ok(ParsedReviewResult {
+        verdict,
+        criteria: array("criteria", true)?,
+        summary,
+        findings: array("findings", false)?,
+        questions: array("questions", false)?,
+        evidence_considered: array("evidence_considered", true)?,
+    })
+}
+
 fn validate_artifact_storage(
     storage_kind: ArtifactStorageKind,
     content: Option<&str>,
@@ -1453,6 +1687,37 @@ fn validate_artifact_storage(
         _ => Err(invalid(
             "Artifact storage requires exactly one of inline content or external content_ref",
         )),
+    }
+}
+
+#[cfg(test)]
+mod review_report_tests {
+    use super::parse_review_result;
+
+    #[test]
+    fn pr8_review_report_parser_requires_one_complete_final_structured_result() {
+        let parsed = parse_review_result(
+            "Inspection complete.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"All required behavior is present.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}",
+        )
+        .expect("complete structured result parses");
+        assert_eq!(parsed.verdict, "pass");
+        assert_eq!(parsed.summary, "All required behavior is present.");
+        assert_eq!(parsed.criteria.len(), 1);
+        assert!(parsed.findings.is_empty());
+        assert!(parsed.questions.is_empty());
+        assert!(parsed.evidence_considered.is_empty());
+    }
+
+    #[test]
+    fn pr8_review_report_parser_rejects_summary_fallback_duplicate_and_trailing_text() {
+        let without_summary = "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"findings\":[],\"questions\":[]}";
+        assert!(parse_review_result(without_summary).is_err());
+
+        let duplicate = "FORGE_RESULT: {}\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"done\",\"findings\":[],\"questions\":[]}";
+        assert!(parse_review_result(duplicate).is_err());
+
+        let trailing = "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"done\",\"findings\":[],\"questions\":[]}\nmore output";
+        assert!(parse_review_result(trailing).is_err());
     }
 }
 

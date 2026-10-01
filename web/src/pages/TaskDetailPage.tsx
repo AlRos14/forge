@@ -15,11 +15,13 @@ import {
   useLaunchExecution,
   useRecoverTask,
   useReviewsQuery,
+  useSubmitReviewReport,
   useTaskDiffQuery,
   useTaskQuery,
   useRejectGate,
   useTransitionTask,
   useTriggerReview,
+  useValidationsQuery,
   useUpdateTask,
   useWorkflowQuery,
 } from '@/api/hooks'
@@ -41,7 +43,6 @@ import {
   extractRunSuffix,
   formatDate,
   getErrorInfo,
-  getLatestReview,
   getTaskDetailApiErrorMessage,
   isRecord,
   readTaskStateConfig,
@@ -120,6 +121,7 @@ export function TaskDetailPage({
   const taskQuery = useTaskQuery(taskId)
   const executionsQuery = useExecutionsQuery(taskId)
   const reviewsQuery = useReviewsQuery(taskId)
+  const validationsQuery = useValidationsQuery(taskId)
   const diffQuery = useTaskDiffQuery(taskId)
   const agentsQuery = useAgentsQuery()
   const updateTask = useUpdateTask()
@@ -130,6 +132,7 @@ export function TaskDetailPage({
   const rolePicker = useRolePicker()
   const launchExecution = useLaunchExecution()
   const triggerReview = useTriggerReview()
+  const submitReviewReport = useSubmitReviewReport()
   const cancelTask = useCancelTask()
   const duplicateTask = useDuplicateTask()
   const recoverTask = useRecoverTask()
@@ -139,7 +142,6 @@ export function TaskDetailPage({
 
   const [launchDialogOpen, setLaunchDialogOpen] = useState(false)
   const [commentDraft, setCommentDraft] = useState('')
-  const [expandedHistoryAttempts, setExpandedHistoryAttempts] = useState<Set<number>>(new Set())
 
   const stopExecution = useMutation({
     mutationFn: (executionId: string) =>
@@ -191,8 +193,8 @@ export function TaskDetailPage({
     const name = agentId ? (agentNamesById.get(agentId) ?? agentId) : undefined
     return name ? stripRunSuffix(name, runSuffix) : undefined
   }
-  const reviews = useMemo(() => reviewsQuery.data ?? [], [reviewsQuery.data])
-  const latestReview = useMemo(() => getLatestReview(reviews), [reviews])
+  const reviews = reviewsQuery.data ?? []
+  const validations = validationsQuery.data ?? []
   const comments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data])
   const workflowQuery = useWorkflowQuery(task?.project_id ?? '')
   const workflow = workflowQuery.data
@@ -359,21 +361,6 @@ export function TaskDetailPage({
         currentStatus: task.status,
       },
       {
-        onSuccess: (result) => {
-          if (status !== 'review' || !result.review) return
-          if (result.review.status === 'passed') {
-            toast.success('Review passed')
-            return
-          }
-          if (result.review.status === 'failed') {
-            const failedStep = result.review.step_results.find((step) => step.exit_code !== 0)
-            if (failedStep) {
-              toast.error(`Review failed on step ${failedStep.index}: ${failedStep.command}`)
-            } else {
-              toast.error('Review failed')
-            }
-          }
-        },
         onError: (error) => {
           toast.error(getTaskDetailApiErrorMessage(error, 'Transition failed'))
         },
@@ -484,27 +471,25 @@ export function TaskDetailPage({
     )
   }
 
-  const rerunReview = () => {
+  const startHumanReview = () => {
     if (!task) return
-    triggerReview.mutate(task.id, {
-      onSuccess: (result) => {
-        if (result.review?.status === 'passed') {
-          toast.success('Review passed')
-        } else if (result.review?.status === 'failed') {
-          const failedStep = result.review.step_results.find((step) => step.exit_code !== 0)
-          if (failedStep) {
-            toast.error(`Review failed on step ${failedStep.index}: ${failedStep.command}`)
-          } else {
-            toast.error('Review failed')
-          }
-        } else {
-          toast.success('Review started')
-        }
+    triggerReview.mutate(
+      { taskId: task.id, body: { workspace_id: task.workspace?.id ?? null } },
+      {
+        onSuccess: (result) => toast.success(`Human Review Execution ${result.execution.id} started`),
+        onError: (error) => toast.error(getApiErrorMessage(error, 'Human review could not start')),
       },
-      onError: (error) => {
-        toast.error(getApiErrorMessage(error, 'Review trigger failed'))
+    )
+  }
+
+  const submitHumanReport = (executionId: string, body: Parameters<typeof submitReviewReport.mutate>[0]['body']) => {
+    submitReviewReport.mutate(
+      { executionId, body },
+      {
+        onSuccess: (result) => toast.success(`ReviewReport ${result.report.id} saved`),
+        onError: (error) => toast.error(getApiErrorMessage(error, 'ReviewReport could not be saved')),
       },
-    })
+    )
   }
 
   const onSubmitLaunch = (config: ExecutionConfigValue, summary: string) => {
@@ -540,18 +525,6 @@ export function TaskDetailPage({
         },
       },
     )
-  }
-
-  const toggleHistoryAttempt = (attemptNumber: number) => {
-    setExpandedHistoryAttempts((current) => {
-      const next = new Set(current)
-      if (next.has(attemptNumber)) {
-        next.delete(attemptNumber)
-      } else {
-        next.add(attemptNumber)
-      }
-      return next
-    })
   }
 
   return (
@@ -646,20 +619,19 @@ export function TaskDetailPage({
               <TaskReviewTab
                 task={task}
                 reviews={reviews}
-                latestReview={latestReview}
+                validations={validations}
                 reviewsLoading={reviewsQuery.isLoading}
-                transitionPending={transitionTask.isPending}
-                triggerReviewPending={triggerReview.isPending}
+                validationsLoading={validationsQuery.isLoading}
+                reviewStartPending={triggerReview.isPending}
+                reportSubmitPending={submitReviewReport.isPending}
                 recoverPending={recoverTask.isPending}
                 cancelPending={cancelTask.isPending}
                 terminal={terminal}
-                expandedHistoryAttempts={expandedHistoryAttempts}
-                onRerunReview={rerunReview}
-                onStatusChange={onStatusChange}
+                onStartReview={startHumanReview}
+                onSubmitReport={submitHumanReport}
                 onRecover={onRecoverTask}
                 onOpenWorkflowExceptionAction={onOpenWorkflowExceptionAction}
                 onCancelTask={onCancelTask}
-                onToggleHistoryAttempt={toggleHistoryAttempt}
               />
             </div>
           ) : null}

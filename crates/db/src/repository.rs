@@ -1230,6 +1230,74 @@ pub trait ScopedMemoryRepository: Send + Sync {
 }
 
 #[async_trait]
+pub trait ValidationRunRepo: Send + Sync {
+    /// Insert the Running identity and `validation_run.started` event atomically.
+    /// Same-key retries return the exact existing row and no second event.
+    async fn start_validation_run(
+        &self,
+        input: CreateValidationRun,
+        event: CreateDomainEvent,
+    ) -> Result<ValidationRunStartWrite>;
+    /// Claim or recover an expired Running check lease. The claim token fences
+    /// concurrent retries from committing a second result.
+    async fn claim_validation_run(
+        &self,
+        id: &str,
+        owner: &str,
+        now: &str,
+        claim_until: &str,
+    ) -> Result<bool>;
+    async fn heartbeat_validation_run(
+        &self,
+        id: &str,
+        owner: &str,
+        now: &str,
+        claim_until: &str,
+    ) -> Result<bool>;
+    /// Commit terminal status, Evidence, optional validation-report Artifact,
+    /// and all domain events as one recoverable database boundary.
+    async fn finish_validation_run(
+        &self,
+        input: FinishValidationRun,
+    ) -> Result<ValidationRunCompletionWrite>;
+    async fn get_validation_run(&self, id: &str) -> Result<Option<ValidationRun>>;
+    async fn get_validation_run_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<ValidationRun>>;
+    async fn list_validation_runs_by_task(&self, task_id: &str) -> Result<Vec<ValidationRun>>;
+    /// Select every result for this exact subject; this method has no latest-row semantics.
+    async fn list_validation_runs_for_subject(
+        &self,
+        task_id: &str,
+        workspace_id: &str,
+        commit_sha: &str,
+        workspace_snapshot_digest: &str,
+        caused_by_execution_id: Option<&str>,
+    ) -> Result<Vec<ValidationRun>>;
+    async fn get_evidence(&self, id: &str) -> Result<Option<Evidence>>;
+    async fn list_evidence_by_task(&self, task_id: &str) -> Result<Vec<Evidence>>;
+    async fn list_evidence_for_validation_run(
+        &self,
+        validation_run_id: &str,
+    ) -> Result<Vec<Evidence>>;
+    async fn list_execution_evidence_inputs(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<ExecutionEvidenceInput>>;
+    async fn get_validation_run_artifact_output(
+        &self,
+        validation_run_id: &str,
+    ) -> Result<Option<Artifact>>;
+    async fn pin_execution_evidence_inputs(
+        &self,
+        execution_id: &str,
+        evidence_ids: &[String],
+        created_at: &str,
+    ) -> Result<Vec<ExecutionEvidenceInput>>;
+}
+
+#[async_trait]
 pub trait ReviewRepo: Send + Sync {
     async fn create(&self, input: CreateReview) -> Result<Review>;
     async fn update_status(

@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo,
-    DaemonStatus, ExecutionRepo, ExecutionStatus, RepoRepo, ResumePolicy, ReviewRepo, ReviewStatus,
-    StopReason, TaskRepo, TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject, UpdateTask,
-    UpsertDaemon,
+    DaemonStatus, ExecutionRepo, ExecutionStatus, RepoRepo, ResumePolicy, StopReason, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon,
 };
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
 use tempfile::TempDir;
@@ -258,93 +257,6 @@ async fn assign_role(db: &db::SqliteDb, task_id: &str, role_name: &str, agent_id
     )
     .await
     .expect("role assignment creates");
-}
-
-async fn set_review_ci_config(db: &db::SqliteDb, task: &Task) -> Task {
-    TaskRepo::update(
-        db,
-        UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: Some(Some(r#"{"review":{"ci_steps":["test -d ."]}}"#.to_owned())),
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task review config updates")
-}
-
-async fn seed_running_review(
-    db: &db::SqliteDb,
-    task_id: &str,
-    execution_id: &str,
-    step_results_json: &str,
-) {
-    let now = now_rfc3339();
-    ReviewRepo::create(
-        db,
-        db::CreateReview {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            execution_id: execution_id.to_owned(),
-            attempt_number: 1,
-            status: ReviewStatus::Running,
-            step_results_json: step_results_json.to_owned(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("review creates");
-}
-
-async fn seed_completed_coder_execution(db: &db::SqliteDb, task_id: &str) -> String {
-    let now = now_rfc3339();
-    let execution_id = new_uuid_v4();
-    ExecutionRepo::create(
-        db,
-        db::CreateExecution {
-            id: execution_id.clone(),
-            task_id: task_id.to_owned(),
-            agent_id: None,
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: crate::workflow::default_roles::CODER.to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("completed".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("execution creates");
-    execution_id
 }
 
 async fn seed_running_execution(db: &db::SqliteDb, task_id: &str, agent_id: &str, role: &str) {
@@ -1339,14 +1251,13 @@ async fn dispatcher_skips_active_task_with_blocking_annotation() {
 }
 
 #[tokio::test]
-async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
+async fn dispatcher_can_run_cognitive_review_without_validation_result() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, &repo_id, "review", "review", 0).await;
-    let task = set_review_ci_config(&db, &task).await;
     assign_role(
         &db,
         &task.id,
@@ -1358,7 +1269,7 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
 
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
 
-    assert_eq!(dispatched, 0);
+    assert_eq!(dispatched, 1);
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
             &*db,
@@ -1367,28 +1278,12 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
         )
         .await
         .expect("execution count loads"),
-        0
+        1
     );
-    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
-        .await
-        .is_err());
-
-    let coder_execution_id = seed_completed_coder_execution(&db, &task.id).await;
-    seed_running_review(
-        &db,
-        &task.id,
-        &coder_execution_id,
-        r#"{"ci_steps":[{"index":0,"command":"test -d .","exit_code":0}]}"#,
-    )
-    .await;
-
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
-
-    assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
-        .expect("execution spawned in time")
-        .expect("execution context received");
+        .expect("reviewer Execution dispatch completes")
+        .expect("reviewer Execution context is received");
     assert_eq!(ctx.task_id, task.id);
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(

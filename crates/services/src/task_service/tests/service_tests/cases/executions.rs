@@ -47,6 +47,82 @@ async fn create_remote_execution_fixture(
     .expect("remote Execution fixture creates")
 }
 
+#[tokio::test]
+async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let now = now_rfc3339();
+    let execution = db::ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            role: "reviewer".to_owned(),
+            purpose: Some(db::ExecutionPurpose::Review),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some("aaaaaaa000000000000000000000000000000000".to_owned()),
+            after_sha: Some("bbbbbbb000000000000000000000000000000000".to_owned()),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Agent reviewer Execution creates");
+    assert_eq!(
+        execution.actor_ref(),
+        Some(db::ActorRef::Agent(agent_id.clone()))
+    );
+
+    let service = crate::CollaborationService::new(Arc::clone(&db), event_bus);
+    let output = "Review notes.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The exact subject is sound.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}";
+    let report = service
+        .create_review_report_from_execution(&execution.id, output)
+        .await
+        .expect("structured result becomes a ReviewReport Artifact");
+    let retry = service
+        .create_review_report_from_execution(&execution.id, output)
+        .await
+        .expect("identical output retry reuses its Artifact");
+    assert_eq!(report.id, retry.id);
+    assert!(matches!(
+        &report.producer,
+        db::ArtifactProducer::Execution { execution_id, actor: db::ActorRef::Agent(id) }
+            if execution_id == &execution.id && id == &agent_id
+    ));
+    let contradictory = output.replace("The exact subject is sound.", "A different conclusion.");
+    assert!(service
+        .create_review_report_from_execution(&execution.id, &contradictory)
+        .await
+        .is_err());
+    assert_eq!(
+        db::ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution lookup succeeds")
+            .expect("Execution remains")
+            .status,
+        ExecutionStatus::Running
+    );
+}
+
 fn completed_remote_notification(
     execution_id: &str,
     assistant_output: Option<&str>,
@@ -478,8 +554,11 @@ async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors(
     .expect("Plan output loads")
     .expect("Plan output exists");
     assert_eq!(first.task_id, task.id);
-    assert_eq!(first.producer_execution_id, completed.id);
-    assert_eq!(first.producer, db::ActorRef::Agent(agent_id.clone()));
+    assert!(matches!(
+        &first.producer,
+        db::ArtifactProducer::Execution { execution_id, actor: db::ActorRef::Agent(id) }
+            if execution_id == &completed.id && id == &agent_id
+    ));
     assert_eq!(first.content.as_deref(), Some("- [x] verify plan\n"));
 
     let downstream = db::ExecutionRepo::create(
@@ -560,7 +639,11 @@ async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors(
     .expect("second Plan output exists");
     assert_ne!(first.id, second.id);
     assert_eq!(first.content.as_deref(), Some("- [x] verify plan\n"));
-    assert_eq!(second.producer_execution_id, second_execution.id);
+    assert!(matches!(
+        &second.producer,
+        db::ArtifactProducer::Execution { execution_id, .. }
+            if execution_id == &second_execution.id
+    ));
 
     let retry = collaboration
         .create_plan_artifact_from_execution(&completed.id, "- [x] verify plan\n")
@@ -595,8 +678,11 @@ async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors(
         .await
         .expect("Human Plan Execution completes");
     assert_eq!(human_artifact.task_id, task.id);
-    assert_eq!(human_artifact.producer_execution_id, human_execution.id);
-    assert_eq!(human_artifact.producer, db::ActorRef::Human(human_id));
+    assert!(matches!(
+        &human_artifact.producer,
+        db::ArtifactProducer::Execution { execution_id, actor: db::ActorRef::Human(id) }
+            if execution_id == &human_execution.id && id == &human_id
+    ));
 
     let artifact_count_before_legacy_human_approval: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
@@ -973,8 +1059,11 @@ async fn remote_plan_completion_materializes_output_before_terminal_state_and_re
     .expect("Plan output lookup succeeds")
     .expect("remote Plan output is materialized");
     assert_eq!(artifact.content.as_deref(), Some(full_output));
-    assert_eq!(artifact.producer_execution_id, execution.id);
-    assert_eq!(artifact.producer, db::ActorRef::Agent(agent_id));
+    assert!(matches!(
+        &artifact.producer,
+        db::ArtifactProducer::Execution { execution_id, actor: db::ActorRef::Agent(id) }
+            if execution_id == &execution.id && id == &agent_id
+    ));
 
     service
         .complete_remote_execution(notification, None)

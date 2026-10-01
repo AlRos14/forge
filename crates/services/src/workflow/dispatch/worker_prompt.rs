@@ -1,5 +1,3 @@
-use db::ReviewStatus;
-
 use crate::workflow::{
     default_roles, default_states,
     dispatch::{
@@ -107,11 +105,6 @@ fn worker_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) 
         system.push_str(reason);
         system.push_str(". Address it in this attempt.");
     }
-    if let Some(attempt) = last_failed_review_attempt(ctx) {
-        system.push_str(&format!(
-            "\n\nThis task has failed validation or review on attempt {attempt}. Use the supplied evidence to repair it before resubmitting."
-        ));
-    }
     system
 }
 
@@ -137,13 +130,8 @@ fn review_fix_user(ctx: &AgentDispatchContext) -> String {
     );
     append_task_context(ctx, &mut user);
 
-    if let Some(reason) = latest_ci_failure_reason(ctx) {
-        user.push_str("\nLatest validation failure:\n");
-        user.push_str(&reason);
-        user.push('\n');
-    }
-    if let Some(feedback) = review_feedback(ctx) {
-        user.push_str("\nReview feedback:\n");
+    if let Some(feedback) = collaboration_context(ctx) {
+        user.push_str("\nCollaboration Message and attached Artifact:\n");
         user.push_str(&feedback);
         user.push('\n');
     }
@@ -160,9 +148,6 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
         user.push_str("\nMerge failure evidence:\n");
         user.push_str(&reason);
         user.push('\n');
-    }
-    if ctx.task.review_passed_at.is_some() {
-        user.push_str("\nReview already passed before the merge failure. Preserve that reviewed implementation and verify the repair; do not redesign the task.\n");
     }
     append_continuation_context(ctx, &mut user);
     user
@@ -202,71 +187,14 @@ fn append_continuation_context(ctx: &AgentDispatchContext, user: &mut String) {
         user.push_str(logs_path);
         user.push('\n');
     }
-    if let Some(execution_id) = ctx.latest_review_execution_id.as_deref() {
-        user.push_str("Review execution:\n");
-        user.push_str(execution_id);
-        user.push('\n');
-    }
-    if let Some(logs_path) = ctx.latest_review_logs_path.as_deref() {
-        user.push_str("Review log file:\n");
-        user.push_str(logs_path);
-        user.push('\n');
-    }
 }
 
-fn latest_ci_failure_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    ctx.prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-        .and_then(|review| {
-            let value =
-                serde_json::from_str::<serde_json::Value>(&review.step_results_json).ok()?;
-            if value
-                .get("auditor")
-                .is_some_and(|auditor| !auditor.is_null())
-            {
-                return None;
-            }
-            let steps = value
-                .get("ci_steps")
-                .or_else(|| value.is_array().then_some(&value))?
-                .as_array()?;
-            let failed = steps.iter().find(|step| {
-                step.get("exit_code")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_some_and(|code| code != 0)
-            })?;
-            let command = failed
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("validation step");
-            let output = failed
-                .get("output_tail")
-                .or_else(|| failed.get("stderr_tail"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            Some(format!("{command}\n{output}"))
-        })
-}
-
-fn review_feedback(ctx: &AgentDispatchContext) -> Option<String> {
+fn collaboration_context(ctx: &AgentDispatchContext) -> Option<String> {
     ctx.latest_review_feedback
         .as_deref()
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            ctx.transition_log
-                .iter()
-                .rev()
-                .find(|entry| {
-                    entry.from_state == default_states::REVIEW
-                        && entry.to_state == ctx.state_name
-                        && entry.rejection
-                })
-                .map(|entry| entry.trigger_reason.clone())
-        })
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {
@@ -275,12 +203,4 @@ fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {
         .rev()
         .find(|entry| entry.to_state == default_states::MERGE_FAILED)
         .map(|entry| entry.trigger_reason.clone())
-}
-
-fn last_failed_review_attempt(ctx: &AgentDispatchContext) -> Option<i64> {
-    ctx.prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .map(|review| review.attempt_number)
-        .max()
 }

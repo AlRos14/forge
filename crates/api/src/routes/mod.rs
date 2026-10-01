@@ -5,15 +5,14 @@ use std::{
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, RoleMembershipResponse,
-    RoleMembershipStatus, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse,
-    TaskRoleResponse, TaskType, WorkspaceResponse,
+    ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, StateKind,
+    Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
+    TaskRoleAssignmentResponse, TaskRoleResponse, TaskType, WorkspaceResponse,
 };
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
-    Project, ProjectRepo, Repo, Review, RoleMembership, RoleMembershipRepo, SortBy, SortOrder,
-    Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo, Workspace,
+    Project, ProjectRepo, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task,
+    TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo, Workspace,
     WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
@@ -223,13 +222,13 @@ fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
 }
 
 pub async fn task_response(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
-    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
-    task_response_inner(db, task, true, false, latest_review, latest_execution).await
+    let latest_execution = latest_diagnostic_execution(db, &task.id).await?;
+    task_response_inner(db, task, true, false, latest_execution).await
 }
 
 pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
-    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
-    task_response_inner(db, task, false, false, latest_review, latest_execution).await
+    let latest_execution = latest_diagnostic_execution(db, &task.id).await?;
+    task_response_inner(db, task, false, false, latest_execution).await
 }
 
 pub async fn task_response_with_awaiting_human(
@@ -237,35 +236,25 @@ pub async fn task_response_with_awaiting_human(
     task: Task,
     awaiting_human: bool,
 ) -> ApiResult<TaskResponse> {
-    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
-    task_response_inner(
-        db,
-        task,
-        true,
-        awaiting_human,
-        latest_review,
-        latest_execution,
-    )
-    .await
+    let latest_execution = latest_diagnostic_execution(db, &task.id).await?;
+    task_response_inner(db, task, true, awaiting_human, latest_execution).await
 }
 
 pub(crate) async fn task_response_light_with_latest(
     db: &db::SqliteDb,
     task: Task,
-    latest_review: Option<Review>,
     latest_execution: Option<Execution>,
 ) -> ApiResult<TaskResponse> {
-    task_response_inner(db, task, false, false, latest_review, latest_execution).await
+    task_response_inner(db, task, false, false, latest_execution).await
 }
 
-async fn latest_diagnostic_rows(
+async fn latest_diagnostic_execution(
     db: &db::SqliteDb,
     task_id: &str,
-) -> std::result::Result<(Option<Review>, Option<Execution>), db::DbError> {
+) -> std::result::Result<Option<Execution>, db::DbError> {
     let task_ids = [task_id];
-    let mut reviews = db::ReviewRepo::list_latest_reviews_for_tasks(db, &task_ids).await?;
     let mut executions = db::ExecutionRepo::list_latest_executions_for_tasks(db, &task_ids).await?;
-    Ok((reviews.pop(), executions.pop()))
+    Ok(executions.pop())
 }
 
 async fn task_response_inner(
@@ -273,7 +262,6 @@ async fn task_response_inner(
     task: Task,
     include_actions: bool,
     awaiting_human: bool,
-    latest_review: Option<Review>,
     latest_execution: Option<Execution>,
 ) -> ApiResult<TaskResponse> {
     let task_role_assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
@@ -444,7 +432,7 @@ async fn task_response_inner(
     let workflow_exception = derive_workflow_exception(
         &diagnostic_task,
         &workflow,
-        latest_review.as_ref(),
+        None,
         latest_execution.as_ref(),
         &remaining_retries,
     );
@@ -452,7 +440,7 @@ async fn task_response_inner(
         &task,
         &workflow,
         &task_role_assignments,
-        latest_review.as_ref(),
+        None,
         latest_execution.as_ref(),
         awaiting_human,
         workflow_exception.as_ref(),
@@ -493,7 +481,9 @@ async fn task_response_inner(
         workflow_exception,
         execution_observability,
         task_state_config: task.task_state_config.map(parse_json_value),
-        review_passed_at: task.review_passed_at,
+        // Kept in the public response shape during the PR13 storage cleanup;
+        // this field is no longer projected as a current Review decision.
+        review_passed_at: None,
         archived_at: task.archived_at,
         workspace,
         plan_progress,
@@ -985,61 +975,6 @@ pub fn task_usage_summary_response(
     }
 }
 
-pub fn review_response(review: db::Review) -> ReviewResponse {
-    let details = parse_review_details(&review.step_results_json).unwrap_or_default();
-    review_response_with_details(review, details)
-}
-
-pub fn review_response_strict(review: db::Review) -> ApiResult<ReviewResponse> {
-    let details = parse_review_details(&review.step_results_json).map_err(|error| {
-        ApiError::bad_request(format!("invalid review step_results_json: {error}"))
-    })?;
-    Ok(review_response_with_details(review, details))
-}
-
-fn review_response_with_details(review: db::Review, details: ReviewDetails) -> ReviewResponse {
-    let step_results = details.ci_steps.iter().map(step_result_response).collect();
-
-    ReviewResponse {
-        id: review.id,
-        task_id: review.task_id,
-        execution_id: review.execution_id,
-        attempt_number: review.attempt_number,
-        status: review_status_response(review.status),
-        step_results,
-        details,
-        started_at: review.started_at,
-        finished_at: review.finished_at,
-        created_at: review.created_at,
-        updated_at: review.updated_at,
-    }
-}
-
-fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
-    let value = serde_json::from_str::<Value>(value)?;
-    if value.is_array() {
-        return Ok(ReviewDetails {
-            ci_steps: serde_json::from_value(value)?,
-            auditor: None,
-            evidence: None,
-            structured_result: None,
-        });
-    }
-    serde_json::from_value(value)
-}
-
-fn step_result_response(step: &StepResultEntry) -> StepResultResponse {
-    StepResultResponse {
-        index: step.index,
-        command: step.command.clone(),
-        exit_code: step.exit_code,
-        stderr_tail: step.stderr_tail.clone(),
-        output_tail: step.output_tail.clone(),
-        started_at: step.started_at.clone(),
-        finished_at: step.finished_at.clone(),
-    }
-}
-
 pub fn serialize_json<T>(value: Option<T>) -> ApiResult<Option<String>>
 where
     T: Serialize,
@@ -1161,16 +1096,6 @@ fn parse_sort_order(value: Option<&str>) -> ApiResult<SortOrder> {
         value => Err(ApiError::bad_request(format!(
             "invalid sort_order: {value}"
         ))),
-    }
-}
-
-fn review_status_response(value: db::ReviewStatus) -> api_types::ReviewStatus {
-    match value {
-        db::ReviewStatus::Running => api_types::ReviewStatus::Running,
-        db::ReviewStatus::AwaitingHuman => api_types::ReviewStatus::AwaitingHuman,
-        db::ReviewStatus::Passed => api_types::ReviewStatus::Passed,
-        db::ReviewStatus::Failed => api_types::ReviewStatus::Failed,
-        db::ReviewStatus::Cancelled => api_types::ReviewStatus::Cancelled,
     }
 }
 

@@ -1,5 +1,6 @@
 use super::helpers::*;
 use super::*;
+use db::ReviewRepo;
 
 #[tokio::test]
 async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {

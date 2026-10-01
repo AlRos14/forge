@@ -8,6 +8,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Review decisions now come from an exact `role=reviewer`, `purpose=review`
+  Execution and its immutable `review_report` Artifact. Task-level approve and
+  reject review endpoints return `409`; callers start or select a Human Review
+  Execution and submit the report to that exact Execution. `GET /tasks/{id}/reviews`
+  and `GET /reviews/{id}` are projections of reviewer Executions, not legacy
+  Review rows. Deterministic checks are separate ValidationRuns with exact
+  Evidence and no Actor. The Task `review_passed_at` response remains nullable
+  for compatibility and is no longer a decision source.
+
 - WorkUnit provenance now encodes Actor identity as a typed `ActorRef` and
   validates that the referenced Actor exists. V091 Actor provenance that cannot
   be resolved unambiguously remains visible as response-only `legacy_actor`

@@ -1304,8 +1304,13 @@ impl OrchestratorRuntime {
                 .map(|execution| execution.id.as_str())
                 .collect::<HashSet<_>>();
             artifacts.retain(|artifact| {
-                linked_artifact_ids.contains(artifact.id.as_str())
-                    || execution_ids.contains(artifact.producer_execution_id.as_str())
+                let produced_by_visible_execution = match &artifact.producer {
+                    db::ArtifactProducer::Execution { execution_id, .. } => {
+                        execution_ids.contains(execution_id.as_str())
+                    }
+                    db::ArtifactProducer::ValidationRun { .. } => false,
+                };
+                linked_artifact_ids.contains(artifact.id.as_str()) || produced_by_visible_execution
             });
         }
         let event_payload = parse_payload(&event);
@@ -1367,7 +1372,7 @@ impl OrchestratorRuntime {
                 "digest": artifact.digest,
                 "metadata": truncate(&artifact.metadata_json, 4096),
                 "content": artifact.content.as_deref().map(|content| truncate(content, 4096)),
-                "producer_execution_id": artifact.producer_execution_id,
+                "producer": artifact.producer,
             })).collect::<Vec<_>>(),
             "messages": messages.iter().map(|message| json!({
                 "id": message.id,

@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentChatRepo, CommentAuthorType,
-    CreateDomainEvent, CreateExecution, CreateProject, CreateReview, CreateTask, CreateTaskComment,
-    CreateTransitionLog, DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryConfidence,
-    MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskCommentRepo,
-    TaskRepo, TransitionLogRepo,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorRef, AgentChatRepo,
+    CommentAuthorType, CreateDomainEvent, CreateExecution, CreateProject, CreateReview, CreateTask,
+    CreateTaskComment, CreateTransitionLog, DomainEventRepo, ExecutionPurpose, ExecutionRepo,
+    ExecutionStatus, MemoryConfidence, MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo,
+    ReviewStatus, SqliteDb, TaskCommentRepo, TaskRepo, TransitionLogRepo, UserRepo,
 };
 use serde_json::json;
-use services::{AgentChatMemoryConsumer, MemoryItemInput, MemoryService, TaskService};
+use services::{AgentChatMemoryConsumer, CollaborationService, MemoryItemInput, MemoryService};
 use uuid::Uuid;
 
 async fn sqlite_db() -> Arc<SqliteDb> {
@@ -219,10 +219,25 @@ async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying
 }
 
 #[tokio::test]
-async fn memory_indexing_failure_does_not_fail_source_operation() {
+async fn review_report_artifact_creation_does_not_depend_on_memory_indexing() {
     let db = sqlite_db().await;
     let (_project_id, task_id) = seed_project_and_task(&db, "review").await;
+    let human_actor_id = new_uuid_v4();
     let now = now_rfc3339();
+    UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: human_actor_id.clone(),
+            email: format!("{human_actor_id}@example.com"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Reviewer".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Human Actor creates");
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
         &*db,
@@ -230,8 +245,8 @@ async fn memory_indexing_failure_does_not_fail_source_operation() {
             id: execution_id.clone(),
             task_id: task_id.clone(),
             agent_id: None,
-            actor_ref: None,
-            purpose: None,
+            actor_ref: Some(ActorRef::Human(human_actor_id.clone())),
+            purpose: Some(ExecutionPurpose::Review),
             harness_session_id: None,
             role: "reviewer".to_owned(),
             status: ExecutionStatus::Completed,
@@ -256,40 +271,27 @@ async fn memory_indexing_failure_does_not_fail_source_operation() {
     )
     .await
     .expect("execution creates");
-    let review_id = new_uuid_v4();
-    ReviewRepo::create(
-        &*db,
-        CreateReview {
-            id: review_id.clone(),
-            task_id: task_id.clone(),
-            execution_id,
-            attempt_number: 1,
-            status: ReviewStatus::AwaitingHuman,
-            step_results_json: json!({ "auditor": { "verdict": "pass" } }).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("review creates");
-
     sqlx::query("DROP TABLE memory_item")
         .execute(db.pool())
         .await
         .expect("memory table drops");
 
-    let service = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
-    service
-        .approve_review(task_id.clone())
+    let report = CollaborationService::new(
+        Arc::clone(&db),
+        Arc::new(events::EventBus::new(16)),
+    )
+        .create_review_report_from_execution(
+            &execution_id,
+            "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The exact subject is sound.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}",
+        )
         .await
-        .expect("source operation succeeds");
-
-    let review = ReviewRepo::get_by_id(&*db, &review_id)
-        .await
-        .expect("review loads")
-        .expect("review exists");
-    assert_eq!(review.status, ReviewStatus::Passed);
+        .expect("ReviewReport source operation succeeds");
+    assert_eq!(report.kind, db::ArtifactKind::ReviewReport);
+    assert!(matches!(
+        report.producer,
+        db::ArtifactProducer::Execution { execution_id: producer_id, actor: ActorRef::Human(actor_id) }
+            if producer_id == execution_id && actor_id == human_actor_id
+    ));
 }
 
 #[tokio::test]

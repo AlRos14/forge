@@ -9,7 +9,7 @@ use crate::{
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
 };
-use ::review::{ReviewRequest, ReviewRunner};
+use ::review::ReviewRunner;
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
 use api_types::{Actor, ActorRef, ProjectSettings, UserActionSource};
 use db::{
@@ -18,11 +18,10 @@ use db::{
     CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DbError, Execution,
     ExecutionPurpose, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
     HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, Review,
-    ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment,
-    TaskCommentRepo, TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment,
-    TaskRoleAssignmentRepo, TaskStatus, TransitionLogRepo, UpsertExecutionUsage, UserRepo,
-    WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo,
+    TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
+    TaskStatus, TransitionLogRepo, UpsertExecutionUsage, UserRepo, WorkUnitRepo,
+    WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -56,7 +55,6 @@ mod move_task;
 mod orchestrator;
 mod reorder_subtasks;
 mod review;
-mod review_config;
 mod roles;
 mod subtask;
 mod transition;
@@ -82,18 +80,14 @@ use self::{
     config::{
         build_executor_config_snapshot, create_failed_execution_record,
         executor_snapshot_for_fresh_start, executor_snapshot_for_harness_resume, parse_json_value,
-        truncate_utf8_bytes,
     },
     logs::execution_logs_path,
-    review_config::review_config_from_json,
     validation::{serialize_config, validate_required},
     workspace::{default_workspace_root, prepare_workspace, reset_workspace},
 };
 
 pub(super) const DISPATCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 pub(super) const DISPATCH_STATUS_WAIT_CEILING: Duration = Duration::from_secs(10 * 60);
-pub(super) const MAX_FOLLOW_UP_DIFF_BYTES: usize = 64 * 1024;
-
 pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
     let Ok(annotation) = serde_json::from_str::<Value>(raw_annotation) else {
         return false;
@@ -624,11 +618,12 @@ impl TaskService {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let succeeded = notification.exit_code == Some(0) && signal.is_none() && error.is_none();
-        let outcome = notification.status.as_deref().unwrap_or(if succeeded {
-            "completed"
-        } else {
-            "failed"
-        });
+        let mut outcome = notification
+            .status
+            .as_deref()
+            .unwrap_or(if succeeded { "completed" } else { "failed" })
+            .to_owned();
+        let mut review_result_error = None;
         if current_execution.purpose == Some(ExecutionPurpose::Plan) && outcome == "completed" {
             let assistant_output = notification
                 .assistant_output
@@ -643,40 +638,64 @@ impl TaskService {
                 .create_plan_artifact_from_execution(&current_execution.id, assistant_output)
                 .await?;
         }
-        let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) = match outcome {
-            "completed" => (
-                ExecutionStatus::Completed,
-                None,
-                None,
-                None,
-                None,
-                Some(None),
-            ),
-            "cancelled" => (
-                ExecutionStatus::Cancelled,
-                Some(Some(db::StopReason::ExecutorCancelled)),
-                Some(Some(
-                    Actor::system(api_types::SystemComponent::Executor).display(),
-                )),
-                Some(Some(db::ResumePolicy::Manual)),
-                Some(Some(notification.ts.clone())),
-                Some(None),
-            ),
-            _ => (
-                ExecutionStatus::Failed,
-                Some(Some(db::StopReason::ExecutorFailed)),
-                Some(Some(
-                    Actor::system(api_types::SystemComponent::Executor).display(),
-                )),
-                Some(Some(db::ResumePolicy::Manual)),
-                Some(Some(notification.ts.clone())),
-                Some(Some(remote_terminal_error_message(
-                    notification.exit_code,
-                    signal,
-                    error,
-                ))),
-            ),
-        };
+        if current_execution.role == crate::workflow::default_roles::REVIEWER
+            && current_execution.purpose == Some(ExecutionPurpose::Review)
+            && outcome == "completed"
+        {
+            let assistant_output = notification
+                .assistant_output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty());
+            let materialized = if let Some(assistant_output) = assistant_output {
+                crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                    .create_review_report_from_execution(&current_execution.id, assistant_output)
+                    .await
+                    .map(|_| ())
+            } else {
+                Err(ServiceError::invalid_operation(
+                    "completed remote Review Execution did not return a complete structured result",
+                ))
+            };
+            if let Err(error) = materialized {
+                outcome = "failed".to_owned();
+                review_result_error = Some(format!(
+                    "completed Review Execution result could not be materialized: {error}"
+                ));
+            }
+        }
+        let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) =
+            match outcome.as_str() {
+                "completed" => (
+                    ExecutionStatus::Completed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(None),
+                ),
+                "cancelled" => (
+                    ExecutionStatus::Cancelled,
+                    Some(Some(db::StopReason::ExecutorCancelled)),
+                    Some(Some(
+                        Actor::system(api_types::SystemComponent::Executor).display(),
+                    )),
+                    Some(Some(db::ResumePolicy::Manual)),
+                    Some(Some(notification.ts.clone())),
+                    Some(None),
+                ),
+                _ => (
+                    ExecutionStatus::Failed,
+                    Some(Some(db::StopReason::ExecutorFailed)),
+                    Some(Some(
+                        Actor::system(api_types::SystemComponent::Executor).display(),
+                    )),
+                    Some(Some(db::ResumePolicy::Manual)),
+                    Some(Some(notification.ts.clone())),
+                    Some(Some(review_result_error.unwrap_or_else(|| {
+                        remote_terminal_error_message(notification.exit_code, signal, error)
+                    }))),
+                ),
+            };
 
         let executor_unavailable = notification.failure_class
             == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable);

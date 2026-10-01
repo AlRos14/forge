@@ -116,7 +116,10 @@ fn artifact_storage_to_api(kind: ArtifactStorageKind) -> ApiArtifactStorageKind 
     }
 }
 
-fn artifact_response(record: Artifact, include_content: bool) -> ApiResult<ArtifactResponse> {
+pub(crate) fn artifact_response(
+    record: Artifact,
+    include_content: bool,
+) -> ApiResult<ArtifactResponse> {
     let metadata: Value = serde_json::from_str(&record.metadata_json)
         .map_err(|_| ApiError::internal("Stored Artifact metadata is invalid"))?;
     if !metadata.is_object() {
@@ -132,8 +135,18 @@ fn artifact_response(record: Artifact, include_content: bool) -> ApiResult<Artif
         content: include_content.then_some(record.content).flatten(),
         metadata,
         digest: record.digest,
-        producer_execution_id: record.producer_execution_id,
-        producer: actor_to_api(record.producer),
+        producer: match record.producer {
+            db::ArtifactProducer::Execution {
+                execution_id,
+                actor,
+            } => api_types::ArtifactProducer::Execution {
+                execution_id,
+                actor: actor_to_api(actor),
+            },
+            db::ArtifactProducer::ValidationRun { validation_run_id } => {
+                api_types::ArtifactProducer::ValidationRun { validation_run_id }
+            }
+        },
         created_at: record.created_at,
     })
 }

@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    Artifact, ArtifactKind, CollaborationRepo, CollaborationTarget, CollaborationTargetKind,
-    CollaborationWrite, CreateArtifact, CreateDecision, CreateHandoff, CreateMessage,
-    CreateProposal, Decision, DecisionOutcome, ExecutionArtifactInput,
+    Artifact, ArtifactKind, ArtifactProducer, CollaborationRepo, CollaborationTarget,
+    CollaborationTargetKind, CollaborationWrite, CreateArtifact, CreateDecision, CreateHandoff,
+    CreateMessage, CreateProposal, Decision, DecisionOutcome, ExecutionArtifactInput,
     ExecutionArtifactOutputWrite, Handoff, Message, Proposal, ProposalTarget, TransitionHandoff,
 };
 
@@ -143,14 +143,18 @@ fn target_columns(
 
 fn artifact_select() -> &'static str {
     "SELECT a.*,
-            p.execution_id AS producer_execution_id,
-            p.task_id AS producer_task_id,
+            ep.execution_id AS producer_execution_id,
+            ep.task_id AS producer_task_id,
             e.task_id AS execution_task_id,
             e.actor_kind AS producer_actor_kind,
-            e.actor_id AS producer_actor_id
+            e.actor_id AS producer_actor_id,
+            vp.validation_run_id AS producer_validation_run_id,
+            vr.task_id AS validation_run_task_id
      FROM artifact a
-     LEFT JOIN artifact_execution_producer p ON p.artifact_id = a.id
-     LEFT JOIN execution e ON e.id = p.execution_id"
+     LEFT JOIN artifact_execution_producer ep ON ep.artifact_id = a.id
+     LEFT JOIN artifact_validation_run_producer vp ON vp.artifact_id = a.id
+     LEFT JOIN validation_run vr ON vr.id = vp.validation_run_id
+     LEFT JOIN execution e ON e.id = ep.execution_id"
 }
 
 fn map_artifact(row: SqliteRow) -> Result<Artifact> {
@@ -160,19 +164,36 @@ fn map_artifact(row: SqliteRow) -> Result<Artifact> {
     let execution_task_id: Option<String> = row.try_get("execution_task_id")?;
     let actor_kind: Option<String> = row.try_get("producer_actor_kind")?;
     let actor_id: Option<String> = row.try_get("producer_actor_id")?;
-    if producer_task_id.as_deref() != Some(task_id.as_str())
-        || execution_task_id.as_deref() != Some(task_id.as_str())
-    {
-        return Err(DbError::Check(
-            "Artifact has no valid same-Task Execution producer".to_owned(),
-        ));
-    }
-    let producer = actor_from_columns(
-        actor_kind
-            .ok_or_else(|| DbError::Check("Artifact producer ActorRef is missing".to_owned()))?,
-        actor_id
-            .ok_or_else(|| DbError::Check("Artifact producer actor id is missing".to_owned()))?,
-    )?;
+    let validation_run_id: Option<String> = row.try_get("producer_validation_run_id")?;
+    let validation_run_task_id: Option<String> = row.try_get("validation_run_task_id")?;
+    let producer = match (producer_execution_id, validation_run_id) {
+        (Some(execution_id), None)
+            if producer_task_id.as_deref() == Some(task_id.as_str())
+                && execution_task_id.as_deref() == Some(task_id.as_str()) =>
+        {
+            ArtifactProducer::Execution {
+                execution_id,
+                actor: actor_from_columns(
+                    actor_kind.ok_or_else(|| {
+                        DbError::Check("Artifact producer ActorRef is missing".to_owned())
+                    })?,
+                    actor_id.ok_or_else(|| {
+                        DbError::Check("Artifact producer actor id is missing".to_owned())
+                    })?,
+                )?,
+            }
+        }
+        (None, Some(validation_run_id))
+            if validation_run_task_id.as_deref() == Some(task_id.as_str()) =>
+        {
+            ArtifactProducer::ValidationRun { validation_run_id }
+        }
+        _ => {
+            return Err(DbError::Check(
+                "Artifact must have exactly one valid same-Task producer".to_owned(),
+            ));
+        }
+    };
     Ok(Artifact {
         id: row.try_get("id")?,
         task_id,
@@ -182,8 +203,6 @@ fn map_artifact(row: SqliteRow) -> Result<Artifact> {
         content_ref: row.try_get("content_ref")?,
         metadata_json: row.try_get("metadata_json")?,
         digest: row.try_get("digest")?,
-        producer_execution_id: producer_execution_id
-            .ok_or_else(|| DbError::Check("Artifact producer row is missing".to_owned()))?,
         producer,
         created_at: row.try_get("created_at")?,
     })
@@ -475,7 +494,7 @@ async fn map_decision(db: &SqliteDb, row: SqliteRow) -> Result<Decision> {
     })
 }
 
-async fn get_artifact_row(db: &SqliteDb, id: &str) -> Result<Option<Artifact>> {
+pub(super) async fn get_artifact_row(db: &SqliteDb, id: &str) -> Result<Option<Artifact>> {
     let sql = format!("{} WHERE a.id = ?", artifact_select());
     sqlx::query(&sql)
         .bind(id)
@@ -687,7 +706,8 @@ impl CollaborationRepo for SqliteDb {
                 || existing.content_ref != expected.content_ref
                 || existing.metadata_json != expected.metadata_json
                 || existing.digest != expected.digest
-                || existing.producer_execution_id != expected.producer_execution_id
+                || existing.execution_producer().map(|(id, _)| id)
+                    != Some(expected.producer_execution_id.as_str())
             {
                 return Err(DbError::Check(
                     "Execution already has a different output Artifact of this kind".to_owned(),

@@ -763,7 +763,19 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/tasks/{id}/external-links/{link_id}",
             delete(routes::external_links::delete_external_link),
         )
-        .route("/api/v1/reviews/{id}", get(routes::reviews::get_review))
+        .route(
+            "/api/v1/reviews/{id}",
+            get(routes::reviews::get_review).post(routes::reviews::submit_review_report),
+        )
+        .route(
+            "/api/v1/tasks/{id}/validations",
+            get(routes::reviews::list_validation_runs),
+        )
+        .route(
+            "/api/v1/validations/{id}",
+            get(routes::reviews::get_validation_run),
+        )
+        .route("/api/v1/evidence/{id}", get(routes::reviews::get_evidence))
         .route(
             "/api/v1/notifications",
             get(routes::notifications::list_notifications),

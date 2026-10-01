@@ -550,8 +550,13 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
         )
         .await
         .expect("inline Artifact");
-    assert_eq!(artifact.producer, db::ActorRef::Human(f.user_id.clone()));
-    assert_eq!(artifact.producer_execution_id, f.execution_id);
+    assert!(matches!(
+        &artifact.producer,
+        db::ArtifactProducer::Execution {
+            execution_id,
+            actor: db::ActorRef::Human(id)
+        } if execution_id == &f.execution_id && id == &f.user_id
+    ));
     let external_artifact = f
         .service
         .create_artifact(
@@ -1794,15 +1799,25 @@ async fn agent_identity_is_derived_from_execution_and_decisions_support_mixed_de
         )
         .await
         .expect("Agent Artifact");
-    assert_eq!(artifact.producer, db::ActorRef::Agent(agent_id.clone()));
-    assert_eq!(
-        f.service
-            .get_artifact(&artifact.id, agent_source.clone())
-            .await
-            .expect("Agent reads its authorized Artifact")
-            .producer,
-        db::ActorRef::Agent(agent_id.clone())
-    );
+    assert!(matches!(
+        &artifact.producer,
+        db::ArtifactProducer::Execution {
+            execution_id: producer_execution_id,
+            actor: db::ActorRef::Agent(id)
+        } if producer_execution_id == &execution_id && id == &agent_id
+    ));
+    let loaded_artifact = f
+        .service
+        .get_artifact(&artifact.id, agent_source.clone())
+        .await
+        .expect("Agent reads its authorized Artifact");
+    assert!(matches!(
+        &loaded_artifact.producer,
+        db::ArtifactProducer::Execution {
+            actor: db::ActorRef::Agent(id),
+            ..
+        } if id == &agent_id
+    ));
     assert_eq!(
         f.service
             .list_artifacts(
@@ -2264,14 +2279,18 @@ async fn historical_collaboration_reads_survive_actor_and_workspace_deletion() {
         .expect("Workspace reset deletes live target");
     let reader = CollaborationActorSource::Human(reader_id.to_owned());
 
-    assert_eq!(
-        f.service
-            .get_artifact(&artifact.id, reader.clone())
-            .await
-            .expect("Artifact remains readable")
-            .producer,
-        db::ActorRef::Human(f.user_id.clone())
-    );
+    let loaded_artifact = f
+        .service
+        .get_artifact(&artifact.id, reader.clone())
+        .await
+        .expect("Artifact remains readable");
+    assert!(matches!(
+        &loaded_artifact.producer,
+        db::ArtifactProducer::Execution {
+            execution_id: producer_execution_id,
+            actor: db::ActorRef::Human(id),
+        } if producer_execution_id == &f.execution_id && id == &f.user_id
+    ));
     let message = f
         .service
         .get_message(&message.id, reader.clone())

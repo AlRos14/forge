@@ -3,8 +3,8 @@ use super::*;
 
 use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
 use db::{
-    AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, ReviewRepo,
-    ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
+    AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, SortBy,
+    SortOrder, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
 };
 
 #[derive(Debug)]
@@ -137,58 +137,44 @@ impl TaskService {
                 .task
             }
             TaskAction::RequestChanges => {
-                let latest_review = self.latest_review(&task.id).await?;
-                if task.status == crate::workflow::default_states::REVIEW
-                    && latest_review
-                        .as_ref()
-                        .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-                    && trigger_target(&workflow, &task.status, WorkflowTrigger::Reject).as_deref()
-                        == Some(crate::workflow::default_states::IN_PROGRESS)
-                {
-                    self.reject_review_as(task.id.clone(), reason, actor)
-                        .await?
-                        .0
-                } else {
-                    self.transition_gate_action(
-                        &task,
-                        &workflow,
-                        WorkflowTrigger::Reject,
-                        TransitionOptions {
-                            version: transition_version,
-                            reason: Some(transition_reason),
-                            triggered_by: actor,
-                            rejection: true,
-                            defer_dispatch_seconds: None,
-                        },
-                    )
-                    .await?
+                if task.status == crate::workflow::default_states::REVIEW {
+                    return Err(ServiceError::invalid_operation(
+                        "Review changes must be submitted as a ReviewReport for an exact Human Review Execution",
+                    ));
                 }
+                self.transition_gate_action(
+                    &task,
+                    &workflow,
+                    WorkflowTrigger::Reject,
+                    TransitionOptions {
+                        version: transition_version,
+                        reason: Some(transition_reason),
+                        triggered_by: actor,
+                        rejection: true,
+                        defer_dispatch_seconds: None,
+                    },
+                )
+                .await?
             }
             TaskAction::Approve => {
-                let latest_review = self.latest_review(&task.id).await?;
-                if task.status == crate::workflow::default_states::REVIEW
-                    && latest_review
-                        .as_ref()
-                        .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-                    && trigger_target(&workflow, &task.status, WorkflowTrigger::Accept).as_deref()
-                        == Some(crate::workflow::default_states::MERGING)
-                {
-                    self.approve_review_as(task.id.clone(), actor).await?.0
-                } else {
-                    self.transition_gate_action(
-                        &task,
-                        &workflow,
-                        WorkflowTrigger::Accept,
-                        TransitionOptions {
-                            version: transition_version,
-                            reason: Some(transition_reason),
-                            triggered_by: actor,
-                            rejection: false,
-                            defer_dispatch_seconds: None,
-                        },
-                    )
-                    .await?
+                if task.status == crate::workflow::default_states::REVIEW {
+                    return Err(ServiceError::invalid_operation(
+                        "Review approval must be submitted as a ReviewReport for an exact Human Review Execution",
+                    ));
                 }
+                self.transition_gate_action(
+                    &task,
+                    &workflow,
+                    WorkflowTrigger::Accept,
+                    TransitionOptions {
+                        version: transition_version,
+                        reason: Some(transition_reason),
+                        triggered_by: actor,
+                        rejection: false,
+                        defer_dispatch_seconds: None,
+                    },
+                )
+                .await?
             }
             TaskAction::Cancel => self.cancel_task_as(task.id.clone(), actor).await?,
         };
@@ -208,7 +194,6 @@ impl TaskService {
         let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
             .await?
             .map(|workspace| workspace.id);
-        let latest_review = self.latest_review(&task.id).await?;
         let state = workflow
             .states
             .iter()
@@ -258,10 +243,7 @@ impl TaskService {
             actions.push(TaskAction::Submit);
         }
 
-        let review_waiting = state.is_some_and(|state| state.kind == StateKind::Gate)
-            && latest_review
-                .as_ref()
-                .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman);
+        let review_gate = task.status == crate::workflow::default_states::REVIEW;
         let gate_requires_approval = state
             .and_then(|state| state.gate_config.as_ref())
             .is_some_and(|config| config.requires_user_approval());
@@ -274,12 +256,13 @@ impl TaskService {
             });
         let has_reject = trigger_target(workflow, &task.status, WorkflowTrigger::Reject).is_some();
         let has_accept = trigger_target(workflow, &task.status, WorkflowTrigger::Accept).is_some();
-        if !gate_role_busy && (review_waiting || (gate_requires_approval && has_accept)) {
+        if !review_gate && !gate_role_busy && gate_requires_approval && has_accept {
             actions.push(TaskAction::Approve);
         }
-        if !gate_role_busy
-            && (review_waiting
-                || (state.is_some_and(|state| state.kind == StateKind::Gate) && has_reject))
+        if !review_gate
+            && !gate_role_busy
+            && state.is_some_and(|state| state.kind == StateKind::Gate)
+            && has_reject
         {
             actions.push(TaskAction::RequestChanges);
         }
@@ -594,13 +577,6 @@ impl TaskService {
             .find(|execution| {
                 execution.work_unit_id.is_none() && execution.status == ExecutionStatus::Running
             }))
-    }
-
-    async fn latest_review(&self, task_id: &str) -> Result<Option<Review>> {
-        Ok(ReviewRepo::list_by_task(&*self.db, task_id)
-            .await?
-            .into_iter()
-            .max_by_key(|review| review.attempt_number))
     }
 }
 

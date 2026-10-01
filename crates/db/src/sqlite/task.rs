@@ -687,7 +687,7 @@ impl TaskRepo for SqliteDb {
             }
         }
 
-        let result = sqlx::query("UPDATE task SET assignee_type = ?, assignee_id = ?, status = ?, review_passed_at = NULL, entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
+        let result = sqlx::query("UPDATE task SET assignee_type = ?, assignee_id = ?, status = ?, entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
             .bind(&input.assignee_type)
             .bind(input.assignee_id.as_deref())
             .bind(&input.target_status)
@@ -702,7 +702,6 @@ impl TaskRepo for SqliteDb {
         task.assignee_type = Some(input.assignee_type);
         task.assignee_id = input.assignee_id;
         task.status = input.target_status;
-        task.review_passed_at = None;
         task.entry_barrier_json = None;
         task.version += 1;
         task.updated_at = input.claimed_at;

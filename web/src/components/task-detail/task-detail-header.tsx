@@ -58,11 +58,6 @@ export function TaskDetailHeader({
           )}
           {task ? (
             <>
-              {task.review_passed_at ? (
-                <span className="inline-flex items-center rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
-                  review passed
-                </span>
-              ) : null}
               <p className="truncate text-xs text-muted-foreground">{task.id}</p>
             </>
           ) : (

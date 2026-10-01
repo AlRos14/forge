@@ -4,27 +4,29 @@ use crate::{
     AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimOrchestratorWake,
     ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CoordinationMode, CreateAgent,
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CreateDomainEvent, CreateExecution, CreateOrchestratorWake, CreateProject,
+    CreateDomainEvent, CreateEvidence, CreateExecution, CreateOrchestratorWake, CreateProject,
     CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
     CreateProjectCharterRevisionAtomically, CreateProjectMember,
     CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateRoleMembership,
     CreateSkill, CreateTask, CreateTaskRole, CreateTaskRoleAssignment, CreateTerminalSession,
-    CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError,
-    DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryAccessQuery, MemoryConfidence,
-    MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType,
-    MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery, NotificationRepo,
-    OrchestratorWakeRepo, PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectOrchestrationRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
-    ReserveOrchestratorAction, ReviewRepo, ReviewStatus, RoleMembershipRepo, RoleMembershipStatus,
-    RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo, SortBy, SortOrder,
-    SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
-    TaskRoleAssignmentRepo, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
-    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskRole, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon,
-    WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    CreateValidationRun, CreateValidationRunArtifact, CreateWorkspace, CreateWorkspaceLease,
+    CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo,
+    ExecutionStatus, FinishValidationRun, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery,
+    MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity,
+    MoveTaskPersistence, NotificationListQuery, NotificationRepo, OrchestratorWakeRepo,
+    PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
+    ProviderAuthorizationRepo, RepoRepo, ReserveOrchestratorAction, ReviewRepo, ReviewStatus,
+    RoleMembershipRepo, RoleMembershipStatus, RotateAgentSession, ScopedMemoryRepository,
+    SelectAgentProfile, SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo,
+    TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo, TaskRoleRepo,
+    TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution, UpdateProject,
+    UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskRole,
+    UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, ValidationRunRepo,
+    ValidationRunStatus, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::Digest as _;
 use sqlx::Row;
 
 fn page(limit: i64) -> PageRequest {
@@ -3501,6 +3503,900 @@ async fn task_list_filters_by_search_query() {
     assert_eq!(literal_page.items.len(), 1);
     assert_eq!(literal_page.items[0].id, percent_id);
     assert_ne!(literal_page.items[0].id, wildcard_id);
+}
+
+#[tokio::test]
+async fn pr8_validation_run_evidence_and_report_are_exact_atomic_and_actor_free() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "in_progress".to_owned(),
+        "ValidationRun provenance",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+
+    let columns = sqlx::query("PRAGMA table_info(validation_run)")
+        .fetch_all(db.pool())
+        .await
+        .expect("ValidationRun columns read")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    for forbidden in [
+        "actor_id",
+        "actor_kind",
+        "agent_id",
+        "role",
+        "harness_session_id",
+    ] {
+        assert!(!columns.iter().any(|column| column == forbidden));
+    }
+    for table in [
+        "review",
+        "review_evidence_bundle",
+        "legacy_review_artifact_migration",
+        "legacy_ci_validation_migration",
+    ] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy/audit table lookup");
+        assert_eq!(exists, 1, "{table} remains physically present");
+    }
+
+    let started_at = now_rfc3339();
+    let finished_at = now_rfc3339();
+    let run_id = new_uuid_v4();
+    let config_summary_json = r#"{"shell":"bash -c","environment_digest":"environment-hash"}"#;
+    let config_digest = hex::encode(sha2::Sha256::digest(config_summary_json.as_bytes()));
+    let snapshot_digest = "a".repeat(64);
+    let command = "cargo test -p focused-fixture";
+    let idempotency_key = "validation-run-key-pr8".to_owned();
+    let input = CreateValidationRun {
+        id: run_id.clone(),
+        task_id: task_id.clone(),
+        work_unit_id: None,
+        caused_by_execution_id: None,
+        check_identity: "ci:0:fixture".to_owned(),
+        command: command.to_owned(),
+        config_summary_json: config_summary_json.to_owned(),
+        config_digest: config_digest.clone(),
+        workspace_id: workspace_id.clone(),
+        commit_sha: "b".repeat(40),
+        workspace_snapshot_digest: snapshot_digest.clone(),
+        idempotency_key: idempotency_key.clone(),
+        started_at: started_at.clone(),
+        created_at: started_at.clone(),
+        updated_at: started_at.clone(),
+    };
+    let start_event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "validation_run.started".to_owned(),
+        entity_type: "validation_run".to_owned(),
+        entity_id: run_id.clone(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "task".to_owned(),
+        scope_id: task_id.clone(),
+        correlation_id: run_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some("validation-run-started:pr8-fixture".to_owned()),
+        payload_json: serde_json::json!({"validation_run_id": run_id}).to_string(),
+        created_at: started_at.clone(),
+    };
+    let started = ValidationRunRepo::start_validation_run(&db, input.clone(), start_event.clone())
+        .await
+        .expect("ValidationRun starts with its event");
+    assert_eq!(started.validation_run.status, ValidationRunStatus::Running);
+    assert!(started.event.is_some());
+    let replayed = ValidationRunRepo::start_validation_run(&db, input.clone(), start_event)
+        .await
+        .expect("same identity start is idempotent");
+    assert_eq!(replayed.validation_run.id, run_id);
+    assert!(replayed.event.is_none());
+
+    let claim_owner = new_uuid_v4();
+    assert!(ValidationRunRepo::claim_validation_run(
+        &db,
+        &run_id,
+        &claim_owner,
+        &started_at,
+        "9999-01-01T00:00:00Z",
+    )
+    .await
+    .expect("run lease claimed"));
+    let evidence_id = new_uuid_v4();
+    let evidence_json = serde_json::json!({
+        "validation_run_id": run_id,
+        "task_id": task_id,
+        "check_identity": input.check_identity,
+        "command": command,
+        "config_digest": config_digest,
+        "workspace_id": workspace_id,
+        "commit_sha": input.commit_sha,
+        "workspace_snapshot_digest": snapshot_digest,
+        "status": "passed",
+        "exit_code": 0,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "stdout_tail": "PASS",
+        "stderr_tail": "",
+    })
+    .to_string();
+    let evidence = CreateEvidence {
+        id: evidence_id.clone(),
+        task_id: task_id.clone(),
+        validation_run_id: run_id.clone(),
+        evidence_key: "check:0".to_owned(),
+        kind: "deterministic_check_output".to_owned(),
+        digest: hex::encode(sha2::Sha256::digest(evidence_json.as_bytes())),
+        content_json: evidence_json,
+        created_at: finished_at.clone(),
+    };
+    let report_content = serde_json::json!({
+        "kind": "validation_report",
+        "validation_run_id": run_id,
+        "task_id": task_id,
+        "check_identity": input.check_identity,
+        "workspace_id": workspace_id,
+        "commit_sha": input.commit_sha,
+        "workspace_snapshot_digest": snapshot_digest,
+        "status": "passed",
+        "exit_code": 0,
+        "evidence_ids": [evidence_id],
+    })
+    .to_string();
+    let report = CreateValidationRunArtifact {
+        id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        validation_run_id: run_id.clone(),
+        digest: hex::encode(sha2::Sha256::digest(report_content.as_bytes())),
+        content: report_content,
+        metadata_json: serde_json::json!({"validation_run_id": run_id}).to_string(),
+        created_at: finished_at.clone(),
+    };
+    let report_id = report.id.clone();
+    let event = |event_type: &str, entity_type: &str, entity_id: &str, dedupe_key: &str| {
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: event_type.to_owned(),
+            entity_type: entity_type.to_owned(),
+            entity_id: entity_id.to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: run_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(dedupe_key.to_owned()),
+            payload_json: serde_json::json!({"validation_run_id": run_id}).to_string(),
+            created_at: finished_at.clone(),
+        }
+    };
+    let finish = FinishValidationRun {
+        id: run_id.clone(),
+        claim_owner,
+        status: ValidationRunStatus::Passed,
+        exit_code: Some(0),
+        finished_at: finished_at.clone(),
+        logs_ref: format!("validation-evidence://{evidence_id}"),
+        evidence: vec![evidence],
+        validation_report: Some(report),
+        events: vec![
+            event(
+                "validation_run.completed",
+                "validation_run",
+                &run_id,
+                "validation-run-terminal:pr8-fixture",
+            ),
+            event(
+                "evidence.created",
+                "evidence",
+                &evidence_id,
+                "evidence-created:pr8-fixture",
+            ),
+            event(
+                "artifact.created",
+                "artifact",
+                &report_id,
+                "validation-report-created:pr8-fixture",
+            ),
+        ],
+    };
+    let completed = ValidationRunRepo::finish_validation_run(&db, finish.clone())
+        .await
+        .expect("terminal run, Evidence, report, and events commit together");
+    assert_eq!(completed.validation_run.status, ValidationRunStatus::Passed);
+    assert_eq!(completed.validation_run.exit_code, Some(0));
+    assert_eq!(completed.evidence.len(), 1);
+    assert_eq!(completed.events.len(), 3);
+    let report = completed
+        .validation_report
+        .expect("validation report exists");
+    assert!(matches!(
+        report.producer,
+        crate::ArtifactProducer::ValidationRun { validation_run_id } if validation_run_id == run_id
+    ));
+    let replayed = ValidationRunRepo::finish_validation_run(&db, finish.clone())
+        .await
+        .expect("terminal retry reuses exact Evidence and report");
+    assert_eq!(replayed.validation_run.id, run_id);
+    assert!(replayed.events.is_empty());
+    let mut conflicting = finish;
+    conflicting.logs_ref = "validation-evidence://different".to_owned();
+    assert!(ValidationRunRepo::finish_validation_run(&db, conflicting)
+        .await
+        .is_err());
+
+    let other_task = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "in_progress".to_owned(),
+        "Cross-Task check fixture",
+    )
+    .await;
+    let other_workspace = seed_workspace_for_task(&db, &other_task, &repo_id).await;
+    let mut cross_task_input = input;
+    cross_task_input.id = new_uuid_v4();
+    cross_task_input.task_id = other_task.clone();
+    cross_task_input.workspace_id = other_workspace;
+    cross_task_input.idempotency_key = "validation-run-cross-task".to_owned();
+    let cross_task_run_id = cross_task_input.id.clone();
+    let _cross_task_start = ValidationRunRepo::start_validation_run(
+        &db,
+        cross_task_input.clone(),
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "validation_run.started".to_owned(),
+            entity_type: "validation_run".to_owned(),
+            entity_id: cross_task_run_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: other_task.clone(),
+            correlation_id: cross_task_run_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("same-Task run starts");
+    let claim_owner = new_uuid_v4();
+    assert!(ValidationRunRepo::claim_validation_run(
+        &db,
+        &cross_task_run_id,
+        &claim_owner,
+        &started_at,
+        "9999-01-01T00:00:00Z",
+    )
+    .await
+    .expect("same-Task run lease claimed"));
+    let cross_task_evidence = CreateEvidence {
+        id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        validation_run_id: cross_task_run_id.clone(),
+        evidence_key: "check:0".to_owned(),
+        kind: "deterministic_check_output".to_owned(),
+        content_json: "{}".to_owned(),
+        digest: "c".repeat(64),
+        created_at: finished_at.clone(),
+    };
+    let error = ValidationRunRepo::finish_validation_run(
+        &db,
+        FinishValidationRun {
+            id: cross_task_run_id.clone(),
+            claim_owner,
+            status: ValidationRunStatus::Failed,
+            exit_code: Some(1),
+            finished_at,
+            logs_ref: "validation-evidence://cross-task".to_owned(),
+            evidence: vec![cross_task_evidence],
+            validation_report: None,
+            events: Vec::new(),
+        },
+    )
+    .await
+    .expect_err("cross-Task Evidence is rejected");
+    assert!(matches!(error, DbError::Check(_)));
+    assert_eq!(
+        ValidationRunRepo::get_validation_run(&db, &cross_task_run_id)
+            .await
+            .expect("run lookup succeeds")
+            .expect("run retained")
+            .status,
+        ValidationRunStatus::Running,
+    );
+}
+
+#[tokio::test]
+async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "Human ReviewReport provenance",
+    )
+    .await;
+    let user_id = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES (?, ?, 'test', 'Human reviewer', ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(format!("{user_id}@example.test"))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("Human Actor persists");
+
+    let execution_id = new_uuid_v4();
+    let execution = ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            actor_ref: Some(crate::ActorRef::Human(user_id.clone())),
+            role: "reviewer".to_owned(),
+            purpose: Some(crate::ExecutionPurpose::Review),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some("aaaaaaa000000000000000000000000000000000".to_owned()),
+            after_sha: Some("bbbbbbb000000000000000000000000000000000".to_owned()),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Human reviewer Execution creates without Agent or HarnessSession");
+    assert_eq!(execution.actor_ref(), Some(crate::ActorRef::Human(user_id)));
+    assert!(execution.harness_session_id.is_none());
+
+    let artifact_id = new_uuid_v4();
+    let content = serde_json::json!({
+        "kind": "review_report",
+        "verdict": "pass",
+        "criteria": ["correctness"],
+        "summary": "The exact subject satisfies the criteria.",
+        "findings": [],
+        "questions": [],
+        "evidence_considered": [],
+        "subject": {
+            "task_id": task_id,
+            "review_execution_id": execution_id,
+            "workspace_id": null,
+            "base_commit_sha": execution.before_sha,
+            "head_commit_sha": execution.after_sha,
+        }
+    })
+    .to_string();
+    let digest = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .expect("Artifact transaction begins");
+    sqlx::query(
+        "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&artifact_id)
+    .bind(&execution_id)
+    .bind(&task_id)
+    .execute(&mut *tx)
+    .await
+    .expect("exact Execution producer binds first");
+    sqlx::query(
+        "INSERT INTO execution_artifact_output
+         (execution_id, artifact_id, task_id, kind, digest, created_at)
+         VALUES (?, ?, ?, 'review_report', ?, ?)",
+    )
+    .bind(&execution_id)
+    .bind(&artifact_id)
+    .bind(&task_id)
+    .bind(&digest)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .expect("one exact ReviewReport output identity binds");
+    sqlx::query(
+        "INSERT INTO artifact
+         (id, task_id, kind, storage_kind, content, content_ref, metadata_json, digest, created_at)
+         VALUES (?, ?, 'review_report', 'inline', ?, NULL, '{}', ?, ?)",
+    )
+    .bind(&artifact_id)
+    .bind(&task_id)
+    .bind(&content)
+    .bind(&digest)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .expect("ReviewReport content matches exact Human producer and subject");
+    tx.commit().await.expect("ReviewReport writes commit");
+
+    assert!(ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution_id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .is_ok());
+    let report = crate::CollaborationRepo::get_execution_artifact_output(
+        &db,
+        &execution_id,
+        crate::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport producer lookup succeeds")
+    .expect("exact ReviewReport exists");
+    assert!(matches!(
+        report.producer,
+        crate::ArtifactProducer::Execution { execution_id: producer, actor: crate::ActorRef::Human(_) }
+            if producer == execution_id
+    ));
+
+    let no_report_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: no_report_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            actor_ref: execution.actor_ref(),
+            role: "reviewer".to_owned(),
+            purpose: Some(crate::ExecutionPurpose::Review),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second Human reviewer Execution creates");
+    let completed_without_report = ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: no_report_id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now,
+        },
+    )
+    .await;
+    assert!(completed_without_report.is_err());
+    assert_eq!(
+        ExecutionRepo::get_by_id(&db, &no_report_id)
+            .await
+            .expect("Execution lookup succeeds")
+            .expect("Execution remains persisted")
+            .status,
+        ExecutionStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_is_not_invented() {
+    let migration_dir = tempfile::tempdir().expect("migration directory creates");
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source_dir).expect("migration source reads") {
+        let path = entry.expect("migration entry reads").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("migration filename is UTF-8");
+        let version = filename
+            .strip_prefix('V')
+            .and_then(|version| version.split_once("__"))
+            .and_then(|(version, _)| version.parse::<i64>().ok())
+            .expect("migration name has a version");
+        if version <= 98 {
+            std::fs::copy(&path, migration_dir.path().join(filename))
+                .expect("pre-PR8 migration copies");
+        }
+    }
+
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    crate::run_migrations_from(&pool, migration_dir.path())
+        .await
+        .expect("database migrates through V098");
+    let db = SqliteDb::new(pool);
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "legacy review migration",
+    )
+    .await;
+    let other_task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "wrong Task review source",
+    )
+    .await;
+    let user_id = seed_user(&db).await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = now_rfc3339();
+    let base_sha = "aaaaaaa000000000000000000000000000000000";
+    let head_sha = "bbbbbbb000000000000000000000000000000000";
+
+    async fn historical_execution(
+        db: &SqliteDb,
+        id: &str,
+        task_id: &str,
+        actor: Option<crate::ActorRef>,
+        workspace_id: Option<&str>,
+        base_sha: Option<&str>,
+        head_sha: Option<&str>,
+    ) {
+        let now = now_rfc3339();
+        ExecutionRepo::create(
+            db,
+            CreateExecution {
+                id: id.to_owned(),
+                task_id: task_id.to_owned(),
+                agent_id: None,
+                actor_ref: actor,
+                role: "reviewer".to_owned(),
+                purpose: Some(crate::ExecutionPurpose::Review),
+                status: ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                harness_session_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: base_sha.map(str::to_owned),
+                after_sha: head_sha.map(str::to_owned),
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: workspace_id.map(str::to_owned),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("historical Execution fixture creates");
+    }
+
+    async fn historical_review(
+        db: &SqliteDb,
+        id: &str,
+        task_id: &str,
+        execution_id: &str,
+        attempt: i64,
+        summary: &str,
+    ) {
+        let now = now_rfc3339();
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review",
+            "verdict": "pass",
+            "summary": summary,
+            "criteria": ["correctness"],
+            "findings": [],
+            "questions": [],
+        });
+        sqlx::query(
+            "INSERT INTO review
+             (id, task_id, execution_id, attempt_number, status, step_results_json,
+              started_at, finished_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'passed', ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(task_id)
+        .bind(execution_id)
+        .bind(attempt)
+        .bind(serde_json::json!({ "structured_result": result }).to_string())
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("historical Review fixture inserts");
+    }
+
+    let attributable_execution_id = new_uuid_v4();
+    historical_execution(
+        &db,
+        &attributable_execution_id,
+        &task_id,
+        Some(crate::ActorRef::Human(user_id)),
+        Some(&workspace_id),
+        Some(base_sha),
+        Some(head_sha),
+    )
+    .await;
+    historical_review(
+        &db,
+        "pr8-historical-attributable",
+        &task_id,
+        &attributable_execution_id,
+        1,
+        "Attributable exact report",
+    )
+    .await;
+
+    let ambiguous_execution_id = new_uuid_v4();
+    historical_execution(
+        &db,
+        &ambiguous_execution_id,
+        &task_id,
+        Some(crate::ActorRef::Human(seed_user(&db).await)),
+        None,
+        None,
+        None,
+    )
+    .await;
+    historical_review(
+        &db,
+        "pr8-historical-ambiguous-a",
+        &task_id,
+        &ambiguous_execution_id,
+        2,
+        "Conflicting output A",
+    )
+    .await;
+    historical_review(
+        &db,
+        "pr8-historical-ambiguous-b",
+        &task_id,
+        &ambiguous_execution_id,
+        3,
+        "Conflicting output B",
+    )
+    .await;
+
+    let wrong_task_execution_id = new_uuid_v4();
+    historical_execution(
+        &db,
+        &wrong_task_execution_id,
+        &task_id,
+        Some(crate::ActorRef::Human(seed_user(&db).await)),
+        None,
+        None,
+        None,
+    )
+    .await;
+    historical_review(
+        &db,
+        "pr8-historical-wrong-task",
+        &other_task_id,
+        &wrong_task_execution_id,
+        1,
+        "Wrong Task source",
+    )
+    .await;
+
+    let missing_actor_execution_id = new_uuid_v4();
+    historical_execution(
+        &db,
+        &missing_actor_execution_id,
+        &task_id,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    historical_review(
+        &db,
+        "pr8-historical-missing-actor",
+        &task_id,
+        &missing_actor_execution_id,
+        4,
+        "No persisted Actor",
+    )
+    .await;
+
+    let ci_results = serde_json::json!([{
+        "command": "test -d .",
+        "exit_code": 0,
+        "started_at": now,
+        "finished_at": now,
+        "output_tail": "PASS",
+    }]);
+    sqlx::query(
+        "INSERT INTO review_evidence_bundle
+         (id, review_id, task_id, reviewer_execution_id, plan_revision_id, plan_digest,
+          base_sha, head_sha, diff_text, diff_digest, ci_results_json, fresh_session, created_at)
+         VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, 'exact diff', 'diff-hash', ?, 1, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind("pr8-historical-attributable")
+    .bind(&task_id)
+    .bind(&attributable_execution_id)
+    .bind(base_sha)
+    .bind(head_sha)
+    .bind(ci_results.to_string())
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("V084 CI history inserts");
+
+    std::fs::copy(
+        source_dir.join("V099__review_executions_validation_runs_evidence.sql"),
+        migration_dir
+            .path()
+            .join("V099__review_executions_validation_runs_evidence.sql"),
+    )
+    .expect("V099 migration copies");
+    crate::run_migrations_from(db.pool(), migration_dir.path())
+        .await
+        .expect("PR8 migration maps only fully attributable Reviews");
+
+    let migrated: (String, String) = sqlx::query_as(
+        "SELECT migration_status, artifact_id FROM legacy_review_artifact_migration
+         WHERE review_id = 'pr8-historical-attributable'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("attributable Review audit reads");
+    assert_eq!(migrated.0, "migrated");
+    let report = crate::CollaborationRepo::get_artifact(&db, &migrated.1)
+        .await
+        .expect("historical Artifact lookup succeeds")
+        .expect("attributable ReviewReport persists");
+    assert!(matches!(
+        report.producer,
+        crate::ArtifactProducer::Execution { execution_id, actor: crate::ActorRef::Human(_) }
+            if execution_id == attributable_execution_id
+    ));
+    let report_content: serde_json::Value =
+        serde_json::from_str(report.content.as_deref().expect("inline report content"))
+            .expect("historical ReviewReport content parses");
+    assert_eq!(report_content["subject"]["task_id"], task_id);
+    assert_eq!(
+        report_content["subject"]["review_execution_id"],
+        attributable_execution_id
+    );
+    assert_eq!(report_content["subject"]["head_commit_sha"], head_sha);
+
+    let statuses = sqlx::query_as::<_, (String, String)>(
+        "SELECT review_id, migration_status FROM legacy_review_artifact_migration
+         WHERE review_id LIKE 'pr8-historical-%' ORDER BY review_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("legacy Review audit statuses read");
+    assert!(statuses.contains(&(
+        "pr8-historical-ambiguous-a".to_owned(),
+        "ambiguous".to_owned()
+    )));
+    assert!(statuses.contains(&(
+        "pr8-historical-ambiguous-b".to_owned(),
+        "ambiguous".to_owned()
+    )));
+    assert!(statuses.contains(&(
+        "pr8-historical-wrong-task".to_owned(),
+        "wrong_task".to_owned()
+    )));
+    assert!(statuses.contains(&(
+        "pr8-historical-missing-actor".to_owned(),
+        "actor_missing".to_owned()
+    )));
+    let ci_status: String = sqlx::query_scalar(
+        "SELECT migration_status FROM legacy_ci_validation_migration
+         WHERE review_id = 'pr8-historical-attributable' AND step_index = 0",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("legacy CI audit status reads");
+    assert_eq!(ci_status, "insufficient_provenance");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM validation_run")
+            .fetch_one(db.pool())
+            .await
+            .expect("no fabricated ValidationRuns"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM review")
+            .fetch_one(db.pool())
+            .await
+            .expect("historical Review rows remain"),
+        5
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM review_evidence_bundle")
+            .fetch_one(db.pool())
+            .await
+            .expect("V084 evidence bundle remains"),
+        1
+    );
 }
 
 #[tokio::test]

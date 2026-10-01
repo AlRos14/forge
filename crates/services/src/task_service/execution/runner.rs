@@ -4,13 +4,161 @@ const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 
 impl TaskService {
+    async fn freeze_review_subject_and_inputs(&self, execution: Execution) -> Result<Execution> {
+        if execution.role != crate::workflow::default_roles::REVIEWER
+            || execution.purpose != Some(ExecutionPurpose::Review)
+        {
+            return Ok(execution);
+        }
+        let Some(workspace_id) = execution.workspace_id.as_deref() else {
+            return Ok(execution);
+        };
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        if workspace.task_id != execution.task_id || workspace.status != WorkspaceStatus::Ready {
+            return Err(ServiceError::invalid_operation(
+                "Review Execution requires its exact Ready same-Task Workspace",
+            ));
+        }
+        let diff = crate::DiffService::new(Arc::clone(&self.db))
+            .task_diff(&execution.task_id)
+            .await?;
+        let snapshot_digest =
+            crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+        if diff.head_sha.is_empty()
+            || execution
+                .after_sha
+                .as_deref()
+                .is_some_and(|sha| sha != diff.head_sha)
+            || execution
+                .before_sha
+                .as_deref()
+                .is_some_and(|sha| sha != diff.base_sha)
+        {
+            return Err(ServiceError::invalid_operation(
+                "Review Execution commit identity changed before dispatch",
+            ));
+        }
+        let mut frozen = execution.clone();
+        if execution.before_sha.as_deref() != Some(diff.base_sha.as_str())
+            || execution.after_sha.as_deref() != Some(diff.head_sha.as_str())
+        {
+            frozen = self
+                .persist_frozen_review_subject(
+                    &execution,
+                    &workspace.id,
+                    &diff.base_sha,
+                    &diff.head_sha,
+                )
+                .await?;
+        }
+
+        let runs =
+            db::ValidationRunRepo::list_validation_runs_by_task(&*self.db, &execution.task_id)
+                .await?;
+        let mut evidence_ids = Vec::new();
+        for run in runs.into_iter().filter(|run| {
+            run.workspace_id == workspace.id
+                && run.commit_sha == diff.head_sha
+                && run.workspace_snapshot_digest == snapshot_digest
+        }) {
+            for evidence in
+                db::ValidationRunRepo::list_evidence_for_validation_run(&*self.db, &run.id).await?
+            {
+                if evidence.task_id != execution.task_id
+                    || evidence.producer_validation_run_id != run.id
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "Validation Evidence does not match its exact same-Task producer",
+                    ));
+                }
+                evidence_ids.push(evidence.id);
+            }
+        }
+        evidence_ids.sort();
+        evidence_ids.dedup();
+        if !evidence_ids.is_empty() {
+            db::ValidationRunRepo::pin_execution_evidence_inputs(
+                &*self.db,
+                &execution.id,
+                &evidence_ids,
+                &now_rfc3339(),
+            )
+            .await?;
+        }
+        Ok(frozen)
+    }
+
+    async fn persist_frozen_review_subject(
+        &self,
+        execution: &Execution,
+        workspace_id: &str,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Execution> {
+        let timestamp = now_rfc3339();
+        let actor = execution.actor_ref();
+        let event = db::CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.review_subject_frozen".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution.id.clone(),
+            actor_type: actor
+                .as_ref()
+                .map(|actor| actor.kind().to_string())
+                .unwrap_or_else(|| "system".to_owned()),
+            actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: execution.task_id.clone(),
+            correlation_id: execution.id.clone(),
+            causation_id: execution.parent_execution_id.clone(),
+            causation_depth: i64::from(execution.parent_execution_id.is_some()),
+            dedupe_key: Some(format!("review-subject-frozen:{}:{head_sha}", execution.id)),
+            payload_json: serde_json::json!({
+                "execution_id": execution.id,
+                "task_id": execution.task_id,
+                "workspace_id": workspace_id,
+                "base_commit_sha": base_sha,
+                "head_commit_sha": head_sha,
+            })
+            .to_string(),
+            created_at: timestamp.clone(),
+        };
+        let (updated, event) = ExecutionRepo::update_with_event(
+            &*self.db,
+            db::UpdateExecution {
+                id: execution.id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: Some(Some(base_sha.to_owned())),
+                after_sha: Some(Some(head_sha.to_owned())),
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: timestamp,
+            },
+            event,
+        )
+        .await?;
+        self.publish_committed_domain_event(&event);
+        Ok(updated)
+    }
+
     pub async fn start_execution(
         &self,
         execution_id: impl Into<String>,
     ) -> Result<api_types::ExecutionStartResult> {
         let execution_id = execution_id.into();
         validate_required("execution_id", &execution_id)?;
-        let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+        let mut execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if execution.status != ExecutionStatus::Running {
@@ -38,6 +186,7 @@ impl TaskService {
             }
             return Err(error);
         }
+        execution = self.freeze_review_subject_and_inputs(execution).await?;
 
         let result = async {
             let agent = match execution.agent_id.as_deref() {
@@ -83,7 +232,7 @@ impl TaskService {
         let execution_id = execution_id.into();
         validate_required("execution_id", &execution_id)?;
         tracing::info!(%execution_id, "execution dispatch starting");
-        let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+        let mut execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if execution.status != ExecutionStatus::Running {
@@ -100,6 +249,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        execution = self.freeze_review_subject_and_inputs(execution).await?;
         let orchestrator_execution = execution.role == "orchestrator"
             && execution.purpose == Some(ExecutionPurpose::Orchestrate);
         let workspace = if orchestrator_execution {
@@ -571,6 +721,39 @@ impl TaskService {
                     result.status = ExecutionOutcome::Failed;
                     result.error = Some(
                         "completed Plan Execution did not return a complete assistant result"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+
+        if current_execution.role == crate::workflow::default_roles::REVIEWER
+            && current_execution.purpose == Some(ExecutionPurpose::Review)
+            && result.status == ExecutionOutcome::Completed
+        {
+            let output = result
+                .assistant_output
+                .as_deref()
+                .filter(|content| !content.trim().is_empty());
+            match output {
+                Some(output) => {
+                    if let Err(error) = crate::CollaborationService::new(
+                        Arc::clone(&self.db),
+                        Arc::clone(&self.event_bus),
+                    )
+                    .create_review_report_from_execution(&current_execution.id, output)
+                    .await
+                    {
+                        result.status = ExecutionOutcome::Failed;
+                        result.error = Some(format!(
+                            "completed Review Execution result could not be materialized: {error}"
+                        ));
+                    }
+                }
+                None => {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error = Some(
+                        "completed Review Execution did not return a complete structured result"
                             .to_owned(),
                     );
                 }

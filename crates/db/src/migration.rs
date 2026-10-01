@@ -14,7 +14,8 @@ use std::{
 // migration after the initial build). V095 adds orchestrator bootstrap and
 // TaskRole policy snapshots; V096 guards typed-action effects; V097 commits the
 // action receipt with each effect; V098 adds immutable Execution Artifact
-// outputs/inputs and migrates verifiable legacy plan provenance.
+// outputs/inputs and migrates verifiable legacy plan provenance; V099 adds
+// Review Execution outputs, actor-free ValidationRuns, and exact Evidence.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

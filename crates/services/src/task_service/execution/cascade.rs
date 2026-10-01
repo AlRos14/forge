@@ -1,8 +1,6 @@
 use super::*;
 use db::WorkspaceRepo;
-
-const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
-const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
+use sha2::{Digest, Sha256};
 
 impl TaskService {
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
@@ -11,6 +9,9 @@ impl TaskService {
             None => return Ok(()),
         };
         if execution.role == crate::workflow::default_roles::REVIEWER {
+            if execution.purpose != Some(ExecutionPurpose::Review) {
+                return Ok(());
+            }
             if execution.status == ExecutionStatus::Running {
                 return Ok(());
             }
@@ -1049,6 +1050,12 @@ impl TaskService {
     }
 
     async fn maybe_cascade_reviewer_completion(&self, execution: &Execution) -> Result<()> {
+        if execution.purpose != Some(ExecutionPurpose::Review)
+            || execution.status != ExecutionStatus::Completed
+        {
+            // Execution failure is not a cognitive Review verdict.
+            return Ok(());
+        }
         let task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
             Some(task) => task,
             None => return Ok(()),
@@ -1056,596 +1063,120 @@ impl TaskService {
         if task.status != crate::workflow::default_states::REVIEW {
             return Ok(());
         }
-
-        let review = self
-            .ensure_current_review_for_reviewer(&task.id, &execution.id)
-            .await?;
-        if review.execution_id == execution.id && review.status != ReviewStatus::Running {
-            tracing::debug!(
-                task_id = %task.id,
-                execution_id = %execution.id,
-                review_id = %review.id,
-                status = %review.status,
-                "reviewer completion already processed"
-            );
-            return Ok(());
-        }
-        if execution.status != ExecutionStatus::Completed {
-            return self
-                .fail_review_for_reviewer_execution_exit(&task, execution, review)
-                .await;
-        }
-        let user_approval_required = self.gate_requires_user_approval(&task).await?;
-        let final_message = reviewer_final_message(execution).await?;
-        let stale_evidence = match sqlx::query_as::<_, (String, String)>(
-            "SELECT head_sha, diff_digest FROM review_evidence_bundle WHERE review_id = ?",
-        )
-        .bind(&review.id)
-        .fetch_optional(self.db.pool())
-        .await?
-        {
-            Some((bound_head, bound_diff_digest)) => crate::DiffService::new(Arc::clone(&self.db))
-                .task_diff(&task.id)
-                .await
-                .map(|diff| {
-                    review_evidence_is_stale(
-                        &bound_head,
-                        &bound_diff_digest,
-                        &diff.head_sha,
-                        &diff.diff,
-                    )
-                })
-                .unwrap_or(true),
-            None => true,
-        };
-        let (status, auditor_details) = if stale_evidence {
-            (
-                ReviewStatus::AwaitingHuman,
-                json!({
-                    "verdict": "needs_human",
-                    "reason": "review evidence is missing or stale; run a fresh review"
-                }),
-            )
-        } else {
-            match ::review::auditor::parse_verdict(&final_message) {
-                ::review::auditor::AuditorVerdict::Passed if user_approval_required => {
-                    (ReviewStatus::AwaitingHuman, json!({ "verdict": "pass" }))
-                }
-                ::review::auditor::AuditorVerdict::Passed => {
-                    (ReviewStatus::Passed, json!({ "verdict": "pass" }))
-                }
-                ::review::auditor::AuditorVerdict::Failed { reason } => (
-                    ReviewStatus::Failed,
-                    json!({ "verdict": "fail", "reason": reason }),
-                ),
-                ::review::auditor::AuditorVerdict::NeedsHuman { reason } => (
-                    ReviewStatus::AwaitingHuman,
-                    json!({ "verdict": "needs_human", "reason": reason }),
-                ),
-            }
-        };
-        let comment = reviewer_comment(status.clone(), review.attempt_number, &final_message);
-
-        let finished_at = now_rfc3339();
-        let mut review_details = normalize_review_details(&review.step_results_json);
-        review_details["auditor"] = auditor_details;
-        if let Some(payload) = final_message
-            .lines()
-            .rev()
-            .find_map(|line| line.trim().strip_prefix("FORGE_RESULT: "))
-            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-        {
-            review_details["structured_result"] = payload;
-        }
-        if status == ReviewStatus::AwaitingHuman {
-            review_details["user_approval"] = json!({
-                "status": "awaiting_human",
-                "reason": "gate requires user approval",
-            });
-        }
-        let updated_review = ReviewRepo::update_status(
+        let report = db::CollaborationRepo::get_execution_artifact_output(
             &*self.db,
-            &review.id,
-            status.clone(),
-            review_details.to_string(),
-            (status != ReviewStatus::AwaitingHuman).then_some(finished_at.clone()),
-            &finished_at,
+            &execution.id,
+            db::ArtifactKind::ReviewReport,
         )
-        .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            updated_review.id, updated_review.status, finished_at
-        ))
-        .await;
-        if let Err(error) = self
-            .memory_service
-            .record_review_result_if_final(&task.project_id, &updated_review)
-            .await
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "completed Review Execution has no exact ReviewReport Artifact",
+            )
+        })?;
+        if report.task_id != task.id
+            || !matches!(
+                &report.producer,
+                db::ArtifactProducer::Execution { execution_id, .. } if execution_id == &execution.id
+            )
         {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
+            return Err(ServiceError::invalid_operation(
+                "ReviewReport producer does not match its exact Review Execution",
+            ));
         }
-
-        match status {
-            ReviewStatus::Passed => {
-                let task = if task.review_passed_at.is_some() {
-                    task
-                } else {
-                    TaskRepo::set_review_passed_at(
-                        &*self.db,
-                        &task.id,
-                        Some(finished_at.clone()),
-                        &finished_at,
-                    )
-                    .await?
-                };
-                self.publish(ForgeEvent {
-                    event_type: "review.passed".to_owned(),
-                    entity_id: updated_review.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::ReviewPassed {
-                        task_id: task.id.clone(),
-                        review_id: updated_review.id.clone(),
-                        attempt_number: updated_review.attempt_number,
-                    },
-                });
-                self.publish_reviewer_comment(execution, &task.id, comment)
-                    .await?;
+        let content = report.content.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("ReviewReport content is unavailable")
+        })?;
+        let value: Value = serde_json::from_str(content).map_err(|error| {
+            ServiceError::invalid_operation(format!("ReviewReport JSON is invalid: {error}"))
+        })?;
+        let subject = value.get("subject").ok_or_else(|| {
+            ServiceError::invalid_operation("ReviewReport has no exact subject identity")
+        })?;
+        if value.get("kind").and_then(Value::as_str) != Some("review_report")
+            || subject.get("task_id").and_then(Value::as_str) != Some(task.id.as_str())
+            || subject.get("review_execution_id").and_then(Value::as_str)
+                != Some(execution.id.as_str())
+            || subject.get("workspace_id").and_then(Value::as_str)
+                != execution.workspace_id.as_deref()
+            || subject.get("base_commit_sha").and_then(Value::as_str)
+                != execution.before_sha.as_deref()
+            || subject.get("head_commit_sha").and_then(Value::as_str)
+                != execution.after_sha.as_deref()
+        {
+            return Err(ServiceError::invalid_operation(
+                "ReviewReport subject identity does not match its producer Execution",
+            ));
+        }
+        let verdict = value
+            .get("verdict")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ServiceError::invalid_operation("ReviewReport verdict is missing"))?;
+        match verdict {
+            "pass" => {
+                let agent_review = matches!(execution.actor_ref(), Some(db::ActorRef::Agent(_)));
+                if agent_review && self.gate_requires_user_approval(&task).await? {
+                    return Ok(());
+                }
                 self.cascade_completed_review_task(
                     &task,
                     crate::workflow::default_states::MERGING,
-                    "review passed",
+                    &format!("ReviewReport {} passed", report.id),
                     false,
+                    &execution.id,
+                )
+                .await
+            }
+            "request_changes" | "questions" => {
+                let role = db::TaskRoleRepo::get_by_task_and_role(
+                    &*self.db,
+                    &task.id,
+                    crate::workflow::default_roles::CODER,
                 )
                 .await?;
-            }
-            ReviewStatus::AwaitingHuman => {
-                self.publish_reviewer_comment(execution, &task.id, comment)
+                let target = role
+                    .map(|role| db::CollaborationTarget::Role(role.id))
+                    .unwrap_or(db::CollaborationTarget::Task);
+                let message_id =
+                    review_collaboration_message_id(&execution.id, &report.id, verdict);
+                crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                    .create_message_with_id(
+                        crate::CollaborationActorSource::Execution(execution.id.clone()),
+                        crate::collaboration_service::CreateMessageInput {
+                            task_id: task.id.clone(),
+                            target,
+                            work_unit_id: execution.work_unit_id.clone(),
+                            body: if verdict == "request_changes" {
+                                format!("ReviewReport {} requests changes.", report.id)
+                            } else {
+                                format!(
+                                    "ReviewReport {} contains questions requiring clarification.",
+                                    report.id
+                                )
+                            },
+                            artifact_ids: vec![report.id.clone()],
+                        },
+                        message_id,
+                    )
                     .await?;
-                self.publish(ForgeEvent {
-                    event_type: "task.awaiting_human".to_owned(),
-                    entity_id: task.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::TaskAwaitingHuman {
-                        task_id: task.id.clone(),
-                        role: crate::workflow::default_roles::REVIEWER.to_owned(),
-                        assignee_id: "human".to_owned(),
-                        state: crate::workflow::default_states::REVIEW.to_owned(),
-                    },
-                });
-            }
-            ReviewStatus::Failed => {
-                let task =
-                    TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &finished_at).await?;
-                self.publish(ForgeEvent {
-                    event_type: "review.failed".to_owned(),
-                    entity_id: updated_review.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::ReviewFailed {
-                        task_id: task.id.clone(),
-                        review_id: updated_review.id.clone(),
-                        attempt_number: updated_review.attempt_number,
-                        failed_step_index: 0,
-                    },
-                });
-                self.publish_reviewer_comment(execution, &task.id, comment)
-                    .await?;
-                let (task, target, reason) = self
-                    .review_failure_target(&task, Some(&execution.id))
-                    .await?;
-                if let Some(target) = target {
-                    self.cascade_completed_review_task(&task, &target, &reason, true)
-                        .await?;
+                if verdict == "request_changes" {
+                    let target = self.review_rework_target(&task).await?;
+                    self.cascade_completed_review_task(
+                        &task,
+                        &target,
+                        &format!("ReviewReport {} requests changes", report.id),
+                        true,
+                        &execution.id,
+                    )
+                    .await
+                } else {
+                    Ok(())
                 }
             }
-            _ => {}
+            _ => Err(ServiceError::invalid_operation(
+                "ReviewReport verdict is outside the supported contract",
+            )),
         }
-
-        Ok(())
-    }
-
-    async fn fail_review_for_reviewer_execution_exit(
-        &self,
-        task: &Task,
-        execution: &Execution,
-        review: Review,
-    ) -> Result<()> {
-        let finished_at = now_rfc3339();
-        let reason = execution_failure_reason(execution);
-        let mut review_details = normalize_review_details(&review.step_results_json);
-        review_details["auditor"] = json!({
-            "verdict": "fail",
-            "reason": reason,
-        });
-        review_details["execution"] = json!({
-            "id": execution.id,
-            "status": execution.status.to_string(),
-            "stop_reason": execution.stop_reason.as_ref().map(ToString::to_string),
-            "error": execution.error.as_deref(),
-        });
-        let updated_review = ReviewRepo::update_status(
-            &*self.db,
-            &review.id,
-            ReviewStatus::Failed,
-            review_details.to_string(),
-            Some(finished_at.clone()),
-            &finished_at,
-        )
-        .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            updated_review.id, updated_review.status, finished_at
-        ))
-        .await;
-        if let Err(error) = self
-            .memory_service
-            .record_review_result_if_final(&task.project_id, &updated_review)
-            .await
-        {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-        }
-        let task = TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &finished_at).await?;
-
-        self.publish(ForgeEvent {
-            event_type: "review.failed".to_owned(),
-            entity_id: updated_review.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::ReviewFailed {
-                task_id: task.id.clone(),
-                review_id: updated_review.id.clone(),
-                attempt_number: updated_review.attempt_number,
-                failed_step_index: 0,
-            },
-        });
-        self.publish_reviewer_comment(
-            execution,
-            &task.id,
-            format!(
-                "Review failed (attempt {}): reviewer execution {}",
-                updated_review.attempt_number, reason
-            ),
-        )
-        .await?;
-
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let current_state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        if self
-            .maybe_schedule_execution_retry(
-                execution,
-                &task,
-                current_state.map(|state| &state.config),
-                current_state.and_then(|state| state.gate_config.as_ref()),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    async fn ensure_current_review_for_reviewer(
-        &self,
-        task_id: &str,
-        execution_id: &str,
-    ) -> Result<Review> {
-        let reviews = ReviewRepo::list_by_task(&*self.db, task_id).await?;
-        if let Some(review) = reviews
-            .iter()
-            .find(|review| review.execution_id == execution_id)
-            .cloned()
-        {
-            return Ok(review);
-        }
-        let latest = reviews
-            .into_iter()
-            .max_by_key(|review| review.attempt_number);
-        match latest {
-            Some(review)
-                if matches!(
-                    review.status,
-                    ReviewStatus::Running | ReviewStatus::AwaitingHuman
-                ) =>
-            {
-                Ok(review)
-            }
-            _ => {
-                let now = now_rfc3339();
-                ReviewRepo::create(
-                    &*self.db,
-                    CreateReview {
-                        id: new_uuid_v4(),
-                        task_id: task_id.to_owned(),
-                        execution_id: execution_id.to_owned(),
-                        attempt_number: ReviewRepo::next_attempt_number(&*self.db, task_id).await?,
-                        status: ReviewStatus::Running,
-                        step_results_json: json!({ "ci_steps": [] }).to_string(),
-                        started_at: now.clone(),
-                        created_at: now.clone(),
-                        updated_at: now,
-                    },
-                )
-                .await
-                .map_err(Into::into)
-            }
-        }
-    }
-
-    async fn publish_reviewer_comment(
-        &self,
-        execution: &Execution,
-        task_id: &str,
-        content: String,
-    ) -> Result<()> {
-        if let Some(agent_id) = execution.agent_id.as_deref() {
-            self.create_agent_comment(task_id, agent_id, content).await
-        } else {
-            self.create_system_comment(task_id, content).await
-        }
-    }
-
-    async fn review_failure_target(
-        &self,
-        task: &Task,
-        execution_id: Option<&str>,
-    ) -> Result<(Task, Option<String>, String)> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let review_state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == crate::workflow::default_states::REVIEW);
-        let budget = crate::task_service::config::runtime_retry_budget(
-            task,
-            crate::task_service::config::RetryBudgetKind::Review,
-            review_state.map(|state| &state.config),
-            review_state.and_then(|state| state.gate_config.as_ref()),
-        )?;
-        let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
-        let existing_count = review_rejections_since_boundary(&entries);
-        if existing_count + 1 >= i64::from(budget) {
-            let reason = "review retry budget exhausted";
-            if let Some((task, recovery_reason)) = self
-                .try_dispatch_automatic_review_recovery(
-                    &project,
-                    task,
-                    execution_id,
-                    existing_count,
-                    budget,
-                    reason,
-                )
-                .await?
-            {
-                return Ok((task, None, recovery_reason));
-            }
-            tracing::info!(
-                task_id = %task.id,
-                rejections = existing_count,
-                budget = i64::from(budget),
-                "review retry budget exhausted, blocking task"
-            );
-            let blocked_meta = json!({
-                "reason": reason,
-                "created_at": now_rfc3339(),
-                "kind": api_types::FailureKind::ReviewGateFailed,
-                "source": null,
-                "execution_id": execution_id,
-            });
-            let annotation = json!({
-                "type": api_types::FailureKind::ReviewBudgetExhausted,
-                "blocking_reason": reason,
-                "message": reason,
-                "detected_at": now_rfc3339(),
-                "recovery_actions": [
-                    api_types::RecoveryAction::ResetRetryWindow,
-                    api_types::RecoveryAction::ProceedOnce,
-                    api_types::RecoveryAction::OpenInteractive,
-                ],
-            });
-            let mut current = task.clone();
-            let mut updated = None;
-            for attempt in 0..3 {
-                match TaskRepo::update(
-                    &*self.db,
-                    UpdateTask {
-                        id: current.id.clone(),
-                        expected_version: current.version,
-                        title: None,
-                        description: None,
-                        priority: None,
-                        merge_config: None,
-                        error_annotation: Some(Some(annotation.to_string())),
-                        blocked_json: Some(Some(blocked_meta.to_string())),
-                        failed_json: Some(None),
-                        task_state_config: None,
-                        parent_task_id: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await
-                {
-                    Ok(task) => {
-                        updated = Some(task);
-                        break;
-                    }
-                    Err(DbError::VersionConflict) if attempt < 2 => {
-                        current = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                            .await?
-                            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            let task = updated.ok_or(ServiceError::Db(DbError::VersionConflict))?;
-            self.publish(ForgeEvent {
-                event_type: "task.blocked".to_owned(),
-                entity_id: task.id.clone(),
-                timestamp: event_timestamp(),
-                context: EventContext::TaskBlocked {
-                    project_id: task.project_id.clone(),
-                    reason: reason.to_owned(),
-                    kind: Some(api_types::FailureKind::ReviewGateFailed),
-                    source: None,
-                    execution_id: execution_id.map(str::to_owned),
-                },
-            });
-            Ok((task, None, reason.to_owned()))
-        } else {
-            let target = crate::workflow::default_states::IN_PROGRESS.to_owned();
-            tracing::debug!(
-                task_id = %task.id,
-                rejections = existing_count,
-                budget = i64::from(budget),
-                target = %target,
-                "review failure within budget, cascading"
-            );
-            Ok((task.clone(), Some(target), "review failed".to_owned()))
-        }
-    }
-
-    async fn try_dispatch_automatic_review_recovery(
-        &self,
-        project: &db::Project,
-        task: &Task,
-        review_execution_id: Option<&str>,
-        existing_rejections: i64,
-        budget: i32,
-        failure_reason: &str,
-    ) -> Result<Option<(Task, String)>> {
-        let Some(parent_execution_id) = review_execution_id else {
-            return Ok(None);
-        };
-        let settings = match serde_json::from_str::<ProjectSettings>(&project.settings) {
-            Ok(settings) => settings,
-            Err(error) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    project_id = %project.id,
-                    %error,
-                    "automatic review recovery skipped because project settings are invalid"
-                );
-                return Ok(None);
-            }
-        };
-        let recovery = settings.automatic_recovery;
-        if !recovery.enabled {
-            return Ok(None);
-        }
-        let Some(agent_id) = recovery
-            .agent_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-        else {
-            tracing::warn!(
-                task_id = %task.id,
-                project_id = %project.id,
-                "automatic review recovery is enabled without a recovery agent"
-            );
-            return Ok(None);
-        };
-
-        let max_attempts = recovery.max_attempts.max(1) as usize;
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        let is_automatic_recovery = |execution: &Execution| {
-            execution
-                .summary
-                .as_deref()
-                .is_some_and(|summary| summary.starts_with(AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX))
-        };
-        let recovery_attempts = page
-            .items
-            .iter()
-            .filter(|execution| is_automatic_recovery(execution))
-            .count();
-        if recovery_attempts >= max_attempts {
-            return Ok(None);
-        }
-        if page.items.iter().any(|execution| {
-            execution.status == ExecutionStatus::Running && is_automatic_recovery(execution)
-        }) {
-            return Ok(Some((
-                task.clone(),
-                "automatic review recovery already running".to_owned(),
-            )));
-        }
-
-        let prompt = render_automatic_review_recovery_prompt(
-            task,
-            failure_reason,
-            existing_rejections,
-            budget,
-            parent_execution_id,
-            recovery_attempts + 1,
-            max_attempts,
-        );
-        let execution = match self
-            .dispatch_role_follow_up_with_agent(
-                &task.id,
-                crate::workflow::default_roles::CODER,
-                parent_execution_id.to_owned(),
-                agent_id.clone(),
-                prompt,
-                AUTOMATIC_REVIEW_RECOVERY_TRIGGER,
-                ExecutionPurpose::Implement,
-            )
-            .await
-        {
-            Ok(execution) => execution,
-            Err(error) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    project_id = %project.id,
-                    agent_id = %agent_id,
-                    %error,
-                    "automatic review recovery dispatch failed"
-                );
-                return Ok(None);
-            }
-        };
-
-        self.create_system_comment(
-            &task.id,
-            format!(
-                "Automatic recovery dispatched before blocking: execution {}",
-                execution.id
-            ),
-        )
-        .await?;
-        let latest_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .unwrap_or_else(|| task.clone());
-        Ok(Some((
-            latest_task,
-            "automatic review recovery dispatched".to_owned(),
-        )))
     }
 
     async fn cascade_completed_review_task(
@@ -1654,10 +1185,11 @@ impl TaskService {
         target: &str,
         reason: &str,
         rejection: bool,
+        causing_execution_id: &str,
     ) -> Result<()> {
         let from = task.status.clone();
         match self
-            .transition(
+            .transition_caused_by_execution(
                 task.id.clone(),
                 target.to_owned(),
                 TransitionOptions {
@@ -1667,6 +1199,7 @@ impl TaskService {
                     rejection,
                     defer_dispatch_seconds: None,
                 },
+                causing_execution_id,
             )
             .await
         {
@@ -1711,6 +1244,34 @@ impl TaskService {
             .and_then(|state| state.gate_config.as_ref())
             .is_some_and(|gate_config| gate_config.requires_user_approval()))
     }
+
+    async fn review_rework_target(&self, task: &Task) -> Result<String> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+        );
+        Ok(workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(|state| {
+                state
+                    .gate_config
+                    .as_ref()
+                    .and_then(|gate| gate.reject_target.clone())
+                    .or_else(|| {
+                        state
+                            .triggers
+                            .get(&api_types::WorkflowTrigger::Reject)
+                            .map(|trigger| trigger.to.clone())
+                    })
+            })
+            .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned()))
+    }
 }
 
 fn render_workflow_guard_follow_up_prompt(
@@ -1722,114 +1283,6 @@ fn render_workflow_guard_follow_up_prompt(
     format!(
         "Your previous execution completed, but Forge could not move the task to the next workflow state.\n\nWorkflow guard failed: {guard}\n\nFailure:\n{reason}\n\nMake sure you complete all tasks and Fix what is needed for this guard, update any completed checklist items to `- [x]`, you dont need to commit anything if all tasks are complete.\n\nRetry {attempt}/{budget}."
     )
-}
-
-fn render_automatic_review_recovery_prompt(
-    task: &Task,
-    failure_reason: &str,
-    existing_rejections: i64,
-    budget: i32,
-    review_execution_id: &str,
-    attempt: usize,
-    max_attempts: usize,
-) -> String {
-    format!(
-        "{AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX}\n\n\
-         The normal review retry flow is about to block this task, so this is the final automatic recovery attempt.\n\n\
-         Task: {title}\n\
-         Current status: {status}\n\
-         Review failure: {failure_reason}\n\
-         Review execution: {review_execution_id}\n\
-         Rejections in current window: {rejections}/{budget}\n\
-         Automatic recovery attempt: {attempt}/{max_attempts}\n\n\
-         Inspect the workspace and the review failure context. Make the smallest useful change that addresses the failing review, then leave the task ready for the normal workflow to review again.",
-        title = task.title,
-        status = task.status,
-        rejections = existing_rejections + 1,
-    )
-}
-
-fn review_rejections_since_boundary(entries: &[db::TransitionLog]) -> i64 {
-    let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == crate::workflow::default_states::REVIEW
-            && !entry.rejection
-            && (entry.to_state != crate::workflow::default_states::REVIEW
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
-    });
-    let entries = boundary
-        .and_then(|index| entries.get(index + 1..))
-        .unwrap_or(entries);
-    entries
-        .iter()
-        .filter(|entry| {
-            entry.from_state == crate::workflow::default_states::REVIEW && entry.rejection
-        })
-        .count() as i64
-}
-
-async fn reviewer_final_message(execution: &Execution) -> Result<String> {
-    if let Some(logs_path) = execution.logs_path.as_deref() {
-        let (message, stdout_lines) = match executors::LogReader::fold(
-            std::path::Path::new(logs_path),
-            (String::new(), String::new()),
-            |(message, stdout_lines), entry| {
-                if entry.kind == executors::LogKind::Assistant {
-                    append_reviewer_log_text(&entry.payload, message);
-                } else if entry.kind == executors::LogKind::SessionInfo
-                    && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
-                {
-                    if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                        message.push_str(result);
-                    }
-                } else if entry.kind == executors::LogKind::Stdout {
-                    if let Some(line) = entry.payload.get("line").and_then(Value::as_str) {
-                        stdout_lines.push_str(line);
-                        stdout_lines.push('\n');
-                    }
-                }
-            },
-        )
-        .await
-        {
-            Ok(messages) => messages,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "failed to read reviewer logs: {error}"
-                )))
-            }
-        };
-        if !message.trim().is_empty() {
-            return Ok(message);
-        }
-        if !stdout_lines.trim().is_empty() {
-            return Ok(stdout_lines);
-        }
-    }
-
-    Ok(execution.summary.clone().unwrap_or_default())
-}
-
-fn append_reviewer_log_text(payload: &Value, message: &mut String) {
-    if let Some(text) = payload.get("text").and_then(Value::as_str) {
-        message.push_str(text);
-    }
-
-    let Some(content) = payload
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_array)
-    else {
-        return;
-    };
-
-    for item in content {
-        if item.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                message.push_str(text);
-            }
-        }
-    }
 }
 
 /// Dispatch time for a transient executor-unavailable retry: the structured
@@ -1858,216 +1311,13 @@ pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> b
     )
 }
 
-fn execution_failure_reason(execution: &Execution) -> String {
-    execution
-        .error
-        .as_deref()
-        .or(execution.summary.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("ended with status {}", execution.status))
-}
-
-fn normalize_review_details(step_results_json: &str) -> Value {
-    match serde_json::from_str::<Value>(step_results_json) {
-        Ok(Value::Array(ci_steps)) => json!({ "ci_steps": ci_steps }),
-        Ok(Value::Object(mut object)) => {
-            if !object.contains_key("ci_steps") {
-                object.insert("ci_steps".to_owned(), Value::Array(Vec::new()));
-            }
-            Value::Object(object)
-        }
-        _ => json!({ "ci_steps": [] }),
-    }
-}
-
-fn reviewer_comment(status: ReviewStatus, attempt_number: i64, final_message: &str) -> String {
-    let fallback = match status {
-        ReviewStatus::AwaitingHuman => format!(
-            "Review passed automated checks and is awaiting user approval (attempt {attempt_number})"
-        ),
-        ReviewStatus::Passed => format!("Review passed (attempt {attempt_number})"),
-        ReviewStatus::Failed => {
-            let reason = match ::review::auditor::parse_verdict(final_message) {
-                ::review::auditor::AuditorVerdict::Failed { reason } => reason,
-                ::review::auditor::AuditorVerdict::NeedsHuman { reason } => reason,
-                ::review::auditor::AuditorVerdict::Passed => "review failed".to_owned(),
-            };
-            format!("Review failed (attempt {attempt_number}): {reason}")
-        }
-        _ => format!("Review updated (attempt {attempt_number})"),
-    };
-    let cleaned = strip_review_result(final_message).trim().to_owned();
-    if cleaned.is_empty() {
-        fallback
-    } else {
-        cleaned
-    }
-}
-
-fn strip_review_result(message: &str) -> String {
-    message
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("FORGE_RESULT: "))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn review_evidence_is_stale(
-    bound_head: &str,
-    bound_diff_digest: &str,
-    current_head: &str,
-    current_diff: &str,
-) -> bool {
-    use sha2::{Digest, Sha256};
-    let current_diff_digest = hex::encode(Sha256::digest(current_diff.as_bytes()));
-    current_head != bound_head || current_diff_digest != bound_diff_digest
-}
-
-#[cfg(test)]
-mod reviewer_message_tests {
-    use super::*;
-    use tempfile::NamedTempFile;
-
-    fn reviewer_execution(logs_path: String, summary: &str) -> Execution {
-        let now = now_rfc3339();
-        Execution {
-            id: "execution-reviewer".to_owned(),
-            task_id: "task-reviewer".to_owned(),
-            agent_id: Some("agent-reviewer".to_owned()),
-            actor_kind: Some(db::ActorKind::Agent),
-            actor_id: Some("agent-reviewer".to_owned()),
-            role: crate::workflow::default_roles::REVIEWER.to_owned(),
-            purpose: Some(db::ExecutionPurpose::Review),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            harness_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            prompt: None,
-            summary: Some(summary.to_owned()),
-            logs_path: Some(logs_path),
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            work_unit_id: None,
-            work_unit_version: None,
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
-
-    #[tokio::test]
-    async fn reviewer_final_message_reads_claude_assistant_content() {
-        let file = NamedTempFile::new().expect("temp log creates");
-        let log = json!({
-            "schema_version": 1,
-            "sequence": 1,
-            "timestamp": "2026-04-27T00:00:00Z",
-            "execution_id": "execution-reviewer",
-            "kind": "assistant",
-            "stream": "main",
-            "payload": {
-                "message": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "No issues found.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}"
-                        }
-                    ]
-                }
-            },
-            "truncated": false
-        });
-        std::fs::write(file.path(), format!("{log}\n")).expect("log writes");
-
-        let execution = reviewer_execution(
-            file.path().to_string_lossy().into_owned(),
-            "Truncated summary without marker",
-        );
-
-        let message = reviewer_final_message(&execution)
-            .await
-            .expect("message extracts");
-        assert!(message.contains("FORGE_RESULT:"));
-    }
-
-    #[tokio::test]
-    async fn reviewer_final_message_reads_claude_result_when_assistant_text_missing() {
-        let file = NamedTempFile::new().expect("temp log creates");
-        let log = json!({
-            "schema_version": 1,
-            "sequence": 1,
-            "timestamp": "2026-04-27T00:00:00Z",
-            "execution_id": "execution-reviewer",
-            "kind": "session_info",
-            "stream": "main",
-            "payload": {
-                "subtype": "success",
-                "result": "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}"
-            },
-            "truncated": false
-        });
-        std::fs::write(file.path(), format!("{log}\n")).expect("log writes");
-
-        let execution = reviewer_execution(
-            file.path().to_string_lossy().into_owned(),
-            "Truncated summary without marker",
-        );
-
-        let message = reviewer_final_message(&execution)
-            .await
-            .expect("message extracts");
-        assert!(message.contains("FORGE_RESULT:"));
-    }
-
-    #[test]
-    fn reviewer_comment_uses_clean_final_message() {
-        let comment = reviewer_comment(
-            ReviewStatus::Passed,
-            1,
-            "No blocking issues found.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}",
-        );
-
-        assert_eq!(comment, "No blocking issues found.");
-    }
-
-    #[test]
-    fn reviewer_comment_falls_back_when_only_marker_exists() {
-        let comment = reviewer_comment(
-            ReviewStatus::Passed,
-            2,
-            "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}",
-        );
-
-        assert_eq!(comment, "Review passed (attempt 2)");
-    }
-
-    #[test]
-    fn evidence_staleness_checks_uncommitted_diff_as_well_as_head() {
-        use sha2::{Digest, Sha256};
-        let bound_diff = "diff --git a/a b/a\n-old\n+new\n";
-        let digest = hex::encode(Sha256::digest(bound_diff.as_bytes()));
-
-        assert!(!review_evidence_is_stale(
-            "head-1", &digest, "head-1", bound_diff
-        ));
-        assert!(review_evidence_is_stale(
-            "head-1",
-            &digest,
-            "head-1",
-            "diff --git a/a b/a\n-old\n+different\n"
-        ));
-        assert!(review_evidence_is_stale(
-            "head-1", &digest, "head-2", bound_diff
-        ));
-    }
+fn review_collaboration_message_id(execution_id: &str, report_id: &str, verdict: &str) -> String {
+    let digest = Sha256::digest(
+        format!("review-collaboration:{execution_id}:{report_id}:{verdict}").as_bytes(),
+    );
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
 }

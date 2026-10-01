@@ -158,7 +158,10 @@ async fn transition_from_planning_does_not_require_plan_approval_or_checklist() 
         .await
         .expect("legacy plan revisions count");
     assert_eq!(revisions, 0);
-    assert_eq!(plan.producer_execution_id.len(), 36);
+    assert!(matches!(
+        &plan.producer,
+        db::ArtifactProducer::Execution { execution_id, .. } if execution_id.len() == 36
+    ));
 }
 
 #[tokio::test]
@@ -314,9 +317,8 @@ async fn transition_to_review_runs_configured_review_runner() {
         "merging".to_owned(),
         "passed review auto-cascades to merging; no merge service is configured in this unit test"
     );
-    assert!(result.review.is_some());
-    assert_eq!(
-        result.review.as_ref().map(|review| review.status.clone()),
-        Some(ReviewStatus::Passed)
+    assert!(
+        result.review.is_none(),
+        "legacy Review rows are not authority"
     );
 }

@@ -5,8 +5,9 @@ use api_types::{
     StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
-    CreateTask, CreateTaskRoleAssignment, ProjectRepo, RepoRepo, SqliteDb, TaskRepo,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
+    CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment,
+    ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, SqliteDb, TaskRepo,
     TaskRoleAssignmentRepo, TransitionLogRepo, UpdateProject,
 };
 use events::{EventBus, ForgeEvent};
@@ -258,6 +259,38 @@ fn user_approval_review_workflow(
             review,
             state("done", StateKind::Terminal, None, StateHooks::default()),
         ],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    }
+}
+
+fn review_report_cascade_workflow() -> WorkflowDefinition {
+    let working = with_trigger(
+        state("working", StateKind::Active, None, StateHooks::default()),
+        WorkflowTrigger::Accept,
+        "review",
+    );
+    let mut review = state(
+        "review",
+        StateKind::Gate,
+        Some(default_roles::REVIEWER),
+        StateHooks {
+            after_enter: vec![hook("auto_cascade_on_review_pass", FailurePolicy::Block)],
+            ..StateHooks::default()
+        },
+    );
+    review.gate_config = Some(GateConfig {
+        reject_target: Some("working".to_owned()),
+        max_rejections: Some(3),
+        approve_label: None,
+        reject_label: None,
+        requires_user_approval: Some(false),
+        optional_when_unassigned: Some(false),
+    });
+    let merging = state("merging", StateKind::Active, None, StateHooks::default());
+    WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![working, review, merging],
         configuration: Vec::new(),
         cancellation_state: None,
     }
@@ -1439,6 +1472,108 @@ async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
         .await
         .expect("transition logs load");
     assert!(!logs.iter().any(|entry| entry.rejection));
+}
+
+#[tokio::test]
+async fn manual_review_entry_does_not_reuse_a_prior_passing_review_execution() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let workflow = review_report_cascade_workflow();
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+
+    let agent_id = new_uuid_v4();
+    let now = now_rfc3339();
+    AgentRepo::create(
+        &*db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: "historical reviewer".to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("review Agent creates");
+    let old_review_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &*db,
+        CreateExecution {
+            id: old_review_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id)),
+            purpose: Some(db::ExecutionPurpose::Review),
+            role: default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("prior review passed".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("historical Review Execution creates");
+    crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .create_review_report_from_execution(
+            &old_review_id,
+            "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"Prior scope passed.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}",
+        )
+        .await
+        .expect("historical ReviewReport creates");
+
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .expect("Task lookup succeeds")
+        .expect("Task exists");
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            &task_id,
+            "review",
+            task.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "manual transition to review",
+            false,
+        )
+        .await
+        .expect("manual transition succeeds");
+
+    assert_eq!(result.task.status, "review");
+    assert!(!result.cascaded);
 }
 
 #[tokio::test]

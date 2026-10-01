@@ -91,6 +91,51 @@ stored workflow definitions, and failed Plan Executions no longer create a
 planner-specific retry exception; general workflow and execution recovery stay
 with their owning migration plans.
 
+## Plan PR8 implementation status
+
+V099 adds Actor-free `validation_run` and producer-bound deterministic
+`evidence`, plus `artifact_validation_run_producer`. A new ValidationRun
+freezes Task, Workspace, commit, working-tree snapshot digest, check/command,
+bounded environment summary, and an idempotency key. Terminal result, Evidence,
+optional validation-report Artifact, and their domain events commit together.
+Evidence SQL guards compare its same-Task producer and its recorded check,
+configuration, Workspace, commit, snapshot, status, and exit code.
+
+Cognitive review is now a real Human or Agent reviewer Execution with purpose
+`review`. Completion requires its unique exact `review_report` Artifact;
+structured `FORGE_RESULT` remains only the harness transport parsed into that
+Artifact. New deterministic checks create ValidationRuns and Evidence and do
+not create or update a Review row. Review output and Validation output remain
+independent; the existing workflow may still order checks or block a transition
+using its configured hook, while PR9 owns general Gate policy.
+
+Workflow hook context now carries an Execution ID only when the transition
+names that exact completed Review Execution as its cause. Manual transitions
+and entry-barrier retries do not inherit a recent Execution as cause. Reviewer
+dispatch never resumes a prior thread by role recency; request-changes starts a
+fresh work-role Execution under the active workflow and does not infer a prior
+role HarnessSession.
+
+The generic `/gates/review/{approve,reject}` compatibility routes require a
+matching Task version and exactly one running Human reviewer Execution for the
+authenticated user; they submit a ReviewReport to that exact Execution. The
+older `/review/{approve,reject}` URLs return 409 because their response shape
+requires a legacy Review row. Neither route writes new legacy Review state.
+
+V099 retains all legacy Review, V084 bundle, and Task compatibility storage.
+It migrates only structured review output with same-Task real ActorRef,
+reviewer/review producer Execution, and a complete reconstructible report with
+no unpinned legacy Evidence references. Other rows receive an explicit audit
+status. Legacy CI is audited but not backfilled when its persisted environment
+and Workspace snapshot cannot be proven. Existing tables and
+`review_passed_at` remain for PR13 cleanup. The implementation details,
+transition readers/writers, crash recovery, and remaining PR9/PR13 boundaries
+are recorded in `plan-pr8-review-validation-evidence.md`.
+
+MCP has no tool that reads or writes the new ReviewReport, ValidationRun, or
+deterministic Evidence authorities. Its generic task-type enum, review retry
+budget setting, and prompt preview remain configuration/projection surfaces.
+
 ## Current repository baseline
 
 The Plan PR0 audit was performed against the actual clean local checkout:

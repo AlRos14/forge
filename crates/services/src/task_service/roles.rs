@@ -352,8 +352,6 @@ impl TaskService {
             .await?;
         let Some(active_execution) = active_execution else {
             let assignment = self.assign_role_assignment(input).await?;
-            TaskRepo::set_review_passed_at(&*self.db, &assignment.task_id, None, &now_rfc3339())
-                .await?;
             self.publish_role_reassigned(
                 &assignment.task_id,
                 &assignment.role_name,
@@ -374,8 +372,6 @@ impl TaskService {
         .await?;
 
         let assignment = self.assign_role_assignment(input).await?;
-        TaskRepo::set_review_passed_at(&*self.db, &assignment.task_id, None, &now_rfc3339())
-            .await?;
 
         let workflow = self.workflow_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
@@ -456,7 +452,6 @@ impl TaskService {
         let active_execution = self.active_execution_for_role(&task, role_name).await?;
         let Some(active_execution) = active_execution else {
             TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
-            TaskRepo::set_review_passed_at(&*self.db, task_id, None, &now_rfc3339()).await?;
             self.publish_role_reassigned(
                 task_id,
                 role_name,
@@ -476,7 +471,6 @@ impl TaskService {
         )
         .await?;
         TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
-        TaskRepo::set_review_passed_at(&*self.db, task_id, None, &now_rfc3339()).await?;
 
         let workflow = self.workflow_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;

@@ -1,5 +1,6 @@
 const RESULT_INSTRUCTION: &str = r#"End with exactly one machine-readable line:
-FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass|fail|needs_human","summary":"...","findings":[{"severity":"blocking|non_blocking","evidence":"...","expected":"...","actual":"..."}],"questions":[]}
+FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass|fail|needs_human","summary":"...","criteria":[],"findings":[{"severity":"blocking|non_blocking","evidence":"...","expected":"...","actual":"..."}],"questions":[],"evidence_considered":[{"artifact_id":"exact pinned Artifact id"}]}
+Each evidence_considered item must name exactly one pinned artifact_id or evidence_id.
 Use needs_human when correctness depends on missing product, policy, scope, or risk authority. Missing or invalid structured output is a protocol failure."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
