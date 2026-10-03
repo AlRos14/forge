@@ -10,8 +10,7 @@ use db::{
 use events::TASK_MOVED_EVENT;
 
 use super::transition::{
-    clear_manual_review_awaiting_metadata, should_clear_review_passed_at,
-    should_clear_transient_error_annotation,
+    clear_manual_review_awaiting_metadata, should_clear_transient_error_annotation,
 };
 
 impl TaskService {
@@ -190,10 +189,6 @@ impl TaskService {
                     previous_reason: blocked_previous_reason,
                 },
             });
-        }
-        if should_clear_review_passed_at(&workflow, &previous_status, &task.status, false, &actor) {
-            task =
-                TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
         }
         if previous_status == default_states::REVIEW && task.status != default_states::REVIEW {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;

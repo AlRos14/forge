@@ -1,5 +1,168 @@
 use super::*;
-use crate::{now_rfc3339, AgentExecutionStats, ExecutionPurpose};
+use crate::{now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus};
+
+fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
+    Ok(ReviewExecutionSubject {
+        execution_id: row.try_get("execution_id")?,
+        task_id: row.try_get("task_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        base_commit_sha: row.try_get("base_commit_sha")?,
+        head_commit_sha: row.try_get("head_commit_sha")?,
+        workspace_snapshot_digest: row.try_get("workspace_snapshot_digest")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+async fn insert_review_execution_subject_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    subject: &CreateReviewExecutionSubject,
+) -> Result<ReviewExecutionSubject> {
+    sqlx::query(
+        "INSERT INTO review_execution_subject (
+            execution_id, task_id, workspace_id, base_commit_sha, head_commit_sha,
+            workspace_snapshot_digest, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&subject.execution_id)
+    .bind(&subject.task_id)
+    .bind(&subject.workspace_id)
+    .bind(&subject.base_commit_sha)
+    .bind(&subject.head_commit_sha)
+    .bind(&subject.workspace_snapshot_digest)
+    .bind(&subject.created_at)
+    .execute(&mut **tx)
+    .await?;
+    let row = sqlx::query("SELECT * FROM review_execution_subject WHERE execution_id = ?")
+        .bind(&subject.execution_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    map_review_execution_subject(row)
+}
+
+fn review_subject_identity_matches(
+    current: &ReviewExecutionSubject,
+    proposed: &CreateReviewExecutionSubject,
+) -> bool {
+    current.execution_id == proposed.execution_id
+        && current.task_id == proposed.task_id
+        && current.workspace_id == proposed.workspace_id
+        && current.base_commit_sha == proposed.base_commit_sha
+        && current.head_commit_sha == proposed.head_commit_sha
+        && current.workspace_snapshot_digest == proposed.workspace_snapshot_digest
+}
+
+async fn create_human_review_execution(
+    db: &SqliteDb,
+    input: CreateExecution,
+    subject: Option<CreateReviewExecutionSubject>,
+    event: CreateDomainEvent,
+) -> Result<(Execution, Option<ReviewExecutionSubject>, DomainEvent)> {
+    let human_actor_id = match input.actor_ref.as_ref() {
+        Some(ActorRef::Human(user_id)) => Some(user_id.as_str()),
+        _ => None,
+    };
+    let subject_matches = match subject.as_ref() {
+        Some(subject) => {
+            input.workspace_id.as_deref() == Some(subject.workspace_id.as_str())
+                && input.before_sha.as_deref() == Some(subject.base_commit_sha.as_str())
+                && input.after_sha.as_deref() == Some(subject.head_commit_sha.as_str())
+                && input.id == subject.execution_id
+                && input.task_id == subject.task_id
+        }
+        None => {
+            input.workspace_id.is_none() && input.before_sha.is_none() && input.after_sha.is_none()
+        }
+    };
+    if input.status != ExecutionStatus::Running
+        || input.role != "reviewer"
+        || input.purpose != Some(ExecutionPurpose::Review)
+        || human_actor_id.is_none()
+        || !subject_matches
+        || event.event_type != "execution.started"
+        || event.entity_type != "execution"
+        || event.entity_id != input.id
+        || event.scope_type != "task"
+        || event.scope_id != input.task_id
+        || event.actor_type != "human"
+        || event.actor_id.as_deref() != human_actor_id
+    {
+        return Err(DbError::Check(
+            "Human Review Execution, optional exact subject, and start event must share one identity"
+                .to_owned(),
+        ));
+    }
+
+    let mut tx = db.pool.begin().await?;
+    if !human_has_current_role_authority_in_tx(
+        &mut tx,
+        &input.task_id,
+        "reviewer",
+        human_actor_id.expect("shape validation requires a Human Actor"),
+    )
+    .await?
+    {
+        return Err(DbError::Check(
+            "new Human Review Execution requires current authoritative reviewer membership"
+                .to_owned(),
+        ));
+    }
+    let execution = SqliteDb::create_execution_in_tx(&mut tx, &input, None).await?;
+    let subject = match subject.as_ref() {
+        Some(subject) => Some(insert_review_execution_subject_in_tx(&mut tx, subject).await?),
+        None => None,
+    };
+    let event = DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
+    tx.commit().await?;
+    Ok((execution, subject, event))
+}
+
+/// Recheck current Human role authority inside the same SQLite transaction as
+/// an authoritative Review write. Once the replacement TaskRole exists, the
+/// membership is the sole authority; the legacy singleton is used only when
+/// that TaskRole has not been created.
+pub(super) async fn human_has_current_role_authority_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let Some(canonical_role) = crate::canonical_task_role_name(role) else {
+        return Ok(false);
+    };
+    let authorized: i64 = sqlx::query_scalar(
+        "SELECT CASE
+            WHEN EXISTS (
+                SELECT 1 FROM task_role
+                WHERE task_id = ? AND role = ?
+            ) THEN EXISTS (
+                SELECT 1
+                FROM task_role AS role
+                JOIN role_membership AS membership
+                  ON membership.task_role_id = role.id
+                WHERE role.task_id = ? AND role.role = ?
+                  AND membership.actor_kind = 'human'
+                  AND membership.actor_id = ?
+                  AND membership.status = 'active'
+            )
+            ELSE EXISTS (
+                SELECT 1 FROM task_role_assignment
+                WHERE task_id = ? AND role_name = ?
+                  AND assignee_type = 'user' AND assignee_id = ?
+            )
+         END",
+    )
+    .bind(task_id)
+    .bind(&canonical_role)
+    .bind(task_id)
+    .bind(&canonical_role)
+    .bind(user_id)
+    .bind(task_id)
+    .bind(role)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(authorized != 0)
+}
 
 #[async_trait]
 impl ExecutionRepo for SqliteDb {
@@ -20,6 +183,177 @@ impl ExecutionRepo for SqliteDb {
         let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
         transaction.commit().await?;
         Ok((execution, event))
+    }
+
+    async fn create_human_review_execution_with_subject(
+        &self,
+        input: CreateExecution,
+        subject: CreateReviewExecutionSubject,
+        event: CreateDomainEvent,
+    ) -> Result<ReviewExecutionSubjectWrite> {
+        let (execution, subject, event) =
+            create_human_review_execution(self, input, Some(subject), event).await?;
+        Ok(ReviewExecutionSubjectWrite {
+            execution,
+            subject: subject.expect("workspace-bound method supplies a subject"),
+            event: Some(event),
+        })
+    }
+
+    async fn create_human_review_execution_without_subject(
+        &self,
+        input: CreateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)> {
+        let (execution, subject, event) =
+            create_human_review_execution(self, input, None, event).await?;
+        debug_assert!(subject.is_none());
+        Ok((execution, event))
+    }
+
+    async fn freeze_review_execution_subject(
+        &self,
+        subject: CreateReviewExecutionSubject,
+        updated_at: &str,
+        event: CreateDomainEvent,
+    ) -> Result<ReviewExecutionSubjectWrite> {
+        if event.event_type != "execution.review_subject_frozen"
+            || event.entity_type != "execution"
+            || event.entity_id != subject.execution_id
+            || event.scope_type != "task"
+            || event.scope_id != subject.task_id
+        {
+            return Err(DbError::Check(
+                "Review subject event must identify its exact Execution and Task".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(&subject.execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.task_id != subject.task_id
+            || execution.role != "reviewer"
+            || execution.purpose != Some(ExecutionPurpose::Review)
+            || execution.status != ExecutionStatus::Running
+            || execution.workspace_id.as_deref() != Some(subject.workspace_id.as_str())
+        {
+            return Err(DbError::Check(
+                "Review subject requires its exact Running reviewer Execution".to_owned(),
+            ));
+        }
+        let actor = execution.actor_ref().ok_or_else(|| {
+            DbError::Check("Review subject requires a persisted Human or Agent ActorRef".to_owned())
+        })?;
+        if event.actor_type != actor.kind().to_string()
+            || event.actor_id.as_deref() != Some(actor.id())
+        {
+            return Err(DbError::Check(
+                "Review subject event ActorRef must match its exact Execution".to_owned(),
+            ));
+        }
+
+        let existing = sqlx::query("SELECT * FROM review_execution_subject WHERE execution_id = ?")
+            .bind(&subject.execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_review_execution_subject)
+            .transpose()?;
+        if let Some(existing) = existing {
+            if !review_subject_identity_matches(&existing, &subject)
+                || execution.before_sha.as_deref() != Some(existing.base_commit_sha.as_str())
+                || execution.after_sha.as_deref() != Some(existing.head_commit_sha.as_str())
+            {
+                return Err(DbError::Check(
+                    "Review Execution subject is already frozen to a different identity".to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(ReviewExecutionSubjectWrite {
+                execution,
+                subject: existing,
+                event: None,
+            });
+        }
+
+        if execution
+            .before_sha
+            .as_deref()
+            .is_some_and(|value| value != subject.base_commit_sha)
+            || execution
+                .after_sha
+                .as_deref()
+                .is_some_and(|value| value != subject.head_commit_sha)
+        {
+            return Err(DbError::Check(
+                "Review Execution commit identity conflicts with its frozen subject".to_owned(),
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE execution SET before_sha = ?, after_sha = ?, updated_at = ?
+             WHERE id = ? AND task_id = ? AND status = 'running'",
+        )
+        .bind(&subject.base_commit_sha)
+        .bind(&subject.head_commit_sha)
+        .bind(updated_at)
+        .bind(&subject.execution_id)
+        .bind(&subject.task_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        let row = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(&subject.execution_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let execution = map_execution(row)?;
+        let subject = insert_review_execution_subject_in_tx(&mut tx, &subject).await?;
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        Ok(ReviewExecutionSubjectWrite {
+            execution,
+            subject,
+            event: Some(event),
+        })
+    }
+
+    async fn get_review_execution_subject(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ReviewExecutionSubject>> {
+        sqlx::query("SELECT * FROM review_execution_subject WHERE execution_id = ?")
+            .bind(execution_id)
+            .fetch_optional(self.pool())
+            .await?
+            .map(map_review_execution_subject)
+            .transpose()
+    }
+
+    async fn find_running_human_review_execution(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<Execution>> {
+        sqlx::query(
+            "SELECT * FROM execution
+             WHERE task_id = ? AND role = 'reviewer' AND purpose = 'review'
+               AND actor_kind = 'human' AND actor_id = ? AND status = 'running'
+               AND workspace_id IS ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .fetch_optional(self.pool())
+        .await?
+        .map(map_execution)
+        .transpose()
     }
 
     async fn create_with_artifact_inputs_and_event(

@@ -9,7 +9,8 @@ use crate::workflow::{
 pub struct ReviewerPromptBuilder;
 
 const VERDICT_INSTRUCTION: &str = r#"End with exactly one machine-readable line:
-FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass|fail|needs_human","summary":"...","findings":[{"severity":"blocking|non_blocking","evidence":"...","expected":"...","actual":"..."}],"questions":[]}
+FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass|fail|needs_human","summary":"...","criteria":[],"findings":[{"severity":"blocking|non_blocking","evidence":"...","expected":"...","actual":"..."}],"questions":[],"evidence_considered":[{"evidence_id":"exact pinned Evidence id"}]}
+Each evidence_considered item must name exactly one pinned evidence_id or artifact_id. Do not claim an unpinned item was considered.
 Use needs_human only for missing product, policy, scope, or risk authority. Missing or invalid structured output is a protocol failure."#;
 
 const REVIEWER_ROLE_BOUNDARY: &str = "\
@@ -107,33 +108,13 @@ impl PromptBuilder for ReviewerPromptBuilder {
             }
         }
 
-        if !ctx.prior_reviews.is_empty() {
-            user.push_str("\nPrior reviews:\n");
-            for review in &ctx.prior_reviews {
-                let status_str = match review.status {
-                    db::ReviewStatus::Running => "Running",
-                    db::ReviewStatus::AwaitingHuman => "Awaiting human",
-                    db::ReviewStatus::Passed => "Passed",
-                    db::ReviewStatus::Failed => "Failed",
-                    db::ReviewStatus::Cancelled => "Cancelled",
-                };
-                user.push_str(&format!(
-                    "- Attempt {}: {}\n",
-                    review.attempt_number, status_str
-                ));
-                user.push_str("  Recorded evidence: ");
-                user.push_str(&review.step_results_json);
-                user.push('\n');
-            }
-        }
-
         user.push_str("\nVerdict format:\n");
         user.push_str(VERDICT_INSTRUCTION);
         user.push('\n');
 
         AgentPrompt {
             system: format!(
-                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{VERDICT_INSTRUCTION}"
+                "You are the reviewer Agent for this Forge workflow Task. This is a read-only audit. Verify correctness, distinguish deterministic ValidationRun results from your cognitive verdict, and produce a complete structured ReviewReport. Findings may be shared through ordinary Collaboration Messages that attach this exact report.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{VERDICT_INSTRUCTION}"
             ),
             user,
             tools: default_tool_names(default_roles::REVIEWER),

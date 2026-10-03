@@ -2,10 +2,22 @@ use super::*;
 
 pub async fn approve_gate(
     State(state): State<AppState>,
-    _user: crate::routes::auth::AuthenticatedUser,
+    user: crate::routes::auth::AuthenticatedUser,
     Path((id, state_name)): Path<(String, String)>,
     Json(request): Json<ApproveGateRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    if state_name == default_states::REVIEW {
+        return project_review_gate_decision(
+            &state,
+            &user,
+            &id,
+            request.version,
+            GateDecision::Approve,
+            request.reason,
+        )
+        .await
+        .map(Json);
+    }
     let task = transition_gate(
         &state,
         id,
@@ -20,9 +32,22 @@ pub async fn approve_gate(
 
 pub async fn reject_gate(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path((id, state_name)): Path<(String, String)>,
     Json(request): Json<RejectGateRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    if state_name == default_states::REVIEW {
+        return project_review_gate_decision(
+            &state,
+            &user,
+            &id,
+            request.version,
+            GateDecision::Reject,
+            Some(request.reason),
+        )
+        .await
+        .map(Json);
+    }
     let task = transition_gate(
         &state,
         id,
@@ -33,6 +58,107 @@ pub async fn reject_gate(
     )
     .await?;
     Ok(Json(task))
+}
+
+/// The legacy generic gate URL has no Execution id in its request. Preserve
+/// it only as a projection when exactly one live Human reviewer Execution for
+/// this user exists; the durable verdict is still its exact ReviewReport.
+async fn project_review_gate_decision(
+    state: &AppState,
+    user: &crate::routes::auth::AuthenticatedUser,
+    task_id: &str,
+    expected_version: i64,
+    decision: GateDecision,
+    reason: Option<String>,
+) -> ApiResult<TaskResponse> {
+    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
+    if task.status != default_states::REVIEW {
+        return Err(ApiError::invalid_operation_conflict(format!(
+            "task {task_id} is in {} state; expected review",
+            task.status
+        )));
+    }
+    if task.version != expected_version {
+        return Err(ApiError::invalid_operation_conflict(
+            "Task changed since the review decision was prepared",
+        ));
+    }
+
+    let page = ExecutionRepo::list_by_task_and_role(
+        &*state.db,
+        task_id,
+        services::workflow::default_roles::REVIEWER,
+        PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await?;
+    let mut candidates = page.items.into_iter().filter(|execution| {
+        execution.purpose == Some(db::ExecutionPurpose::Review)
+            && execution.status == ExecutionStatus::Running
+            && execution.actor_ref() == Some(db::ActorRef::Human(user.user_id.clone()))
+    });
+    let Some(execution) = candidates.next() else {
+        return Err(ApiError::invalid_operation_conflict(
+            "Review decision requires one running Human reviewer Execution for this user",
+        ));
+    };
+    if candidates.next().is_some() || page.next_cursor.is_some() {
+        return Err(ApiError::invalid_operation_conflict(
+            "Review decision is ambiguous; submit a ReviewReport to the exact Execution id",
+        ));
+    }
+
+    let (verdict, summary, findings) = match decision {
+        GateDecision::Approve => (
+            api_types::ReviewReportVerdict::Pass,
+            reason
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "Human reviewer approved this Task.".to_owned()),
+            Vec::new(),
+        ),
+        GateDecision::Reject => {
+            let reason = reason
+                .filter(|reason| !reason.trim().is_empty())
+                .ok_or_else(|| ApiError::bad_request("Review changes require a reason"))?;
+            (
+                api_types::ReviewReportVerdict::RequestChanges,
+                reason.clone(),
+                vec![reason],
+            )
+        }
+    };
+    state
+        .task_service
+        .submit_human_review_report(
+            &execution.id,
+            &user.user_id,
+            api_types::SubmitReviewReportRequest {
+                verdict,
+                summary,
+                criteria: vec!["Human review decision".to_owned()],
+                findings,
+                questions: Vec::new(),
+                evidence_ids: Vec::new(),
+                artifact_ids: Vec::new(),
+            },
+        )
+        .await?;
+    let updated = TaskRepo::get_by_id(&*state.db, task_id, false)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
+    let mut response = task_response(&state.db, updated).await?;
+    response.awaiting_human = state
+        .task_service
+        .is_awaiting_human(task_id.to_owned())
+        .await?;
+    Ok(response)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,26 +202,12 @@ async fn transition_gate(
             task.status
         )));
     }
-    ensure_gate_decision_ready(state, &task_id, gate_state).await?;
-
-    if decision == GateDecision::Approve && state_name == default_states::REVIEW {
-        let latest_review = ReviewRepo::list_by_task(&*state.db, &task_id)
-            .await?
-            .into_iter()
-            .max_by_key(|review| review.attempt_number);
-        if latest_review
-            .as_ref()
-            .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-        {
-            let (task, _) = state.task_service.approve_review(task_id).await?;
-            let mut response = task_response(&state.db, task).await?;
-            response.awaiting_human = state
-                .task_service
-                .is_awaiting_human(response.id.clone())
-                .await?;
-            return Ok(response);
-        }
+    if state_name == default_states::REVIEW {
+        return Err(ApiError::invalid_operation_conflict(
+            "Review gates require a completed reviewer Execution and exact ReviewReport; task-level approval is retired",
+        ));
     }
+    ensure_gate_decision_ready(state, &task_id, gate_state).await?;
 
     let target_state = gate_decision_target(&workflow, &state_name, decision)?;
     let trigger_reason = gate_decision_reason(decision, reason);

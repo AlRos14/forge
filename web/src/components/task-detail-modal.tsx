@@ -12,6 +12,7 @@ import {
   useRejectGate,
   useResetTaskWorkspace,
   useReviewsQuery,
+  useValidationsQuery,
   useRecoverTask,
   useTaskQuery,
   useTransitionTask,
@@ -22,7 +23,6 @@ import { TaskDetailHeader } from '@/components/task-detail/task-detail-header'
 import { TaskDetailSidebar } from '@/components/task-detail/task-detail-sidebar'
 import {
   TaskExecutionsPanel,
-  reviewStatusColors,
 } from '@/components/task-detail/task-executions-panel'
 import { TaskPrSummaryCard } from '@/components/task-detail/task-pr-summary-card'
 import { TaskSubtasksPanel } from '@/components/task-detail/task-subtasks-panel'
@@ -39,20 +39,13 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { getBlockingAnnotation } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
-import type { Review, WorkflowExceptionAction } from '@/types/generated'
+import type { ReviewExecutionResponse, ValidationRunResponse, WorkflowExceptionAction } from '@/types/generated'
 
 function formatDate(value?: string | null): string {
   if (!value) return '-'
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString()
-}
-
-function getLatestReview(reviews: Review[]): Review | undefined {
-  return reviews.reduce<Review | undefined>((latest, current) => {
-    if (!latest) return current
-    return current.attempt_number > latest.attempt_number ? current : latest
-  }, undefined)
 }
 
 function getErrorInfo(
@@ -88,6 +81,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   const taskQuery = useTaskQuery(taskId)
   const executionsQuery = useExecutionsQuery(taskId)
   const reviewsQuery = useReviewsQuery(taskId)
+  const validationsQuery = useValidationsQuery(taskId)
   const agentsQuery = useAgentsQuery()
   const updateTask = useUpdateTask()
   const transitionTask = useTransitionTask()
@@ -114,8 +108,11 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   )
   const agentName = (agentId?: string | null) =>
     (agentId ? agentNamesById.get(agentId) : undefined) ?? agentId
-  const reviews = useMemo(() => reviewsQuery.data ?? [], [reviewsQuery.data])
-  const latestReview = useMemo(() => getLatestReview(reviews), [reviews])
+  const reviews = reviewsQuery.data ?? []
+  const validations = validationsQuery.data ?? []
+  const recentReviewProjection = [...reviews].sort((a, b) =>
+    b.execution.created_at.localeCompare(a.execution.created_at),
+  )[0]
 
   useEffect(() => {
     if (!task) return
@@ -212,14 +209,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
         currentStatus: task.status,
       },
       {
-        onSuccess: (result) => {
-          if (status !== 'review' || !result.review) return
-          if (result.review.status === 'passed') toast.success('Review passed')
-          else if (result.review.status === 'failed') {
-            const failedStep = result.review.step_results.find((s) => s.exit_code !== 0)
-            toast.error(failedStep ? `Review failed: ${failedStep.command}` : 'Review failed')
-          }
-        },
         onError: (error) => {
           if (error instanceof ApiError && error.status === 412) {
             let msg = 'Transition blocked by guard condition'
@@ -469,14 +458,11 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                     {showReviewTab ? (
                       <TabsTrigger value="review">
                         Review
-                        {latestReview && (
+                        {recentReviewProjection && (
                           <span
-                            className={cn(
-                              'ml-1.5 inline-flex h-5 items-center rounded-full px-1.5 text-micro font-medium',
-                              reviewStatusColors[latestReview.status],
-                            )}
+                            className="ml-1.5 inline-flex h-5 items-center rounded-full bg-muted px-1.5 text-micro font-medium"
                           >
-                            {latestReview.status}
+                            {recentReviewProjection.execution.status}
                           </span>
                         )}
                       </TabsTrigger>
@@ -498,8 +484,10 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                   {showReviewTab ? (
                     <TabsContent value="review" className="space-y-4 pt-2">
                       <ModalReviewSummary
-                        latestReview={latestReview}
-                        reviewCount={reviews.length}
+                        reviews={reviews}
+                        validations={validations}
+                        reviewsLoading={reviewsQuery.isLoading}
+                        validationsLoading={validationsQuery.isLoading}
                         onOpenFullPage={openFullPage}
                       />
                     </TabsContent>
@@ -544,72 +532,52 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
 }
 
 function ModalReviewSummary({
-  latestReview,
-  reviewCount,
+  reviews,
+  validations,
+  reviewsLoading,
+  validationsLoading,
   onOpenFullPage,
 }: {
-  latestReview: Review | undefined
-  reviewCount: number
+  reviews: ReviewExecutionResponse[]
+  validations: ValidationRunResponse[]
+  reviewsLoading: boolean
+  validationsLoading: boolean
   onOpenFullPage: () => void
 }) {
-  if (!latestReview) {
-    return (
-      <p className="text-sm text-muted-foreground">No reviews yet.</p>
-    )
-  }
-
-  const failedStep =
-    latestReview.status === 'failed'
-      ? latestReview.step_results.find((s) => s.exit_code !== 0)
-      : undefined
-
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium">
-          Review — attempt {latestReview.attempt_number}
-        </span>
-        <span
-          className={cn(
-            'inline-flex items-center rounded-full px-2 py-0.5 text-micro font-medium',
-            reviewStatusColors[latestReview.status],
-            latestReview.status === 'running' && 'animate-pulse',
-          )}
-        >
-          {latestReview.status}
-        </span>
-        {latestReview.finished_at ? (
-          <span className="text-xs text-muted-foreground">
-            {formatDate(latestReview.finished_at)}
-          </span>
-        ) : null}
-      </div>
-
-      {failedStep ? (
-        <div className="rounded-md border bg-muted/30 p-3 text-xs">
-          {failedStep.command ? (
-            <p className="font-mono text-foreground">{failedStep.command}</p>
-          ) : null}
-          {failedStep.exit_code != null ? (
-            <p className="mt-1 text-muted-foreground">exit code {failedStep.exit_code}</p>
-          ) : null}
-          {(failedStep.output_tail || failedStep.stderr_tail) ? (
-            <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
-              {failedStep.stderr_tail || failedStep.output_tail}
-            </pre>
-          ) : null}
-        </div>
-      ) : null}
-
-      {reviewCount > 1 ? (
-        <button
-          type="button"
-          className="cursor-pointer text-xs text-primary hover:underline"
-          onClick={onOpenFullPage}
-        >
-          View full review history ({reviewCount - 1} prior attempts)
+    <div className="space-y-4">
+      <section className="space-y-2">
+        <p className="text-sm font-medium">Review Executions</p>
+        {reviewsLoading ? <p className="text-sm text-muted-foreground">Loading…</p> : reviews.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No reviewer Execution has been recorded.</p>
+        ) : (
+          reviews.map(({ execution, report }) => (
+            <div key={execution.id} className="rounded-md border p-3 text-xs">
+              <p><span className="font-medium">Execution:</span> <code>{execution.id}</code> · {execution.status}</p>
+              <p className="mt-1"><span className="font-medium">Actor:</span> {execution.actor_ref?.kind ?? 'unknown'} / {execution.actor_ref?.id ?? 'unknown'}</p>
+              <p className="mt-1"><span className="font-medium">ReviewReport:</span> {report ? <code>{report.id}</code> : 'not produced'}</p>
+            </div>
+          ))
+        )}
+        <button type="button" className="cursor-pointer text-xs text-primary hover:underline" onClick={onOpenFullPage}>
+          Open Review and Validation detail
         </button>
-      ) : null}
+      </section>
+      <section className="space-y-2">
+        <p className="text-sm font-medium">ValidationRuns</p>
+        {validationsLoading ? <p className="text-sm text-muted-foreground">Loading…</p> : validations.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No deterministic validation is recorded.</p>
+        ) : (
+          validations.map((run) => (
+            <div key={run.id} className="rounded-md border p-3 text-xs">
+              <p>{run.check_identity} · {run.status}</p>
+              <p className="mt-1">ValidationRun <code>{run.id}</code> · commit <code>{run.commit_sha}</code></p>
+              <p className="mt-1 break-all">Workspace snapshot <code>{run.workspace_snapshot_digest}</code></p>
+              <p className="mt-1">Evidence: {run.evidence_ids.map((id) => <code key={id} className="mr-2">{id}</code>).join(' ') || 'none'}</p>
+            </div>
+          ))
+        )}
+      </section>
     </div>
   )
 }

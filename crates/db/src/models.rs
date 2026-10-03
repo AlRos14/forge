@@ -1211,6 +1211,38 @@ pub struct Execution {
     pub updated_at: String,
 }
 
+/// Immutable Workspace, commit, and working-tree identity reviewed by one
+/// workspace-bound reviewer Execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewExecutionSubject {
+    pub execution_id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub base_commit_sha: String,
+    pub head_commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateReviewExecutionSubject {
+    pub execution_id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub base_commit_sha: String,
+    pub head_commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewExecutionSubjectWrite {
+    pub execution: Execution,
+    pub subject: ReviewExecutionSubject,
+    /// Present only when the subject was first frozen with its domain event.
+    pub event: Option<DomainEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessSession {
     pub id: String,
@@ -1729,6 +1761,132 @@ pub enum ExecutionPurpose {
     General,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRunStatus {
+    Running,
+    Passed,
+    Failed,
+    Error,
+    Cancelled,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationRun {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: Option<String>,
+    pub caused_by_execution_id: Option<String>,
+    pub check_identity: String,
+    pub command: String,
+    pub config_summary_json: String,
+    pub config_digest: String,
+    pub workspace_id: String,
+    pub commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub idempotency_key: String,
+    pub status: ValidationRunStatus,
+    pub exit_code: Option<i32>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub logs_ref: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateValidationRun {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: Option<String>,
+    pub caused_by_execution_id: Option<String>,
+    pub check_identity: String,
+    pub command: String,
+    pub config_summary_json: String,
+    pub config_digest: String,
+    pub workspace_id: String,
+    pub commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub idempotency_key: String,
+    pub started_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationRunStartWrite {
+    pub validation_run: ValidationRun,
+    /// `None` means an identical idempotent replay returned the existing run.
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub content_json: String,
+    pub digest: String,
+    pub producer_validation_run_id: String,
+    pub evidence_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateEvidence {
+    pub id: String,
+    pub task_id: String,
+    pub validation_run_id: String,
+    pub evidence_key: String,
+    pub kind: String,
+    pub content_json: String,
+    pub digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateValidationRunArtifact {
+    pub id: String,
+    pub task_id: String,
+    pub validation_run_id: String,
+    pub content: String,
+    pub metadata_json: String,
+    pub digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishValidationRun {
+    pub id: String,
+    pub claim_owner: String,
+    pub status: ValidationRunStatus,
+    pub exit_code: Option<i32>,
+    pub finished_at: String,
+    pub logs_ref: String,
+    pub evidence: Vec<CreateEvidence>,
+    pub validation_report: Option<CreateValidationRunArtifact>,
+    pub events: Vec<crate::CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationRunCompletionWrite {
+    pub validation_run: ValidationRun,
+    pub evidence: Vec<Evidence>,
+    pub validation_report: Option<Artifact>,
+    /// Events are returned only when this call committed the terminal result.
+    pub events: Vec<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionEvidenceInput {
+    pub execution_id: String,
+    pub evidence_id: String,
+    pub task_id: String,
+    pub digest: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessSessionStatus {
     Pending,
@@ -2120,6 +2278,15 @@ macro_rules! enum_strings {
         }
     };
 }
+
+enum_strings!(ValidationRunStatus {
+    Running => "running",
+    Passed => "passed",
+    Failed => "failed",
+    Error => "error",
+    Cancelled => "cancelled",
+    Stale => "stale",
+});
 
 enum_strings!(OrchestratorWakeState {
     Pending => "pending",
@@ -3199,10 +3366,32 @@ pub struct Artifact {
     pub content_ref: Option<String>,
     pub metadata_json: String,
     pub digest: Option<String>,
-    pub producer_execution_id: String,
-    /// Derived through ArtifactExecutionProducer -> Execution -> ActorRef.
-    pub producer: ActorRef,
+    pub producer: ArtifactProducer,
     pub created_at: String,
+}
+
+impl Artifact {
+    pub fn execution_producer(&self) -> Option<(&str, &ActorRef)> {
+        match &self.producer {
+            ArtifactProducer::Execution {
+                execution_id,
+                actor,
+            } => Some((execution_id.as_str(), actor)),
+            ArtifactProducer::ValidationRun { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactProducer {
+    Execution {
+        execution_id: String,
+        actor: ActorRef,
+    },
+    ValidationRun {
+        validation_run_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -123,7 +123,13 @@ pub fn to_plan_artifact_detail(artifact: &Artifact) -> crate::Result<PlanArtifac
     if markdown.is_empty() {
         warnings.push("Plan Artifact content is unavailable in this projection".to_owned());
     }
-    let producer = match &artifact.producer {
+    let (producer_execution_id, actor) =
+        artifact
+            .execution_producer()
+            .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                message: "Plan Artifact is not produced by an Execution".to_owned(),
+            })?;
+    let producer = match actor {
         db::ActorRef::Human(id) => api_types::ActorRef::Human(id.clone()),
         db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id.clone()),
     };
@@ -131,7 +137,7 @@ pub fn to_plan_artifact_detail(artifact: &Artifact) -> crate::Result<PlanArtifac
     Ok(PlanArtifactDetail {
         artifact_id: artifact.id.clone(),
         task_id: artifact.task_id.clone(),
-        producer_execution_id: artifact.producer_execution_id.clone(),
+        producer_execution_id: producer_execution_id.to_owned(),
         producer,
         content_digest: artifact.digest.clone(),
         markdown,

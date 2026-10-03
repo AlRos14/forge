@@ -921,14 +921,6 @@ impl TaskService {
             Some(&gate_state),
             Some(&transition_log.id),
         );
-        if gate_state == crate::workflow::default_states::REVIEW {
-            let latest_review = self.latest_review_for_task(&updated.id).await?;
-            if latest_review.status == ReviewStatus::Failed {
-                return self
-                    .recover_resume_process(updated, Some(reason), None)
-                    .await;
-            }
-        }
         if gate_state == crate::workflow::default_states::MERGING {
             return self
                 .recover_resume_process(updated, Some(reason), None)
@@ -1102,14 +1094,9 @@ impl TaskService {
         }
 
         let has_interruption = task.error_annotation.is_some() || task.blocked_json.is_some();
-        let has_failed_review = if task.status == crate::workflow::default_states::REVIEW {
-            matches!(
-                self.latest_review_for_task(&task.id).await,
-                Ok(review) if review.status == ReviewStatus::Failed
-            )
-        } else {
-            false
-        };
+        // Review Execution failure is operational failure, not a Review
+        // verdict. Recovery must use the exact failed Execution path.
+        let has_failed_review = false;
         if !has_interruption && !has_failed_review {
             return Err(ServiceError::invalid_operation(
                 "resume_process requires a recoverable gate exception",
@@ -1630,88 +1617,10 @@ impl TaskService {
         Ok(task)
     }
 
-    async fn recover_mark_reviewed(&self, task: Task, reason: Option<String>) -> Result<Task> {
-        if task.status != crate::workflow::default_states::REVIEW {
-            return Err(ServiceError::invalid_operation(format!(
-                "mark_reviewed is only supported from review state, got {}",
-                task.status
-            )));
-        }
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::MarkReviewed,
-            )),
-        );
-        let pass_target = workflow
-            .auto_transition_target(&task.status)
-            .unwrap_or(crate::workflow::default_states::MERGING)
-            .to_owned();
-        let reason = optional_recovery_reason(reason, "mark_reviewed");
-        let latest_review = self.latest_review_for_task(&task.id).await?;
-        let finished_at = now_rfc3339();
-        let mut details = serde_json::from_str::<Value>(&latest_review.step_results_json)
-            .unwrap_or_else(|_| json!({ "ci_steps": [] }));
-        details["manual_override"] = json!({
-            "action": "mark_reviewed",
-            "reason": reason.clone(),
-            "at": finished_at,
-        });
-        let review = ReviewRepo::update_status(
-            &*self.db,
-            &latest_review.id,
-            ReviewStatus::Passed,
-            details.to_string(),
-            Some(finished_at.clone()),
-            &finished_at,
-        )
-        .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
+    async fn recover_mark_reviewed(&self, _task: Task, _reason: Option<String>) -> Result<Task> {
+        Err(ServiceError::invalid_operation(
+            "mark_reviewed is retired; submit a ReviewReport for an exact Human Review Execution",
         ))
-        .await;
-        if let Err(error) = self
-            .memory_service
-            .record_review_result_if_final(&task.project_id, &review)
-            .await
-        {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-        }
-        let task = TaskRepo::set_review_passed_at(
-            &*self.db,
-            &task.id,
-            Some(finished_at.clone()),
-            &finished_at,
-        )
-        .await?;
-        self.create_system_comment(
-            &task.id,
-            format!("Review passed manually (attempt {})", review.attempt_number),
-        )
-        .await?;
-        self.publish(ForgeEvent {
-            event_type: "review.approved".to_owned(),
-            entity_id: review.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::ReviewApproved {
-                task_id: task.id.clone(),
-                review_id: review.id.clone(),
-            },
-        });
-        tracing::info!(
-            task_id = %task.id,
-            reason = %reason,
-            "recovery action mark_reviewed logged"
-        );
-        let transitioned = self
-            .transition(task.id.clone(), pass_target, task.version)
-            .await?;
-        Ok(transitioned.task)
     }
 
     async fn recover_retry_hook(

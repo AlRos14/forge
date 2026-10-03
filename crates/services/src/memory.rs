@@ -6,8 +6,7 @@ use db::{
     now_rfc3339, AgentChat, AgentChatMessage, AgentChatMessageAuthorType, CommentAuthorType,
     CreateMemoryLifecycleAssertion, DomainEvent, Execution, ExecutionStatus, MemoryAccessQuery,
     MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
-    MemorySourceType, Review, ReviewStatus, ScopedMemoryRepository, SqliteDb, TaskComment,
-    TransitionLog,
+    MemorySourceType, ScopedMemoryRepository, SqliteDb, TaskComment, TransitionLog,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -796,48 +795,6 @@ where
         parse_uuid(&item.id, "memory_item.id").map(Some)
     }
 
-    pub(crate) async fn record_review_result_if_final(
-        &self,
-        project_id: &str,
-        review: &Review,
-    ) -> Result<Option<Uuid>> {
-        if review.status == ReviewStatus::Running {
-            return Ok(None);
-        }
-        let has_confirmed_outcome = review_has_confirmed_outcome(review);
-        if review_memory_source_exists(
-            self.db.as_ref(),
-            project_id,
-            review.id.as_str(),
-            has_confirmed_outcome,
-        )
-        .await?
-        {
-            return Ok(None);
-        }
-        let item = self
-            .record_from_source(MemoryItemInput {
-                project_id: parse_uuid(project_id, "project_id")?,
-                task_id: Some(review.task_id.clone()),
-                execution_id: Some(review.execution_id.clone()),
-                source_type: MemorySourceType::Review,
-                source_ref: review.id.clone(),
-                kind: MemoryKind::ReviewResult,
-                title: format!("Review {} attempt {}", review.status, review.attempt_number),
-                summary: review_summary(review),
-                body: review.step_results_json.clone(),
-                confidence: Some(if has_confirmed_outcome {
-                    MemoryConfidence::Confirmed
-                } else {
-                    MemoryConfidence::Partial
-                }),
-                quality_score: None,
-                creator: None,
-            })
-            .await?;
-        parse_uuid(&item.id, "memory_item.id").map(Some)
-    }
-
     pub(crate) async fn record_task_comment(
         &self,
         project_id: &str,
@@ -871,7 +828,7 @@ impl MemoryBackfillRepository for SqliteDb {
     async fn list_memory_backfill_sources(&self) -> Result<Vec<MemoryBackfillSource>> {
         let mut sources = Vec::new();
         sources.extend(list_execution_sources(self).await?);
-        sources.extend(list_review_sources(self).await?);
+        sources.extend(list_review_report_sources(self).await?);
         sources.extend(list_comment_sources(self).await?);
         sources.extend(list_transition_sources(self).await?);
         Ok(sources)
@@ -920,19 +877,29 @@ async fn list_execution_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSourc
         .collect()
 }
 
-async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
+async fn list_review_report_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
     let rows = sqlx::query(
-        "SELECT t.project_id, r.id, r.task_id, r.execution_id, r.attempt_number, r.status, r.step_results_json \
-         FROM review r JOIN task t ON t.id = r.task_id \
-         WHERE r.status != 'running' \
-         ORDER BY r.created_at ASC, r.id ASC",
+        "SELECT t.project_id, a.id, a.task_id, ep.execution_id, a.content \
+         FROM artifact a \
+         JOIN artifact_execution_producer ep ON ep.artifact_id = a.id AND ep.task_id = a.task_id \
+         JOIN execution e ON e.id = ep.execution_id AND e.task_id = ep.task_id \
+         JOIN task t ON t.id = a.task_id \
+         WHERE a.kind = 'review_report' AND e.role = 'reviewer' AND e.purpose = 'review' \
+           AND json_valid(a.content) AND json_type(a.content) = 'object' \
+           AND json_extract(a.content, '$.kind') = 'review_report' \
+         ORDER BY a.created_at ASC, a.id ASC",
     )
     .fetch_all(db.pool())
     .await?;
     rows.into_iter()
         .map(|row| {
-            let status: String = row.try_get("status")?;
-            let body: String = row.try_get("step_results_json")?;
+            let body: String = row.try_get("content")?;
+            let report = serde_json::from_str::<Value>(&body)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let verdict = report
+                .get("verdict")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
             Ok(MemoryBackfillSource {
                 project_id: row.try_get("project_id")?,
                 task_id: Some(row.try_get("task_id")?),
@@ -940,17 +907,13 @@ async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>>
                 source_type: MemorySourceType::Review,
                 source_ref: row.try_get("id")?,
                 kind: MemoryKind::ReviewResult,
-                title: format!(
-                    "Review {status} attempt {}",
-                    row.try_get::<i64, _>("attempt_number")?
-                ),
-                summary: review_summary_from_json(&body, &status),
+                title: format!("ReviewReport verdict: {verdict}"),
+                summary: report
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 body,
-                confidence: Some(if status == "passed" || status == "failed" {
-                    MemoryConfidence::Confirmed
-                } else {
-                    MemoryConfidence::Partial
-                }),
+                confidence: Some(MemoryConfidence::Partial),
                 creator: None,
             })
         })
@@ -1315,16 +1278,6 @@ async fn backfill_source_exists<R>(db: &R, source: &MemoryBackfillSource) -> Res
 where
     R: MemoryRepository + Send + Sync,
 {
-    if source.source_type == MemorySourceType::Review {
-        return review_memory_source_exists(
-            db,
-            &source.project_id,
-            &source.source_ref,
-            source.confidence == Some(MemoryConfidence::Confirmed),
-        )
-        .await;
-    }
-
     Ok(db
         .memory_source_exists(
             &source.project_id,
@@ -1332,36 +1285,6 @@ where
             &source.source_ref,
         )
         .await?)
-}
-
-async fn review_memory_source_exists<R>(
-    db: &R,
-    project_id: &str,
-    source_ref: &str,
-    has_confirmed_outcome: bool,
-) -> Result<bool>
-where
-    R: MemoryRepository + Send + Sync,
-{
-    let source_type = MemorySourceType::Review.to_string();
-    if has_confirmed_outcome {
-        return Ok(db
-            .memory_source_exists_with_confidence(
-                project_id,
-                &source_type,
-                source_ref,
-                &MemoryConfidence::Confirmed.to_string(),
-            )
-            .await?);
-    }
-
-    Ok(db
-        .memory_source_exists(project_id, &source_type, source_ref)
-        .await?)
-}
-
-fn review_has_confirmed_outcome(review: &Review) -> bool {
-    matches!(&review.status, ReviewStatus::Passed | ReviewStatus::Failed)
 }
 
 fn snippet(content: &str) -> Option<String> {
@@ -1387,29 +1310,6 @@ fn execution_summary_body(execution: &Execution) -> Option<String> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         })
-}
-
-fn review_summary(review: &Review) -> Option<String> {
-    review_summary_from_json(&review.step_results_json, &review.status.to_string())
-}
-
-fn review_summary_from_json(step_results_json: &str, status: &str) -> Option<String> {
-    let details = serde_json::from_str::<Value>(step_results_json).ok()?;
-    if let Some(reason) = details
-        .get("auditor")
-        .and_then(|auditor| auditor.get("reason"))
-        .and_then(Value::as_str)
-    {
-        return Some(reason.to_owned());
-    }
-    if let Some(verdict) = details
-        .get("auditor")
-        .and_then(|auditor| auditor.get("verdict"))
-        .and_then(Value::as_str)
-    {
-        return Some(format!("review {status}: {verdict}"));
-    }
-    Some(format!("review {status}"))
 }
 
 fn transition_body(transition: &TransitionLog, hook_results_json: Option<&str>) -> String {
@@ -1539,9 +1439,8 @@ mod tests {
     use db::{
         create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateExecution,
         CreateProject, CreateTask, Execution, ExecutionRepo, ExecutionStatus, MemorySourceType,
-        ProjectRepo, Review, ReviewStatus, SqliteDb, TaskRepo,
+        ProjectRepo, SqliteDb, TaskRepo,
     };
-    use serde_json::json;
     use uuid::Uuid;
 
     use super::{guard_evidence_json, guard_memory_reason, MemoryService};
@@ -1641,91 +1540,6 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("memory count loads")
-    }
-
-    #[tokio::test]
-    async fn record_review_result_if_final_is_idempotent() {
-        let db = sqlite_db().await;
-        let (project_id, task_id, execution) = seed_project_task_execution(&db).await;
-        let service = MemoryService::new(Arc::clone(&db));
-        let now = now_rfc3339();
-        let review = Review {
-            id: new_uuid_v4(),
-            task_id,
-            execution_id: execution.id,
-            attempt_number: 1,
-            status: ReviewStatus::Passed,
-            step_results_json: json!({ "auditor": { "verdict": "pass" } }).to_string(),
-            started_at: now.clone(),
-            finished_at: Some(now.clone()),
-            created_at: now.clone(),
-            updated_at: now,
-        };
-
-        let first = service
-            .record_review_result_if_final(&project_id.to_string(), &review)
-            .await
-            .expect("first review memory records");
-        let second = service
-            .record_review_result_if_final(&project_id.to_string(), &review)
-            .await
-            .expect("second review memory is skipped");
-
-        assert!(first.is_some());
-        assert!(second.is_none());
-        assert_eq!(
-            memory_count(&db, &project_id, MemorySourceType::Review).await,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn record_review_result_if_final_records_final_after_awaiting_human() {
-        let db = sqlite_db().await;
-        let (project_id, task_id, execution) = seed_project_task_execution(&db).await;
-        let service = MemoryService::new(Arc::clone(&db));
-        let now = now_rfc3339();
-        let review_id = new_uuid_v4();
-        let awaiting_review = Review {
-            id: review_id.clone(),
-            task_id: task_id.clone(),
-            execution_id: execution.id.clone(),
-            attempt_number: 1,
-            status: ReviewStatus::AwaitingHuman,
-            step_results_json: json!({ "manual": { "state": "waiting" } }).to_string(),
-            started_at: now.clone(),
-            finished_at: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
-        let passed_review = Review {
-            status: ReviewStatus::Passed,
-            step_results_json: json!({ "manual": { "verdict": "pass" } }).to_string(),
-            finished_at: Some(now.clone()),
-            updated_at: now,
-            ..awaiting_review.clone()
-        };
-
-        let awaiting = service
-            .record_review_result_if_final(&project_id.to_string(), &awaiting_review)
-            .await
-            .expect("awaiting-human review memory records");
-        let passed = service
-            .record_review_result_if_final(&project_id.to_string(), &passed_review)
-            .await
-            .expect("final review memory records");
-        let duplicate_passed = service
-            .record_review_result_if_final(&project_id.to_string(), &passed_review)
-            .await
-            .expect("duplicate final review memory is skipped");
-
-        assert!(awaiting.is_some());
-        assert!(passed.is_some());
-        assert!(duplicate_passed.is_none());
-        assert_eq!(
-            memory_count(&db, &project_id, MemorySourceType::Review).await,
-            2
-        );
     }
 
     #[tokio::test]

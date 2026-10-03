@@ -3,7 +3,8 @@ use api_types::ActorRef;
 use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, AssigneeKind, CoordinationMode,
     CreateTaskRole, CreateTaskRoleAssignment, ProjectRepo, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, TaskRole, TaskRoleAssignment, TaskRoleRepo, UpdateTaskRole, UserRepo,
+    RoleMembershipStatus, TaskRole, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo,
+    UpdateTaskRole, UserRepo,
 };
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -566,6 +567,30 @@ pub async fn current_role_memberships_authoritative(
         .await
         .map(Some)
         .map_err(Into::into)
+}
+
+/// Check current Human authority from the replacement TaskRole when it
+/// exists. The singleton assignment is consulted only for Tasks that have not
+/// acquired that replacement authority yet.
+pub(crate) async fn human_is_active_role_member_authoritative(
+    db: &db::SqliteDb,
+    task_id: &str,
+    role: &str,
+    user_id: &str,
+) -> Result<bool> {
+    if let Some(memberships) = current_role_memberships_authoritative(db, task_id, role).await? {
+        return Ok(memberships.iter().any(|membership| {
+            membership.actor_kind == db::ActorKind::Human
+                && membership.actor_id == user_id
+                && membership.status == db::RoleMembershipStatus::Active
+        }));
+    }
+
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, role).await?;
+    Ok(assignment.is_some_and(|assignment| {
+        assignment.assignee_type == Some(db::AssigneeKind::User)
+            && assignment.assignee_id.as_deref() == Some(user_id)
+    }))
 }
 
 /// Select the first currently usable Agent from an authoritative membership

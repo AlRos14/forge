@@ -234,21 +234,6 @@ pub(super) fn executor_snapshot_for_fresh_start(snapshot_json: &str) -> Result<S
     })
 }
 
-pub(super) fn truncate_utf8_bytes(bytes: &[u8], max_bytes: usize) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    if text.len() <= max_bytes {
-        return text.into_owned();
-    }
-
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = text[..end].to_owned();
-    truncated.push_str("[truncated]");
-    truncated
-}
-
 pub(super) async fn build_executor_config_snapshot(
     db: &SqliteDb,
     task: &Task,

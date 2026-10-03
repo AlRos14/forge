@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentChatRepo, CommentAuthorType,
-    CreateDomainEvent, CreateExecution, CreateProject, CreateReview, CreateTask, CreateTaskComment,
-    CreateTransitionLog, DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryConfidence,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorRef, AgentChatRepo,
+    AgentRepo, AgentStatus, CommentAuthorType, CreateAgent, CreateDomainEvent, CreateExecution,
+    CreateProject, CreateReview, CreateTask, CreateTaskComment, CreateTransitionLog,
+    DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus, MemoryConfidence,
     MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskCommentRepo,
     TaskRepo, TransitionLogRepo,
 };
 use serde_json::json;
-use services::{AgentChatMemoryConsumer, MemoryItemInput, MemoryService, TaskService};
+use services::{AgentChatMemoryConsumer, CollaborationService, MemoryItemInput, MemoryService};
 use uuid::Uuid;
 
 async fn sqlite_db() -> Arc<SqliteDb> {
@@ -219,22 +220,53 @@ async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying
 }
 
 #[tokio::test]
-async fn memory_indexing_failure_does_not_fail_source_operation() {
+async fn review_report_artifact_creation_does_not_depend_on_memory_indexing() {
     let db = sqlite_db().await;
     let (_project_id, task_id) = seed_project_and_task(&db, "review").await;
+    let agent_id = new_uuid_v4();
     let now = now_rfc3339();
+    AgentRepo::create(
+        &*db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: "Reviewer Agent".to_owned(),
+            description: Some("Memory-independent ReviewReport producer".to_owned()),
+            executor_type: "test".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Agent Actor creates");
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
         &*db,
         CreateExecution {
             id: execution_id.clone(),
             task_id: task_id.clone(),
-            agent_id: None,
-            actor_ref: None,
-            purpose: None,
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(ActorRef::Agent(agent_id.clone())),
+            purpose: Some(ExecutionPurpose::Review),
             harness_session_id: None,
             role: "reviewer".to_owned(),
-            status: ExecutionStatus::Completed,
+            status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
             resume_policy: None,
@@ -256,40 +288,27 @@ async fn memory_indexing_failure_does_not_fail_source_operation() {
     )
     .await
     .expect("execution creates");
-    let review_id = new_uuid_v4();
-    ReviewRepo::create(
-        &*db,
-        CreateReview {
-            id: review_id.clone(),
-            task_id: task_id.clone(),
-            execution_id,
-            attempt_number: 1,
-            status: ReviewStatus::AwaitingHuman,
-            step_results_json: json!({ "auditor": { "verdict": "pass" } }).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("review creates");
-
     sqlx::query("DROP TABLE memory_item")
         .execute(db.pool())
         .await
         .expect("memory table drops");
 
-    let service = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
-    service
-        .approve_review(task_id.clone())
+    let report = CollaborationService::new(
+        Arc::clone(&db),
+        Arc::new(events::EventBus::new(16)),
+    )
+        .create_review_report_from_execution(
+            &execution_id,
+            "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The exact subject is sound.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}",
+        )
         .await
-        .expect("source operation succeeds");
-
-    let review = ReviewRepo::get_by_id(&*db, &review_id)
-        .await
-        .expect("review loads")
-        .expect("review exists");
-    assert_eq!(review.status, ReviewStatus::Passed);
+        .expect("ReviewReport source operation succeeds");
+    assert_eq!(report.kind, db::ArtifactKind::ReviewReport);
+    assert!(matches!(
+        report.producer,
+        db::ArtifactProducer::Execution { execution_id: producer_id, actor: ActorRef::Agent(actor_id) }
+            if producer_id == execution_id && actor_id == agent_id
+    ));
 }
 
 #[tokio::test]

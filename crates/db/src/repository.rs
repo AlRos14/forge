@@ -845,6 +845,40 @@ pub trait ExecutionRepo: Send + Sync {
         input: CreateExecution,
         event: CreateDomainEvent,
     ) -> Result<(Execution, DomainEvent)>;
+    /// Create a workspace-bound Human Review Execution, its immutable exact
+    /// subject, and the start event in one transaction.
+    async fn create_human_review_execution_with_subject(
+        &self,
+        input: CreateExecution,
+        subject: CreateReviewExecutionSubject,
+        event: CreateDomainEvent,
+    ) -> Result<ReviewExecutionSubjectWrite>;
+    /// Create a workspace-free Running Human Review Execution and its start
+    /// event in one transaction, rechecking current reviewer authority there.
+    async fn create_human_review_execution_without_subject(
+        &self,
+        input: CreateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
+    /// Freeze the exact subject of a running reviewer Execution, or return
+    /// the already-frozen identity only when every field still matches.
+    async fn freeze_review_execution_subject(
+        &self,
+        subject: CreateReviewExecutionSubject,
+        updated_at: &str,
+        event: CreateDomainEvent,
+    ) -> Result<ReviewExecutionSubjectWrite>;
+    async fn get_review_execution_subject(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ReviewExecutionSubject>>;
+    /// Exact bounded lookup used to reuse one running Human Review Execution.
+    async fn find_running_human_review_execution(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<Execution>>;
     /// Create a Running Execution, its immutable Artifact inputs, and the
     /// `execution.started` ledger event as one durable boundary.
     async fn create_with_artifact_inputs_and_event(
@@ -920,6 +954,15 @@ pub trait CollaborationRepo: Send + Sync {
     async fn create_execution_artifact_output(
         &self,
         input: CreateArtifact,
+        event: CreateDomainEvent,
+    ) -> Result<ExecutionArtifactOutputWrite>;
+    /// Pin a Human Review's complete requested input sets and persist or reuse
+    /// its exact ReviewReport and event atomically.
+    async fn create_review_report_with_inputs(
+        &self,
+        input: CreateArtifact,
+        evidence_input_ids: Vec<String>,
+        artifact_input_ids: Vec<String>,
         event: CreateDomainEvent,
     ) -> Result<ExecutionArtifactOutputWrite>;
     async fn get_execution_artifact_output(
@@ -1227,6 +1270,74 @@ pub trait ScopedMemoryRepository: Send + Sync {
         &self,
         manifest_id: &str,
     ) -> std::result::Result<Vec<ContextManifestSource>, DbError>;
+}
+
+#[async_trait]
+pub trait ValidationRunRepo: Send + Sync {
+    /// Insert the Running identity and `validation_run.started` event atomically.
+    /// Same-key retries return the exact existing row and no second event.
+    async fn start_validation_run(
+        &self,
+        input: CreateValidationRun,
+        event: CreateDomainEvent,
+    ) -> Result<ValidationRunStartWrite>;
+    /// Claim or recover an expired Running check lease. The claim token fences
+    /// concurrent retries from committing a second result.
+    async fn claim_validation_run(
+        &self,
+        id: &str,
+        owner: &str,
+        now: &str,
+        claim_until: &str,
+    ) -> Result<bool>;
+    async fn heartbeat_validation_run(
+        &self,
+        id: &str,
+        owner: &str,
+        now: &str,
+        claim_until: &str,
+    ) -> Result<bool>;
+    /// Commit terminal status, Evidence, optional validation-report Artifact,
+    /// and all domain events as one recoverable database boundary.
+    async fn finish_validation_run(
+        &self,
+        input: FinishValidationRun,
+    ) -> Result<ValidationRunCompletionWrite>;
+    async fn get_validation_run(&self, id: &str) -> Result<Option<ValidationRun>>;
+    async fn get_validation_run_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<ValidationRun>>;
+    async fn list_validation_runs_by_task(&self, task_id: &str) -> Result<Vec<ValidationRun>>;
+    /// Select every result for this exact subject; this method has no latest-row semantics.
+    async fn list_validation_runs_for_subject(
+        &self,
+        task_id: &str,
+        workspace_id: &str,
+        commit_sha: &str,
+        workspace_snapshot_digest: &str,
+        caused_by_execution_id: Option<&str>,
+    ) -> Result<Vec<ValidationRun>>;
+    async fn get_evidence(&self, id: &str) -> Result<Option<Evidence>>;
+    async fn list_evidence_by_task(&self, task_id: &str) -> Result<Vec<Evidence>>;
+    async fn list_evidence_for_validation_run(
+        &self,
+        validation_run_id: &str,
+    ) -> Result<Vec<Evidence>>;
+    async fn list_execution_evidence_inputs(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<ExecutionEvidenceInput>>;
+    async fn get_validation_run_artifact_output(
+        &self,
+        validation_run_id: &str,
+    ) -> Result<Option<Artifact>>;
+    async fn pin_execution_evidence_inputs(
+        &self,
+        execution_id: &str,
+        evidence_ids: &[String],
+        created_at: &str,
+    ) -> Result<Vec<ExecutionEvidenceInput>>;
 }
 
 #[async_trait]

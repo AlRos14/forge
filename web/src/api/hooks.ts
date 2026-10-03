@@ -75,8 +75,11 @@ import type {
   ProjectOverview,
   ProjectRelease,
   Repo,
-  Review,
-  ReviewDecisionResponse,
+  ReviewExecutionResponse,
+  StartReviewExecutionRequest,
+  SubmitReviewReportRequest,
+  SubmitReviewReportResponse,
+  ValidationRunResponse,
   Task,
   TaskPlanHistoryResponse,
   TaskMediaResponse,
@@ -85,7 +88,6 @@ import type {
   TransitionLogEntry,
   TransitionTaskResponse,
   TransitionTaskRequest,
-  RejectReviewRequest,
   UpdateAgentRequest,
   SaveWorkflowTemplateRequest,
   RecoveryAction,
@@ -571,13 +573,15 @@ export function useRecoverTask() {
 export function useTriggerReview() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/review`, {
+    mutationFn: ({ taskId, body }: { taskId: string; body: StartReviewExecutionRequest }) =>
+      apiFetch<ReviewExecutionResponse>(`/tasks/${taskId}/review`, {
         method: 'POST',
+        body: JSON.stringify(body),
       }),
     onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(result.execution.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.execution.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(result.execution.task_id) })
     },
   })
 }
@@ -585,39 +589,33 @@ export function useTriggerReview() {
 export function useReviewsQuery(taskId: string) {
   return useQuery({
     queryKey: qk.reviews(taskId),
-    queryFn: () => apiFetch<Review[]>(`/tasks/${taskId}/reviews`),
+    queryFn: () => apiFetch<ReviewExecutionResponse[]>(`/tasks/${taskId}/reviews`),
     enabled: Boolean(taskId),
   })
 }
 
-export function useApproveReview() {
+export function useSubmitReviewReport() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<ReviewDecisionResponse>(`/tasks/${taskId}/review/approve`, {
+    mutationFn: ({ executionId, body }: { executionId: string; body: SubmitReviewReportRequest }) =>
+      apiFetch<SubmitReviewReportResponse>(`/reviews/${executionId}`, {
         method: 'POST',
+        body: JSON.stringify(body),
       }),
     onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
+      const taskId = result.review_execution.execution.task_id
+      void queryClient.invalidateQueries({ queryKey: qk.reviews(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
     },
   })
 }
 
-export function useRejectReview() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ taskId, reason }: { taskId: string; reason?: string }) =>
-      apiFetch<ReviewDecisionResponse>(`/tasks/${taskId}/review/reject`, {
-        method: 'POST',
-        body: JSON.stringify({ reason } satisfies RejectReviewRequest),
-      }),
-    onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
-    },
+export function useValidationsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.validations(taskId),
+    queryFn: () => apiFetch<ValidationRunResponse[]>(`/tasks/${taskId}/validations`),
+    enabled: Boolean(taskId),
   })
 }
 

@@ -4,12 +4,12 @@ use api_types::{
     CreateTaskRequest, CreateTaskRoleRequest, DiffEnvelope, HookResultEntry,
     LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest, MoveTaskResponse,
     PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest, RejectGateRequest,
-    RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig, ReviewDecisionResponse,
-    RoleMembershipResponse, StateKind, TaskAction, TaskActionRequest, TaskDependency,
-    TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TaskRoleResponse, TasksResponse,
-    TransitionLogEntry, TransitionSource, TransitionTaskRequest, TransitionTaskResponse,
-    UpdateRoleMembershipRequest, UpdateTaskRequest, UpdateTaskRoleRequest, WorkflowDefinition,
-    WorkflowTrigger, WorkspaceResponse,
+    RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig, RoleMembershipResponse, StateKind,
+    TaskAction, TaskActionRequest, TaskDependency, TaskMediaResponse, TaskResponse,
+    TaskRoleAssignmentResponse, TaskRoleResponse, TasksResponse, TransitionLogEntry,
+    TransitionSource, TransitionTaskRequest, TransitionTaskResponse, UpdateRoleMembershipRequest,
+    UpdateTaskRequest, UpdateTaskRoleRequest, WorkflowDefinition, WorkflowTrigger,
+    WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -18,9 +18,9 @@ use axum::{
 };
 use db::{
     now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SharedMediaRepo, SortBy, SortOrder,
-    TaskBoardRepo, TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
-    TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    PageRequest, ProjectRepo, SharedMediaRepo, SortBy, SortOrder, TaskBoardRepo, TaskCommentRepo,
+    TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo, TaskRoleAssignmentRepo,
+    TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde::{Deserialize, Serialize};
@@ -30,13 +30,12 @@ use services::{
     workflow::{default_states, engine::WorkflowEngine},
     Assignee, DiffService, ServiceError,
 };
-use uuid::Uuid;
 
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        auth::AuthenticatedUser, execution_response, paginated, parse_csv, review_response,
-        serialize_json, task_page_request, task_response, task_response_light_with_latest,
+        auth::AuthenticatedUser, execution_response, paginated, parse_csv, serialize_json,
+        task_page_request, task_response, task_response_light_with_latest,
         task_response_with_awaiting_human, task_role_assignment_response, workspace_response,
         ListParams,
     },
@@ -83,7 +82,7 @@ pub use roles::{
 pub use transitions::{list_transitions, transition_task, TransitionLogListResponse};
 pub use workspace::{get_task_diff, get_task_workspace, reset_task_workspace};
 
-async fn require_task_visible(
+pub(super) async fn require_task_visible(
     state: &AppState,
     task_id: &str,
     user: &AuthenticatedUser,
@@ -145,13 +144,6 @@ fn map_diff_error(error: ServiceError) -> ApiError {
         ServiceError::InvalidOperation { message } if message.contains("error state") => {
             ApiError::conflict_with_code("workspace.error_state", message)
         }
-        other => ApiError::from(other),
-    }
-}
-
-fn map_manual_review_error(error: ServiceError) -> ApiError {
-    match error {
-        ServiceError::InvalidOperation { message } => ApiError::invalid_operation_conflict(message),
         other => ApiError::from(other),
     }
 }

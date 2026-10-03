@@ -22,7 +22,7 @@ pub async fn transition_task(
         .await?;
     Ok(Json(TransitionTaskResponse {
         task: response,
-        review: result.review.map(review_response),
+        review: None,
     }))
 }
 

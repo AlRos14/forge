@@ -4,11 +4,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask,
-    CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, ExecutionRepo,
-    ExecutionStatus, PageRequest, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, SortBy,
-    SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject,
-    UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
+    CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment,
+    CreateWorkspace, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, PageRequest,
+    ProjectRepo, RepoRepo, ReviewRepo, SortBy, SortOrder, SqliteDb, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::{EventBus, EventContext};
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
@@ -692,7 +692,7 @@ async fn seed_transition_log_at(
     .expect("transition log inserts");
 }
 
-async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
+async fn seed_completed_executor_execution(ctx: &mut HookContext) -> String {
     let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
         .await
         .expect("task loads")
@@ -719,6 +719,7 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
     )
     .await
     .expect("workspace creates");
+    ctx.workspace_id = Some(workspace_id.clone());
 
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
@@ -753,62 +754,6 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
     )
     .await
     .expect("execution creates");
-    execution_id
-}
-
-async fn seed_review(ctx: &HookContext, status: ReviewStatus, attempt_number: i64) -> String {
-    let now = now_rfc3339();
-    let execution_id = ctx.execution_id.clone().unwrap_or_else(new_uuid_v4);
-    ExecutionRepo::create(
-        &*ctx.db,
-        CreateExecution {
-            id: execution_id.clone(),
-            task_id: ctx.task_id.clone(),
-            agent_id: None,
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("executor summary".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("execution creates");
-
-    ReviewRepo::create(
-        &*ctx.db,
-        CreateReview {
-            id: new_uuid_v4(),
-            task_id: ctx.task_id.clone(),
-            execution_id: execution_id.clone(),
-            attempt_number,
-            status,
-            step_results_json: "[]".to_owned(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("review creates");
-
     execution_id
 }
 
@@ -889,7 +834,7 @@ async fn run_ci_steps_skips_when_ci_steps_empty() {
 }
 
 #[tokio::test]
-async fn run_ci_steps_skips_when_workspace_missing() {
+async fn run_ci_steps_fails_closed_when_workspace_missing() {
     let mut ctx = build_test_ctx(
         "task-run-review-no-workspace",
         default_states::IN_PROGRESS,
@@ -901,14 +846,11 @@ async fn run_ci_steps_skips_when_workspace_missing() {
 
     let result = RunCiSteps.execute(&ctx).await;
 
-    match result {
-        HookResult::Skipped { reason } => assert!(reason.contains("no workspace")),
-        other => panic!("expected skipped result, got {other:?}"),
-    }
+    assert!(matches!(result, HookResult::Failed { reason } if reason.contains("exact Workspace")));
 }
 
 #[tokio::test]
-async fn run_ci_steps_skips_when_executor_execution_missing() {
+async fn run_ci_steps_does_not_require_an_actor_execution() {
     let mut ctx = build_test_ctx(
         "task-run-review-runner-missing",
         default_states::IN_PROGRESS,
@@ -916,19 +858,25 @@ async fn run_ci_steps_skips_when_executor_execution_missing() {
         None,
     )
     .await;
-    ctx.state_config = json!({ "ci_steps": ["cargo test"] });
-    ctx.workspace_id = Some("workspace-1".to_owned());
+    let _unused_execution_id = seed_completed_executor_execution(&mut ctx).await;
+    ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     let result = RunCiSteps.execute(&ctx).await;
-
-    match result {
-        HookResult::Skipped { reason } => assert!(reason.contains("no executor execution")),
-        other => panic!("expected skipped result, got {other:?}"),
-    }
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
+    assert!(runs[0].caused_by_execution_id.is_none());
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
 }
 
 #[tokio::test]
-async fn run_ci_steps_creates_passed_review_record() {
+async fn run_ci_steps_creates_validation_without_review_authority() {
     let task_id = new_uuid_v4();
     let mut ctx = build_test_ctx(
         &task_id,
@@ -937,18 +885,22 @@ async fn run_ci_steps_creates_passed_review_record() {
         None,
     )
     .await;
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     let result = RunCiSteps.execute(&ctx).await;
 
     assert!(matches!(result, HookResult::Ok));
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Passed);
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -964,18 +916,22 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
     )
     .await;
     let mut ctx = harness.ctx.clone();
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Running);
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
     assert!(
@@ -998,7 +954,7 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
 }
 
 #[tokio::test]
-async fn merge_fix_re_review_runs_ci_only_and_skips_reviewer() {
+async fn legacy_review_pass_timestamp_does_not_skip_new_review_execution() {
     let agent_id = "agent-reviewer-ci-only";
     let mut harness = build_role_dispatch_harness(
         "task-run-ci-reviewer-ci-only",
@@ -1010,7 +966,7 @@ async fn merge_fix_re_review_runs_ci_only_and_skips_reviewer() {
     )
     .await;
     let mut ctx = harness.ctx.clone();
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
     TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, Some(now_rfc3339()), &now_rfc3339())
@@ -1020,35 +976,34 @@ async fn merge_fix_re_review_runs_ci_only_and_skips_reviewer() {
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Passed);
-    assert!(reviews[0].step_results_json.contains("pass_ci_only"));
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
-    match dispatch_result {
-        HookResult::Skipped { reason } => assert_eq!(reason, "review already passed CI-only"),
-        other => panic!("expected skipped dispatch, got {other:?}"),
-    }
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
-            .await
-            .is_err()
+        matches!(dispatch_result, HookResult::Ok),
+        "{dispatch_result:?}"
     );
+    let _reviewer_context =
+        tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+            .await
+            .expect("reviewer dispatch is not inferred from review_passed_at")
+            .expect("reviewer Execution context is produced");
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
             .expect("reviewer execution count loads"),
-        0
+        1
     );
 }
 
 #[tokio::test]
 async fn run_ci_steps_failure_prevents_reviewer_dispatch() {
     let agent_id = "agent-reviewer-ci-fail";
-    let mut harness = build_role_dispatch_harness(
+    let harness = build_role_dispatch_harness(
         "task-run-ci-reviewer-fail",
         default_states::IN_PROGRESS,
         default_states::REVIEW,
@@ -1058,7 +1013,7 @@ async fn run_ci_steps_failure_prevents_reviewer_dispatch() {
     )
     .await;
     let mut ctx = harness.ctx.clone();
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["false"] });
 
@@ -1068,26 +1023,25 @@ async fn run_ci_steps_failure_prevents_reviewer_dispatch() {
         "{ci_result:?}"
     );
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Failed);
-
-    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
-    match dispatch_result {
-        HookResult::Skipped { reason } => assert_eq!(reason, "review already failed"),
-        other => panic!("expected skipped dispatch, got {other:?}"),
-    }
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Failed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
-            .is_err()
+            .expect("reviewer executions load"),
+        0
     );
 }
 
 #[tokio::test]
-async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
+async fn validation_is_independent_when_reviewer_is_at_capacity() {
     let agent_id = "agent-reviewer-capacity";
     let mut harness = build_role_dispatch_harness(
         "task-run-ci-reviewer-capacity",
@@ -1099,7 +1053,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
     )
     .await;
     let mut ctx = harness.ctx.clone();
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
@@ -1145,11 +1099,15 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
         other => panic!("expected capacity skip, got {other:?}"),
     }
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Running);
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
             .await
@@ -1158,7 +1116,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
 }
 
 #[tokio::test]
-async fn run_ci_steps_without_reviewer_cascades_to_merging() {
+async fn validation_pass_without_review_execution_does_not_authorize_merge() {
     let task_id = new_uuid_v4();
     let mut ctx = build_test_ctx(
         &task_id,
@@ -1167,20 +1125,109 @@ async fn run_ci_steps_without_reviewer_cascades_to_merging() {
         None,
     )
     .await;
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
-    match AutoCascadeOnReviewPass.execute(&ctx).await {
-        HookResult::Cascade { to, reason } => {
-            assert_eq!(to, default_states::MERGING);
-            assert_eq!(reason, "review passed");
-        }
-        other => panic!("expected cascade to merging, got {other:?}"),
-    }
+    assert!(matches!(
+        AutoCascadeOnReviewPass.execute(&ctx).await,
+        HookResult::Skipped { .. }
+    ));
+    assert_eq!(
+        TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+            .await
+            .expect("Task lookup succeeds")
+            .expect("Task exists")
+            .status,
+        default_states::REVIEW
+    );
+}
+
+#[tokio::test]
+async fn validation_pass_and_review_request_changes_remain_independent() {
+    let task_id = new_uuid_v4();
+    let mut ctx = build_test_ctx(
+        &task_id,
+        default_states::IN_PROGRESS,
+        default_states::REVIEW,
+        None,
+    )
+    .await;
+    let executor_id = seed_completed_executor_execution(&mut ctx).await;
+    ctx.execution_id = Some(executor_id);
+    ctx.state_config = json!({ "ci_steps": ["test -d ."] });
+    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+    let validation = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("ValidationRuns load")
+        .into_iter()
+        .next()
+        .expect("ValidationRun exists");
+    assert_eq!(validation.status, db::ValidationRunStatus::Passed);
+
+    let agent_id = new_uuid_v4();
+    seed_agent_with_max(&ctx.db, &agent_id, 1).await;
+    let now = now_rfc3339();
+    let reviewer = ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: ctx.task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id)),
+            purpose: Some(db::ExecutionPurpose::Review),
+            harness_session_id: None,
+            role: default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("requests a correction".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Review Execution creates");
+    crate::CollaborationService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus))
+        .create_review_report_from_execution(
+            &reviewer.id,
+            "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"fail\",\"summary\":\"A correction is required.\",\"criteria\":[\"correctness\"],\"findings\":[\"Fix the boundary case.\"],\"questions\":[],\"evidence_considered\":[]}",
+        )
+        .await
+        .expect("request-changes ReviewReport creates");
+
+    ctx.execution_id = Some(reviewer.id.clone());
+    assert!(matches!(
+        AutoCascadeOnReviewPass.execute(&ctx).await,
+        HookResult::Cascade { to, .. } if to == default_states::IN_PROGRESS
+    ));
+    assert_eq!(
+        db::ValidationRunRepo::get_validation_run(&*ctx.db, &validation.id)
+            .await
+            .expect("exact ValidationRun rereads")
+            .expect("ValidationRun remains")
+            .status,
+        db::ValidationRunStatus::Passed
+    );
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Review rows load")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1197,7 +1244,7 @@ async fn run_ci_steps_with_user_approval_gate_waits_for_human() {
         .as_mut()
         .expect("review gate config")
         .requires_user_approval = Some(true);
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
@@ -1207,15 +1254,13 @@ async fn run_ci_steps_with_user_approval_gate_waits_for_human() {
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
         .await
         .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::AwaitingHuman);
-    assert!(reviews[0].finished_at.is_none());
+    assert!(
+        reviews.is_empty(),
+        "Human review is an exact Human Execution"
+    );
 
     let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
-    assert!(
-        matches!(cascade_result, HookResult::Ok),
-        "{cascade_result:?}"
-    );
+    assert!(matches!(cascade_result, HookResult::Skipped { .. }));
 }
 
 #[tokio::test]
@@ -1232,7 +1277,7 @@ async fn unconfigured_review_with_user_approval_gate_waits_for_human() {
         .as_mut()
         .expect("review gate config")
         .requires_user_approval = Some(true);
-    let execution_id = seed_completed_executor_execution(&ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut ctx).await;
     ctx.execution_id = Some(execution_id);
 
     let result = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
@@ -1241,8 +1286,10 @@ async fn unconfigured_review_with_user_approval_gate_waits_for_human() {
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
         .await
         .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::AwaitingHuman);
+    assert!(
+        reviews.is_empty(),
+        "no synthetic awaiting_human Review exists"
+    );
 }
 
 #[tokio::test]
@@ -1317,96 +1364,6 @@ async fn check_retry_budget_ok_without_gate_config() {
     let result = CheckRetryBudget.execute(&ctx).await;
 
     assert!(matches!(result, HookResult::Ok));
-}
-
-#[tokio::test]
-async fn auto_cascade_review_failure_at_budget_blocks_with_metadata() {
-    let mut ctx = build_test_ctx(
-        "task-review-budget-final-attempt",
-        default_states::IN_PROGRESS,
-        default_states::REVIEW,
-        None,
-    )
-    .await;
-    ctx.execution_id = Some(new_uuid_v4());
-    seed_review(&ctx, ReviewStatus::Failed, 1).await;
-    seed_transition_log_at(
-        &ctx.db,
-        &ctx.task_id,
-        default_states::REVIEW,
-        default_states::IN_PROGRESS,
-        true,
-        "2026-04-17T00:00:00Z",
-    )
-    .await;
-
-    match AutoCascadeOnReviewPass.execute(&ctx).await {
-        HookResult::Ok => {}
-        other => panic!("expected review budget block, got {other:?}"),
-    }
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let blocked = task.blocked_json.expect("blocked metadata is set");
-    let blocked: serde_json::Value = serde_json::from_str(&blocked).expect("blocked json parses");
-    assert_eq!(blocked["kind"], "review_gate_failed");
-    assert_eq!(blocked["reason"], "review retry budget exhausted");
-}
-
-#[tokio::test]
-async fn auto_cascade_review_failure_budget_blocks_with_metadata() {
-    let mut ctx = build_test_ctx(
-        "task-review-budget-blocks",
-        default_states::IN_PROGRESS,
-        default_states::REVIEW,
-        None,
-    )
-    .await;
-    ctx.execution_id = Some(new_uuid_v4());
-    seed_review(&ctx, ReviewStatus::Failed, 1).await;
-    seed_transition_log_at(
-        &ctx.db,
-        &ctx.task_id,
-        default_states::REVIEW,
-        default_states::IN_PROGRESS,
-        true,
-        "2026-04-17T00:00:00Z",
-    )
-    .await;
-    seed_transition_log_at(
-        &ctx.db,
-        &ctx.task_id,
-        default_states::REVIEW,
-        default_states::IN_PROGRESS,
-        true,
-        "2026-04-17T00:01:00Z",
-    )
-    .await;
-    let mut rx = ctx.event_bus.subscribe();
-
-    match AutoCascadeOnReviewPass.execute(&ctx).await {
-        HookResult::Ok => {}
-        other => panic!("expected review budget block, got {other:?}"),
-    }
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(task.status, default_states::IN_PROGRESS);
-    let blocked = task.blocked_json.expect("blocked metadata is set");
-    let blocked: serde_json::Value = serde_json::from_str(&blocked).expect("blocked json parses");
-    assert_eq!(blocked["kind"], "review_gate_failed");
-    assert_eq!(blocked["reason"], "review retry budget exhausted");
-    let event = rx.try_recv().expect("blocked event emits");
-    assert_eq!(event.event_type, "task.blocked");
-    match event.context {
-        EventContext::TaskBlocked { reason, kind, .. } => {
-            assert_eq!(reason, "review retry budget exhausted");
-            assert_eq!(kind, Some(api_types::FailureKind::ReviewGateFailed));
-        }
-        other => panic!("expected task blocked event, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -1871,7 +1828,7 @@ async fn build_reviewer_dispatch_harness(
         _workspace_root: workspace_root,
     };
 
-    let execution_id = seed_completed_executor_execution(&harness.ctx).await;
+    let execution_id = seed_completed_executor_execution(&mut harness.ctx).await;
     harness.ctx.execution_id = Some(execution_id);
     harness
 }
@@ -1890,15 +1847,15 @@ async fn ci_passes_then_reviewer_dispatched_via_dispatch_role_agent() {
         "CI should pass: {ci_result:?}"
     );
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(
-        reviews[0].status,
-        ReviewStatus::Running,
-        "reviewer assigned so review stays Running"
-    );
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
     assert!(
@@ -2049,7 +2006,7 @@ async fn reviewer_dispatch_ignores_waiting_review_tasks_without_running_executio
 }
 
 #[tokio::test]
-async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
+async fn validation_failure_is_not_a_review_verdict() {
     let task_id = new_uuid_v4();
     let reviewer_id = "agent-reviewer-ci-fail";
     let harness = build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, vec!["exit 1"]).await;
@@ -2061,37 +2018,22 @@ async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
         "CI hook returns Failed on CI failure: {ci_result:?}"
     );
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(
-        reviews[0].status,
-        ReviewStatus::Failed,
-        "failing CI sets review to Failed"
-    );
-
-    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
-    match dispatch_result {
-        HookResult::Skipped { reason } => assert_eq!(reason, "review already failed"),
-        other => panic!("expected skipped, got {other:?}"),
-    }
-
-    let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
-    match cascade_result {
-        HookResult::Cascade { to, reason } => {
-            assert_eq!(to, default_states::IN_PROGRESS);
-            assert_eq!(reason, "review failed");
-        }
-        other => panic!("expected cascade to in_progress, got {other:?}"),
-    }
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Failed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
 
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
             .expect("reviewer execution count"),
         0,
-        "no reviewer execution should be created when CI fails"
+        "Validation failure does not fabricate a reviewer verdict"
     );
 }
 
@@ -2153,11 +2095,15 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
         "CI should pass even when reviewer at capacity: {ci_result:?}"
     );
 
-    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+    let runs = db::ValidationRunRepo::list_validation_runs_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Running);
+        .expect("ValidationRuns load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, db::ValidationRunStatus::Passed);
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("legacy Reviews load")
+        .is_empty());
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
     match dispatch_result {

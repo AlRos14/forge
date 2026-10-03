@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use db::ReviewStatus;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
@@ -19,9 +18,8 @@ use crate::{
 };
 
 use super::common::{
-    ensure_review_awaiting_human, ensure_review_record_for_dispatch, execution_guard_roles,
-    follow_up_trigger, get_role_assignment, get_usable_agent_assignment,
-    has_running_execution_for_roles, latest_review, review_is_ci_only, task,
+    execution_guard_roles, follow_up_trigger, get_role_assignment, get_usable_agent_assignment,
+    has_running_execution_for_roles, task,
 };
 use super::gates::non_review_gate_retry_budget;
 
@@ -88,29 +86,6 @@ impl HookAction for DispatchRoleAgent {
                     return HookResult::Skipped {
                         reason: "task has no associated repo".to_string(),
                     };
-                }
-                if role_name == crate::workflow::default_roles::REVIEWER {
-                    match latest_review(ctx).await {
-                        Ok(Some(review))
-                            if review.status == ReviewStatus::Failed
-                                && Some(review.execution_id.as_str())
-                                    == ctx.execution_id.as_deref() =>
-                        {
-                            return HookResult::Skipped {
-                                reason: "review already failed".to_string(),
-                            };
-                        }
-                        Ok(Some(review))
-                            if review.status == ReviewStatus::Passed
-                                && review_is_ci_only(&review) =>
-                        {
-                            return HookResult::Skipped {
-                                reason: "review already passed CI-only".to_string(),
-                            };
-                        }
-                        Ok(_) => {}
-                        Err(reason) => return HookResult::Failed { reason },
-                    }
                 }
                 let agent_id = assignment.assignee_id.expect("checked by match guard");
                 let state_dispatch =
@@ -235,14 +210,7 @@ impl HookAction for DispatchRoleAgent {
                         )
                         .await
                     {
-                        Ok(execution) => {
-                            if let Err(reason) =
-                                ensure_review_record_for_dispatch(ctx, &execution.id).await
-                            {
-                                return HookResult::Failed { reason };
-                            }
-                            HookResult::Ok
-                        }
+                        Ok(_) => HookResult::Ok,
                         Err(error) => HookResult::Failed {
                             reason: error.to_string(),
                         },
@@ -346,14 +314,7 @@ impl HookAction for DispatchRoleAgent {
                     )
                     .await
                 {
-                    Ok(execution) => {
-                        if let Err(reason) =
-                            ensure_review_record_for_dispatch(ctx, &execution.id).await
-                        {
-                            return HookResult::Failed { reason };
-                        }
-                        HookResult::Ok
-                    }
+                    Ok(_) => HookResult::Ok,
                     Err(error) => HookResult::Failed {
                         reason: error.to_string(),
                     },
@@ -364,21 +325,19 @@ impl HookAction for DispatchRoleAgent {
                     && assignment.assignee_id.is_some() =>
             {
                 if role_name == crate::workflow::default_roles::REVIEWER {
-                    match latest_review(ctx).await {
-                        Ok(Some(review))
-                            if review.status == ReviewStatus::Failed
-                                && Some(review.execution_id.as_str())
-                                    == ctx.execution_id.as_deref() =>
-                        {
-                            return HookResult::Skipped {
-                                reason: "review already failed".to_string(),
-                            };
-                        }
-                        Ok(_) => {}
-                        Err(reason) => return HookResult::Failed { reason },
-                    }
-                    if let Err(reason) = ensure_review_awaiting_human(ctx).await {
-                        return HookResult::Failed { reason };
+                    let user_id = assignment.assignee_id.as_deref().unwrap_or_default();
+                    let service = TaskService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus));
+                    if let Err(error) = service
+                        .start_human_review_execution(
+                            &ctx.task_id,
+                            user_id,
+                            ctx.workspace_id.as_deref(),
+                        )
+                        .await
+                    {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
                     }
                 }
                 let assignee_id = assignment.assignee_id.expect("checked by match guard");

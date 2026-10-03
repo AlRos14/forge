@@ -236,9 +236,21 @@ pub struct ArtifactResponse {
     #[ts(type = "Record<string, unknown>")]
     pub metadata: Value,
     pub digest: Option<String>,
-    pub producer_execution_id: String,
-    pub producer: ActorRef,
+    pub producer: ArtifactProducer,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ArtifactProducer {
+    Execution {
+        execution_id: String,
+        actor: ActorRef,
+    },
+    ValidationRun {
+        validation_run_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]

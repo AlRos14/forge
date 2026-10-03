@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent,
     CreateProjectAgentBinding, CreateProjectMember, CreateTask, DaemonRepo, DaemonStatus,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceProjectAgentBinding, UpdateProject,
-    UpsertDaemon,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceProjectAgentBinding, ReviewRepo,
+    ReviewStatus, UpdateProject, UpsertDaemon,
 };
 use executors::{ExecutionResult, ExecutorError};
 use sqlx::Row;
@@ -161,6 +161,23 @@ async fn sqlite_db() -> SqliteDb {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     SqliteDb::new(pool)
+}
+
+fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git command runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir) {

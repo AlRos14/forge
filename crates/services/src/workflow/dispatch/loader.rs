@@ -2,16 +2,16 @@ use std::sync::Arc;
 
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
-    Artifact, ExecutionRepo, ExecutionStatus, PageRequest, ReviewRepo, SortBy, SortOrder,
-    TaskCommentRepo, TaskRepo, TransitionLogRepo,
+    Artifact, CollaborationRepo, CollaborationTarget, ExecutionRepo, ExecutionStatus, PageRequest,
+    SortBy, SortOrder, TaskCommentRepo, TaskRepo, TaskRoleRepo, TransitionLogRepo,
+    ValidationRunRepo, WorkspaceRepo,
 };
-use executors::LogKind;
 use serde_json::Value;
 
 use crate::workflow::dispatch::EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD;
 use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
 
-const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
+const CONTEXT_PROJECTION_LIMIT: usize = 16_000;
 
 pub async fn load_agent_dispatch_context(
     db: Arc<db::SqliteDb>,
@@ -40,7 +40,7 @@ pub async fn load_agent_dispatch_context(
     )
     .await?
     .items;
-    let prior_reviews = ReviewRepo::list_by_task(&*db, task_id).await?;
+    let collaboration_context = load_collaboration_context(&db, task_id, role).await?;
     let parent_task = match task.parent_task_id.as_deref() {
         Some(parent_task_id) => TaskRepo::get_by_id(&*db, parent_task_id, false).await?,
         None => None,
@@ -51,18 +51,35 @@ pub async fn load_agent_dispatch_context(
     // This legacy workflow policy selects a causal/contextual parent only.
     // Follow-up creation performs the Actor-first, explicit HarnessSession
     // continuity check; this lookup is never a session selector.
-    let continuation_execution = if should_resume_latest_target_role_thread(execution_policy) {
-        latest_terminal_execution_for_role(&db, task_id, role).await?
-    } else {
-        None
+    let causing_execution = match causing_execution_id {
+        Some(id) => Some(
+            ExecutionRepo::get_by_id(&*db, id)
+                .await?
+                .filter(|execution| execution.task_id == task_id)
+                .ok_or_else(|| ServiceError::not_found("execution", id.to_owned()))?,
+        ),
+        None => None,
     };
+    // Review rework starts a fresh coder Execution. The exact Review Execution
+    // and attached ReviewReport are context, never permission to infer a prior
+    // coder Execution or HarnessSession from role recency. Reviewer dispatch
+    // also never resumes a prior thread by role recency.
+    let review_rework = causing_execution.as_ref().is_some_and(|execution| {
+        execution.role == crate::workflow::default_roles::REVIEWER
+            && execution.purpose == Some(db::ExecutionPurpose::Review)
+    });
+    let continuation_execution =
+        if should_resume_latest_target_role_thread(execution_policy, role, review_rework) {
+            latest_terminal_execution_for_role(&db, task_id, role).await?
+        } else {
+            None
+        };
     let continuation_of_execution_id = continuation_execution
         .as_ref()
         .map(|execution| execution.id.clone());
     let continuation_logs_path = continuation_execution
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
-    let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
     let plan_artifacts = match causing_execution_id {
         Some(execution_id) => {
             crate::plan_artifact::plan_artifacts_for_execution(&db, task_id, execution_id).await?
@@ -79,10 +96,17 @@ pub async fn load_agent_dispatch_context(
             .task_diff(task_id)
             .await
         {
-            Ok(diff) => Some(format!(
-                "Base SHA: {}\nHead SHA: {}\n\nExact diff:\n```diff\n{}\n```",
-                diff.base_sha, diff.head_sha, diff.diff
-            )),
+            Ok(diff) => {
+                let validation_context =
+                    load_validation_context(&db, task_id, diff.head_sha.as_str()).await?;
+                Some(format!(
+                    "Base SHA: {}\nHead SHA: {}\n\nExact diff:\n```diff\n{}\n```{}",
+                    diff.base_sha,
+                    diff.head_sha,
+                    diff.diff,
+                    validation_context.unwrap_or_default(),
+                ))
+            }
             Err(error) => Some(format!("Diff evidence unavailable: {error}")),
         }
     } else {
@@ -99,15 +123,15 @@ pub async fn load_agent_dispatch_context(
         plan,
         plan_artifact_ids,
         review_evidence,
-        prior_reviews,
+        prior_reviews: Vec::new(),
         parent_task,
         sub_tasks,
         last_manual_bounce_reason,
         continuation_of_execution_id,
         continuation_logs_path,
-        latest_review_feedback: latest_review_context.feedback,
-        latest_review_execution_id: latest_review_context.execution_id,
-        latest_review_logs_path: latest_review_context.logs_path,
+        latest_review_feedback: collaboration_context,
+        latest_review_execution_id: None,
+        latest_review_logs_path: None,
     })
 }
 
@@ -119,15 +143,23 @@ fn render_plan_context(artifacts: &[Artifact]) -> Option<String> {
         artifacts
             .iter()
             .map(|artifact| {
-                let actor = match &artifact.producer {
-                    db::ActorRef::Human(id) => format!("human:{id}"),
-                    db::ActorRef::Agent(id) => format!("agent:{id}"),
+                let (producer, actor) = match &artifact.producer {
+                    db::ArtifactProducer::Execution { execution_id, actor } => {
+                        let actor = match actor {
+                            db::ActorRef::Human(id) => format!("human:{id}"),
+                            db::ActorRef::Agent(id) => format!("agent:{id}"),
+                        };
+                        (format!("execution:{execution_id}"), actor)
+                    }
+                    db::ArtifactProducer::ValidationRun { validation_run_id } => {
+                        (format!("validation_run:{validation_run_id}"), "none".to_owned())
+                    }
                 };
                 format!(
-                    "Plan Artifact {}\nDigest: {}\nProducer Execution: {}\nProducer Actor: {}\nCreated: {}\n\n{}",
+                    "Plan Artifact {}\nDigest: {}\nProducer: {}\nProducer Actor: {}\nCreated: {}\n\n{}",
                     artifact.id,
                     artifact.digest.as_deref().unwrap_or("unavailable"),
-                    artifact.producer_execution_id,
+                    producer,
                     actor,
                     artifact.created_at,
                     artifact.content.as_deref().unwrap_or("[content unavailable]")
@@ -138,8 +170,14 @@ fn render_plan_context(artifacts: &[Artifact]) -> Option<String> {
     )
 }
 
-fn should_resume_latest_target_role_thread(execution_policy: Option<&str>) -> bool {
-    execution_policy == Some(EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD)
+fn should_resume_latest_target_role_thread(
+    execution_policy: Option<&str>,
+    role: &str,
+    review_rework: bool,
+) -> bool {
+    role != crate::workflow::default_roles::REVIEWER
+        && !review_rework
+        && execution_policy == Some(EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD)
 }
 
 fn derive_last_manual_bounce_reason(
@@ -207,134 +245,115 @@ async fn latest_terminal_execution_for_exact_role(
     }))
 }
 
-#[derive(Debug, Default)]
-struct LatestReviewContext {
-    feedback: Option<String>,
-    execution_id: Option<String>,
-    logs_path: Option<String>,
-}
-
-async fn latest_failed_review_context(
+async fn load_collaboration_context(
     db: &db::SqliteDb,
-    prior_reviews: &[db::Review],
-) -> Result<LatestReviewContext> {
-    let Some(review) = prior_reviews
-        .iter()
-        .filter(|review| review.status == db::ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-    else {
-        return Ok(LatestReviewContext::default());
-    };
-
-    let execution = ExecutionRepo::get_by_id(db, &review.execution_id).await?;
-    let logs_path = execution
-        .as_ref()
-        .and_then(|execution| execution.logs_path.clone());
-    let feedback = if review_has_auditor_feedback(&review.step_results_json) {
-        match execution.as_ref() {
-            Some(execution) => reviewer_final_message(execution).await?,
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    Ok(LatestReviewContext {
-        feedback,
-        execution_id: Some(review.execution_id.clone()),
-        logs_path,
-    })
-}
-
-fn review_has_auditor_feedback(step_results_json: &str) -> bool {
-    serde_json::from_str::<Value>(step_results_json)
-        .ok()
-        .and_then(|value| value.get("auditor").cloned())
-        .is_some_and(|auditor| !auditor.is_null())
-}
-
-async fn reviewer_final_message(execution: &db::Execution) -> Result<Option<String>> {
-    let Some(logs_path) = execution.logs_path.as_deref() else {
-        return Ok(execution
-            .summary
-            .as_deref()
-            .map(str::trim)
-            .filter(|summary| !summary.is_empty())
-            .map(str::to_owned));
-    };
-    let (message, stdout_lines) = match executors::LogReader::fold(
-        std::path::Path::new(logs_path),
-        (String::new(), String::new()),
-        |(message, stdout_lines), entry| match entry.kind {
-            LogKind::Assistant | LogKind::AssistantDelta => {
-                append_log_text(&entry.payload, message);
-            }
-            LogKind::SessionInfo
-                if entry.payload.get("subtype").and_then(Value::as_str) == Some("success") =>
-            {
-                if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                    message.push_str(result);
-                }
-            }
-            LogKind::Stdout => {
-                if let Some(line) = entry.payload.get("line").and_then(Value::as_str) {
-                    stdout_lines.push_str(line);
-                    stdout_lines.push('\n');
-                }
-            }
-            _ => {}
+    task_id: &str,
+    role: &str,
+) -> Result<Option<String>> {
+    let target_role_id = TaskRoleRepo::get_by_task_and_role(db, task_id, role)
+        .await?
+        .map(|role| role.id);
+    let messages = CollaborationRepo::list_messages(
+        db,
+        task_id,
+        PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
         },
     )
-    .await
-    {
-        Ok(messages) => messages,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(execution_id = %execution.id, logs_path, %error, "failed to read reviewer execution log");
-            }
-            Default::default()
+    .await?;
+    let mut entries = Vec::new();
+    for message in messages.items {
+        let addressed = match &message.target {
+            CollaborationTarget::Task => true,
+            CollaborationTarget::Role(role_id) => target_role_id.as_deref() == Some(role_id),
+            CollaborationTarget::Actor(_) => false,
+        };
+        if !addressed {
+            continue;
         }
-    };
-
-    let feedback = if !message.trim().is_empty() {
-        message
-    } else if !stdout_lines.trim().is_empty() {
-        stdout_lines
-    } else {
-        execution.summary.clone().unwrap_or_default()
-    };
-    let feedback = feedback.trim();
-    if feedback.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(tail_chars(feedback, REVIEW_FEEDBACK_LIMIT)))
+        let mut entry = format!("Message {}: {}", message.id, message.body);
+        for artifact_id in message.artifact_ids {
+            let Some(artifact) = CollaborationRepo::get_artifact(db, &artifact_id).await? else {
+                continue;
+            };
+            if artifact.task_id != task_id {
+                return Err(ServiceError::invalid_operation(
+                    "collaboration Message references an Artifact from another Task",
+                ));
+            }
+            entry.push_str(&format!(
+                "\nAttached Artifact {} ({:?}, digest {}):\n{}",
+                artifact.id,
+                artifact.kind,
+                artifact.digest.as_deref().unwrap_or("unavailable"),
+                artifact
+                    .content
+                    .as_deref()
+                    .unwrap_or("content stored externally"),
+            ));
+        }
+        entries.push(entry);
+        if entries.len() == 5 {
+            break;
+        }
     }
+    entries.reverse();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let context = entries.join("\n\n");
+    Ok(Some(tail_chars(&context, CONTEXT_PROJECTION_LIMIT)))
 }
 
-fn append_log_text(payload: &Value, out: &mut String) {
-    if let Some(text) = payload
-        .get("text")
-        .or_else(|| payload.get("content"))
-        .and_then(Value::as_str)
-    {
-        out.push_str(text);
-    }
-
-    let Some(content) = payload
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_array)
-    else {
-        return;
+async fn load_validation_context(
+    db: &db::SqliteDb,
+    task_id: &str,
+    head_sha: &str,
+) -> Result<Option<String>> {
+    let Some(workspace) = WorkspaceRepo::get_by_task_id(db, task_id).await? else {
+        return Ok(None);
     };
-
-    for item in content {
-        if item.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                out.push_str(text);
-            }
+    let snapshot_digest =
+        crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+    let runs = ValidationRunRepo::list_validation_runs_by_task(db, task_id).await?;
+    let exact = runs
+        .into_iter()
+        .filter(|run| {
+            run.workspace_id == workspace.id
+                && run.commit_sha == head_sha
+                && run.workspace_snapshot_digest == snapshot_digest
+        })
+        .collect::<Vec<_>>();
+    if exact.is_empty() {
+        return Ok(None);
+    }
+    let mut context = format!(
+        "\n\nDeterministic Validation Evidence for exact Workspace {}, commit {}, and snapshot {}:\n",
+        workspace.id, head_sha, snapshot_digest
+    );
+    for run in exact {
+        context.push_str(&format!(
+            "\nValidationRun {}: check={}, status={}, config_digest={}\n",
+            run.id, run.check_identity, run.status, run.config_digest
+        ));
+        for evidence in ValidationRunRepo::list_evidence_for_validation_run(db, &run.id).await? {
+            let content: Value = serde_json::from_str(&evidence.content_json).map_err(|_| {
+                ServiceError::invalid_operation("stored Validation Evidence is invalid JSON")
+            })?;
+            context.push_str(&format!(
+                "Evidence {} (kind={}, digest={}): {}\n",
+                evidence.id, evidence.kind, evidence.digest, content
+            ));
+        }
+        if context.len() >= CONTEXT_PROJECTION_LIMIT {
+            break;
         }
     }
+    Ok(Some(tail_chars(&context, CONTEXT_PROJECTION_LIMIT)))
 }
 
 fn tail_chars(value: &str, limit: usize) -> String {
@@ -346,7 +365,10 @@ fn tail_chars(value: &str, limit: usize) -> String {
     while !value.is_char_boundary(start) {
         start += 1;
     }
-    format!("[truncated]\n{}", &value[start..])
+    format!(
+        "[truncated projection; exact source remains addressable by ID]\n{}",
+        &value[start..]
+    )
 }
 
 #[cfg(test)]
@@ -356,16 +378,38 @@ mod tests {
 
     #[test]
     fn new_execution_policy_does_not_resume_previous_execution() {
-        assert!(!should_resume_latest_target_role_thread(Some(
-            "new_execution"
-        )));
+        assert!(!should_resume_latest_target_role_thread(
+            Some("new_execution"),
+            crate::workflow::default_roles::CODER,
+            false
+        ));
     }
 
     #[test]
     fn resume_latest_target_role_thread_policy_resumes_previous_execution() {
-        assert!(should_resume_latest_target_role_thread(Some(
-            EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD
-        )));
+        assert!(should_resume_latest_target_role_thread(
+            Some(EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD),
+            crate::workflow::default_roles::CODER,
+            false
+        ));
+    }
+
+    #[test]
+    fn review_rework_never_infers_a_coder_execution_or_harness_session() {
+        assert!(!should_resume_latest_target_role_thread(
+            Some(EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD),
+            crate::workflow::default_roles::CODER,
+            true,
+        ));
+    }
+
+    #[test]
+    fn reviewer_never_infers_a_prior_execution_or_harness_session() {
+        assert!(!should_resume_latest_target_role_thread(
+            Some(EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD),
+            crate::workflow::default_roles::REVIEWER,
+            false,
+        ));
     }
 
     #[tokio::test]

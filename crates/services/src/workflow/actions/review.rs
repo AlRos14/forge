@@ -1,22 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use db::{
-    now_rfc3339, ReviewRepo, ReviewStatus, TaskRepo, TransitionLog, TransitionLogRepo,
-    WorkspaceRepo,
-};
-use serde_json::json;
+use db::{ArtifactKind, CollaborationRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
 };
 
-use super::common::{
-    block_task, create_review_attempt, get_role_assignment, latest_executor_execution,
-    latest_review, publish_domain_event, publish_review_failed, publish_review_passed,
-    review_ci_steps, review_has_auditor_verdict, review_is_ci_only, run_ci_steps_in_worktree, task,
-    workspace_id,
-};
+use super::common::{get_role_assignment, review_ci_steps};
 
 pub struct RunCiSteps;
 
@@ -33,187 +24,41 @@ impl HookAction for RunCiSteps {
             };
         }
 
-        let task = match task(ctx).await {
-            Ok(task) => task,
-            Err(reason) => return HookResult::Failed { reason },
-        };
-        let Some(workspace_id) = workspace_id(ctx).await else {
-            return HookResult::Skipped {
-                reason: "no workspace".to_string(),
+        let Some(workspace_id) = ctx.workspace_id.as_deref() else {
+            return HookResult::Failed {
+                reason: "deterministic validation requires an exact Workspace identity".to_owned(),
             };
         };
-        let execution_id = match ctx.execution_id.clone() {
-            Some(execution_id) => Some(execution_id),
-            None => latest_executor_execution(ctx)
+        let validation =
+            crate::ValidationService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus));
+        for (index, command) in ci_steps.iter().enumerate() {
+            let result = match validation
+                .run_command(
+                    &ctx.task_id,
+                    workspace_id,
+                    command,
+                    index,
+                    ctx.execution_id.as_deref(),
+                    ctx.workspace_exec_locks.as_deref(),
+                )
                 .await
-                .map(|execution| execution.id),
-        };
-        let Some(execution_id) = execution_id else {
-            return HookResult::Skipped {
-                reason: "no executor execution".to_string(),
-            };
-        };
-
-        let workspace = match WorkspaceRepo::get_by_id(&*ctx.db, &workspace_id).await {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => {
-                return HookResult::Skipped {
-                    reason: "workspace not found".to_string(),
-                };
-            }
-            Err(error) => {
-                return HookResult::Failed {
-                    reason: error.to_string(),
-                };
-            }
-        };
-
-        let review = match create_review_attempt(ctx, &execution_id).await {
-            Ok(review) => review,
-            Err(reason) => return HookResult::Failed { reason },
-        };
-        let had_review_passed = task.review_passed_at.is_some();
-        let reviewer_assignment =
-            match get_role_assignment(ctx, crate::workflow::default_roles::REVIEWER).await {
-                Ok(assignment) => assignment,
-                Err(reason) => return HookResult::Failed { reason },
-            };
-        let reviewer_assigned = reviewer_assignment
-            .as_ref()
-            .is_some_and(|assignment| assignment.assignee_id.is_some());
-
-        let (ci_results, failed_step_index) =
-            match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps).await {
-                Ok(result) => result,
-                Err(reason) => return HookResult::Failed { reason },
-            };
-        let mut review_details = json!({ "ci_steps": ci_results });
-        let now = now_rfc3339();
-
-        let user_approval_required =
-            gate_requires_user_approval(ctx) || human_review_requested(ctx, reviewer_assigned);
-
-        let (status, finished_at) = if let Some(failed_step_index) = failed_step_index {
-            let review = match ReviewRepo::update_status(
-                &*ctx.db,
-                &review.id,
-                ReviewStatus::Failed,
-                review_details.to_string(),
-                Some(now.clone()),
-                &now,
-            )
-            .await
             {
-                Ok(review) => review,
+                Ok(result) => result,
                 Err(error) => {
                     return HookResult::Failed {
                         reason: error.to_string(),
-                    };
+                    }
                 }
             };
-            publish_domain_event(
-                ctx,
-                &format!("review-status:{}:{}:{}", review.id, review.status, now),
-            )
-            .await;
-            let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
-            if let Err(error) = memory_service
-                .record_review_result_if_final(&ctx.project_id, &review)
-                .await
-            {
-                tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-            }
-            publish_review_failed(ctx, &review, failed_step_index);
-            if had_review_passed {
-                if let Err(error) =
-                    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now).await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-                let reason = "merge-fix follow-up failed: ci";
-                if let Err(error) =
-                    block_task(ctx, &task, reason, api_types::FailureKind::CiFailed, None).await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
+            if result.run.status != db::ValidationRunStatus::Passed {
                 return HookResult::Failed {
-                    reason: reason.to_string(),
+                    reason: format!(
+                        "ValidationRun {} for check {} ended as {}",
+                        result.run.id, result.run.check_identity, result.run.status
+                    ),
                 };
             }
-            return HookResult::Failed {
-                reason: format!("CI step {} failed", failed_step_index),
-            };
-        } else if had_review_passed {
-            review_details["auditor"] = json!({
-                "verdict": "pass_ci_only",
-                "reason": "CI-only re-review",
-            });
-            (ReviewStatus::Passed, Some(now.clone()))
-        } else if reviewer_assigned {
-            (ReviewStatus::Running, None)
-        } else if user_approval_required {
-            let reason = if gate_requires_user_approval(ctx) {
-                "gate requires user approval"
-            } else {
-                "manual review requested"
-            };
-            review_details["user_approval"] = json!({
-                "status": "awaiting_human",
-                "reason": reason,
-            });
-            (ReviewStatus::AwaitingHuman, None)
-        } else {
-            (ReviewStatus::Passed, Some(now.clone()))
-        };
-
-        let review = match ReviewRepo::update_status(
-            &*ctx.db,
-            &review.id,
-            status.clone(),
-            review_details.to_string(),
-            finished_at.clone(),
-            &now,
-        )
-        .await
-        {
-            Ok(review) => review,
-            Err(error) => {
-                return HookResult::Failed {
-                    reason: error.to_string(),
-                };
-            }
-        };
-        publish_domain_event(
-            ctx,
-            &format!("review-status:{}:{}:{}", review.id, review.status, now),
-        )
-        .await;
-        let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
-        if let Err(error) = memory_service
-            .record_review_result_if_final(&ctx.project_id, &review)
-            .await
-        {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
-
-        if status == ReviewStatus::Passed {
-            if !had_review_passed {
-                if let Err(error) =
-                    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, Some(now.clone()), &now)
-                        .await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-            }
-            publish_review_passed(ctx, &review);
-        }
-
         HookResult::Ok
     }
 }
@@ -223,107 +68,94 @@ pub struct AutoCascadeOnReviewPass;
 #[async_trait]
 impl HookAction for AutoCascadeOnReviewPass {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        let user_approval_required = gate_requires_user_approval(ctx);
-        let task = match task(ctx).await {
-            Ok(task) => task,
-            Err(reason) => return HookResult::Failed { reason },
-        };
-
-        let reviewer_assigned =
-            match get_role_assignment(ctx, crate::workflow::default_roles::REVIEWER).await {
-                Ok(assignment) => {
-                    assignment.is_some_and(|assignment| assignment.assignee_id.is_some())
-                }
-                Err(reason) => return HookResult::Failed { reason },
+        let Some(execution_id) = ctx.execution_id.as_deref() else {
+            return HookResult::Skipped {
+                reason: "no exact Review Execution is attached to this transition".to_owned(),
             };
-        let latest_review = match latest_review(ctx).await {
-            Ok(review) => review,
-            Err(reason) => return HookResult::Failed { reason },
         };
-        match latest_review {
-            Some(review)
-                if review.status == ReviewStatus::Passed
-                    && !user_approval_required
-                    && (!reviewer_assigned || review_has_auditor_verdict(&review)) =>
-            {
+        let execution = match ExecutionRepo::get_by_id(&*ctx.db, execution_id).await {
+            Ok(Some(execution)) => execution,
+            Ok(None) => {
+                return HookResult::Failed {
+                    reason: "Review Execution not found".into(),
+                }
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if execution.task_id != ctx.task_id
+            || execution.role != crate::workflow::default_roles::REVIEWER
+            || execution.purpose != Some(ExecutionPurpose::Review)
+        {
+            return HookResult::Skipped {
+                reason: "transition is not attached to an exact reviewer Review Execution".into(),
+            };
+        }
+        if execution.status != ExecutionStatus::Completed {
+            return HookResult::Ok;
+        }
+        let report = match CollaborationRepo::get_execution_artifact_output(
+            &*ctx.db,
+            execution_id,
+            ArtifactKind::ReviewReport,
+        )
+        .await
+        {
+            Ok(Some(report)) => report,
+            Ok(None) => {
+                return HookResult::Failed {
+                    reason: "completed Review Execution has no ReviewReport Artifact".into(),
+                }
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        let parsed = report
+            .content
+            .as_deref()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
+        let Some(verdict) = parsed
+            .as_ref()
+            .and_then(|value| value.get("verdict"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return HookResult::Failed {
+                reason: "ReviewReport has no structured verdict".into(),
+            };
+        };
+        let human_review_execution = matches!(execution.actor_ref(), Some(db::ActorRef::Human(_)));
+        match verdict {
+            // A Human reviewer Execution is the exact cognitive review and
+            // therefore carries the former approve/reject action in its
+            // ReviewReport. Requiring the retired task-level approval after
+            // that report would create a second, actor-less verdict source.
+            "pass" if human_review_execution || !gate_requires_user_approval(ctx) => {
                 HookResult::Cascade {
-                    to: default_states::MERGING.to_string(),
-                    reason: if review_is_ci_only(&review) {
-                        "CI-only re-review passed".to_string()
-                    } else {
-                        "review passed".to_string()
-                    },
+                    to: default_states::MERGING.to_owned(),
+                    reason: format!("ReviewReport {} passed", report.id),
                 }
             }
-            Some(review)
-                if review.status == ReviewStatus::Failed
-                    && Some(review.execution_id.as_str()) == ctx.execution_id.as_deref() =>
-            {
-                if task.review_passed_at.is_some() && !review_has_auditor_verdict(&review) {
-                    if let Err(error) =
-                        TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now_rfc3339())
-                            .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    let reason = "merge-fix follow-up failed: ci";
-                    if let Err(error) =
-                        block_task(ctx, &task, reason, api_types::FailureKind::CiFailed, None).await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    return HookResult::Ok;
-                }
-                let budget = match crate::task_service::config::runtime_retry_budget(
-                    &task,
-                    crate::task_service::config::RetryBudgetKind::Review,
-                    Some(&ctx.state_config),
-                    ctx.gate_config.as_ref(),
-                ) {
-                    Ok(budget) => budget,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                };
-                let existing_count =
-                    match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-                        Ok(entries) => review_rejections_since_boundary(&entries),
-                        Err(error) => {
-                            return HookResult::Failed {
-                                reason: error.to_string(),
-                            };
-                        }
-                    };
-                if existing_count + 1 >= i64::from(budget) {
-                    let reason = "review retry budget exhausted";
-                    if let Err(error) = block_task(
-                        ctx,
-                        &task,
-                        reason,
-                        api_types::FailureKind::ReviewGateFailed,
-                        None,
-                    )
-                    .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    HookResult::Ok
-                } else {
-                    HookResult::Cascade {
-                        to: default_states::IN_PROGRESS.to_string(),
-                        reason: "review failed".to_string(),
-                    }
-                }
-            }
-            Some(_) | None => HookResult::Ok,
+            "request_changes" => HookResult::Cascade {
+                to: ctx
+                    .workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == ctx.to_state)
+                    .and_then(|state| state.gate_config.as_ref())
+                    .and_then(|gate| gate.reject_target.clone())
+                    .unwrap_or_else(|| default_states::IN_PROGRESS.to_owned()),
+                reason: format!("ReviewReport {} requests changes", report.id),
+            },
+            "pass" | "questions" => HookResult::Ok,
+            _ => HookResult::Failed {
+                reason: "ReviewReport verdict is outside the supported contract".into(),
+            },
         }
     }
 }
@@ -372,9 +204,6 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
         }
 
         if gate_requires_user_approval(ctx) || human_review_requested(ctx, false) {
-            if let Err(reason) = super::common::ensure_review_awaiting_human(ctx).await {
-                return HookResult::Failed { reason };
-            }
             return HookResult::Ok;
         }
 
@@ -393,20 +222,4 @@ fn gate_requires_user_approval(ctx: &HookContext) -> bool {
 
 fn human_review_requested(ctx: &HookContext, reviewer_assigned: bool) -> bool {
     ctx.triggered_by.is_user() && ctx.to_state == default_states::REVIEW && !reviewer_assigned
-}
-
-fn review_rejections_since_boundary(entries: &[TransitionLog]) -> i64 {
-    let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == default_states::REVIEW
-            && !entry.rejection
-            && (entry.to_state != default_states::REVIEW
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
-    });
-    let entries = boundary
-        .and_then(|index| entries.get(index + 1..))
-        .unwrap_or(entries);
-    entries
-        .iter()
-        .filter(|entry| entry.from_state == default_states::REVIEW && entry.rejection)
-        .count() as i64
 }

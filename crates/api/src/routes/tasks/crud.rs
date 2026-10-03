@@ -116,11 +116,6 @@ pub async fn list_tasks(
             .iter()
             .map(|task| task.id.as_str())
             .collect::<Vec<_>>();
-        let latest_reviews = ReviewRepo::list_latest_reviews_for_tasks(&*state.db, &task_ids)
-            .await?
-            .into_iter()
-            .map(|review| (review.task_id.clone(), review))
-            .collect::<std::collections::HashMap<_, _>>();
         let latest_executions =
             ExecutionRepo::list_latest_executions_for_tasks(&*state.db, &task_ids)
                 .await?
@@ -129,12 +124,8 @@ pub async fn list_tasks(
                 .collect::<std::collections::HashMap<_, _>>();
         let mut items = Vec::with_capacity(page.items.len());
         for task in page.items {
-            let latest_review = latest_reviews.get(&task.id).cloned();
             let latest_execution = latest_executions.get(&task.id).cloned();
-            items.push(
-                task_response_light_with_latest(&state.db, task, latest_review, latest_execution)
-                    .await?,
-            );
+            items.push(task_response_light_with_latest(&state.db, task, latest_execution).await?);
         }
         let current_revision = TaskBoardRepo::board_revision(&*state.db, &project_id).await?;
         if current_revision == board_revision {

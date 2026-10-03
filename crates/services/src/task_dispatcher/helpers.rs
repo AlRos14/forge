@@ -1,8 +1,5 @@
 use api_types::{StateKind, WorkflowDefinition};
-use db::{
-    ExecutionRepo, ExecutionStatus, PageRequest, ResumePolicy, ReviewRepo, ReviewStatus, SortBy,
-    SortOrder,
-};
+use db::{ExecutionRepo, ExecutionStatus, PageRequest, ResumePolicy, SortBy, SortOrder};
 use serde_json::Value;
 
 use crate::{Result, ServiceError};
@@ -54,49 +51,13 @@ pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {
 }
 
 pub(super) async fn reviewer_dispatch_ready(
-    db: &db::SqliteDb,
-    task_id: &str,
-    state_config: &Value,
+    _db: &db::SqliteDb,
+    _task_id: &str,
+    _state_config: &Value,
 ) -> Result<bool> {
-    if !review_ci_steps_configured(state_config) {
-        return Ok(true);
-    }
-
-    let latest_review = ReviewRepo::list_by_task(db, task_id)
-        .await?
-        .into_iter()
-        .max_by_key(|review| review.attempt_number);
-    let Some(review) = latest_review else {
-        return Ok(false);
-    };
-    if review.status != ReviewStatus::Running {
-        return Ok(false);
-    }
-
-    Ok(review_ci_steps_finished(&review.step_results_json))
-}
-
-fn review_ci_steps_configured(state_config: &Value) -> bool {
-    let review_config = state_config.get("review").unwrap_or(state_config);
-    review_config
-        .get("ci_steps")
-        .and_then(Value::as_array)
-        .is_some_and(|steps| !steps.is_empty())
-}
-
-fn review_ci_steps_finished(step_results_json: &str) -> bool {
-    let Ok(details) = serde_json::from_str::<Value>(step_results_json) else {
-        return false;
-    };
-    details
-        .get("ci_steps")
-        .and_then(Value::as_array)
-        .is_some_and(|steps| {
-            !steps.is_empty()
-                && steps
-                    .iter()
-                    .all(|step| step.get("exit_code").and_then(Value::as_i64).is_some())
-        })
+    // Deterministic checks are independent ValidationRuns. Reviewer dispatch
+    // does not read the retired Review.step_results projection.
+    Ok(true)
 }
 
 pub(super) async fn latest_stopped_execution_blocks_dispatch(

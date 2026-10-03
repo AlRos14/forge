@@ -1,14 +1,4 @@
-use db::{ExecutionRepo, PageRequest, ReviewRepo, SortBy, SortOrder};
-
-pub(super) async fn latest_review(
-    db: &db::SqliteDb,
-    task_id: &str,
-) -> crate::Result<Option<db::Review>> {
-    let reviews = ReviewRepo::list_by_task(db, task_id).await?;
-    Ok(reviews
-        .into_iter()
-        .max_by_key(|review| review.attempt_number))
-}
+use db::{ExecutionRepo, PageRequest, SortBy, SortOrder};
 
 pub(super) async fn latest_execution_context(
     db: &db::SqliteDb,

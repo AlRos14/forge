@@ -16,7 +16,7 @@ use tracing::Instrument;
 use workspace::RepoCacheLockManager;
 
 use self::{
-    context::{latest_execution_context, latest_executor_context, latest_review},
+    context::{latest_execution_context, latest_executor_context},
     hooks::{
         effective_after_enter_hooks, elapsed_ms, hook_audience_matches, hook_result_entry,
         log_hook_result, log_hook_skipped_by_audience, log_hook_start, merged_state_config,
@@ -140,6 +140,37 @@ impl WorkflowEngine {
             defer_dispatch_until,
             None,
             0,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transition_with_execution_cause(
+        &self,
+        task_id: &str,
+        target_state: &str,
+        version: i64,
+        workflow: &WorkflowDefinition,
+        actor: &Actor,
+        reason: &str,
+        rejection: bool,
+        defer_dispatch_until: Option<String>,
+        causing_execution_id: &str,
+    ) -> crate::Result<TransitionResult> {
+        self.transition_inner(
+            task_id.to_owned(),
+            target_state.to_owned(),
+            version,
+            workflow,
+            actor.clone(),
+            reason.to_owned(),
+            rejection,
+            false,
+            defer_dispatch_until,
+            None,
+            0,
+            Some(causing_execution_id.to_owned()),
         )
         .await
     }
@@ -167,6 +198,7 @@ impl WorkflowEngine {
             None,
             Some(move_request),
             0,
+            None,
         )
         .await
     }
@@ -194,6 +226,7 @@ impl WorkflowEngine {
             None,
             None,
             0,
+            None,
         )
         .await
     }
@@ -281,14 +314,6 @@ impl WorkflowEngine {
                     .as_ref()
                     .and_then(|execution| execution.workspace_id.clone())
             });
-        let execution_id = latest_executor
-            .as_ref()
-            .map(|execution| execution.id.clone())
-            .or_else(|| {
-                latest_execution
-                    .as_ref()
-                    .map(|execution| execution.id.clone())
-            });
         let enter_ctx = HookContext {
             task_id: task.id.clone(),
             project_id: task.project_id.clone(),
@@ -313,7 +338,10 @@ impl WorkflowEngine {
             agent_id: latest_execution
                 .as_ref()
                 .and_then(|execution| execution.agent_id.clone()),
-            execution_id,
+            // Retrying an entry barrier has no exact causal Execution. Keep
+            // workspace context for deterministic checks, but never promote a
+            // recent Execution into authority for Review or continuity.
+            execution_id: None,
             state_config,
         };
 
@@ -389,10 +417,9 @@ impl WorkflowEngine {
         }
 
         if blocked {
-            let review = latest_review(&self.db, &task.id).await?;
             return Ok(TransitionResult {
                 task,
-                review,
+                review: None,
                 cascaded: false,
                 board_move: None,
             });
@@ -471,16 +498,16 @@ impl WorkflowEngine {
                     None,
                     None,
                     1,
+                    None,
                 )
                 .await?;
             cascaded.cascaded = true;
             return Ok(cascaded);
         }
 
-        let review = latest_review(&self.db, &task.id).await?;
         Ok(TransitionResult {
             task,
-            review,
+            review: None,
             cascaded: false,
             board_move: None,
         })
@@ -523,6 +550,7 @@ impl WorkflowEngine {
                 None,
                 None,
                 0,
+                None,
             )
             .await?;
         Ok(result.task)
@@ -654,6 +682,7 @@ impl WorkflowEngine {
         defer_dispatch_until: Option<String>,
         board_move: Option<BoardMoveRequest>,
         depth: u8,
+        causing_execution_id: Option<String>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<TransitionResult>> + Send + 'a>> {
         let span = tracing::info_span!(
             "workflow.transition_inner",
@@ -693,6 +722,25 @@ impl WorkflowEngine {
                     db::DbError::VersionConflict.into()
                 });
             }
+
+            let causal_execution = match causing_execution_id.as_deref() {
+                Some(id) => {
+                    let execution = db::ExecutionRepo::get_by_id(&*self.db, id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("execution", id.to_owned()))?;
+                    if execution.task_id != task.id
+                        || execution.role != default_roles::REVIEWER
+                        || execution.purpose != Some(db::ExecutionPurpose::Review)
+                        || execution.status != db::ExecutionStatus::Completed
+                    {
+                        return Err(ServiceError::invalid_operation(
+                            "workflow execution cause must be the exact completed reviewer Review Execution",
+                        ));
+                    }
+                    Some(execution)
+                }
+                None => None,
+            };
 
             let current_status = task.status.to_string();
             tracing::debug!(
@@ -805,22 +853,27 @@ impl WorkflowEngine {
             let workflow_ctx = Arc::new(workflow.clone());
             let latest_execution = latest_execution_context(&self.db, &task.id).await?;
             let latest_executor = latest_executor_context(&self.db, &task.id).await?;
-            let workspace_id = latest_execution
-                .as_ref()
-                .and_then(|execution| execution.workspace_id.clone())
-                .or_else(|| {
-                    latest_executor
-                        .as_ref()
-                        .and_then(|execution| execution.workspace_id.clone())
-                });
-            let execution_id = latest_executor
-                .as_ref()
-                .map(|execution| execution.id.clone())
-                .or_else(|| {
-                    latest_execution
-                        .as_ref()
-                        .map(|execution| execution.id.clone())
-                });
+            let (workspace_id, context_agent_id) =
+                if let Some(execution) = causal_execution.as_ref() {
+                    (
+                        execution.workspace_id.clone(),
+                        execution.agent_id.clone(),
+                    )
+                } else {
+                    (
+                        latest_execution
+                            .as_ref()
+                            .and_then(|execution| execution.workspace_id.clone())
+                            .or_else(|| {
+                                latest_executor
+                                    .as_ref()
+                                    .and_then(|execution| execution.workspace_id.clone())
+                            }),
+                        latest_execution
+                            .as_ref()
+                            .and_then(|execution| execution.agent_id.clone()),
+                    )
+                };
 
             let exit_ctx = HookContext {
                 task_id: task.id.clone(),
@@ -843,10 +896,8 @@ impl WorkflowEngine {
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
                 workspace_id: workspace_id.clone(),
-                agent_id: latest_execution
-                    .as_ref()
-                    .and_then(|execution| execution.agent_id.clone()),
-                execution_id: execution_id.clone(),
+                agent_id: context_agent_id.clone(),
+                execution_id: causing_execution_id.clone(),
                 state_config: from_state_config,
             };
             let enter_ctx = HookContext {
@@ -870,10 +921,8 @@ impl WorkflowEngine {
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
                 workspace_id,
-                agent_id: latest_execution
-                    .as_ref()
-                    .and_then(|execution| execution.agent_id.clone()),
-                execution_id,
+                agent_id: context_agent_id,
+                execution_id: causing_execution_id.clone(),
                 state_config: to_state_config,
             };
 
@@ -1091,10 +1140,9 @@ impl WorkflowEngine {
                     .await?;
                     match persistence {
                         MoveTaskPersistence::Replayed(result) => {
-                            let review = latest_review(&self.db, &result.task.id).await?;
                             return Ok(TransitionResult {
                                 task: result.task.clone(),
-                                review,
+                                review: None,
                                 cascaded: false,
                                 board_move: Some(BoardMoveOutcome::Replayed(*result)),
                             });
@@ -1753,10 +1801,9 @@ impl WorkflowEngine {
                         cascade_reason = %cascade_reason,
                         "workflow cascade paused because gate requires user approval"
                     );
-                    let review = latest_review(&self.db, &task.id).await?;
                     return Ok(TransitionResult {
                         task,
-                        review,
+                        review: None,
                         cascaded: false,
                         board_move: board_move_outcome,
                     });
@@ -1812,6 +1859,7 @@ impl WorkflowEngine {
                             None,
                             None,
                             depth + 1,
+                            causing_execution_id.clone(),
                         )
                         .await?;
                     cascaded.cascaded = true;
@@ -1820,11 +1868,9 @@ impl WorkflowEngine {
                 }
             }
 
-            let review = latest_review(&self.db, &task.id).await?;
-
             Ok(TransitionResult {
                 task,
-                review,
+                review: None,
                 cascaded: false,
                 board_move: board_move_outcome,
             })

@@ -7,17 +7,22 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
+    ActorRef, AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
     ExecutionResponse, ExecutionStatus, PaginatedResponse, ProjectResponse, RepoResponse,
-    TaskResponse, TaskStatus, TerminalAttachTokenResponse, TerminalServerFrame,
-    TerminalSessionResponse, TerminalSessionStatus,
+    ReviewExecutionResponse, ReviewReportVerdict, StartReviewExecutionRequest,
+    SubmitReviewReportRequest, SubmitReviewReportResponse, TaskResponse, TaskStatus,
+    TerminalAttachTokenResponse, TerminalServerFrame, TerminalSessionResponse,
+    TerminalSessionStatus,
 };
 use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use db::{ProjectHookRunRepo, ReviewRepo, TaskRepo};
+use db::{
+    new_uuid_v4, now_rfc3339, AssigneeKind, CreateTaskRoleAssignment, ProjectHookRunRepo, TaskRepo,
+    TaskRoleAssignmentRepo, ValidationRunRepo, ValidationRunStatus,
+};
 use events::{EventBus, EventContext, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -31,6 +36,12 @@ async fn forge_happy_path_end_to_end() {
 
     let workspaces_root = TestDir::new("forge-happy-workspaces");
     let harness = test_app(workspaces_root.path()).await;
+    harness
+        .state
+        .workflow_template_service
+        .initialize()
+        .await
+        .expect("builtin workflow templates initialize");
     let mut events_rx = harness.event_bus.subscribe();
 
     let project: ProjectResponse = json_request(
@@ -42,6 +53,14 @@ async fn forge_happy_path_end_to_end() {
     )
     .await;
     let project_id = project.id;
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "template_name": "autonomous_v1" }),
+        StatusCode::OK,
+    )
+    .await;
 
     let repo: RepoResponse = json_request(
         &harness.app,
@@ -98,8 +117,9 @@ async fn forge_happy_path_end_to_end() {
     )
     .await;
     let task_id = created_task.id;
-    assert_eq!(created_task.status, "todo".to_owned());
+    assert_eq!(created_task.status, "ready".to_owned());
     assert_eq!(created_task.version, 1);
+    assign_test_user_as_reviewer(&harness.state.db, &task_id).await;
 
     let claimed: TaskResponse = json_request(
         &harness.app,
@@ -109,8 +129,7 @@ async fn forge_happy_path_end_to_end() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(claimed.status, "in_progress".to_owned());
-    assert_eq!(claimed.version, 2);
+    assert_eq!(claimed.status, "working".to_owned());
 
     let execution = single_execution_for_task(&harness.app, &task_id).await;
     let execution_id = execution.id.clone();
@@ -120,6 +139,18 @@ async fn forge_happy_path_end_to_end() {
     poll_until_workspace_written(&harness.app, &task_id, &greeting_path).await;
     poll_until_execution_completed(&harness.state.db, &execution_id).await;
 
+    let awaiting_human = poll_until_task_awaiting_human(&harness.app, &task_id).await;
+    let review = submit_human_review(
+        &harness.app,
+        &task_id,
+        ReviewReportVerdict::Pass,
+        "The committed file satisfies the requested change.",
+    )
+    .await;
+    assert_eq!(
+        review.review_execution.execution.status,
+        ExecutionStatus::Completed
+    );
     let completed = poll_until_task_status(&harness.app, &task_id, "done".to_owned()).await;
     assert_eq!(
         completed.status,
@@ -137,20 +168,37 @@ async fn forge_happy_path_end_to_end() {
         "workspace task directory is cleaned"
     );
 
-    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+    let validations = ValidationRunRepo::list_validation_runs_by_task(&*harness.state.db, &task_id)
         .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, db::ReviewStatus::Passed);
-    assert_eq!(reviews[0].attempt_number, 1);
-    let step_results: serde_json::Value =
-        serde_json::from_str(&reviews[0].step_results_json).expect("step results parse");
-    let ci_steps = step_results
-        .get("ci_steps")
-        .cloned()
-        .unwrap_or(step_results.clone());
-    assert_eq!(ci_steps.as_array().expect("step results array").len(), 1);
-    assert_eq!(ci_steps[0]["exit_code"], 0);
+        .expect("ValidationRun history loads");
+    assert_eq!(validations.len(), 1);
+    assert_eq!(validations[0].status, ValidationRunStatus::Passed);
+    assert_eq!(validations[0].command, "test -f greeting.txt");
+    assert!(!validations[0].workspace_id.is_empty());
+    assert!(!validations[0].commit_sha.is_empty());
+    assert_eq!(
+        ValidationRunRepo::list_evidence_for_validation_run(&*harness.state.db, &validations[0].id)
+            .await
+            .expect("Validation Evidence loads")
+            .len(),
+        1
+    );
+    assert!(
+        db::ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+            .await
+            .expect("legacy Review rows load")
+            .is_empty(),
+        "new deterministic checks do not write legacy Review rows"
+    );
+    let validation_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'validation_run.completed' AND entity_id = ?",
+    )
+    .bind(&validations[0].id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("durable ValidationRun completion event loads");
+    assert_eq!(validation_event_count, 1);
+    assert!(awaiting_human.awaiting_human);
 
     let listed_tasks: PaginatedResponse<TaskResponse> = empty_request(
         &harness.app,
@@ -186,9 +234,9 @@ async fn forge_happy_path_end_to_end() {
     let events = drain_events(&mut events_rx).await;
     assert_event_type(&events, "task.created");
     assert_event_type(&events, "task.assigned");
-    assert_status_event(&events, &task_id, "in_progress");
+    assert_status_event(&events, &task_id, "working");
     assert_event_type(&events, "task.auto_transitioned");
-    assert_event_type(&events, "review.passed");
+    assert_event_type(&events, "domain_event.committed");
     assert_status_event(&events, &task_id, "review");
     assert_status_event(&events, &task_id, "merging");
     assert_status_event(&events, &task_id, "done");
@@ -202,7 +250,7 @@ async fn forge_happy_path_end_to_end() {
 }
 
 #[tokio::test]
-async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject() {
+async fn autonomous_workflow_request_changes_starts_a_fresh_worker_from_review_report() {
     let repo_dir = TestDir::new("forge-autonomous-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
@@ -273,6 +321,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     )
     .await;
     assert_eq!(task.status, "ready".to_owned());
+    assign_test_user_as_reviewer(&harness.state.db, &task.id).await;
 
     let claimed: TaskResponse = json_request(
         &harness.app,
@@ -288,15 +337,14 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
 
     let review_task = poll_until_task_awaiting_human(&harness.app, &task.id).await;
 
-    let approved: TaskResponse = json_request(
+    assert!(review_task.awaiting_human);
+    submit_human_review(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/gates/review/approve", task.id),
-        json!({ "version": review_task.version, "reason": "human approval" }),
-        StatusCode::OK,
+        &task.id,
+        ReviewReportVerdict::Pass,
+        "Human review approves this delivery.",
     )
     .await;
-    assert!(matches!(approved.status.as_str(), "merging" | "done"));
     let completed = poll_until_task_status(&harness.app, &task.id, "done".to_owned()).await;
     assert_eq!(completed.status, "done".to_owned());
 
@@ -312,6 +360,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         StatusCode::OK,
     )
     .await;
+    assign_test_user_as_reviewer(&harness.state.db, &ci_failure_task.id).await;
     let claimed_ci_failure: TaskResponse = json_request(
         &harness.app,
         Method::POST,
@@ -364,26 +413,30 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     .await;
 
     let ci_review = poll_until_task_awaiting_human(&harness.app, &ci_failure_task.id).await;
-    let ci_approved: TaskResponse = json_request(
+    assert!(ci_review.awaiting_human);
+    submit_human_review(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/gates/review/approve", ci_failure_task.id),
-        json!({ "version": ci_review.version, "reason": "human approval" }),
-        StatusCode::OK,
+        &ci_failure_task.id,
+        ReviewReportVerdict::Pass,
+        "The corrected validation run and delivery pass review.",
     )
     .await;
-    assert!(matches!(ci_approved.status.as_str(), "merging" | "done"));
     let ci_completed =
         poll_until_task_status(&harness.app, &ci_failure_task.id, "done".to_owned()).await;
     assert_eq!(ci_completed.status, "done".to_owned());
-    let ci_reviews = ReviewRepo::list_by_task(&*harness.state.db, &ci_failure_task.id)
-        .await
-        .expect("CI retry reviews load");
+    let ci_validations =
+        ValidationRunRepo::list_validation_runs_by_task(&*harness.state.db, &ci_failure_task.id)
+            .await
+            .expect("CI retry ValidationRuns load");
+    assert_eq!(ci_validations.len(), 2);
+    assert_eq!(ci_validations[0].status, ValidationRunStatus::Failed);
+    assert_eq!(ci_validations[1].status, ValidationRunStatus::Passed);
     assert!(
-        ci_reviews
-            .iter()
-            .any(|review| review.status == db::ReviewStatus::Failed),
-        "the first validation attempt should be recorded as failed"
+        db::ReviewRepo::list_by_task(&*harness.state.db, &ci_failure_task.id)
+            .await
+            .expect("legacy Review rows load")
+            .is_empty(),
+        "failed and passing checks remain ValidationRuns, independent of Review"
     );
 
     let second_task: TaskResponse = json_request(
@@ -398,6 +451,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         StatusCode::OK,
     )
     .await;
+    assign_test_user_as_reviewer(&harness.state.db, &second_task.id).await;
     let claimed_second: TaskResponse = json_request(
         &harness.app,
         Method::POST,
@@ -408,28 +462,101 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     .await;
     assert_eq!(claimed_second.status, "working".to_owned());
     let second_execution = single_execution_for_task(&harness.app, &second_task.id).await;
+    assert_eq!(second_execution.role.to_string(), "worker");
     let second_review = poll_until_task_awaiting_human(&harness.app, &second_task.id).await;
 
-    let rejected: TaskResponse = json_request(
+    assert!(second_review.awaiting_human);
+    let request_changes = submit_human_review(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/gates/review/reject", second_task.id),
-        json!({
-            "version": second_review.version,
-            "reason": "Please add evidence for the requested behavior"
-        }),
+        &second_task.id,
+        ReviewReportVerdict::RequestChanges,
+        "Please add evidence for the requested behavior.",
+    )
+    .await;
+    assert_eq!(
+        request_changes.review_execution.execution.status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(
+        request_changes.report.kind,
+        api_types::ArtifactKind::ReviewReport
+    );
+
+    let resumed =
+        poll_until_fresh_worker_execution(&harness.app, &second_task.id, &second_execution.id)
+            .await;
+    assert_eq!(resumed.role.to_string(), "worker");
+    assert_ne!(resumed.id, request_changes.review_execution.execution.id);
+    assert_ne!(resumed.id, second_execution.id);
+    assert!(resumed.parent_execution_id.is_none());
+    let messages: PaginatedResponse<api_types::MessageResponse> = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/messages", second_task.id),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(rejected.status, "working".to_owned());
+    assert!(messages.items.iter().any(|message| {
+        message.artifact_ids.contains(&request_changes.report.id)
+            && matches!(message.sender, ActorRef::Human(ref user_id) if user_id == "test-user-id")
+    }), "request-changes collaboration message must attach the exact ReviewReport");
+}
 
-    let resumed =
-        poll_until_follow_up_execution(&harness.app, &second_task.id, &second_execution.id).await;
-    assert_eq!(resumed.role.to_string(), "worker");
+async fn assign_test_user_as_reviewer(db: &db::SqliteDb, task_id: &str) {
+    TaskRoleAssignmentRepo::assign(
+        db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            role_name: "reviewer".to_owned(),
+            assignee_type: Some(AssigneeKind::User),
+            assignee_id: Some("test-user-id".to_owned()),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("test Human reviewer assignment persists");
+}
+
+async fn submit_human_review(
+    app: &Router,
+    task_id: &str,
+    verdict: ReviewReportVerdict,
+    summary: &str,
+) -> SubmitReviewReportResponse {
+    let review: ReviewExecutionResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/review"),
+        serde_json::to_value(StartReviewExecutionRequest { workspace_id: None })
+            .expect("review start request serializes"),
+        StatusCode::OK,
+    )
+    .await;
     assert_eq!(
-        resumed.parent_execution_id.as_deref(),
-        Some(second_execution.id.as_str())
+        review.execution.actor_ref,
+        Some(ActorRef::Human("test-user-id".to_owned()))
     );
+    assert_eq!(review.execution.role.to_string(), "reviewer");
+    assert_eq!(review.execution.purpose.as_deref(), Some("review"));
+    json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/reviews/{}", review.execution.id),
+        serde_json::to_value(SubmitReviewReportRequest {
+            verdict,
+            summary: summary.to_owned(),
+            criteria: vec!["acceptance criteria".to_owned()],
+            findings: Vec::new(),
+            questions: Vec::new(),
+            evidence_ids: Vec::new(),
+            artifact_ids: Vec::new(),
+        })
+        .expect("ReviewReport request serializes"),
+        StatusCode::OK,
+    )
+    .await
 }
 
 struct TestHarness {
@@ -814,6 +941,31 @@ async fn poll_until_follow_up_execution(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("worker follow-up execution was not recorded");
+}
+
+async fn poll_until_fresh_worker_execution(
+    app: &Router,
+    task_id: &str,
+    previous_execution_id: &str,
+) -> ExecutionResponse {
+    for _ in 0..100 {
+        let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+            app,
+            Method::GET,
+            &format!("/api/v1/tasks/{task_id}/executions"),
+            StatusCode::OK,
+        )
+        .await;
+        if let Some(execution) = executions
+            .items
+            .into_iter()
+            .find(|execution| execution.role == "worker" && execution.id != previous_execution_id)
+        {
+            return execution;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fresh worker execution was not recorded after the ReviewReport");
 }
 
 async fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<ForgeEvent>) -> Vec<ForgeEvent> {

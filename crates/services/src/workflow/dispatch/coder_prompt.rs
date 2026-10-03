@@ -1,5 +1,3 @@
-use db::ReviewStatus;
-
 use crate::workflow::{
     default_roles, default_states,
     dispatch::{
@@ -103,11 +101,6 @@ fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -
         system.push_str(reason);
         system.push_str(". Address it in this attempt.");
     }
-    if let Some(attempt) = last_failed_review_attempt(ctx) {
-        system.push_str(&format!(
-            "\n\nThis task has failed review {attempt} time(s). Focus on addressing the review feedback precisely."
-        ));
-    }
     system
 }
 
@@ -156,27 +149,6 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn review_fix_user(ctx: &AgentDispatchContext) -> String {
-    if let Some(reason) = latest_ci_failure_reason(ctx) {
-        let mut user = format!("Task: {}\n", ctx.task.title);
-        user.push_str(
-            "\nCI failed during review. Fix only the failing check below, keep the existing implementation direction, and commit the minimal correction.\n",
-        );
-        user.push_str("\nCI failure:\n");
-        user.push_str(&reason);
-        user.push('\n');
-        if let Some(execution_id) = ctx.continuation_of_execution_id.as_deref() {
-            user.push_str("\nPrevious coder execution:\n");
-            user.push_str(execution_id);
-            user.push('\n');
-        }
-        if let Some(logs_path) = ctx.continuation_logs_path.as_deref() {
-            user.push_str("\nPrevious coder log file:\n");
-            user.push_str(logs_path);
-            user.push('\n');
-        }
-        return user;
-    }
-
     let mut user = format!("Task: {}\n", ctx.task.title);
     if let Some(description) = ctx.task.description.as_deref() {
         user.push_str("\nDescription:\n");
@@ -189,21 +161,11 @@ fn review_fix_user(ctx: &AgentDispatchContext) -> String {
         user.push('\n');
     }
     user.push_str(
-        "\nThe reviewer agent flagged the previous implementation. Inspect the current worktree diff, address only the review findings, and commit your fixes. The task will return to the reviewer agent for re-verification.\n",
+        "\nA Collaboration Message attached the exact ReviewReport that requests changes. Inspect the current worktree, address those findings, and keep the repair scoped.\n",
     );
-    if let Some(reason) = review_feedback(ctx) {
-        user.push_str("\nReview feedback:\n");
+    if let Some(reason) = collaboration_context(ctx) {
+        user.push_str("\nCollaboration Message and attached Artifact:\n");
         user.push_str(&reason);
-        user.push('\n');
-    }
-    if let Some(execution_id) = ctx.latest_review_execution_id.as_deref() {
-        user.push_str("\nReviewer execution:\n");
-        user.push_str(execution_id);
-        user.push('\n');
-    }
-    if let Some(logs_path) = ctx.latest_review_logs_path.as_deref() {
-        user.push_str("\nReviewer log file:\n");
-        user.push_str(logs_path);
         user.push('\n');
     }
     if let Some(execution_id) = ctx.continuation_of_execution_id.as_deref() {
@@ -216,37 +178,11 @@ fn review_fix_user(ctx: &AgentDispatchContext) -> String {
         user.push_str(logs_path);
         user.push('\n');
     }
-    if let Some(attempt) = last_failed_review_attempt(ctx) {
-        user.push_str(&format!(
-            "\nReview attempt {attempt} failed. Address the review feedback, keep the change scoped, and resubmit.\n"
-        ));
-    }
     user
 }
 
-fn latest_ci_failure_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    ctx.prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-        .and_then(|review| {
-            let value =
-                serde_json::from_str::<serde_json::Value>(&review.step_results_json).ok()?;
-            let has_auditor = value
-                .get("auditor")
-                .is_some_and(|auditor| !auditor.is_null());
-            if has_auditor {
-                return None;
-            }
-            ci_failure_reason(&value)
-        })
-}
-
-fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
+fn merge_fix_user(_ctx: &AgentDispatchContext) -> String {
     let mut user = String::new();
-    if ctx.task.review_passed_at.is_some() {
-        user.push_str("merge-conflict re-review: the reviewer already approved this task, but the merge failed due to conflicts. Since the review already passed, only CI checks will run after your fix — the reviewer will not re-review. Focus solely on resolving the merge conflicts without redesigning the change.\n\n");
-    }
     user.push_str("Rebase your worktree branch onto the latest default branch, resolve the merge conflicts, and verify CI passes.");
     user
 }
@@ -259,78 +195,10 @@ fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {
         .map(|entry| entry.trigger_reason.clone())
 }
 
-fn last_failed_review_attempt(ctx: &AgentDispatchContext) -> Option<i64> {
-    ctx.prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .map(|review| review.attempt_number)
-        .max()
-}
-
-fn last_review_rejection_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    let review_reason = ctx
-        .prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-        .and_then(|review| review_failure_reason(&review.step_results_json));
-    if review_reason.is_some() {
-        return review_reason;
-    }
-
-    ctx.transition_log
-        .iter()
-        .rev()
-        .find(|entry| {
-            entry.from_state == default_states::REVIEW
-                && entry.to_state == ctx.state_name
-                && entry.rejection
-        })
-        .map(|entry| entry.trigger_reason.clone())
-}
-
-fn review_feedback(ctx: &AgentDispatchContext) -> Option<String> {
+fn collaboration_context(ctx: &AgentDispatchContext) -> Option<String> {
     ctx.latest_review_feedback
         .as_deref()
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
         .map(str::to_owned)
-        .or_else(|| last_review_rejection_reason(ctx))
-}
-
-fn review_failure_reason(step_results_json: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(step_results_json).ok()?;
-    value
-        .get("auditor")
-        .and_then(|auditor| auditor.get("reason"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| ci_failure_reason(&value))
-}
-
-fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
-    let steps = value
-        .get("ci_steps")
-        .or_else(|| if value.is_array() { Some(value) } else { None })?
-        .as_array()?;
-    let failed = steps.iter().find(|step| {
-        step.get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| code != 0)
-    })?;
-    let command = failed
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("CI step");
-    let output = failed
-        .get("output_tail")
-        .and_then(serde_json::Value::as_str)
-        .filter(|output| !output.trim().is_empty())
-        .or_else(|| {
-            failed
-                .get("stderr_tail")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or("");
-    Some(format!("CI failed: {command}\n{output}"))
 }

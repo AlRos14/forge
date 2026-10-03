@@ -9,8 +9,7 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AuthorType, CommentResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    ReviewDecisionResponse, TaskResponse,
+    AuthorType, CommentResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -74,61 +73,41 @@ fn review_config_serializes_without_auditor_agent_id() {
 // ── Test 13.5: reject_review bounces to in_progress ──
 
 #[tokio::test]
-async fn reject_review_bounces_to_in_progress() {
+async fn task_level_reject_does_not_create_review_verdict() {
     let workspace_root = TestDir::new("forge-manual-review-reject");
     let harness = test_app(workspace_root.path()).await;
-
-    let (task_id, _review_id) = seed_awaiting_human_review(
-        &harness.state.db,
-        r#"{"retry_budgets":{"review":3,"merge_fix":1}}"#,
-        workspace_root.path(),
-    )
-    .await;
-
-    let result: ReviewDecisionResponse = json_request(
+    let task_id = seed_task_with_system_comment(&harness.state.db).await;
+    let response = raw_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/review/reject"),
         json!({ "reason": "bad code quality" }),
-        StatusCode::OK,
     )
     .await;
-
-    assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
-    assert_eq!(result.task.status, "in_progress".to_owned());
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
-async fn reject_review_without_reason_uses_default() {
+async fn task_level_reject_without_reason_is_retired() {
     let workspace_root = TestDir::new("forge-manual-review-reject-default");
     let harness = test_app(workspace_root.path()).await;
-
-    let (task_id, _review_id) = seed_awaiting_human_review(
-        &harness.state.db,
-        r#"{"retry_budgets":{"review":3,"merge_fix":1}}"#,
-        workspace_root.path(),
-    )
-    .await;
-
-    let result: ReviewDecisionResponse = json_request(
+    let task_id = seed_task_with_system_comment(&harness.state.db).await;
+    let response = raw_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/review/reject"),
         json!({}),
-        StatusCode::OK,
     )
     .await;
-
-    assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
-    assert_eq!(result.task.status, "in_progress".to_owned());
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
-async fn approve_review_returns_409_when_not_awaiting_human() {
+async fn task_level_approve_is_retired() {
     let workspace_root = TestDir::new("forge-manual-review-409");
     let harness = test_app(workspace_root.path()).await;
 
-    let task_id = seed_review_with_status(&harness.state.db, ReviewStatus::Passed).await;
+    let task_id = seed_task_with_system_comment(&harness.state.db).await;
 
     let response = raw_request(
         &harness.app,
@@ -138,7 +117,7 @@ async fn approve_review_returns_409_when_not_awaiting_human() {
     )
     .await;
 
-    // Returns 409 because the review status doesn't match the expected state
+    // Task-level approval no longer creates or changes a Review result.
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
@@ -256,141 +235,22 @@ async fn system_comments_cannot_be_deleted() {
     assert_eq!(delete_response.status(), StatusCode::FORBIDDEN);
 }
 
-// ── Test 13.7: system comments auto-created ──
+// ── Review decisions target an exact Human Review Execution. ──
 
 #[tokio::test]
-async fn reject_review_creates_system_comment_with_reason() {
-    let workspace_root = TestDir::new("forge-sys-comment-reject");
+async fn task_level_approval_does_not_terminalize_work() {
+    let workspace_root = TestDir::new("forge-task-review-approval-retired");
     let harness = test_app(workspace_root.path()).await;
+    let task_id = seed_task_with_system_comment(&harness.state.db).await;
 
-    let (task_id, _review_id) = seed_awaiting_human_review(
-        &harness.state.db,
-        r#"{"retry_budgets":{"review":3,"merge_fix":1}}"#,
-        workspace_root.path(),
-    )
-    .await;
-
-    let _result: ReviewDecisionResponse = json_request(
+    let response = raw_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "needs refactoring" }),
-        StatusCode::OK,
-    )
-    .await;
-
-    let comments: PaginatedResponse<CommentResponse> = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/comments"),
-        StatusCode::OK,
-    )
-    .await;
-
-    let system_comments: Vec<_> = comments
-        .items
-        .iter()
-        .filter(|c| c.author_type == AuthorType::System)
-        .collect();
-    assert!(
-        system_comments.iter().any(
-            |c| c.content.contains("Review failed") && c.content.contains("needs refactoring")
-        ),
-        "expected system comment with rejection reason, got: {:?}",
-        system_comments
-            .iter()
-            .map(|c| &c.content)
-            .collect::<Vec<_>>()
-    );
-}
-
-// ── Test 13.4: approve + full cascade with real git ──
-
-#[tokio::test]
-async fn approve_review_cascades_via_merge() {
-    let temp = TestDir::new("forge-approve-cascade");
-    let repo_path = temp.path().join("repo");
-    std::fs::create_dir_all(&repo_path).expect("create repo dir");
-    run_git(&repo_path, &["init", "--initial-branch=main"]);
-    run_git(&repo_path, &["config", "user.email", "test@test.com"]);
-    run_git(&repo_path, &["config", "user.name", "Test"]);
-    std::fs::write(repo_path.join("file.txt"), "base\n").expect("write file");
-    run_git(&repo_path, &["add", "."]);
-    run_git(&repo_path, &["commit", "-m", "initial"]);
-
-    let task_id = new_uuid_v4();
-    let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
-    std::fs::create_dir_all(worktree_path.parent().unwrap()).expect("create worktree parent");
-    run_git(
-        &repo_path,
-        &[
-            "worktree",
-            "add",
-            worktree_path.to_str().unwrap(),
-            "-b",
-            &::workspace::task_branch_name(&task_id),
-        ],
-    );
-    std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("write feature");
-    run_git(&worktree_path, &["add", "."]);
-    run_git(&worktree_path, &["commit", "-m", "feature"]);
-
-    let workspace_root = TestDir::new("forge-approve-cascade-workspaces");
-    let harness = test_app(workspace_root.path()).await;
-
-    let (seeded_task_id, _review_id) = seed_awaiting_human_review_with_workspace(
-        &harness.state.db,
-        &task_id,
-        &repo_path,
-        &worktree_path,
-    )
-    .await;
-
-    let result: ReviewDecisionResponse = json_request(
-        &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{seeded_task_id}/review/approve"),
+        &format!("/api/v1/tasks/{task_id}/review/approve"),
         json!({}),
-        StatusCode::OK,
     )
     .await;
-
-    assert_eq!(result.review.status, api_types::ReviewStatus::Passed);
-    assert_eq!(result.task.status, "done".to_owned());
-
-    // Verify system comment was created
-    let comments: PaginatedResponse<CommentResponse> = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{seeded_task_id}/comments"),
-        StatusCode::OK,
-    )
-    .await;
-    let system_comments: Vec<_> = comments
-        .items
-        .iter()
-        .filter(|c| c.author_type == AuthorType::System)
-        .collect();
-    assert!(
-        system_comments
-            .iter()
-            .any(|c| c.content.contains("Review passed")),
-        "expected 'Review passed' comment, got: {:?}",
-        system_comments
-            .iter()
-            .map(|c| &c.content)
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        system_comments
-            .iter()
-            .any(|c| c.content.contains("Changes merged to")),
-        "expected 'Changes merged' comment, got: {:?}",
-        system_comments
-            .iter()
-            .map(|c| &c.content)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 // ── Harness ──
