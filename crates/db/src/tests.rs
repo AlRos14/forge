@@ -1500,6 +1500,20 @@ fn pr8_human_review_start_inputs(
     )
 }
 
+fn pr8_workspace_free_human_review_start_inputs(
+    task_id: &str,
+    user_id: &str,
+    execution_id: &str,
+    created_at: &str,
+) -> (CreateExecution, CreateDomainEvent) {
+    let (mut execution, _unused_subject, event) =
+        pr8_human_review_start_inputs(task_id, user_id, "workspace-free", execution_id, created_at);
+    execution.workspace_id = None;
+    execution.before_sha = None;
+    execution.after_sha = None;
+    (execution, event)
+}
+
 async fn seed_pr6_orchestrator_event(
     db: &SqliteDb,
 ) -> (String, String, String, crate::DomainEvent) {
@@ -4520,6 +4534,78 @@ async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
     .expect("Report event lookup succeeds");
     assert_eq!(artifact_event_count, 0);
 
+    let generic_report_id = new_uuid_v4();
+    let generic_report_content = serde_json::json!({
+        "kind": "review_report",
+        "verdict": "pass",
+        "criteria": [],
+        "summary": "Generic Human output must also recheck authority",
+        "findings": [],
+        "questions": [],
+        "evidence_considered": [],
+        "subject": {
+            "task_id": task_id,
+            "review_execution_id": report_execution_id,
+            "workspace_id": workspace_id,
+            "base_commit_sha": subject.base_commit_sha,
+            "head_commit_sha": subject.head_commit_sha,
+            "workspace_snapshot_digest": subject.workspace_snapshot_digest,
+        }
+    })
+    .to_string();
+    let generic_report_digest =
+        hex::encode(sha2::Sha256::digest(generic_report_content.as_bytes()));
+    let generic_report_event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "artifact.created".to_owned(),
+        entity_type: "artifact".to_owned(),
+        entity_id: generic_report_id.clone(),
+        actor_type: "human".to_owned(),
+        actor_id: Some(user_id.clone()),
+        scope_type: "task".to_owned(),
+        scope_id: task_id.clone(),
+        correlation_id: report_execution_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(format!("artifact-created:{generic_report_id}")),
+        payload_json: "{}".to_owned(),
+        created_at: now.clone(),
+    };
+    let generic_write = crate::CollaborationRepo::create_execution_artifact_output(
+        &db,
+        crate::CreateArtifact {
+            id: generic_report_id.clone(),
+            task_id: task_id.clone(),
+            kind: crate::ArtifactKind::ReviewReport,
+            storage_kind: crate::ArtifactStorageKind::Inline,
+            content: Some(generic_report_content),
+            content_ref: None,
+            metadata_json: serde_json::json!({
+                "schema_version": 1,
+                "review_execution_id": report_execution_id,
+            })
+            .to_string(),
+            digest: Some(generic_report_digest),
+            producer_execution_id: report_execution_id.clone(),
+            created_at: now.clone(),
+        },
+        generic_report_event,
+    )
+    .await
+    .expect_err("generic ReviewReport output also enforces current Human authority");
+    assert!(matches!(
+        generic_write,
+        DbError::Check(message) if message.contains("current authoritative reviewer membership")
+    ));
+    assert!(crate::CollaborationRepo::get_execution_artifact_output(
+        &db,
+        &report_execution_id,
+        crate::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("generic ReviewReport lookup succeeds")
+    .is_none());
+
     let rejected_execution_id = new_uuid_v4();
     let (execution_input, subject_input, start_event) = pr8_human_review_start_inputs(
         &task_id,
@@ -4590,6 +4676,92 @@ async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
     .await
     .expect("exact legacy assignment remains valid without a replacement TaskRole");
     assert_eq!(legacy_write.execution.id, legacy_execution_id);
+}
+
+#[tokio::test]
+async fn pr8_workspace_free_human_review_start_rechecks_authority_transactionally() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let user_id = seed_user(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "Workspace-free transactional Human Review authority",
+    )
+    .await;
+    let (_, membership_id) = seed_pr8_human_reviewer_role(&db, &task_id, &user_id).await;
+    seed_pr8_legacy_human_reviewer_assignment(&db, &task_id, &user_id).await;
+    RoleMembershipRepo::update(
+        &db,
+        UpdateRoleMembership {
+            id: membership_id,
+            expected_version: 1,
+            status: RoleMembershipStatus::Suspended,
+            updated_at: now_rfc3339(),
+            ended_at: None,
+        },
+    )
+    .await
+    .expect("membership suspension leaves the stale legacy row in place");
+
+    let rejected_id = new_uuid_v4();
+    let (execution, event) = pr8_workspace_free_human_review_start_inputs(
+        &task_id,
+        &user_id,
+        &rejected_id,
+        &now_rfc3339(),
+    );
+    let rejected =
+        ExecutionRepo::create_human_review_execution_without_subject(&db, execution, event)
+            .await
+            .expect_err(
+                "replacement TaskRole with inactive membership rejects the workspace-free start",
+            );
+    assert!(matches!(
+        rejected,
+        DbError::Check(message) if message.contains("current authoritative reviewer membership")
+    ));
+    assert!(ExecutionRepo::get_by_id(&db, &rejected_id)
+        .await
+        .expect("rejected Execution lookup succeeds")
+        .is_none());
+    let rejected_start_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&rejected_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("rejected start event count reads");
+    assert_eq!(rejected_start_events, 0);
+
+    let legacy_task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "Workspace-free legacy Human Review fallback",
+    )
+    .await;
+    seed_pr8_legacy_human_reviewer_assignment(&db, &legacy_task_id, &user_id).await;
+    let legacy_execution_id = new_uuid_v4();
+    let (execution, event) = pr8_workspace_free_human_review_start_inputs(
+        &legacy_task_id,
+        &user_id,
+        &legacy_execution_id,
+        &now_rfc3339(),
+    );
+    let (created, committed_event) =
+        ExecutionRepo::create_human_review_execution_without_subject(&db, execution, event)
+            .await
+            .expect("exact legacy assignment is used when no replacement TaskRole exists");
+    assert_eq!(created.id, legacy_execution_id);
+    assert!(created.workspace_id.is_none());
+    assert_eq!(committed_event.event_type, "execution.started");
 }
 
 async fn insert_pr8_review_report(

@@ -163,6 +163,23 @@ async fn sqlite_db() -> SqliteDb {
     SqliteDb::new(pool)
 }
 
+fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git command runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir) {
     let now = now_rfc3339();
     let project_id = new_uuid_v4();

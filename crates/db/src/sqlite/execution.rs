@@ -51,6 +51,71 @@ fn review_subject_identity_matches(
         && current.workspace_snapshot_digest == proposed.workspace_snapshot_digest
 }
 
+async fn create_human_review_execution(
+    db: &SqliteDb,
+    input: CreateExecution,
+    subject: Option<CreateReviewExecutionSubject>,
+    event: CreateDomainEvent,
+) -> Result<(Execution, Option<ReviewExecutionSubject>, DomainEvent)> {
+    let human_actor_id = match input.actor_ref.as_ref() {
+        Some(ActorRef::Human(user_id)) => Some(user_id.as_str()),
+        _ => None,
+    };
+    let subject_matches = match subject.as_ref() {
+        Some(subject) => {
+            input.workspace_id.as_deref() == Some(subject.workspace_id.as_str())
+                && input.before_sha.as_deref() == Some(subject.base_commit_sha.as_str())
+                && input.after_sha.as_deref() == Some(subject.head_commit_sha.as_str())
+                && input.id == subject.execution_id
+                && input.task_id == subject.task_id
+        }
+        None => {
+            input.workspace_id.is_none() && input.before_sha.is_none() && input.after_sha.is_none()
+        }
+    };
+    if input.status != ExecutionStatus::Running
+        || input.role != "reviewer"
+        || input.purpose != Some(ExecutionPurpose::Review)
+        || human_actor_id.is_none()
+        || !subject_matches
+        || event.event_type != "execution.started"
+        || event.entity_type != "execution"
+        || event.entity_id != input.id
+        || event.scope_type != "task"
+        || event.scope_id != input.task_id
+        || event.actor_type != "human"
+        || event.actor_id.as_deref() != human_actor_id
+    {
+        return Err(DbError::Check(
+            "Human Review Execution, optional exact subject, and start event must share one identity"
+                .to_owned(),
+        ));
+    }
+
+    let mut tx = db.pool.begin().await?;
+    if !human_has_current_role_authority_in_tx(
+        &mut tx,
+        &input.task_id,
+        "reviewer",
+        human_actor_id.expect("shape validation requires a Human Actor"),
+    )
+    .await?
+    {
+        return Err(DbError::Check(
+            "new Human Review Execution requires current authoritative reviewer membership"
+                .to_owned(),
+        ));
+    }
+    let execution = SqliteDb::create_execution_in_tx(&mut tx, &input, None).await?;
+    let subject = match subject.as_ref() {
+        Some(subject) => Some(insert_review_execution_subject_in_tx(&mut tx, subject).await?),
+        None => None,
+    };
+    let event = DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
+    tx.commit().await?;
+    Ok((execution, subject, event))
+}
+
 /// Recheck current Human role authority inside the same SQLite transaction as
 /// an authoritative Review write. Once the replacement TaskRole exists, the
 /// membership is the sole authority; the legacy singleton is used only when
@@ -126,55 +191,24 @@ impl ExecutionRepo for SqliteDb {
         subject: CreateReviewExecutionSubject,
         event: CreateDomainEvent,
     ) -> Result<ReviewExecutionSubjectWrite> {
-        let human_actor_id = match input.actor_ref.as_ref() {
-            Some(ActorRef::Human(user_id)) => Some(user_id.as_str()),
-            _ => None,
-        };
-        if input.status != ExecutionStatus::Running
-            || input.role != "reviewer"
-            || input.purpose != Some(ExecutionPurpose::Review)
-            || human_actor_id.is_none()
-            || input.workspace_id.as_deref() != Some(subject.workspace_id.as_str())
-            || input.before_sha.as_deref() != Some(subject.base_commit_sha.as_str())
-            || input.after_sha.as_deref() != Some(subject.head_commit_sha.as_str())
-            || input.id != subject.execution_id
-            || input.task_id != subject.task_id
-            || event.event_type != "execution.started"
-            || event.entity_type != "execution"
-            || event.entity_id != input.id
-            || event.scope_type != "task"
-            || event.scope_id != input.task_id
-            || event.actor_type != "human"
-            || event.actor_id.as_deref() != human_actor_id
-        {
-            return Err(DbError::Check(
-                "Human Review Execution, exact subject, and start event must share one identity"
-                    .to_owned(),
-            ));
-        }
-        let mut tx = self.pool.begin().await?;
-        if !human_has_current_role_authority_in_tx(
-            &mut tx,
-            &input.task_id,
-            "reviewer",
-            human_actor_id.expect("shape validation requires a Human Actor"),
-        )
-        .await?
-        {
-            return Err(DbError::Check(
-                "new Human Review Execution requires current authoritative reviewer membership"
-                    .to_owned(),
-            ));
-        }
-        let execution = Self::create_execution_in_tx(&mut tx, &input, None).await?;
-        let subject = insert_review_execution_subject_in_tx(&mut tx, &subject).await?;
-        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
-        tx.commit().await?;
+        let (execution, subject, event) =
+            create_human_review_execution(self, input, Some(subject), event).await?;
         Ok(ReviewExecutionSubjectWrite {
             execution,
-            subject,
+            subject: subject.expect("workspace-bound method supplies a subject"),
             event: Some(event),
         })
+    }
+
+    async fn create_human_review_execution_without_subject(
+        &self,
+        input: CreateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)> {
+        let (execution, subject, event) =
+            create_human_review_execution(self, input, None, event).await?;
+        debug_assert!(subject.is_none());
+        Ok((execution, event))
     }
 
     async fn freeze_review_execution_subject(

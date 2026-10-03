@@ -146,6 +146,18 @@ impl TaskService {
                 "only running executions can be started",
             ));
         }
+        if execution.role == crate::workflow::default_roles::REVIEWER
+            && execution.purpose == Some(ExecutionPurpose::Review)
+            && self
+                .reconcile_existing_review_report(&execution, None, None)
+                .await?
+                .is_some()
+        {
+            return Ok(api_types::ExecutionStartResult {
+                execution_id: execution.id,
+                accepted: false,
+            });
+        }
         // Remote and local adapters both require the scheduler-issued lease;
         // checking at this boundary closes the gap between execution-row
         // creation and adapter launch/recovery.
@@ -224,6 +236,16 @@ impl TaskService {
             return Err(ServiceError::invalid_operation(
                 "only running executions can be executed",
             ));
+        }
+        if execution.role == crate::workflow::default_roles::REVIEWER
+            && execution.purpose == Some(ExecutionPurpose::Review)
+        {
+            if let Some((completed, _report)) = self
+                .reconcile_existing_review_report(&execution, None, None)
+                .await?
+            {
+                return Ok(completed);
+            }
         }
         if let Some(failed) = self
             .wait_for_agent_active_before_dispatch(&execution)

@@ -22,6 +22,7 @@ const OUTPUT_TAIL_LIMIT: usize = 8 * 1024;
 const CLAIM_SECONDS: i64 = 60;
 const HEARTBEAT_SECONDS: u64 = 20;
 const COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
+// The HEAD-to-index and HEAD-to-worktree diffs share one total byte budget.
 const MAX_TRACKED_DIFF_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UNTRACKED_PATH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UNTRACKED_FILES: usize = 100_000;
@@ -551,41 +552,38 @@ async fn read_head(worktree_path: &str) -> Result<String> {
 
 pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<String> {
     let environment = capture_environment()?;
-    let mut tracked = Command::new("git")
-        .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
-        .current_dir(worktree_path)
-        .env_clear()
-        .envs(environment.iter().cloned())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "could not snapshot tracked workspace files: {error}"
-            ))
-        })?;
-    let mut tracked_output = Sha256::new();
-    let tracked_stdout = tracked.stdout.take().expect("git stdout was piped");
-    let tracked_bytes = hash_reader_into(
-        tracked_stdout,
-        &mut tracked_output,
+    let (staged_bytes, staged_digest) = bounded_git_diff_digest(
+        worktree_path,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+        &environment,
         MAX_TRACKED_DIFF_BYTES as u64,
+        "staged workspace files",
     )
-    .await
-    .map_err(|error| {
-        ServiceError::invalid_operation(format!("could not hash tracked workspace files: {error}"))
-    })?;
-    if !tracked
-        .wait()
-        .await
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
-        return Err(ServiceError::invalid_operation(
-            "could not snapshot tracked workspace files",
-        ));
-    }
+    .await?;
+    let remaining_tracked_bytes = (MAX_TRACKED_DIFF_BYTES as u64).saturating_sub(staged_bytes);
+    let (tracked_bytes, tracked_digest) = bounded_git_diff_digest(
+        worktree_path,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+        &environment,
+        remaining_tracked_bytes,
+        "tracked workspace files",
+    )
+    .await?;
 
     let untracked = Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
@@ -604,25 +602,33 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
             "untracked workspace file list is unavailable or exceeds its bound",
         ));
     }
-    let paths = untracked
+    let mut paths = untracked
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty());
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if paths.len() > MAX_UNTRACKED_FILES {
+        return Err(ServiceError::invalid_operation(
+            "untracked workspace file count exceeds its bound",
+        ));
+    }
+    paths.sort();
+
     let mut digest = Sha256::new();
-    digest.update(b"forge-workspace-snapshot-v1\0");
+    digest.update(b"forge-workspace-snapshot-v2\0");
+    digest.update(b"section:head-to-index\0");
+    digest.update(staged_bytes.to_be_bytes());
+    digest.update(staged_digest);
+    digest.update(b"section:head-to-worktree\0");
     digest.update((tracked_bytes as u64).to_be_bytes());
-    digest.update(tracked_output.finalize());
+    digest.update(tracked_digest);
+    digest.update(b"section:untracked\0");
+    digest.update((paths.len() as u64).to_be_bytes());
     let root = Path::new(worktree_path);
-    let mut file_count = 0usize;
     let mut total_bytes = 0u64;
     for raw_path in paths {
-        file_count += 1;
-        if file_count > MAX_UNTRACKED_FILES {
-            return Err(ServiceError::invalid_operation(
-                "untracked workspace file count exceeds its bound",
-            ));
-        }
-        let relative = std::str::from_utf8(raw_path).map_err(|_| {
+        let relative = std::str::from_utf8(&raw_path).map_err(|_| {
             ServiceError::invalid_operation("untracked workspace contains a non-UTF8 path")
         })?;
         let relative_path = PathBuf::from(relative);
@@ -644,9 +650,9 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
                     "could not inspect untracked workspace file: {error}"
                 ))
             })?;
-        digest.update(b"untracked\0");
+        digest.update(b"entry\0");
         digest.update((raw_path.len() as u64).to_be_bytes());
-        digest.update(raw_path);
+        digest.update(&raw_path);
         if metadata.file_type().is_symlink() {
             let target = tokio::fs::read_link(&full_path).await.map_err(|error| {
                 ServiceError::invalid_operation(format!(
@@ -656,9 +662,9 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
             let target = target.to_str().ok_or_else(|| {
                 ServiceError::invalid_operation("untracked workspace symlink target is non-UTF8")
             })?;
-            digest.update(b"symlink\0");
+            digest.update(b"type:symlink\0");
             digest.update((target.len() as u64).to_be_bytes());
-            digest.update(target.as_bytes());
+            digest.update(Sha256::digest(target.as_bytes()));
         } else if metadata.is_file() {
             if metadata.len() > MAX_UNTRACKED_FILE_BYTES
                 || total_bytes.saturating_add(metadata.len()) > MAX_UNTRACKED_TOTAL_BYTES
@@ -667,7 +673,7 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
                     "untracked workspace file contents exceed the snapshot bound",
                 ));
             }
-            digest.update(b"file\0");
+            digest.update(b"type:file\0");
             digest.update(metadata.len().to_be_bytes());
             #[cfg(unix)]
             digest.update(metadata.permissions().mode().to_be_bytes());
@@ -678,7 +684,8 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
                     "could not read untracked workspace file: {error}"
                 ))
             })?;
-            let read = hash_reader_into(file, &mut digest, metadata.len())
+            let mut content_digest = Sha256::new();
+            let read = hash_reader_into(file, &mut content_digest, metadata.len())
                 .await
                 .map_err(|error| {
                     ServiceError::invalid_operation(format!(
@@ -690,6 +697,7 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
                     "untracked workspace file changed while its identity was read",
                 ));
             }
+            digest.update(content_digest.finalize());
             total_bytes += read;
         } else {
             return Err(ServiceError::invalid_operation(
@@ -698,6 +706,45 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
         }
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+async fn bounded_git_diff_digest(
+    worktree_path: &str,
+    args: &[&str],
+    environment: &[(String, String)],
+    max_bytes: u64,
+    subject: &str,
+) -> Result<(u64, Vec<u8>)> {
+    let mut command = Command::new("git")
+        .args(args)
+        .current_dir(worktree_path)
+        .env_clear()
+        .envs(environment.iter().cloned())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!("could not snapshot {subject}: {error}"))
+        })?;
+    let mut content_digest = Sha256::new();
+    let stdout = command.stdout.take().expect("git stdout was piped");
+    let byte_count = hash_reader_into(stdout, &mut content_digest, max_bytes)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!("could not hash {subject}: {error}"))
+        })?;
+    if !command
+        .wait()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        return Err(ServiceError::invalid_operation(format!(
+            "could not snapshot {subject} within the shared tracked-state bound"
+        )));
+    }
+    Ok((byte_count, content_digest.finalize().to_vec()))
 }
 
 async fn hash_reader_into<R>(

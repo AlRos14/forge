@@ -162,6 +162,121 @@ impl CollaborationService {
         Ok(())
     }
 
+    /// Load and validate the immutable ReviewReport output for its exact
+    /// historical producer. This check intentionally does not inspect the
+    /// current Human membership or live Workspace state.
+    pub(crate) async fn exact_review_report_for_execution(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<Option<Artifact>> {
+        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+            return Err(invalid(
+                "ReviewReport reconciliation requires its exact reviewer Execution",
+            ));
+        }
+        let Some(actor) = execution.actor_ref() else {
+            return Err(invalid("Review Execution has no persisted ActorRef"));
+        };
+        let Some(report) = CollaborationRepo::get_execution_artifact_output(
+            &*self.db,
+            &execution.id,
+            ArtifactKind::ReviewReport,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if report.task_id != execution.task_id
+            || report.kind != ArtifactKind::ReviewReport
+            || report.storage_kind != ArtifactStorageKind::Inline
+            || report.content_ref.is_some()
+            || report.execution_producer() != Some((execution.id.as_str(), &actor))
+        {
+            return Err(invalid(
+                "persisted ReviewReport producer does not match its exact Execution and ActorRef",
+            ));
+        }
+        let content = report
+            .content
+            .as_deref()
+            .ok_or_else(|| invalid("persisted ReviewReport has no inline content"))?;
+        let digest = hex::encode(Sha256::digest(content.as_bytes()));
+        if report.digest.as_deref() != Some(digest.as_str()) {
+            return Err(invalid(
+                "persisted ReviewReport content does not match its exact digest",
+            ));
+        }
+        let metadata: serde_json::Value = serde_json::from_str(&report.metadata_json)
+            .map_err(|error| invalid(format!("ReviewReport metadata is invalid: {error}")))?;
+        if metadata
+            != serde_json::json!({
+                "schema_version": 1,
+                "review_execution_id": execution.id,
+            })
+        {
+            return Err(invalid(
+                "persisted ReviewReport metadata does not name its exact Execution",
+            ));
+        }
+
+        let persisted_subject =
+            ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id).await?;
+        let expected_subject = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => {
+                let subject = persisted_subject.ok_or_else(|| {
+                    invalid("workspace-bound Review Execution has no frozen subject")
+                })?;
+                if subject.execution_id != execution.id
+                    || subject.task_id != execution.task_id
+                    || subject.workspace_id != workspace_id
+                    || execution.before_sha.as_deref() != Some(subject.base_commit_sha.as_str())
+                    || execution.after_sha.as_deref() != Some(subject.head_commit_sha.as_str())
+                {
+                    return Err(invalid(
+                        "persisted Review subject does not match its historical Execution",
+                    ));
+                }
+                serde_json::json!({
+                    "task_id": execution.task_id,
+                    "review_execution_id": execution.id,
+                    "workspace_id": subject.workspace_id,
+                    "base_commit_sha": subject.base_commit_sha,
+                    "head_commit_sha": subject.head_commit_sha,
+                    "workspace_snapshot_digest": subject.workspace_snapshot_digest,
+                })
+            }
+            None => {
+                if persisted_subject.is_some() {
+                    return Err(invalid(
+                        "workspace-free Review Execution unexpectedly has a frozen Workspace subject",
+                    ));
+                }
+                serde_json::json!({
+                    "task_id": execution.task_id,
+                    "review_execution_id": execution.id,
+                    "workspace_id": serde_json::Value::Null,
+                    "base_commit_sha": execution.before_sha,
+                    "head_commit_sha": execution.after_sha,
+                    "workspace_snapshot_digest": serde_json::Value::Null,
+                })
+            }
+        };
+        let value: serde_json::Value = serde_json::from_str(content)
+            .map_err(|error| invalid(format!("ReviewReport JSON is invalid: {error}")))?;
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("review_report")
+            || value.get("subject") != Some(&expected_subject)
+            || !matches!(
+                value.get("verdict").and_then(serde_json::Value::as_str),
+                Some("pass" | "request_changes" | "questions")
+            )
+        {
+            return Err(invalid(
+                "persisted ReviewReport content does not match its historical subject",
+            ));
+        }
+        Ok(Some(report))
+    }
+
     pub async fn create_artifact(
         &self,
         source: CollaborationActorSource,
@@ -765,7 +880,7 @@ impl CollaborationService {
             producer_execution_id: execution.id.clone(),
             created_at: now,
         };
-        if execution.status == db::ExecutionStatus::Running {
+        if execution.status == db::ExecutionStatus::Running && existing_output.is_none() {
             self.ensure_review_subject_current(&execution).await?;
         }
         let write = if let Some((evidence_input_ids, artifact_input_ids)) = requested_inputs {

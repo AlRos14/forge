@@ -133,3 +133,138 @@ async fn pr8_validation_service_records_exact_pass_fail_stale_and_retry_identity
         3
     );
 }
+
+#[tokio::test]
+async fn pr8_workspace_snapshot_v2_distinguishes_staged_and_unstaged_state_and_restores() {
+    let temp = TempDir::new().expect("workspace temp directory creates");
+    let worktree_path = temp.path().join("worktree");
+    std::fs::create_dir_all(&worktree_path).expect("worktree directory creates");
+    git::init(&worktree_path)
+        .await
+        .expect("git repository initializes");
+    std::fs::write(worktree_path.join("foo.txt"), "HEAD bytes\n").expect("baseline writes");
+    git::commit_all(&worktree_path, "baseline")
+        .await
+        .expect("baseline commit creates");
+
+    std::fs::write(worktree_path.join("foo.txt"), "same worktree bytes\n")
+        .expect("working tree change writes");
+    run_workspace_git(&worktree_path, &["add", "foo.txt"]);
+    std::fs::write(
+        worktree_path.join("same-untracked.txt"),
+        "stable untracked bytes\n",
+    )
+    .expect("untracked content writes");
+    let staged_digest = crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+        .await
+        .expect("staged snapshot v2 digest computes");
+    assert_eq!(
+        crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+            .await
+            .expect("same logical snapshot computes stably"),
+        staged_digest
+    );
+
+    let snapshot = git::capture_worktree_state(&worktree_path)
+        .await
+        .expect("exact pre-review staged state captures");
+    std::fs::write(worktree_path.join("foo.txt"), "reviewer mutation\n")
+        .expect("reviewer mutation writes");
+    std::fs::write(worktree_path.join("reviewer-only.txt"), "temporary\n")
+        .expect("reviewer untracked file writes");
+    snapshot
+        .restore(&worktree_path)
+        .await
+        .expect("exact staged state restores after reviewer mutation");
+    assert_eq!(
+        crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+            .await
+            .expect("restored v2 digest computes"),
+        staged_digest
+    );
+
+    run_workspace_git(&worktree_path, &["reset", "HEAD", "--", "foo.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(worktree_path.join("foo.txt")).unwrap(),
+        "same worktree bytes\n",
+        "reset changes only the index and preserves the final worktree bytes"
+    );
+    let unstaged_digest =
+        crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+            .await
+            .expect("unstaged snapshot v2 digest computes");
+    assert_ne!(staged_digest, unstaged_digest);
+    assert_eq!(
+        crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+            .await
+            .expect("same unstaged logical snapshot computes stably"),
+        unstaged_digest
+    );
+}
+
+#[tokio::test]
+async fn pr8_validation_idempotency_identity_includes_staged_workspace_state() {
+    let db = Arc::new(sqlite_db().await);
+    let validation = crate::ValidationService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, _) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let temp = TempDir::new().expect("workspace temp directory creates");
+    let worktree_path = temp.path().join("worktree");
+    std::fs::create_dir_all(&worktree_path).expect("worktree directory creates");
+    git::init(&worktree_path)
+        .await
+        .expect("git repository initializes");
+    std::fs::write(worktree_path.join("foo.txt"), "HEAD bytes\n").expect("baseline writes");
+    git::commit_all(&worktree_path, "baseline")
+        .await
+        .expect("baseline commit creates");
+    let workspace = WorkspaceRepo::create(
+        &*db,
+        db::CreateWorkspace {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id,
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch: "validation-snapshot-v2".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Workspace records the validation repository");
+
+    std::fs::write(worktree_path.join("foo.txt"), "same worktree bytes\n")
+        .expect("working tree change writes");
+    run_workspace_git(&worktree_path, &["add", "foo.txt"]);
+    let staged = validation
+        .run_command(
+            &task.id,
+            &workspace.id,
+            "printf 'same check\\n'",
+            7,
+            None,
+            None,
+        )
+        .await
+        .expect("staged-state ValidationRun completes");
+    run_workspace_git(&worktree_path, &["reset", "HEAD", "--", "foo.txt"]);
+    let unstaged = validation
+        .run_command(
+            &task.id,
+            &workspace.id,
+            "printf 'same check\\n'",
+            7,
+            None,
+            None,
+        )
+        .await
+        .expect("same check on unstaged-state input creates a new ValidationRun");
+    assert_ne!(
+        staged.run.workspace_snapshot_digest,
+        unstaged.run.workspace_snapshot_digest
+    );
+    assert_ne!(staged.run.idempotency_key, unstaged.run.idempotency_key);
+    assert_ne!(staged.run.id, unstaged.run.id);
+}

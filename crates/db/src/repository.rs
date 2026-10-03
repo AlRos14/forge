@@ -853,6 +853,13 @@ pub trait ExecutionRepo: Send + Sync {
         subject: CreateReviewExecutionSubject,
         event: CreateDomainEvent,
     ) -> Result<ReviewExecutionSubjectWrite>;
+    /// Create a workspace-free Running Human Review Execution and its start
+    /// event in one transaction, rechecking current reviewer authority there.
+    async fn create_human_review_execution_without_subject(
+        &self,
+        input: CreateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<(Execution, DomainEvent)>;
     /// Freeze the exact subject of a running reviewer Execution, or return
     /// the already-frozen identity only when every field still matches.
     async fn freeze_review_execution_subject(

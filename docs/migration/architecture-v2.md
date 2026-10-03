@@ -125,9 +125,20 @@ Local read-only Review captures and restores the exact pre-review HEAD, Git
 index, tracked diff and file permissions, and non-ignored untracked files under
 the Workspace lock. Its isolated restore snapshot stays outside the worktree.
 It verifies the restored snapshot digest before report materialization and
-fails without a report if restoration cannot be proven. Human Review start and
-new report writes recheck RoleMembership-first authority inside their write
-transactions; exact completed report replay remains historical.
+fails without a report if restoration cannot be proven. The durable v2
+Workspace snapshot digest covers staged index-visible state, tracked
+working-tree state, and untracked state; it does not hash raw Git index bytes.
+The temporary restore snapshot may retain those exact bytes to restore local
+state. Review and ValidationRun use this same semantic digest.
+
+Human start with or without a Workspace and new Human ReviewReport creation
+recheck current RoleMembership-first authority in their write transactions. An
+exact persisted ReviewReport with a still-Running Execution is a recoverable
+crash boundary: validate its historical producer, ActorRef, subject, content,
+and digest, then complete and cascade from that Artifact without current
+membership or live Workspace revalidation. The same rule applies to Agent
+report recovery; it does not rerun review cognition. Conflicting retries fail
+closed.
 
 When a replacement TaskRole exists, its RoleMembership records alone decide
 current Human reviewer authority; the singular TaskRoleAssignment row is only a

@@ -668,6 +668,58 @@ impl CollaborationRepo for SqliteDb {
     ) -> Result<ExecutionArtifactOutputWrite> {
         let expected = input.clone();
         let mut tx = self.pool.begin().await?;
+        if input.kind == ArtifactKind::ReviewReport {
+            let has_existing_output: i64 = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM execution_artifact_output
+                    WHERE execution_id = ? AND kind = 'review_report'
+                 )",
+            )
+            .bind(&input.producer_execution_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_existing_output == 0 {
+                let producer = sqlx::query(
+                    "SELECT actor_kind, actor_id, status FROM execution
+                     WHERE id = ? AND task_id = ?
+                       AND role = 'reviewer' AND purpose = 'review'",
+                )
+                .bind(&input.producer_execution_id)
+                .bind(&input.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(producer) = producer else {
+                    return Err(DbError::Check(
+                        "ReviewReport requires its exact reviewer Execution producer".to_owned(),
+                    ));
+                };
+                let actor_kind: String = producer.try_get("actor_kind")?;
+                let actor_id: Option<String> = producer.try_get("actor_id")?;
+                let status: String = producer.try_get("status")?;
+                if actor_kind == "human" {
+                    let Some(actor_id) = actor_id else {
+                        return Err(DbError::Check(
+                            "new Human ReviewReport requires its persisted Human ActorRef"
+                                .to_owned(),
+                        ));
+                    };
+                    if status != "running"
+                        || !super::execution::human_has_current_role_authority_in_tx(
+                            &mut tx,
+                            &input.task_id,
+                            "reviewer",
+                            &actor_id,
+                        )
+                        .await?
+                    {
+                        return Err(DbError::Check(
+                            "new Human ReviewReport requires current authoritative reviewer membership"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         sqlx::query(
             "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
              VALUES (?, ?, ?)",

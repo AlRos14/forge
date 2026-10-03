@@ -38,13 +38,25 @@ stored digest is copied into the report. A Human submits the same report shape
 to one exact Human Review Execution.
 
 When a replacement reviewer TaskRole exists, active Human RoleMembership is
-the only authority to start and complete a running Human Review. The singular
+the only authority for new Human Review writes. The singular
 TaskRoleAssignment row remains a compatibility projection and cannot grant or
 revoke that authority. A Human may start an exact Review Execution when another
 Human is named by the projection. The legacy singleton fallback is permitted
-only when the replacement reviewer TaskRole does not exist. A Human may replay
-only the identical existing ReviewReport as the same Actor after completion;
-later membership changes do not rewrite that historical authority.
+only when the replacement reviewer TaskRole does not exist.
+
+The Human authority matrix is:
+
+| Write | Authority rule |
+| --- | --- |
+| New workspace-bound Human Review start | Current reviewer authority is rechecked transactionally with Execution, frozen subject, and start event. |
+| New workspace-free Human Review start | Current reviewer authority is rechecked transactionally with Execution and start event. |
+| New Human ReviewReport | Current reviewer authority is rechecked transactionally with the output, requested inputs, and Artifact event; the live Workspace must still match the frozen subject before a new report is built. |
+| Existing exact ReviewReport reconciliation | Historical authority: exact producer Execution, Task, Human ActorRef, persisted subject, content, and digest must match; current membership and live Workspace are not rechecked. |
+
+An exact existing Human ReviewReport may therefore be replayed after the
+membership changes or its Workspace moves. This does not authorize a new
+verdict: a different requested report fails closed and leaves the persisted
+Artifact unchanged.
 
 Human Review freezes the exact Workspace subject when the Review Execution
 starts, then recomputes Workspace ID, base SHA, head SHA, and snapshot digest
@@ -96,12 +108,18 @@ closed status, exit code, timestamps, and a durable Evidence reference.
 Statuses are `running`, `passed`, `failed`, `error`, `cancelled`, and `stale`.
 
 The current deterministic hook runs each configured CI command as its own
-ValidationRun. It hashes tracked changes against HEAD and untracked file names
-and contents before the check; it records both commit SHA and snapshot digest.
+ValidationRun. It records both commit SHA and a v2 logical Workspace snapshot
+digest. The digest independently covers `HEAD → index`, `HEAD → worktree`, and
+untracked entries, including their paths, types, contents, and file
+permissions. Each diff section and untracked entry is length-delimited and
+content-hashed; raw `.git/index` bytes are not part of durable identity. The
+same digest is used for Review and ValidationRun identity.
 It hashes the snapshot again after the command and marks the run stale if the
 Workspace moved. Snapshot calculation has explicit file-count and byte bounds;
 an unreadable, unsupported, or over-bound snapshot fails closed before the
-command starts.
+command starts. The two tracked diffs share a 256 MiB total output bound; the
+untracked path list is limited to 16 MiB and 100,000 entries, and untracked
+file contents are limited to 128 MiB per file and 512 MiB total.
 
 Each run emits exact `deterministic_check_output` Evidence with the same Task,
 run, command/check, config digest, Workspace, commit, snapshot, result, exit
@@ -198,10 +216,14 @@ provenance. Legacy data remains physically available for repair and audit.
 
 - Review output insertion and its Artifact event are one DB transaction under
   the unique `(execution_id, kind)` output key. The later Execution terminal
-  update is separate by design. A crash in between leaves a running Execution
-  with a reusable Artifact; retrying the same structured output reuses it, and
-  conflicting output is rejected. The DB prevents the invalid completed/no
-  report terminal state.
+  update is separate by design. `ReviewReport exists + Execution is Running`
+  is a recoverable intermediate state. Recovery validates the exact historical
+  producer, Task, ActorRef, frozen subject, inline content, and content digest,
+  then completes that same Execution and cascades from the persisted verdict.
+  It does not refreeze or recheck the live Workspace, require current Human
+  membership, or rerun reviewer cognition. A supplied retry output must
+  reconstruct the same Artifact; conflicting output is rejected. The DB
+  prevents the invalid completed/no-report terminal state.
 - Local read-only Review restores its isolated pre-run worktree snapshot and
   verifies the persisted subject digest before output materialization. A
   failed restore retains the snapshot and cannot produce an authoritative
@@ -210,18 +232,24 @@ provenance. Legacy data remains physically available for repair and audit.
   Artifact sets, creates or reuses the ReviewReport output, and appends its
   Artifact event in one DB transaction. A failed request rolls back every new
   binding and the output/event. An identical retry reuses the same output; a
-  conflicting retry fails closed. The later Execution terminal update remains
-  a separate transaction guarded by the required-output trigger.
+  conflicting retry fails closed. Reconciliation completes the same Running
+  Execution and repeats the deterministic cascade safely after a crash between
+  those commits.
 - Validation start and its event are atomic. A claim lease controls execution.
   Terminal status, Evidence, report Artifact, and all completion events are
   atomic. A crash after the process exits but before terminal commit can rerun
   the command after claim expiry; only one terminal identity/Evidence set can
   commit.
-- Git HEAD and the tracked/untracked snapshot are captured before and after the
+- Git HEAD and the v2 staged/tracked/untracked snapshot are captured before and after the
   command. A persistent movement is recorded as `stale`, preserving which
   before-snapshot was subject. Commands that mutate files and restore the exact
   same bytes between snapshots are outside the guarantees of the current
   Workspace lock and remain a runtime limitation.
+
+The durable v2 digest is a logical identity over staged, tracked working-tree,
+and untracked state. Local Review's temporary restore snapshot separately keeps
+the exact Git index bytes so it can restore the user's original local state;
+those bytes are not included in durable ReviewReport or ValidationRun identity.
 
 ## PR9 boundary
 
@@ -319,3 +347,21 @@ command, exit code, timestamps, Workspace/commit and output tail, but not the
 exact runtime environment or the new before-check Workspace snapshot digest;
 it is therefore audited as insufficient provenance rather than fabricated
 into a ValidationRun.
+
+Focused recovery and snapshot-v2 follow-up on 2026-10-03 used the shared
+repository target and a writable temporary Cargo home because the default
+Cargo home is read-only in this environment:
+
+- `cargo fmt --all -- --check`: PASS.
+- `git diff --check`: PASS.
+- `CARGO_HOME=/tmp/forge-cargo-home CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test --locked -p db pr8_ -- --nocapture`: PASS, 6 tests (85 filtered). Includes workspace-free transactional Human start, replacement-role precedence, legacy fallback, and workspace-bound start/report authority.
+- `CARGO_HOME=/tmp/forge-cargo-home CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test --locked -p services --lib pr8_ -- --nocapture`: PASS, 19 tests (688 filtered). Covers Human crash replay after membership revocation and Workspace mutation, conflicting retry, Agent recovery without executor relaunch, staged-versus-unstaged v2 identity, ValidationRun idempotency, and exact local restoration.
+- `CARGO_HOME=/tmp/forge-cargo-home CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test --locked -p git capture_restore_worktree_state_preserves_exact_pre_review_state -- --nocapture`: PASS, 1 test (11 filtered).
+- `CARGO_HOME=/tmp/forge-cargo-home CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test --locked -p services --test memory_service review_report_artifact_creation_does_not_depend_on_memory_indexing -- --nocapture`: PASS, 1 test (4 filtered). Its fixture now uses a Running Agent Execution, so it tests memory independence without creating a new Human verdict outside the transactional authority path.
+
+The initial DB invocation with the default Cargo home stopped before
+compilation because Cargo could not write its Git cache. The first services
+invocation also stopped before compilation because the sandbox could not
+resolve crates.io. Locked dependencies were then fetched to `/tmp` with network
+access and all focused commands above passed offline. Full workspace/crate
+suites, release builds, API suites, and PR7 tests remain deliberately unrun.

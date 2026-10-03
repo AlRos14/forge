@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorRef, AgentChatRepo,
-    CommentAuthorType, CreateDomainEvent, CreateExecution, CreateProject, CreateReview, CreateTask,
-    CreateTaskComment, CreateTransitionLog, DomainEventRepo, ExecutionPurpose, ExecutionRepo,
-    ExecutionStatus, MemoryConfidence, MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo,
-    ReviewStatus, SqliteDb, TaskCommentRepo, TaskRepo, TransitionLogRepo, UserRepo,
+    AgentRepo, AgentStatus, CommentAuthorType, CreateAgent, CreateDomainEvent, CreateExecution,
+    CreateProject, CreateReview, CreateTask, CreateTaskComment, CreateTransitionLog,
+    DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus, MemoryConfidence,
+    MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskCommentRepo,
+    TaskRepo, TransitionLogRepo,
 };
 use serde_json::json;
 use services::{AgentChatMemoryConsumer, CollaborationService, MemoryItemInput, MemoryService};
@@ -222,34 +223,50 @@ async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying
 async fn review_report_artifact_creation_does_not_depend_on_memory_indexing() {
     let db = sqlite_db().await;
     let (_project_id, task_id) = seed_project_and_task(&db, "review").await;
-    let human_actor_id = new_uuid_v4();
+    let agent_id = new_uuid_v4();
     let now = now_rfc3339();
-    UserRepo::create_user(
+    AgentRepo::create(
         &*db,
-        &db::User {
-            id: human_actor_id.clone(),
-            email: format!("{human_actor_id}@example.com"),
-            password_hash: "test".to_owned(),
-            display_name: Some("Reviewer".to_owned()),
-            is_admin: false,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: "Reviewer Agent".to_owned(),
+            description: Some("Memory-independent ReviewReport producer".to_owned()),
+            executor_type: "test".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
-    .expect("Human Actor creates");
+    .expect("Agent Actor creates");
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
         &*db,
         CreateExecution {
             id: execution_id.clone(),
             task_id: task_id.clone(),
-            agent_id: None,
-            actor_ref: Some(ActorRef::Human(human_actor_id.clone())),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(ActorRef::Agent(agent_id.clone())),
             purpose: Some(ExecutionPurpose::Review),
             harness_session_id: None,
             role: "reviewer".to_owned(),
-            status: ExecutionStatus::Completed,
+            status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
             resume_policy: None,
@@ -289,8 +306,8 @@ async fn review_report_artifact_creation_does_not_depend_on_memory_indexing() {
     assert_eq!(report.kind, db::ArtifactKind::ReviewReport);
     assert!(matches!(
         report.producer,
-        db::ArtifactProducer::Execution { execution_id: producer_id, actor: ActorRef::Human(actor_id) }
-            if producer_id == execution_id && actor_id == human_actor_id
+        db::ArtifactProducer::Execution { execution_id: producer_id, actor: ActorRef::Agent(actor_id) }
+            if producer_id == execution_id && actor_id == agent_id
     ));
 }
 

@@ -601,6 +601,21 @@ impl TaskService {
             .ok_or_else(|| {
                 ServiceError::not_found("execution", notification.execution_id.clone())
             })?;
+        if current_execution.status == ExecutionStatus::Running
+            && current_execution.role == crate::workflow::default_roles::REVIEWER
+            && current_execution.purpose == Some(ExecutionPurpose::Review)
+        {
+            let expected_output = notification
+                .assistant_output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty());
+            if let Some((completed, _report)) = self
+                .reconcile_existing_review_report(&current_execution, None, expected_output)
+                .await?
+            {
+                return Ok(completed);
+            }
+        }
         let _workspace_review_guard = if current_execution.status == ExecutionStatus::Running
             && current_execution.role == crate::workflow::default_roles::REVIEWER
             && current_execution.purpose == Some(ExecutionPurpose::Review)

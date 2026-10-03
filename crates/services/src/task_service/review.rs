@@ -1,7 +1,110 @@
 use super::*;
-use db::WorkspaceRepo;
+use db::{CollaborationRepo, WorkspaceRepo};
 
 impl TaskService {
+    /// Reuse one exact durable ReviewReport and repair the separate Execution
+    /// terminal write after a crash. The Artifact's historical producer,
+    /// ActorRef, and frozen subject are validated without consulting current
+    /// membership or live Workspace state.
+    pub(crate) async fn reconcile_existing_review_report(
+        &self,
+        execution: &Execution,
+        expected_report: Option<&db::Artifact>,
+        expected_assistant_output: Option<&str>,
+    ) -> Result<Option<(Execution, db::Artifact)>> {
+        let collaboration =
+            crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let Some(report) = collaboration
+            .exact_review_report_for_execution(execution)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Some(expected) = expected_report {
+            if expected.id != report.id
+                || expected.task_id != report.task_id
+                || expected.digest != report.digest
+                || expected.content != report.content
+                || expected.execution_producer() != report.execution_producer()
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Human Review retry does not match its exact persisted ReviewReport",
+                ));
+            }
+        }
+        if let Some(output) = expected_assistant_output {
+            let replayed = collaboration
+                .create_review_report_from_execution(&execution.id, output)
+                .await?;
+            if replayed.id != report.id
+                || replayed.digest != report.digest
+                || replayed.content != report.content
+                || replayed.execution_producer() != report.execution_producer()
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Review retry conflicts with its exact persisted ReviewReport",
+                ));
+            }
+        }
+
+        let updated = match execution.status {
+            ExecutionStatus::Running => {
+                let content = report.content.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("ReviewReport content is unavailable")
+                })?;
+                let value: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "ReviewReport JSON is invalid: {error}"
+                    ))
+                })?;
+                let summary = value
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Review completed")
+                    .to_owned();
+                let timestamp = now_rfc3339();
+                let event = execution_status_domain_event(
+                    execution,
+                    &ExecutionStatus::Completed,
+                    &timestamp,
+                );
+                let (updated, committed_event) = ExecutionRepo::update_with_event(
+                    &*self.db,
+                    db::UpdateExecution {
+                        id: execution.id.clone(),
+                        status: Some(ExecutionStatus::Completed),
+                        stop_reason: None,
+                        stopped_by: None,
+                        resume_policy: None,
+                        stopped_at: None,
+                        agent_session_id: None,
+                        agent_message_id: None,
+                        last_activity_at: Some(Some(timestamp.clone())),
+                        summary: Some(Some(summary)),
+                        logs_path: None,
+                        before_sha: None,
+                        after_sha: None,
+                        error: Some(None),
+                        executor_config_snapshot_json: None,
+                        updated_at: timestamp,
+                    },
+                    event,
+                )
+                .await?;
+                self.publish_committed_domain_event(&committed_event);
+                updated
+            }
+            ExecutionStatus::Completed => execution.clone(),
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "persisted ReviewReport can reconcile only a Running or Completed Execution",
+                ));
+            }
+        };
+        self.maybe_cascade_executor_completion(&updated.id).await?;
+        Ok(Some((updated, report)))
+    }
+
     pub async fn start_human_review_execution(
         &self,
         task_id: &str,
@@ -182,7 +285,12 @@ impl TaskService {
                 })?;
                 (write.execution, committed_event)
             } else {
-                ExecutionRepo::create_with_event(&*self.db, execution_input, event).await?
+                ExecutionRepo::create_human_review_execution_without_subject(
+                    &*self.db,
+                    execution_input,
+                    event,
+                )
+                .await?
             };
         crate::DomainEventService::publish_committed_hint(&self.event_bus, &committed_event);
         Ok(execution)
@@ -231,22 +339,6 @@ impl TaskService {
                 "ReviewReport can only complete a running Human Review Execution",
             ));
         }
-        if execution.status == ExecutionStatus::Running {
-            if !human_is_active_role_member_authoritative(
-                &self.db,
-                &execution.task_id,
-                crate::workflow::default_roles::REVIEWER,
-                user_id,
-            )
-            .await?
-            {
-                return Err(ServiceError::AuthorizationDenied {
-                    message: "Human Actor no longer holds active reviewer TaskRole membership"
-                        .to_owned(),
-                });
-            }
-        }
-
         let summary = request.summary.trim();
         if summary.is_empty() || summary.len() > 8192 {
             return Err(ServiceError::invalid_operation(
@@ -303,6 +395,17 @@ impl TaskService {
                 "evidence_considered": evidence_considered,
             })
         );
+        let existing_report = CollaborationRepo::get_execution_artifact_output(
+            &*self.db,
+            execution_id,
+            db::ArtifactKind::ReviewReport,
+        )
+        .await?;
+        if execution.status == ExecutionStatus::Completed && existing_report.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "completed Human Review Execution has no exact ReviewReport to replay",
+            ));
+        }
         let report =
             crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
                 .create_human_review_report_from_execution(
@@ -312,40 +415,14 @@ impl TaskService {
                     request.artifact_ids,
                 )
                 .await?;
-
-        let updated = if execution.status == ExecutionStatus::Completed {
-            execution
-        } else {
-            let timestamp = now_rfc3339();
-            let event =
-                execution_status_domain_event(&execution, &ExecutionStatus::Completed, &timestamp);
-            let (updated, committed_event) = ExecutionRepo::update_with_event(
-                &*self.db,
-                db::UpdateExecution {
-                    id: execution.id.clone(),
-                    status: Some(ExecutionStatus::Completed),
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: Some(Some(timestamp.clone())),
-                    summary: Some(Some(summary.to_owned())),
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: Some(None),
-                    executor_config_snapshot_json: None,
-                    updated_at: timestamp,
-                },
-                event,
-            )
-            .await?;
-            self.publish_committed_domain_event(&committed_event);
-            updated
-        };
-        self.maybe_cascade_executor_completion(&updated.id).await?;
+        let (updated, report) = self
+            .reconcile_existing_review_report(&execution, Some(&report), None)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Human Review submission did not persist its exact ReviewReport",
+                )
+            })?;
         Ok((updated, report))
     }
 }
