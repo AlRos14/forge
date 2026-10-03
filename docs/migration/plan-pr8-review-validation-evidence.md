@@ -309,8 +309,8 @@ Final microfix checks on 2026-10-03, using
 The API integration test was not repeated because this microfix changes no
 public request, response, or repository signature; the DB and service paths
 that changed were exercised directly. The workspace suite, full crate suites,
-release build, PR7 suite, and web checks were not run. Cargo cleanup is deferred
-until after the verified push and clean working tree, as required for this
+release build, PR7 suite, and web checks were not run. Cargo cleanup occurs
+only after the verified push and clean working tree, as required for this
 iteration.
 
 Deliberately not run: `cargo test --workspace`, full crate suites, release
