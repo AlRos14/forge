@@ -222,7 +222,7 @@ pub(super) async fn seed_execution(
             task_id: task_id.to_owned(),
             agent_id: agent_id.map(str::to_owned),
             actor_ref: None,
-            purpose: None,
+            purpose: (role == "reviewer").then_some(db::ExecutionPurpose::Review),
             harness_session_id: None,
             role: role.to_owned(),
             status,

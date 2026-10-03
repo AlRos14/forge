@@ -174,7 +174,7 @@ async fn create_claim_and_transition_task() {
         .await
         .expect("task enters review");
     assert!(review.review.is_none());
-    assert_eq!(review.task.status, "merging".to_owned());
+    assert_eq!(review.task.status, "blocked".to_owned());
     let event = rx.recv().await.unwrap();
     assert_eq!(event.event_type, "task.status_changed");
 }

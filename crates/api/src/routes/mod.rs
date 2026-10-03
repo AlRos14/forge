@@ -5,15 +5,14 @@ use std::{
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, StateKind,
-    Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
-    TaskRoleAssignmentResponse, TaskRoleResponse, TaskType, WorkspaceResponse,
+    ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, Task as ApiTask,
+    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse,
+    TaskRoleResponse, TaskType, WorkspaceResponse,
 };
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
     Project, ProjectRepo, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task,
-    TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, TransitionLogRepo, Workspace,
-    WorkspaceRepo,
+    TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -307,24 +306,7 @@ async fn task_response_inner(
         &api_types::Actor::system(api_types::SystemComponent::General),
     );
     let canonical_phase = workflow.canonical_phase_for_state(&task.status);
-    let mut remaining_retries = HashMap::new();
-    for state in &workflow.states {
-        if state.kind != StateKind::Gate {
-            continue;
-        }
-        let Some(max_rejections) = state
-            .gate_config
-            .as_ref()
-            .and_then(|config| config.max_rejections)
-        else {
-            continue;
-        };
-        let count = TransitionLogRepo::count_gate_rejections(db, &task.id, &state.name).await?;
-        remaining_retries.insert(
-            state.name.clone(),
-            (i64::from(max_rejections) - count).max(0),
-        );
-    }
+    let remaining_retries: HashMap<String, i64> = HashMap::new();
     let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
     let current_workspace_id = workspace_model
         .as_ref()
@@ -341,6 +323,13 @@ async fn task_response_inner(
     });
     let mut diagnostic_task = task.clone();
     if let Some(TaskAnnotation::Blocking(annotation)) = error_annotation.as_mut() {
+        services::task_diagnostics::filter_retired_workflow_recovery_actions(
+            &mut annotation.recovery_actions,
+        );
+        diagnostic_task.error_annotation = Some(
+            serde_json::to_string(&TaskAnnotation::Blocking(annotation.clone()))
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+        );
         if annotation
             .recovery_actions
             .contains(&api_types::RecoveryAction::ResumeSession)
@@ -363,6 +352,9 @@ async fn task_response_inner(
     }
     let mut blocked_metadata_annotation = blocked_metadata_annotation(&task);
     if let Some(annotation) = blocked_metadata_annotation.as_mut() {
+        services::task_diagnostics::filter_retired_workflow_recovery_actions(
+            &mut annotation.recovery_actions,
+        );
         if annotation
             .recovery_actions
             .contains(&api_types::RecoveryAction::ResumeSession)

@@ -1,125 +1,18 @@
+// Legacy retry/review cascade helpers remain stored until PR13 cleanup. The
+// public completion entry point below is intentionally a no-op after PR9.
+#![allow(dead_code)]
+
 use super::*;
 use db::WorkspaceRepo;
 use sha2::{Digest, Sha256};
 
 impl TaskService {
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
-        let execution = match ExecutionRepo::get_by_id(&*self.db, execution_id).await? {
-            Some(execution) => execution,
-            None => return Ok(()),
-        };
-        if execution.role == crate::workflow::default_roles::REVIEWER {
-            if execution.purpose != Some(ExecutionPurpose::Review) {
-                return Ok(());
-            }
-            if execution.status == ExecutionStatus::Running {
-                return Ok(());
-            }
-            return self.maybe_cascade_reviewer_completion(&execution).await;
-        }
-        if execution.status != ExecutionStatus::Completed {
-            return Ok(());
-        }
-
-        if execution.role == "interactive" {
-            return Ok(());
-        }
-
-        let task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
-            Some(task) => task,
-            None => return Ok(()),
-        };
-        let project = match ProjectRepo::get_by_id(&*self.db, &task.project_id).await? {
-            Some(project) => project,
-            None => return Ok(()),
-        };
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let Some(current_state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(());
-        };
-        let Some(effective_role) = crate::workflow::effective_role(current_state) else {
-            return Ok(());
-        };
-        let role_matches = execution.role == effective_role
-            || (effective_role == crate::workflow::default_roles::CODER
-                && execution.role == "executor");
-        if !role_matches {
-            return Ok(());
-        }
-        if workflow.state_kind(&task.status) != Some(api_types::StateKind::Active) {
-            return Ok(());
-        }
-        let Some(target) = workflow
-            .auto_transition_target(&task.status)
-            .map(str::to_owned)
-        else {
-            return Ok(());
-        };
-        if let Some(summary) = execution.summary.as_deref().map(str::trim) {
-            if !summary.is_empty() {
-                let content = format!("Agent completed execution: {summary}");
-                if let Some(agent_id) = execution.agent_id.as_deref() {
-                    self.create_agent_comment(&task.id, agent_id, content)
-                        .await?;
-                } else {
-                    self.create_system_comment(&task.id, content).await?;
-                }
-            }
-        }
-
-        let from = task.status.clone();
-        match self
-            .transition(task.id.clone(), target.clone(), task.version)
-            .await
-        {
-            Ok(_) => {
-                if let Err(error) = self.clear_workflow_guard_retry_metadata(&task.id).await {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        %error,
-                        "failed to clear workflow guard retry metadata"
-                    );
-                }
-                self.publish(ForgeEvent {
-                    event_type: "task.auto_transitioned".to_owned(),
-                    entity_id: task.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::TaskAutoTransitioned {
-                        task_id: task.id,
-                        from,
-                        to: target,
-                        reason: "executor_completed".to_owned(),
-                    },
-                });
-                Ok(())
-            }
-            Err(ServiceError::Db(DbError::VersionConflict)) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    "executor completion cascade version conflict"
-                );
-                Ok(())
-            }
-            Err(ServiceError::GuardRejection { guard, reason }) => {
-                self.handle_executor_completion_guard_rejection(
-                    &execution,
-                    &task,
-                    current_state,
-                    &guard,
-                    &reason,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        }
+        // Execution completion is a durable fact consumed by event-driven
+        // orchestration and Gate evaluation. It cannot advance aggregate Task
+        // lifecycle or turn a reviewer execution into a verdict.
+        let _ = execution_id;
+        Ok(())
     }
 
     async fn handle_executor_completion_guard_rejection(

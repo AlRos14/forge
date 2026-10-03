@@ -168,13 +168,91 @@ impl TaskBoardRepo for SqliteDb {
             ));
         }
 
-        let updated = sqlx::query(
-            "UPDATE task SET status = ?, board_position = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ? WHERE id = ? AND project_id = ? AND version = ? AND deleted_at IS NULL AND archived_at IS NULL",
+        let target_state = TaskLifecycleState::from_legacy_status(&input.target_status)
+            .ok_or_else(|| {
+                DbError::InvalidTaskMove("unknown Task lifecycle projection".to_owned())
+            })?;
+        if matches!(
+            target_state,
+            TaskLifecycleState::ReadyToMerge
+                | TaskLifecycleState::Merging
+                | TaskLifecycleState::Done
+        ) {
+            return Err(DbError::InvalidTaskMove(
+                "board moves cannot satisfy a Gate or authorize merge completion".to_owned(),
+            ));
+        }
+        let lifecycle_row = sqlx::query(
+            "SELECT task_id, state, version, reason_kind, reason_ref, created_at, updated_at
+             FROM task_lifecycle WHERE task_id = ?",
         )
-        .bind(&input.target_status)
+        .bind(&input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
+        if lifecycle.state != target_state {
+            let key = format!("task-board-move:{}", input.operation_id);
+            let event = CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.lifecycle_changed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: input.task_id.clone(),
+                actor_type: input
+                    .triggered_by
+                    .split(':')
+                    .next()
+                    .unwrap_or("system")
+                    .to_owned(),
+                actor_id: input
+                    .triggered_by
+                    .split_once(':')
+                    .map(|(_, id)| id.to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: input.task_id.clone(),
+                correlation_id: input.operation_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(key.clone()),
+                payload_json: serde_json::json!({
+                    "task_id": input.task_id,
+                    "from_state": lifecycle.state,
+                    "to_state": target_state,
+                    "cause_kind": "actor",
+                    "cause_ref": input.triggered_by,
+                })
+                .to_string(),
+                created_at: input.updated_at.clone(),
+            };
+            super::gate_lifecycle::record_lifecycle_transition_in_tx(
+                self,
+                &mut tx,
+                &TransitionTaskLifecycle {
+                    id: new_uuid_v4(),
+                    task_id: input.task_id.clone(),
+                    expected_task_version: input.task_version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_state: lifecycle.state,
+                    to_state: target_state,
+                    cause_kind: "actor".to_owned(),
+                    cause_ref: Some(input.triggered_by.clone()),
+                    reason_kind: Some("board_move".to_owned()),
+                    reason_ref: Some(input.operation_id.clone()),
+                    gate_evaluation_id: None,
+                    idempotency_key: key,
+                    updated_at: input.updated_at.clone(),
+                    event,
+                },
+            )
+            .await?;
+        }
+
+        let updated = sqlx::query(
+            "UPDATE task SET status = ?, board_position = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = NULL WHERE id = ? AND project_id = ? AND version = ? AND deleted_at IS NULL AND archived_at IS NULL",
+        )
+        .bind(target_state.legacy_projection())
         .bind(new_position)
         .bind(&input.updated_at)
-        .bind(input.entry_barrier_json.as_deref())
         .bind(&input.task_id)
         .bind(&input.project_id)
         .bind(input.task_version)

@@ -82,6 +82,7 @@ pub async fn record_subtask_commit_result(
     })
 }
 
+#[allow(dead_code)] // Legacy completion-driven handoff retired; PR6 consumes durable facts.
 pub enum NextTurn {
     Prompt { user_prompt: String },
     AllDone,
@@ -364,6 +365,7 @@ async fn start_turn_for(
     Ok((subtask, before_sha))
 }
 
+#[allow(dead_code)] // Historical ordered-Task subtask flow; executable scope is a PR5 WorkUnit.
 pub async fn begin_next_turn(
     db: &db::SqliteDb,
     event_bus: &Arc<EventBus>,
@@ -421,6 +423,7 @@ pub async fn begin_next_turn(
     }))
 }
 
+#[allow(dead_code)] // Legacy recursive cascade entry point, retained until PR13 cleanup.
 pub async fn finish_current_turn_and_begin_next(
     db: &db::SqliteDb,
     event_bus: &Arc<EventBus>,

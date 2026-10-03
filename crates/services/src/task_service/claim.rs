@@ -1,7 +1,8 @@
 use super::workspace::prepare_workspace_owned;
 use super::*;
-use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
+use crate::workflow::engine::WorkflowEngine;
+use api_types::{Actor, SystemComponent};
+use db::TaskLifecycleRepo;
 use sqlx::Row;
 
 impl TaskService {
@@ -26,6 +27,15 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if lifecycle.state != db::TaskLifecycleState::Ready {
+            return Err(ServiceError::invalid_operation(format!(
+                "Task can only be claimed from aggregate lifecycle ready; current state is {}",
+                lifecycle.state
+            )));
+        }
         // Do this before workspace preparation so a blocked Charter-backed
         // implementation Task can never receive a workspace/lease as a side
         // effect of an attempted claim.
@@ -40,15 +50,14 @@ impl TaskService {
             &project.workflow_definition,
             &Actor::system(SystemComponent::General),
         );
-        WorkflowEngine::validate_claimable(&workflow, &task.status)?;
-        let target_status = resolve_claim_target(&workflow, &task.status)?;
+        let target_status = "in_progress".to_owned();
         let target_role = workflow
             .states
             .iter()
             .find(|state| state.name == target_status)
             .and_then(crate::workflow::effective_role)
             .map(str::to_owned);
-        let capacity_statuses = workflow_capacity_statuses(&workflow);
+        let capacity_statuses = vec![target_status.clone()];
         let (assignee_type, agent, assignee_id, max_concurrent_tasks, event_assignee_id) =
             match assignee {
                 Assignee::Agent(agent_id) => {
@@ -106,8 +115,9 @@ impl TaskService {
                     .await?;
             }
         }
-        let previous_status = task.status.clone();
-        let role = target_role.clone().unwrap_or_else(|| "executor".to_owned());
+        let role = target_role
+            .clone()
+            .unwrap_or_else(|| "implementer".to_owned());
         let purpose = super::execution::execution_purpose_for_workflow_state(
             &task.task_type,
             &target_status,
@@ -600,110 +610,22 @@ impl TaskService {
         });
 
         if agent_id.is_some() {
-            if claimed.task.parent_task_id.is_none() {
-                if let Err(error) = super::execution::subtasks::begin_next_turn(
-                    &self.db,
-                    &self.event_bus,
-                    &self.workspace_root,
-                    &claimed.task.id,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %claimed.task.id,
-                        %error,
-                        "failed to begin subtask sequence, dispatching normally"
-                    );
-                }
+            if let Err(error) = self.start_execution(execution_id.clone()).await {
+                tracing::warn!(
+                    task_id = %claimed.task.id,
+                    execution_id = %execution_id,
+                    %error,
+                    "claimed Execution could not start"
+                );
             }
-            self.dispatch_claim_state_role_agent(
-                &claimed.task,
-                &previous_status,
-                &execution_id,
-                claimed.execution.workspace_id.clone(),
-                agent_id.as_deref(),
-            )
-            .await;
+            if let Some(current_task) =
+                TaskRepo::get_by_id(&*self.db, &claimed.task.id, false).await?
+            {
+                claimed.task = current_task;
+            }
         }
 
         Ok(claimed)
-    }
-
-    async fn dispatch_claim_state_role_agent(
-        &self,
-        task: &Task,
-        previous_status: &str,
-        execution_id: &str,
-        workspace_id: Option<String>,
-        execution_agent_id: Option<&str>,
-    ) {
-        let Ok(Some(project)) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await else {
-            return;
-        };
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        let Some(state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return;
-        };
-        if !state
-            .hooks
-            .on_enter
-            .iter()
-            .any(|hook| hook.action == "dispatch_role_agent")
-        {
-            return;
-        }
-        let gate_config = state.gate_config.clone();
-        let state_config = state.config.clone();
-        let trigger_agent_id = execution_agent_id.or_else(|| {
-            (task.assignee_type.as_deref() == Some("agent"))
-                .then_some(task.assignee_id.as_deref())
-                .flatten()
-        });
-        let triggered_by = match trigger_agent_id {
-            Some(agent_id) => Actor::Agent {
-                agent_id: agent_id.to_owned(),
-                execution_id: Some(execution_id.to_owned()),
-            },
-            None if task.assignee_type.as_deref() == Some("user") => {
-                Actor::user(UserActionSource::Transition)
-            }
-            None => Actor::system(SystemComponent::Workflow),
-        };
-
-        let ctx = HookContext {
-            task_id: task.id.clone(),
-            project_id: task.project_id.clone(),
-            from_state: previous_status.to_owned(),
-            to_state: task.status.clone(),
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            gate_config,
-            workflow: Arc::new(workflow),
-            triggered_by,
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
-            adapter_registry: self.adapter_registry.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_id,
-            agent_id: trigger_agent_id.map(str::to_owned),
-            execution_id: Some(execution_id.to_owned()),
-            state_config,
-        };
-        let _ = DispatchRoleAgent.execute(&ctx).await;
     }
 
     pub(super) async fn role_for_state(
@@ -783,42 +705,4 @@ impl TaskService {
         }
         Ok(())
     }
-}
-
-fn resolve_claim_target(workflow: &WorkflowDefinition, current_status: &str) -> Result<String> {
-    let source_kind = workflow.state_kind(current_status);
-    let targets = workflow
-        .outgoing_trigger_targets(current_status)
-        .filter(|(trigger, _)| {
-            !trigger.system_only()
-                || matches!(source_kind, Some(StateKind::Initial | StateKind::Custom))
-        })
-        .filter_map(|(_, target_name)| {
-            workflow
-                .states
-                .iter()
-                .find(|target| target.name == target_name)
-                .map(|target| (target.name.clone(), target.kind))
-        })
-        .collect::<Vec<_>>();
-    let target = targets
-        .iter()
-        .find(|(_, kind)| *kind == StateKind::Active)
-        .or_else(|| targets.iter().find(|(_, kind)| *kind == StateKind::Gate))
-        .map(|(name, _)| name.clone());
-
-    target.ok_or_else(|| {
-        ServiceError::invalid_operation(format!(
-            "task in state '{current_status}' has no claimable active transition"
-        ))
-    })
-}
-
-fn workflow_capacity_statuses(workflow: &WorkflowDefinition) -> Vec<String> {
-    workflow
-        .states
-        .iter()
-        .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
-        .map(|state| state.name.clone())
-        .collect()
 }

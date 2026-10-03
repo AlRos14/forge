@@ -15,7 +15,8 @@ use std::{
 // TaskRole policy snapshots; V096 guards typed-action effects; V097 commits the
 // action receipt with each effect; V098 adds immutable Execution Artifact
 // outputs/inputs and migrates verifiable legacy plan provenance; V099 adds
-// Review Execution outputs, actor-free ValidationRuns, and exact Evidence.
+// Review Execution outputs, actor-free ValidationRuns, and exact Evidence;
+// V100 adds aggregate Task lifecycle and deterministic Gate records.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

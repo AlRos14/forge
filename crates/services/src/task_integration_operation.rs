@@ -28,11 +28,94 @@ impl TaskIntegrationOperationManager {
         kind: TaskIntegrationOperationKind,
         owner_id: &str,
     ) -> crate::Result<TaskIntegrationOperationGuard> {
+        self.acquire_with_gate(task_id, kind, owner_id, None).await
+    }
+
+    pub(crate) async fn acquire_after_gate(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        gate_evaluation_id: &str,
+    ) -> crate::Result<TaskIntegrationOperationGuard> {
+        self.acquire_kind_after_gate(
+            task_id,
+            TaskIntegrationOperationKind::TaskMerge,
+            owner_id,
+            gate_evaluation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_kind_after_gate(
+        &self,
+        task_id: &str,
+        kind: TaskIntegrationOperationKind,
+        owner_id: &str,
+        gate_evaluation_id: &str,
+    ) -> crate::Result<TaskIntegrationOperationGuard> {
+        self.acquire_with_gate(task_id, kind, owner_id, Some(gate_evaluation_id))
+            .await
+    }
+
+    /// Finish an operation when an external provider has durably confirmed
+    /// that the exact admitted merge completed. If a prior process crashed
+    /// after admission, resume that same operation under the Task lock.
+    pub(crate) async fn record_provider_confirmed_merge(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        gate_evaluation_id: &str,
+    ) -> crate::Result<TaskIntegrationOperation> {
+        let file = match self.try_process_lock(task_id).await? {
+            Ok(file) => file,
+            Err(()) => return Err(busy(task_id)),
+        };
+        let operation =
+            match TaskIntegrationOperationRepo::get_active_for_task(&*self.db, task_id).await? {
+                Some(operation)
+                    if operation.kind == TaskIntegrationOperationKind::TaskMerge
+                        && operation.gate_evaluation_id.as_deref() == Some(gate_evaluation_id) =>
+                {
+                    operation
+                }
+                Some(_) => return Err(busy(task_id)),
+                None => {
+                    TaskIntegrationOperationRepo::begin(
+                        &*self.db,
+                        CreateTaskIntegrationOperation {
+                            id: new_uuid_v4(),
+                            task_id: task_id.to_owned(),
+                            kind: TaskIntegrationOperationKind::TaskMerge,
+                            owner_id: owner_id.to_owned(),
+                            gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
+                            created_at: now_rfc3339(),
+                        },
+                    )
+                    .await?
+                }
+            };
+        TaskIntegrationOperationGuard {
+            db: Arc::clone(&self.db),
+            operation,
+            _file: Some(file),
+        }
+        .finish(TaskIntegrationOperationStatus::Succeeded)
+        .await
+    }
+
+    async fn acquire_with_gate(
+        &self,
+        task_id: &str,
+        kind: TaskIntegrationOperationKind,
+        owner_id: &str,
+        gate_evaluation_id: Option<&str>,
+    ) -> crate::Result<TaskIntegrationOperationGuard> {
         let input = CreateTaskIntegrationOperation {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
             kind,
             owner_id: owner_id.to_owned(),
+            gate_evaluation_id: gate_evaluation_id.map(str::to_owned),
             created_at: now_rfc3339(),
         };
 
@@ -238,7 +321,14 @@ pub(crate) struct TaskIntegrationOperationGuard {
 }
 
 impl TaskIntegrationOperationGuard {
-    pub(crate) async fn finish(self, status: TaskIntegrationOperationStatus) -> crate::Result<()> {
+    pub(crate) fn id(&self) -> &str {
+        &self.operation.id
+    }
+
+    pub(crate) async fn finish(
+        self,
+        status: TaskIntegrationOperationStatus,
+    ) -> crate::Result<TaskIntegrationOperation> {
         let now = now_rfc3339();
         let result = TaskIntegrationOperationRepo::finish(
             &*self.db,
@@ -252,7 +342,7 @@ impl TaskIntegrationOperationGuard {
         )
         .await;
         drop(self);
-        result.map(|_| ()).map_err(Into::into)
+        result.map_err(Into::into)
     }
 }
 
@@ -395,6 +485,7 @@ mod tests {
                 task_id: task_id.to_owned(),
                 kind: TaskIntegrationOperationKind::TaskMerge,
                 owner_id: "simulated-operation-owner".to_owned(),
+                gate_evaluation_id: None,
                 created_at: now_rfc3339(),
             },
         )

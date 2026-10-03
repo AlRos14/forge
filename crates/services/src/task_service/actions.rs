@@ -1,10 +1,10 @@
 use super::execution::resumable_external_session;
 use super::*;
 
-use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
+use api_types::{Actor, StateKind, TaskAction, UserActionSource};
 use db::{
     AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, SortBy,
-    SortOrder, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
+    SortOrder, TaskLifecycleRepo, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
 };
 
 #[derive(Debug)]
@@ -31,7 +31,11 @@ impl TaskService {
         let actor = Actor::user(UserActionSource::Api);
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
-        self.available_task_actions_for(&task, &workflow).await
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        self.available_task_actions_for(&task, &workflow, lifecycle.state)
+            .await
     }
 
     pub async fn perform_task_action(
@@ -65,25 +69,22 @@ impl TaskService {
         // Cancelling an already-cancelled task stays an idempotent no-op, matching the
         // pre-facade POST /tasks/{id}/cancel contract. cancellation_target falls back to a
         // terminal "cancelled" state for workflows with no explicit cancellation_state.
-        if action == TaskAction::Cancel
-            && cancellation_target(&workflow).is_some_and(|cancelled| cancelled == task.status)
-        {
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if action == TaskAction::Cancel && lifecycle.state == db::TaskLifecycleState::Cancelled {
             return Ok(TaskActionResult { task, action });
         }
 
-        let available = self.available_task_actions_for(&task, &workflow).await?;
+        let available = self
+            .available_task_actions_for(&task, &workflow, lifecycle.state)
+            .await?;
         if !available.contains(&action) {
             return Err(ServiceError::TaskActionUnavailable {
                 available_actions: available,
-                reason: unavailable_reason(action, &task, &workflow),
+                reason: unavailable_reason(action, &task, lifecycle.state),
             });
         }
-
-        let transition_version = requested_version.unwrap_or(task.version);
-        let transition_reason = reason
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| format!("task action: {}", action_name(action)));
 
         let result = match action {
             TaskAction::Start => {
@@ -120,61 +121,19 @@ impl TaskService {
             }
             TaskAction::Resume => self.resume_task_execution(&task, &workflow, reason).await?,
             TaskAction::Submit => {
-                let target = trigger_target(&workflow, &task.status, WorkflowTrigger::Accept)
-                    .expect("submit capability guarantees an Accept target");
-                self.transition(
-                    task.id.clone(),
-                    target,
-                    TransitionOptions {
-                        version: transition_version,
-                        reason: Some(transition_reason),
-                        triggered_by: actor,
-                        rejection: false,
-                        defer_dispatch_seconds: None,
-                    },
-                )
-                .await?
-                .task
+                return Err(ServiceError::invalid_operation(
+                    "Task submission cannot satisfy a Gate; use an exact GateEvaluation",
+                ));
             }
             TaskAction::RequestChanges => {
-                if task.status == crate::workflow::default_states::REVIEW {
-                    return Err(ServiceError::invalid_operation(
-                        "Review changes must be submitted as a ReviewReport for an exact Human Review Execution",
-                    ));
-                }
-                self.transition_gate_action(
-                    &task,
-                    &workflow,
-                    WorkflowTrigger::Reject,
-                    TransitionOptions {
-                        version: transition_version,
-                        reason: Some(transition_reason),
-                        triggered_by: actor,
-                        rejection: true,
-                        defer_dispatch_seconds: None,
-                    },
-                )
-                .await?
+                return Err(ServiceError::invalid_operation(
+                    "Review changes must be recorded in an exact ReviewReport and evaluated by a Gate",
+                ));
             }
             TaskAction::Approve => {
-                if task.status == crate::workflow::default_states::REVIEW {
-                    return Err(ServiceError::invalid_operation(
-                        "Review approval must be submitted as a ReviewReport for an exact Human Review Execution",
-                    ));
-                }
-                self.transition_gate_action(
-                    &task,
-                    &workflow,
-                    WorkflowTrigger::Accept,
-                    TransitionOptions {
-                        version: transition_version,
-                        reason: Some(transition_reason),
-                        triggered_by: actor,
-                        rejection: false,
-                        defer_dispatch_seconds: None,
-                    },
-                )
-                .await?
+                return Err(ServiceError::invalid_operation(
+                    "Approval must be recorded as an exact Decision and evaluated by a Gate",
+                ));
             }
             TaskAction::Cancel => self.cancel_task_as(task.id.clone(), actor).await?,
         };
@@ -189,16 +148,16 @@ impl TaskService {
         &self,
         task: &Task,
         workflow: &api_types::WorkflowDefinition,
+        lifecycle_state: db::TaskLifecycleState,
     ) -> Result<Vec<TaskAction>> {
         let executions = self.task_executions(&task.id).await?;
         let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
             .await?
             .map(|workspace| workspace.id);
-        let state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        let is_terminal = state.is_some_and(|state| state.kind == StateKind::Terminal);
+        let is_terminal = matches!(
+            lifecycle_state,
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
+        );
         let running = executions
             .iter()
             .any(|execution| execution.status == ExecutionStatus::Running);
@@ -224,7 +183,7 @@ impl TaskService {
         let has_agent = self.action_agent_id(task, workflow).await.is_ok();
 
         let mut actions = Vec::new();
-        if can_start(workflow, task) && has_agent {
+        if lifecycle_state == db::TaskLifecycleState::Ready && has_agent {
             actions.push(TaskAction::Start);
         }
         if running {
@@ -233,63 +192,14 @@ impl TaskService {
         if !is_terminal
             && (resumable
                 || has_previous_execution
-                || (state.is_some_and(|state| state.kind == StateKind::Active) && has_agent))
+                || (lifecycle_state == db::TaskLifecycleState::Active && has_agent))
         {
             actions.push(TaskAction::Resume);
         }
-        if state.is_some_and(|state| state.kind == StateKind::Active)
-            && trigger_target(workflow, &task.status, WorkflowTrigger::Accept).is_some()
-        {
-            actions.push(TaskAction::Submit);
-        }
-
-        let review_gate = task.status == crate::workflow::default_states::REVIEW;
-        let gate_requires_approval = state
-            .and_then(|state| state.gate_config.as_ref())
-            .is_some_and(|config| config.requires_user_approval());
-        let gate_role_busy = state
-            .and_then(crate::workflow::effective_role)
-            .is_some_and(|role| {
-                executions.iter().any(|execution| {
-                    execution.role == role && execution.status == ExecutionStatus::Running
-                })
-            });
-        let has_reject = trigger_target(workflow, &task.status, WorkflowTrigger::Reject).is_some();
-        let has_accept = trigger_target(workflow, &task.status, WorkflowTrigger::Accept).is_some();
-        if !review_gate && !gate_role_busy && gate_requires_approval && has_accept {
-            actions.push(TaskAction::Approve);
-        }
-        if !review_gate
-            && !gate_role_busy
-            && state.is_some_and(|state| state.kind == StateKind::Gate)
-            && has_reject
-        {
-            actions.push(TaskAction::RequestChanges);
-        }
-        if !is_terminal && cancellation_target(workflow).is_some() {
+        if !is_terminal {
             actions.push(TaskAction::Cancel);
         }
         Ok(actions)
-    }
-
-    async fn transition_gate_action(
-        &self,
-        task: &Task,
-        workflow: &api_types::WorkflowDefinition,
-        trigger: WorkflowTrigger,
-        options: TransitionOptions,
-    ) -> Result<Task> {
-        let target = trigger_target(workflow, &task.status, trigger).ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "state '{}' has no {} target",
-                task.status,
-                action_name_for_trigger(trigger),
-            ))
-        })?;
-        Ok(self
-            .transition(task.id.clone(), target, options)
-            .await?
-            .task)
     }
 
     async fn resume_task_execution(
@@ -580,42 +490,6 @@ impl TaskService {
     }
 }
 
-fn can_start(workflow: &api_types::WorkflowDefinition, task: &Task) -> bool {
-    workflow.state_kind(&task.status) == Some(StateKind::Initial)
-        && workflow
-            .outgoing_trigger_targets(&task.status)
-            .any(|(_, target)| {
-                matches!(
-                    workflow.state_kind(&target),
-                    Some(StateKind::Active | StateKind::Gate)
-                )
-            })
-}
-
-fn trigger_target(
-    workflow: &api_types::WorkflowDefinition,
-    state: &str,
-    trigger: WorkflowTrigger,
-) -> Option<String> {
-    workflow
-        .outgoing_trigger_targets(state)
-        .find(|(candidate, _)| *candidate == trigger)
-        .map(|(_, target)| target)
-}
-
-fn cancellation_target(workflow: &api_types::WorkflowDefinition) -> Option<String> {
-    workflow.cancellation_state.clone().or_else(|| {
-        workflow
-            .states
-            .iter()
-            .find(|state| {
-                state.kind == StateKind::Terminal
-                    && state.name == crate::workflow::default_states::CANCELLED
-            })
-            .map(|state| state.name.clone())
-    })
-}
-
 fn action_name(action: TaskAction) -> &'static str {
     match action {
         TaskAction::Start => "start",
@@ -628,27 +502,15 @@ fn action_name(action: TaskAction) -> &'static str {
     }
 }
 
-fn action_name_for_trigger(trigger: WorkflowTrigger) -> &'static str {
-    match trigger {
-        WorkflowTrigger::Accept => "accept",
-        WorkflowTrigger::Reject => "reject",
-        _ => "trigger",
-    }
-}
-
 fn unavailable_reason(
     action: TaskAction,
     task: &Task,
-    workflow: &api_types::WorkflowDefinition,
+    lifecycle: db::TaskLifecycleState,
 ) -> String {
-    let state_kind = workflow
-        .state_kind(&task.status)
-        .map(|kind| format!("{kind:?}"))
-        .unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "action '{}' is not available while task is in {} state '{}'",
+        "action '{}' is not available while Task lifecycle is '{}' (legacy status '{}')",
         action_name(action),
-        state_kind,
+        lifecycle,
         task.status
     )
 }

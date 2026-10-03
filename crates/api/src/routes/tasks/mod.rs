@@ -1,14 +1,13 @@
 use api_types::{
-    AddDependencyRequest, AddRoleMembershipRequest, ApproveGateRequest, AssignRoleRequest,
-    AuthorType, CanonicalPhase, ClaimTaskRequest, CommentResponse, CreateCommentRequest,
-    CreateTaskRequest, CreateTaskRoleRequest, DiffEnvelope, HookResultEntry,
-    LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest, MoveTaskResponse,
-    PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest, RejectGateRequest,
-    RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig, RoleMembershipResponse, StateKind,
-    TaskAction, TaskActionRequest, TaskDependency, TaskMediaResponse, TaskResponse,
-    TaskRoleAssignmentResponse, TaskRoleResponse, TasksResponse, TransitionLogEntry,
-    TransitionSource, TransitionTaskRequest, TransitionTaskResponse, UpdateRoleMembershipRequest,
-    UpdateTaskRequest, UpdateTaskRoleRequest, WorkflowDefinition, WorkflowTrigger,
+    AddDependencyRequest, AddRoleMembershipRequest, AssignRoleRequest, AuthorType, CanonicalPhase,
+    ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest,
+    CreateTaskRoleRequest, DiffEnvelope, HookResultEntry, LaunchExecutionRequest,
+    LaunchExecutionResponse, MoveTaskRequest, MoveTaskResponse, PaginatedResponse,
+    PromptPreviewResponse, RecoverTaskRequest, RejectReviewRequest, ReorderSubtasksRequest,
+    ReviewConfig, RoleMembershipResponse, TaskAction, TaskActionRequest, TaskDependency,
+    TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TaskRoleResponse, TasksResponse,
+    TransitionLogEntry, TransitionSource, TransitionTaskRequest, TransitionTaskResponse,
+    UpdateRoleMembershipRequest, UpdateTaskRequest, UpdateTaskRoleRequest, WorkflowTrigger,
     WorkspaceResponse,
 };
 use axum::{
@@ -17,8 +16,8 @@ use axum::{
     Json,
 };
 use db::{
-    now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectRepo, SharedMediaRepo, SortBy, SortOrder, TaskBoardRepo, TaskCommentRepo,
+    now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, PageRequest,
+    ProjectRepo, SharedMediaRepo, SortBy, SortOrder, TaskBoardRepo, TaskCommentRepo,
     TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo, TaskRoleAssignmentRepo,
     TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
@@ -26,9 +25,8 @@ use executors::ExecutionOverrides;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::{
-    task_service::TransitionOptions,
-    workflow::{default_states, engine::WorkflowEngine},
-    Assignee, DiffService, ServiceError,
+    task_service::TransitionOptions, workflow::engine::WorkflowEngine, Assignee, DiffService,
+    ServiceError,
 };
 
 use crate::{
@@ -69,7 +67,10 @@ pub use crud::{
 pub use decisions::{answer_task_decision, list_task_decisions};
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use execution::{claim_task, launch_task};
-pub use gates::{approve_gate, reject_gate};
+pub use gates::{
+    approve_gate, create_task_gate, evaluate_gate, get_gate, get_gate_evaluation,
+    get_task_lifecycle, merge_after_gate, reject_gate, revise_gate_policy,
+};
 pub use media::{delete_media, get_media, list_media, upload_media};
 pub use plans::get_task_plan;
 pub use prompt_preview::prompt_preview;

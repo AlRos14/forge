@@ -57,6 +57,11 @@ WorkUnit also needs a completed Execution result SHA admitted for its current
 WorkUnit version; the completion transition freezes that result for explicit
 integration.
 
+A Gate requirement can pin the WorkUnit ID and version, dependency snapshot,
+Execution result, and exact WorkUnitIntegration. Completion alone does not
+satisfy an integration requirement. Gate evaluation does not alter WorkUnit
+completion or integration state.
+
 ## Dependencies
 
 Dependencies form a same-Task directed acyclic graph. Self-edges, duplicate

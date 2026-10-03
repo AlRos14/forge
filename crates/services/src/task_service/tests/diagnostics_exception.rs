@@ -2,7 +2,7 @@ use super::helpers::*;
 use super::*;
 
 #[tokio::test]
-async fn test_derive_workflow_exception_review_failed_no_annotation() {
+async fn test_legacy_review_projection_does_not_restore_workflow_retry_authority() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
@@ -12,7 +12,7 @@ async fn test_derive_workflow_exception_review_failed_no_annotation() {
         crate::workflow::default_states::REVIEW,
     )
     .await;
-    assert_eq!(task.error_annotation, None);
+    assert_eq!(task.status, "blocked");
     assert_eq!(task.blocked_json, None);
     let execution = seed_execution(
         &db,
@@ -48,89 +48,10 @@ async fn test_derive_workflow_exception_review_failed_no_annotation() {
         Some(&review),
         Some(&execution),
         &remaining_retries,
-    )
-    .expect("workflow exception derives");
-
-    assert_eq!(exception.exception_type, "review_failed");
-    let failing_step = exception.failing_step.expect("failing step exists");
-    assert_eq!(
-        failing_step.command.as_deref(),
-        Some("cargo test --workspace")
     );
-    assert_eq!(failing_step.exit_code, Some(101));
-    assert_eq!(
-        failing_step.output_tail.as_deref(),
-        Some("test failure tail")
-    );
-    assert_eq!(
-        failing_step.stderr_tail.as_deref(),
-        Some("stderr failure tail")
-    );
-
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
-    assert!(action_kinds.iter().any(|kind| kind == "resume_process"));
-    assert!(action_kinds.iter().any(|kind| kind == "proceed_once"));
-    assert!(action_kinds.iter().any(|kind| kind == "open_interactive"));
-
-    let retry_hook = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("retry_hook")
-        })
-        .expect("retry_hook action exists");
     assert!(
-        retry_hook.enabled,
-        "retry_hook should be enabled for review gate with failed review and retries remaining"
-    );
-
-    let resume_process = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("resume_process")
-        })
-        .expect("resume_process action exists");
-    assert!(resume_process.enabled);
-    assert_eq!(
-        resume_process.target_state.as_deref(),
-        Some(crate::workflow::default_states::IN_PROGRESS)
-    );
-    assert_eq!(
-        resume_process.target_role.as_deref(),
-        Some(crate::workflow::default_roles::CODER)
-    );
-
-    let proceed_once = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("proceed_once")
-        })
-        .expect("proceed_once action exists");
-    assert!(
-        !proceed_once.enabled,
-        "proceed_once should be disabled when retry budget is not exhausted"
+        exception.is_none(),
+        "ambiguous legacy review facts must not recreate workflow retry authority"
     );
 }
 

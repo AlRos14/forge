@@ -8,6 +8,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Task progress is now owned by the aggregate `task_lifecycle` record. Legacy
+  `task.status` is a one-way compatibility projection; old workflow states,
+  gates, hooks, and reviewer verdicts cannot advance lifecycle. Existing rows
+  migrate conservatively, with ambiguous review/custom states recorded as
+  blocked migration audit entries. Gate results are immutable evaluations over
+  exact policy revisions and inputs. Callers that used Task status transitions
+  to run workflow hooks must use lifecycle-owned operations or wait for the
+  PR12 public-surface migration. Manual workflow advancement and legacy
+  review/hook recovery actions return `409`; `remaining_retries` is retained as
+  an empty response projection until PR12 replaces that public field.
+
 - Review decisions now come from an exact `role=reviewer`, `purpose=review`
   Execution and its immutable `review_report` Artifact. Task-level approve and
   reject review endpoints return `409`; callers start or select a Human Review

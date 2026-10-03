@@ -282,8 +282,10 @@ defect; a formal review requires a separate reviewer Execution.
 Gates express deterministic constraints such as required validation, required
 reviewers, human authorization, merge readiness, or a policy decision. A Gate
 can require several independent, partitioned, or collaborative reviewers.
-Review failure produces rework collaboration and may resume the original
-implementer's exact session.
+Review failure remains an exact ReviewReport input and makes the Gate
+unsatisfied. The current PR9 branch does not yet consume that failure into a
+retry budget or create a rework Handoff/WorkUnit/Execution; the old workflow
+retry readers still need to be removed before PR9 is ready.
 
 See [review-and-validation.md](concepts/review-and-validation.md) and
 [gates.md](concepts/gates.md).
@@ -330,6 +332,17 @@ planner thinking, coder thinking, or reviewer thinking. Planning, implementing,
 reviewing, validating, and orchestrating may overlap. UI activity such as
 Planning, three Implementers active, Reviewing, or Waiting for Human is a
 derived projection.
+
+The current PR9 branch implements `task_lifecycle`, an optimistic version, and
+immutable transition receipts. A compatibility projection writes the existing
+`task.status` column from the aggregate state. Some active service paths still
+consult WorkflowEngine/StateDefinition and GateConfig for role, dispatch,
+recovery, or retry behavior, so that authority cutover is incomplete. Gate
+identity, immutable policy revisions, exact-input evaluations, and their
+durable events provide deterministic readiness evidence. A Gate does not
+perform review, validation, orchestration, or merge work. V100 preserves
+ambiguous legacy states in a migration audit and fails closed. PR12 owns public
+endpoint/UI alignment, and PR13 owns physical legacy-schema cleanup.
 
 The scheduler starts eligible requested Executions while respecting dependency
 edges, Actor capacity, WorkUnit scope, workspace leases, Gates, Task lifecycle,

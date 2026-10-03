@@ -663,6 +663,34 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::reject_gate),
         )
         .route(
+            "/api/v1/tasks/{id}/gates",
+            post(routes::tasks::create_task_gate),
+        )
+        .route(
+            "/api/v1/gates/{id}",
+            get(routes::tasks::get_gate),
+        )
+        .route(
+            "/api/v1/gates/{id}/policy",
+            put(routes::tasks::revise_gate_policy),
+        )
+        .route(
+            "/api/v1/gates/{id}/evaluate",
+            post(routes::tasks::evaluate_gate),
+        )
+        .route(
+            "/api/v1/gate-evaluations/{id}",
+            get(routes::tasks::get_gate_evaluation),
+        )
+        .route(
+            "/api/v1/tasks/{id}/merge",
+            post(routes::tasks::merge_after_gate),
+        )
+        .route(
+            "/api/v1/tasks/{id}/lifecycle",
+            get(routes::tasks::get_task_lifecycle),
+        )
+        .route(
             "/api/v1/tasks/{id}/transitions",
             get(routes::tasks::list_transitions),
         )

@@ -172,6 +172,38 @@ and Workspace snapshot cannot be proven. Existing tables and
 transition readers/writers, crash recovery, and remaining PR9/PR13 boundaries
 are recorded in `plan-pr8-review-validation-evidence.md`.
 
+## Plan PR9 implementation status on the current branch
+
+V100 adds an aggregate `task_lifecycle` row, transition receipts, conservative
+legacy-state audit, Task/WorkUnit/operation-scoped Gate identity, immutable
+versioned policy revisions, immutable evaluations, and ordered exact input
+references. SQL guards fence Task and lifecycle versions, enforce legal state
+edges, pin same-Task producers and Gate scope, prevent mutation of historical
+policy/evaluation/receipt records, and require a current satisfied merge
+readiness evaluation for merge admission and publication.
+
+`TaskLifecycleService` owns aggregate transitions, causal-record ownership,
+idempotency, and durable events. `GateEngine` evaluates bounded review,
+ValidationRun/Evidence, Decision, and WorkUnit requirements from explicit IDs
+and frozen identity. Durable fact events drive evaluation; EventBus is only a
+post-commit hint. Lifecycle advancement caused by a Gate records the exact
+evaluation. PR9 does not create HumanApproval, copy review or validation
+verdicts, or convert legacy workflow definitions into Gate policies.
+For merge readiness, ReviewReport and ValidationRun subjects must share the
+same Workspace, commit, and snapshot. WorkUnit-backed merges bind to an exact
+successful integration, and MergeService checks the evaluated commit under
+the shared Workspace lock before creating a merge operation.
+
+`task.status` is guarded as a one-way compatibility projection until PR12.
+However, active service paths still consult WorkflowEngine/StateDefinition and
+GateConfig for role, dispatch, recovery, and retry behavior. Those readers are
+not a safe compatibility projection and remain PR9 blockers. Retry budgets are
+not Gate inputs, but this branch does not yet provide the replacement exact-
+failure budget consumer: a request-changes evaluation is durable and
+unsatisfied, but does not create rework or block on exhaustion. The branch is
+therefore **not ready for review**. See
+`plan-pr9-gate-engine-task-lifecycle.md` for the concrete audit and test gaps.
+
 MCP has no tool that reads or writes the new ReviewReport, ValidationRun, or
 deterministic Evidence authorities. Its generic task-type enum, review retry
 budget setting, and prompt preview remain configuration/projection surfaces.

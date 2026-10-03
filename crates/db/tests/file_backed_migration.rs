@@ -85,13 +85,15 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
         task_id: task_id.clone(),
         kind: TaskIntegrationOperationKind::WorkUnitIntegration,
         owner_id: "integration-attempt-a".to_owned(),
+        gate_evaluation_id: None,
         created_at: db::now_rfc3339(),
     };
     let second_claim = CreateTaskIntegrationOperation {
         id: db::new_uuid_v4(),
         task_id: task_id.clone(),
-        kind: TaskIntegrationOperationKind::TaskMerge,
+        kind: TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
         owner_id: "merge-attempt-b".to_owned(),
+        gate_evaluation_id: None,
         created_at: db::now_rfc3339(),
     };
     let (first, second) = tokio::join!(
@@ -113,6 +115,123 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
         .expect("active operation query")
         .expect("one durable active claim");
     assert_eq!(active.status, TaskIntegrationOperationStatus::Running);
+}
+
+#[tokio::test]
+async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambiguity() {
+    let base_dir = unique_temp_path("pr9-v099-migrations");
+    let final_dir = unique_temp_path("pr9-v100-migrations");
+    fs::create_dir_all(&base_dir).expect("base migration dir");
+    fs::create_dir_all(&final_dir).expect("final migration dir");
+    copy_migrations_up_to(99, &base_dir);
+    copy_migrations_up_to(100, &final_dir);
+
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    run_migrations_from(&pool, &base_dir)
+        .await
+        .expect("V099 baseline");
+    let db = SqliteDb::new(pool.clone());
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "PR9 lifecycle migration".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+
+    let expected = [
+        ("backlog", "backlog", "mapped"),
+        ("todo", "ready", "mapped"),
+        ("ready", "ready", "mapped"),
+        ("planning", "active", "mapped"),
+        ("in_progress", "active", "mapped"),
+        ("working", "active", "mapped"),
+        ("review", "blocked", "ambiguous_review"),
+        ("merge_failed", "blocked", "merge_failed"),
+        ("merging", "blocked", "ambiguous_merge"),
+        ("custom_state", "blocked", "unknown_custom_state"),
+        ("done", "done", "mapped"),
+        ("cancelled", "cancelled", "mapped"),
+    ];
+    let mut task_ids = Vec::new();
+    for (legacy_state, _, _) in expected {
+        let task_id = db::new_uuid_v4();
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: format!("legacy {legacy_state}"),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: legacy_state.to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: Some("{\"legacy\":true}".to_owned()),
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy Task");
+        task_ids.push((task_id, legacy_state));
+    }
+    let review_task_id = task_ids
+        .iter()
+        .find(|(_, status)| *status == "review")
+        .expect("review migration fixture exists");
+    sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+        .bind("{\"status\":\"running\",\"state\":\"review\"}")
+        .bind(&review_task_id.0)
+        .execute(&pool)
+        .await
+        .expect("legacy entry barrier setup");
+
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("V100 migration");
+    for ((task_id, _), (_, mapped, status)) in task_ids.iter().zip(expected) {
+        let actual: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT l.state, a.mapping_status, t.entry_barrier_json
+             FROM task_lifecycle l
+             JOIN task_lifecycle_migration_audit a ON a.task_id = l.task_id
+             JOIN task t ON t.id = l.task_id
+             WHERE l.task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("mapped lifecycle lookup");
+        assert_eq!(actual, (mapped.to_owned(), status.to_owned(), None));
+    }
+    let audit_details: String = sqlx::query_scalar(
+        "SELECT details_json FROM task_lifecycle_migration_audit WHERE task_id = ?",
+    )
+    .bind(&review_task_id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy uncertainty audit");
+    assert!(audit_details.contains("legacy_entry_barrier_json"));
+    assert!(audit_details.contains("running"));
+
+    let _ = fs::remove_dir_all(base_dir);
+    let _ = fs::remove_dir_all(final_dir);
 }
 
 #[tokio::test]

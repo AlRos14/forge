@@ -3,11 +3,10 @@
 Validation and review are separate kinds of work and separate sources of
 truth.
 
-PR4 adds generic collaboration primitives but does not migrate the existing
-Review, validation, `review_evidence_bundle`, or `task_decision_*` authorities.
-Those continue to own their legacy data until PR8. PR4 Artifacts can represent
-generic reports created through the new surface, but no legacy review or
-validation writer automatically creates one.
+PR8 makes reviewer Executions and ReviewReport Artifacts authoritative for new
+review results, and ValidationRuns/Evidence authoritative for deterministic
+checks. Legacy Review and `review_evidence_bundle` rows remain historical until
+PR13; they do not satisfy a PR9 Gate.
 
 ## Validation
 
@@ -22,9 +21,8 @@ HarnessSession, or fake System Actor. It records:
 * status and exit code;
 * a log or output reference.
 
-The future PR8 run produces Evidence and may produce a generic validation-report
-Artifact through a dedicated ValidationRun producer relation. PR4 supports
-only Execution-produced Artifacts; it creates no ValidationRun foreign key.
+The PR8 run produces Evidence and may produce a generic validation-report
+Artifact through a dedicated ValidationRun producer relation.
 Typical checks include
 tests, typecheck, lint, build, security scanners, and required repository
 commands. It is never attributed to a fake Actor or to an Actor Execution.
@@ -49,6 +47,11 @@ A reviewer may inspect changes, ask a question, request validation, pass, or
 request changes. It does not directly mutate implementation work through a
 review verdict.
 
+PR9 Gate policies pin an exact ReviewReport ID/digest, its producing reviewer
+Execution, verdict, subject, and permitted actor set. A Gate may also pin an
+exact ValidationRun and Evidence pair. Neither input substitutes for the
+other, and no reviewer verdict directly advances Task lifecycle.
+
 ## Multiple reviewers
 
 Reviewer TaskRoles may be independent, partitioned, or collaborative:
@@ -62,10 +65,11 @@ reviewer's failure.
 
 ## Rework
 
-Request-changes produces a ReviewReport Artifact and a rework Handoff. A PR4
-Handoff identifies its target Actor, Role, or Task but does not persist the
-recipient's exact HarnessSession. If PR6 or PR8 needs session continuity for
-rework, it must add an explicit additive relation or typed action carrying
-that identity. It must never infer the session from a Role or latest
-Execution lookup. Historical reviewer and implementer Executions remain
-unchanged.
+The target flow keeps request-changes in the exact ReviewReport, evaluates the
+Gate as unsatisfied, then lets lifecycle/orchestration policy consume that
+failure and direct a Handoff or WorkUnit. The current PR9 branch implements the
+first two facts only: it does not yet record retry-budget consumption or create
+the rework Handoff/WorkUnit/Execution. The old workflow retry paths remain and
+are a PR9 readiness blocker. Any later rework must carry exact failure identity
+and must never infer a HarnessSession from a Role or latest Execution lookup.
+Historical reviewer and implementer Executions remain unchanged.

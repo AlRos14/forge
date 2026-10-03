@@ -1,6 +1,6 @@
 use super::*;
-use api_types::{Actor, SystemComponent, UserActionSource};
-use db::UpdateTask;
+use api_types::{Actor, SystemComponent};
+use db::{TaskLifecycleRepo, UpdateTask};
 
 impl TaskService {
     pub async fn transition(
@@ -13,6 +13,7 @@ impl TaskService {
             .await
     }
 
+    #[allow(dead_code)] // Historical review path; GateEvaluation owns lifecycle transitions now.
     pub(crate) async fn transition_caused_by_execution(
         &self,
         task_id: impl Into<String>,
@@ -44,148 +45,61 @@ impl TaskService {
         options: TransitionOptions,
         causing_execution_id: Option<&str>,
     ) -> Result<TransitionResult> {
-        let trigger_reason = options.reason.unwrap_or_else(|| "user action".to_owned());
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let previous_status = task.status.clone();
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &options.triggered_by,
-        );
-        if task.repo_id.is_some()
-            && workflow.state_kind(&new_status) == Some(api_types::StateKind::Active)
+        let target = crate::task_lifecycle::lifecycle_state_for_legacy_status(&new_status)
+            .ok_or_else(|| ServiceError::invalid_operation("unknown Task lifecycle projection"))?;
+        if target == db::TaskLifecycleState::Active
+            && task.repo_id.is_some()
+            && options.version == task.version
         {
-            // Direct transitions must obey the same admission boundary as
-            // claim/launch for every repository-capable task type.  Task
-            // labels such as discovery/planning only select a read-only
-            // executor profile; they do not bypass the baseline/lease gate.
+            // Preserve the repository admission boundary while aggregate
+            // progress replaces workflow state transitions.
             self.ensure_task_runnable(&task).await?;
         }
-        self.cancel_active_execution_for_user_transition(
-            &task,
-            &new_status,
-            &workflow,
-            &options.triggered_by,
+        let cause = causing_execution_id
+            .map(|id| crate::task_lifecycle::LifecycleCause::Execution(id.to_owned()))
+            .unwrap_or_else(|| {
+                crate::task_lifecycle::LifecycleCause::Actor(options.triggered_by.clone())
+            });
+        let result = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
         )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: task_id.clone(),
+            expected_task_version: options.version,
+            to_state: target,
+            cause,
+            reason_kind: Some("task_transition".to_owned()),
+            reason_ref: Some(options.reason.unwrap_or_else(|| "user action".to_owned())),
+            idempotency_key: format!("task-transition:{task_id}:{}:{target}", options.version),
+        })
         .await?;
-        let was_blocked = task.blocked_json.is_some();
-        let blocked_previous_reason = task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<Value>(json).ok())
-            .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_owned));
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
-            adapter_registry: self.adapter_registry.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
-        let defer_dispatch_until = options
-            .defer_dispatch_seconds
-            .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
-        let result = if let Some(causing_execution_id) = causing_execution_id {
-            engine
-                .transition_with_execution_cause(
-                    &task_id,
-                    &new_status,
-                    options.version,
-                    &workflow,
-                    &options.triggered_by,
-                    &trigger_reason,
-                    options.rejection,
-                    defer_dispatch_until,
-                    causing_execution_id,
-                )
-                .await?
-        } else {
-            engine
-                .transition_with_deferred_dispatch(
-                    &task_id,
-                    &new_status,
-                    options.version,
-                    &workflow,
-                    &options.triggered_by,
-                    &trigger_reason,
-                    options.rejection,
-                    defer_dispatch_until,
-                )
-                .await?
-        };
-        let mut task = result.task;
-        if was_blocked {
+        if task.status != result.task.status {
             self.publish(ForgeEvent {
-                event_type: "task.unblocked".to_owned(),
-                entity_id: task.id.clone(),
+                event_type: "task.status_changed".to_owned(),
+                entity_id: result.task.id.clone(),
                 timestamp: event_timestamp(),
-                context: EventContext::TaskUnblocked {
-                    project_id: task.project_id.clone(),
-                    previous_reason: blocked_previous_reason.clone(),
+                context: EventContext::TaskStatusChanged {
+                    project_id: result.task.project_id.clone(),
+                    old_status: task.status,
+                    new_status: result.task.status.clone(),
                 },
             });
-            tracing::info!(
-                task_id = %task.id,
-                from_status = %previous_status,
-                to_status = %task.status,
-                previous_reason = ?blocked_previous_reason,
-                "blocked metadata cleared by transition"
-            );
         }
-        if previous_status == crate::workflow::default_states::REVIEW
-            && task.status != crate::workflow::default_states::REVIEW
-        {
-            task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
-        }
-        if should_clear_transient_error_annotation(&task) {
-            match TaskRepo::update(
-                &*self.db,
-                UpdateTask {
-                    id: task.id.clone(),
-                    expected_version: task.version,
-                    title: None,
-                    description: None,
-                    priority: None,
-                    merge_config: None,
-                    error_annotation: Some(None),
-                    blocked_json: None,
-                    failed_json: None,
-                    task_state_config: None,
-                    parent_task_id: None,
-                    updated_at: now_rfc3339(),
-                },
+        if target == db::TaskLifecycleState::Cancelled {
+            self.cancel_running_executions_for_task(
+                &result.task,
+                "cancelled by aggregate Task lifecycle",
+                options.triggered_by,
             )
-            .await
-            {
-                Ok(updated) => task = updated,
-                Err(DbError::VersionConflict) => {
-                    // An on_enter hook (e.g. dispatch_role_follow_up) may have already
-                    // cleared the annotation and incremented the version; re-fetch.
-                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                }
-                Err(e) => return Err(e.into()),
-            }
+            .await?;
         }
-        if previous_status != task.status {
-            super::execution::clear_execution_retry_metadata(&self.db, &task).await?;
-        }
-
         Ok(TransitionResult {
-            task,
-            review: result.review,
+            task: result.task,
+            review: None,
         })
     }
 
@@ -195,9 +109,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.blocked_json.is_some() {
-            return Ok(true);
-        }
         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid task metadata: {error}"))
         })?;
@@ -209,137 +120,25 @@ impl TaskService {
         {
             return Ok(true);
         }
-        if task.status == crate::workflow::default_states::REVIEW {
-            let executions = ExecutionRepo::list_by_task(
-                &*self.db,
-                &task_id,
-                PageRequest {
-                    cursor: None,
-                    limit: 100,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Desc,
-                },
-            )
-            .await?;
-            if executions.items.iter().any(|execution| {
-                execution.role == crate::workflow::default_roles::REVIEWER
-                    && execution.purpose == Some(ExecutionPurpose::Review)
-                    && execution
-                        .actor_ref()
-                        .is_some_and(|actor| matches!(actor, db::ActorRef::Human(_)))
-                    && execution.status == ExecutionStatus::Running
-            }) {
-                return Ok(true);
-            }
-        }
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        let Some(state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(false);
-        };
-        if task.status == crate::workflow::default_states::PLANNING {
-            let Some(role_name) = state.role.as_deref() else {
-                return Ok(false);
-            };
-            return Ok(
-                match crate::task_service::current_role_memberships_authoritative(
-                    &self.db, &task_id, role_name,
-                )
-                .await?
-                {
-                    Some(memberships) => memberships.iter().any(|membership| {
-                        membership.actor_kind == db::ActorKind::Human
-                            && membership.status == db::RoleMembershipStatus::Active
-                    }),
-                    None => {
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
-                            .await?
-                            .is_some_and(|assignment| {
-                                assignment.assignee_type == Some(AssigneeKind::User)
-                                    && assignment.assignee_id.is_some()
-                            })
-                    }
-                },
-            );
-        }
-        if state.kind != api_types::StateKind::Gate {
-            return Ok(false);
-        }
-        let transition_log = TransitionLogRepo::list_by_task(&*self.db, &task_id).await?;
-        let entered_at = transition_log
-            .iter()
-            .rev()
-            .find(|entry| entry.to_state == task.status)
-            .map(|entry| entry.created_at.as_str())
-            .unwrap_or(task.created_at.as_str());
-        let has_decision_since_entry = transition_log.iter().any(|entry| {
-            entry.from_state == task.status
-                && entry.created_at.as_str() >= entered_at
-                && (entry.trigger_reason.starts_with("gate approved")
-                    || entry.trigger_reason.starts_with("gate rejected"))
-        });
-        if let Some(gate_config) = state
-            .gate_config
-            .as_ref()
-            .filter(|gate_config| gate_config.requires_user_approval())
-        {
-            if gate_config.optional_when_unassigned() {
-                let Some(role_name) = state.role.as_deref() else {
-                    return Ok(false);
-                };
-                let assigned = match crate::task_service::current_role_memberships_authoritative(
-                    &self.db, &task_id, role_name,
-                )
-                .await?
-                {
-                    Some(memberships) => memberships
-                        .iter()
-                        .any(|membership| membership.status == db::RoleMembershipStatus::Active),
-                    None => {
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
-                            .await?
-                            .is_some_and(|assignment| {
-                                assignment.assignee_type.is_some()
-                                    && assignment.assignee_id.is_some()
-                            })
-                    }
-                };
-                if !assigned {
-                    return Ok(false);
-                }
-            }
-            return Ok(!has_decision_since_entry);
-        }
-
-        let Some(role_name) = state.role.as_deref() else {
-            return Ok(false);
-        };
-
-        let has_human_reviewer = match crate::task_service::current_role_memberships_authoritative(
-            &self.db, &task_id, role_name,
+        let executions = ExecutionRepo::list_by_task(
+            &*self.db,
+            &task_id,
+            PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
         )
-        .await?
-        {
-            Some(memberships) => memberships.iter().any(|membership| {
-                membership.actor_kind == db::ActorKind::Human
-                    && membership.status == db::RoleMembershipStatus::Active
-            }),
-            None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
-                .await?
-                .is_some_and(|assignment| assignment.assignee_type == Some(AssigneeKind::User)),
-        };
-        Ok(has_human_reviewer && !has_decision_since_entry)
+        .await?;
+        Ok(executions.items.iter().any(|execution| {
+            execution.purpose == Some(ExecutionPurpose::Review)
+                && execution
+                    .actor_ref()
+                    .is_some_and(|actor| matches!(actor, db::ActorRef::Human(_)))
+                && execution.status == ExecutionStatus::Running
+        }))
     }
 
     pub async fn executor_attempt_count(&self, task_id: &str) -> Result<i64> {
@@ -348,36 +147,6 @@ impl TaskService {
             ExecutionRepo::count_by_task_and_role(&*self.db, task_id, "executor").await?;
         let coder = ExecutionRepo::count_by_task_and_role(&*self.db, task_id, "coder").await?;
         Ok(executor + coder)
-    }
-
-    pub async fn remaining_retries(&self, task_id: &str) -> Result<i32> {
-        validate_required("task_id", task_id)?;
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        let state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        let max_retries = super::config::runtime_retry_budget(
-            &task,
-            super::config::RetryBudgetKind::Review,
-            state.map(|state| &state.config),
-            state.and_then(|state| state.gate_config.as_ref()),
-        )?;
-
-        let attempts = self.executor_attempt_count(task_id).await?;
-        let remaining = i64::from(max_retries) + 1 - attempts;
-        Ok(remaining.clamp(0, i64::from(i32::MAX)) as i32)
     }
 
     pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -391,20 +160,10 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        let cancel_target = workflow
-            .cancellation_state
-            .as_deref()
-            .unwrap_or("cancelled")
-            .to_owned();
-        if task.status == cancel_target {
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if lifecycle.state == db::TaskLifecycleState::Cancelled {
             return Ok(task);
         }
         self.cancel_running_executions_for_task(
@@ -416,7 +175,7 @@ impl TaskService {
         let result = self
             .transition(
                 task_id,
-                cancel_target,
+                "cancelled".to_owned(),
                 TransitionOptions {
                     version: task.version,
                     reason: Some("cancel task".to_owned()),
@@ -426,55 +185,16 @@ impl TaskService {
                 },
             )
             .await?;
-        let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        let task =
+            clear_transient_error_annotation_after_cancel(&self.db, &task, result.task).await?;
         Ok(task)
     }
 
     pub async fn advance_to_next_state(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        validate_required("task_id", &task_id)?;
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::user(UserActionSource::ManualAdvance),
-        );
-        let target = next_workflow_state(&workflow, &task.status)?;
-
-        self.cancel_running_executions_for_manual_advance(&task)
-            .await?;
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
-            adapter_registry: self.adapter_registry.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
-        let result = engine
-            .manual_override_transition(
-                &task_id,
-                &target,
-                task.version,
-                &workflow,
-                Actor::user(UserActionSource::ManualAdvance),
-                "manual advance",
-                false,
-            )
-            .await?;
-        let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
-        Ok(task)
+        let _ = task_id.into();
+        Err(ServiceError::invalid_operation(
+            "manual workflow advancement is retired; Task progress requires an aggregate lifecycle transition and exact Gate facts",
+        ))
     }
 
     pub async fn soft_delete(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -483,20 +203,17 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, true)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
         if matches!(
-            workflow.state_kind(&task.status),
-            Some(api_types::StateKind::Active | api_types::StateKind::Gate)
+            lifecycle.state,
+            db::TaskLifecycleState::Active
+                | db::TaskLifecycleState::ReadyToMerge
+                | db::TaskLifecycleState::Merging
         ) {
             return Err(ServiceError::invalid_operation(
-                "tasks can only be deleted from inactive states",
+                "Tasks with active aggregate work cannot be deleted",
             ));
         }
 
@@ -555,6 +272,7 @@ impl TaskService {
 }
 
 impl TaskService {
+    #[allow(dead_code)] // Retained for legacy WorkflowEngine teardown until PR13.
     pub(super) async fn cancel_active_execution_for_user_transition(
         &self,
         task: &Task,
@@ -607,16 +325,7 @@ impl TaskService {
         Ok(())
     }
 
-    async fn cancel_running_executions_for_manual_advance(&self, task: &Task) -> Result<()> {
-        self.cancel_running_executions_for_task(
-            task,
-            "cancelled by manual advance",
-            Actor::user(UserActionSource::ManualAdvance),
-        )
-        .await
-    }
-
-    async fn cancel_running_executions_for_task(
+    pub(super) async fn cancel_running_executions_for_task(
         &self,
         task: &Task,
         reason: &str,
@@ -652,52 +361,7 @@ impl TaskService {
     }
 }
 
-fn next_workflow_state(
-    workflow: &api_types::WorkflowDefinition,
-    current_status: &str,
-) -> Result<String> {
-    let current_index = workflow
-        .states
-        .iter()
-        .position(|state| state.name == current_status)
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
-                current_status,
-                workflow,
-            ))
-        })?;
-    let cancellation_state = workflow.cancellation_state.as_deref();
-    let reject_target = workflow.gate_reject_target(current_status);
-    let candidates = workflow
-        .outgoing_trigger_targets(current_status)
-        .filter(|(_, target)| {
-            target != current_status
-                && cancellation_state != Some(target.as_str())
-                && reject_target != Some(target.as_str())
-        })
-        .collect::<Vec<_>>();
-
-    candidates
-        .iter()
-        .filter_map(|(_, target)| {
-            workflow
-                .states
-                .iter()
-                .position(|state| state.name == *target)
-                .filter(|target_index| *target_index > current_index)
-                .map(|target_index| (target.clone(), target_index))
-        })
-        .min_by_key(|(_, target_index)| *target_index)
-        .map(|(target, _)| target)
-        .or_else(|| candidates.first().map(|(_, target)| target.clone()))
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "state '{current_status}' has no next workflow transition"
-            ))
-        })
-}
-
-async fn clear_manual_advance_error_annotation(
+async fn clear_transient_error_annotation_after_cancel(
     db: &SqliteDb,
     source_task: &Task,
     advanced_task: Task,
@@ -729,6 +393,7 @@ async fn clear_manual_advance_error_annotation(
     .map_err(Into::into)
 }
 
+#[allow(dead_code)] // Historical ReviewRunner metadata cleanup; PR13 storage cleanup.
 pub(super) async fn clear_manual_review_awaiting_metadata(
     db: &SqliteDb,
     task: &Task,
@@ -769,29 +434,6 @@ pub(super) fn should_clear_transient_error_annotation(task: &Task) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::{default_states, default_workflow::default_workflow};
-
-    #[test]
-    fn manual_advance_uses_forward_workflow_state() {
-        let workflow = default_workflow();
-
-        assert_eq!(
-            next_workflow_state(&workflow, default_states::TODO).unwrap(),
-            default_states::PLANNING
-        );
-        assert_eq!(
-            next_workflow_state(&workflow, default_states::IN_PROGRESS).unwrap(),
-            default_states::REVIEW
-        );
-        assert_eq!(
-            next_workflow_state(&workflow, default_states::REVIEW).unwrap(),
-            default_states::MERGING
-        );
-        assert_eq!(
-            next_workflow_state(&workflow, default_states::MERGING).unwrap(),
-            default_states::DONE
-        );
-    }
 
     #[test]
     fn executor_failure_annotations_are_transient() {

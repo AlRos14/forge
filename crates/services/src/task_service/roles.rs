@@ -373,19 +373,6 @@ impl TaskService {
 
         let assignment = self.assign_role_assignment(input).await?;
 
-        let workflow = self.workflow_for_task(&task).await?;
-        let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
-            .reset_to_initial(
-                &task.id,
-                &initial_state,
-                task.version,
-                &workflow,
-                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
-                "coder reassigned",
-            )
-            .await?;
-
         let (effective_reset_workspace, effective_reset_worktree) = self
             .apply_reassignment_reset(&task, &active_execution, reset_workspace, reset_worktree)
             .await?;
@@ -471,19 +458,6 @@ impl TaskService {
         )
         .await?;
         TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
-
-        let workflow = self.workflow_for_task(&task).await?;
-        let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
-            .reset_to_initial(
-                &task.id,
-                &initial_state,
-                task.version,
-                &workflow,
-                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
-                "coder reassigned",
-            )
-            .await?;
 
         let (effective_reset_workspace, effective_reset_worktree) = self
             .apply_reassignment_reset(&task, &active_execution, reset_workspace, reset_worktree)
@@ -847,23 +821,6 @@ impl TaskService {
         Ok((false, false))
     }
 
-    fn workflow_engine(&self) -> WorkflowEngine {
-        WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
-            adapter_registry: self.adapter_registry.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        }
-    }
-
     fn publish_role_reassigned(
         &self,
         task_id: &str,
@@ -939,15 +896,6 @@ fn snapshot(assignment: &TaskRoleAssignment) -> RoleAssignmentSnapshot {
         assignee_type: assignment.assignee_type.as_ref().map(ToString::to_string),
         assignee_id: assignment.assignee_id.clone(),
     }
-}
-
-fn workflow_initial_state(workflow: &api_types::WorkflowDefinition) -> Result<String> {
-    workflow
-        .states
-        .iter()
-        .find(|state| state.kind == api_types::StateKind::Initial)
-        .map(|state| state.name.clone())
-        .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))
 }
 
 fn reassignment_repo_name(repo_url: &str) -> String {

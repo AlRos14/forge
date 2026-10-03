@@ -223,6 +223,43 @@ pub fn derive_workflow_exception(
     latest_execution: Option<&Execution>,
     remaining_retries: &HashMap<String, i64>,
 ) -> Option<WorkflowExceptionSummary> {
+    let mut summary = derive_legacy_workflow_exception(
+        task,
+        workflow,
+        latest_review,
+        latest_execution,
+        remaining_retries,
+    )?;
+    summary
+        .actions
+        .retain(|action| !is_retired_workflow_recovery_action(action.kind));
+    Some(summary)
+}
+
+pub fn filter_retired_workflow_recovery_actions(actions: &mut Vec<RecoveryAction>) {
+    actions.retain(|action| !is_retired_workflow_recovery_action(*action));
+}
+
+fn is_retired_workflow_recovery_action(action: RecoveryAction) -> bool {
+    matches!(
+        action,
+        RecoveryAction::MarkReviewed
+            | RecoveryAction::RetryHook
+            | RecoveryAction::ResumeProcess
+            | RecoveryAction::UpdateWorkspaceAndRetryHook
+            | RecoveryAction::SkipHookOnce
+            | RecoveryAction::ResetRetryWindow
+            | RecoveryAction::ProceedOnce
+    )
+}
+
+fn derive_legacy_workflow_exception(
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    latest_review: Option<&Review>,
+    latest_execution: Option<&Execution>,
+    remaining_retries: &HashMap<String, i64>,
+) -> Option<WorkflowExceptionSummary> {
     let current_state = workflow
         .states
         .iter()

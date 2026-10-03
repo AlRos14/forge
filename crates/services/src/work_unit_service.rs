@@ -291,7 +291,7 @@ impl WorkUnitService {
             })
             .await;
         match (result, finish_result) {
-            (Ok(unit), Ok(())) => Ok(unit),
+            (Ok(unit), Ok(_)) => Ok(unit),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
@@ -915,7 +915,7 @@ impl WorkUnitService {
             })
             .await;
         match (result, finish_result) {
-            (Ok(workspace), Ok(())) => Ok(workspace),
+            (Ok(workspace), Ok(_)) => Ok(workspace),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
@@ -1209,7 +1209,7 @@ impl WorkUnitService {
         };
         let finish_result = operation.finish(operation_status).await;
         match (result, finish_result) {
-            (Ok(record), Ok(())) => Ok(record),
+            (Ok(record), Ok(_)) => Ok(record),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }

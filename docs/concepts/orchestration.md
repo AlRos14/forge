@@ -58,6 +58,13 @@ allocation changes, and explicitly addressed collaboration can wake eligible
 members. Unsupported event producers remain deferred to their lifecycle owner
 rather than being promoted from EventBus-only signals.
 
+PR9 Gate evaluations and lifecycle transitions append durable domain events.
+The Gate Engine consumes relevant committed fact events (review reports,
+terminal ValidationRuns, Evidence, Decisions, WorkUnit and integration facts,
+role changes, and policy revisions). A satisfied or unsatisfied evaluation is
+an input to PR6 orchestration; the orchestrator may direct rework but cannot
+write the Gate result or reinterpret its exact inputs.
+
 PR6 reads the TaskRole policy using a small versioned schema documented in
 [Roles and memberships](roles.md). `{}` keeps the current PR6 defaults.
 Unknown fields and versions fail closed. The wake captures the TaskRole version

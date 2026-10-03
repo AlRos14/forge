@@ -41,9 +41,10 @@ use crate::{
     SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo,
     SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task, TaskComment,
     TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskIntegrationOperation,
-    TaskIntegrationOperationRepo, TaskIntegrationOperationStatus, TaskListQuery, TaskMedia,
-    TaskMediaRepo, TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
-    TerminalSessionStatus, TransferAgentCommitment, TransitionWorkUnit, UpdateAgent,
+    TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
+    TaskLifecycleState, TaskLifecycleTransitionIdentity, TaskListQuery, TaskMedia, TaskMediaRepo,
+    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
+    TransferAgentCommitment, TransitionTaskLifecycle, TransitionWorkUnit, UpdateAgent,
     UpdateAgentAction, UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment,
     UpdateAgentInboxItem, UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution,
     UpdateHarnessSession, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
@@ -80,6 +81,7 @@ mod embedded_agent;
 mod execution;
 mod execution_usage;
 mod external_link;
+mod gate_lifecycle;
 mod harness_session;
 mod inbox;
 mod integration;

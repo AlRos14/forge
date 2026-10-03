@@ -52,6 +52,55 @@ pub trait TaskRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait TaskLifecycleRepo: Send + Sync {
+    async fn get_task_lifecycle(&self, task_id: &str) -> Result<Option<TaskLifecycle>>;
+    async fn get_task_lifecycle_transition(
+        &self,
+        identity: TaskLifecycleTransitionIdentity,
+    ) -> Result<Option<TaskLifecycleTransitionWrite>>;
+    async fn list_lifecycle_migration_audit(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskLifecycleMigrationAudit>>;
+    /// The Task projection, lifecycle CAS, causal receipt, and domain event
+    /// commit as one transaction. Replays return the original receipt.
+    async fn transition_task_lifecycle(
+        &self,
+        input: TransitionTaskLifecycle,
+    ) -> Result<TaskLifecycleTransitionWrite>;
+}
+
+#[async_trait]
+pub trait GateRepo: Send + Sync {
+    async fn create_gate(&self, input: CreateGate) -> Result<CollaborationWrite<Gate>>;
+    async fn get_gate(&self, id: &str) -> Result<Option<Gate>>;
+    async fn list_active_gate_policies(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<(Gate, GatePolicyRevision)>>;
+    async fn get_gate_policy_revision(
+        &self,
+        gate_id: &str,
+        revision: i64,
+    ) -> Result<Option<GatePolicyRevision>>;
+    /// Appends one immutable policy revision and changes the active revision
+    /// pointer under compare-and-swap in the same event transaction.
+    async fn create_gate_policy_revision(
+        &self,
+        input: CreateGatePolicyRevision,
+    ) -> Result<CollaborationWrite<GatePolicyRevision>>;
+    async fn create_gate_evaluation(
+        &self,
+        input: StoreGateEvaluation,
+    ) -> Result<GateEvaluationWrite>;
+    async fn get_gate_evaluation(&self, id: &str) -> Result<Option<GateEvaluation>>;
+    async fn list_gate_evaluation_inputs(
+        &self,
+        evaluation_id: &str,
+    ) -> Result<Vec<GateEvaluationInput>>;
+}
+
+#[async_trait]
 pub trait TaskBoardRepo: Send + Sync {
     async fn board_revision(&self, project_id: &str) -> Result<i64>;
     async fn replay_move_task(
@@ -759,6 +808,7 @@ pub trait WorkUnitRepo: Send + Sync {
 /// atomic across independent SQLite connections/processes.
 #[async_trait]
 pub trait TaskIntegrationOperationRepo: Send + Sync {
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskIntegrationOperation>>;
     async fn begin(
         &self,
         input: CreateTaskIntegrationOperation,
@@ -2021,6 +2071,7 @@ pub struct CreateTaskIntegrationOperation {
     pub task_id: String,
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
+    pub gate_evaluation_id: Option<String>,
     pub created_at: String,
 }
 

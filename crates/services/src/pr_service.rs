@@ -1,9 +1,14 @@
-use crate::{DomainEventService, Result, ServiceError};
+use crate::{
+    task_integration_operation::TaskIntegrationOperationManager,
+    task_lifecycle::{LifecycleCause, TaskLifecycleService, TransitionLifecycleInput},
+    DomainEventService, Result, ServiceError,
+};
 use async_trait::async_trait;
 use db::{
-    new_uuid_v4, now_rfc3339, CreatePrMetadata, PrMetadata, PrMetadataRepo, PrProviderConfig,
-    PrProviderConfigRepo, Repo, RepoRepo, SqliteDb, Task, TaskMetadata, TaskRepo, UpdatePrMetadata,
-    UpdateTaskStatus,
+    new_uuid_v4, now_rfc3339, CreateDomainEvent, CreatePrMetadata, GateEvaluationOutcome, GateRepo,
+    PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Repo, RepoRepo, SqliteDb,
+    Task, TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
+    TaskLifecycleState, TaskMetadata, TaskRepo, UpdatePrMetadata,
 };
 use events::EventBus;
 use serde_json::json;
@@ -152,13 +157,49 @@ impl PrService {
         Self { db }
     }
 
-    pub async fn publish_pr(
+    pub(crate) async fn publish_pr(
         &self,
         task: &Task,
         repo: &Repo,
         source_branch: &str,
         target_branch: &str,
     ) -> Result<PublishedPr> {
+        let operation = TaskIntegrationOperationRepo::get_active_for_task(&*self.db, &task.id)
+            .await?
+            .filter(|operation| {
+                operation.kind == TaskIntegrationOperationKind::PublishPr
+                    && operation.gate_evaluation_id.is_some()
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "PR publication requires an active exact Gate-authorized operation",
+                )
+            })?;
+        let evaluation_id = operation
+            .gate_evaluation_id
+            .as_deref()
+            .expect("checked above");
+        let evaluation = GateRepo::get_gate_evaluation(&*self.db, evaluation_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("GateEvaluation", evaluation_id.to_owned()))?;
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if evaluation.task_id != task.id
+            || evaluation.outcome != GateEvaluationOutcome::Satisfied
+            || gate.gate_kind != "merge_readiness"
+            || gate.scope_kind != db::GateScopeKind::Task
+            || gate.scope_id != task.id
+            || gate.active_policy_revision != Some(evaluation.policy_revision)
+            || lifecycle.state != TaskLifecycleState::ReadyToMerge
+        {
+            return Err(ServiceError::invalid_operation(
+                "PR publication GateEvaluation is stale, unsatisfied, or out of scope",
+            ));
+        }
         let config = PrProviderConfigRepo::get_by_repo_id(&*self.db, &repo.id)
             .await?
             .ok_or_else(|| ServiceError::PrProviderMissing {
@@ -334,6 +375,49 @@ impl PrReconciler {
                 .await?;
             }
             RemotePrStatus::Merged => {
+                let status_event = self
+                    .record_pr_status_event(&metadata, &task, "merged")
+                    .await?;
+                let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+                match lifecycle.state {
+                    TaskLifecycleState::Done => {}
+                    TaskLifecycleState::ReadyToMerge | TaskLifecycleState::Merging => {
+                        let gate_evaluation_id =
+                            lifecycle.reason_ref.as_deref().ok_or_else(|| {
+                                ServiceError::invalid_operation(
+                                    "PR merge readiness has no exact GateEvaluation reference",
+                                )
+                            })?;
+                        let manager = TaskIntegrationOperationManager::new(
+                            Arc::clone(&self.db),
+                            std::env::temp_dir().join("forge-pr-reconciler"),
+                        );
+                        let operation = manager
+                            .record_provider_confirmed_merge(
+                                &task.id,
+                                &status_event.id,
+                                gate_evaluation_id,
+                            )
+                            .await?;
+                        let events = DomainEventService::new(
+                            Arc::clone(&self.db),
+                            Arc::clone(&self.event_bus),
+                        );
+                        let _ = events
+                            .publish_by_dedupe(&format!("task-merge-admission:{}", operation.id))
+                            .await?;
+                        let _ = events
+                            .publish_by_dedupe(&format!("task-merge-terminal:{}", operation.id))
+                            .await?;
+                    }
+                    _ => {
+                        return Err(ServiceError::invalid_operation(
+                            "provider confirmed a merged PR without an admitted merge-readiness Gate",
+                        ));
+                    }
+                }
                 PrMetadataRepo::update(
                     &*self.db,
                     UpdatePrMetadata {
@@ -350,24 +434,67 @@ impl PrReconciler {
                     },
                 )
                 .await?;
-                set_task_awaiting_human(&self.db, &task, false).await?;
+                if let Some(updated) = TaskRepo::get_by_id(&*self.db, &task.id, false).await? {
+                    set_task_awaiting_human(&self.db, &updated, false).await?;
+                }
+            }
+            RemotePrStatus::Closed => {
+                let status_event = self
+                    .record_pr_status_event(&metadata, &task, "closed")
+                    .await?;
+                let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+                if lifecycle.state != TaskLifecycleState::Blocked {
+                    let expected_task_version =
+                        serde_json::from_str::<serde_json::Value>(&status_event.payload_json)
+                            .ok()
+                            .and_then(|payload| {
+                                payload.get("task_version").and_then(|v| v.as_i64())
+                            })
+                            .ok_or_else(|| {
+                                ServiceError::invalid_operation(
+                                    "PR status fact has no original Task version",
+                                )
+                            })?;
+                    TaskLifecycleService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                        .transition(TransitionLifecycleInput {
+                            task_id: task.id.clone(),
+                            expected_task_version,
+                            to_state: TaskLifecycleState::Blocked,
+                            cause: LifecycleCause::DomainEvent(status_event.id.clone()),
+                            reason_kind: Some("pr_closed_without_merge".to_owned()),
+                            reason_ref: Some(metadata.id.clone()),
+                            idempotency_key: format!("pr-status:{}:closed", metadata.id),
+                        })
+                        .await?;
+                }
+                let blocked = json!({
+                    "kind": api_types::FailureKind::PrClosedWithoutMerge,
+                    "reason": "pull request was closed without merge",
+                    "provider_pr_id": metadata.provider_pr_id,
+                    "pr_url": metadata.pr_url,
+                    "recovery_actions": ["return_to_implementation", "retry_pr_publication", "cancel_task"],
+                    "blocked_at": now,
+                });
+                let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
                 let updated = TaskRepo::update_status(
                     &*self.db,
-                    UpdateTaskStatus {
-                        id: task.id,
-                        expected_version: task.version,
-                        status: "done".to_owned(),
+                    db::UpdateTaskStatus {
+                        id: current.id.clone(),
+                        expected_version: current.version,
+                        status: "blocked".to_owned(),
                         assignee_id: Some(None),
-                        error_annotation: Some(None),
-                        blocked_json: Some(None),
+                        error_annotation: None,
+                        blocked_json: Some(Some(blocked.to_string())),
                         failed_json: Some(None),
-                        updated_at: now,
+                        updated_at: now_rfc3339(),
                     },
                 )
                 .await?;
                 self.publish_task_status_event(&updated).await;
-            }
-            RemotePrStatus::Closed => {
                 PrMetadataRepo::update(
                     &*self.db,
                     UpdatePrMetadata {
@@ -380,34 +507,18 @@ impl PrReconciler {
                         pr_state: Some("closed".to_owned()),
                         merge_status: Some("closed_without_merge".to_owned()),
                         last_synced_at: Some(Some(now.clone())),
-                        updated_at: now.clone(),
+                        updated_at: now,
                     },
                 )
                 .await?;
-                set_task_awaiting_human(&self.db, &task, false).await?;
-                let blocked = json!({
-                    "kind": api_types::FailureKind::PrClosedWithoutMerge,
-                    "reason": "pull request was closed without merge",
-                    "provider_pr_id": metadata.provider_pr_id,
-                    "pr_url": metadata.pr_url,
-                    "recovery_actions": ["return_to_implementation", "retry_pr_publication", "cancel_task"],
-                    "blocked_at": now,
-                });
-                let updated = TaskRepo::update_status(
-                    &*self.db,
-                    UpdateTaskStatus {
-                        id: task.id,
-                        expected_version: task.version,
-                        status: "blocked".to_owned(),
-                        assignee_id: Some(None),
-                        error_annotation: None,
-                        blocked_json: Some(Some(blocked.to_string())),
-                        failed_json: Some(None),
-                        updated_at: now_rfc3339(),
-                    },
+                set_task_awaiting_human(
+                    &self.db,
+                    &TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?,
+                    false,
                 )
                 .await?;
-                self.publish_task_status_event(&updated).await;
             }
         }
         Ok(())
@@ -419,6 +530,44 @@ impl PrReconciler {
         if let Err(error) = service.publish_by_dedupe(&dedupe_key).await {
             tracing::warn!(task_id = %task.id, %error, "failed to mirror PR task status domain event");
         }
+    }
+
+    async fn record_pr_status_event(
+        &self,
+        metadata: &PrMetadata,
+        task: &Task,
+        status: &str,
+    ) -> Result<db::DomainEvent> {
+        let service = DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let dedupe_key = format!("pr-status:{}:{status}", metadata.id);
+        if let Some(existing) = service.get_by_dedupe(&dedupe_key).await? {
+            return Ok(existing);
+        }
+        service
+            .append(CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "pr.status_changed".to_owned(),
+                entity_type: "pr_metadata".to_owned(),
+                entity_id: metadata.id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task.id.clone(),
+                correlation_id: metadata.id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(dedupe_key),
+                payload_json: json!({
+                    "task_id": task.id,
+                    "pr_metadata_id": metadata.id,
+                    "provider_pr_id": metadata.provider_pr_id,
+                    "status": status,
+                    "task_version": task.version,
+                })
+                .to_string(),
+                created_at: now_rfc3339(),
+            })
+            .await
     }
 }
 

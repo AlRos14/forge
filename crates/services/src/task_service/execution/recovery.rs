@@ -13,6 +13,20 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        if matches!(
+            action,
+            api_types::RecoveryAction::MarkReviewed
+                | api_types::RecoveryAction::RetryHook
+                | api_types::RecoveryAction::ProceedOnce
+                | api_types::RecoveryAction::ResetRetryWindow
+                | api_types::RecoveryAction::ResumeProcess
+                | api_types::RecoveryAction::UpdateWorkspaceAndRetryHook
+                | api_types::RecoveryAction::SkipHookOnce
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "legacy workflow recovery actions are retired; lifecycle and Gate decisions use exact durable facts",
+            ));
+        }
         if task.failed_json.is_some()
             && !matches!(
                 action,
@@ -23,18 +37,16 @@ impl TaskService {
                 "task has failed and cannot be resumed from current context; restart or cancel required",
             ));
         }
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if matches!(
+            lifecycle.state,
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
+        ) {
             return Err(ServiceError::invalid_operation(format!(
-                "cannot recover task {} in terminal status {}",
-                task.id, task.status
+                "cannot recover Task {} in terminal lifecycle {}",
+                task.id, lifecycle.state
             )));
         }
         let annotation = self.recovery_annotation(&task);
@@ -1531,17 +1543,52 @@ impl TaskService {
         annotation: &api_types::TaskBlockingAnnotation,
         reason: Option<String>,
     ) -> Result<Task> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResetToInitial,
-            )),
-        );
-        let initial_state = workflow_initial_state(&workflow)?;
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let actor = api_types::Actor::user(api_types::UserActionSource::Recovery(
+            api_types::RecoveryAction::ResetToInitial,
+        ));
+        let next_state = match lifecycle.state {
+            db::TaskLifecycleState::Backlog
+            | db::TaskLifecycleState::Ready
+            | db::TaskLifecycleState::Active
+            | db::TaskLifecycleState::Blocked => db::TaskLifecycleState::Ready,
+            db::TaskLifecycleState::ReadyToMerge => db::TaskLifecycleState::Active,
+            db::TaskLifecycleState::Merging => {
+                return Err(ServiceError::invalid_operation(
+                    "an admitted merge must finish or fail through its exact TaskMerge operation",
+                ));
+            }
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled => {
+                return Err(ServiceError::invalid_operation(
+                    "terminal Task lifecycle cannot be reset",
+                ));
+            }
+        };
+        let lifecycle_task = if next_state == lifecycle.state {
+            task.clone()
+        } else {
+            crate::task_lifecycle::TaskLifecycleService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .transition(crate::task_lifecycle::TransitionLifecycleInput {
+                task_id: task.id.clone(),
+                expected_task_version: task.version,
+                to_state: next_state,
+                cause: crate::task_lifecycle::LifecycleCause::Actor(actor),
+                reason_kind: Some("recovery_reset".to_owned()),
+                reason_ref: Some(
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| "reset to ready lifecycle".to_owned()),
+                ),
+                idempotency_key: format!("recovery-reset:{}:{}", task.id, task.version),
+            })
+            .await?
+            .task
+        };
         let assignee_id = if should_clear_assignments_for_reset(annotation) {
             Some(None)
         } else {
@@ -1550,9 +1597,9 @@ impl TaskService {
         let recovered = TaskRepo::update_status(
             &*self.db,
             UpdateTaskStatus {
-                id: task.id.clone(),
-                expected_version: task.version,
-                status: initial_state,
+                id: lifecycle_task.id.clone(),
+                expected_version: lifecycle_task.version,
+                status: crate::task_lifecycle::legacy_status_projection(next_state).to_owned(),
                 assignee_id,
                 error_annotation: Some(None),
                 blocked_json: Some(None),
@@ -2082,15 +2129,6 @@ fn should_clear_assignments_for_reset(annotation: &api_types::TaskBlockingAnnota
     // cleared the annotation, synthesized from failed_json (workspace_failed).
     annotation.annotation_type == api_types::FailureKind::RecoveryRequired
         || annotation.annotation_type.is_workspace_failure()
-}
-
-fn workflow_initial_state(workflow: &api_types::WorkflowDefinition) -> Result<String> {
-    workflow
-        .states
-        .iter()
-        .find(|state| state.kind == api_types::StateKind::Initial)
-        .map(|state| state.name.clone())
-        .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))
 }
 
 fn metadata_recovery_annotation(

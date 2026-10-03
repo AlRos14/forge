@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorKind, ActorRef, AgentRepo, ClaimDomainEvents, CollaborationRepo,
     CollaborationTarget, CompleteDomainEvent, CoordinationMode, CreateOrchestratorWake,
-    DomainEvent, DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus,
+    DomainEvent, DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus, GateRepo,
     OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
     PageRequest, ProposalTarget, ProposalTargetKind, ReviewRepo, ReviewStatus, RoleMembership,
     RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo,
@@ -69,6 +69,7 @@ pub struct OrchestratorRuntime {
     db: Arc<db::SqliteDb>,
     event_bus: Arc<EventBus>,
     task_service: Arc<TaskService>,
+    gate_engine: crate::gate_engine::GateEngine,
     consumer_name: String,
     lease_owner: String,
 }
@@ -258,6 +259,10 @@ impl OrchestratorRuntime {
         task_service: Arc<TaskService>,
     ) -> Self {
         Self {
+            gate_engine: crate::gate_engine::GateEngine::new(
+                Arc::clone(&db),
+                Arc::clone(&event_bus),
+            ),
             db,
             event_bus,
             task_service,
@@ -321,6 +326,7 @@ impl OrchestratorRuntime {
         };
 
         for event in events {
+            self.gate_engine.process_domain_event(&event).await?;
             if self.reconcile_orchestrator_terminal(&event).await? {
                 // Orchestrator lifecycle is handled only for its exact source
                 // wake. It never enters generic event classification.
@@ -393,6 +399,51 @@ impl OrchestratorRuntime {
                 }
                 WakeSignal {
                     work_unit_id: execution.work_unit_id,
+                    target: WakeTarget::Task,
+                }
+            }
+            "gate.evaluated" => {
+                if event.entity_type != "gate_evaluation" {
+                    return Ok(None);
+                }
+                let Some(evaluation) =
+                    GateRepo::get_gate_evaluation(&*self.db, &event.entity_id).await?
+                else {
+                    return Ok(None);
+                };
+                let payload = parse_payload(event);
+                if evaluation.task_id != task_id
+                    || payload.get("evaluation_id").and_then(Value::as_str)
+                        != Some(evaluation.id.as_str())
+                    || payload.get("gate_id").and_then(Value::as_str)
+                        != Some(evaluation.gate_id.as_str())
+                    || payload.get("policy_revision").and_then(Value::as_i64)
+                        != Some(evaluation.policy_revision)
+                    || payload.get("input_digest").and_then(Value::as_str)
+                        != Some(evaluation.input_digest.as_str())
+                {
+                    return Ok(None);
+                }
+                let Some(gate) = GateRepo::get_gate(&*self.db, &evaluation.gate_id).await? else {
+                    return Ok(None);
+                };
+                if gate.task_id != task_id {
+                    return Ok(None);
+                }
+                let work_unit_id = if gate.scope_kind == db::GateScopeKind::WorkUnit {
+                    let Some(unit) = WorkUnitRepo::get_by_id(&*self.db, &gate.scope_id).await?
+                    else {
+                        return Ok(None);
+                    };
+                    if unit.task_id != task_id {
+                        return Ok(None);
+                    }
+                    Some(unit.id)
+                } else {
+                    None
+                };
+                WakeSignal {
+                    work_unit_id,
                     target: WakeTarget::Task,
                 }
             }

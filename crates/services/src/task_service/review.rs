@@ -1,5 +1,5 @@
 use super::*;
-use db::{CollaborationRepo, WorkspaceRepo};
+use db::{CollaborationRepo, TaskLifecycleRepo, WorkspaceRepo};
 
 impl TaskService {
     /// Reuse one exact durable ReviewReport and repair the separate Execution
@@ -116,9 +116,12 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        if task.status != crate::workflow::default_states::REVIEW {
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+        if lifecycle.state != db::TaskLifecycleState::Active {
             return Err(ServiceError::invalid_operation(
-                "Human Review Execution requires a Task in review state",
+                "Human Review Execution requires an active aggregate Task lifecycle",
             ));
         }
         if !human_is_active_role_member_authoritative(
@@ -143,12 +146,12 @@ impl TaskService {
             None
         };
         if workspace_id.is_some() {
-            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-            if task.status != crate::workflow::default_states::REVIEW {
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+            if lifecycle.state != db::TaskLifecycleState::Active {
                 return Err(ServiceError::invalid_operation(
-                    "Human Review Execution requires a Task in review state",
+                    "Human Review Execution requires an active aggregate Task lifecycle",
                 ));
             }
             if !human_is_active_role_member_authoritative(
