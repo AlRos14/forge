@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use tempfile::TempDir;
 use tokio::process::Command;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +49,27 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(GitError::CommandFailed {
+            command: format!("git {}", args.join(" ")),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+
+    Ok(output.stdout)
 }
 
 pub async fn is_git_repo(path: &Path) -> bool {
@@ -154,6 +176,454 @@ pub async fn status_porcelain(worktree_path: &Path) -> Result<Vec<String>> {
 pub async fn restore_worktree(worktree_path: &Path, commit_sha: &str) -> Result<()> {
     run_git(worktree_path, &["reset", "--hard", commit_sha]).await?;
     run_git(worktree_path, &["clean", "-fd"]).await?;
+    Ok(())
+}
+
+/// A temporary, exact snapshot of the worktree state used by local Review.
+/// The snapshot lives outside the worktree and never uses the user's stash.
+pub struct WorktreeStateSnapshot {
+    directory: TempDir,
+    head_sha: String,
+    index_permissions: std::fs::Permissions,
+    tracked_file_permissions: Vec<(PathBuf, std::fs::Permissions)>,
+    untracked_paths: Vec<PathBuf>,
+    ignored_paths: Vec<PathBuf>,
+}
+
+impl WorktreeStateSnapshot {
+    pub fn head_sha(&self) -> &str {
+        &self.head_sha
+    }
+
+    /// Keep the isolated backup after a failed restore so an operator can
+    /// inspect or recover the pre-review state.
+    pub fn preserve_for_diagnostics(self) -> PathBuf {
+        self.directory.keep()
+    }
+
+    /// Restore the original HEAD, tracked worktree bytes, exact Git index,
+    /// and non-ignored untracked files. Ignored files are outside the
+    /// workspace snapshot contract and are left untouched.
+    pub async fn restore(&self, worktree_path: &Path) -> Result<()> {
+        run_git(worktree_path, &["reset", "--hard", &self.head_sha]).await?;
+
+        let pre_patch_untracked = list_untracked_paths(worktree_path, false).await?;
+        for relative_path in pre_patch_untracked {
+            if self.untracked_paths.contains(&relative_path)
+                || is_within_any_path(&relative_path, &self.ignored_paths)
+            {
+                continue;
+            }
+            remove_worktree_entry(worktree_path, &relative_path).await?;
+        }
+
+        let tracked_patch = self.directory.path().join("tracked.patch");
+        let tracked_patch_bytes = tokio::fs::read(&tracked_patch).await?;
+        if !tracked_patch_bytes.is_empty() {
+            run_git(
+                worktree_path,
+                &[
+                    "apply",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    tracked_patch
+                        .to_str()
+                        .ok_or_else(|| GitError::CommandFailed {
+                            command: "git apply".to_owned(),
+                            stdout: String::new(),
+                            stderr: "snapshot patch path is not valid UTF-8".to_owned(),
+                        })?,
+                ],
+            )
+            .await?;
+        }
+
+        // Re-evaluate ignored paths after restoring the original tracked
+        // .gitignore files. Protect anything that was ignored before Review,
+        // even if the reviewer changed an ignore rule while running.
+        let current_untracked = list_untracked_paths(worktree_path, false).await?;
+        for relative_path in current_untracked {
+            if self.untracked_paths.contains(&relative_path)
+                || is_within_any_path(&relative_path, &self.ignored_paths)
+            {
+                continue;
+            }
+            remove_worktree_entry(worktree_path, &relative_path).await?;
+        }
+
+        let backup_root = self.directory.path().join("untracked");
+        for relative_path in &self.untracked_paths {
+            remove_worktree_entry(worktree_path, relative_path).await?;
+            copy_worktree_entry(&backup_root, worktree_path, relative_path).await?;
+        }
+
+        for (relative_path, permissions) in &self.tracked_file_permissions {
+            ensure_safe_parent_directories(worktree_path, relative_path).await?;
+            let path = worktree_path.join(relative_path);
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if !metadata.is_file() {
+                return Err(GitError::CommandFailed {
+                    command: "restore tracked file permissions".to_owned(),
+                    stdout: path.display().to_string(),
+                    stderr: "tracked file type changed during Review".to_owned(),
+                });
+            }
+            tokio::fs::set_permissions(path, permissions.clone()).await?;
+        }
+
+        let index_backup = self.directory.path().join("index");
+        let current_index = resolve_git_path(worktree_path, "index").await?;
+        let index_parent = current_index
+            .parent()
+            .ok_or_else(|| GitError::CommandFailed {
+                command: "git rev-parse --git-path index".to_owned(),
+                stdout: current_index.display().to_string(),
+                stderr: "Git index path has no parent directory".to_owned(),
+            })?;
+        let restore_index = index_parent.join(format!(
+            ".forge-review-index-{}",
+            self.directory
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("snapshot")
+        ));
+        tokio::fs::copy(&index_backup, &restore_index).await?;
+        tokio::fs::set_permissions(&restore_index, self.index_permissions.clone()).await?;
+        tokio::fs::rename(&restore_index, &current_index).await?;
+
+        let restored_head = get_current_sha(worktree_path).await?;
+        if restored_head != self.head_sha {
+            return Err(GitError::CommandFailed {
+                command: "git rev-parse HEAD".to_owned(),
+                stdout: restored_head,
+                stderr: "Review restore did not return to the original HEAD".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Capture the exact input state before a local Review starts. Staged state
+/// is preserved by saving the real index file; tracked worktree content is
+/// stored as a binary patch against HEAD; untracked files, symlinks, and
+/// their relevant permissions are copied into an isolated temporary folder.
+pub async fn capture_worktree_state(worktree_path: &Path) -> Result<WorktreeStateSnapshot> {
+    let canonical_worktree = tokio::fs::canonicalize(worktree_path).await?;
+    let temporary_root = tokio::fs::canonicalize(std::env::temp_dir()).await?;
+    if temporary_root.starts_with(&canonical_worktree) {
+        return Err(GitError::CommandFailed {
+            command: "capture worktree state".to_owned(),
+            stdout: temporary_root.display().to_string(),
+            stderr: "system temporary directory is inside the Review worktree".to_owned(),
+        });
+    }
+    let directory = tempfile::tempdir_in(temporary_root)?;
+    let canonical_snapshot = tokio::fs::canonicalize(directory.path()).await?;
+    if canonical_snapshot.starts_with(&canonical_worktree) {
+        return Err(GitError::CommandFailed {
+            command: "capture worktree state".to_owned(),
+            stdout: canonical_snapshot.display().to_string(),
+            stderr: "Review state snapshot must be outside the worktree".to_owned(),
+        });
+    }
+    let head_sha = get_current_sha(worktree_path).await?;
+    let tracked_patch = run_git_bytes(
+        worktree_path,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    )
+    .await?;
+    tokio::fs::write(directory.path().join("tracked.patch"), tracked_patch).await?;
+
+    let index_path = resolve_git_path(worktree_path, "index").await?;
+    let index_metadata = tokio::fs::metadata(&index_path).await?;
+    tokio::fs::copy(&index_path, directory.path().join("index")).await?;
+
+    let mut tracked_file_permissions = Vec::new();
+    for relative_path in list_tracked_paths(worktree_path).await? {
+        let path = worktree_path.join(&relative_path);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => {
+                tracked_file_permissions.push((relative_path, metadata.permissions()));
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(GitError::CommandFailed {
+                    command: "snapshot tracked workspace file".to_owned(),
+                    stdout: path.display().to_string(),
+                    stderr: "tracked workspace entry is not a regular file or symlink".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let untracked_paths = list_untracked_paths(worktree_path, false).await?;
+    let ignored_paths = list_untracked_paths(worktree_path, true).await?;
+    let backup_root = directory.path().join("untracked");
+    for relative_path in &untracked_paths {
+        copy_worktree_entry(worktree_path, &backup_root, relative_path).await?;
+    }
+
+    let original_index = tokio::fs::read(directory.path().join("index")).await?;
+    if tokio::fs::read(&index_path).await? != original_index {
+        return Err(GitError::CommandFailed {
+            command: "snapshot Git index".to_owned(),
+            stdout: index_path.display().to_string(),
+            stderr: "Git index changed while the pre-review state was captured".to_owned(),
+        });
+    }
+    for (relative_path, permissions) in &tracked_file_permissions {
+        let path = worktree_path.join(relative_path);
+        let current = tokio::fs::symlink_metadata(&path).await?.permissions();
+        if !same_permissions(&current, permissions) {
+            return Err(GitError::CommandFailed {
+                command: "snapshot tracked file permissions".to_owned(),
+                stdout: path.display().to_string(),
+                stderr: "tracked file permissions changed while the pre-review state was captured"
+                    .to_owned(),
+            });
+        }
+    }
+
+    Ok(WorktreeStateSnapshot {
+        directory,
+        head_sha,
+        index_permissions: index_metadata.permissions(),
+        tracked_file_permissions,
+        untracked_paths,
+        ignored_paths,
+    })
+}
+
+async fn list_tracked_paths(worktree_path: &Path) -> Result<Vec<PathBuf>> {
+    let output = run_git_bytes(worktree_path, &["ls-files", "--cached", "-z"]).await?;
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let relative_path = path_from_git_bytes(path)?;
+            validate_relative_path(&relative_path)?;
+            Ok(relative_path)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn same_permissions(left: &std::fs::Permissions, right: &std::fs::Permissions) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    left.mode() == right.mode()
+}
+
+#[cfg(not(unix))]
+fn same_permissions(left: &std::fs::Permissions, right: &std::fs::Permissions) -> bool {
+    left.readonly() == right.readonly()
+}
+
+async fn resolve_git_path(worktree_path: &Path, path: &str) -> Result<PathBuf> {
+    let resolved = run_git(worktree_path, &["rev-parse", "--git-path", path]).await?;
+    let resolved = PathBuf::from(resolved);
+    Ok(if resolved.is_absolute() {
+        resolved
+    } else {
+        worktree_path.join(resolved)
+    })
+}
+
+async fn list_untracked_paths(worktree_path: &Path, ignored: bool) -> Result<Vec<PathBuf>> {
+    let args = if ignored {
+        vec![
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ]
+    } else {
+        vec!["ls-files", "--others", "--exclude-standard", "-z"]
+    };
+    let output = run_git_bytes(worktree_path, &args).await?;
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let relative_path = path_from_git_bytes(path)?;
+            validate_relative_path(&relative_path)?;
+            Ok(relative_path)
+        })
+        .collect()
+}
+
+fn path_from_git_bytes(path: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+    }
+    #[cfg(not(unix))]
+    {
+        let path = std::str::from_utf8(path).map_err(|_| GitError::CommandFailed {
+            command: "git ls-files --others".to_owned(),
+            stdout: String::new(),
+            stderr: "worktree contains a non-UTF8 untracked path".to_owned(),
+        })?;
+        Ok(PathBuf::from(path))
+    }
+}
+
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(GitError::CommandFailed {
+            command: "git ls-files --others".to_owned(),
+            stdout: path.display().to_string(),
+            stderr: "Git returned an unsafe worktree path".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn is_within_any_path(path: &Path, parents: &[PathBuf]) -> bool {
+    parents
+        .iter()
+        .any(|parent| path == parent || path.starts_with(parent))
+}
+
+async fn copy_worktree_entry(
+    source_root: &Path,
+    target_root: &Path,
+    relative: &Path,
+) -> Result<()> {
+    validate_relative_path(relative)?;
+    let source = source_root.join(relative);
+    let target = target_root.join(relative);
+    let metadata = tokio::fs::symlink_metadata(&source).await?;
+    tokio::fs::create_dir_all(target_root).await?;
+    ensure_safe_parent_directories(target_root, relative).await?;
+    if metadata.file_type().is_symlink() {
+        let target_path = tokio::fs::read_link(&source).await?;
+        create_symlink(&target_path, &target, &source).await?;
+    } else if metadata.is_file() {
+        tokio::fs::copy(&source, &target).await?;
+        tokio::fs::set_permissions(&target, metadata.permissions()).await?;
+    } else {
+        return Err(GitError::CommandFailed {
+            command: "snapshot untracked workspace entry".to_owned(),
+            stdout: source.display().to_string(),
+            stderr: "untracked workspace entry is not a regular file or symlink".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn ensure_safe_parent_directories(root: &Path, relative: &Path) -> Result<()> {
+    let components = relative.components().collect::<Vec<_>>();
+    let mut parent = root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        let Component::Normal(name) = component else {
+            return Err(GitError::CommandFailed {
+                command: "restore worktree entry".to_owned(),
+                stdout: relative.display().to_string(),
+                stderr: "worktree path has an unsafe parent component".to_owned(),
+            });
+        };
+        parent.push(name);
+        match tokio::fs::symlink_metadata(&parent).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                tokio::fs::remove_file(&parent).await?;
+                tokio::fs::create_dir(&parent).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(&parent).await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn create_symlink(target: &Path, destination: &Path, _source: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn create_symlink(target: &Path, destination: &Path, source: &Path) -> Result<()> {
+    let points_to_directory = tokio::fs::metadata(source)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .map_err(|error| GitError::CommandFailed {
+            command: "snapshot untracked workspace symlink".to_owned(),
+            stdout: source.display().to_string(),
+            stderr: format!("could not determine the symlink target kind: {error}"),
+        })?;
+    if points_to_directory {
+        std::os::windows::fs::symlink_dir(target, destination)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn create_symlink(_target: &Path, source: &Path, _original: &Path) -> Result<()> {
+    Err(GitError::CommandFailed {
+        command: "snapshot untracked workspace symlink".to_owned(),
+        stdout: source.display().to_string(),
+        stderr: "symlink restoration is unsupported on this platform".to_owned(),
+    })
+}
+
+async fn remove_worktree_entry(worktree_path: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    let mut parent = worktree_path.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        let Component::Normal(name) = component else {
+            return Err(GitError::CommandFailed {
+                command: "restore worktree entry".to_owned(),
+                stdout: relative.display().to_string(),
+                stderr: "worktree path has an unsafe parent component".to_owned(),
+            });
+        };
+        parent.push(name);
+        match tokio::fs::symlink_metadata(&parent).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let Some(Component::Normal(name)) = components.last() else {
+        return Err(GitError::CommandFailed {
+            command: "restore worktree entry".to_owned(),
+            stdout: relative.display().to_string(),
+            stderr: "worktree path has no safe final component".to_owned(),
+        });
+    };
+    let path = parent.join(name);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            tokio::fs::remove_dir(&path).await?;
+        }
+        Ok(_) => tokio::fs::remove_file(&path).await?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -651,6 +1121,166 @@ mod tests {
         assert!(!repo_path.join("reviewer.tmp").exists());
         assert!(!repo_path.join("leftover.tmp").exists());
         assert!(is_worktree_clean(&repo_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn capture_restore_worktree_state_preserves_exact_pre_review_state() {
+        let (_dir, repo_path) = setup_repo().await;
+        let original_head = get_current_sha(&repo_path).await.unwrap();
+        let untracked_dir = repo_path.join("review-input");
+        fs::create_dir_all(&untracked_dir).await.unwrap();
+        fs::write(repo_path.join("README.md"), "staged subject\n")
+            .await
+            .unwrap();
+        run_git(&repo_path, &["add", "README.md"]).await.unwrap();
+        fs::write(repo_path.join("README.md"), "unstaged subject\n")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                repo_path.join("README.md"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await
+            .unwrap();
+        }
+        fs::write(untracked_dir.join("notes.txt"), "pre-review untracked\n")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                untracked_dir.join("notes.txt"),
+                std::fs::Permissions::from_mode(0o751),
+            )
+            .await
+            .unwrap();
+            std::os::unix::fs::symlink("notes.txt", untracked_dir.join("notes-link")).unwrap();
+        }
+        let staged_before = run_git_bytes(&repo_path, &["diff", "--cached", "--binary"])
+            .await
+            .unwrap();
+        let tracked_before = run_git_bytes(
+            &repo_path,
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+            ],
+        )
+        .await
+        .unwrap();
+        let status_before = run_git(&repo_path, &["status", "--porcelain"])
+            .await
+            .unwrap();
+        let snapshot = capture_worktree_state(&repo_path).await.unwrap();
+        assert!(!snapshot
+            .directory
+            .path()
+            .starts_with(std::fs::canonicalize(&repo_path).unwrap()));
+
+        fs::write(repo_path.join("README.md"), "reviewer mutation\n")
+            .await
+            .unwrap();
+        fs::write(
+            untracked_dir.join("notes.txt"),
+            "reviewer overwrote input\n",
+        )
+        .await
+        .unwrap();
+        fs::remove_file(untracked_dir.join("notes-link"))
+            .await
+            .unwrap();
+        commit_all(&repo_path, "reviewer created commit")
+            .await
+            .unwrap();
+        fs::write(
+            repo_path.join("reviewer-created.tmp"),
+            "reviewer temporary file",
+        )
+        .await
+        .unwrap();
+
+        snapshot.restore(&repo_path).await.unwrap();
+
+        assert_eq!(get_current_sha(&repo_path).await.unwrap(), original_head);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))
+                .await
+                .unwrap(),
+            "unstaged subject\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(repo_path.join("README.md"))
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            run_git_bytes(&repo_path, &["diff", "--cached", "--binary"])
+                .await
+                .unwrap(),
+            staged_before
+        );
+        assert_eq!(
+            run_git_bytes(
+                &repo_path,
+                &["diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+            )
+            .await
+            .unwrap(),
+            tracked_before
+        );
+        assert_eq!(
+            run_git(&repo_path, &["status", "--porcelain"])
+                .await
+                .unwrap(),
+            status_before
+        );
+        assert_eq!(
+            fs::read_to_string(untracked_dir.join("notes.txt"))
+                .await
+                .unwrap(),
+            "pre-review untracked\n"
+        );
+        assert!(!repo_path.join("reviewer-created.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(untracked_dir.join("notes.txt"))
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o751
+            );
+            assert!(fs::symlink_metadata(untracked_dir.join("notes-link"))
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::read_link(untracked_dir.join("notes-link"))
+                    .await
+                    .unwrap(),
+                PathBuf::from("notes.txt")
+            );
+        }
     }
 
     #[tokio::test]

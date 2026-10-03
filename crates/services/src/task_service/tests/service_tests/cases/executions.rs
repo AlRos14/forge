@@ -94,6 +94,420 @@ fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+async fn create_claimed_review_execution(
+    db: &db::SqliteDb,
+    event_bus: Arc<EventBus>,
+    project_id: &str,
+    repo_id: &str,
+    agent_id: &str,
+    workspace_root: &std::path::Path,
+) -> (TaskService, db::Task, db::Execution, db::Workspace) {
+    let service = TaskService::new(Arc::new(db.clone()), event_bus)
+        .with_workspace_root(workspace_root.to_path_buf())
+        .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    let todo = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == crate::workflow::default_states::TODO)
+        .expect("default workflow has Todo");
+    todo.triggers.clear();
+    todo.triggers.insert(
+        api_types::WorkflowTrigger::Accept,
+        api_types::WorkflowTriggerDefinition {
+            to: crate::workflow::default_states::REVIEW.to_owned(),
+            dispatch: None,
+        },
+    );
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).expect("review workflow serializes"))
+        .bind(project_id)
+        .execute(db.pool())
+        .await
+        .expect("fixture project routes directly to reviewer gate");
+    let now = now_rfc3339();
+    let task = TaskRepo::create(
+        db,
+        db::CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: project_id.to_owned(),
+            repo_id: Some(repo_id.to_owned()),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Read-only exact Review fixture".to_owned(),
+            description: Some("Review a dirty Workspace snapshot".to_owned()),
+            task_type: "review".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Review fixture Task creates");
+    service
+        .create_task_role(
+            &task.id,
+            "reviewer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole creates");
+    service
+        .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(agent_id.to_owned()))
+        .await
+        .expect("Agent joins the reviewer TaskRole");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id.to_owned()), None)
+        .await
+        .expect("review workflow creates a reviewer Execution and WorkspaceLease");
+    assert_eq!(claimed.execution.role, "reviewer");
+    assert_eq!(
+        claimed.execution.purpose,
+        Some(db::ExecutionPurpose::Review)
+    );
+    let workspace = db::WorkspaceRepo::get_by_id(
+        db,
+        claimed
+            .execution
+            .workspace_id
+            .as_deref()
+            .expect("Review Execution binds its exact Workspace"),
+    )
+    .await
+    .expect("Workspace loads")
+    .expect("Workspace exists");
+    (service, task, claimed.execution, workspace)
+}
+
+const REVIEW_EXECUTOR_RESULT: &str = "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The frozen workspace subject passes.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}";
+
+struct ReviewOutputExecutor {
+    mutate_worktree: bool,
+    commit_mutation: bool,
+    remove_git_marker: bool,
+}
+
+#[async_trait]
+impl TaskExecutor for ReviewOutputExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
+        assert!(executors::is_worktree_read_only(&ctx.agent_config));
+        let worktree = std::path::Path::new(&ctx.worktree_path);
+        if self.mutate_worktree {
+            std::fs::write(worktree.join("README.md"), "reviewer mutation\n")
+                .expect("reviewer modifies tracked file");
+            std::fs::write(worktree.join("reviewer-created.tmp"), "reviewer file\n")
+                .expect("reviewer creates an untracked file");
+            if self.commit_mutation {
+                run_workspace_git(worktree, &["config", "user.name", "Review Test"]);
+                run_workspace_git(worktree, &["config", "user.email", "review@test.invalid"]);
+                run_workspace_git(worktree, &["add", "README.md"]);
+                run_workspace_git(worktree, &["commit", "-m", "reviewer mutation"]);
+            }
+        }
+        if self.remove_git_marker {
+            std::fs::remove_file(worktree.join(".git"))
+                .expect("fake reviewer removes the linked worktree marker");
+        }
+        Ok(executors::ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            assistant_output: Some(REVIEW_EXECUTOR_RESULT.to_owned()),
+            summary: Some("Review completed".to_owned()),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(
+        &self,
+        _execution_id: &str,
+    ) -> std::result::Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+}
+
+fn make_dirty_review_subject(worktree: &std::path::Path) -> (String, String, String, String) {
+    let head = run_workspace_git(worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(worktree.join("README.md"), "staged review subject\n")
+        .expect("staged subject content writes");
+    run_workspace_git(worktree, &["add", "README.md"]);
+    std::fs::write(worktree.join("README.md"), "unstaged review subject\n")
+        .expect("unstaged subject content writes");
+    std::fs::write(
+        worktree.join("user-subject.txt"),
+        "pre-review untracked content\n",
+    )
+    .expect("pre-review untracked file writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            worktree.join("README.md"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("pre-review tracked permissions set");
+    }
+    let staged_diff = run_workspace_git(worktree, &["diff", "--cached", "--binary"]);
+    let tracked_diff = run_workspace_git(worktree, &["diff", "--binary", "HEAD", "--"]);
+    let status = run_workspace_git(worktree, &["status", "--porcelain"]);
+    (head, staged_diff, tracked_diff, status)
+}
+
+async fn assert_review_report_has_subject(
+    db: &db::SqliteDb,
+    execution_id: &str,
+    expected_digest: &str,
+) {
+    let subject = db::ExecutionRepo::get_review_execution_subject(db, execution_id)
+        .await
+        .expect("frozen subject lookup succeeds")
+        .expect("Review subject is persisted");
+    assert_eq!(subject.workspace_snapshot_digest, expected_digest);
+    let report = db::CollaborationRepo::get_execution_artifact_output(
+        db,
+        execution_id,
+        db::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup succeeds")
+    .expect("ReviewReport is materialized");
+    let content: serde_json::Value = serde_json::from_str(
+        report
+            .content
+            .as_deref()
+            .expect("ReviewReport content is inline"),
+    )
+    .expect("ReviewReport JSON parses");
+    assert_eq!(
+        content["subject"]["workspace_snapshot_digest"].as_str(),
+        Some(expected_digest)
+    );
+    assert_eq!(content["subject"]["workspace_id"], subject.workspace_id);
+    assert_eq!(
+        content["subject"]["head_commit_sha"],
+        subject.head_commit_sha
+    );
+}
+
+#[tokio::test]
+async fn pr8_local_review_preserves_dirty_tracked_and_untracked_subject() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let workspace_root = TempDir::new().expect("Review workspace root creates");
+    let (service, _task, execution, workspace) = create_claimed_review_execution(
+        &db,
+        Arc::clone(&event_bus),
+        &project_id,
+        &repo_id,
+        &agent_id,
+        workspace_root.path(),
+    )
+    .await;
+    let worktree = std::path::Path::new(&workspace.worktree_path);
+    let (head, staged_diff, tracked_diff, status) = make_dirty_review_subject(worktree);
+    let snapshot_digest = crate::ValidationService::snapshot_digest(&workspace.worktree_path)
+        .await
+        .expect("pre-review snapshot digest computes");
+
+    let completed = service
+        .run_execution(
+            execution.id.clone(),
+            &ReviewOutputExecutor {
+                mutate_worktree: false,
+                commit_mutation: false,
+                remove_git_marker: false,
+            },
+        )
+        .await
+        .expect("no-op local reviewer completes");
+
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(git::get_current_sha(worktree).await.unwrap(), head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "unstaged review subject\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("user-subject.txt")).unwrap(),
+        "pre-review untracked content\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(worktree.join("README.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        run_workspace_git(worktree, &["diff", "--cached", "--binary"]),
+        staged_diff
+    );
+    assert_eq!(
+        run_workspace_git(worktree, &["diff", "--binary", "HEAD", "--"]),
+        tracked_diff
+    );
+    assert_eq!(
+        run_workspace_git(worktree, &["status", "--porcelain"]),
+        status
+    );
+    assert_eq!(
+        crate::ValidationService::snapshot_digest(&workspace.worktree_path)
+            .await
+            .expect("post-review snapshot digest computes"),
+        snapshot_digest
+    );
+    assert_review_report_has_subject(&db, &execution.id, &snapshot_digest).await;
+}
+
+#[tokio::test]
+async fn pr8_local_review_discards_reviewer_mutations_and_restores_exact_subject() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let workspace_root = TempDir::new().expect("Review workspace root creates");
+    let (service, _task, execution, workspace) = create_claimed_review_execution(
+        &db,
+        Arc::clone(&event_bus),
+        &project_id,
+        &repo_id,
+        &agent_id,
+        workspace_root.path(),
+    )
+    .await;
+    let worktree = std::path::Path::new(&workspace.worktree_path);
+    let (head, staged_diff, tracked_diff, status) = make_dirty_review_subject(worktree);
+    let snapshot_digest = crate::ValidationService::snapshot_digest(&workspace.worktree_path)
+        .await
+        .expect("pre-review snapshot digest computes");
+
+    let completed = service
+        .run_execution(
+            execution.id.clone(),
+            &ReviewOutputExecutor {
+                mutate_worktree: true,
+                commit_mutation: true,
+                remove_git_marker: false,
+            },
+        )
+        .await
+        .expect("mutating reviewer result completes after exact restoration");
+
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(git::get_current_sha(worktree).await.unwrap(), head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "unstaged review subject\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("user-subject.txt")).unwrap(),
+        "pre-review untracked content\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(worktree.join("README.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert!(!worktree.join("reviewer-created.tmp").exists());
+    assert_eq!(
+        run_workspace_git(worktree, &["diff", "--cached", "--binary"]),
+        staged_diff
+    );
+    assert_eq!(
+        run_workspace_git(worktree, &["diff", "--binary", "HEAD", "--"]),
+        tracked_diff
+    );
+    assert_eq!(
+        run_workspace_git(worktree, &["status", "--porcelain"]),
+        status
+    );
+    assert_eq!(
+        crate::ValidationService::snapshot_digest(&workspace.worktree_path)
+            .await
+            .expect("post-review snapshot digest computes"),
+        snapshot_digest
+    );
+    assert_review_report_has_subject(&db, &execution.id, &snapshot_digest).await;
+}
+
+#[tokio::test]
+async fn pr8_local_review_restore_failure_fails_execution_without_report() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let workspace_root = TempDir::new().expect("Review workspace root creates");
+    let (service, _task, execution, workspace) = create_claimed_review_execution(
+        &db,
+        Arc::clone(&event_bus),
+        &project_id,
+        &repo_id,
+        &agent_id,
+        workspace_root.path(),
+    )
+    .await;
+    let worktree = std::path::Path::new(&workspace.worktree_path);
+    let _ = make_dirty_review_subject(worktree);
+
+    let failed = service
+        .run_execution(
+            execution.id.clone(),
+            &ReviewOutputExecutor {
+                mutate_worktree: false,
+                commit_mutation: false,
+                remove_git_marker: true,
+            },
+        )
+        .await
+        .expect("restore failure terminalizes the Review Execution");
+
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    let error = failed.error.expect("restore diagnostic is persisted");
+    assert!(error.contains("pre-review state backup retained at"));
+    let backup_path = error
+        .split("pre-review state backup retained at ")
+        .nth(1)
+        .expect("diagnostic names isolated backup path");
+    let backup_path = std::path::Path::new(backup_path);
+    assert!(backup_path.join("index").exists());
+    assert!(backup_path.join("tracked.patch").exists());
+    assert!(backup_path
+        .join("untracked")
+        .join("user-subject.txt")
+        .exists());
+    assert!(db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &execution.id,
+        db::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup succeeds")
+    .is_none());
+    std::fs::remove_dir_all(backup_path).expect("diagnostic snapshot is cleaned after assertions");
+}
+
 fn create_workspace_checkout(
     source: &std::path::Path,
     destination: &std::path::Path,

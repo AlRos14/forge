@@ -51,6 +51,54 @@ fn review_subject_identity_matches(
         && current.workspace_snapshot_digest == proposed.workspace_snapshot_digest
 }
 
+/// Recheck current Human role authority inside the same SQLite transaction as
+/// an authoritative Review write. Once the replacement TaskRole exists, the
+/// membership is the sole authority; the legacy singleton is used only when
+/// that TaskRole has not been created.
+pub(super) async fn human_has_current_role_authority_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let Some(canonical_role) = crate::canonical_task_role_name(role) else {
+        return Ok(false);
+    };
+    let authorized: i64 = sqlx::query_scalar(
+        "SELECT CASE
+            WHEN EXISTS (
+                SELECT 1 FROM task_role
+                WHERE task_id = ? AND role = ?
+            ) THEN EXISTS (
+                SELECT 1
+                FROM task_role AS role
+                JOIN role_membership AS membership
+                  ON membership.task_role_id = role.id
+                WHERE role.task_id = ? AND role.role = ?
+                  AND membership.actor_kind = 'human'
+                  AND membership.actor_id = ?
+                  AND membership.status = 'active'
+            )
+            ELSE EXISTS (
+                SELECT 1 FROM task_role_assignment
+                WHERE task_id = ? AND role_name = ?
+                  AND assignee_type = 'user' AND assignee_id = ?
+            )
+         END",
+    )
+    .bind(task_id)
+    .bind(&canonical_role)
+    .bind(task_id)
+    .bind(&canonical_role)
+    .bind(user_id)
+    .bind(task_id)
+    .bind(role)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(authorized != 0)
+}
+
 #[async_trait]
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
@@ -105,6 +153,19 @@ impl ExecutionRepo for SqliteDb {
             ));
         }
         let mut tx = self.pool.begin().await?;
+        if !human_has_current_role_authority_in_tx(
+            &mut tx,
+            &input.task_id,
+            "reviewer",
+            human_actor_id.expect("shape validation requires a Human Actor"),
+        )
+        .await?
+        {
+            return Err(DbError::Check(
+                "new Human Review Execution requires current authoritative reviewer membership"
+                    .to_owned(),
+            ));
+        }
         let execution = Self::create_execution_in_tx(&mut tx, &input, None).await?;
         let subject = insert_review_execution_subject_in_tx(&mut tx, &subject).await?;
         let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;

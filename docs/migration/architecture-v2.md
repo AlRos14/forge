@@ -121,6 +121,14 @@ when its ValidationRun matches the frozen Workspace, head, and snapshot digest.
 ReviewReport repeats the complete frozen subject, and SQL guards require an
 exact match.
 
+Local read-only Review captures and restores the exact pre-review HEAD, Git
+index, tracked diff and file permissions, and non-ignored untracked files under
+the Workspace lock. Its isolated restore snapshot stays outside the worktree.
+It verifies the restored snapshot digest before report materialization and
+fails without a report if restoration cannot be proven. Human Review start and
+new report writes recheck RoleMembership-first authority inside their write
+transactions; exact completed report replay remains historical.
+
 When a replacement TaskRole exists, its RoleMembership records alone decide
 current Human reviewer authority; the singular TaskRoleAssignment row is only a
 projection. A Human may start a Review Execution for each active membership,

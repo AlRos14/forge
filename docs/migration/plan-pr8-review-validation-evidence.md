@@ -59,6 +59,26 @@ matching the persisted subject's exact Workspace, head, and snapshot digest.
 Review freeze uses the exact Workspace diff and never a Task-level
 canonical-workspace lookup.
 
+Before a local read-only reviewer starts, Forge captures the exact pre-review
+HEAD, index, tracked diff, and non-ignored untracked files into a unique
+temporary directory outside the worktree while holding the Workspace execution
+lock. It freezes the Review subject from that state, checks the digest again
+before launch, and restores the captured state after the reviewer exits. The
+restore preserves staged and unstaged content, tracked and untracked file
+permissions, untracked file contents, symlinks, and the original HEAD without
+changing the user's stash.
+Forge verifies the restored HEAD and workspace snapshot digest against the
+frozen subject before creating a ReviewReport. If restoration or verification
+fails, the Execution fails, no ReviewReport is created, and the isolated
+snapshot is retained with the failure diagnostic for recovery.
+
+Human Review start and new ReviewReport creation both recheck current reviewer
+authority inside the same SQLite transaction as their authoritative writes.
+When the reviewer TaskRole exists, only an active Human RoleMembership grants
+that authority; the legacy singleton assignment is considered only before the
+TaskRole exists. Replaying the exact already-created ReviewReport remains a
+historical idempotent operation and does not require current membership.
+
 The harness may continue to emit a final `FORGE_RESULT` line. The server parses
 it and turns it into `ReviewReport`; the marker is transport, not a domain
 status machine. Before a successful Agent or Human Review Execution is
@@ -182,6 +202,10 @@ provenance. Legacy data remains physically available for repair and audit.
   with a reusable Artifact; retrying the same structured output reuses it, and
   conflicting output is rejected. The DB prevents the invalid completed/no
   report terminal state.
+- Local read-only Review restores its isolated pre-run worktree snapshot and
+  verifies the persisted subject digest before output materialization. A
+  failed restore retains the snapshot and cannot produce an authoritative
+  report.
 - Human report submission validates and pins the full exact Evidence and
   Artifact sets, creates or reuses the ReviewReport output, and appends its
   Artifact event in one DB transaction. A failed request rolls back every new
@@ -272,8 +296,25 @@ the focused API integration test compiled the affected API path. No
 After the focused builds, `du -sh target` reported 13 GiB and `df -h .`
 reported 116 GiB available.
 
+Final microfix checks on 2026-10-03, using
+`CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target`:
+
+- `cargo fmt --all -- --check`: PASS.
+- `git diff --check`: PASS.
+- `cargo test -p git capture_restore_worktree_state_preserves_exact_pre_review_state -- --nocapture`: PASS, 1 test. Covers staged and unstaged changes, reviewer commit rollback, untracked file and symlink restoration, and tracked/untracked permissions.
+- `cargo test -p db pr8_ -- --nocapture`: PASS, 5 tests. Includes transactional Human start/report authority, replacement TaskRole precedence, legacy fallback, and exact historical output replay.
+- `cargo test -p services --lib pr8_ -- --nocapture`: PASS, 14 tests.
+- `cargo test -p services --lib pr8_local_review_ -- --nocapture`: PASS, 3 tests after the fixture was wired to the Workspace execution lock. Covers dirty subject preservation, reviewer mutation rollback and exact digest, and failed restoration without a ReviewReport.
+
+The API integration test was not repeated because this microfix changes no
+public request, response, or repository signature; the DB and service paths
+that changed were exercised directly. The workspace suite, full crate suites,
+release build, PR7 suite, and web checks were not run. Cargo cleanup is deferred
+until after the verified push and clean working tree, as required for this
+iteration.
+
 Deliberately not run: `cargo test --workspace`, full crate suites, release
-builds, the PR7 suite, and another `cargo clean`. The V084 fixture carries a
+builds, and the PR7 suite. The V084 fixture carries a
 command, exit code, timestamps, Workspace/commit and output tail, but not the
 exact runtime environment or the new before-check Workspace snapshot digest;
 it is therefore audited as insufficient provenance rather than fabricated

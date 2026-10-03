@@ -20,9 +20,10 @@ use crate::{
     SelectAgentProfile, SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo,
     TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo, TaskRoleRepo,
     TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution, UpdateProject,
-    UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskRole,
-    UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, ValidationRunRepo,
-    ValidationRunStatus, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    UpdateProviderAuthorizationOperation, UpdateRepo, UpdateRoleMembership, UpdateSkill,
+    UpdateTask, UpdateTaskRole, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon,
+    ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -1374,6 +1375,129 @@ async fn seed_task(
         .expect("role assignment creates");
     }
     task_id
+}
+
+async fn seed_pr8_human_reviewer_role(
+    db: &SqliteDb,
+    task_id: &str,
+    user_id: &str,
+) -> (String, String) {
+    let now = now_rfc3339();
+    let role = TaskRoleRepo::create(
+        db,
+        CreateTaskRole {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            role: "reviewer".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("reviewer TaskRole creates");
+    let membership = RoleMembershipRepo::add(
+        db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role.id.clone(),
+            actor_kind: ActorKind::Human,
+            actor_id: user_id.to_owned(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("active Human reviewer membership creates");
+    (role.id, membership.id)
+}
+
+async fn seed_pr8_legacy_human_reviewer_assignment(db: &SqliteDb, task_id: &str, user_id: &str) {
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO task_role_assignment
+         (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+         VALUES (?, ?, 'reviewer', 'user', ?, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(task_id)
+    .bind(user_id)
+    .bind(now.clone())
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .expect("legacy Human reviewer assignment creates");
+}
+
+fn pr8_human_review_start_inputs(
+    task_id: &str,
+    user_id: &str,
+    workspace_id: &str,
+    execution_id: &str,
+    created_at: &str,
+) -> (
+    CreateExecution,
+    crate::CreateReviewExecutionSubject,
+    CreateDomainEvent,
+) {
+    let base_sha = "a".repeat(40);
+    let head_sha = "b".repeat(40);
+    (
+        CreateExecution {
+            id: execution_id.to_owned(),
+            task_id: task_id.to_owned(),
+            agent_id: None,
+            actor_ref: Some(crate::ActorRef::Human(user_id.to_owned())),
+            purpose: Some(crate::ExecutionPurpose::Review),
+            harness_session_id: None,
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some(base_sha.clone()),
+            after_sha: Some(head_sha.clone()),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id.to_owned()),
+            created_at: created_at.to_owned(),
+            updated_at: created_at.to_owned(),
+        },
+        crate::CreateReviewExecutionSubject {
+            execution_id: execution_id.to_owned(),
+            task_id: task_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            base_commit_sha: base_sha,
+            head_commit_sha: head_sha,
+            workspace_snapshot_digest: "c".repeat(64),
+            created_at: created_at.to_owned(),
+        },
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.to_owned(),
+            actor_type: "human".to_owned(),
+            actor_id: Some(user_id.to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.to_owned(),
+            correlation_id: execution_id.to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("human-review-execution-started:{execution_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
 }
 
 async fn seed_pr6_orchestrator_event(
@@ -3849,7 +3973,6 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
     .execute(db.pool())
     .await
     .expect("Human Actor persists");
-
     let execution_id = new_uuid_v4();
     let execution = ExecutionRepo::create(
         &db,
@@ -4079,6 +4202,7 @@ async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
     .execute(db.pool())
     .await
     .expect("Human Actor persists");
+    let (_, _membership_id) = seed_pr8_human_reviewer_role(&db, &task_id, &user_id).await;
 
     let execution_id = new_uuid_v4();
     let base_sha = "aaaaaaa000000000000000000000000000000000";
@@ -4243,6 +4367,229 @@ async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
     ProjectRepo::delete(&db, &project_id)
         .await
         .expect("Project teardown removes the immutable Review subject");
+}
+
+#[tokio::test]
+async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "Transactional Human reviewer authority",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let user_id = seed_user(&db).await;
+    let (_, membership_id) = seed_pr8_human_reviewer_role(&db, &task_id, &user_id).await;
+    let now = now_rfc3339();
+
+    let report_execution_id = new_uuid_v4();
+    let (execution_input, subject_input, start_event) = pr8_human_review_start_inputs(
+        &task_id,
+        &user_id,
+        &workspace_id,
+        &report_execution_id,
+        &now,
+    );
+    let started = ExecutionRepo::create_human_review_execution_with_subject(
+        &db,
+        execution_input,
+        subject_input,
+        start_event,
+    )
+    .await
+    .expect("active RoleMembership authorizes the exact Human Review start");
+    assert!(
+        ExecutionRepo::get_review_execution_subject(&db, &report_execution_id)
+            .await
+            .expect("frozen subject lookup succeeds")
+            .is_some()
+    );
+
+    seed_pr8_legacy_human_reviewer_assignment(&db, &task_id, &user_id).await;
+    RoleMembershipRepo::update(
+        &db,
+        UpdateRoleMembership {
+            id: membership_id.clone(),
+            expected_version: 1,
+            status: RoleMembershipStatus::Suspended,
+            updated_at: now.clone(),
+            ended_at: None,
+        },
+    )
+    .await
+    .expect("reviewer authority is revoked after the service-level check");
+
+    let evidence_id = "evidence-existing-but-unpinned".to_owned();
+    let artifact_input_id = "artifact-existing-but-unpinned".to_owned();
+    let report_id = new_uuid_v4();
+    let subject = started.subject;
+    let report_content = serde_json::json!({
+        "kind": "review_report",
+        "verdict": "pass",
+        "criteria": [],
+        "summary": "Exact report",
+        "findings": [],
+        "questions": [],
+        "evidence_considered": [
+            {"evidence_id": evidence_id},
+            {"artifact_id": artifact_input_id},
+        ],
+        "subject": {
+            "task_id": task_id,
+            "review_execution_id": report_execution_id,
+            "workspace_id": workspace_id,
+            "base_commit_sha": subject.base_commit_sha,
+            "head_commit_sha": subject.head_commit_sha,
+            "workspace_snapshot_digest": subject.workspace_snapshot_digest,
+        }
+    })
+    .to_string();
+    let report_digest = hex::encode(sha2::Sha256::digest(report_content.as_bytes()));
+    let report_event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "artifact.created".to_owned(),
+        entity_type: "artifact".to_owned(),
+        entity_id: report_id.clone(),
+        actor_type: "human".to_owned(),
+        actor_id: Some(user_id.clone()),
+        scope_type: "task".to_owned(),
+        scope_id: task_id.clone(),
+        correlation_id: report_execution_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(format!("artifact-created:{report_id}")),
+        payload_json: "{}".to_owned(),
+        created_at: now.clone(),
+    };
+    let report_write = crate::CollaborationRepo::create_review_report_with_inputs(
+        &db,
+        crate::CreateArtifact {
+            id: report_id.clone(),
+            task_id: task_id.clone(),
+            kind: crate::ArtifactKind::ReviewReport,
+            storage_kind: crate::ArtifactStorageKind::Inline,
+            content: Some(report_content),
+            content_ref: None,
+            metadata_json: "{}".to_owned(),
+            digest: Some(report_digest),
+            producer_execution_id: report_execution_id.clone(),
+            created_at: now.clone(),
+        },
+        vec![evidence_id],
+        vec![artifact_input_id],
+        report_event,
+    )
+    .await
+    .expect_err("revoked Human authority blocks a new ReviewReport inside its transaction");
+    assert!(matches!(
+        report_write,
+        DbError::Check(message) if message.contains("current authoritative reviewer membership")
+    ));
+    assert!(crate::CollaborationRepo::get_execution_artifact_output(
+        &db,
+        &report_execution_id,
+        crate::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup succeeds")
+    .is_none());
+    assert!(
+        crate::ValidationRunRepo::list_execution_evidence_inputs(&db, &report_execution_id)
+            .await
+            .expect("Evidence pin lookup succeeds")
+            .is_empty()
+    );
+    assert!(
+        crate::CollaborationRepo::list_execution_artifact_inputs(&db, &report_execution_id)
+            .await
+            .expect("Artifact pin lookup succeeds")
+            .is_empty()
+    );
+    let artifact_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'artifact.created' AND entity_id = ?",
+    )
+    .bind(&report_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Report event lookup succeeds");
+    assert_eq!(artifact_event_count, 0);
+
+    let rejected_execution_id = new_uuid_v4();
+    let (execution_input, subject_input, start_event) = pr8_human_review_start_inputs(
+        &task_id,
+        &user_id,
+        &workspace_id,
+        &rejected_execution_id,
+        &now,
+    );
+    let creation_write = ExecutionRepo::create_human_review_execution_with_subject(
+        &db,
+        execution_input,
+        subject_input,
+        start_event,
+    )
+    .await
+    .expect_err(
+        "replacement TaskRole blocks its stale legacy projection after membership revocation",
+    );
+    assert!(matches!(
+        creation_write,
+        DbError::Check(message) if message.contains("current authoritative reviewer membership")
+    ));
+    assert!(ExecutionRepo::get_by_id(&db, &rejected_execution_id)
+        .await
+        .expect("rejected Execution lookup succeeds")
+        .is_none());
+    assert!(
+        ExecutionRepo::get_review_execution_subject(&db, &rejected_execution_id)
+            .await
+            .expect("rejected subject lookup succeeds")
+            .is_none()
+    );
+    let started_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&rejected_execution_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("rejected start event lookup succeeds");
+    assert_eq!(started_event_count, 0);
+
+    let legacy_task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "Legacy-only Human reviewer authority",
+    )
+    .await;
+    let legacy_workspace_id = seed_workspace_for_task(&db, &legacy_task_id, &repo_id).await;
+    seed_pr8_legacy_human_reviewer_assignment(&db, &legacy_task_id, &user_id).await;
+    let legacy_execution_id = new_uuid_v4();
+    let (execution_input, subject_input, start_event) = pr8_human_review_start_inputs(
+        &legacy_task_id,
+        &user_id,
+        &legacy_workspace_id,
+        &legacy_execution_id,
+        &now,
+    );
+    let legacy_write = ExecutionRepo::create_human_review_execution_with_subject(
+        &db,
+        execution_input,
+        subject_input,
+        start_event,
+    )
+    .await
+    .expect("exact legacy assignment remains valid without a replacement TaskRole");
+    assert_eq!(legacy_write.execution.id, legacy_execution_id);
 }
 
 async fn insert_pr8_review_report(

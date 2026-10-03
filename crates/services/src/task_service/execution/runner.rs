@@ -175,17 +175,17 @@ impl TaskService {
                 ),
                 None => None,
             };
-            let provider = self
-                .execution_provider_for_agent(agent.as_ref(), &execution.id)
-                .await?;
-            let params = self.execution_start_params(&execution).await?;
             if execution.role == crate::workflow::default_roles::REVIEWER
                 && execution.purpose == Some(ExecutionPurpose::Review)
             {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
             }
-            self.freeze_review_subject_and_inputs(execution).await?;
+            let execution = self.freeze_review_subject_and_inputs(execution).await?;
+            let provider = self
+                .execution_provider_for_agent(agent.as_ref(), &execution.id)
+                .await?;
+            let params = self.execution_start_params(&execution).await?;
             provider.start(params).await
         }
         .await;
@@ -395,9 +395,113 @@ impl TaskService {
             return Err(error);
         }
 
+        let is_review_execution = execution_before_launch.role
+            == crate::workflow::default_roles::REVIEWER
+            && execution_before_launch.purpose == Some(ExecutionPurpose::Review);
+        let mut review_worktree_snapshot = None;
+        let mut review_snapshot_digest = None;
+        if is_review_execution
+            && execution_before_launch.workspace_id.is_some()
+            && executors::is_worktree_read_only(&agent_config)
+        {
+            let worktree_path = std::path::Path::new(&workspace.worktree_path);
+            let digest_before =
+                match crate::ValidationService::snapshot_digest(&workspace.worktree_path).await {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        return self
+                            .fail_execution_before_dispatch(
+                                &execution_before_launch.id,
+                                format!("could not verify the pre-review workspace state: {error}"),
+                            )
+                            .await;
+                    }
+                };
+            let snapshot = match git::capture_worktree_state(worktree_path).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return self
+                        .fail_execution_before_dispatch(
+                            &execution_before_launch.id,
+                            format!(
+                                "could not capture the exact pre-review workspace state: {error}"
+                            ),
+                        )
+                        .await;
+                }
+            };
+            let digest_after =
+                match crate::ValidationService::snapshot_digest(&workspace.worktree_path).await {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        return self
+                            .fail_execution_before_dispatch(
+                                &execution_before_launch.id,
+                                format!(
+                                "could not verify the captured pre-review workspace state: {error}"
+                            ),
+                            )
+                            .await;
+                    }
+                };
+            let current_head = match git::get_current_sha(worktree_path).await {
+                Ok(head) => head,
+                Err(error) => {
+                    return self
+                        .fail_execution_before_dispatch(
+                            &execution_before_launch.id,
+                            format!("could not verify the captured pre-review HEAD: {error}"),
+                        )
+                        .await;
+                }
+            };
+            if current_head != snapshot.head_sha() || digest_before != digest_after {
+                return self
+                    .fail_execution_before_dispatch(
+                        &execution_before_launch.id,
+                        "workspace state changed while the pre-review snapshot was captured"
+                            .to_owned(),
+                    )
+                    .await;
+            }
+            review_snapshot_digest = Some(digest_after);
+            review_worktree_snapshot = Some(snapshot);
+        }
+
         execution = self
             .freeze_review_subject_and_inputs(execution_before_launch)
             .await?;
+        let review_subject = if let Some(snapshot) = review_worktree_snapshot.as_ref() {
+            let subject = ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "local Review Execution did not persist its exact workspace subject",
+                    )
+                })?;
+            let live_digest =
+                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+            let live_head =
+                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?;
+            if subject.workspace_id != workspace.id
+                || subject.head_commit_sha != snapshot.head_sha()
+                || Some(subject.workspace_snapshot_digest.as_str())
+                    != review_snapshot_digest.as_deref()
+                || live_digest != subject.workspace_snapshot_digest
+                || live_head != subject.head_commit_sha
+            {
+                return self
+                    .fail_execution_before_dispatch(
+                        &execution.id,
+                        "Review subject changed while its exact pre-review workspace state was frozen"
+                            .to_owned(),
+                    )
+                    .await;
+            }
+            Some(subject)
+        } else {
+            None
+        };
         let launch_activity_at = now_rfc3339();
         ExecutionRepo::update(
             &*self.db,
@@ -573,7 +677,8 @@ impl TaskService {
             }
         });
 
-        let read_only_head = if execution.workspace_id.is_some()
+        let read_only_head = if review_worktree_snapshot.is_none()
+            && execution.workspace_id.is_some()
             && executors::is_worktree_read_only(&agent_config)
         {
             Some(git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?)
@@ -612,6 +717,38 @@ impl TaskService {
                 )
             })
         };
+        let prelaunch_review_error = if let Some(subject) = review_subject.as_ref() {
+            let current_head =
+                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
+            let current_digest =
+                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await;
+            match (current_head, current_digest) {
+                (Ok(head), Ok(digest))
+                    if head == subject.head_commit_sha
+                        && digest == subject.workspace_snapshot_digest =>
+                {
+                    None
+                }
+                (Ok(_), Ok(_)) => Some(
+                    "Review workspace changed after its subject was frozen and before launch"
+                        .to_owned(),
+                ),
+                (Err(error), _) => Some(format!(
+                    "could not read the frozen Review HEAD before launch: {error}"
+                )),
+                (_, Err(error)) => Some(format!(
+                    "could not read the frozen Review snapshot before launch: {error}"
+                )),
+            }
+        } else {
+            None
+        };
+        if let Some(error) = prelaunch_review_error {
+            return self
+                .fail_execution_before_dispatch(&execution.id, error)
+                .await;
+        }
+
         let execution_result = if let Some(artifact) = existing_plan_output.as_ref() {
             let content = artifact.content.clone().ok_or_else(|| {
                 ServiceError::invalid_operation(
@@ -647,18 +784,87 @@ impl TaskService {
         if let Err(error) = executors::LogWriter::compact(std::path::Path::new(&logs_path)).await {
             tracing::warn!(%execution_id, %error, "failed to compress final execution log segment; plain log retained");
         }
-        let restore_result = if let Some(head) = read_only_head.as_deref() {
+        let mut review_restore_error = None;
+        if let (Some(snapshot), Some(subject)) =
+            (review_worktree_snapshot.as_ref(), review_subject.as_ref())
+        {
+            let restore = snapshot
+                .restore(std::path::Path::new(&workspace.worktree_path))
+                .await;
+            match restore {
+                Ok(()) => {
+                    let restored_head =
+                        git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
+                    let restored_digest =
+                        crate::ValidationService::snapshot_digest(&workspace.worktree_path).await;
+                    match (restored_head, restored_digest) {
+                        (Ok(head), Ok(digest))
+                            if head == subject.head_commit_sha
+                                && digest == subject.workspace_snapshot_digest => {}
+                        (Ok(head), Ok(digest)) => {
+                            review_restore_error = Some(format!(
+                                "restored workspace does not match the frozen Review subject (HEAD {head}, snapshot {digest})"
+                            ));
+                        }
+                        (Err(error), _) => {
+                            review_restore_error =
+                                Some(format!("could not read restored Review HEAD: {error}"));
+                        }
+                        (_, Err(error)) => {
+                            review_restore_error =
+                                Some(format!("could not read restored Review snapshot: {error}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    review_restore_error = Some(format!(
+                        "could not restore the exact pre-review workspace state: {error}"
+                    ));
+                }
+            }
+        }
+        let restore_result = if review_worktree_snapshot.is_some() {
+            Ok(())
+        } else if let Some(head) = read_only_head.as_deref() {
             git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
                 .await
                 .map_err(ServiceError::from)
         } else {
             Ok(())
         };
-        let mut result = execution_result?;
-        restore_result?;
-        if let Some(head) = read_only_head {
-            result.after_sha = Some(head);
-        }
+        let mut result = if let Some(error) = review_restore_error {
+            let snapshot = review_worktree_snapshot
+                .take()
+                .expect("Review restore failure retains its isolated snapshot");
+            let backup_path = snapshot.preserve_for_diagnostics();
+            tracing::error!(
+                execution_id = %execution_id,
+                workspace_path = %workspace.worktree_path,
+                snapshot_backup_path = %backup_path.display(),
+                %error,
+                "read-only Review workspace could not be restored to its exact subject"
+            );
+            executors::ExecutionResult {
+                status: ExecutionOutcome::Failed,
+                after_sha: review_subject
+                    .as_ref()
+                    .map(|subject| subject.head_commit_sha.clone()),
+                error: Some(format!(
+                    "{error}; pre-review state backup retained at {}",
+                    backup_path.display()
+                )),
+                ..Default::default()
+            }
+        } else {
+            let mut result = execution_result?;
+            restore_result?;
+            if let Some(subject) = review_subject.as_ref() {
+                result.after_sha = Some(subject.head_commit_sha.clone());
+            } else if let Some(head) = read_only_head {
+                result.after_sha = Some(head);
+            }
+            result
+        };
         let max_turns_exceeded = max_turns_exceeded.load(std::sync::atomic::Ordering::SeqCst);
         let assistant_turn_count = assistant_turn_count.load(std::sync::atomic::Ordering::SeqCst);
         if max_turns_exceeded {
