@@ -103,6 +103,65 @@ impl CollaborationService {
         }
     }
 
+    /// Recompute and compare the complete durable subject of a workspace-bound
+    /// Review Execution. Callers hold the local workspace lock when one exists.
+    pub(crate) async fn ensure_review_subject_current(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<()> {
+        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+            return Err(invalid(
+                "Review subject check requires a reviewer Review Execution",
+            ));
+        }
+        let Some(workspace_id) = execution.workspace_id.as_deref() else {
+            if ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id)
+                .await?
+                .is_some()
+            {
+                return Err(invalid(
+                    "workspace-free Review Execution has a Workspace subject",
+                ));
+            }
+            return Ok(());
+        };
+        let frozen = ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id)
+            .await?
+            .ok_or_else(|| invalid("workspace-bound Review Execution has no frozen subject"))?;
+        if frozen.task_id != execution.task_id
+            || frozen.workspace_id != workspace_id
+            || execution.before_sha.as_deref() != Some(frozen.base_commit_sha.as_str())
+            || execution.after_sha.as_deref() != Some(frozen.head_commit_sha.as_str())
+        {
+            return Err(invalid(
+                "Review Execution fields diverge from its frozen subject",
+            ));
+        }
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| not_found("workspace", workspace_id.to_owned()))?;
+        if workspace.task_id != execution.task_id || workspace.status != db::WorkspaceStatus::Ready
+        {
+            return Err(invalid(
+                "Review Execution Workspace is no longer Ready for its exact Task",
+            ));
+        }
+        let diff = crate::DiffService::new(Arc::clone(&self.db))
+            .workspace_diff(&workspace.id)
+            .await?;
+        let snapshot_digest =
+            crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+        if diff.base_sha != frozen.base_commit_sha
+            || diff.head_sha != frozen.head_commit_sha
+            || snapshot_digest != frozen.workspace_snapshot_digest
+        {
+            return Err(invalid(
+                "Review Execution subject changed; a fresh exact Review Execution is required",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn create_artifact(
         &self,
         source: CollaborationActorSource,
@@ -413,6 +472,31 @@ impl CollaborationService {
         execution_id: &str,
         assistant_output: &str,
     ) -> Result<Artifact> {
+        self.create_review_report_from_execution_inner(execution_id, assistant_output, None)
+            .await
+    }
+
+    pub(crate) async fn create_human_review_report_from_execution(
+        &self,
+        execution_id: &str,
+        assistant_output: &str,
+        evidence_input_ids: Vec<String>,
+        artifact_input_ids: Vec<String>,
+    ) -> Result<Artifact> {
+        self.create_review_report_from_execution_inner(
+            execution_id,
+            assistant_output,
+            Some((evidence_input_ids, artifact_input_ids)),
+        )
+        .await
+    }
+
+    async fn create_review_report_from_execution_inner(
+        &self,
+        execution_id: &str,
+        assistant_output: &str,
+        requested_inputs: Option<(Vec<String>, Vec<String>)>,
+    ) -> Result<Artifact> {
         let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
@@ -427,6 +511,17 @@ impl CollaborationService {
                 "ReviewReport producer must be a running or completed reviewer Review Execution",
             ));
         }
+        let existing_output = CollaborationRepo::get_execution_artifact_output(
+            &*self.db,
+            execution_id,
+            ArtifactKind::ReviewReport,
+        )
+        .await?;
+        if execution.status == db::ExecutionStatus::Completed && existing_output.is_none() {
+            return Err(invalid(
+                "completed Review Execution can only replay its existing exact ReviewReport",
+            ));
+        }
         let actor = execution
             .actor_ref()
             .ok_or_else(|| invalid("Review Execution has no persisted ActorRef"))?;
@@ -434,72 +529,184 @@ impl CollaborationService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| not_found("task", execution.task_id.clone()))?;
-
-        let artifact_inputs =
-            CollaborationRepo::list_execution_artifact_inputs(&*self.db, execution_id).await?;
-        let evidence_inputs =
-            db::ValidationRunRepo::list_execution_evidence_inputs(&*self.db, execution_id).await?;
         let mut considered = Vec::new();
         let mut seen = HashSet::new();
-        for reference in structured.evidence_considered {
-            let reference = reference.as_object().ok_or_else(|| {
-                invalid("ReviewReport evidence_considered entries must be exact reference objects")
-            })?;
-            let artifact_id = reference
-                .get("artifact_id")
-                .and_then(serde_json::Value::as_str);
-            let evidence_id = reference
-                .get("evidence_id")
-                .and_then(serde_json::Value::as_str);
-            if artifact_id.is_some() == evidence_id.is_some() {
-                return Err(invalid(
-                    "ReviewReport evidence reference must name exactly one Artifact or Evidence",
-                ));
-            }
-            if let Some(artifact_id) = artifact_id {
-                if !seen.insert(("artifact", artifact_id.to_owned())) {
+        if let Some((evidence_ids, artifact_ids)) = requested_inputs.as_ref() {
+            let mut declared_evidence = HashSet::new();
+            let mut declared_artifacts = HashSet::new();
+            for reference in &structured.evidence_considered {
+                let reference = reference.as_object().ok_or_else(|| {
+                    invalid(
+                        "ReviewReport evidence_considered entries must be exact reference objects",
+                    )
+                })?;
+                let artifact_id = reference
+                    .get("artifact_id")
+                    .and_then(serde_json::Value::as_str);
+                let evidence_id = reference
+                    .get("evidence_id")
+                    .and_then(serde_json::Value::as_str);
+                if artifact_id.is_some() == evidence_id.is_some() {
                     return Err(invalid(
-                        "ReviewReport contains a duplicate Artifact reference",
+                        "ReviewReport evidence reference must name exactly one Artifact or Evidence",
                     ));
                 }
-                let input = artifact_inputs
-                    .iter()
-                    .find(|input| input.artifact_id == artifact_id)
-                    .ok_or_else(|| {
-                        invalid("ReviewReport references an Artifact not pinned to this Execution")
-                    })?;
-                let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
-                    .await?
-                    .ok_or_else(|| invalid("pinned ReviewReport Artifact input is missing"))?;
-                considered.push(serde_json::json!({
-                    "artifact_id": input.artifact_id,
-                    "digest": input.digest,
-                    "kind": artifact.kind,
-                }));
+                if let Some(id) = artifact_id {
+                    if !declared_artifacts.insert(id.to_owned()) {
+                        return Err(invalid(
+                            "ReviewReport contains a duplicate Artifact reference",
+                        ));
+                    }
+                }
+                if let Some(id) = evidence_id {
+                    if !declared_evidence.insert(id.to_owned()) {
+                        return Err(invalid(
+                            "ReviewReport contains a duplicate Evidence reference",
+                        ));
+                    }
+                }
             }
-            if let Some(evidence_id) = evidence_id {
-                if !seen.insert(("evidence", evidence_id.to_owned())) {
+            if declared_evidence.len() != evidence_ids.len()
+                || evidence_ids
+                    .iter()
+                    .any(|id| !declared_evidence.contains(id))
+                || declared_artifacts.len() != artifact_ids.len()
+                || artifact_ids
+                    .iter()
+                    .any(|id| !declared_artifacts.contains(id))
+            {
+                return Err(invalid(
+                    "ReviewReport references must match the complete requested input sets",
+                ));
+            }
+            for evidence_id in evidence_ids {
+                if !seen.insert(("evidence", evidence_id.clone())) {
                     return Err(invalid(
                         "ReviewReport contains a duplicate Evidence reference",
                     ));
                 }
-                let input = evidence_inputs
-                    .iter()
-                    .find(|input| input.evidence_id == evidence_id)
-                    .ok_or_else(|| {
-                        invalid("ReviewReport references Evidence not pinned to this Execution")
-                    })?;
-                let evidence = db::ValidationRunRepo::get_evidence(&*self.db, evidence_id)
-                    .await?
-                    .ok_or_else(|| invalid("pinned ReviewReport Evidence input is missing"))?;
-                considered.push(serde_json::json!({
-                    "evidence_id": input.evidence_id,
-                    "digest": input.digest,
-                    "kind": evidence.kind,
-                    "validation_run_id": evidence.producer_validation_run_id,
-                }));
+                let evidence = db::ValidationRunRepo::get_evidence(&*self.db, evidence_id).await?;
+                considered.push(
+                    match evidence.filter(|evidence| evidence.task_id == execution.task_id) {
+                        Some(evidence) => serde_json::json!({
+                            "evidence_id": evidence.id,
+                            "digest": evidence.digest,
+                            "kind": evidence.kind,
+                            "validation_run_id": evidence.producer_validation_run_id,
+                        }),
+                        None => serde_json::json!({
+                            "evidence_id": evidence_id,
+                            "digest": null,
+                            "kind": "unavailable",
+                            "validation_run_id": null,
+                        }),
+                    },
+                );
+            }
+            for artifact_id in artifact_ids {
+                if !seen.insert(("artifact", artifact_id.clone())) {
+                    return Err(invalid(
+                        "ReviewReport contains a duplicate Artifact reference",
+                    ));
+                }
+                let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id).await?;
+                considered.push(
+                    match artifact.filter(|artifact| artifact.task_id == execution.task_id) {
+                        Some(artifact) => serde_json::json!({
+                            "artifact_id": artifact.id,
+                            "digest": artifact.digest,
+                            "kind": artifact.kind,
+                        }),
+                        None => serde_json::json!({
+                            "artifact_id": artifact_id,
+                            "digest": null,
+                            "kind": "unavailable",
+                        }),
+                    },
+                );
+            }
+        } else {
+            let artifact_inputs =
+                CollaborationRepo::list_execution_artifact_inputs(&*self.db, execution_id).await?;
+            let evidence_inputs =
+                db::ValidationRunRepo::list_execution_evidence_inputs(&*self.db, execution_id)
+                    .await?;
+            for reference in structured.evidence_considered {
+                let reference = reference.as_object().ok_or_else(|| {
+                    invalid(
+                        "ReviewReport evidence_considered entries must be exact reference objects",
+                    )
+                })?;
+                let artifact_id = reference
+                    .get("artifact_id")
+                    .and_then(serde_json::Value::as_str);
+                let evidence_id = reference
+                    .get("evidence_id")
+                    .and_then(serde_json::Value::as_str);
+                if artifact_id.is_some() == evidence_id.is_some() {
+                    return Err(invalid(
+                        "ReviewReport evidence reference must name exactly one Artifact or Evidence",
+                    ));
+                }
+                if let Some(artifact_id) = artifact_id {
+                    if !seen.insert(("artifact", artifact_id.to_owned())) {
+                        return Err(invalid(
+                            "ReviewReport contains a duplicate Artifact reference",
+                        ));
+                    }
+                    let input = artifact_inputs
+                        .iter()
+                        .find(|input| input.artifact_id == artifact_id)
+                        .ok_or_else(|| {
+                            invalid(
+                                "ReviewReport references an Artifact not pinned to this Execution",
+                            )
+                        })?;
+                    let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
+                        .await?
+                        .ok_or_else(|| invalid("pinned ReviewReport Artifact input is missing"))?;
+                    considered.push(serde_json::json!({
+                        "artifact_id": input.artifact_id,
+                        "digest": input.digest,
+                        "kind": artifact.kind,
+                    }));
+                }
+                if let Some(evidence_id) = evidence_id {
+                    if !seen.insert(("evidence", evidence_id.to_owned())) {
+                        return Err(invalid(
+                            "ReviewReport contains a duplicate Evidence reference",
+                        ));
+                    }
+                    let input = evidence_inputs
+                        .iter()
+                        .find(|input| input.evidence_id == evidence_id)
+                        .ok_or_else(|| {
+                            invalid("ReviewReport references Evidence not pinned to this Execution")
+                        })?;
+                    let evidence = db::ValidationRunRepo::get_evidence(&*self.db, evidence_id)
+                        .await?
+                        .ok_or_else(|| invalid("pinned ReviewReport Evidence input is missing"))?;
+                    considered.push(serde_json::json!({
+                        "evidence_id": input.evidence_id,
+                        "digest": input.digest,
+                        "kind": evidence.kind,
+                        "validation_run_id": evidence.producer_validation_run_id,
+                    }));
+                }
             }
         }
+
+        let subject = if execution.workspace_id.is_some() {
+            Some(
+                ExecutionRepo::get_review_execution_subject(&*self.db, execution_id)
+                    .await?
+                    .ok_or_else(|| {
+                        invalid("workspace-bound Review Execution has no frozen subject")
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let content = serde_json::json!({
             "kind": "review_report",
@@ -513,8 +720,9 @@ impl CollaborationService {
                 "task_id": task.id,
                 "review_execution_id": execution.id,
                 "workspace_id": execution.workspace_id,
-                "base_commit_sha": execution.before_sha,
-                "head_commit_sha": execution.after_sha,
+                "base_commit_sha": subject.as_ref().map(|subject| subject.base_commit_sha.as_str()).or(execution.before_sha.as_deref()),
+                "head_commit_sha": subject.as_ref().map(|subject| subject.head_commit_sha.as_str()).or(execution.after_sha.as_deref()),
+                "workspace_snapshot_digest": subject.as_ref().map(|subject| subject.workspace_snapshot_digest.as_str()),
             },
         })
         .to_string();
@@ -541,27 +749,37 @@ impl CollaborationService {
                 &now,
             )
             .await?;
-        let write = CollaborationRepo::create_execution_artifact_output(
-            &*self.db,
-            CreateArtifact {
-                id,
-                task_id: execution.task_id,
-                kind: ArtifactKind::ReviewReport,
-                storage_kind: ArtifactStorageKind::Inline,
-                content: Some(content),
-                content_ref: None,
-                metadata_json: serde_json::json!({
-                    "schema_version": 1,
-                    "review_execution_id": execution.id,
-                })
-                .to_string(),
-                digest: Some(digest),
-                producer_execution_id: execution.id,
-                created_at: now,
-            },
-            event,
-        )
-        .await?;
+        let input = CreateArtifact {
+            id,
+            task_id: execution.task_id.clone(),
+            kind: ArtifactKind::ReviewReport,
+            storage_kind: ArtifactStorageKind::Inline,
+            content: Some(content),
+            content_ref: None,
+            metadata_json: serde_json::json!({
+                "schema_version": 1,
+                "review_execution_id": execution.id.clone(),
+            })
+            .to_string(),
+            digest: Some(digest),
+            producer_execution_id: execution.id.clone(),
+            created_at: now,
+        };
+        if execution.status == db::ExecutionStatus::Running {
+            self.ensure_review_subject_current(&execution).await?;
+        }
+        let write = if let Some((evidence_input_ids, artifact_input_ids)) = requested_inputs {
+            CollaborationRepo::create_review_report_with_inputs(
+                &*self.db,
+                input,
+                evidence_input_ids,
+                artifact_input_ids,
+                event,
+            )
+            .await?
+        } else {
+            CollaborationRepo::create_execution_artifact_output(&*self.db, input, event).await?
+        };
         if let Some(event) = write.event.as_ref() {
             self.domain_events.publish_committed(event);
         }

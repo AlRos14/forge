@@ -748,6 +748,238 @@ impl CollaborationRepo for SqliteDb {
         })
     }
 
+    async fn create_review_report_with_inputs(
+        &self,
+        input: CreateArtifact,
+        evidence_input_ids: Vec<String>,
+        artifact_input_ids: Vec<String>,
+        event: CreateDomainEvent,
+    ) -> Result<ExecutionArtifactOutputWrite> {
+        if input.kind != ArtifactKind::ReviewReport
+            || input.storage_kind != crate::ArtifactStorageKind::Inline
+            || input.content.is_none()
+            || input.content_ref.is_some()
+        {
+            return Err(DbError::Check(
+                "Human Review submission requires an inline ReviewReport".to_owned(),
+            ));
+        }
+        let unique = |ids: &[String]| {
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            ids.iter().all(|id| seen.insert(id))
+        };
+        if !unique(&evidence_input_ids) || !unique(&artifact_input_ids) {
+            return Err(DbError::Check(
+                "Human Review input sets cannot contain duplicate references".to_owned(),
+            ));
+        }
+
+        let content = input.content.as_deref().ok_or_else(|| {
+            DbError::Check("Human Review submission requires ReviewReport content".to_owned())
+        })?;
+        let value: serde_json::Value = serde_json::from_str(content)
+            .map_err(|error| DbError::Check(format!("invalid ReviewReport JSON: {error}")))?;
+        let references = value
+            .get("evidence_considered")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                DbError::Check("ReviewReport evidence_considered must be an array".to_owned())
+            })?;
+        let mut referenced_evidence = std::collections::HashSet::new();
+        let mut referenced_artifacts = std::collections::HashSet::new();
+        for reference in references {
+            let object = reference.as_object().ok_or_else(|| {
+                DbError::Check("ReviewReport input references must be objects".to_owned())
+            })?;
+            match (
+                object
+                    .get("evidence_id")
+                    .and_then(serde_json::Value::as_str),
+                object
+                    .get("artifact_id")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                (Some(id), None) if referenced_evidence.insert(id.to_owned()) => {}
+                (None, Some(id)) if referenced_artifacts.insert(id.to_owned()) => {}
+                _ => {
+                    return Err(DbError::Check(
+                        "ReviewReport inputs must be unique exact Evidence or Artifact references"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        if referenced_evidence.len() != evidence_input_ids.len()
+            || evidence_input_ids
+                .iter()
+                .any(|id| !referenced_evidence.contains(id))
+            || referenced_artifacts.len() != artifact_input_ids.len()
+            || artifact_input_ids
+                .iter()
+                .any(|id| !referenced_artifacts.contains(id))
+        {
+            return Err(DbError::Check(
+                "ReviewReport references must equal the complete requested input sets".to_owned(),
+            ));
+        }
+
+        let expected = input.clone();
+        let mut tx = self.pool.begin().await?;
+        let existing_id: Option<String> = sqlx::query_scalar(
+            "SELECT artifact_id FROM execution_artifact_output
+             WHERE execution_id = ? AND kind = 'review_report'",
+        )
+        .bind(&input.producer_execution_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing_id.is_some() {
+            tx.rollback().await?;
+            let existing = self
+                .get_execution_artifact_output(
+                    &expected.producer_execution_id,
+                    ArtifactKind::ReviewReport,
+                )
+                .await?
+                .ok_or(DbError::VersionConflict)?;
+            if existing.task_id != expected.task_id
+                || existing.kind != expected.kind
+                || existing.storage_kind != expected.storage_kind
+                || existing.content != expected.content
+                || existing.content_ref != expected.content_ref
+                || existing.metadata_json != expected.metadata_json
+                || existing.digest != expected.digest
+                || existing.execution_producer().map(|(id, _)| id)
+                    != Some(expected.producer_execution_id.as_str())
+            {
+                return Err(DbError::Check(
+                    "Execution already has a different output Artifact of this kind".to_owned(),
+                ));
+            }
+            return Ok(ExecutionArtifactOutputWrite {
+                artifact: existing,
+                event: None,
+            });
+        }
+
+        let exact_running_human_review: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM execution e
+                WHERE e.id = ? AND e.task_id = ?
+                  AND e.role = 'reviewer' AND e.purpose = 'review'
+                  AND e.actor_kind = 'human' AND e.actor_id IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM user u WHERE u.id = e.actor_id)
+                  AND e.status = 'running'
+            )",
+        )
+        .bind(&input.producer_execution_id)
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exact_running_human_review != 1 {
+            return Err(DbError::Check(
+                "new Human ReviewReport requires its exact Running Human reviewer Execution"
+                    .to_owned(),
+            ));
+        }
+
+        for evidence_id in &evidence_input_ids {
+            super::validation_run::pin_execution_evidence_input_in_tx(
+                &mut tx,
+                &input.producer_execution_id,
+                evidence_id,
+                &input.created_at,
+            )
+            .await?;
+        }
+        for artifact_id in &artifact_input_ids {
+            pin_execution_artifact_input_in_tx(
+                &mut tx,
+                &input.producer_execution_id,
+                artifact_id,
+                &input.created_at,
+            )
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.producer_execution_id)
+        .bind(&input.task_id)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO execution_artifact_output
+             (execution_id, artifact_id, task_id, kind, digest, created_at)
+             VALUES (?, ?, ?, 'review_report', ?, ?)
+             ON CONFLICT(execution_id, kind) DO NOTHING",
+        )
+        .bind(&input.producer_execution_id)
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.digest)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            tx.rollback().await?;
+            let existing = self
+                .get_execution_artifact_output(
+                    &expected.producer_execution_id,
+                    ArtifactKind::ReviewReport,
+                )
+                .await?
+                .ok_or(DbError::VersionConflict)?;
+            if existing.task_id != expected.task_id
+                || existing.kind != expected.kind
+                || existing.storage_kind != expected.storage_kind
+                || existing.content != expected.content
+                || existing.content_ref != expected.content_ref
+                || existing.metadata_json != expected.metadata_json
+                || existing.digest != expected.digest
+                || existing.execution_producer().map(|(id, _)| id)
+                    != Some(expected.producer_execution_id.as_str())
+            {
+                return Err(DbError::Check(
+                    "Execution already has a different output Artifact of this kind".to_owned(),
+                ));
+            }
+            return Ok(ExecutionArtifactOutputWrite {
+                artifact: existing,
+                event: None,
+            });
+        }
+        sqlx::query(
+            "INSERT INTO artifact (
+                id, task_id, kind, storage_kind, content, content_ref,
+                metadata_json, digest, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(input.kind.to_string())
+        .bind(input.storage_kind.to_string())
+        .bind(&input.content)
+        .bind(&input.content_ref)
+        .bind(&input.metadata_json)
+        .bind(&input.digest)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await?;
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        let artifact = get_artifact_row(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        Ok(ExecutionArtifactOutputWrite {
+            artifact,
+            event: Some(event),
+        })
+    }
+
     async fn get_execution_artifact_output(
         &self,
         execution_id: &str,

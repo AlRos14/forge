@@ -1,6 +1,71 @@
 -- Plan PR8 adds independent, durable Review Execution outputs and deterministic
 -- ValidationRuns. V006/V008/V011/V084 remain immutable historical storage.
 
+CREATE TABLE review_execution_subject (
+    execution_id                TEXT PRIMARY KEY,
+    task_id                     TEXT NOT NULL,
+    workspace_id                TEXT NOT NULL,
+    base_commit_sha             TEXT NOT NULL CHECK (length(trim(base_commit_sha)) BETWEEN 7 AND 128),
+    head_commit_sha             TEXT NOT NULL CHECK (length(trim(head_commit_sha)) BETWEEN 7 AND 128),
+    workspace_snapshot_digest   TEXT NOT NULL CHECK (length(workspace_snapshot_digest) = 64),
+    created_at                  TEXT NOT NULL,
+    FOREIGN KEY (execution_id, task_id)
+        REFERENCES execution(id, task_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, task_id)
+        REFERENCES workspace(id, task_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_review_execution_subject_task
+    ON review_execution_subject(task_id, workspace_id, head_commit_sha);
+
+CREATE TRIGGER review_execution_subject_guard_insert
+BEFORE INSERT ON review_execution_subject
+WHEN NOT EXISTS (
+    SELECT 1 FROM execution e
+    JOIN workspace w ON w.id = NEW.workspace_id AND w.task_id = NEW.task_id
+    WHERE e.id = NEW.execution_id AND e.task_id = NEW.task_id
+      AND e.role = 'reviewer' AND e.purpose = 'review' AND e.status = 'running'
+      AND e.actor_kind IN ('human', 'agent') AND e.actor_id IS NOT NULL
+      AND ((e.actor_kind = 'human' AND EXISTS (SELECT 1 FROM user u WHERE u.id = e.actor_id))
+        OR (e.actor_kind = 'agent' AND EXISTS (SELECT 1 FROM agent_identity ai WHERE ai.id = e.actor_id)))
+      AND e.workspace_id = NEW.workspace_id
+      AND e.before_sha = NEW.base_commit_sha AND e.after_sha = NEW.head_commit_sha
+      AND NOT EXISTS (
+          SELECT 1 FROM execution_artifact_output o
+          WHERE o.execution_id = e.id AND o.kind = 'review_report'
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Review subject requires its exact Running reviewer Execution and Workspace');
+END;
+CREATE TRIGGER review_execution_subject_immutable_update
+BEFORE UPDATE ON review_execution_subject BEGIN
+    SELECT RAISE(ABORT, 'Review Execution subject is immutable');
+END;
+CREATE TRIGGER review_execution_subject_immutable_delete
+BEFORE DELETE ON review_execution_subject
+WHEN NOT EXISTS (
+    SELECT 1 FROM task t JOIN project_deletion_guard g ON g.project_id = t.project_id
+    WHERE t.id = OLD.task_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Review Execution subject is immutable outside Project teardown');
+END;
+CREATE TRIGGER review_execution_subject_execution_match_update
+BEFORE UPDATE OF task_id, workspace_id, before_sha, after_sha, role, purpose ON execution
+WHEN EXISTS (
+    SELECT 1 FROM review_execution_subject s WHERE s.execution_id = OLD.id
+) AND NOT EXISTS (
+    SELECT 1 FROM review_execution_subject s
+    WHERE s.execution_id = NEW.id AND s.task_id = NEW.task_id
+      AND s.workspace_id = NEW.workspace_id
+      AND s.base_commit_sha = NEW.before_sha
+      AND s.head_commit_sha = NEW.after_sha
+      AND NEW.role = 'reviewer' AND NEW.purpose = 'review'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Review Execution identity cannot diverge from its frozen subject');
+END;
+
 CREATE TABLE validation_run (
     id                       TEXT PRIMARY KEY,
     task_id                  TEXT NOT NULL,
@@ -345,9 +410,16 @@ WHEN NEW.kind = 'review_report' AND NOT EXISTS (
       AND e.actor_kind IN ('human', 'agent') AND e.actor_id IS NOT NULL
       AND ((e.actor_kind = 'human' AND EXISTS (SELECT 1 FROM user u WHERE u.id = e.actor_id))
         OR (e.actor_kind = 'agent' AND EXISTS (SELECT 1 FROM agent_identity ai WHERE ai.id = e.actor_id)))
+      AND (e.workspace_id IS NULL OR EXISTS (
+          SELECT 1 FROM review_execution_subject s
+          WHERE s.execution_id = e.id AND s.task_id = e.task_id
+            AND s.workspace_id = e.workspace_id
+            AND s.base_commit_sha = e.before_sha
+            AND s.head_commit_sha = e.after_sha
+      ))
 )
 BEGIN
-    SELECT RAISE(ABORT, 'ReviewReport output requires a real reviewer Review Execution');
+    SELECT RAISE(ABORT, 'ReviewReport output requires a real reviewer Execution with its exact Workspace subject');
 END;
 CREATE TRIGGER validation_run_artifact_output_guard_insert
 BEFORE INSERT ON validation_run_artifact_output
@@ -410,6 +482,23 @@ WHEN NEW.kind = 'review_report' AND NOT EXISTS (
       AND json_extract(NEW.content, '$.subject.workspace_id') IS e.workspace_id
       AND json_extract(NEW.content, '$.subject.base_commit_sha') IS e.before_sha
       AND json_extract(NEW.content, '$.subject.head_commit_sha') IS e.after_sha
+      AND (
+          (e.workspace_id IS NULL
+           AND json_extract(NEW.content, '$.subject.workspace_snapshot_digest') IS NULL
+           AND json_type(NEW.content, '$.subject.workspace_snapshot_digest') = 'null'
+           AND NOT EXISTS (
+               SELECT 1 FROM review_execution_subject s WHERE s.execution_id = e.id
+           ))
+          OR EXISTS (
+              SELECT 1 FROM review_execution_subject s
+              WHERE s.execution_id = e.id AND s.task_id = e.task_id
+                AND s.workspace_id = e.workspace_id
+                AND s.base_commit_sha = e.before_sha
+                AND s.head_commit_sha = e.after_sha
+                AND json_extract(NEW.content, '$.subject.workspace_snapshot_digest')
+                    = s.workspace_snapshot_digest
+          )
+      )
       AND e.role = 'reviewer' AND e.purpose = 'review'
       AND e.actor_kind IN ('human', 'agent') AND e.actor_id IS NOT NULL
       AND ((e.actor_kind = 'human' AND EXISTS (SELECT 1 FROM user u WHERE u.id = e.actor_id))
@@ -544,7 +633,8 @@ CREATE TABLE legacy_review_artifact_migration (
     migration_status  TEXT NOT NULL CHECK (migration_status IN (
         'migrated', 'mapped_duplicate', 'source_execution_missing',
         'source_execution_unresolved', 'wrong_task', 'actor_missing',
-        'content_unrecoverable', 'ambiguous', 'existing_output_conflict'
+        'content_unrecoverable', 'ambiguous', 'existing_output_conflict',
+        'status_verdict_mismatch', 'terminal_timestamp_missing', 'subject_unavailable'
     )),
     details_json      TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json))
 );
@@ -584,6 +674,7 @@ SELECT r.id AS review_id, r.task_id, r.execution_id, r.created_at,
          WHEN e.role != 'reviewer' OR e.purpose != 'review' OR e.status != 'completed'
            THEN 'source_execution_unresolved'
          WHEN r.status NOT IN ('passed', 'failed') THEN 'content_unrecoverable'
+         WHEN r.finished_at IS NULL THEN 'terminal_timestamp_missing'
          WHEN json_type(r.step_results_json, '$.structured_result') != 'object'
            OR json_extract(r.step_results_json, '$.structured_result.schema_version') != 1
            OR json_extract(r.step_results_json, '$.structured_result.kind') != 'review'
@@ -610,6 +701,12 @@ SELECT r.id AS review_id, r.task_id, r.execution_id, r.created_at,
                AND (json_type(r.step_results_json, '$.structured_result.evidence_considered') != 'array'
                     OR json_array_length(r.step_results_json, '$.structured_result.evidence_considered') != 0))
            THEN 'content_unrecoverable'
+         WHEN (r.status = 'passed'
+               AND COALESCE(json_extract(r.step_results_json, '$.structured_result.verdict'), '') != 'pass')
+           OR (r.status = 'failed'
+               AND COALESCE(json_extract(r.step_results_json, '$.structured_result.verdict'), '') != 'fail')
+           THEN 'status_verdict_mismatch'
+         WHEN e.workspace_id IS NOT NULL THEN 'subject_unavailable'
          ELSE 'eligible'
        END AS candidate_status
 FROM review r
@@ -656,7 +753,8 @@ SELECT review_id, task_id, execution_id, result_json, workspace_id, before_sha, 
                        'review_execution_id', eligible.execution_id,
                        'workspace_id', eligible.workspace_id,
                        'base_commit_sha', eligible.before_sha,
-                       'head_commit_sha', eligible.after_sha)))
+                       'head_commit_sha', eligible.after_sha,
+                       'workspace_snapshot_digest', NULL)))
          ) THEN 'mapped_duplicate'
          WHEN EXISTS (
              SELECT 1 FROM execution_artifact_output o
@@ -691,7 +789,8 @@ SELECT p.artifact_id, p.task_id, 'review_report', 'inline',
                'review_execution_id', p.execution_id,
                'workspace_id', p.workspace_id,
                'base_commit_sha', p.before_sha,
-               'head_commit_sha', p.after_sha))),
+               'head_commit_sha', p.after_sha,
+               'workspace_snapshot_digest', NULL))),
        NULL, json_object('migration_source', 'legacy_review', 'review_id', p.review_id), NULL, r.created_at
 FROM pr8_legacy_review_primary p JOIN review r ON r.id = p.review_id
 WHERE p.migration_status = 'migrated';

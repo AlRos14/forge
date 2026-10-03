@@ -845,6 +845,33 @@ pub trait ExecutionRepo: Send + Sync {
         input: CreateExecution,
         event: CreateDomainEvent,
     ) -> Result<(Execution, DomainEvent)>;
+    /// Create a workspace-bound Human Review Execution, its immutable exact
+    /// subject, and the start event in one transaction.
+    async fn create_human_review_execution_with_subject(
+        &self,
+        input: CreateExecution,
+        subject: CreateReviewExecutionSubject,
+        event: CreateDomainEvent,
+    ) -> Result<ReviewExecutionSubjectWrite>;
+    /// Freeze the exact subject of a running reviewer Execution, or return
+    /// the already-frozen identity only when every field still matches.
+    async fn freeze_review_execution_subject(
+        &self,
+        subject: CreateReviewExecutionSubject,
+        updated_at: &str,
+        event: CreateDomainEvent,
+    ) -> Result<ReviewExecutionSubjectWrite>;
+    async fn get_review_execution_subject(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ReviewExecutionSubject>>;
+    /// Exact bounded lookup used to reuse one running Human Review Execution.
+    async fn find_running_human_review_execution(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<Execution>>;
     /// Create a Running Execution, its immutable Artifact inputs, and the
     /// `execution.started` ledger event as one durable boundary.
     async fn create_with_artifact_inputs_and_event(
@@ -920,6 +947,15 @@ pub trait CollaborationRepo: Send + Sync {
     async fn create_execution_artifact_output(
         &self,
         input: CreateArtifact,
+        event: CreateDomainEvent,
+    ) -> Result<ExecutionArtifactOutputWrite>;
+    /// Pin a Human Review's complete requested input sets and persist or reuse
+    /// its exact ReviewReport and event atomically.
+    async fn create_review_report_with_inputs(
+        &self,
+        input: CreateArtifact,
+        evidence_input_ids: Vec<String>,
+        artifact_input_ids: Vec<String>,
         event: CreateDomainEvent,
     ) -> Result<ExecutionArtifactOutputWrite>;
     async fn get_execution_artifact_output(

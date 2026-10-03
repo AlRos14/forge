@@ -3901,6 +3901,7 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             "workspace_id": null,
             "base_commit_sha": execution.before_sha,
             "head_commit_sha": execution.after_sha,
+            "workspace_snapshot_digest": null,
         }
     })
     .to_string();
@@ -4052,6 +4053,245 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
 }
 
 #[tokio::test]
+async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "review".to_owned(),
+        "Immutable Review subject",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let user_id = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES (?, ?, 'test', 'Human reviewer', ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(format!("{user_id}@example.test"))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("Human Actor persists");
+
+    let execution_id = new_uuid_v4();
+    let base_sha = "aaaaaaa000000000000000000000000000000000";
+    let head_sha = "bbbbbbb000000000000000000000000000000000";
+    let write = ExecutionRepo::create_human_review_execution_with_subject(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            actor_ref: Some(crate::ActorRef::Human(user_id.clone())),
+            role: "reviewer".to_owned(),
+            purpose: Some(crate::ExecutionPurpose::Review),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some(base_sha.to_owned()),
+            after_sha: Some(head_sha.to_owned()),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        crate::CreateReviewExecutionSubject {
+            execution_id: execution_id.clone(),
+            task_id: task_id.clone(),
+            workspace_id: workspace_id.clone(),
+            base_commit_sha: base_sha.to_owned(),
+            head_commit_sha: head_sha.to_owned(),
+            workspace_snapshot_digest: "a".repeat(64),
+            created_at: now.clone(),
+        },
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some(user_id.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: execution_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("human-review-execution-started:{execution_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Human Execution and immutable subject commit together");
+    assert_eq!(write.subject.workspace_id, workspace_id);
+
+    let immutable_update = sqlx::query(
+        "UPDATE review_execution_subject SET workspace_snapshot_digest = ? WHERE execution_id = ?",
+    )
+    .bind("b".repeat(64))
+    .bind(&execution_id)
+    .execute(db.pool())
+    .await;
+    assert!(immutable_update.is_err(), "subject updates are rejected");
+    let diverged_execution = sqlx::query("UPDATE execution SET after_sha = ? WHERE id = ?")
+        .bind("c".repeat(40))
+        .bind(&execution_id)
+        .execute(db.pool())
+        .await;
+    assert!(
+        diverged_execution.is_err(),
+        "Execution cannot diverge from subject"
+    );
+    let delete_outside_teardown =
+        sqlx::query("DELETE FROM review_execution_subject WHERE execution_id = ?")
+            .bind(&execution_id)
+            .execute(db.pool())
+            .await;
+    assert!(
+        delete_outside_teardown.is_err(),
+        "subject deletion is rejected outside Project teardown"
+    );
+
+    let report_content = |snapshot: &str| {
+        serde_json::json!({
+            "kind": "review_report",
+            "verdict": "pass",
+            "criteria": [],
+            "summary": "The exact Workspace subject passes.",
+            "findings": [],
+            "questions": [],
+            "evidence_considered": [],
+            "subject": {
+                "task_id": task_id.clone(),
+                "review_execution_id": execution_id.clone(),
+                "workspace_id": workspace_id.clone(),
+                "base_commit_sha": base_sha,
+                "head_commit_sha": head_sha,
+                "workspace_snapshot_digest": snapshot,
+            }
+        })
+        .to_string()
+    };
+    let wrong_digest = report_content(&"b".repeat(64));
+    assert!(insert_pr8_review_report(
+        &db,
+        &execution_id,
+        &task_id,
+        &now,
+        &new_uuid_v4(),
+        &wrong_digest,
+    )
+    .await
+    .is_err());
+    assert!(
+        ExecutionRepo::get_review_execution_subject(&db, &execution_id)
+            .await
+            .expect("subject lookup succeeds")
+            .is_some()
+    );
+    let exact_report = report_content(&"a".repeat(64));
+    insert_pr8_review_report(
+        &db,
+        &execution_id,
+        &task_id,
+        &now,
+        &new_uuid_v4(),
+        &exact_report,
+    )
+    .await
+    .expect("report with the exact frozen digest is accepted");
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution_id,
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Review Execution completes with its exact report");
+    ProjectRepo::delete(&db, &project_id)
+        .await
+        .expect("Project teardown removes the immutable Review subject");
+}
+
+async fn insert_pr8_review_report(
+    db: &SqliteDb,
+    execution_id: &str,
+    task_id: &str,
+    created_at: &str,
+    artifact_id: &str,
+    content: &str,
+) -> std::result::Result<(), sqlx::Error> {
+    let digest = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+    let mut tx = db.pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(artifact_id)
+    .bind(execution_id)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO execution_artifact_output
+         (execution_id, artifact_id, task_id, kind, digest, created_at)
+         VALUES (?, ?, ?, 'review_report', ?, ?)",
+    )
+    .bind(execution_id)
+    .bind(artifact_id)
+    .bind(task_id)
+    .bind(&digest)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO artifact
+         (id, task_id, kind, storage_kind, content, content_ref, metadata_json, digest, created_at)
+         VALUES (?, ?, 'review_report', 'inline', ?, NULL, '{}', ?, ?)",
+    )
+    .bind(artifact_id)
+    .bind(task_id)
+    .bind(content)
+    .bind(digest)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+#[tokio::test]
 async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_is_not_invented() {
     let migration_dir = tempfile::tempdir().expect("migration directory creates");
     let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -4159,11 +4399,36 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         attempt: i64,
         summary: &str,
     ) {
+        historical_review_state(
+            db,
+            id,
+            task_id,
+            execution_id,
+            attempt,
+            summary,
+            "passed",
+            "pass",
+            true,
+        )
+        .await;
+    }
+
+    async fn historical_review_state(
+        db: &SqliteDb,
+        id: &str,
+        task_id: &str,
+        execution_id: &str,
+        attempt: i64,
+        summary: &str,
+        status: &str,
+        verdict: &str,
+        has_finished_at: bool,
+    ) {
         let now = now_rfc3339();
         let result = serde_json::json!({
             "schema_version": 1,
             "kind": "review",
-            "verdict": "pass",
+            "verdict": verdict,
             "summary": summary,
             "criteria": ["correctness"],
             "findings": [],
@@ -4173,15 +4438,16 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
             "INSERT INTO review
              (id, task_id, execution_id, attempt_number, status, step_results_json,
               started_at, finished_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'passed', ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(task_id)
         .bind(execution_id)
         .bind(attempt)
+        .bind(status)
         .bind(serde_json::json!({ "structured_result": result }).to_string())
         .bind(&now)
-        .bind(&now)
+        .bind(has_finished_at.then_some(now.as_str()))
         .bind(&now)
         .bind(&now)
         .execute(db.pool())
@@ -4195,7 +4461,7 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         &attributable_execution_id,
         &task_id,
         Some(crate::ActorRef::Human(user_id)),
-        Some(&workspace_id),
+        None,
         Some(base_sha),
         Some(head_sha),
     )
@@ -4209,6 +4475,70 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         "Attributable exact report",
     )
     .await;
+
+    let workspace_bound_execution_id = new_uuid_v4();
+    historical_execution(
+        &db,
+        &workspace_bound_execution_id,
+        &task_id,
+        Some(crate::ActorRef::Human(seed_user(&db).await)),
+        Some(&workspace_id),
+        Some(base_sha),
+        Some(head_sha),
+    )
+    .await;
+    historical_review(
+        &db,
+        "pr8-historical-subject-unavailable",
+        &task_id,
+        &workspace_bound_execution_id,
+        5,
+        "Workspace snapshot was not persisted",
+    )
+    .await;
+
+    for (review_id, attempt, status, verdict, has_finished_at) in [
+        ("pr8-historical-passed-fail", 6, "passed", "fail", true),
+        ("pr8-historical-failed-pass", 7, "failed", "pass", true),
+        (
+            "pr8-historical-passed-needs-human",
+            8,
+            "passed",
+            "needs_human",
+            true,
+        ),
+        (
+            "pr8-historical-terminal-no-finish",
+            9,
+            "passed",
+            "pass",
+            false,
+        ),
+    ] {
+        let execution_id = new_uuid_v4();
+        historical_execution(
+            &db,
+            &execution_id,
+            &task_id,
+            Some(crate::ActorRef::Human(seed_user(&db).await)),
+            None,
+            None,
+            None,
+        )
+        .await;
+        historical_review_state(
+            &db,
+            review_id,
+            &task_id,
+            &execution_id,
+            attempt,
+            "Contradictory terminal history",
+            status,
+            verdict,
+            has_finished_at,
+        )
+        .await;
+    }
 
     let ambiguous_execution_id = new_uuid_v4();
     historical_execution(
@@ -4296,9 +4626,9 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
          VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, 'exact diff', 'diff-hash', ?, 1, ?)",
     )
     .bind(new_uuid_v4())
-    .bind("pr8-historical-attributable")
+    .bind("pr8-historical-subject-unavailable")
     .bind(&task_id)
-    .bind(&attributable_execution_id)
+    .bind(&workspace_bound_execution_id)
     .bind(base_sha)
     .bind(head_sha)
     .bind(ci_results.to_string())
@@ -4344,6 +4674,7 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         attributable_execution_id
     );
     assert_eq!(report_content["subject"]["head_commit_sha"], head_sha);
+    assert!(report_content["subject"]["workspace_snapshot_digest"].is_null());
 
     let statuses = sqlx::query_as::<_, (String, String)>(
         "SELECT review_id, migration_status FROM legacy_review_artifact_migration
@@ -4368,9 +4699,36 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         "pr8-historical-missing-actor".to_owned(),
         "actor_missing".to_owned()
     )));
+    assert!(statuses.contains(&(
+        "pr8-historical-subject-unavailable".to_owned(),
+        "subject_unavailable".to_owned()
+    )));
+    for review_id in [
+        "pr8-historical-passed-fail",
+        "pr8-historical-failed-pass",
+        "pr8-historical-passed-needs-human",
+    ] {
+        assert!(statuses.contains(&(review_id.to_owned(), "status_verdict_mismatch".to_owned())));
+    }
+    assert!(statuses.contains(&(
+        "pr8-historical-terminal-no-finish".to_owned(),
+        "terminal_timestamp_missing".to_owned()
+    )));
+    let rejected_artifacts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM legacy_review_artifact_migration
+         WHERE review_id IN (
+             'pr8-historical-passed-fail', 'pr8-historical-failed-pass',
+             'pr8-historical-passed-needs-human', 'pr8-historical-terminal-no-finish',
+             'pr8-historical-subject-unavailable'
+         ) AND artifact_id IS NOT NULL",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("contradictory and incomplete history has no Artifact");
+    assert_eq!(rejected_artifacts, 0);
     let ci_status: String = sqlx::query_scalar(
         "SELECT migration_status FROM legacy_ci_validation_migration
-         WHERE review_id = 'pr8-historical-attributable' AND step_index = 0",
+         WHERE review_id = 'pr8-historical-subject-unavailable' AND step_index = 0",
     )
     .fetch_one(db.pool())
     .await
@@ -4388,7 +4746,7 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
             .fetch_one(db.pool())
             .await
             .expect("historical Review rows remain"),
-        5
+        10
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM review_evidence_bundle")

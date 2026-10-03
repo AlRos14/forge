@@ -82,6 +82,55 @@ async fn get_evidence_for_run_in_tx(
     rows.into_iter().map(map_evidence).collect()
 }
 
+pub(super) async fn pin_execution_evidence_input_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    execution_id: &str,
+    evidence_id: &str,
+    created_at: &str,
+) -> Result<ExecutionEvidenceInput> {
+    let row = sqlx::query("SELECT task_id, digest FROM evidence WHERE id = ?")
+        .bind(evidence_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let task_id: String = row.try_get("task_id")?;
+    let digest: String = row.try_get("digest")?;
+    sqlx::query(
+        "INSERT INTO execution_evidence_input
+         (execution_id, evidence_id, task_id, digest, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(execution_id, evidence_id) DO NOTHING",
+    )
+    .bind(execution_id)
+    .bind(evidence_id)
+    .bind(&task_id)
+    .bind(&digest)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT execution_id, evidence_id, task_id, digest, created_at
+         FROM execution_evidence_input WHERE execution_id = ? AND evidence_id = ?",
+    )
+    .bind(execution_id)
+    .bind(evidence_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let record = ExecutionEvidenceInput {
+        execution_id: row.try_get("execution_id")?,
+        evidence_id: row.try_get("evidence_id")?,
+        task_id: row.try_get("task_id")?,
+        digest: row.try_get("digest")?,
+        created_at: row.try_get("created_at")?,
+    };
+    if record.task_id != task_id || record.digest != digest {
+        return Err(DbError::Check(
+            "Execution input Evidence binding conflicts with persisted provenance".to_owned(),
+        ));
+    }
+    Ok(record)
+}
+
 fn same_validation_run_identity(left: &ValidationRun, right: &CreateValidationRun) -> bool {
     left.task_id == right.task_id
         && left.work_unit_id == right.work_unit_id
@@ -576,40 +625,10 @@ impl ValidationRunRepo for SqliteDb {
                 continue;
             }
             seen.push(evidence_id);
-            let row = sqlx::query("SELECT task_id, digest FROM evidence WHERE id = ?")
-                .bind(evidence_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(DbError::NotFound)?;
-            let task_id: String = row.try_get("task_id")?;
-            let digest: String = row.try_get("digest")?;
-            sqlx::query(
-                "INSERT INTO execution_evidence_input
-                 (execution_id, evidence_id, task_id, digest, created_at)
-                 VALUES (?, ?, ?, ?, ?) ON CONFLICT(execution_id, evidence_id) DO NOTHING",
-            )
-            .bind(execution_id)
-            .bind(evidence_id)
-            .bind(&task_id)
-            .bind(&digest)
-            .bind(created_at)
-            .execute(&mut *tx)
-            .await?;
-            let record = sqlx::query(
-                "SELECT execution_id, evidence_id, task_id, digest, created_at
-                 FROM execution_evidence_input WHERE execution_id = ? AND evidence_id = ?",
-            )
-            .bind(execution_id)
-            .bind(evidence_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            result.push(ExecutionEvidenceInput {
-                execution_id: record.try_get("execution_id")?,
-                evidence_id: record.try_get("evidence_id")?,
-                task_id: record.try_get("task_id")?,
-                digest: record.try_get("digest")?,
-                created_at: record.try_get("created_at")?,
-            });
+            result.push(
+                pin_execution_evidence_input_in_tx(&mut tx, execution_id, evidence_id, created_at)
+                    .await?,
+            );
         }
         tx.commit().await?;
         Ok(result)

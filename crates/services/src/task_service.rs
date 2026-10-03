@@ -65,8 +65,9 @@ pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
 pub use execution::subtasks::build_first_turn_prompt_from_context;
 pub(crate) use memberships::{
-    active_agent_membership, current_role_memberships_authoritative, is_usable_active_agent,
-    is_usable_repository_agent, repository_worker_identity_is_eligible, select_usable_agent_id,
+    active_agent_membership, current_role_memberships_authoritative,
+    human_is_active_role_member_authoritative, is_usable_active_agent, is_usable_repository_agent,
+    repository_worker_identity_is_eligible, select_usable_agent_id,
     select_usable_repository_agent_id,
 };
 pub use subtask::{is_root_task, is_subtask, root_for};
@@ -595,11 +596,33 @@ impl TaskService {
         host_identity: Option<&str>,
     ) -> Result<Execution> {
         validate_required("execution_id", &notification.execution_id)?;
-        let current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
+        let mut current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
             .await?
             .ok_or_else(|| {
                 ServiceError::not_found("execution", notification.execution_id.clone())
             })?;
+        let _workspace_review_guard = if current_execution.status == ExecutionStatus::Running
+            && current_execution.role == crate::workflow::default_roles::REVIEWER
+            && current_execution.purpose == Some(ExecutionPurpose::Review)
+        {
+            if let (Some(workspace_id), Some(locks)) = (
+                current_execution.workspace_id.as_deref(),
+                self.workspace_exec_locks.as_ref(),
+            ) {
+                Some(locks.acquire(workspace_id).await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if _workspace_review_guard.is_some() {
+            current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("execution", notification.execution_id.clone())
+                })?;
+        }
         if current_execution.status != ExecutionStatus::Running {
             return Ok(current_execution);
         }
@@ -647,10 +670,23 @@ impl TaskService {
                 .as_deref()
                 .filter(|output| !output.trim().is_empty());
             let materialized = if let Some(assistant_output) = assistant_output {
-                crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                    .create_review_report_from_execution(&current_execution.id, assistant_output)
+                let collaboration = crate::CollaborationService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                );
+                match collaboration
+                    .ensure_review_subject_current(&current_execution)
                     .await
-                    .map(|_| ())
+                {
+                    Ok(()) => collaboration
+                        .create_review_report_from_execution(
+                            &current_execution.id,
+                            assistant_output,
+                        )
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error),
+                }
             } else {
                 Err(ServiceError::invalid_operation(
                     "completed remote Review Execution did not return a complete structured result",

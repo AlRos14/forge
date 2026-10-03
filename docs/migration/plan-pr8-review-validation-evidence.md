@@ -24,12 +24,40 @@ profile/capability snapshots, and explicit HarnessSession behavior.
 
 `ReviewReport` is an inline `review_report` Artifact containing verdict,
 criteria, summary, findings, questions, exact Artifact/Evidence references
-considered, and Task/Execution/Workspace/commit subject. Its unique
+considered, and Task/Execution/Workspace/base/head/working-tree snapshot
+subject. A workspace-bound Review Execution has one immutable
+`review_execution_subject` row that freezes this exact identity outside
+`executor_config_snapshot_json`. Its Task and Workspace must match the exact
+Execution, and it cannot be changed or removed outside Project teardown.
+ReviewReport repeats the complete frozen identity and SQL guards compare every
+field, including the snapshot digest. Its unique
 `execution_artifact_output` identity fixes one output for one Review Execution:
 an identical retry returns that Artifact; a different output fails closed.
 Evidence references must have been pinned to the same Execution and their
 stored digest is copied into the report. A Human submits the same report shape
 to one exact Human Review Execution.
+
+When a replacement reviewer TaskRole exists, active Human RoleMembership is
+the only authority to start and complete a running Human Review. The singular
+TaskRoleAssignment row remains a compatibility projection and cannot grant or
+revoke that authority. A Human may start an exact Review Execution when another
+Human is named by the projection. The legacy singleton fallback is permitted
+only when the replacement reviewer TaskRole does not exist. A Human may replay
+only the identical existing ReviewReport as the same Actor after completion;
+later membership changes do not rewrite that historical authority.
+
+Human Review freezes the exact Workspace subject when the Review Execution
+starts, then recomputes Workspace ID, base SHA, head SHA, and snapshot digest
+before accepting a report. Agent Review freezes the exact
+`execution.workspace_id` after the local workspace lock and final WorkspaceLease
+revalidation, directly before launch; a remote provider path freezes directly
+before launch. Both Agent completion paths recheck the frozen identity before
+materializing the ReviewReport. A changed Workspace fails closed without an
+authoritative report or verdict and requires a fresh Review Execution.
+Deterministic Evidence is automatically pinned only from ValidationRuns
+matching the persisted subject's exact Workspace, head, and snapshot digest.
+Review freeze uses the exact Workspace diff and never a Task-level
+canonical-workspace lookup.
 
 The harness may continue to emit a final `FORGE_RESULT` line. The server parses
 it and turns it into `ReviewReport`; the marker is transport, not a domain
@@ -115,17 +143,23 @@ rows.
 Review migration statuses include `migrated`, `mapped_duplicate`,
 `source_execution_missing`, `source_execution_unresolved`, `wrong_task`,
 `actor_missing`, `content_unrecoverable`, `ambiguous`, and
-`existing_output_conflict`. CI audit statuses separately describe absent
-steps, source/execution mismatch, missing check/result/timestamps/Workspace/
-commit/output, ambiguity, or insufficient provenance. Legacy data remains
-physically available for repair and audit.
+`existing_output_conflict`, `status_verdict_mismatch`,
+`terminal_timestamp_missing`, and `subject_unavailable`. `passed` requires a
+structured `pass`, `failed` requires a structured `fail`, and terminal history
+without `finished_at` remains legacy. A historical `needs_human` result is not
+reconstructed as a terminal pass or failure. CI audit statuses separately
+describe absent steps, source/execution mismatch, missing
+check/result/timestamps/Workspace/commit/output, ambiguity, or insufficient
+provenance. Legacy data remains physically available for repair and audit.
 
 ## API, MCP, UI, and prompts
 
 - `GET /api/v1/tasks/{id}/reviews` returns exact reviewer Executions and their
   optional ReviewReport Artifacts. `/api/v1/reviews/{execution_id}` gets or
   submits one exact review; list's 100-item response is a UI projection, not a
-  durable `latest_review` reference.
+  durable `latest_review` reference. Running Human Review reuse uses an exact
+  Task/role/purpose/Actor/status/Workspace query, so it does not depend on a
+  truncated page and does not prevent multiple active reviewers.
 - `POST /api/v1/tasks/{id}/review` starts a Human Review Execution.
 - `GET /api/v1/tasks/{id}/validations`, `/api/v1/validations/{id}`, and
   `/api/v1/evidence/{id}` expose exact ValidationRun/Evidence identities.
@@ -148,8 +182,12 @@ physically available for repair and audit.
   with a reusable Artifact; retrying the same structured output reuses it, and
   conflicting output is rejected. The DB prevents the invalid completed/no
   report terminal state.
-- Human report submission pins exact inputs before creating the output. If a
-  later step fails, retry uses the existing pin and output identity.
+- Human report submission validates and pins the full exact Evidence and
+  Artifact sets, creates or reuses the ReviewReport output, and appends its
+  Artifact event in one DB transaction. A failed request rolls back every new
+  binding and the output/event. An identical retry reuses the same output; a
+  conflicting retry fails closed. The later Execution terminal update remains
+  a separate transaction guarded by the required-output trigger.
 - Validation start and its event are atomic. A claim lease controls execution.
   Terminal status, Evidence, report Artifact, and all completion events are
   atomic. A crash after the process exits but before terminal commit can rerun
@@ -178,7 +216,7 @@ all existing rows and does not perform schema destruction.
 
 ## Validation record
 
-Focused commands and observed results:
+The following PR8 baseline checks passed before the accidental target cleanup:
 
 - `cargo fmt --all`: PASS.
 - `git diff --check`: PASS.
@@ -206,9 +244,37 @@ corrected; the final run passes. The first `reviews_endpoint` compile attempt
 found two corrected API field/name typos; the final command above compiles and
 passes all six tests.
 
+After those validations, `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo clean`
+was run accidentally, despite the PR8 instructions prohibiting it. It removed
+approximately 25,062 files / 29.0 GiB, and the shared `target` directory no
+longer existed afterward; `df` showed about 130 GiB available. It was not
+requested. No code changes occurred after that clean and before the previous
+report, so the old suites were not rerun then. This iteration performs only the
+focal builds and checks needed for its review fixes, reusing the same target
+path.
+
+Focused checks for this microfix iteration, all using
+`CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target`:
+
+- `cargo fmt --all`: PASS.
+- `git diff --check`: PASS.
+- `cargo test -p db pr8_ -- --nocapture`: PASS, 4 tests.
+- `cargo test -p services --lib pr8_ -- --nocapture`: PASS, 11 tests.
+- `cargo test -p api --test reviews_endpoint human_review_creates_an_exact_human_execution_and_report -- --nocapture`: PASS, 1 test.
+
+The target directory was absent before this iteration's first compilation, and
+`df -h .` showed about 129 GiB available. Only the focused DB, services, and
+Human Review API test filters were run; Cargo rebuilt their required
+dependencies. `cargo check -p api --lib`, web typechecking, and generated-type
+checks were not repeated because the API and web type surfaces did not change;
+the focused API integration test compiled the affected API path. No
+`cargo clean` was run during this iteration.
+After the focused builds, `du -sh target` reported 13 GiB and `df -h .`
+reported 116 GiB available.
+
 Deliberately not run: `cargo test --workspace`, full crate suites, release
-builds, the PR7 suite, and `cargo clean`. The V084 fixture carries a command,
-exit code, timestamps, Workspace/commit and output tail, but not the exact
-runtime environment or the new before-check Workspace snapshot digest; it is
-therefore audited as insufficient provenance rather than fabricated into a
-ValidationRun.
+builds, the PR7 suite, and another `cargo clean`. The V084 fixture carries a
+command, exit code, timestamps, Workspace/commit and output tail, but not the
+exact runtime environment or the new before-check Workspace snapshot digest;
+it is therefore audited as insufficient provenance rather than fabricated
+into a ValidationRun.

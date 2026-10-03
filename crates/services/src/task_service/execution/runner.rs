@@ -4,7 +4,10 @@ const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 
 impl TaskService {
-    async fn freeze_review_subject_and_inputs(&self, execution: Execution) -> Result<Execution> {
+    pub(crate) async fn freeze_review_subject_and_inputs(
+        &self,
+        execution: Execution,
+    ) -> Result<Execution> {
         if execution.role != crate::workflow::default_roles::REVIEWER
             || execution.purpose != Some(ExecutionPurpose::Review)
         {
@@ -22,7 +25,7 @@ impl TaskService {
             ));
         }
         let diff = crate::DiffService::new(Arc::clone(&self.db))
-            .task_diff(&execution.task_id)
+            .workspace_diff(&workspace.id)
             .await?;
         let snapshot_digest =
             crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
@@ -40,34 +43,73 @@ impl TaskService {
                 "Review Execution commit identity changed before dispatch",
             ));
         }
-        let mut frozen = execution.clone();
-        if execution.before_sha.as_deref() != Some(diff.base_sha.as_str())
-            || execution.after_sha.as_deref() != Some(diff.head_sha.as_str())
-        {
-            frozen = self
-                .persist_frozen_review_subject(
-                    &execution,
-                    &workspace.id,
-                    &diff.base_sha,
-                    &diff.head_sha,
-                )
-                .await?;
+        let timestamp = now_rfc3339();
+        let actor = execution.actor_ref();
+        let event = db::CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.review_subject_frozen".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution.id.clone(),
+            actor_type: actor
+                .as_ref()
+                .map(|actor| actor.kind().to_string())
+                .unwrap_or_else(|| "system".to_owned()),
+            actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: execution.task_id.clone(),
+            correlation_id: execution.id.clone(),
+            causation_id: execution.parent_execution_id.clone(),
+            causation_depth: i64::from(execution.parent_execution_id.is_some()),
+            dedupe_key: Some(format!("review-subject-frozen:{}", execution.id)),
+            payload_json: serde_json::json!({
+                "execution_id": execution.id,
+                "task_id": execution.task_id,
+                "workspace_id": workspace.id,
+                "base_commit_sha": diff.base_sha,
+                "head_commit_sha": diff.head_sha,
+                "workspace_snapshot_digest": snapshot_digest,
+            })
+            .to_string(),
+            created_at: timestamp.clone(),
+        };
+        let write = ExecutionRepo::freeze_review_execution_subject(
+            &*self.db,
+            db::CreateReviewExecutionSubject {
+                execution_id: execution.id.clone(),
+                task_id: execution.task_id.clone(),
+                workspace_id: workspace.id.clone(),
+                base_commit_sha: diff.base_sha,
+                head_commit_sha: diff.head_sha,
+                workspace_snapshot_digest: snapshot_digest,
+                created_at: timestamp.clone(),
+            },
+            &timestamp,
+            event,
+        )
+        .await?;
+        if let Some(event) = write.event.as_ref() {
+            self.publish_committed_domain_event(event);
         }
 
-        let runs =
-            db::ValidationRunRepo::list_validation_runs_by_task(&*self.db, &execution.task_id)
-                .await?;
+        let runs = db::ValidationRunRepo::list_validation_runs_for_subject(
+            &*self.db,
+            &write.subject.task_id,
+            &write.subject.workspace_id,
+            &write.subject.head_commit_sha,
+            &write.subject.workspace_snapshot_digest,
+            None,
+        )
+        .await?;
         let mut evidence_ids = Vec::new();
-        for run in runs.into_iter().filter(|run| {
-            run.workspace_id == workspace.id
-                && run.commit_sha == diff.head_sha
-                && run.workspace_snapshot_digest == snapshot_digest
-        }) {
+        for run in runs {
             for evidence in
                 db::ValidationRunRepo::list_evidence_for_validation_run(&*self.db, &run.id).await?
             {
                 if evidence.task_id != execution.task_id
                     || evidence.producer_validation_run_id != run.id
+                    || run.workspace_id != write.subject.workspace_id
+                    || run.commit_sha != write.subject.head_commit_sha
+                    || run.workspace_snapshot_digest != write.subject.workspace_snapshot_digest
                 {
                     return Err(ServiceError::invalid_operation(
                         "Validation Evidence does not match its exact same-Task producer",
@@ -87,69 +129,7 @@ impl TaskService {
             )
             .await?;
         }
-        Ok(frozen)
-    }
-
-    async fn persist_frozen_review_subject(
-        &self,
-        execution: &Execution,
-        workspace_id: &str,
-        base_sha: &str,
-        head_sha: &str,
-    ) -> Result<Execution> {
-        let timestamp = now_rfc3339();
-        let actor = execution.actor_ref();
-        let event = db::CreateDomainEvent {
-            id: new_uuid_v4(),
-            event_type: "execution.review_subject_frozen".to_owned(),
-            entity_type: "execution".to_owned(),
-            entity_id: execution.id.clone(),
-            actor_type: actor
-                .as_ref()
-                .map(|actor| actor.kind().to_string())
-                .unwrap_or_else(|| "system".to_owned()),
-            actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
-            scope_type: "task".to_owned(),
-            scope_id: execution.task_id.clone(),
-            correlation_id: execution.id.clone(),
-            causation_id: execution.parent_execution_id.clone(),
-            causation_depth: i64::from(execution.parent_execution_id.is_some()),
-            dedupe_key: Some(format!("review-subject-frozen:{}:{head_sha}", execution.id)),
-            payload_json: serde_json::json!({
-                "execution_id": execution.id,
-                "task_id": execution.task_id,
-                "workspace_id": workspace_id,
-                "base_commit_sha": base_sha,
-                "head_commit_sha": head_sha,
-            })
-            .to_string(),
-            created_at: timestamp.clone(),
-        };
-        let (updated, event) = ExecutionRepo::update_with_event(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution.id.clone(),
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: Some(Some(base_sha.to_owned())),
-                after_sha: Some(Some(head_sha.to_owned())),
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: timestamp,
-            },
-            event,
-        )
-        .await?;
-        self.publish_committed_domain_event(&event);
-        Ok(updated)
+        Ok(write.execution)
     }
 
     pub async fn start_execution(
@@ -158,7 +138,7 @@ impl TaskService {
     ) -> Result<api_types::ExecutionStartResult> {
         let execution_id = execution_id.into();
         validate_required("execution_id", &execution_id)?;
-        let mut execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+        let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if execution.status != ExecutionStatus::Running {
@@ -186,8 +166,6 @@ impl TaskService {
             }
             return Err(error);
         }
-        execution = self.freeze_review_subject_and_inputs(execution).await?;
-
         let result = async {
             let agent = match execution.agent_id.as_deref() {
                 Some(agent_id) => Some(
@@ -201,6 +179,13 @@ impl TaskService {
                 .execution_provider_for_agent(agent.as_ref(), &execution.id)
                 .await?;
             let params = self.execution_start_params(&execution).await?;
+            if execution.role == crate::workflow::default_roles::REVIEWER
+                && execution.purpose == Some(ExecutionPurpose::Review)
+            {
+                self.verify_execution_workspace_authority(&execution)
+                    .await?;
+            }
+            self.freeze_review_subject_and_inputs(execution).await?;
             provider.start(params).await
         }
         .await;
@@ -210,11 +195,11 @@ impl TaskService {
             Err(error) => {
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
-                    .fail_execution_before_dispatch(&execution.id, failure_message)
+                    .fail_execution_before_dispatch(&execution_id, failure_message)
                     .await
                 {
                     tracing::warn!(
-                        execution_id = %execution.id,
+                        %execution_id,
                         %mark_error,
                         "failed to mark execution failed after dispatch start error"
                     );
@@ -249,7 +234,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        execution = self.freeze_review_subject_and_inputs(execution).await?;
         let orchestrator_execution = execution.role == "orchestrator"
             && execution.purpose == Some(ExecutionPurpose::Orchestrate);
         let workspace = if orchestrator_execution {
@@ -327,31 +311,6 @@ impl TaskService {
                 ServiceError::invalid_operation(format!("failed to create log directory: {error}"))
             })?;
         }
-
-        let launch_activity_at = now_rfc3339();
-        ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution_id.clone(),
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: Some(Some(launch_activity_at)),
-                summary: None,
-                logs_path: Some(Some(logs_path.clone())),
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await
-        .map_err(ServiceError::from)?;
 
         if let Some(terminal_activity) = self.terminal_activity.as_ref() {
             if terminal_activity
@@ -435,6 +394,34 @@ impl TaskService {
             }
             return Err(error);
         }
+
+        execution = self
+            .freeze_review_subject_and_inputs(execution_before_launch)
+            .await?;
+        let launch_activity_at = now_rfc3339();
+        ExecutionRepo::update(
+            &*self.db,
+            db::UpdateExecution {
+                id: execution_id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: Some(Some(launch_activity_at)),
+                summary: None,
+                logs_path: Some(Some(logs_path.clone())),
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .map_err(ServiceError::from)?;
 
         let description = execution_description(&execution, &task);
 
@@ -737,13 +724,21 @@ impl TaskService {
                 .filter(|content| !content.trim().is_empty());
             match output {
                 Some(output) => {
-                    if let Err(error) = crate::CollaborationService::new(
+                    let collaboration = crate::CollaborationService::new(
                         Arc::clone(&self.db),
                         Arc::clone(&self.event_bus),
-                    )
-                    .create_review_report_from_execution(&current_execution.id, output)
-                    .await
+                    );
+                    let materialized = match collaboration
+                        .ensure_review_subject_current(&current_execution)
+                        .await
                     {
+                        Ok(()) => collaboration
+                            .create_review_report_from_execution(&current_execution.id, output)
+                            .await
+                            .map(|_| ()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = materialized {
                         result.status = ExecutionOutcome::Failed;
                         result.error = Some(format!(
                             "completed Review Execution result could not be materialized: {error}"

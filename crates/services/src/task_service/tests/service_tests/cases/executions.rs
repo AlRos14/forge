@@ -1,6 +1,150 @@
 use super::super::*;
 use api_types::ActorRef;
-use db::{CollaborationRepo, CoordinationMode, TaskRoleRepo};
+use db::{CollaborationRepo, CoordinationMode, ProjectMemberRepo, TaskRoleRepo};
+
+async fn add_human_reviewer(
+    db: &db::SqliteDb,
+    service: &TaskService,
+    task: &db::Task,
+) -> (String, db::RoleMembership) {
+    if TaskRoleRepo::get_by_task_and_role(db, &task.id, "reviewer")
+        .await
+        .expect("reviewer role lookup succeeds")
+        .is_none()
+    {
+        service
+            .create_task_role(
+                &task.id,
+                "reviewer",
+                CoordinationMode::Collaborative,
+                "{}".to_owned(),
+            )
+            .await
+            .expect("reviewer TaskRole creates");
+    }
+    let user_id = seed_human_user(db).await;
+    let now = now_rfc3339();
+    ProjectMemberRepo::add_member(
+        db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: task.project_id.clone(),
+            user_id: user_id.clone(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Human joins the Task project");
+    let membership = service
+        .add_task_role_member(&task.id, "reviewer", ActorRef::Human(user_id.clone()))
+        .await
+        .expect("Human joins the reviewer TaskRole");
+    (user_id, membership)
+}
+
+async fn assign_legacy_human_reviewer(db: &db::SqliteDb, task_id: &str, user_id: &str) {
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO task_role_assignment
+         (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+         VALUES (?, ?, 'reviewer', 'user', ?, ?, ?)",
+    )
+    .bind(db::new_uuid_v4())
+    .bind(task_id)
+    .bind(user_id)
+    .bind(now.clone())
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .expect("legacy Human reviewer projection fixture writes");
+}
+
+fn human_review_request(
+    summary: &str,
+    evidence_ids: Vec<String>,
+    artifact_ids: Vec<String>,
+) -> api_types::SubmitReviewReportRequest {
+    api_types::SubmitReviewReportRequest {
+        verdict: api_types::ReviewReportVerdict::Pass,
+        summary: summary.to_owned(),
+        criteria: vec!["correctness".to_owned()],
+        findings: Vec::new(),
+        questions: Vec::new(),
+        evidence_ids,
+        artifact_ids,
+    }
+}
+
+fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git command runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn create_workspace_checkout(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    file_name: &str,
+    content: &str,
+) {
+    std::fs::create_dir_all(destination.parent().expect("workspace parent exists"))
+        .expect("workspace parent creates");
+    let output = std::process::Command::new("git")
+        .args(["clone", "--no-hardlinks"])
+        .arg(source)
+        .arg(destination)
+        .output()
+        .expect("git clone runs");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    run_workspace_git(destination, &["checkout", "-b", "review-fixture"]);
+    run_workspace_git(destination, &["config", "user.email", "test@forge.dev"]);
+    run_workspace_git(destination, &["config", "user.name", "Forge Test"]);
+    std::fs::write(destination.join(file_name), content).expect("workspace change writes");
+    run_workspace_git(destination, &["add", file_name]);
+    run_workspace_git(destination, &["commit", "-m", "workspace review fixture"]);
+}
+
+async fn create_workspace_record(
+    db: &db::SqliteDb,
+    task: &db::Task,
+    repo_id: &str,
+    worktree_path: &std::path::Path,
+) -> db::Workspace {
+    let now = now_rfc3339();
+    db::WorkspaceRepo::create(
+        db,
+        db::CreateWorkspace {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id: repo_id.to_owned(),
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch: run_workspace_git(worktree_path, &["branch", "--show-current"]),
+            status: db::WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("exact Workspace records")
+}
 
 async fn create_remote_execution_fixture(
     db: &db::SqliteDb,
@@ -121,6 +265,654 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
             .status,
         ExecutionStatus::Running
     );
+}
+
+#[tokio::test]
+async fn pr8_human_review_uses_plural_active_memberships_over_legacy_projection() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let (human_a, membership_a) = add_human_reviewer(&db, &service, &task).await;
+    let (human_b, membership_b) = add_human_reviewer(&db, &service, &task).await;
+
+    assert_eq!(membership_a.status, db::RoleMembershipStatus::Active);
+    assert_eq!(membership_b.status, db::RoleMembershipStatus::Active);
+    let projected_user: Option<String> = sqlx::query_scalar(
+        "SELECT assignee_id FROM task_role_assignment
+         WHERE task_id = ? AND role_name = 'reviewer'",
+    )
+    .bind(&task.id)
+    .fetch_optional(db.pool())
+    .await
+    .expect("legacy projection lookup succeeds");
+    assert_eq!(projected_user.as_deref(), Some(human_a.as_str()));
+
+    sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer'")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("legacy projection is absent for the membership-only check");
+    let execution_a = service
+        .start_human_review_execution(&task.id, &human_a, None)
+        .await
+        .expect("active Human starts without any singleton row");
+    assert_eq!(
+        execution_a.actor_ref(),
+        Some(db::ActorRef::Human(human_a.clone()))
+    );
+    assert_eq!(execution_a.role, "reviewer");
+    assert_eq!(execution_a.purpose, Some(db::ExecutionPurpose::Review));
+
+    assign_legacy_human_reviewer(&db, &task.id, &human_a).await;
+    let execution_b = service
+        .start_human_review_execution(&task.id, &human_b, None)
+        .await
+        .expect("singleton projection to A does not block active member B");
+    assert_eq!(execution_b.actor_ref(), Some(db::ActorRef::Human(human_b)));
+    assert_eq!(execution_b.role, "reviewer");
+    assert_eq!(execution_b.purpose, Some(db::ExecutionPurpose::Review));
+    let reused_a = service
+        .start_human_review_execution(&task.id, &human_a, None)
+        .await
+        .expect("exact running Human review lookup reuses A's Execution");
+    assert_eq!(reused_a.id, execution_a.id);
+}
+
+#[tokio::test]
+async fn pr8_suspended_and_ended_humans_cannot_start_review() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let (suspended_user, suspended_membership) = add_human_reviewer(&db, &service, &task).await;
+    let (ended_user, ended_membership) = add_human_reviewer(&db, &service, &task).await;
+    service
+        .update_task_role_member(
+            &task.id,
+            &suspended_membership.id,
+            suspended_membership.version,
+            db::RoleMembershipStatus::Suspended,
+        )
+        .await
+        .expect("Human membership suspends");
+    service
+        .update_task_role_member(
+            &task.id,
+            &ended_membership.id,
+            ended_membership.version,
+            db::RoleMembershipStatus::Ended,
+        )
+        .await
+        .expect("Human membership ends");
+
+    for user_id in [suspended_user, ended_user] {
+        let error = service
+            .start_human_review_execution(&task.id, &user_id, None)
+            .await
+            .expect_err("inactive Human cannot start a fresh Review Execution");
+        assert!(matches!(error, ServiceError::AuthorizationDenied { .. }));
+    }
+}
+
+#[tokio::test]
+async fn pr8_human_review_uses_legacy_only_without_replacement_task_role() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let user_id = seed_human_user(&db).await;
+    let replacement_task =
+        seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    service
+        .create_task_role(
+            &replacement_task.id,
+            "reviewer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("replacement reviewer TaskRole exists with no members");
+    assign_legacy_human_reviewer(&db, &replacement_task.id, &user_id).await;
+    let denied = service
+        .start_human_review_execution(&replacement_task.id, &user_id, None)
+        .await
+        .expect_err("contradictory singleton cannot grant replacement-role authority");
+    assert!(matches!(denied, ServiceError::AuthorizationDenied { .. }));
+
+    let legacy_task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    assign_legacy_human_reviewer(&db, &legacy_task.id, &user_id).await;
+    let execution = service
+        .start_human_review_execution(&legacy_task.id, &user_id, None)
+        .await
+        .expect("bounded singleton fallback works before replacement TaskRole exists");
+    assert_eq!(execution.actor_ref(), Some(db::ActorRef::Human(user_id)));
+}
+
+#[tokio::test]
+async fn pr8_completed_human_report_retry_survives_later_membership_change() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let (user_id, membership) = add_human_reviewer(&db, &service, &task).await;
+    let execution = service
+        .start_human_review_execution(&task.id, &user_id, None)
+        .await
+        .expect("active Human starts Review Execution");
+    let request = human_review_request("Exact report", Vec::new(), Vec::new());
+    let (_, report) = service
+        .submit_human_review_report(&execution.id, &user_id, request)
+        .await
+        .expect("Human submits exact ReviewReport");
+    service
+        .update_task_role_member(
+            &task.id,
+            &membership.id,
+            membership.version,
+            db::RoleMembershipStatus::Suspended,
+        )
+        .await
+        .expect("membership changes after the report completes");
+    let (_, retry) = service
+        .submit_human_review_report(
+            &execution.id,
+            &user_id,
+            human_review_request("Exact report", Vec::new(), Vec::new()),
+        )
+        .await
+        .expect("same completed report replays without current membership authority");
+    assert_eq!(retry.id, report.id);
+}
+
+#[tokio::test]
+async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    service
+        .create_task_role(
+            &task.id,
+            "reviewer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole creates");
+    service
+        .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(agent_id.clone()))
+        .await
+        .expect("Agent joins reviewer TaskRole");
+
+    let workspaces_root = TempDir::new().expect("workspace root creates");
+    let integration_path = workspaces_root.path().join("integration");
+    create_workspace_checkout(
+        repo_dir.path(),
+        &integration_path,
+        "integration-change.txt",
+        "integration head\n",
+    );
+    let integration = create_workspace_record(&db, &task, &repo_id, &integration_path).await;
+
+    let now = now_rfc3339();
+    let work_unit_id = db::new_uuid_v4();
+    db::WorkUnitRepo::create(
+        &*db,
+        db::CreateWorkUnit {
+            id: work_unit_id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Review isolated workspace".to_owned(),
+            scope: "Exact Review subject fixture".to_owned(),
+            role: "reviewer".to_owned(),
+            assigned_actor: Some(db::ActorRef::Agent(agent_id.clone())),
+            requires_integration: true,
+            provenance: None,
+            created_by: db::ActorRef::Agent(agent_id.clone()),
+            created_at: now.clone(),
+        },
+        db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "work_unit.created".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: work_unit_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: work_unit_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("work-unit-created:{work_unit_id}")),
+            payload_json: json!({ "work_unit_id": work_unit_id, "task_id": task.id }).to_string(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit creates");
+    let work_unit_path = workspaces_root.path().join("work-unit");
+    create_workspace_checkout(
+        repo_dir.path(),
+        &work_unit_path,
+        "work-unit-change.txt",
+        "work-unit head\n",
+    );
+    let work_unit_workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
+        &*db,
+        db::CreateWorkUnitWorkspace {
+            workspace: db::CreateWorkspace {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                repo_id: repo_id.clone(),
+                worktree_path: work_unit_path.to_string_lossy().into_owned(),
+                branch: run_workspace_git(&work_unit_path, &["branch", "--show-current"]),
+                status: db::WorkspaceStatus::Ready,
+                before_sha: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            work_unit_id,
+        },
+    )
+    .await
+    .expect("WorkUnit Workspace creates");
+
+    let validation = crate::ValidationService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let integration_check = validation
+        .run_command(
+            &task.id,
+            &integration.id,
+            "printf integration",
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("integration Workspace ValidationRun finishes");
+    let work_unit_check = validation
+        .run_command(
+            &task.id,
+            &work_unit_workspace.id,
+            "printf work-unit",
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("WorkUnit Workspace ValidationRun finishes");
+    let integration_diff = crate::DiffService::new(Arc::clone(&db))
+        .task_diff(&task.id)
+        .await
+        .expect("Task diff resolves its canonical integration Workspace");
+    let work_unit_diff = crate::DiffService::new(Arc::clone(&db))
+        .workspace_diff(&work_unit_workspace.id)
+        .await
+        .expect("exact WorkUnit diff resolves");
+    assert_ne!(integration_diff.head_sha, work_unit_diff.head_sha);
+    assert_ne!(integration_diff.diff, work_unit_diff.diff);
+
+    let now = now_rfc3339();
+    let execution = db::ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+            role: "reviewer".to_owned(),
+            purpose: Some(db::ExecutionPurpose::Review),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(work_unit_workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Agent Review Execution uses the exact WorkUnit Workspace");
+    let frozen = service
+        .freeze_review_subject_and_inputs(execution)
+        .await
+        .expect("Review subject freezes against its exact workspace_id");
+    let subject = db::ExecutionRepo::get_review_execution_subject(&*db, &frozen.id)
+        .await
+        .expect("durable Review subject lookup succeeds")
+        .expect("durable Review subject persists");
+    assert_eq!(subject.workspace_id, work_unit_workspace.id);
+    assert_eq!(subject.base_commit_sha, work_unit_diff.base_sha);
+    assert_eq!(subject.head_commit_sha, work_unit_diff.head_sha);
+    assert_eq!(
+        subject.workspace_snapshot_digest,
+        work_unit_check.run.workspace_snapshot_digest
+    );
+    assert_ne!(subject.head_commit_sha, integration_diff.head_sha);
+    let evidence_inputs = db::ValidationRunRepo::list_execution_evidence_inputs(&*db, &frozen.id)
+        .await
+        .expect("Review Evidence inputs load");
+    assert_eq!(evidence_inputs.len(), work_unit_check.evidence.len());
+    assert!(evidence_inputs
+        .iter()
+        .all(|input| input.evidence_id == work_unit_check.evidence[0].id));
+    assert!(evidence_inputs
+        .iter()
+        .all(|input| input.evidence_id != integration_check.evidence[0].id));
+
+    std::fs::write(
+        work_unit_path.join("uncommitted-after-freeze.txt"),
+        "changed\n",
+    )
+    .expect("post-freeze Workspace change writes");
+    let output = "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The exact WorkUnit subject is sound.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}";
+    assert!(crate::CollaborationService::new(Arc::clone(&db), event_bus)
+        .create_review_report_from_execution(&frozen.id, output)
+        .await
+        .is_err());
+    assert!(db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &frozen.id,
+        db::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup succeeds")
+    .is_none());
+}
+
+#[tokio::test]
+async fn pr8_human_review_subject_change_rejects_report_without_pins() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let (user_id, _) = add_human_reviewer(&db, &service, &task).await;
+    let workspace_root = TempDir::new().expect("Human review workspace root creates");
+    let worktree_path = workspace_root.path().join("human-review");
+    create_workspace_checkout(
+        repo_dir.path(),
+        &worktree_path,
+        "reviewed-commit.txt",
+        "initial reviewed commit\n",
+    );
+    let workspace = create_workspace_record(&db, &task, &repo_id, &worktree_path).await;
+    let execution = service
+        .start_human_review_execution(&task.id, &user_id, Some(&workspace.id))
+        .await
+        .expect("Human Review freezes its exact Workspace subject at start");
+    let subject = db::ExecutionRepo::get_review_execution_subject(&*db, &execution.id)
+        .await
+        .expect("Review subject lookup succeeds")
+        .expect("Human Review subject persists");
+    assert_eq!(subject.workspace_id, workspace.id);
+    assert_eq!(
+        subject.base_commit_sha,
+        execution.before_sha.clone().unwrap()
+    );
+    assert_eq!(
+        subject.head_commit_sha,
+        execution.after_sha.clone().unwrap()
+    );
+    assert_eq!(subject.workspace_snapshot_digest.len(), 64);
+
+    std::fs::write(
+        worktree_path.join("after-review-start.txt"),
+        "new content\n",
+    )
+    .expect("post-start working tree change writes");
+    assert!(service
+        .submit_human_review_report(
+            &execution.id,
+            &user_id,
+            human_review_request("Stale subject", Vec::new(), Vec::new()),
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        db::ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution lookup succeeds")
+            .expect("Execution remains")
+            .status,
+        ExecutionStatus::Running
+    );
+    assert!(db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &execution.id,
+        db::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup succeeds")
+    .is_none());
+    assert!(
+        db::ValidationRunRepo::list_execution_evidence_inputs(&*db, &execution.id)
+            .await
+            .expect("Evidence input lookup succeeds")
+            .is_empty()
+    );
+    assert!(
+        db::CollaborationRepo::list_execution_artifact_inputs(&*db, &execution.id)
+            .await
+            .expect("Artifact input lookup succeeds")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn pr8_human_review_inputs_and_report_commit_atomically_and_retry_exactly() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(64));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let (user_id, membership) = add_human_reviewer(&db, &service, &task).await;
+    let workspace_root = TempDir::new().expect("Human review workspace root creates");
+    let worktree_path = workspace_root.path().join("human-review-atomic");
+    create_workspace_checkout(
+        repo_dir.path(),
+        &worktree_path,
+        "reviewed-commit.txt",
+        "reviewed subject\n",
+    );
+    let workspace = create_workspace_record(&db, &task, &repo_id, &worktree_path).await;
+    let validation = crate::ValidationService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let check = validation
+        .run_command(&task.id, &workspace.id, "printf pass", 0, None, None)
+        .await
+        .expect("exact ValidationRun creates Evidence");
+    let plan_execution =
+        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+    let collaboration = crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let artifact_a = collaboration
+        .create_plan_artifact_from_execution(&plan_execution.id, "Exact pinned plan input")
+        .await
+        .expect("same-Task Plan Artifact input creates");
+    let execution = service
+        .start_human_review_execution(&task.id, &user_id, Some(&workspace.id))
+        .await
+        .expect("Human Review freezes exact Workspace subject");
+
+    let artifact_events_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'artifact.created' AND scope_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("pre-submit artifact event count reads");
+    let missing_artifact = "missing-review-input-artifact".to_owned();
+    for artifact_ids in [
+        vec![missing_artifact.clone()],
+        vec![artifact_a.id.clone(), missing_artifact.clone()],
+    ] {
+        assert!(service
+            .submit_human_review_report(
+                &execution.id,
+                &user_id,
+                human_review_request(
+                    "Rejected before commit",
+                    vec![check.evidence[0].id.clone()],
+                    artifact_ids,
+                ),
+            )
+            .await
+            .is_err());
+        assert!(
+            db::ValidationRunRepo::list_execution_evidence_inputs(&*db, &execution.id)
+                .await
+                .expect("failed Evidence pins read")
+                .is_empty()
+        );
+        assert!(
+            db::CollaborationRepo::list_execution_artifact_inputs(&*db, &execution.id)
+                .await
+                .expect("failed Artifact pins read")
+                .is_empty()
+        );
+        assert!(db::CollaborationRepo::get_execution_artifact_output(
+            &*db,
+            &execution.id,
+            db::ArtifactKind::ReviewReport,
+        )
+        .await
+        .expect("failed ReviewReport lookup succeeds")
+        .is_none());
+    }
+    assert!(service
+        .submit_human_review_report(
+            &execution.id,
+            &user_id,
+            human_review_request(
+                "Duplicate reference",
+                vec![check.evidence[0].id.clone(), check.evidence[0].id.clone()],
+                Vec::new(),
+            ),
+        )
+        .await
+        .is_err());
+    assert!(
+        db::ValidationRunRepo::list_execution_evidence_inputs(&*db, &execution.id)
+            .await
+            .expect("duplicate Evidence pins read")
+            .is_empty()
+    );
+    assert!(
+        db::CollaborationRepo::list_execution_artifact_inputs(&*db, &execution.id)
+            .await
+            .expect("duplicate Artifact pins read")
+            .is_empty()
+    );
+
+    let request = human_review_request(
+        "Exact report",
+        vec![check.evidence[0].id.clone()],
+        vec![artifact_a.id.clone()],
+    );
+    let (_, report) = service
+        .submit_human_review_report(&execution.id, &user_id, request)
+        .await
+        .expect("valid exact inputs and report commit together");
+    let report_content: serde_json::Value = serde_json::from_str(
+        report
+            .content
+            .as_deref()
+            .expect("ReviewReport stores inline content"),
+    )
+    .expect("ReviewReport content is valid JSON");
+    assert_eq!(
+        report_content["subject"]["workspace_snapshot_digest"].as_str(),
+        Some(check.run.workspace_snapshot_digest.as_str())
+    );
+    let evidence_inputs =
+        db::ValidationRunRepo::list_execution_evidence_inputs(&*db, &execution.id)
+            .await
+            .expect("committed Evidence pins read");
+    let artifact_inputs =
+        db::CollaborationRepo::list_execution_artifact_inputs(&*db, &execution.id)
+            .await
+            .expect("committed Artifact pins read");
+    assert_eq!(evidence_inputs.len(), 1);
+    assert_eq!(artifact_inputs.len(), 1);
+    assert_eq!(evidence_inputs[0].evidence_id, check.evidence[0].id);
+    assert_eq!(artifact_inputs[0].artifact_id, artifact_a.id);
+    let artifact_events_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'artifact.created' AND scope_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("post-submit artifact event count reads");
+    assert_eq!(artifact_events_after, artifact_events_before + 1);
+
+    service
+        .update_task_role_member(
+            &task.id,
+            &membership.id,
+            membership.version,
+            db::RoleMembershipStatus::Suspended,
+        )
+        .await
+        .expect("Human authority changes after completed report");
+    let (_, retry) = service
+        .submit_human_review_report(
+            &execution.id,
+            &user_id,
+            human_review_request(
+                "Exact report",
+                vec![check.evidence[0].id.clone()],
+                vec![artifact_a.id.clone()],
+            ),
+        )
+        .await
+        .expect("same completed report reuses its output after membership change");
+    assert_eq!(retry.id, report.id);
+    assert!(service
+        .submit_human_review_report(
+            &execution.id,
+            &user_id,
+            human_review_request(
+                "Conflicting completed report",
+                vec![check.evidence[0].id.clone()],
+                vec![artifact_a.id.clone()],
+            ),
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        db::ValidationRunRepo::list_execution_evidence_inputs(&*db, &execution.id)
+            .await
+            .expect("final Evidence pin set reads")
+            .len(),
+        1
+    );
+    assert_eq!(
+        db::CollaborationRepo::list_execution_artifact_inputs(&*db, &execution.id)
+            .await
+            .expect("final Artifact pin set reads")
+            .len(),
+        1
+    );
+    let final_artifact_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'artifact.created' AND scope_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("final artifact event count reads");
+    assert_eq!(final_artifact_events, artifact_events_after);
 }
 
 fn completed_remote_notification(

@@ -109,6 +109,27 @@ not create or update a Review row. Review output and Validation output remain
 independent; the existing workflow may still order checks or block a transition
 using its configured hook, while PR9 owns general Gate policy.
 
+Each workspace-bound Review Execution freezes one immutable
+`review_execution_subject` row with its exact Task, Workspace, base commit,
+head commit, and working-tree snapshot digest. Human Review freezes at start
+and rechecks all five identities at submission. A local Agent Review freezes
+after acquiring the workspace execution lock and its final WorkspaceLease
+revalidation, directly before launch; remote Review freezes directly before
+provider launch. Both Agent paths recheck the same identity before
+materializing a ReviewReport. Automatic Validation Evidence is pinned only
+when its ValidationRun matches the frozen Workspace, head, and snapshot digest.
+ReviewReport repeats the complete frozen subject, and SQL guards require an
+exact match.
+
+When a replacement TaskRole exists, its RoleMembership records alone decide
+current Human reviewer authority; the singular TaskRoleAssignment row is only a
+projection. A Human may start a Review Execution for each active membership,
+even when the compatibility projection names another Human. The bounded
+legacy singleton fallback applies only before a replacement TaskRole exists.
+Human submission pins the exact requested Evidence and Artifacts, creates or
+reuses the one ReviewReport output, and appends its Artifact event in one DB
+transaction. A failed submission leaves no partial input bindings.
+
 Workflow hook context now carries an Execution ID only when the transition
 names that exact completed Review Execution as its cause. Manual transitions
 and entry-barrier retries do not inherit a recent Execution as cause. Reviewer
@@ -189,7 +210,10 @@ classes. Agent is an Actor; Role describes task responsibility.
 
 A TaskRole contains zero or more RoleMembership records. A role has a
 coordination policy, not one singular assignee. Human and Agent memberships
-are both ordinary records.
+are both ordinary records. When the replacement TaskRole exists,
+RoleMembership is the current authority and the singular legacy assignment is
+only a projection; a bounded legacy fallback is valid only while no replacement
+TaskRole exists.
 
 ### INV-006 — One Actor may hold several roles
 

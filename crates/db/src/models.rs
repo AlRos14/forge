@@ -1211,6 +1211,38 @@ pub struct Execution {
     pub updated_at: String,
 }
 
+/// Immutable Workspace, commit, and working-tree identity reviewed by one
+/// workspace-bound reviewer Execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewExecutionSubject {
+    pub execution_id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub base_commit_sha: String,
+    pub head_commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateReviewExecutionSubject {
+    pub execution_id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub base_commit_sha: String,
+    pub head_commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewExecutionSubjectWrite {
+    pub execution: Execution,
+    pub subject: ReviewExecutionSubject,
+    /// Present only when the subject was first frozen with its domain event.
+    pub event: Option<DomainEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessSession {
     pub id: String,
