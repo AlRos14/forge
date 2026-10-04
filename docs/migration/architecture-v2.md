@@ -172,37 +172,57 @@ and Workspace snapshot cannot be proven. Existing tables and
 transition readers/writers, crash recovery, and remaining PR9/PR13 boundaries
 are recorded in `plan-pr8-review-validation-evidence.md`.
 
-## Plan PR9 implementation status on the current branch
+## Plan PR9 implementation status
 
-V100 adds an aggregate `task_lifecycle` row, transition receipts, conservative
-legacy-state audit, Task/WorkUnit/operation-scoped Gate identity, immutable
-versioned policy revisions, immutable evaluations, and ordered exact input
-references. SQL guards fence Task and lifecycle versions, enforce legal state
-edges, pin same-Task producers and Gate scope, prevent mutation of historical
-policy/evaluation/receipt records, and require a current satisfied merge
-readiness evaluation for merge admission and publication.
+PR9 is implemented on branch `feat/plan-pr9-gate-engine-task-lifecycle` from
+the post-PR8 `main` base recorded in
+`plan-pr9-gate-engine-task-lifecycle.md`. V100 adds aggregate
+`task_lifecycle`, conservative migration audit, scoped Gate identity,
+immutable policy revisions/evaluations, exact input refs, and transition
+receipts. V101 adds immutable retry receipts over exact failure facts. V102
+emits TaskRole change events and permits guarded Project teardown to remove
+retry receipts; TaskRole policy edits must advance the role version fence.
+V103 fences exhausted retry budgets, V104 rechecks exact mutable Gate inputs at
+lifecycle and merge effects, and V105 permits merge-ready rework only from a
+current GateEvaluation or verified retry receipt that has not been superseded
+by a later lifecycle transition.
 
-`TaskLifecycleService` owns aggregate transitions, causal-record ownership,
-idempotency, and durable events. `GateEngine` evaluates bounded review,
-ValidationRun/Evidence, Decision, and WorkUnit requirements from explicit IDs
-and frozen identity. Durable fact events drive evaluation; EventBus is only a
-post-commit hint. Lifecycle advancement caused by a Gate records the exact
-evaluation. PR9 does not create HumanApproval, copy review or validation
-verdicts, or convert legacy workflow definitions into Gate policies.
+`TaskLifecycleService` owns aggregate progress, version fencing, causal
+identity, idempotency, the one-way `task.status` projection, and durable
+events. `GateEngine` evaluates bounded review, ValidationRun/Evidence,
+Decision, WorkUnit, exact TaskMerge operation, and exact lifecycle transition
+requirements. Durable fact events drive evaluation; EventBus is only a wake
+hint. A Gate-caused transition stores the exact GateEvaluation, and replay
+applies that persisted evaluation rather than recomputing against newer facts.
+PR9 does not create HumanApproval, copy review or validation verdicts, or
+convert legacy workflow definitions into Gate policies.
+
 For merge readiness, ReviewReport and ValidationRun subjects must share the
 same Workspace, commit, and snapshot. WorkUnit-backed merges bind to an exact
-successful integration, and MergeService checks the evaluated commit under
-the shared Workspace lock before creating a merge operation.
+successful integration. A merge Gate can require only passing ValidationRuns
+and approving Decisions. Reviewer TaskRole snapshots include the current role
+version and exact membership observation; membership mutations advance the
+role fence and append a durable fact event. Gate and its first policy revision
+commit together. MergeService acquires the cross-process Task integration lock
+before reading its candidate, verifies the caller supplied the current
+satisfied evaluation, checks the Workspace commit, and retains the lock through
+atomic merge admission. Durable insertion order identifies the latest
+evaluation, so replay cannot promote an older receipt.
 
-`task.status` is guarded as a one-way compatibility projection until PR12.
-However, active service paths still consult WorkflowEngine/StateDefinition and
-GateConfig for role, dispatch, recovery, and retry behavior. Those readers are
-not a safe compatibility projection and remain PR9 blockers. Retry budgets are
-not Gate inputs, but this branch does not yet provide the replacement exact-
-failure budget consumer: a request-changes evaluation is durable and
-unsatisfied, but does not create rework or block on exhaustion. The branch is
-therefore **not ready for review**. See
-`plan-pr9-gate-engine-task-lifecycle.md` for the concrete audit and test gaps.
+Retry budgets remain outside Gate authority. V101 receipts deduplicate exact
+ReviewReport request-changes, failed ValidationRun, failed Execution, and merge
+failure facts. Rework produces a durable Orchestrator event; exhaustion blocks
+the aggregate lifecycle and Execution admission. An exact failure replay does
+not consume another attempt, and a rework fact does not release a block owned
+by an unrelated cause.
+
+`task.status` remains only as a one-way compatibility projection until PR12.
+Legacy workflow state, hooks, GateConfig, and transition-log counts do not
+advance lifecycle or authorize Gate outcomes. Stored workflow configuration,
+diagnostic projections, historical transition data, and unused recovery code
+remain bounded cleanup for PR12/PR13; the final authority audit is in the
+PR9 plan. MCP/UI/CLI projection alignment belongs to PR12, and physical legacy
+schema cleanup belongs to PR13.
 
 MCP has no tool that reads or writes the new ReviewReport, ValidationRun, or
 deterministic Evidence authorities. Its generic task-type enum, review retry

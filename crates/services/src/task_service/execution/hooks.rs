@@ -112,6 +112,28 @@ impl TaskService {
             "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
         });
 
+        let reason_kind = if failure.timed_out {
+            "before_work_hook_timeout"
+        } else {
+            "before_work_hook_failed"
+        };
+        let reason_ref = format!("task-version:{}:hook:{}", task.version, failure.index);
+        let task = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .block(
+            &task.id,
+            crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::LifecycleHook,
+            ),
+            reason_kind,
+            reason_ref.clone(),
+            format!("before-work-hook:{}:{reason_ref}", task.id),
+        )
+        .await?
+        .task;
+
         TaskRepo::update(
             &*self.db,
             db::UpdateTask {

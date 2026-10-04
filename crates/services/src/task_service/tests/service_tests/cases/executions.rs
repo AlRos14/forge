@@ -1,6 +1,6 @@
 use super::super::*;
 use api_types::ActorRef;
-use db::{CollaborationRepo, CoordinationMode, ProjectMemberRepo, TaskRoleRepo};
+use db::{CollaborationRepo, CoordinationMode, ProjectMemberRepo, TaskLifecycleRepo, TaskRoleRepo};
 
 async fn add_human_reviewer(
     db: &db::SqliteDb,
@@ -2599,7 +2599,7 @@ async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_
 }
 
 #[tokio::test]
-async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
+async fn role_dispatch_runs_required_before_work_hook_before_execution_creation() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
@@ -2641,10 +2641,16 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
         .await
         .expect("coder role assignment succeeds");
 
-    let transitioned = service
-        .transition(task.id.clone(), "in_progress".to_owned(), task.version)
+    let launched = service
+        .dispatch_initial_role_execution(
+            &task.id,
+            &agent_id,
+            crate::workflow::default_roles::CODER,
+            db::ExecutionPurpose::Implement,
+            "run the required before-work hook".to_owned(),
+        )
         .await
-        .expect("required hook passes and transition succeeds");
+        .expect("required hook passes and role dispatch succeeds");
 
     let executions = ExecutionRepo::list_by_task(
         &*db,
@@ -2668,7 +2674,7 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
         executions.items[0].agent_id.as_deref(),
         Some(agent_id.as_str())
     );
-    assert_eq!(transitioned.task.entry_barrier_json, None);
+    assert_eq!(launched.id, executions.items[0].id);
 
     let workspace =
         WorkspaceRepo::get_by_id(&*db, executions.items[0].workspace_id.as_deref().unwrap())
@@ -2683,7 +2689,7 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
 }
 
 #[tokio::test]
-async fn before_enter_blocks_when_required_before_work_hook_fails() {
+async fn role_dispatch_blocks_lifecycle_when_required_before_work_hook_fails() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
@@ -2716,7 +2722,7 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
             role_assignment_input(
                 &task.id,
                 crate::workflow::default_roles::CODER,
-                Some(agent_id),
+                Some(agent_id.clone()),
                 None,
             ),
             false,
@@ -2726,10 +2732,18 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         .expect("coder role assignment succeeds");
 
     let result = service
-        .transition(task.id.clone(), "in_progress".to_owned(), task.version)
-        .await
-        .expect("required hook failure records a blocked entry");
-    assert_eq!(result.task.status, "in_progress");
+        .dispatch_initial_role_execution(
+            &task.id,
+            &agent_id,
+            crate::workflow::default_roles::CODER,
+            db::ExecutionPurpose::Implement,
+            "run the required before-work hook".to_owned(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "required hook failure rejects role dispatch"
+    );
     let executions = ExecutionRepo::list_by_task(
         &*db,
         &task.id,
@@ -2752,16 +2766,11 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         .await
         .expect("task loads")
         .expect("task exists");
-    assert_eq!(blocked.status, "in_progress");
-    let barrier: serde_json::Value = serde_json::from_str(
-        blocked
-            .entry_barrier_json
-            .as_deref()
-            .expect("entry barrier remains blocked"),
-    )
-    .expect("entry barrier parses");
-    assert_eq!(barrier["state"], "in_progress");
-    assert_eq!(barrier["status"], "blocked");
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("task lifecycle lookup succeeds")
+        .expect("task lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
     let annotation: serde_json::Value = serde_json::from_str(
         blocked
             .error_annotation
@@ -2773,7 +2782,10 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
     assert_eq!(annotation["artifact"]["kind"], "hook");
     assert_eq!(annotation["hook"]["exit_code"], 9);
     assert_eq!(annotation["hook"]["stdout"], "preflight-out\n");
-    assert_eq!(annotation["hook"]["stderr"], "preflight-err\n");
+    assert!(annotation["hook"]["stderr"]
+        .as_str()
+        .expect("hook stderr is captured")
+        .contains("preflight-err\n"));
     let recovery_actions = annotation["recovery_actions"]
         .as_array()
         .expect("recovery actions array");

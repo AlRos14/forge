@@ -31,30 +31,69 @@ impl TaskIntegrationOperationManager {
         self.acquire_with_gate(task_id, kind, owner_id, None).await
     }
 
-    pub(crate) async fn acquire_after_gate(
-        &self,
-        task_id: &str,
-        owner_id: &str,
-        gate_evaluation_id: &str,
-    ) -> crate::Result<TaskIntegrationOperationGuard> {
-        self.acquire_kind_after_gate(
-            task_id,
-            TaskIntegrationOperationKind::TaskMerge,
-            owner_id,
-            gate_evaluation_id,
-        )
-        .await
+    /// Hold the cross-process Task lock before a merge flow reads its source
+    /// Workspace and validates the Gate candidate. If a durable running row
+    /// remains after this lock is acquired, its former owner is gone; reconcile
+    /// it and require the caller to evaluate Gate readiness again.
+    pub(crate) async fn lock_for_gate_admission(&self, task_id: &str) -> crate::Result<File> {
+        let file = match self.try_process_lock(task_id).await? {
+            Ok(file) => file,
+            Err(()) => return Err(busy(task_id)),
+        };
+        if let Some(operation) =
+            TaskIntegrationOperationRepo::get_active_for_task(&*self.db, task_id).await?
+        {
+            let now = now_rfc3339();
+            if let Some(abandoned) =
+                TaskIntegrationOperationRepo::abandon_stale(&*self.db, task_id, &now).await?
+            {
+                tracing::info!(
+                    task_id,
+                    operation_id = %abandoned.id,
+                    "reconciled stale Task integration operation before Gate admission"
+                );
+            }
+            return Err(ServiceError::Conflict(format!(
+                "previous Task integration operation {} was reconciled; re-evaluate merge readiness",
+                operation.id
+            )));
+        }
+        Ok(file)
     }
 
-    pub(crate) async fn acquire_kind_after_gate(
+    pub(crate) async fn acquire_kind_after_gate_with_lock(
         &self,
         task_id: &str,
         kind: TaskIntegrationOperationKind,
         owner_id: &str,
         gate_evaluation_id: &str,
+        file: File,
     ) -> crate::Result<TaskIntegrationOperationGuard> {
-        self.acquire_with_gate(task_id, kind, owner_id, Some(gate_evaluation_id))
-            .await
+        let input = CreateTaskIntegrationOperation {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            kind,
+            owner_id: owner_id.to_owned(),
+            gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
+            created_at: now_rfc3339(),
+        };
+        let operation = match TaskIntegrationOperationRepo::begin(&*self.db, input.clone()).await {
+            Ok(operation) => operation,
+            Err(db::DbError::TaskIntegrationOperationBusy) => {
+                TaskIntegrationOperationRepo::recover_stale_and_begin(
+                    &*self.db,
+                    input,
+                    &now_rfc3339(),
+                )
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(TaskIntegrationOperationGuard {
+            db: Arc::clone(&self.db),
+            operation,
+            _file: Some(file),
+        })
     }
 
     /// Finish an operation when an external provider has durably confirmed
@@ -119,72 +158,31 @@ impl TaskIntegrationOperationManager {
             created_at: now_rfc3339(),
         };
 
-        match TaskIntegrationOperationRepo::begin(&*self.db, input.clone()).await {
-            Ok(operation) => match self.try_process_lock(task_id).await {
-                Ok(Ok(file)) => {
-                    let active = match TaskIntegrationOperationRepo::get_active_for_task(
-                        &*self.db, task_id,
-                    )
-                    .await
-                    {
-                        Ok(active) => active,
-                        Err(error) => {
-                            drop(file);
-                            let original_error: ServiceError = error.into();
-                            if let Err(abandon_error) = self.abandon_unowned(&operation).await {
-                                return Err(ServiceError::invalid_operation(format!(
-                                    "{original_error}; could not abandon the operation claim created by this process: {abandon_error}"
-                                )));
-                            }
-                            return Err(original_error);
-                        }
-                    };
-                    if active.as_ref().map(|active| active.id.as_str())
-                        != Some(operation.id.as_str())
-                    {
-                        drop(file);
-                        return Err(busy(task_id));
-                    }
-                    Ok(TaskIntegrationOperationGuard {
-                        db: Arc::clone(&self.db),
-                        operation,
-                        _file: Some(file),
-                    })
-                }
-                Ok(Err(())) => {
-                    self.abandon_unowned(&operation).await?;
-                    Err(busy(task_id))
-                }
-                Err(lock_error) => {
-                    if let Err(abandon_error) = self.abandon_unowned(&operation).await {
-                        return Err(ServiceError::invalid_operation(format!(
-                            "{lock_error}; could not abandon the operation claim created by this process: {abandon_error}"
-                        )));
-                    }
-                    Err(lock_error)
-                }
-            },
+        let file = match self.try_process_lock(task_id).await? {
+            Ok(file) => file,
+            Err(()) => return Err(busy(task_id)),
+        };
+        let operation = match TaskIntegrationOperationRepo::begin(&*self.db, input.clone()).await {
+            Ok(operation) => operation,
             Err(db::DbError::TaskIntegrationOperationBusy) => {
-                let file = match self.try_process_lock(task_id).await? {
-                    Ok(file) => file,
-                    Err(()) => return Err(busy(task_id)),
-                };
-                let now = now_rfc3339();
-                let operation =
-                    TaskIntegrationOperationRepo::recover_stale_and_begin(&*self.db, input, &now)
-                        .await
-                        .map_err(|error| match error {
-                            db::DbError::TaskIntegrationOperationBusy => busy(task_id),
-                            error => error.into(),
-                        })?;
-                Ok(TaskIntegrationOperationGuard {
-                    db: Arc::clone(&self.db),
-                    operation,
-                    _file: Some(file),
-                })
+                TaskIntegrationOperationRepo::recover_stale_and_begin(
+                    &*self.db,
+                    input,
+                    &now_rfc3339(),
+                )
+                .await
+                .map_err(|error| match error {
+                    db::DbError::TaskIntegrationOperationBusy => busy(task_id),
+                    error => error.into(),
+                })?
             }
-            Err(error) => Err(error.into()),
-        }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(TaskIntegrationOperationGuard {
+            db: Arc::clone(&self.db),
+            operation,
+            _file: Some(file),
+        })
     }
 
     /// Reconcile a persisted running row for consumers that are blocked by
@@ -292,25 +290,6 @@ impl TaskIntegrationOperationManager {
             self.workspace_root.clone()
         };
         Ok(lock_parent.join(".forge-task-integration-locks"))
-    }
-
-    async fn abandon_unowned(&self, operation: &TaskIntegrationOperation) -> crate::Result<()> {
-        let now = now_rfc3339();
-        match TaskIntegrationOperationRepo::finish(
-            &*self.db,
-            FinishTaskIntegrationOperation {
-                id: operation.id.clone(),
-                expected_version: operation.version,
-                status: TaskIntegrationOperationStatus::Abandoned,
-                updated_at: now.clone(),
-                finished_at: now,
-            },
-        )
-        .await
-        {
-            Ok(_) | Err(db::DbError::VersionConflict) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
     }
 }
 
@@ -483,7 +462,7 @@ mod tests {
             db::CreateTaskIntegrationOperation {
                 id: new_uuid_v4(),
                 task_id: task_id.to_owned(),
-                kind: TaskIntegrationOperationKind::TaskMerge,
+                kind: TaskIntegrationOperationKind::WorkUnitIntegration,
                 owner_id: "simulated-operation-owner".to_owned(),
                 gate_evaluation_id: None,
                 created_at: now_rfc3339(),
@@ -494,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_abandons_its_claim_when_process_lock_setup_fails() {
+    async fn acquire_writes_no_claim_when_process_lock_setup_fails() {
         let temp = TempDir::new().expect("temporary directory");
         let db_fixture = fixture("sqlite::memory:", temp.path()).await;
         let lock_root_file = temp.path().join("not-a-directory");
@@ -529,7 +508,7 @@ mod tests {
                 .fetch_all(db_fixture.db.pool())
                 .await
                 .expect("operation history");
-        assert_eq!(statuses, vec!["abandoned"]);
+        assert!(statuses.is_empty(), "claim starts only after its OS lock");
     }
 
     #[tokio::test]
@@ -571,7 +550,7 @@ mod tests {
         )
         .acquire(
             &db_fixture.task_id,
-            TaskIntegrationOperationKind::TaskMerge,
+            TaskIntegrationOperationKind::WorkUnitIntegration,
             "live-owner",
         )
         .await
@@ -600,6 +579,62 @@ mod tests {
             active.id
         );
         drop(owner);
+    }
+
+    #[tokio::test]
+    async fn gate_admission_lock_blocks_cross_process_operation_before_candidate_read() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_path = temp.path().join("gate-admission-lock.db");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let db_fixture = fixture(&database_url, temp.path()).await;
+        let competing_pool = create_sqlite_pool(&database_url)
+            .await
+            .expect("independent database pool");
+        let competing_db = Arc::new(SqliteDb::new(competing_pool));
+        let merge_owner = TaskIntegrationOperationManager::new(
+            Arc::clone(&db_fixture.db),
+            temp.path().to_path_buf(),
+        );
+        let competing = TaskIntegrationOperationManager::new(
+            Arc::clone(&competing_db),
+            temp.path().to_path_buf(),
+        );
+
+        let held = merge_owner
+            .lock_for_gate_admission(&db_fixture.task_id)
+            .await
+            .expect("merge validates its candidate while holding the process lock");
+        assert!(matches!(
+            competing
+                .acquire(
+                    &db_fixture.task_id,
+                    TaskIntegrationOperationKind::WorkUnitIntegration,
+                    "competing-integration",
+                )
+                .await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert!(TaskIntegrationOperationRepo::get_active_for_task(
+            &*db_fixture.db,
+            &db_fixture.task_id,
+        )
+        .await
+        .expect("no operation row was written before acquiring the lock")
+        .is_none());
+
+        drop(held);
+        let integration = competing
+            .acquire(
+                &db_fixture.task_id,
+                TaskIntegrationOperationKind::WorkUnitIntegration,
+                "after-merge-candidate-read",
+            )
+            .await
+            .expect("operation begins after candidate lock is released");
+        integration
+            .finish(TaskIntegrationOperationStatus::Failed)
+            .await
+            .expect("finish operation");
     }
 
     #[tokio::test]
@@ -664,7 +699,7 @@ mod tests {
             reconciler.reconcile_stale(&db_fixture.task_id),
             contender.acquire(
                 &db_fixture.task_id,
-                TaskIntegrationOperationKind::TaskMerge,
+                TaskIntegrationOperationKind::WorkUnitIntegration,
                 "new-operation-owner",
             ),
         );

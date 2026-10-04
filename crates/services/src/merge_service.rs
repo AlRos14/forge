@@ -1,3 +1,4 @@
+use crate::gate_engine::GateEngine;
 use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 use db::{
@@ -178,16 +179,30 @@ impl MergeService {
             .workspace_exec_locks
             .acquire(&format!("task-integration:{task_id}"))
             .await;
+        let task_operation_file = self
+            .integration_operations
+            .lock_for_gate_admission(&task_id)
+            .await?;
         let source = task_merge_source(&self.db, &task_id).await?;
         let _workspace_guard = self
             .workspace_exec_locks
             .acquire(&source.workspace.id)
             .await;
+        self.ensure_current_gate_evaluation(&task_id, &evaluation)
+            .await?;
         self.validate_gate_candidate(&task_id, &evaluation, &source)
+            .await?;
+        self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
             .await?;
         let operation = self
             .integration_operations
-            .acquire_after_gate(&task_id, &db::new_uuid_v4(), gate_evaluation_id)
+            .acquire_kind_after_gate_with_lock(
+                &task_id,
+                db::TaskIntegrationOperationKind::TaskMerge,
+                &db::new_uuid_v4(),
+                gate_evaluation_id,
+                task_operation_file,
+            )
             .await?;
         self.publish_domain_event_by_dedupe(&format!("task-merge-admission:{}", operation.id()))
             .await;
@@ -377,6 +392,10 @@ impl MergeService {
             .workspace_exec_locks
             .acquire(&format!("task-integration:{task_id}"))
             .await;
+        let task_operation_file = self
+            .integration_operations
+            .lock_for_gate_admission(&task_id)
+            .await?;
         let evaluation = GateRepo::get_gate_evaluation(&*self.db, gate_evaluation_id)
             .await?
             .ok_or_else(|| {
@@ -405,15 +424,20 @@ impl MergeService {
             .workspace_exec_locks
             .acquire(&source.workspace.id)
             .await;
+        self.ensure_current_gate_evaluation(&task_id, &evaluation)
+            .await?;
         self.validate_gate_candidate(&task_id, &evaluation, &source)
+            .await?;
+        self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
             .await?;
         let operation = self
             .integration_operations
-            .acquire_kind_after_gate(
+            .acquire_kind_after_gate_with_lock(
                 &task_id,
                 db::TaskIntegrationOperationKind::PublishPr,
                 &db::new_uuid_v4(),
                 gate_evaluation_id,
+                task_operation_file,
             )
             .await?;
         let result = async {
@@ -605,6 +629,55 @@ impl MergeService {
         {
             return Err(ServiceError::Conflict(
                 "Task has a running Execution and cannot enter merge admission".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_current_gate_evaluation(
+        &self,
+        task_id: &str,
+        evaluation: &GateEvaluation,
+    ) -> Result<()> {
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        if gate.task_id != task_id
+            || gate.gate_kind != "merge_readiness"
+            || gate.scope_kind != db::GateScopeKind::Task
+            || gate.scope_id != task_id
+            || gate.active_policy_revision != Some(evaluation.policy_revision)
+        {
+            return Err(ServiceError::Conflict(
+                "merge-readiness policy changed after the supplied GateEvaluation".to_owned(),
+            ));
+        }
+        let current = GateEngine::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .evaluate_revision(gate, evaluation.policy_revision)
+            .await?;
+        if current.evaluation.id != evaluation.id
+            || current.evaluation.outcome != GateEvaluationOutcome::Satisfied
+        {
+            return Err(ServiceError::Conflict(
+                "supplied GateEvaluation is stale; use the current satisfied evaluation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_ready_lifecycle_cause(
+        &self,
+        task_id: &str,
+        gate_evaluation_id: &str,
+    ) -> Result<()> {
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+        if lifecycle.state != TaskLifecycleState::ReadyToMerge
+            || lifecycle.reason_ref.as_deref() != Some(gate_evaluation_id)
+        {
+            return Err(ServiceError::Conflict(
+                "Task is not ready to merge from the supplied GateEvaluation".to_owned(),
             ));
         }
         Ok(())

@@ -54,6 +54,9 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         self.ensure_agent_membership_for_role(task_id, role, agent_id)
             .await?;
         self.ensure_task_runnable(&task).await?;
@@ -62,6 +65,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+        let task = self.activate_task_for_execution(task).await?;
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
                 &self.db,
@@ -70,6 +74,8 @@ impl TaskService {
                 &task.id,
                 self.repo_cache_locks.clone(),
             )
+            .await?;
+        self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(agent_id), None)
             .await?;
         let mut executor_config_snapshot_json = with_dispatch_metadata(
             build_executor_config_snapshot(
@@ -164,40 +170,8 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Executor),
-        );
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
-            return Err(ServiceError::invalid_operation(format!(
-                "cannot launch execution for task {} in terminal status {}",
-                task.id, task.status
-            )));
-        }
         self.ensure_no_running_repository_execution(&task).await?;
-        let task = match workflow.state_kind(&task.status) {
-            Some(api_types::StateKind::Initial | api_types::StateKind::Custom) => {
-                if let Some(target) = first_launch_target(&workflow, &task.status) {
-                    self.transition(task.id.clone(), target, task.version)
-                        .await?
-                        .task
-                } else {
-                    task
-                }
-            }
-            _ => task,
-        };
         self.ensure_task_runnable(&task).await?;
-        if let Some(role) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-        {
-            self.ensure_agent_membership_for_role(&task.id, role, &agent_id)
-                .await?;
-        }
         self.check_dependency_gate(&task, &agent_id).await?;
         self.ensure_no_running_interactive_execution(&task.id)
             .await?;
@@ -205,6 +179,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+        let task = self.activate_task_for_execution(task).await?;
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
                 &self.db,
@@ -309,33 +284,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Executor),
-        );
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
-            return Err(ServiceError::invalid_operation(format!(
-                "cannot follow up on a task in terminal status {}",
-                task.status
-            )));
-        }
         self.ensure_no_running_repository_execution(&task).await?;
-        let task = match workflow.state_kind(&task.status) {
-            Some(api_types::StateKind::Initial | api_types::StateKind::Custom) => {
-                if let Some(target) = first_launch_target(&workflow, &task.status) {
-                    self.transition(task.id.clone(), target, task.version)
-                        .await?
-                        .task
-                } else {
-                    task
-                }
-            }
-            _ => task,
-        };
 
         let authoritative_memberships = if let Some(role) =
             db::canonical_task_role_name(&parent_execution.role)
@@ -444,6 +393,7 @@ impl TaskService {
         self.ensure_no_running_interactive_execution(&task.id)
             .await?;
         self.ensure_task_runnable(&task).await?;
+        let task = self.activate_task_for_execution(task).await?;
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
                 &self.db,
@@ -724,55 +674,8 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
 
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Executor),
-        );
-        // Verify the execution role matches the current state effective role for cascade eligibility
-        let current_state = workflow.states.iter().find(|s| s.name == task.status);
-        let effective_role = current_state.and_then(|s| {
-            s.role.clone().or_else(|| {
-                if s.kind == api_types::StateKind::Active {
-                    Some("assignee".to_owned())
-                } else {
-                    None
-                }
-            })
-        });
-        if effective_role.as_deref() != Some(&parent_execution.role)
-            && parent_execution.role != "interactive"
-        {
-            tracing::info!(
-                task_id = %task.id,
-                execution_role = %parent_execution.role,
-                effective_role = ?effective_role,
-                "re-execute role does not match current state effective role; execution will not cascade"
-            );
-        }
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
-            return Err(ServiceError::invalid_operation(format!(
-                "cannot re-execute a task in terminal status {}",
-                task.status
-            )));
-        }
-
-        let task = match workflow.state_kind(&task.status) {
-            Some(api_types::StateKind::Initial | api_types::StateKind::Custom) => {
-                if let Some(target) = first_launch_target(&workflow, &task.status) {
-                    self.transition(task.id.clone(), target, task.version)
-                        .await?
-                        .task
-                } else {
-                    task
-                }
-            }
-            _ => task,
-        };
         self.ensure_task_runnable(&task).await?;
+        let task = self.activate_task_for_execution(task).await?;
 
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
@@ -792,29 +695,22 @@ impl TaskService {
         )
         .await?;
         let role_name = &parent_execution.role;
-        let state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        let state_config = state
-            .map(|state| state.config.clone())
-            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-        let state_dispatch =
-            dispatch_intent_from_workflow_dispatch(state.and_then(|state| state.dispatch.as_ref()));
-        let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
+        // Fixed role templates may still provide prompt text. Project workflow
+        // state and dispatch configuration have no execution authority.
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        let selection = effective_prompt_selection(role_name, None, None);
         let dispatch_ctx = load_agent_dispatch_context(
             Arc::clone(&self.db),
             &task.id,
             role_name,
             &task.status,
-            state_config,
+            Value::Null,
             Some(selection.execution_policy.as_str()),
             Some(&parent_execution.id),
             &workflow,
         )
         .await?;
-        let (prompt, _selection) =
-            build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
+        let (prompt, _selection) = build_effective_prompt(&dispatch_ctx, None, None);
         let summary = match context {
             Some(ctx) => format!("[User context: {ctx}]\n\n{}", prompt.user),
             None => prompt.user,
@@ -839,11 +735,7 @@ impl TaskService {
                     agent_id: Some(agent.id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
                     purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
-                        execution_purpose_for_workflow_state(
-                            &task.task_type,
-                            &task.status,
-                            &parent_execution.role,
-                        )
+                        execution_purpose_for_task_type(&task.task_type, &parent_execution.role)
                     })),
                     harness_session_id: None,
                     role: parent_execution.role.clone(),
@@ -958,6 +850,19 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let task = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .block(
+            &task.id,
+            crate::task_lifecycle::LifecycleCause::Execution(execution.id.clone()),
+            format!("manual_stop:{blocking_reason}"),
+            execution.id.clone(),
+            format!("manual-stop:{}:{}", execution.id, blocking_reason),
+        )
+        .await?
+        .task;
         let mut recovery_actions = vec![
             api_types::RecoveryAction::Reexecute,
             api_types::RecoveryAction::ResetToInitial,
@@ -1021,6 +926,73 @@ impl TaskService {
     }
 }
 
+impl TaskService {
+    pub(super) async fn activate_task_for_execution(&self, mut task: Task) -> Result<Task> {
+        let lifecycle = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        );
+        let mut current = lifecycle
+            .get(&task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+
+        // A backlog Task must first cross the explicit backlog -> ready edge.
+        // If execution startup crashes between edges, replay resumes from the
+        // durable aggregate state.
+        if current.state == db::TaskLifecycleState::Backlog {
+            task = lifecycle
+                .transition(crate::task_lifecycle::TransitionLifecycleInput {
+                    task_id: task.id.clone(),
+                    expected_task_version: task.version,
+                    to_state: db::TaskLifecycleState::Ready,
+                    cause: crate::task_lifecycle::LifecycleCause::System(
+                        api_types::SystemComponent::Executor,
+                    ),
+                    reason_kind: Some("execution_start".to_owned()),
+                    reason_ref: Some(format!("task:{}:backlog-to-ready", task.id)),
+                    idempotency_key: format!("execution-start:{}:backlog", task.id),
+                })
+                .await?
+                .task;
+            current = lifecycle
+                .get(&task.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        }
+
+        if current.state == db::TaskLifecycleState::Active {
+            return Ok(task);
+        }
+        if !matches!(
+            current.state,
+            db::TaskLifecycleState::Ready
+                | db::TaskLifecycleState::Blocked
+                | db::TaskLifecycleState::ReadyToMerge
+        ) {
+            return Err(ServiceError::invalid_operation(format!(
+                "cannot launch an Execution for Task lifecycle {}",
+                current.state
+            )));
+        }
+
+        Ok(lifecycle
+            .transition(crate::task_lifecycle::TransitionLifecycleInput {
+                task_id: task.id.clone(),
+                expected_task_version: task.version,
+                to_state: db::TaskLifecycleState::Active,
+                cause: crate::task_lifecycle::LifecycleCause::System(
+                    api_types::SystemComponent::Executor,
+                ),
+                reason_kind: Some("execution_start".to_owned()),
+                reason_ref: Some(format!("task:{}:active", task.id)),
+                idempotency_key: format!("execution-start:{}:active", task.id),
+            })
+            .await?
+            .task)
+    }
+}
+
 fn with_dispatch_metadata(
     snapshot_json: Option<String>,
     dispatch_metadata: Option<Value>,
@@ -1041,29 +1013,4 @@ fn with_dispatch_metadata(
     serde_json::to_string(&snapshot)
         .map(Some)
         .map_err(|error| ServiceError::invalid_operation(format!("invalid JSON snapshot: {error}")))
-}
-
-fn first_launch_target(workflow: &api_types::WorkflowDefinition, from: &str) -> Option<String> {
-    let source_kind = workflow.state_kind(from);
-    let targets = workflow
-        .outgoing_trigger_targets(from)
-        .filter(|(trigger, _)| {
-            !trigger.system_only()
-                || matches!(
-                    source_kind,
-                    Some(api_types::StateKind::Initial | api_types::StateKind::Custom)
-                )
-        })
-        .filter_map(|(_, target)| workflow.state_kind(&target).map(|kind| (target, kind)))
-        .collect::<Vec<_>>();
-
-    targets
-        .iter()
-        .find(|(_, kind)| *kind == api_types::StateKind::Active)
-        .or_else(|| {
-            targets
-                .iter()
-                .find(|(_, kind)| *kind == api_types::StateKind::Gate)
-        })
-        .map(|(target, _)| target.clone())
 }

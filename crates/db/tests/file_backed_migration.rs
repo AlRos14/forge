@@ -202,6 +202,37 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
         .execute(&pool)
         .await
         .expect("legacy entry barrier setup");
+    let blocked_active_id = db::new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: blocked_active_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: None,
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "active Task with legacy block metadata".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("active blocked Task");
+    sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+        .bind("{\"type\":\"manual_stop\"}")
+        .bind(&blocked_active_id)
+        .execute(&pool)
+        .await
+        .expect("legacy active blocker setup");
 
     run_migrations_from(&pool, &final_dir)
         .await
@@ -229,6 +260,25 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
     .expect("legacy uncertainty audit");
     assert!(audit_details.contains("legacy_entry_barrier_json"));
     assert!(audit_details.contains("running"));
+    let blocked_mapping: (String, String, String, String) = sqlx::query_as(
+        "SELECT l.state, a.mapping_status, a.reason_kind, a.reason_ref
+         FROM task_lifecycle l
+         JOIN task_lifecycle_migration_audit a ON a.task_id = l.task_id
+         WHERE l.task_id = ?",
+    )
+    .bind(&blocked_active_id)
+    .fetch_one(&pool)
+    .await
+    .expect("active legacy blocker maps fail closed");
+    assert_eq!(
+        blocked_mapping,
+        (
+            "blocked".to_owned(),
+            "legacy_active_block_metadata".to_owned(),
+            "legacy_blocked_task_metadata".to_owned(),
+            blocked_active_id,
+        )
+    );
 
     let _ = fs::remove_dir_all(base_dir);
     let _ = fs::remove_dir_all(final_dir);

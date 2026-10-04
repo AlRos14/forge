@@ -259,6 +259,53 @@ async fn assign_role(db: &db::SqliteDb, task_id: &str, role_name: &str, agent_id
     .expect("role assignment creates");
 }
 
+async fn assign_authoritative_role(
+    db: &db::SqliteDb,
+    task_id: &str,
+    role_name: &str,
+    agent_id: &str,
+) {
+    let role_name = db::canonical_task_role_name(role_name).expect("TaskRole name is valid");
+    let role = match db::TaskRoleRepo::get_by_task_and_role(db, task_id, &role_name)
+        .await
+        .expect("TaskRole lookup succeeds")
+    {
+        Some(role) => role,
+        None => {
+            let now = now_rfc3339();
+            db::TaskRoleRepo::create(
+                db,
+                db::CreateTaskRole {
+                    id: new_uuid_v4(),
+                    task_id: task_id.to_owned(),
+                    role: role_name,
+                    coordination_mode: Some(db::CoordinationMode::Collaborative),
+                    policy_json: "{}".to_owned(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("TaskRole creates")
+        }
+    };
+    let now = now_rfc3339();
+    db::RoleMembershipRepo::add(
+        db,
+        db::CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role.id,
+            actor_kind: db::ActorKind::Agent,
+            actor_id: agent_id.to_owned(),
+            status: db::RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("authoritative RoleMembership creates");
+}
+
 async fn seed_running_execution(db: &db::SqliteDb, task_id: &str, agent_id: &str, role: &str) {
     let now = now_rfc3339();
     ExecutionRepo::create(
@@ -342,6 +389,50 @@ async fn seed_cancelled_execution(
     .expect("execution creates")
 }
 
+async fn seed_failed_execution(
+    db: &db::SqliteDb,
+    task_id: &str,
+    agent_id: &str,
+    role: &str,
+    resume_policy: Option<ResumePolicy>,
+) -> db::Execution {
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.to_owned()),
+            actor_ref: None,
+            purpose: None,
+            role: role.to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(StopReason::ExecutorFailed),
+            stopped_by: Some("system:test".to_owned()),
+            resume_policy,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("deterministic failure".to_owned()),
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("failed execution creates")
+}
+
 async fn build_dispatcher(
     db: Arc<db::SqliteDb>,
     workspace_root: &Path,
@@ -367,7 +458,7 @@ async fn build_dispatcher(
 }
 
 #[tokio::test]
-async fn pr6_task_dispatcher_skips_orchestrator_and_keeps_worker_review_paths() {
+async fn dispatcher_uses_aggregate_lifecycle_and_task_roles_not_workflow_states() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
@@ -443,57 +534,58 @@ async fn pr6_task_dispatcher_skips_orchestrator_and_keeps_worker_review_paths() 
         seed_task(&*db, &project_id, &repo_id, "active", "in_progress", 0).await;
     let legacy_worker = seed_task(&*db, &project_id, &repo_id, "active", "legacy_worker", 0).await;
     let legacy_reviewer = seed_task(&*db, &project_id, &repo_id, "review", "review", 0).await;
-    assign_role(
+    assign_authoritative_role(
         &*db,
-        &legacy_worker.id,
+        &initial_orchestrator.id,
         crate::workflow::default_roles::CODER,
-        &agent_id,
-    )
-    .await;
-    assign_role(
-        &*db,
-        &legacy_reviewer.id,
-        crate::workflow::default_roles::REVIEWER,
         &agent_id,
     )
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 2);
-    for task in [&initial_orchestrator, &active_orchestrator] {
-        assert_eq!(
-            ExecutionRepo::count_by_task_and_role(&*db, &task.id, "orchestrator")
-                .await
-                .expect("orchestrator execution count loads"),
-            0,
-        );
-    }
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*db, &initial_orchestrator.id, "orchestrator")
+            .await
+            .expect("orchestrator execution count loads"),
+        0,
+    );
     assert_eq!(
         TaskRepo::get_by_id(&*db, &initial_orchestrator.id, false)
             .await
             .expect("initial Task loads")
             .expect("initial Task exists")
             .status,
-        "todo",
+        "in_progress",
     );
-    let mut legacy_roles = Vec::new();
-    for _ in 0..2 {
-        legacy_roles.push(
-            tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("legacy execution starts in time")
-                .expect("legacy execution context arrives")
-                .role,
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("initial implementer execution starts in time")
+            .expect("initial execution context arrives")
+            .role,
+        "implementer",
+    );
+    for task in [&active_orchestrator, &legacy_worker, &legacy_reviewer] {
+        assert_eq!(
+            ExecutionRepo::list_by_task(
+                &*db,
+                &task.id,
+                db::PageRequest {
+                    cursor: None,
+                    limit: 10,
+                    include_total: false,
+                    sort_by: db::SortBy::CreatedAt,
+                    sort_order: db::SortOrder::Desc,
+                },
+            )
+            .await
+            .expect("Task execution rows load")
+            .items
+            .len(),
+            0,
         );
     }
-    legacy_roles.sort();
-    assert_eq!(
-        legacy_roles,
-        vec![
-            crate::workflow::default_roles::CODER.to_owned(),
-            crate::workflow::default_roles::REVIEWER.to_owned(),
-        ],
-    );
 }
 
 #[tokio::test]
@@ -504,7 +596,7 @@ async fn dispatcher_check_once_does_not_dispatch_after_stop() {
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, &repo_id, "high", "todo", 1).await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -528,14 +620,14 @@ async fn dispatcher_check_once_does_not_dispatch_after_stop() {
 }
 
 #[tokio::test]
-async fn dispatcher_skips_optional_unassigned_planning_stage_before_coder_dispatch() {
+async fn dispatcher_schedules_ready_task_from_authoritative_role_membership() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, &repo_id, "high", "todo", 1).await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -545,7 +637,6 @@ async fn dispatcher_skips_optional_unassigned_planning_stage_before_coder_dispat
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
-
     assert_eq!(dispatched, 1);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
@@ -558,19 +649,15 @@ async fn dispatcher_skips_optional_unassigned_planning_stage_before_coder_dispat
         .expect("execution context received");
     assert_eq!(execution_ctx.task_id, task.id);
     assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::CODER
-        )
-        .await
-        .expect("execution count loads"),
+        ExecutionRepo::count_by_task_and_role(&*db, &task.id, "implementer")
+            .await
+            .expect("execution count loads"),
         1
     );
 }
 
 #[tokio::test]
-async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
+async fn dispatcher_ignores_legacy_deferred_metadata_for_active_task() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
@@ -585,7 +672,7 @@ async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
         1,
     )
     .await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -633,21 +720,25 @@ async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
     .expect("deferred dispatch metadata updates");
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
 
-    assert_eq!(dispatched, 1);
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("executor spawned in time")
-        .expect("execution context received");
-    assert_eq!(execution_ctx.task_id, task.id);
+    assert_eq!(dispatched, 0);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*db, &task.id, "implementer")
+            .await
+            .expect("execution count loads"),
+        0
+    );
     let task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task reloads")
         .expect("task exists");
-    assert!(deferred_dispatch::pending_until(&task).is_none());
+    // The old metadata remains inert compatibility data; active lifecycle
+    // work is never scheduled or cleared from that projection.
+    assert!(deferred_dispatch::pending_until(&task).is_some());
 }
 
 #[tokio::test]
-async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_stage() {
+async fn dispatcher_does_not_dispatch_active_task_from_legacy_planning_projection() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
@@ -657,12 +748,12 @@ async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_stage() 
         &db,
         &project_id,
         &repo_id,
-        "stuck planning",
+        "legacy planning projection",
         crate::workflow::default_states::PLANNING,
         1,
     )
     .await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -673,27 +764,24 @@ async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_stage() 
 
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
 
-    assert_eq!(dispatched, 1);
+    assert_eq!(dispatched, 0);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
         .expect("task exists");
     assert_eq!(updated.status, crate::workflow::default_states::IN_PROGRESS);
-    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
         .await
-        .expect("execution spawned in time")
-        .expect("execution context received");
-    assert_eq!(execution_ctx.task_id, task.id);
+        .expect("Task lifecycle lookup succeeds")
+        .expect("Task lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
     assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::CODER
-        )
-        .await
-        .expect("execution count loads"),
-        1
+        ExecutionRepo::count_by_task_and_role(&*db, &task.id, "implementer")
+            .await
+            .expect("execution count loads"),
+        0
     );
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -719,7 +807,7 @@ async fn dispatcher_skips_task_when_agent_at_capacity() {
     )
     .await;
     let task = seed_task(&db, &project_id, &repo_id, "todo", "todo", 0).await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -749,7 +837,7 @@ async fn dispatcher_skips_task_when_agent_offline() {
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Offline, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, &repo_id, "todo", "todo", 0).await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -808,51 +896,14 @@ async fn dispatcher_skips_paused_project() {
 }
 
 #[tokio::test]
-async fn dispatcher_recovers_undispatched_active_task() {
-    let db = Arc::new(sqlite_db().await);
-    let repo_dir = TempDir::new().expect("repo dir creates");
-    let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
-    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "active", "in_progress", 0).await;
-    assign_role(
-        &db,
-        &task.id,
-        crate::workflow::default_roles::CODER,
-        &agent_id,
-    )
-    .await;
-    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
-
-    assert_eq!(dispatched, 1);
-    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("execution spawned in time")
-        .expect("execution context received");
-    assert_eq!(ctx.task_id, task.id);
-    assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::CODER
-        )
-        .await
-        .expect("execution count loads"),
-        1
-    );
-}
-
-#[tokio::test]
-async fn dispatcher_recovers_undispatched_reviewer_task() {
+async fn dispatcher_never_infers_review_gate_from_legacy_review_status() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, &repo_id, "review", "review", 0).await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::REVIEWER,
@@ -863,13 +914,12 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
 
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
 
-    assert_eq!(dispatched, 1);
-    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    assert_eq!(dispatched, 0);
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
         .await
-        .expect("reviewer execution spawned in time")
-        .expect("reviewer execution context received");
-    assert_eq!(ctx.task_id, task.id);
-    assert!(ctx.description.contains("FORGE_RESULT:"));
+        .expect("Task lifecycle lookup succeeds")
+        .expect("Task lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
             &*db,
@@ -878,8 +928,9 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
         )
         .await
         .expect("reviewer execution count loads"),
-        1
+        0
     );
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -890,7 +941,7 @@ async fn dispatcher_respects_priority_ordering() {
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let low = seed_task(&db, &project_id, &repo_id, "low", "todo", 1).await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &low.id,
         crate::workflow::default_roles::CODER,
@@ -906,7 +957,7 @@ async fn dispatcher_respects_priority_ordering() {
         "10".parse().unwrap(),
     )
     .await;
-    assign_role(
+    assign_authoritative_role(
         &db,
         &high.id,
         crate::workflow::default_roles::CODER,
@@ -1068,7 +1119,7 @@ async fn dispatcher_dispatches_when_graceful_shutdown_stop_is_auto() {
         &agent_id,
     )
     .await;
-    seed_cancelled_execution(
+    let cancelled_execution = seed_cancelled_execution(
         &db,
         &task.id,
         &agent_id,
@@ -1082,21 +1133,35 @@ async fn dispatcher_dispatches_when_graceful_shutdown_stop_is_auto() {
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("execution rows load");
+    assert_eq!(executions.items.len(), 2);
+    assert_eq!(executions.items[0].role, cancelled_execution.role);
     assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::CODER
-        )
-        .await
-        .expect("execution count loads"),
-        2
+        executions.items[0].parent_execution_id.as_deref(),
+        Some(cancelled_execution.id.as_str())
     );
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("execution spawned in time")
         .expect("execution context received");
     assert_eq!(ctx.task_id, task.id);
+    assert_eq!(
+        dispatcher.check_once().await.expect("replay check runs"),
+        0,
+        "the new running Execution fences duplicate recovery"
+    );
 }
 
 #[tokio::test]
@@ -1188,14 +1253,185 @@ async fn dispatcher_skips_legacy_stopped_execution_without_resume_policy() {
 }
 
 #[tokio::test]
-async fn dispatcher_skips_active_task_with_blocking_annotation() {
+async fn dispatcher_leaves_exact_retry_direction_to_orchestrator() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir");
+    let workspace_dir = TempDir::new().expect("workspace dir");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "exact retry", "in_progress", 0).await;
+    assign_authoritative_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let execution = seed_failed_execution(
+        &db,
+        &task.id,
+        &agent_id,
+        crate::workflow::default_roles::CODER,
+        Some(ResumePolicy::Manual),
+    )
+    .await;
+    let failed_at = now_rfc3339();
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let failure_event = db::DomainEventRepo::append_event(
+        &*db,
+        db::CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution.id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: execution.id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("test:execution-failed:{}", execution.id)),
+            payload_json: serde_json::json!({
+                "execution_id": execution.id,
+                "task_id": task.id,
+            })
+            .to_string(),
+            created_at: failed_at,
+        },
+    )
+    .await
+    .expect("durable source failure event");
+    assert_eq!(
+        crate::task_failure_retry::TaskFailureRetryService::new(
+            Arc::clone(&db),
+            Arc::clone(&dispatcher.event_bus),
+        )
+        .process_domain_event(&failure_event)
+        .await
+        .expect("exact retry policy consumes the failure"),
+        1
+    );
+    let rework_event_id: String = sqlx::query_scalar(
+        "SELECT id FROM domain_event
+         WHERE event_type = 'task.rework_requested' AND scope_id = ?
+           AND json_extract(payload_json, '$.failure_ref') = ?",
+    )
+    .bind(&task.id)
+    .bind(&execution.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("durable rework event is recorded");
+    let rework_event = db::DomainEventRepo::get_event(&*db, &rework_event_id)
+        .await
+        .expect("rework event lookup succeeds")
+        .expect("rework event exists");
+    assert!(
+        crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+            &db,
+            &rework_event,
+        )
+        .await
+        .expect("exact receipt validates rework event")
+    );
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 0);
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("execution rows load");
+    assert_eq!(executions.items.len(), 1);
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn dispatcher_does_not_dispatch_active_task_work_without_orchestrator_direction() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir");
+    let workspace_dir = TempDir::new().expect("workspace dir");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "orchestrated", "in_progress", 0).await;
+    assign_authoritative_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 0);
+    assert_eq!(
+        ExecutionRepo::list_by_task(
+            &*db,
+            &task.id,
+            db::PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Desc,
+            },
+        )
+        .await
+        .expect("execution rows load")
+        .items
+        .len(),
+        0
+    );
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn dispatcher_keeps_permanent_executor_unavailability_blocked() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let repo_dir = TempDir::new().expect("repo dir");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let task = seed_task(&db, &project_id, &repo_id, "unavailable", "in_progress", 0).await;
+    let result = crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), event_bus)
+        .block(
+            &task.id,
+            crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::TaskDispatcher,
+            ),
+            "executor_unavailable",
+            "execution:unavailable",
+            "test:executor-unavailable",
+        )
+        .await
+        .expect("permanent executor unavailability blocks aggregate lifecycle");
+    assert_eq!(result.lifecycle.state, db::TaskLifecycleState::Blocked);
+}
+
+#[tokio::test]
+async fn dispatcher_does_not_treat_a_legacy_annotation_as_lifecycle_authority() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
     let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "blocked", "in_progress", 0).await;
-    assign_role(
+    let task = seed_task(&db, &project_id, &repo_id, "ready", "todo", 0).await;
+    assign_authoritative_role(
         &db,
         &task.id,
         crate::workflow::default_roles::CODER,
@@ -1232,67 +1468,29 @@ async fn dispatcher_skips_active_task_with_blocking_annotation() {
     .expect("task update creates");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
-
-    assert_eq!(dispatched, 0);
-    assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::CODER
-        )
-        .await
-        .expect("execution count loads"),
-        0
-    );
-    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
-        .await
-        .is_err());
-}
-
-#[tokio::test]
-async fn dispatcher_can_run_cognitive_review_without_validation_result() {
-    let db = Arc::new(sqlite_db().await);
-    let repo_dir = TempDir::new().expect("repo dir creates");
-    let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
-    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "review", "review", 0).await;
-    assign_role(
-        &db,
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
         &task.id,
-        crate::workflow::default_roles::REVIEWER,
-        &agent_id,
+        db::PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Desc,
+        },
     )
-    .await;
-    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
-
-    assert_eq!(dispatched, 1);
+    .await
+    .expect("execution rows load");
+    assert_eq!(executions.items.len(), 1);
+    assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("ready lifecycle dispatches despite stale annotation")
+        .is_some());
     assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::REVIEWER
-        )
-        .await
-        .expect("execution count loads"),
-        1
-    );
-    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("reviewer Execution dispatch completes")
-        .expect("reviewer Execution context is received");
-    assert_eq!(ctx.task_id, task.id);
-    assert_eq!(
-        ExecutionRepo::count_by_task_and_role(
-            &*db,
-            &task.id,
-            crate::workflow::default_roles::REVIEWER
-        )
-        .await
-        .expect("execution count loads"),
+        ExecutionRepo::count_by_task_and_role(&*db, &task.id, "implementer")
+            .await
+            .expect("execution count loads"),
         1
     );
 }

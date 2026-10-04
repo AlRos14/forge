@@ -597,6 +597,7 @@ fn is_task_outcome_event(event: &DomainEvent) -> bool {
     matches!(
         event.event_type.as_str(),
         "task.transitioned"
+            | "task.lifecycle_changed"
             | "task.done"
             | "task.completed"
             | "task.blocked"
@@ -606,6 +607,15 @@ fn is_task_outcome_event(event: &DomainEvent) -> bool {
 }
 
 fn task_outcome(event: &DomainEvent, task: &Task, payload: &Value) -> Option<TaskOutcome> {
+    if event.event_type == "task.lifecycle_changed" {
+        let state = payload.get("to_state").and_then(Value::as_str)?;
+        return lifecycle_task_outcome(
+            state,
+            payload.get("reason_kind").and_then(Value::as_str),
+            payload.get("reason_ref").and_then(Value::as_str),
+        );
+    }
+
     let state = payload
         .get("to_state")
         .and_then(Value::as_str)
@@ -634,6 +644,33 @@ fn task_outcome(event: &DomainEvent, task: &Task, payload: &Value) -> Option<Tas
         return Some(TaskOutcome::Blocked { reason });
     }
     None
+}
+
+fn lifecycle_task_outcome(
+    state: &str,
+    reason_kind: Option<&str>,
+    reason_ref: Option<&str>,
+) -> Option<TaskOutcome> {
+    if reason_kind == Some("board_move") {
+        // TaskMove already writes a compatibility `task.transitioned` event
+        // in the same transaction. Let that single outcome event notify its
+        // commitment recipients without emitting a duplicate lifecycle notice.
+        return None;
+    }
+    let reason = reason_ref
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| reason_kind.filter(|value| !value.trim().is_empty()))
+        .unwrap_or("Task lifecycle changed");
+    match state {
+        "done" => Some(TaskOutcome::Delivered),
+        "cancelled" => Some(TaskOutcome::Cancelled {
+            reason: reason.to_owned(),
+        }),
+        "blocked" => Some(TaskOutcome::Blocked {
+            reason: reason.to_owned(),
+        }),
+        _ => None,
+    }
 }
 
 fn task_reason(task: &Task) -> Option<String> {
@@ -679,4 +716,63 @@ pub fn coordination_consumer_name() -> &'static str {
 
 pub fn coordination_consumer_lease_owner() -> String {
     format!("coordination-consumer-{}", Uuid::new_v4())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_task_outcome_event, lifecycle_task_outcome, DomainEvent, TaskOutcome};
+
+    #[test]
+    fn aggregate_lifecycle_outcomes_are_read_from_exact_transition_state() {
+        let event = DomainEvent {
+            sequence: 1,
+            id: "event".to_owned(),
+            event_type: "task.lifecycle_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task".to_owned(),
+            correlation_id: "transition".to_owned(),
+            causation_id: None,
+            causation_depth: 1,
+            dedupe_key: Some("transition".to_owned()),
+            payload_json: "{}".to_owned(),
+            created_at: "2026-10-04T00:00:00Z".to_owned(),
+        };
+        assert!(is_task_outcome_event(&event));
+        assert_eq!(
+            lifecycle_task_outcome(
+                "done",
+                Some("task_merge_succeeded"),
+                Some("merge-operation")
+            ),
+            Some(TaskOutcome::Delivered)
+        );
+        assert_eq!(
+            lifecycle_task_outcome("cancelled", Some("actor_cancel"), Some("user-cancel")),
+            Some(TaskOutcome::Cancelled {
+                reason: "user-cancel".to_owned(),
+            })
+        );
+        assert_eq!(
+            lifecycle_task_outcome(
+                "blocked",
+                Some("retry_budget_exhausted"),
+                Some("retry-budget-exhausted")
+            ),
+            Some(TaskOutcome::Blocked {
+                reason: "retry-budget-exhausted".to_owned(),
+            })
+        );
+        assert_eq!(
+            lifecycle_task_outcome("active", Some("old_failure"), Some("old-failure")),
+            None
+        );
+        assert_eq!(
+            lifecycle_task_outcome("cancelled", Some("board_move"), Some("move")),
+            None
+        );
+    }
 }

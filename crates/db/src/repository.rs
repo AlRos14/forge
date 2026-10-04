@@ -54,6 +54,15 @@ pub trait TaskRepo: Send + Sync {
 #[async_trait]
 pub trait TaskLifecycleRepo: Send + Sync {
     async fn get_task_lifecycle(&self, task_id: &str) -> Result<Option<TaskLifecycle>>;
+    async fn get_task_lifecycle_transition_fact(
+        &self,
+        transition_id: &str,
+    ) -> Result<Option<TaskLifecycleTransitionFact>>;
+    async fn has_task_lifecycle_transition(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool>;
     async fn get_task_lifecycle_transition(
         &self,
         identity: TaskLifecycleTransitionIdentity,
@@ -73,11 +82,30 @@ pub trait TaskLifecycleRepo: Send + Sync {
 #[async_trait]
 pub trait GateRepo: Send + Sync {
     async fn create_gate(&self, input: CreateGate) -> Result<CollaborationWrite<Gate>>;
+    /// Create a Gate and its first immutable policy revision with both durable
+    /// events in one transaction. API creation must not leave an unusable Gate
+    /// when policy validation or persistence fails.
+    async fn create_gate_with_initial_policy(
+        &self,
+        gate: CreateGate,
+        policy: CreateGatePolicyRevision,
+    ) -> Result<(
+        CollaborationWrite<Gate>,
+        CollaborationWrite<GatePolicyRevision>,
+    )>;
     async fn get_gate(&self, id: &str) -> Result<Option<Gate>>;
     async fn list_active_gate_policies(
         &self,
         task_id: &str,
     ) -> Result<Vec<(Gate, GatePolicyRevision)>>;
+    /// Find the immutable evaluation emitted while consuming one exact source
+    /// event. A replay of that source must leave the evaluation event to apply
+    /// its already frozen inputs rather than evaluating newer facts again.
+    async fn get_gate_evaluation_for_cause(
+        &self,
+        gate_id: &str,
+        causation_event_id: &str,
+    ) -> Result<Option<GateEvaluation>>;
     async fn get_gate_policy_revision(
         &self,
         gate_id: &str,
@@ -94,6 +122,15 @@ pub trait GateRepo: Send + Sync {
         input: StoreGateEvaluation,
     ) -> Result<GateEvaluationWrite>;
     async fn get_gate_evaluation(&self, id: &str) -> Result<Option<GateEvaluation>>;
+    async fn is_latest_gate_evaluation(
+        &self,
+        gate_id: &str,
+        revision: i64,
+        evaluation_id: &str,
+    ) -> Result<bool>;
+    /// Mutable exact inputs (TaskRole, WorkUnit, and Proposal fences) must
+    /// still match before a satisfied evaluation changes lifecycle.
+    async fn gate_evaluation_inputs_are_current(&self, evaluation_id: &str) -> Result<bool>;
     async fn list_gate_evaluation_inputs(
         &self,
         evaluation_id: &str,
@@ -2315,7 +2352,6 @@ pub struct ClaimTask {
     pub expected_version: i64,
     pub source_status: String,
     pub target_status: String,
-    pub capacity_statuses: Vec<String>,
     pub execution: CreateExecution,
     pub max_concurrent_tasks: i64,
     pub claimed_at: String,

@@ -1,10 +1,10 @@
 use super::execution::resumable_external_session;
 use super::*;
 
-use api_types::{Actor, StateKind, TaskAction, UserActionSource};
+use api_types::{Actor, TaskAction, UserActionSource};
 use db::{
-    AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, SortBy,
-    SortOrder, TaskLifecycleRepo, TaskRepo, TaskRoleAssignmentRepo, WorkspaceRepo,
+    AssigneeKind, ExecutionRepo, PageRequest, SortBy, SortOrder, TaskLifecycleRepo, TaskRepo,
+    TaskRoleAssignmentRepo, WorkspaceRepo,
 };
 
 #[derive(Debug)]
@@ -14,9 +14,7 @@ pub struct TaskActionResult {
 }
 
 impl TaskService {
-    /// Return intent actions from the resolved workflow capabilities and the
-    /// task's current execution/review state. Callers do not need to know the
-    /// project's concrete state names.
+    /// Return available aggregate lifecycle and Execution actions.
     pub async fn available_task_actions(
         &self,
         task_id: impl Into<String>,
@@ -25,16 +23,10 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let actor = Actor::user(UserActionSource::Api);
-        let workflow =
-            WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
         let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
-        self.available_task_actions_for(&task, &workflow, lifecycle.state)
+        self.available_task_actions_for(&task, lifecycle.state)
             .await
     }
 
@@ -49,12 +41,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let actor = Actor::user(UserActionSource::Api);
-        let workflow =
-            WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
         // A stale client version is a conflict for every action, not only the ones whose
         // inner path happens to re-check it.
         if let Some(version) = requested_version {
@@ -66,18 +52,19 @@ impl TaskService {
             }
         }
 
-        // Cancelling an already-cancelled task stays an idempotent no-op, matching the
-        // pre-facade POST /tasks/{id}/cancel contract. cancellation_target falls back to a
-        // terminal "cancelled" state for workflows with no explicit cancellation_state.
+        // Cancelling an already-cancelled Task stays idempotent.
         let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
         if action == TaskAction::Cancel && lifecycle.state == db::TaskLifecycleState::Cancelled {
+            let task = self
+                .cancel_task_as(task.id.clone(), Actor::user(UserActionSource::Api))
+                .await?;
             return Ok(TaskActionResult { task, action });
         }
 
         let available = self
-            .available_task_actions_for(&task, &workflow, lifecycle.state)
+            .available_task_actions_for(&task, lifecycle.state)
             .await?;
         if !available.contains(&action) {
             return Err(ServiceError::TaskActionUnavailable {
@@ -86,9 +73,10 @@ impl TaskService {
             });
         }
 
+        let actor = Actor::user(UserActionSource::Api);
         let result = match action {
             TaskAction::Start => {
-                let agent_id = self.action_agent_id(&task, &workflow).await?;
+                let agent_id = self.action_agent_id(&task).await?;
                 self.claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
                     .await?
                     .task
@@ -119,7 +107,7 @@ impl TaskService {
                     .await?
                     .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
             }
-            TaskAction::Resume => self.resume_task_execution(&task, &workflow, reason).await?,
+            TaskAction::Resume => self.resume_task_execution(&task, reason).await?,
             TaskAction::Submit => {
                 return Err(ServiceError::invalid_operation(
                     "Task submission cannot satisfy a Gate; use an exact GateEvaluation",
@@ -147,7 +135,6 @@ impl TaskService {
     async fn available_task_actions_for(
         &self,
         task: &Task,
-        workflow: &api_types::WorkflowDefinition,
         lifecycle_state: db::TaskLifecycleState,
     ) -> Result<Vec<TaskAction>> {
         let executions = self.task_executions(&task.id).await?;
@@ -180,7 +167,12 @@ impl TaskService {
         let has_previous_execution = executions.iter().any(|execution| {
             execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
         });
-        let has_agent = self.action_agent_id(task, workflow).await.is_ok();
+        let has_agent = self.action_agent_id(task).await.is_ok();
+        let retry_budget_exhausted =
+            crate::task_failure_retry::TaskFailureRetryService::has_exhausted_retry_budget(
+                &self.db, &task.id,
+            )
+            .await?;
 
         let mut actions = Vec::new();
         if lifecycle_state == db::TaskLifecycleState::Ready && has_agent {
@@ -189,25 +181,23 @@ impl TaskService {
         if running {
             actions.push(TaskAction::Pause);
         }
-        if !is_terminal
-            && (resumable
-                || has_previous_execution
-                || (lifecycle_state == db::TaskLifecycleState::Active && has_agent))
-        {
+        if should_offer_resume(
+            lifecycle_state,
+            is_terminal,
+            retry_budget_exhausted,
+            resumable,
+            has_previous_execution,
+            has_agent,
+        ) {
             actions.push(TaskAction::Resume);
         }
-        if !is_terminal {
+        if should_offer_cancel(lifecycle_state) {
             actions.push(TaskAction::Cancel);
         }
         Ok(actions)
     }
 
-    async fn resume_task_execution(
-        &self,
-        task: &Task,
-        workflow: &api_types::WorkflowDefinition,
-        reason: Option<String>,
-    ) -> Result<Task> {
+    async fn resume_task_execution(&self, task: &Task, reason: Option<String>) -> Result<Task> {
         let context = reason.filter(|value| !value.trim().is_empty());
         if let Some(annotation) = task
             .error_annotation
@@ -288,21 +278,15 @@ impl TaskService {
             return Ok(launched.task);
         }
 
-        let agent_id = self.action_agent_id(task, workflow).await?;
-        let role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-            .unwrap_or(crate::workflow::default_roles::WORKER);
+        let agent_id = self.action_agent_id(task).await?;
+        let role = task_execution_role(task);
         let _launched = self
             .dispatch_initial_role_execution(
                 &task.id,
                 &agent_id,
                 role,
-                crate::task_service::execution::execution_purpose_for_workflow_state(
+                crate::task_service::execution::execution_purpose_for_task_type(
                     &task.task_type,
-                    &task.status,
                     role,
                 ),
                 context.unwrap_or_else(|| "Resume task work.".to_owned()),
@@ -313,154 +297,49 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
     }
 
-    async fn action_agent_id(
-        &self,
-        task: &Task,
-        workflow: &api_types::WorkflowDefinition,
-    ) -> Result<String> {
-        let mut authoritative_role_seen = false;
-
-        if let Some(role) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
+    async fn action_agent_id(&self, task: &Task) -> Result<String> {
+        let role = task_execution_role(task);
+        if let Some(memberships) =
+            crate::task_service::current_role_memberships_authoritative(&self.db, &task.id, role)
+                .await?
         {
-            match crate::task_service::current_role_memberships_authoritative(
-                &self.db, &task.id, role,
-            )
-            .await?
+            let selected = if task.repo_id.is_some() {
+                crate::task_service::select_usable_repository_agent_id(
+                    &self.db,
+                    &task.project_id,
+                    &memberships,
+                )
+                .await?
+            } else {
+                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+            };
+            return selected.ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "no active Agent membership is available for TaskRole {role}"
+                ))
+            });
+        }
+
+        let legacy_roles: &[&str] = if role == "implementer" {
+            &["implementer", "coder", "worker", "assignee", "executor"]
+        } else {
+            &[role]
+        };
+        for legacy_role in legacy_roles {
+            if let Some(assignment) =
+                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, legacy_role)
+                    .await?
             {
-                Some(memberships) => {
-                    authoritative_role_seen = true;
-                    let selected = if task.repo_id.is_some() {
-                        crate::task_service::select_usable_repository_agent_id(
-                            &self.db,
-                            &task.project_id,
-                            &memberships,
-                        )
-                        .await?
-                    } else {
-                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
-                    };
-                    if let Some(agent_id) = selected {
+                if assignment.assignee_type == Some(AssigneeKind::Agent) {
+                    if let Some(agent_id) = assignment.assignee_id {
                         return Ok(agent_id);
                     }
                 }
-                None => {
-                    if let Some(assignment) =
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
-                            .await?
-                    {
-                        if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                            if let Some(agent_id) = assignment.assignee_id {
-                                return Ok(agent_id);
-                            }
-                        }
-                    }
-                }
             }
         }
-
-        let first_work_role = workflow
-            .outgoing_trigger_targets(&task.status)
-            .filter_map(|(_, target)| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.name == target)
-                    .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
-                    .and_then(crate::workflow::effective_role)
-            })
-            .next();
-        if let Some(role) = first_work_role {
-            match crate::task_service::current_role_memberships_authoritative(
-                &self.db, &task.id, role,
-            )
-            .await?
-            {
-                Some(memberships) => {
-                    authoritative_role_seen = true;
-                    let selected = if task.repo_id.is_some() {
-                        crate::task_service::select_usable_repository_agent_id(
-                            &self.db,
-                            &task.project_id,
-                            &memberships,
-                        )
-                        .await?
-                    } else {
-                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
-                    };
-                    if let Some(agent_id) = selected {
-                        return Ok(agent_id);
-                    }
-                }
-                None => {
-                    if let Some(assignment) =
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
-                            .await?
-                    {
-                        if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                            if let Some(agent_id) = assignment.assignee_id {
-                                return Ok(agent_id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Once any candidate workflow role has a replacement TaskRole row, an
-        // empty active-Agent set is authoritative.  Do not fall through to a
-        // stale task fallback, historical execution, or an arbitrary default
-        // Agent and thereby turn eligibility into an implicit assignment.
-        if authoritative_role_seen {
-            return Err(ServiceError::invalid_operation(
-                "no active Agent membership is available for the current TaskRole",
-            ));
-        }
-
-        if !authoritative_role_seen
-            && task.assignee_type.as_deref() == Some("agent")
-            && task.assignee_id.is_some()
-        {
-            return Ok(task.assignee_id.clone().expect("checked above"));
-        }
-
-        if let Some(execution) = self
-            .task_executions(&task.id)
-            .await?
-            .into_iter()
-            .find(|execution| execution.agent_id.is_some())
-        {
-            if let Some(agent_id) = execution.agent_id {
-                return Ok(agent_id);
-            }
-        }
-
-        let agents = AgentRepo::list(
-            &*self.db,
-            AgentListQuery {
-                status: None,
-                executor_type: None,
-                capabilities: Vec::new(),
-                page: PageRequest {
-                    cursor: None,
-                    limit: 500,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Asc,
-                },
-            },
-        )
-        .await?
-        .items;
-        agents
-            .iter()
-            .find(|agent| agent.is_default && !agent.paused)
-            .or_else(|| agents.iter().find(|agent| !agent.paused))
-            .map(|agent| agent.id.clone())
-            .ok_or_else(|| ServiceError::invalid_operation("no available agent to start task"))
+        Err(ServiceError::invalid_operation(format!(
+            "TaskRole {role} has no assigned Agent"
+        )))
     }
 
     async fn task_executions(&self, task_id: &str) -> Result<Vec<Execution>> {
@@ -490,6 +369,33 @@ impl TaskService {
     }
 }
 
+fn should_offer_resume(
+    lifecycle: db::TaskLifecycleState,
+    is_terminal: bool,
+    retry_budget_exhausted: bool,
+    resumable: bool,
+    has_previous_execution: bool,
+    has_agent: bool,
+) -> bool {
+    !matches!(
+        lifecycle,
+        db::TaskLifecycleState::ReadyToMerge | db::TaskLifecycleState::Merging
+    ) && !is_terminal
+        && !retry_budget_exhausted
+        && (resumable
+            || has_previous_execution
+            || (lifecycle == db::TaskLifecycleState::Active && has_agent))
+}
+
+fn should_offer_cancel(lifecycle: db::TaskLifecycleState) -> bool {
+    !matches!(
+        lifecycle,
+        db::TaskLifecycleState::Merging
+            | db::TaskLifecycleState::Done
+            | db::TaskLifecycleState::Cancelled
+    )
+}
+
 fn action_name(action: TaskAction) -> &'static str {
     match action {
         TaskAction::Start => "start",
@@ -500,6 +406,46 @@ fn action_name(action: TaskAction) -> &'static str {
         TaskAction::Approve => "approve",
         TaskAction::Cancel => "cancel",
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_offer_cancel, should_offer_resume};
+    use db::TaskLifecycleState;
+
+    #[test]
+    fn merge_ready_task_does_not_offer_resume_without_a_gate_rework_effect() {
+        assert!(!should_offer_resume(
+            TaskLifecycleState::ReadyToMerge,
+            false,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(should_offer_resume(
+            TaskLifecycleState::Active,
+            false,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert!(!should_offer_resume(
+            TaskLifecycleState::Merging,
+            false,
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!should_offer_cancel(TaskLifecycleState::Merging));
+        assert!(should_offer_cancel(TaskLifecycleState::Active));
+    }
+}
+
+fn task_execution_role(task: &Task) -> &'static str {
+    crate::task_service::execution::task_role_for_task_type(&task.task_type)
 }
 
 fn unavailable_reason(

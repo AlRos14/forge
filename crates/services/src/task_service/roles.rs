@@ -332,8 +332,8 @@ impl TaskService {
             });
         }
 
-        let is_coder_role =
-            self.active_work_role(&task).await?.as_deref() == Some(input.role_name.as_str());
+        let is_coder_role = db::canonical_task_role_name(&input.role_name).as_deref()
+            == self.active_work_role(&task).await?.as_deref();
 
         if !is_coder_role {
             let assignment = self.assign_role_assignment(input).await?;
@@ -423,7 +423,8 @@ impl TaskService {
             return Ok(());
         };
 
-        let is_coder_role = self.active_work_role(&task).await?.as_deref() == Some(role_name);
+        let is_coder_role = db::canonical_task_role_name(role_name).as_deref()
+            == self.active_work_role(&task).await?.as_deref();
         if !is_coder_role {
             TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
             self.publish_role_reassigned(
@@ -483,19 +484,16 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        if workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .is_some_and(|state| state.kind == api_types::StateKind::Terminal)
-        {
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if matches!(
+            lifecycle.state,
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
+        ) {
             return Err(ServiceError::invalid_operation(format!(
-                "task {} is in terminal state {}; cannot reassign role",
-                task.id, task.status
+                "task {} is in terminal lifecycle {}; cannot reassign role",
+                task.id, lifecycle.state
             )));
         }
         Ok(task)
@@ -555,15 +553,6 @@ impl TaskService {
         Ok(())
     }
 
-    async fn workflow_for_task(&self, task: &Task) -> Result<api_types::WorkflowDefinition> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        Ok(WorkflowEngine::resolve_workflow(
-            &project.workflow_definition,
-        ))
-    }
-
     async fn enforce_mode_specific_role_guards(
         &self,
         task: &Task,
@@ -598,7 +587,7 @@ impl TaskService {
                 ));
             }
         }
-        if role_name != "coder" {
+        if db::canonical_task_role_name(role_name).as_deref() != Some("implementer") {
             return Ok(RoleGuardAction::Continue);
         }
 
@@ -608,16 +597,18 @@ impl TaskService {
             ));
         }
 
-        if TaskRepo::list_subtasks_ordered(&*self.db, &task.id)
-            .await?
-            .iter()
-            .any(|s| {
-                s.status != default_states::TODO
-                    && s.status != default_states::DONE
-                    && s.status != default_states::CANCELLED
-            })
-        {
-            return Err(ServiceError::task_sequence_already_started(task.id.clone()));
+        for subtask in TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await? {
+            let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &subtask.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", subtask.id.clone()))?;
+            if !matches!(
+                lifecycle.state,
+                db::TaskLifecycleState::Ready
+                    | db::TaskLifecycleState::Done
+                    | db::TaskLifecycleState::Cancelled
+            ) {
+                return Err(ServiceError::task_sequence_already_started(task.id.clone()));
+            }
         }
 
         Ok(RoleGuardAction::Continue)
@@ -637,21 +628,8 @@ impl TaskService {
     }
 
     async fn active_work_role(&self, task: &Task) -> Result<Option<String>> {
-        let workflow = self.workflow_for_task(task).await?;
-        Ok(workflow
-            .states
-            .iter()
-            .find(|state| state.name == default_states::IN_PROGRESS)
-            .and_then(crate::workflow::effective_role)
-            .map(str::to_owned)
-            .or_else(|| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.kind == api_types::StateKind::Active)
-                    .and_then(crate::workflow::effective_role)
-                    .map(str::to_owned)
-            }))
+        let _ = task;
+        Ok(Some("implementer".to_owned()))
     }
 
     async fn active_execution_for_role(
@@ -659,9 +637,6 @@ impl TaskService {
         task: &Task,
         role_name: &str,
     ) -> Result<Option<Execution>> {
-        if self.role_for_state(task, &task.status).await?.as_deref() != Some(role_name) {
-            return Ok(None);
-        }
         let page = ExecutionRepo::list_by_task(
             &*self.db,
             &task.id,
@@ -674,10 +649,11 @@ impl TaskService {
             },
         )
         .await?;
+        let requested_role = db::canonical_task_role_name(role_name);
         Ok(page.items.into_iter().find(|execution| {
             execution.work_unit_id.is_none()
                 && execution.status == ExecutionStatus::Running
-                && (execution.role == role_name || execution.role == "executor")
+                && db::canonical_task_role_name(&execution.role) == requested_role
         }))
     }
 

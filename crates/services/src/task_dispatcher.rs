@@ -11,12 +11,10 @@ use events::EventBus;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
-use crate::{workflow::engine::WorkflowEngine, Result, TaskService};
+use crate::{Result, TaskService};
 
 mod active_recovery;
-mod helpers;
 mod initial_scheduling;
-mod workspace_blocking;
 
 pub struct TaskDispatcher {
     db: Arc<db::SqliteDb>,
@@ -99,12 +97,8 @@ impl TaskDispatcher {
             if project.paused_at.is_some() {
                 continue;
             }
-            let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-            dispatched += self.dispatch_initial_tasks(&project, &workflow).await?;
-            if self.is_stopped() {
-                break;
-            }
-            dispatched += self.recover_active_tasks(&project, &workflow).await?;
+            dispatched += self.dispatch_initial_tasks(&project).await?;
+            dispatched += self.recover_auto_cancelled_tasks(&project).await?;
         }
 
         tracing::info!(

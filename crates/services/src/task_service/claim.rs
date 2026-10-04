@@ -1,7 +1,5 @@
 use super::workspace::prepare_workspace_owned;
 use super::*;
-use crate::workflow::engine::WorkflowEngine;
-use api_types::{Actor, SystemComponent};
 use db::TaskLifecycleRepo;
 use sqlx::Row;
 
@@ -45,19 +43,9 @@ impl TaskService {
                 project_id: project.id,
             });
         }
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
         let target_status = "in_progress".to_owned();
-        let target_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == target_status)
-            .and_then(crate::workflow::effective_role)
-            .map(str::to_owned);
-        let capacity_statuses = vec![target_status.clone()];
+        let target_role =
+            Some(super::execution::task_role_for_task_type(&task.task_type).to_owned());
         let (assignee_type, agent, assignee_id, max_concurrent_tasks, event_assignee_id) =
             match assignee {
                 Assignee::Agent(agent_id) => {
@@ -118,11 +106,7 @@ impl TaskService {
         let role = target_role
             .clone()
             .unwrap_or_else(|| "implementer".to_owned());
-        let purpose = super::execution::execution_purpose_for_workflow_state(
-            &task.task_type,
-            &target_status,
-            &role,
-        );
+        let purpose = super::execution::execution_purpose_for_task_type(&task.task_type, &role);
         let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
             &self.db,
             &self.workspace_root,
@@ -182,7 +166,6 @@ impl TaskService {
                 expected_version: task.version,
                 source_status: task.status.clone(),
                 target_status: target_status.clone(),
-                capacity_statuses,
                 execution: CreateExecution {
                     id: execution_id.clone(),
                     task_id: task_id.clone(),
@@ -304,65 +287,16 @@ impl TaskService {
                 .map_err(DbError::from)?;
             }
 
-            // Keep the old singleton row as a deterministic, non-authoritative
-            // projection for legacy workspace SQL and public clients.  The
-            // membership above is the only eligibility truth; the claimant is
-            // not automatically the compatibility representative when another
-            // eligible Agent was already present.
-            let projection = sqlx::query(
-                "SELECT actor_kind, actor_id
-                 FROM role_membership
-                 WHERE task_role_id = ? AND status = 'active'
-                 ORDER BY CASE actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
-                          created_at, id
-                 LIMIT 1",
+            let projection_role = legacy_projection_role_name(&canonical_role);
+            crate::project_actor_scope::sync_legacy_role_projection_in_tx(
+                &mut transaction,
+                &claimed.task.id,
+                &task_role_id,
+                &canonical_role,
+                Some(projection_role),
+                None,
             )
-            .bind(&task_role_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(DbError::from)?;
-            let projection_kind: String = projection.get("actor_kind");
-            let projection_id: String = projection.get("actor_id");
-            let projection_assignee_type = if projection_kind == "agent" {
-                "agent"
-            } else {
-                "user"
-            };
-            sqlx::query(
-                "INSERT INTO task_role_assignment
-                    (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(task_id, role_name) DO UPDATE SET
-                    assignee_type = excluded.assignee_type,
-                    assignee_id = excluded.assignee_id,
-                    updated_at = excluded.updated_at",
-            )
-            .bind(new_uuid_v4())
-            .bind(&claimed.task.id)
-            .bind(role_name)
-            .bind(projection_assignee_type)
-            .bind(&projection_id)
-            .bind(&role_now)
-            .bind(&role_now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(DbError::from)?;
-            if canonical_role == "implementer" {
-                sqlx::query(
-                    "UPDATE task
-                     SET assignee_type = ?, assignee_id = ?, updated_at = ?
-                     WHERE id = ?",
-                )
-                .bind(projection_assignee_type)
-                .bind(&projection_id)
-                .bind(&role_now)
-                .bind(&claimed.task.id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(DbError::from)?;
-                claimed.task.assignee_type = Some(projection_assignee_type.to_owned());
-                claimed.task.assignee_id = Some(projection_id);
-            }
+            .await?;
             }
             if agent_id.is_none() {
                 if let (Some(role_name), Some(user_id)) =
@@ -467,59 +401,16 @@ impl TaskService {
                         .await
                         .map_err(DbError::from)?;
                     }
-                    let projection = sqlx::query(
-                        "SELECT actor_kind, actor_id
-                         FROM role_membership
-                         WHERE task_role_id = ? AND status = 'active'
-                         ORDER BY CASE actor_kind WHEN 'agent' THEN 0 ELSE 1 END, created_at, id
-                         LIMIT 1",
+                    let projection_role = legacy_projection_role_name(&canonical_role);
+                    crate::project_actor_scope::sync_legacy_role_projection_in_tx(
+                        &mut transaction,
+                        &claimed.task.id,
+                        &task_role_id,
+                        &canonical_role,
+                        Some(projection_role),
+                        None,
                     )
-                    .bind(&task_role_id)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(DbError::from)?;
-                    if let Some(projection) = projection {
-                        let actor_kind: String = projection.get("actor_kind");
-                        let actor_id: String = projection.get("actor_id");
-                        let projected_assignee_type =
-                            if actor_kind == "agent" { "agent" } else { "user" };
-                        sqlx::query(
-                            "INSERT INTO task_role_assignment
-                                (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)
-                             ON CONFLICT(task_id, role_name) DO UPDATE SET
-                                assignee_type = excluded.assignee_type,
-                                assignee_id = excluded.assignee_id,
-                                updated_at = excluded.updated_at",
-                        )
-                        .bind(new_uuid_v4())
-                        .bind(&claimed.task.id)
-                        .bind(role_name)
-                        .bind(projected_assignee_type)
-                        .bind(&actor_id)
-                        .bind(&role_now)
-                        .bind(&role_now)
-                        .execute(&mut *transaction)
-                        .await
-                        .map_err(DbError::from)?;
-                        if canonical_role == "implementer" {
-                            sqlx::query(
-                                "UPDATE task
-                                 SET assignee_type = ?, assignee_id = ?, updated_at = ?
-                                 WHERE id = ?",
-                            )
-                            .bind(projected_assignee_type)
-                            .bind(&actor_id)
-                            .bind(&role_now)
-                            .bind(&claimed.task.id)
-                            .execute(&mut *transaction)
-                            .await
-                            .map_err(DbError::from)?;
-                            claimed.task.assignee_type =
-                                Some(projected_assignee_type.to_owned());
-                            claimed.task.assignee_id = Some(actor_id);
-                        }
-                    }
+                    .await?;
                 }
                 }
             }
@@ -628,27 +519,6 @@ impl TaskService {
         Ok(claimed)
     }
 
-    pub(super) async fn role_for_state(
-        &self,
-        task: &Task,
-        state_name: &str,
-    ) -> Result<Option<String>> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        Ok(workflow
-            .states
-            .iter()
-            .find(|state| state.name == state_name)
-            .and_then(crate::workflow::effective_role)
-            .map(str::to_owned))
-    }
-
     async fn ensure_claim_role_available(
         &self,
         task_id: &str,
@@ -704,5 +574,12 @@ impl TaskService {
             }
         }
         Ok(())
+    }
+}
+
+fn legacy_projection_role_name(canonical_role: &str) -> &str {
+    match canonical_role {
+        "implementer" => crate::workflow::default_roles::CODER,
+        role => role,
     }
 }

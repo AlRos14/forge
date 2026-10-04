@@ -3788,6 +3788,23 @@ pub struct TaskLifecycleTransitionIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLifecycleTransitionFact {
+    pub id: String,
+    pub task_id: String,
+    pub from_state: TaskLifecycleState,
+    pub to_state: TaskLifecycleState,
+    pub from_version: i64,
+    pub to_version: i64,
+    pub cause_kind: String,
+    pub cause_ref: Option<String>,
+    pub gate_evaluation_id: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub domain_event_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskLifecycleTransitionWrite {
     pub lifecycle: TaskLifecycle,
     pub transition_id: String,

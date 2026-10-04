@@ -366,7 +366,11 @@ pub(crate) fn apply_route_outcome_to_snapshot(
         .get(executors::ROUTING_SNAPSHOT_KEY)
         .and_then(Value::as_object)
         .is_some();
-    if !has_routing && outcome.selected.is_none() {
+    if !has_routing
+        && outcome.selected.is_none()
+        && outcome.attempts.is_empty()
+        && outcome.unavailable_retry_at.is_none()
+    {
         return Ok(None);
     }
     if let Some((candidate_key, executor_type, config, _, _)) = &outcome.selected {
@@ -415,6 +419,27 @@ pub(crate) fn apply_route_outcome_to_snapshot(
         }
     }
     if !has_routing {
+        let attempts = outcome
+            .attempts
+            .iter()
+            .map(|(candidate_key, outcome)| {
+                json!({"candidate_key": candidate_key, "outcome": outcome})
+            })
+            .collect::<Vec<_>>();
+        let disposition = outcome.unavailable_retry_at.as_ref().map(|retry_at| {
+            json!({
+                "failure_class": "executor_unavailable",
+                "retry_at": retry_at,
+            })
+        });
+        object.insert(
+            executors::ROUTING_SNAPSHOT_KEY.to_owned(),
+            json!({
+                "selected_candidate_key": outcome.selected.as_ref().map(|selected| &selected.0),
+                "attempts": attempts,
+                "disposition": disposition,
+            }),
+        );
         return serde_json::to_string(&snapshot).map(Some).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
         });
@@ -1196,6 +1221,30 @@ mod tests {
         assert_eq!(
             updated["harness_capabilities"]["capabilities"]["resume"],
             "native"
+        );
+    }
+
+    #[test]
+    fn executor_unavailable_disposition_is_persisted_without_a_candidate_list() {
+        let snapshot = json!({"executor_type":"embedded","config":{}}).to_string();
+        let outcome = RouteOutcome {
+            attempts: vec![("embedded:default".to_owned(), "unavailable".to_owned())],
+            unavailable_retry_at: Some(None),
+            ..RouteOutcome::default()
+        };
+
+        let updated = apply_route_outcome_to_snapshot(&snapshot, &outcome)
+            .expect("unavailable outcome applies")
+            .expect("unavailable disposition is durable");
+        let updated: Value = serde_json::from_str(&updated).expect("snapshot parses");
+        assert_eq!(
+            updated[executors::ROUTING_SNAPSHOT_KEY]["disposition"]["failure_class"],
+            "executor_unavailable"
+        );
+        assert!(updated[executors::ROUTING_SNAPSHOT_KEY]["disposition"]["retry_at"].is_null());
+        assert_eq!(
+            updated[executors::ROUTING_SNAPSHOT_KEY]["attempts"][0]["outcome"],
+            "unavailable"
         );
     }
 

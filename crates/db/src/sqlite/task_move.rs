@@ -220,6 +220,8 @@ impl TaskBoardRepo for SqliteDb {
                     "to_state": target_state,
                     "cause_kind": "actor",
                     "cause_ref": input.triggered_by,
+                    "reason_kind": "board_move",
+                    "reason_ref": input.operation_id,
                 })
                 .to_string(),
                 created_at: input.updated_at.clone(),

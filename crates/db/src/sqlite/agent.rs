@@ -446,7 +446,7 @@ impl AgentRepo for SqliteDb {
                 (
                     SELECT COUNT(DISTINCT task.id)
                     FROM task
-                    JOIN project ON project.id = task.project_id
+                    JOIN task_lifecycle lifecycle ON lifecycle.task_id = task.id
                     WHERE (
                         EXISTS (
                         SELECT 1
@@ -469,36 +469,7 @@ impl AgentRepo for SqliteDb {
                         )
                     )
                       AND task.deleted_at IS NULL
-                      AND (
-                          EXISTS (
-                              SELECT 1
-                              FROM json_each(
-                                  CASE
-                                      WHEN json_valid(project.workflow_definition)
-                                      THEN project.workflow_definition
-                                      ELSE '{\"states\":[]}'
-                                  END,
-                                  '$.states'
-                              ) AS workflow_state
-                              WHERE json_extract(workflow_state.value, '$.name') = task.status
-                                AND json_extract(workflow_state.value, '$.kind') IN ('active', 'gate')
-                          )
-                          OR (
-                              task.status IN ('in_progress', 'review', 'merging')
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                  FROM json_each(
-                                      CASE
-                                          WHEN json_valid(project.workflow_definition)
-                                          THEN project.workflow_definition
-                                          ELSE '{\"states\":[]}'
-                                      END,
-                                      '$.states'
-                                  ) AS workflow_state
-                                  WHERE json_extract(workflow_state.value, '$.name') = task.status
-                              )
-                          )
-                      )
+                      AND lifecycle.state = 'active'
                 ) +
                 (
                     SELECT COUNT(*)

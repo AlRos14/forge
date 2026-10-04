@@ -124,7 +124,7 @@ impl TaskService {
         }
         self.validate_actor_for_task(&task, &actor_ref).await?;
         let fallback_role = self
-            .workflow_role_for_canonical(&task, &task_role.role)
+            .legacy_projection_role_name(&task, &task_role.role)
             .await?;
         let now = now_rfc3339();
         let membership_id = new_uuid_v4();
@@ -221,7 +221,7 @@ impl TaskService {
             self.validate_actor_for_task(&task, actor_ref).await?;
         }
         let fallback_role = self
-            .workflow_role_for_canonical(&task, &canonical_role)
+            .legacy_projection_role_name(&task, &canonical_role)
             .await?;
 
         let mut transaction = self.db.pool().begin().await?;
@@ -367,7 +367,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let fallback_role = self.workflow_role_for_canonical(&task, &role.role).await?;
+        let fallback_role = self.legacy_projection_role_name(&task, &role.role).await?;
         let updated_at = now_rfc3339();
         let ended_at = (status == RoleMembershipStatus::Ended).then(|| updated_at.clone());
         let mut transaction = self.db.pool().begin().await?;
@@ -524,24 +524,19 @@ impl TaskService {
         .await
     }
 
-    async fn workflow_role_for_canonical(
+    async fn legacy_projection_role_name(
         &self,
-        task: &db::Task,
+        _task: &db::Task,
         canonical: &str,
     ) -> Result<Option<String>> {
-        // The task's workflow is the only compatibility context that can tell
-        // whether the old public label was `coder`, `worker`, or another
-        // workflow role.  This projection is never used for eligibility.
-        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
-            return Ok(None);
+        // The legacy role row is a one-way projection. Use a fixed historical
+        // spelling for implementer; project WorkflowDefinitions do not choose
+        // role identity or membership eligibility.
+        let projected = match canonical {
+            "implementer" => "coder",
+            role => role,
         };
-        let workflow =
-            crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        Ok(workflow
-            .roles
-            .into_iter()
-            .find(|role| db::canonical_task_role_name(&role.name).as_deref() == Some(canonical))
-            .map(|role| role.name))
+        Ok(Some(projected.to_owned()))
     }
 }
 

@@ -59,6 +59,42 @@ impl TaskLifecycleService {
         Ok(TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id).await?)
     }
 
+    pub async fn block(
+        &self,
+        task_id: &str,
+        cause: LifecycleCause,
+        reason_kind: impl Into<String>,
+        reason_ref: impl Into<String>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<TaskLifecycleTransitionResult> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+        if matches!(
+            lifecycle.state,
+            TaskLifecycleState::Blocked | TaskLifecycleState::Done | TaskLifecycleState::Cancelled
+        ) {
+            return Ok(TaskLifecycleTransitionResult {
+                task,
+                lifecycle,
+                transition: None,
+            });
+        }
+        self.transition(TransitionLifecycleInput {
+            task_id: task.id,
+            expected_task_version: task.version,
+            to_state: TaskLifecycleState::Blocked,
+            cause,
+            reason_kind: Some(reason_kind.into()),
+            reason_ref: Some(reason_ref.into()),
+            idempotency_key: idempotency_key.into(),
+        })
+        .await
+    }
+
     pub async fn transition(
         &self,
         input: TransitionLifecycleInput,
@@ -96,21 +132,65 @@ impl TaskLifecycleService {
                 transition: Some(transition),
             });
         }
+        if matches!(
+            input.to_state,
+            TaskLifecycleState::Ready | TaskLifecycleState::Active
+        ) && crate::task_failure_retry::TaskFailureRetryService::has_exhausted_retry_budget(
+            &self.db,
+            &input.task_id,
+        )
+        .await?
+        {
+            return Err(ServiceError::invalid_operation(
+                "Task retry budget is exhausted; runnable lifecycle states are fenced",
+            ));
+        }
         if task.version != input.expected_task_version {
             return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
                 expected: input.expected_task_version,
                 actual: task.version,
             }));
         }
-        if lifecycle.state == input.to_state {
-            return Ok(TaskLifecycleTransitionResult {
-                task,
-                lifecycle,
-                transition: None,
-            });
-        }
         if !allowed_transition(lifecycle.state, input.to_state) {
             return Err(ServiceError::Db(db::DbError::InvalidTransition));
+        }
+        if lifecycle.state == TaskLifecycleState::ReadyToMerge
+            && input.to_state == TaskLifecycleState::Active
+            && cause.kind != "gate_evaluation"
+        {
+            let exact_retry_rework = if cause.kind == "domain_event" {
+                match cause.cause_ref.as_deref() {
+                    Some(event_id) => {
+                        if let Some(event) = DomainEventRepo::get_event(&*self.db, event_id).await?
+                        {
+                            let failure_ref =
+                                serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                                    .ok()
+                                    .and_then(|payload| {
+                                        payload
+                                            .get("failure_ref")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::to_owned)
+                                    });
+                            failure_ref.as_deref() == input.reason_ref.as_deref()
+                                && crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+                                    &self.db, &event,
+                                )
+                                .await?
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !exact_retry_rework {
+                return Err(ServiceError::invalid_operation(
+                    "ready_to_merge can return to active only from a new exact GateEvaluation or exact retry receipt",
+                ));
+            }
         }
         if input.to_state == TaskLifecycleState::Merging {
             return Err(ServiceError::invalid_operation(
@@ -118,19 +198,22 @@ impl TaskLifecycleService {
             ));
         }
         if let Some(evaluation_id) = cause.gate_evaluation_id.as_deref() {
-            let evaluation = GateRepo::get_gate_evaluation(&*self.db, evaluation_id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::not_found("GateEvaluation", evaluation_id.to_owned())
-                })?;
-            let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
-            if evaluation.task_id != task.id || gate.task_id != task.id {
-                return Err(ServiceError::invalid_operation(
-                    "GateEvaluation lifecycle cause belongs to another Task",
-                ));
-            }
+            self.validate_gate_lifecycle_cause(
+                &task.id,
+                lifecycle.state,
+                input.to_state,
+                lifecycle.reason_ref.as_deref(),
+                input.reason_ref.as_deref(),
+                evaluation_id,
+            )
+            .await?;
+        }
+        if lifecycle.state == input.to_state {
+            return Ok(TaskLifecycleTransitionResult {
+                task,
+                lifecycle,
+                transition: None,
+            });
         }
         if input.to_state == TaskLifecycleState::Done && cause.kind != "merge_operation" {
             return Err(ServiceError::invalid_operation(
@@ -144,33 +227,6 @@ impl TaskLifecycleService {
             return Err(ServiceError::invalid_operation(
                 "failed merge lifecycle transition requires its exact TaskMerge operation",
             ));
-        }
-
-        if input.to_state == TaskLifecycleState::ReadyToMerge {
-            let evaluation_id = cause.gate_evaluation_id.as_deref().ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "merge lifecycle transition requires its exact satisfied GateEvaluation",
-                )
-            })?;
-            let evaluation = GateRepo::get_gate_evaluation(&*self.db, evaluation_id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::not_found("GateEvaluation", evaluation_id.to_owned())
-                })?;
-            let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
-            if evaluation.task_id != task.id
-                || evaluation.outcome != GateEvaluationOutcome::Satisfied
-                || gate.gate_kind != "merge_readiness"
-                || gate.scope_kind != db::GateScopeKind::Task
-                || gate.scope_id != task.id
-                || gate.active_policy_revision != Some(evaluation.policy_revision)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "GateEvaluation does not authorize this exact merge lifecycle transition",
-                ));
-            }
         }
 
         let now = now_rfc3339();
@@ -238,6 +294,55 @@ impl TaskLifecycleService {
             lifecycle: write.lifecycle.clone(),
             transition: Some(write),
         })
+    }
+
+    async fn validate_gate_lifecycle_cause(
+        &self,
+        task_id: &str,
+        from_state: TaskLifecycleState,
+        to_state: TaskLifecycleState,
+        current_reason_ref: Option<&str>,
+        reason_ref: Option<&str>,
+        evaluation_id: &str,
+    ) -> Result<()> {
+        let evaluation = GateRepo::get_gate_evaluation(&*self.db, evaluation_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("GateEvaluation", evaluation_id.to_owned()))?;
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        let is_merge_readiness = evaluation.task_id == task_id
+            && gate.task_id == task_id
+            && gate.gate_kind == "merge_readiness"
+            && gate.scope_kind == db::GateScopeKind::Task
+            && gate.scope_id == task_id
+            && gate.active_policy_revision == Some(evaluation.policy_revision);
+        let is_supported_edge = match (from_state, to_state) {
+            (TaskLifecycleState::Active, TaskLifecycleState::ReadyToMerge) => {
+                evaluation.outcome == GateEvaluationOutcome::Satisfied
+                    && reason_ref == Some(evaluation_id)
+            }
+            (TaskLifecycleState::ReadyToMerge, TaskLifecycleState::Active) => {
+                current_reason_ref != Some(evaluation_id) && reason_ref == Some(evaluation_id)
+            }
+            _ => false,
+        };
+        if !is_merge_readiness
+            || !is_supported_edge
+            || !GateRepo::is_latest_gate_evaluation(
+                &*self.db,
+                &gate.id,
+                evaluation.policy_revision,
+                evaluation_id,
+            )
+            .await?
+            || !GateRepo::gate_evaluation_inputs_are_current(&*self.db, evaluation_id).await?
+        {
+            return Err(ServiceError::invalid_operation(
+                "GateEvaluation is stale or does not authorize this exact merge lifecycle edge",
+            ));
+        }
+        Ok(())
     }
 
     async fn validate_cause(&self, task_id: &str, cause: &LifecycleCause) -> Result<()> {
@@ -355,6 +460,7 @@ fn allowed_transition(from: TaskLifecycleState, to: TaskLifecycleState) -> bool 
     matches!(
         (from, to),
         (S::Backlog, S::Ready | S::Cancelled)
+            | (S::Backlog, S::Blocked)
             | (S::Ready, S::Active | S::Blocked | S::Cancelled)
             | (
                 S::Active,
@@ -400,13 +506,16 @@ pub fn legacy_status_projection(state: TaskLifecycleState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate_engine::{GateEngine, GatePolicyDocument, ValidationRequirement};
+    use crate::gate_engine::{
+        GateEngine, GatePolicyDocument, GateScopeRequirement, ValidationRequirement,
+    };
     use db::{
         CreateDomainEvent, CreateEvidence, CreateProject, CreateRepo, CreateTask,
-        CreateTaskIntegrationOperation, CreateValidationRun, CreateWorkspace, FinishValidationRun,
-        GateScopeKind, ProjectRepo, RepoRepo, TaskIntegrationOperationKind,
-        TaskIntegrationOperationRepo, TaskLifecycleRepo, ValidationRunRepo, ValidationRunStatus,
-        WorkMode, WorkspaceRepo, WorkspaceStatus,
+        CreateTaskIntegrationOperation, CreateValidationRun, CreateWorkspace,
+        FinishTaskIntegrationOperation, FinishValidationRun, GateScopeKind, ProjectRepo, RepoRepo,
+        TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
+        TaskLifecycleRepo, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceRepo,
+        WorkspaceStatus,
     };
     use sha2::Digest;
 
@@ -527,6 +636,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_records_aggregate_lifecycle_and_keeps_legacy_annotation_out_of_authority() {
+        let (db, event_bus, task) = seeded_ready_task().await;
+        let service = TaskLifecycleService::new(Arc::clone(&db), event_bus);
+        let blocked = service
+            .block(
+                &task.id,
+                LifecycleCause::System(SystemComponent::TaskDispatcher),
+                "executor_unavailable",
+                "execution:unavailable-1",
+                "executor-unavailable:execution:unavailable-1",
+            )
+            .await
+            .expect("block transition commits");
+        assert_eq!(blocked.lifecycle.state, TaskLifecycleState::Blocked);
+        assert_eq!(
+            blocked.lifecycle.reason_kind.as_deref(),
+            Some("executor_unavailable")
+        );
+        assert_eq!(
+            blocked.lifecycle.reason_ref.as_deref(),
+            Some("execution:unavailable-1")
+        );
+        assert!(blocked.transition.is_some());
+
+        let replay = service
+            .block(
+                &task.id,
+                LifecycleCause::System(SystemComponent::TaskDispatcher),
+                "executor_unavailable",
+                "execution:unavailable-1",
+                "executor-unavailable:execution:unavailable-1",
+            )
+            .await
+            .expect("repeated block is stable");
+        assert_eq!(replay.lifecycle.version, blocked.lifecycle.version);
+        assert!(replay.transition.is_none());
+    }
+
+    #[tokio::test]
     async fn lifecycle_transition_fences_versions_and_replays_one_exact_receipt() {
         let (db, event_bus, task) = seeded_ready_task().await;
         let service = TaskLifecycleService::new(Arc::clone(&db), event_bus);
@@ -594,6 +742,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_lifecycle_transitions_commit_one_version_fenced_winner() {
+        let (db, event_bus, task) = seeded_ready_task().await;
+        let service = TaskLifecycleService::new(Arc::clone(&db), event_bus);
+        let input = |idempotency_key: &str| TransitionLifecycleInput {
+            task_id: task.id.clone(),
+            expected_task_version: task.version,
+            to_state: TaskLifecycleState::Active,
+            cause: LifecycleCause::Actor(Actor::user(api_types::UserActionSource::Test)),
+            reason_kind: Some("concurrent_start".to_owned()),
+            reason_ref: Some(idempotency_key.to_owned()),
+            idempotency_key: idempotency_key.to_owned(),
+        };
+        let (left, right) = tokio::join!(
+            service.transition(input("concurrent-transition:left")),
+            service.transition(input("concurrent-transition:right")),
+        );
+        assert_ne!(left.is_ok(), right.is_ok());
+        let loser = if left.is_err() { left } else { right };
+        assert!(matches!(
+            loser,
+            Err(ServiceError::Db(
+                db::DbError::TaskVersionConflict { .. } | db::DbError::VersionConflict
+            ))
+        ));
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+        assert_eq!(lifecycle.version, 2);
+        let transition_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("lifecycle transition count");
+        assert_eq!(transition_count, 1);
+    }
+
+    #[tokio::test]
     async fn gate_evaluations_are_deterministic_immutable_and_revision_scoped() {
         let (db, event_bus, task) = seeded_ready_task().await;
         let engine = GateEngine::new(Arc::clone(&db), event_bus);
@@ -614,6 +802,7 @@ mod tests {
         };
         let policy = |config_digest: &str| GatePolicyDocument {
             schema_version: 1,
+            scope_requirement: None,
             review: None,
             validations: vec![ValidationRequirement {
                 config_digest: config_digest.to_owned(),
@@ -811,6 +1000,7 @@ mod tests {
             .expect("merge-readiness Gate");
         let policy = |policy_config_digest: &str| GatePolicyDocument {
             schema_version: 1,
+            scope_requirement: None,
             review: None,
             validations: vec![ValidationRequirement {
                 validation_run_id: run_id.clone(),
@@ -841,10 +1031,11 @@ mod tests {
         let evaluation_event = direct_evaluation
             .event
             .as_ref()
-            .expect("evaluation event is durable");
+            .expect("evaluation event is durable")
+            .clone();
         assert_eq!(
             gate_engine
-                .process_domain_event(evaluation_event)
+                .process_domain_event(&evaluation_event)
                 .await
                 .expect("replay applies exact GateEvaluation lifecycle effect"),
             0
@@ -862,6 +1053,180 @@ mod tests {
                 .expect("evaluation")
                 .outcome,
             GateEvaluationOutcome::Satisfied
+        );
+
+        let ready_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task lookup")
+            .expect("Task");
+        let same_evaluation_demotion = lifecycle
+            .transition(TransitionLifecycleInput {
+                task_id: task.id.clone(),
+                expected_task_version: ready_task.version,
+                to_state: TaskLifecycleState::Active,
+                cause: LifecycleCause::GateEvaluation(exact_evaluation_id.clone()),
+                reason_kind: Some("merge_readiness_rechecked".to_owned()),
+                reason_ref: Some(exact_evaluation_id.clone()),
+                idempotency_key: "gate-readiness:reject-same-evaluation-demotion".to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            same_evaluation_demotion,
+            Err(ServiceError::InvalidOperation { .. })
+        ));
+
+        let actor_demotion = lifecycle
+            .transition(TransitionLifecycleInput {
+                task_id: task.id.clone(),
+                expected_task_version: ready_task.version,
+                to_state: TaskLifecycleState::Active,
+                cause: LifecycleCause::Actor(Actor::user(api_types::UserActionSource::Test)),
+                reason_kind: Some("rework_requested".to_owned()),
+                reason_ref: Some("review changed after readiness".to_owned()),
+                idempotency_key: "gate-readiness:reject-actor-demotion".to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            actor_demotion,
+            Err(ServiceError::InvalidOperation { .. })
+        ));
+
+        let merge_operation_id = new_uuid_v4();
+        let merge_operation = TaskIntegrationOperationRepo::begin(
+            &*db,
+            CreateTaskIntegrationOperation {
+                id: merge_operation_id.clone(),
+                task_id: task.id.clone(),
+                kind: TaskIntegrationOperationKind::TaskMerge,
+                owner_id: "gate-scope-test".to_owned(),
+                gate_evaluation_id: Some(exact_evaluation_id.clone()),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("exact merge admission");
+        let merge_scope_policy = GatePolicyDocument {
+            schema_version: 1,
+            scope_requirement: Some(GateScopeRequirement::MergeOperation {
+                operation_id: merge_operation.id.clone(),
+                version: merge_operation.version,
+                expected_status: merge_operation.status.to_string(),
+                gate_evaluation_id: exact_evaluation_id.clone(),
+            }),
+            review: None,
+            validations: Vec::new(),
+            decisions: Vec::new(),
+            work_units: Vec::new(),
+        };
+        let (merge_operation_gate, _) = gate_engine
+            .create_gate_with_initial_policy(
+                &task.id,
+                "merge_operation_audit",
+                GateScopeKind::MergeOperation,
+                &merge_operation.id,
+                merge_scope_policy,
+            )
+            .await
+            .expect("merge-operation-scoped Gate");
+        let merge_scope_evaluation = gate_engine
+            .evaluate_active(&merge_operation_gate.id)
+            .await
+            .expect("merge operation Gate evaluation");
+        assert_eq!(
+            merge_scope_evaluation.evaluation.outcome,
+            GateEvaluationOutcome::Satisfied
+        );
+        assert_eq!(merge_scope_evaluation.inputs.len(), 1);
+        assert_eq!(
+            merge_scope_evaluation.inputs[0].input_kind,
+            "merge_operation"
+        );
+        assert_eq!(
+            merge_scope_evaluation.inputs[0].input_id,
+            merge_operation.id
+        );
+        assert!(GateRepo::gate_evaluation_inputs_are_current(
+            &*db,
+            &merge_scope_evaluation.evaluation.id
+        )
+        .await
+        .expect("merge operation input currentness"));
+
+        TaskIntegrationOperationRepo::finish(
+            &*db,
+            FinishTaskIntegrationOperation {
+                id: merge_operation_id.clone(),
+                expected_version: merge_operation.version,
+                status: TaskIntegrationOperationStatus::Failed,
+                updated_at: now_rfc3339(),
+                finished_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("merge operation failure is durable");
+        assert!(!GateRepo::gate_evaluation_inputs_are_current(
+            &*db,
+            &merge_scope_evaluation.evaluation.id
+        )
+        .await
+        .expect("finished merge makes the running input stale"));
+        let merge_finished_event = db::DomainEventRepo::get_event_by_dedupe(
+            &*db,
+            &format!("task-merge-terminal:{merge_operation_id}"),
+        )
+        .await
+        .expect("merge terminal event query")
+        .expect("durable merge terminal event");
+        assert_eq!(
+            gate_engine
+                .process_domain_event(&merge_finished_event)
+                .await
+                .expect("operation fact reevaluation"),
+            1
+        );
+        let failed_scope_evaluation = GateRepo::get_gate_evaluation_for_cause(
+            &*db,
+            &merge_operation_gate.id,
+            &merge_finished_event.id,
+        )
+        .await
+        .expect("replayed exact operation-scoped evaluation")
+        .expect("new evaluation for terminal operation state");
+        assert_eq!(
+            failed_scope_evaluation.outcome,
+            GateEvaluationOutcome::Unsatisfied
+        );
+
+        let ready_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task lookup")
+            .expect("Task");
+        TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .transition(TransitionLifecycleInput {
+                task_id: task.id.clone(),
+                expected_task_version: ready_task.version,
+                to_state: TaskLifecycleState::Active,
+                cause: LifecycleCause::Actor(api_types::Actor::user(
+                    api_types::UserActionSource::Test,
+                )),
+                reason_kind: Some("reopen_after_readiness".to_owned()),
+                reason_ref: Some("exercise exact evaluation replay".to_owned()),
+                idempotency_key: "test:reopen-after-readiness".to_owned(),
+            })
+            .await
+            .expect("explicit re-entry to active lifecycle");
+        gate_engine
+            .process_domain_event(&evaluation_event)
+            .await
+            .expect("replaying an already-applied GateEvaluation is a no-op");
+        assert_eq!(
+            TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+                .await
+                .expect("lifecycle lookup")
+                .expect("lifecycle")
+                .state,
+            TaskLifecycleState::Active,
+            "replay must not reapply a previously committed lifecycle transition"
         );
         gate_engine
             .revise_policy(&gate.id, Some(1), policy(&"e".repeat(64)))
@@ -887,6 +1252,465 @@ mod tests {
             revoked.reason_ref.as_deref(),
             Some(exact_evaluation_id.as_str())
         );
+
+        let exact_validation = ValidationRequirement {
+            validation_run_id: run_id.clone(),
+            evidence_id: evidence_id.clone(),
+            evidence_digest: evidence_digest.clone(),
+            check_identity: check_identity.clone(),
+            config_digest: config_digest.clone(),
+            workspace_id: workspace_id.clone(),
+            commit_sha: commit_sha.clone(),
+            workspace_snapshot_digest: snapshot_digest.clone(),
+            required_outcome: ValidationRunStatus::Passed,
+        };
+        let validation_policy = |requirement| GatePolicyDocument {
+            schema_version: 1,
+            scope_requirement: None,
+            review: None,
+            validations: vec![requirement],
+            decisions: Vec::new(),
+            work_units: Vec::new(),
+        };
+        let (validation_gate, _) = gate_engine
+            .create_gate_with_initial_policy(
+                &task.id,
+                "validation_exactness_probe",
+                GateScopeKind::Task,
+                &task.id,
+                validation_policy(exact_validation.clone()),
+            )
+            .await
+            .expect("exact validation Gate");
+        let exact = gate_engine
+            .evaluate_active(&validation_gate.id)
+            .await
+            .expect("exact PASS validation and Evidence");
+        assert_eq!(exact.evaluation.outcome, GateEvaluationOutcome::Satisfied);
+
+        let mut mismatches = Vec::new();
+        let mut wrong_check = exact_validation.clone();
+        wrong_check.check_identity.push_str(" changed");
+        mismatches.push(wrong_check);
+        let mut wrong_config = exact_validation.clone();
+        wrong_config.config_digest = "f".repeat(64);
+        mismatches.push(wrong_config);
+        let mut wrong_workspace = exact_validation.clone();
+        wrong_workspace.workspace_id.push_str("-other");
+        mismatches.push(wrong_workspace);
+        let mut stale_commit = exact_validation.clone();
+        stale_commit.commit_sha = "e".repeat(40);
+        mismatches.push(stale_commit);
+        let mut stale_snapshot = exact_validation.clone();
+        stale_snapshot.workspace_snapshot_digest = "f".repeat(64);
+        mismatches.push(stale_snapshot);
+        let mut wrong_outcome = exact_validation;
+        wrong_outcome.required_outcome = ValidationRunStatus::Failed;
+        mismatches.push(wrong_outcome);
+
+        let mut policy_revision = 1;
+        for requirement in mismatches {
+            gate_engine
+                .revise_policy(
+                    &validation_gate.id,
+                    Some(policy_revision),
+                    validation_policy(requirement),
+                )
+                .await
+                .expect("append immutable mismatch policy");
+            policy_revision += 1;
+            let evaluation = gate_engine
+                .evaluate_active(&validation_gate.id)
+                .await
+                .expect("mismatched exact validation remains unsatisfied");
+            assert_eq!(
+                evaluation.evaluation.outcome,
+                GateEvaluationOutcome::Unsatisfied
+            );
+        }
+
+        let supplemental_run_id = new_uuid_v4();
+        let supplemental_evidence_id = new_uuid_v4();
+        let supplemental_check = "cargo fmt --all -- --check".to_owned();
+        let supplemental_summary = r#"{"source":"lifecycle rework regression"}"#.to_owned();
+        let supplemental_config_digest = sha256(supplemental_summary.as_bytes());
+        let supplemental_now = now_rfc3339();
+        let supplemental_started = ValidationRunRepo::start_validation_run(
+            &*db,
+            CreateValidationRun {
+                id: supplemental_run_id.clone(),
+                task_id: task.id.clone(),
+                work_unit_id: None,
+                caused_by_execution_id: None,
+                check_identity: supplemental_check.clone(),
+                command: supplemental_check.clone(),
+                config_summary_json: supplemental_summary,
+                config_digest: supplemental_config_digest.clone(),
+                workspace_id: workspace_id.clone(),
+                commit_sha: commit_sha.clone(),
+                workspace_snapshot_digest: snapshot_digest.clone(),
+                idempotency_key: "validation-run:lifecycle-rework-regression".to_owned(),
+                started_at: supplemental_now.clone(),
+                created_at: supplemental_now.clone(),
+                updated_at: supplemental_now.clone(),
+            },
+            event(
+                "validation_run.started",
+                "validation_run",
+                &supplemental_run_id,
+                &task.id,
+                "validation-run-started:lifecycle-rework-regression",
+                &supplemental_now,
+            ),
+        )
+        .await
+        .expect("supplemental exact ValidationRun starts");
+        assert!(ValidationRunRepo::claim_validation_run(
+            &*db,
+            &supplemental_run_id,
+            "lifecycle-rework-owner",
+            &supplemental_now,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .expect("supplemental ValidationRun claim"));
+        let supplemental_finished = now_rfc3339();
+        let supplemental_content = serde_json::json!({
+            "validation_run_id": supplemental_run_id,
+            "task_id": task.id,
+            "check_identity": supplemental_check,
+            "command": supplemental_check,
+            "config_digest": supplemental_config_digest,
+            "workspace_id": workspace_id,
+            "commit_sha": commit_sha,
+            "workspace_snapshot_digest": snapshot_digest,
+            "status": "passed",
+            "exit_code": 0,
+            "started_at": supplemental_started.validation_run.started_at,
+            "finished_at": supplemental_finished,
+        })
+        .to_string();
+        let supplemental_evidence_digest = sha256(supplemental_content.as_bytes());
+        ValidationRunRepo::finish_validation_run(
+            &*db,
+            FinishValidationRun {
+                id: supplemental_run_id.clone(),
+                claim_owner: "lifecycle-rework-owner".to_owned(),
+                status: ValidationRunStatus::Passed,
+                exit_code: Some(0),
+                finished_at: supplemental_finished.clone(),
+                logs_ref: format!("validation-evidence://{supplemental_evidence_id}"),
+                evidence: vec![CreateEvidence {
+                    id: supplemental_evidence_id.clone(),
+                    task_id: task.id.clone(),
+                    validation_run_id: supplemental_run_id.clone(),
+                    evidence_key: "check-output".to_owned(),
+                    kind: "deterministic_check_output".to_owned(),
+                    content_json: supplemental_content,
+                    digest: supplemental_evidence_digest.clone(),
+                    created_at: supplemental_finished.clone(),
+                }],
+                validation_report: None,
+                events: vec![event(
+                    "validation_run.completed",
+                    "validation_run",
+                    &supplemental_run_id,
+                    &task.id,
+                    "validation-run-terminal:lifecycle-rework-regression",
+                    &supplemental_finished,
+                )],
+            },
+        )
+        .await
+        .expect("supplemental exact ValidationRun passes");
+        let mut rework_policy = policy(&config_digest);
+        rework_policy.validations.push(ValidationRequirement {
+            validation_run_id: supplemental_run_id,
+            evidence_id: supplemental_evidence_id,
+            evidence_digest: supplemental_evidence_digest,
+            check_identity: "cargo fmt --all -- --check".to_owned(),
+            config_digest: sha256(br#"{"source":"lifecycle rework regression"}"#),
+            workspace_id: workspace_id.clone(),
+            commit_sha: commit_sha.clone(),
+            workspace_snapshot_digest: snapshot_digest.clone(),
+            required_outcome: ValidationRunStatus::Passed,
+        });
+        gate_engine
+            .revise_policy(&gate.id, Some(2), rework_policy)
+            .await
+            .expect("new exact policy revalidates merge readiness");
+        let readiness_policy_event = db::DomainEventRepo::get_event_by_dedupe(
+            &*db,
+            &format!("gate.policy_revised:{}:policy:3", gate.id),
+        )
+        .await
+        .expect("policy event lookup")
+        .expect("exact merge-readiness policy revision");
+        assert_eq!(
+            gate_engine
+                .process_domain_event(&readiness_policy_event)
+                .await
+                .expect("new merge-readiness evaluation"),
+            1
+        );
+        let readiness_evaluation =
+            GateRepo::get_gate_evaluation_for_cause(&*db, &gate.id, &readiness_policy_event.id)
+                .await
+                .expect("GateEvaluation lookup")
+                .expect("new exact satisfied evaluation");
+        let readiness_evaluation_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE event_type = 'gate.evaluated' AND entity_id = ?",
+        )
+        .bind(&readiness_evaluation.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("durable GateEvaluation event");
+        let readiness_evaluation_event =
+            db::DomainEventRepo::get_event(&*db, &readiness_evaluation_event_id)
+                .await
+                .expect("GateEvaluation event lookup")
+                .expect("GateEvaluation event");
+        gate_engine
+            .process_domain_event(&readiness_evaluation_event)
+            .await
+            .expect("exact satisfied GateEvaluation moves lifecycle to merge-ready");
+        assert_eq!(
+            TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+                .await
+                .expect("lifecycle lookup")
+                .expect("lifecycle")
+                .state,
+            TaskLifecycleState::ReadyToMerge
+        );
+
+        let failed_execution_id = new_uuid_v4();
+        let (_, failed_execution_event) = ExecutionRepo::create_with_event(
+            &*db,
+            db::CreateExecution {
+                id: failed_execution_id.clone(),
+                task_id: task.id.clone(),
+                agent_id: None,
+                actor_ref: None,
+                role: "implementer".to_owned(),
+                purpose: Some(db::ExecutionPurpose::Implement),
+                status: db::ExecutionStatus::Failed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                harness_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: Some("exact post-readiness execution failure".to_owned()),
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            event(
+                "execution.failed",
+                "execution",
+                &failed_execution_id,
+                &task.id,
+                "test:post-readiness-execution-failed",
+                &now_rfc3339(),
+            ),
+        )
+        .await
+        .expect("exact failed Execution and source event");
+        assert_eq!(
+            crate::task_failure_retry::TaskFailureRetryService::new(
+                Arc::clone(&db),
+                Arc::clone(&event_bus),
+            )
+            .process_domain_event(&failed_execution_event)
+            .await
+            .expect("exact retry receipt reopens merge-ready Task"),
+            1
+        );
+        let reworked = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("reworked lifecycle lookup")
+            .expect("reworked lifecycle");
+        assert_eq!(reworked.state, TaskLifecycleState::Active);
+        assert_eq!(reworked.reason_kind.as_deref(), Some("failure_rework"));
+        assert_eq!(
+            reworked.reason_ref.as_deref(),
+            Some(failed_execution_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operation_gate_pins_the_exact_transition_fact() {
+        let (db, event_bus, task) = seeded_ready_task().await;
+        let transition = TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .transition(TransitionLifecycleInput {
+                task_id: task.id.clone(),
+                expected_task_version: task.version,
+                to_state: TaskLifecycleState::Active,
+                cause: LifecycleCause::Actor(Actor::user(api_types::UserActionSource::Test)),
+                reason_kind: Some("test_start".to_owned()),
+                reason_ref: Some("operation-scoped Gate fixture".to_owned()),
+                idempotency_key: "lifecycle-operation-gate:start".to_owned(),
+            })
+            .await
+            .expect("Task becomes active");
+        let transition_id = transition
+            .transition
+            .expect("durable transition receipt")
+            .transition_id;
+        let fact = TaskLifecycleRepo::get_task_lifecycle_transition_fact(&*db, &transition_id)
+            .await
+            .expect("transition fact lookup")
+            .expect("transition fact");
+        let policy = GatePolicyDocument {
+            schema_version: 1,
+            scope_requirement: Some(GateScopeRequirement::LifecycleOperation {
+                transition_id: fact.id.clone(),
+                from_state: fact.from_state.to_string(),
+                to_state: fact.to_state.to_string(),
+                from_version: fact.from_version,
+                to_version: fact.to_version,
+                cause_kind: fact.cause_kind.clone(),
+                cause_ref: fact.cause_ref.clone(),
+                gate_evaluation_id: fact.gate_evaluation_id.clone(),
+            }),
+            review: None,
+            validations: Vec::new(),
+            decisions: Vec::new(),
+            work_units: Vec::new(),
+        };
+        let engine = GateEngine::new(Arc::clone(&db), event_bus);
+        let (gate, _) = engine
+            .create_gate_with_initial_policy(
+                &task.id,
+                "lifecycle_operation_audit",
+                GateScopeKind::LifecycleOperation,
+                &transition_id,
+                policy,
+            )
+            .await
+            .expect("lifecycle-operation-scoped Gate");
+        let evaluation = engine
+            .evaluate_active(&gate.id)
+            .await
+            .expect("lifecycle operation evaluation");
+        assert_eq!(
+            evaluation.evaluation.outcome,
+            GateEvaluationOutcome::Satisfied
+        );
+        assert_eq!(evaluation.inputs.len(), 1);
+        assert_eq!(evaluation.inputs[0].input_kind, "lifecycle_operation");
+        assert_eq!(evaluation.inputs[0].input_id, transition_id);
+        assert_eq!(evaluation.inputs[0].input_version, fact.to_version);
+        assert!(
+            GateRepo::gate_evaluation_inputs_are_current(&*db, &evaluation.evaluation.id)
+                .await
+                .expect("lifecycle operation input currentness")
+        );
+    }
+
+    #[tokio::test]
+    async fn source_event_replay_after_policy_revision_keeps_its_original_evaluation() {
+        let (db, event_bus, task) = seeded_ready_task().await;
+        let now = now_rfc3339();
+        let requirement = ValidationRequirement {
+            validation_run_id: "missing-validation-run".to_owned(),
+            evidence_id: "missing-evidence".to_owned(),
+            evidence_digest: sha256(b"missing evidence"),
+            check_identity: "cargo test -p services".to_owned(),
+            config_digest: sha256(b"config one"),
+            workspace_id: new_uuid_v4(),
+            commit_sha: "a".repeat(40),
+            workspace_snapshot_digest: sha256(b"workspace snapshot"),
+            required_outcome: ValidationRunStatus::Passed,
+        };
+        let policy = |config_digest: &str| GatePolicyDocument {
+            schema_version: 1,
+            scope_requirement: None,
+            review: None,
+            validations: vec![ValidationRequirement {
+                config_digest: config_digest.to_owned(),
+                ..requirement.clone()
+            }],
+            decisions: Vec::new(),
+            work_units: Vec::new(),
+        };
+        let engine = GateEngine::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let (gate, _) = engine
+            .create_gate_with_initial_policy(
+                &task.id,
+                "validation_gate",
+                GateScopeKind::Task,
+                &task.id,
+                policy(&requirement.config_digest),
+            )
+            .await
+            .expect("Gate with exact missing validation ref");
+        let source_event = db::DomainEventRepo::append_event(
+            &*db,
+            event(
+                "validation_run.completed",
+                "validation_run",
+                "missing-validation-run",
+                &task.id,
+                "test:validation-source-event",
+                &now,
+            ),
+        )
+        .await
+        .expect("durable source fact event");
+        assert_eq!(
+            engine
+                .process_domain_event(&source_event)
+                .await
+                .expect("first exact evaluation"),
+            1
+        );
+        let first = GateRepo::get_gate_evaluation_for_cause(&*db, &gate.id, &source_event.id)
+            .await
+            .expect("source evaluation lookup")
+            .expect("source event has exact E1");
+        assert_eq!(first.policy_revision, 1);
+
+        engine
+            .revise_policy(&gate.id, Some(1), policy(&sha256(b"config two")))
+            .await
+            .expect("new immutable policy revision");
+        assert_eq!(
+            engine
+                .process_domain_event(&source_event)
+                .await
+                .expect("old source replay does not reevaluate under P2"),
+            0
+        );
+        let policy_event = db::DomainEventRepo::get_event_by_dedupe(
+            &*db,
+            &format!("gate.policy_revised:{}:policy:2", gate.id),
+        )
+        .await
+        .expect("policy event lookup")
+        .expect("P2 event");
+        assert_eq!(
+            engine
+                .process_domain_event(&policy_event)
+                .await
+                .expect("P2 event creates its own evaluation"),
+            1
+        );
+        let second = GateRepo::get_gate_evaluation_for_cause(&*db, &gate.id, &policy_event.id)
+            .await
+            .expect("P2 evaluation lookup")
+            .expect("P2 event has exact E2");
+        assert_eq!(second.policy_revision, 2);
+        assert_ne!(first.id, second.id);
     }
 
     fn sha256(input: &[u8]) -> String {

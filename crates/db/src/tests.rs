@@ -5735,6 +5735,87 @@ async fn sqlite_execution_role_auditor_round_trips() {
 }
 
 #[tokio::test]
+async fn running_execution_admission_is_fenced_after_terminal_task_lifecycle() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "cancelled".to_owned(),
+        "Terminal Task",
+    )
+    .await;
+
+    let create_execution = |id: String, status: ExecutionStatus| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        actor_ref: None,
+        purpose: None,
+        harness_session_id: None,
+        role: "executor".to_owned(),
+        status,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+
+    assert!(ExecutionRepo::create(
+        &db,
+        create_execution(new_uuid_v4(), ExecutionStatus::Running),
+    )
+    .await
+    .is_err());
+
+    let completed = ExecutionRepo::create(
+        &db,
+        create_execution(new_uuid_v4(), ExecutionStatus::Completed),
+    )
+    .await
+    .expect("terminal historical Execution remains recordable");
+    assert!(ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: completed.id,
+            status: Some(ExecutionStatus::Running),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
 async fn migration_runner_is_idempotent() {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
@@ -7000,15 +7081,6 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             expected_version: 1,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec![
-                // The task being claimed may already be role-assigned in a
-                // source state that participates in capacity accounting.
-                // It must not consume a slot before its own first claim.
-                "todo".to_owned(),
-                "in_progress".to_owned(),
-                "review".to_owned(),
-                "merging".to_owned(),
-            ],
             execution: CreateExecution {
                 id: new_uuid_v4(),
                 task_id: task_id.clone(),
@@ -7064,7 +7136,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
 }
 
 #[tokio::test]
-async fn agent_active_task_count_uses_workflow_state_kinds() {
+async fn agent_active_task_count_uses_aggregate_lifecycle_not_workflow() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let workflow = serde_json::json!({
@@ -7110,10 +7182,28 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
         "terminal state",
     )
     .await;
+    seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "aggregate active state",
+    )
+    .await;
+    seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "review".to_owned(),
+        "ambiguous legacy review is blocked",
+    )
+    .await;
 
     assert_eq!(
         AgentRepo::count_active_tasks(&db, &agent_id).await.unwrap(),
-        2
+        1
     );
 }
 
@@ -7250,7 +7340,6 @@ async fn task_claim_rejects_active_entry_barrier() {
             expected_version: task.version,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec!["in_progress".to_owned()],
             execution: CreateExecution {
                 id: new_uuid_v4(),
                 task_id,
@@ -7463,11 +7552,6 @@ async fn test_dependency_gate_blocks_non_context_holder() {
             expected_version: 1,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec![
-                "in_progress".to_owned(),
-                "review".to_owned(),
-                "merging".to_owned(),
-            ],
             execution: CreateExecution {
                 id: new_uuid_v4(),
                 task_id,
@@ -8801,7 +8885,6 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
             expected_version: task_before.version,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec!["in_progress".to_owned()],
             execution: CreateExecution {
                 id: new_uuid_v4(),
                 task_id: task_id.clone(),

@@ -1530,6 +1530,7 @@ impl AttentionService {
              FROM (
                 SELECT t.id AS task_id, t.updated_at
                  FROM task t
+                 JOIN task_lifecycle lifecycle ON lifecycle.task_id = t.id
                  WHERE (
                      EXISTS (
                          SELECT 1
@@ -1548,7 +1549,7 @@ impl AttentionService {
                          AND t.assignee_id = ?
                      )
                  )
-                   AND t.status = 'in_progress'
+                   AND lifecycle.state = 'active'
                    AND t.deleted_at IS NULL
                  UNION
                  SELECT t.id AS task_id, t.updated_at

@@ -65,11 +65,11 @@ reviewer's failure.
 
 ## Rework
 
-The target flow keeps request-changes in the exact ReviewReport, evaluates the
-Gate as unsatisfied, then lets lifecycle/orchestration policy consume that
-failure and direct a Handoff or WorkUnit. The current PR9 branch implements the
-first two facts only: it does not yet record retry-budget consumption or create
-the rework Handoff/WorkUnit/Execution. The old workflow retry paths remain and
-are a PR9 readiness blocker. Any later rework must carry exact failure identity
-and must never infer a HarnessSession from a Role or latest Execution lookup.
-Historical reviewer and implementer Executions remain unchanged.
+The flow keeps request-changes in the exact ReviewReport and evaluates its Gate
+as unsatisfied. A separate retry receipt consumes that exact failure at most
+once and emits a durable rework event. The Orchestrator may react by selecting
+a Handoff, WorkUnit, or new Execution; it cannot edit the verdict or Gate
+outcome. An exhausted budget moves the aggregate lifecycle to `blocked` and
+prevents further Execution admission. Rework receipts do not release blocks
+owned by unrelated causes. Historical reviewer and implementer Executions
+remain unchanged.

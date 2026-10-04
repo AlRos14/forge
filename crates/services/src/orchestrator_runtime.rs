@@ -327,6 +327,12 @@ impl OrchestratorRuntime {
 
         for event in events {
             self.gate_engine.process_domain_event(&event).await?;
+            crate::task_failure_retry::TaskFailureRetryService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .process_domain_event(&event)
+            .await?;
             if self.reconcile_orchestrator_terminal(&event).await? {
                 // Orchestrator lifecycle is handled only for its exact source
                 // wake. It never enters generic event classification.
@@ -363,7 +369,33 @@ impl OrchestratorRuntime {
         if event.scope_type != "task" || !wake_depth_allowed(event.causation_depth) {
             return Ok(None);
         }
+        if crate::task_failure_retry::TaskFailureRetryService::source_event_has_retry_receipt(
+            &self.db, &event.id,
+        )
+        .await?
+        {
+            // The exact retry receipt has its own task.rework_requested event.
+            // Classifying both it and the source failure as independent wakes
+            // can dispatch the Orchestrator twice for one failure.
+            return Ok(None);
+        }
         let task_id = event.scope_id.as_str();
+        if event.event_type == "gate.evaluated" {
+            if let Some(source_event_id) = event.causation_id.as_deref() {
+                // An evaluation emitted while processing a failed fact is a
+                // deterministic observation of that same failure. Once the
+                // retry consumer has durably receipted the failure, let its
+                // exact retry/exhaustion event own the orchestration outcome.
+                if crate::task_failure_retry::TaskFailureRetryService::source_event_has_retry_receipt(
+                    &self.db,
+                    source_event_id,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+            }
+        }
         let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
             return Ok(None);
         };
@@ -444,6 +476,19 @@ impl OrchestratorRuntime {
                 };
                 WakeSignal {
                     work_unit_id,
+                    target: WakeTarget::Task,
+                }
+            }
+            "task.rework_requested" => {
+                if !crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+                    &self.db, event,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+                WakeSignal {
+                    work_unit_id: None,
                     target: WakeTarget::Task,
                 }
             }
@@ -2592,6 +2637,14 @@ mod tests {
         id
     }
 
+    async fn test_task_role_version(database: &Arc<db::SqliteDb>, role_id: &str) -> i64 {
+        TaskRoleRepo::get_by_id(&**database, role_id)
+            .await
+            .expect("TaskRole lookup succeeds")
+            .expect("TaskRole exists")
+            .version
+    }
+
     async fn test_membership(
         database: &Arc<db::SqliteDb>,
         role_id: &str,
@@ -2813,6 +2866,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_failure_has_one_wake_after_retry_lifecycle_effect() {
+        use db::{
+            CreateDomainEvent, CreateExecution, DomainEventRepo, ExecutionPurpose, ExecutionRepo,
+            ExecutionStatus,
+        };
+
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("SQLite pool creates");
+        db::run_migrations(&pool).await.expect("schema migrates");
+        let database = Arc::new(db::SqliteDb::new(pool));
+        let event_bus = Arc::new(EventBus::new(16));
+        let human_id = test_user(&database, "Retry Orchestrator").await;
+        let project_id = test_project(&database, &human_id).await;
+        // `todo` maps to aggregate `ready`; applying the exact retry receipt
+        // must move it to `active` before its Orchestrator wake is consumed.
+        let task_id = test_task(&database, &project_id, "Retry wake deduplication").await;
+        let role_id = test_orchestrator_role(
+            &database,
+            &task_id,
+            Some(CoordinationMode::Collaborative),
+            "{}",
+        )
+        .await;
+        test_membership(&database, &role_id, &human_id, RoleMembershipStatus::Active).await;
+        set_orchestrator_cursor_to_head(&database).await;
+
+        let now = now_rfc3339();
+        let execution_id = new_uuid_v4();
+        ExecutionRepo::create(
+            &*database,
+            CreateExecution {
+                id: execution_id.clone(),
+                task_id: task_id.clone(),
+                agent_id: None,
+                actor_ref: Some(ActorRef::Human(human_id.clone())),
+                purpose: Some(ExecutionPurpose::Implement),
+                role: "implementer".to_owned(),
+                status: ExecutionStatus::Failed,
+                stop_reason: Some(db::StopReason::ExecutorFailed),
+                stopped_by: Some(format!("human:{human_id}")),
+                resume_policy: None,
+                stopped_at: Some(now.clone()),
+                parent_execution_id: None,
+                agent_session_id: None,
+                harness_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: Some("deterministic test failure".to_owned()),
+                executor_config_snapshot_json: Some("{}".to_owned()),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("exact failed Execution creates");
+        let source = DomainEventRepo::append_event(
+            &*database,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "execution.failed".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: execution_id.clone(),
+                actor_type: "human".to_owned(),
+                actor_id: Some(human_id.clone()),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: execution_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("test:execution-failed:{execution_id}")),
+                payload_json: json!({"execution_id": execution_id, "task_id": task_id}).to_string(),
+                created_at: now,
+            },
+        )
+        .await
+        .expect("exact failure event appends");
+        let (_gate, _) =
+            crate::gate_engine::GateEngine::new(Arc::clone(&database), Arc::clone(&event_bus))
+                .create_gate_with_initial_policy(
+                    &task_id,
+                    "merge_readiness",
+                    db::GateScopeKind::Task,
+                    &task_id,
+                    crate::gate_engine::GatePolicyDocument {
+                        schema_version: 1,
+                        scope_requirement: None,
+                        review: None,
+                        validations: vec![crate::gate_engine::ValidationRequirement {
+                            validation_run_id: "missing-validation".to_owned(),
+                            evidence_id: "missing-evidence".to_owned(),
+                            evidence_digest: "a".repeat(64),
+                            check_identity: "cargo test".to_owned(),
+                            config_digest: "b".repeat(64),
+                            workspace_id: "exact-workspace".to_owned(),
+                            commit_sha: "c".repeat(40),
+                            workspace_snapshot_digest: "d".repeat(64),
+                            required_outcome: db::ValidationRunStatus::Passed,
+                        }],
+                        decisions: Vec::new(),
+                        work_units: Vec::new(),
+                    },
+                )
+                .await
+                .expect("active Gate for the failed Execution");
+        let gate_engine =
+            crate::gate_engine::GateEngine::new(Arc::clone(&database), Arc::clone(&event_bus));
+        assert_eq!(
+            gate_engine
+                .process_domain_event(&source)
+                .await
+                .expect("source failure deterministically reevaluates its Gate"),
+            1
+        );
+        let gate_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE event_type = 'gate.evaluated' AND entity_type = 'gate_evaluation'
+               AND scope_id = ? AND causation_id = ?",
+        )
+        .bind(&task_id)
+        .bind(&source.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("GateEvaluation event caused by the source failure");
+        let gate_event = DomainEventRepo::get_event(&*database, &gate_event_id)
+            .await
+            .expect("GateEvaluation event lookup succeeds")
+            .expect("GateEvaluation event exists");
+        let task_service = Arc::new(TaskService::new(
+            Arc::clone(&database),
+            Arc::clone(&event_bus),
+        ));
+        let runtime =
+            OrchestratorRuntime::new(Arc::clone(&database), Arc::clone(&event_bus), task_service);
+
+        assert_eq!(
+            crate::task_failure_retry::TaskFailureRetryService::new(
+                Arc::clone(&database),
+                Arc::clone(&event_bus),
+            )
+            .process_domain_event(&source)
+            .await
+            .expect("one exact retry receipt is consumed"),
+            1
+        );
+        let receipt_event_id: String = sqlx::query_scalar(
+            "SELECT receipt_event_id FROM task_failure_retry_receipt
+             WHERE task_id = ? AND failure_kind = 'execution_failed' AND failure_ref = ?",
+        )
+        .bind(&task_id)
+        .bind(&execution_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("exact retry event is durable");
+        let receipt_event = DomainEventRepo::get_event(&*database, &receipt_event_id)
+            .await
+            .expect("retry event lookup succeeds")
+            .expect("retry event exists");
+
+        assert_eq!(
+            TaskRepo::get_by_id(&*database, &task_id, false)
+                .await
+                .expect("Task query succeeds")
+                .expect("Task exists")
+                .status,
+            "in_progress",
+            "the retry's own lifecycle transition must not invalidate its wake"
+        );
+        assert!(
+            crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+                &database,
+                &receipt_event,
+            )
+            .await
+            .expect("retry receipt is checked")
+        );
+        assert!(runtime
+            .classify_event(&source)
+            .await
+            .expect("source event classification succeeds")
+            .is_none());
+        assert!(runtime
+            .classify_event(&gate_event)
+            .await
+            .expect("derived GateEvaluation classification succeeds")
+            .is_none());
+        let Some(signal) = runtime
+            .classify_event(&receipt_event)
+            .await
+            .expect("rework event classification succeeds")
+        else {
+            panic!("the exact rework event must be the single Orchestrator wake");
+        };
+        assert!(matches!(signal.target, WakeTarget::Task));
+        assert_eq!(
+            runtime
+                .admit_signal(&receipt_event, signal)
+                .await
+                .expect("one exact wake is admitted"),
+            1
+        );
+        let wake_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM orchestrator_wake WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("wake count loads");
+        assert_eq!(wake_count, 1);
+    }
+
+    #[tokio::test]
     async fn pr6_new_task_member_activation_is_durable_without_eventbus_authority() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
@@ -2888,7 +3157,9 @@ mod tests {
             .run_once(10)
             .await
             .expect("durable membership event is processed without a bus hint");
-        assert_eq!(activated.claimed_events, 1);
+        // Membership activation emits its Orchestrator wake fact and the
+        // separate Gate re-evaluation fact in one membership transaction.
+        assert_eq!(activated.claimed_events, 2);
         assert_eq!(activated.admitted_wakes, 1);
         assert_eq!(activated.dispatched_wakes, 1);
 
@@ -2937,7 +3208,9 @@ mod tests {
             .run_once(10)
             .await
             .expect("new Task activation is found by the durable scan");
-        assert_eq!(new_task.processed_events, 2);
+        // Task creation, the Gate role-revision fact from membership insert,
+        // and bootstrap reconciliation are separate durable records.
+        assert_eq!(new_task.processed_events, 3);
         assert_eq!(new_task.admitted_wakes, 1);
         assert_eq!(new_task.dispatched_wakes, 1);
         let new_task_wake: String = sqlx::query_scalar(
@@ -3006,11 +3279,12 @@ mod tests {
         )
         .await;
         test_membership(&database, &role_id, &human_id, RoleMembershipStatus::Active).await;
+        let role_version = test_task_role_version(&database, &role_id).await;
         let unchanged_role = TaskRoleRepo::update(
             &*database,
             db::UpdateTaskRole {
                 id: role_id.clone(),
-                expected_version: 1,
+                expected_version: role_version,
                 coordination_mode: Some(Some(CoordinationMode::Collaborative)),
                 policy_json: Some("{}".to_owned()),
                 updated_at: now_rfc3339(),
@@ -3018,7 +3292,7 @@ mod tests {
         )
         .await
         .expect("a semantically unchanged policy update is accepted");
-        assert_eq!(unchanged_role.version, 1);
+        assert_eq!(unchanged_role.version, role_version);
         let unchanged_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM domain_event
              WHERE event_type = 'orchestrator.task_role_changed' AND entity_id = ?",
@@ -3072,7 +3346,7 @@ mod tests {
             &*database,
             db::UpdateTaskRole {
                 id: role_id.clone(),
-                expected_version: 1,
+                expected_version: test_task_role_version(&database, &role_id).await,
                 coordination_mode: None,
                 policy_json: Some(r#"{"automatic_orchestration":false}"#.to_owned()),
                 updated_at: now_rfc3339(),
@@ -3493,7 +3767,8 @@ mod tests {
             &*fixture.database,
             UpdateTaskRole {
                 id: fixture.task_role_id.clone(),
-                expected_version: 1,
+                expected_version: test_task_role_version(&fixture.database, &fixture.task_role_id)
+                    .await,
                 coordination_mode: None,
                 policy_json: Some(r#"{"allowed_actions":["proposal"]}"#.to_owned()),
                 updated_at: now_rfc3339(),
@@ -3586,7 +3861,8 @@ mod tests {
             &*fixture.database,
             UpdateTaskRole {
                 id: fixture.task_role_id.clone(),
-                expected_version: 1,
+                expected_version: test_task_role_version(&fixture.database, &fixture.task_role_id)
+                    .await,
                 coordination_mode: None,
                 policy_json: Some(r#"{"allowed_actions":["proposal"]}"#.to_owned()),
                 updated_at: now_rfc3339(),
@@ -4473,11 +4749,12 @@ mod tests {
         assert_eq!(work_units_after_replay.len(), 1);
         assert_eq!(proposals_after_replay.items.len(), 1);
 
+        let current_role_version = test_task_role_version(&database, &orchestrator_role_id).await;
         TaskRoleRepo::update(
             &*database,
             db::UpdateTaskRole {
                 id: orchestrator_role_id,
-                expected_version: 1,
+                expected_version: current_role_version,
                 coordination_mode: None,
                 policy_json: Some(r#"{"allowed_actions":["message"]}"#.to_owned()),
                 updated_at: now_rfc3339(),

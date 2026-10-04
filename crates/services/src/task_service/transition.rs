@@ -164,14 +164,25 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
         if lifecycle.state == db::TaskLifecycleState::Cancelled {
-            return Ok(task);
+            self.cancel_running_executions_for_task(&task, "cancelled by task cancellation", actor)
+                .await?;
+            let source_task = task.clone();
+            return clear_transient_error_annotation_after_cancel(&self.db, &source_task, task)
+                .await;
         }
-        self.cancel_running_executions_for_task(
-            &task,
-            "cancelled by task cancellation",
-            actor.clone(),
-        )
-        .await?;
+        if lifecycle.state == db::TaskLifecycleState::Done {
+            return Err(ServiceError::invalid_operation(
+                "a completed Task cannot be cancelled",
+            ));
+        }
+        if lifecycle.state == db::TaskLifecycleState::Merging {
+            return Err(ServiceError::invalid_operation(
+                "an admitted TaskMerge must finish or recover before Task cancellation",
+            ));
+        }
+        // The lifecycle transition commits before the execution cleanup. If
+        // cleanup fails or the process stops, a repeated cancellation must
+        // still reconcile any Running Execution left behind.
         let result = self
             .transition(
                 task_id,

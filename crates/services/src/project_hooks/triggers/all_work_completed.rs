@@ -1,10 +1,8 @@
-use api_types::StateKind;
 use async_trait::async_trait;
 use sqlx::Row;
 
 use crate::{
     project_hooks::triggers::{HookTrigger, TriggerContext, TriggerMatch},
-    workflow::engine::WorkflowEngine,
     Result,
 };
 
@@ -16,12 +14,13 @@ pub struct AllWorkCompletedTrigger;
 impl HookTrigger for AllWorkCompletedTrigger {
     async fn evaluate(&self, context: &TriggerContext<'_>) -> Result<Option<TriggerMatch>> {
         let rows = sqlx::query(
-            "SELECT id, status, parent_task_id \
+            "SELECT task.id, lifecycle.state AS lifecycle_state \
              FROM task \
-             WHERE project_id = ? \
-               AND is_automation = 0 \
-               AND archived_at IS NULL \
-               AND deleted_at IS NULL",
+             LEFT JOIN task_lifecycle AS lifecycle ON lifecycle.task_id = task.id \
+             WHERE task.project_id = ? \
+               AND task.is_automation = 0 \
+               AND task.archived_at IS NULL \
+               AND task.deleted_at IS NULL",
         )
         .bind(&context.project.id)
         .fetch_all(context.db.pool())
@@ -31,18 +30,9 @@ impl HookTrigger for AllWorkCompletedTrigger {
             return Ok(None);
         }
 
-        let project_workflow =
-            WorkflowEngine::resolve_workflow(&context.project.workflow_definition);
-        let subtask_workflow = WorkflowEngine::resolve_subtask_workflow();
         for row in rows {
-            let status: String = row.try_get("status")?;
-            let parent_task_id: Option<String> = row.try_get("parent_task_id")?;
-            let workflow = if parent_task_id.is_some() {
-                &subtask_workflow
-            } else {
-                &project_workflow
-            };
-            if workflow.state_kind(&status) != Some(StateKind::Terminal) {
+            let lifecycle_state: Option<String> = row.try_get("lifecycle_state")?;
+            if !matches!(lifecycle_state.as_deref(), Some("done" | "cancelled")) {
                 return Ok(None);
             }
         }

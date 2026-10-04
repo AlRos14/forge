@@ -3,7 +3,8 @@ use crate::{
     CollaborationWrite, CreateGate, CreateGatePolicyRevision, Gate, GateEvaluation,
     GateEvaluationInput, GateEvaluationWrite, GatePolicyRevision, GateRepo, Result,
     StoreGateEvaluation, TaskLifecycle, TaskLifecycleMigrationAudit, TaskLifecycleRepo,
-    TaskLifecycleState, TaskLifecycleTransitionWrite, TransitionTaskLifecycle,
+    TaskLifecycleState, TaskLifecycleTransitionFact, TaskLifecycleTransitionWrite,
+    TransitionTaskLifecycle,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -225,6 +226,57 @@ impl TaskLifecycleRepo for SqliteDb {
         .as_ref()
         .map(map_task_lifecycle)
         .transpose()
+    }
+
+    async fn get_task_lifecycle_transition_fact(
+        &self,
+        transition_id: &str,
+    ) -> Result<Option<TaskLifecycleTransitionFact>> {
+        let row = sqlx::query(
+            "SELECT id, task_id, from_state, to_state, from_version, to_version,
+                    cause_kind, cause_ref, gate_evaluation_id, reason_kind, reason_ref,
+                    domain_event_id, created_at
+             FROM task_lifecycle_transition WHERE id = ?",
+        )
+        .bind(transition_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(TaskLifecycleTransitionFact {
+                id: row.try_get("id")?,
+                task_id: row.try_get("task_id")?,
+                from_state: parse_gate_enum(row.try_get("from_state")?)?,
+                to_state: parse_gate_enum(row.try_get("to_state")?)?,
+                from_version: row.try_get("from_version")?,
+                to_version: row.try_get("to_version")?,
+                cause_kind: row.try_get("cause_kind")?,
+                cause_ref: row.try_get("cause_ref")?,
+                gate_evaluation_id: row.try_get("gate_evaluation_id")?,
+                reason_kind: row.try_get("reason_kind")?,
+                reason_ref: row.try_get("reason_ref")?,
+                domain_event_id: row.try_get("domain_event_id")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn has_task_lifecycle_transition(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_lifecycle_transition
+                WHERE task_id = ? AND idempotency_key = ?
+            )",
+        )
+        .bind(task_id)
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     async fn get_task_lifecycle_transition(
@@ -482,6 +534,92 @@ impl GateRepo for SqliteDb {
         })
     }
 
+    async fn create_gate_with_initial_policy(
+        &self,
+        gate_input: CreateGate,
+        policy_input: CreateGatePolicyRevision,
+    ) -> Result<(
+        CollaborationWrite<Gate>,
+        CollaborationWrite<GatePolicyRevision>,
+    )> {
+        if policy_input.gate_id != gate_input.id
+            || policy_input.expected_active_revision.is_some()
+            || policy_input.revision != 1
+        {
+            return Err(DbError::Check(
+                "initial Gate policy must be revision 1 for the new Gate".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO gate (id, task_id, gate_kind, scope_kind, scope_id, active_policy_revision, created_at)
+             VALUES (?, ?, ?, ?, ?, NULL, ?)",
+        )
+        .bind(&gate_input.id)
+        .bind(&gate_input.task_id)
+        .bind(&gate_input.gate_kind)
+        .bind(gate_input.scope_kind.to_string())
+        .bind(&gate_input.scope_id)
+        .bind(&gate_input.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        let gate_event =
+            DomainEventRepo::append_event_in_tx(self, &mut transaction, &gate_input.event).await?;
+        sqlx::query(
+            "INSERT INTO gate_policy_revision
+                (gate_id, revision, schema_version, policy_json, policy_digest, created_at)
+             VALUES (?, 1, ?, ?, ?, ?)",
+        )
+        .bind(&policy_input.gate_id)
+        .bind(policy_input.schema_version)
+        .bind(&policy_input.policy_json)
+        .bind(&policy_input.policy_digest)
+        .bind(&policy_input.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        let advanced = sqlx::query(
+            "UPDATE gate SET active_policy_revision = 1
+             WHERE id = ? AND active_policy_revision IS NULL",
+        )
+        .bind(&gate_input.id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if advanced != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        let policy_event =
+            DomainEventRepo::append_event_in_tx(self, &mut transaction, &policy_input.event)
+                .await?;
+        let gate_row = sqlx::query(
+            "SELECT id, task_id, gate_kind, scope_kind, scope_id, active_policy_revision, created_at
+             FROM gate WHERE id = ?",
+        )
+        .bind(&gate_input.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let policy_row = sqlx::query(
+            "SELECT gate_id, revision, schema_version, policy_json, policy_digest, created_at
+             FROM gate_policy_revision WHERE gate_id = ? AND revision = 1",
+        )
+        .bind(&gate_input.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let gate = map_gate(&gate_row)?;
+        let policy = map_policy(&policy_row)?;
+        transaction.commit().await?;
+        Ok((
+            CollaborationWrite {
+                record: gate,
+                event: gate_event,
+            },
+            CollaborationWrite {
+                record: policy,
+                event: policy_event,
+            },
+        ))
+    }
+
     async fn get_gate(&self, id: &str) -> Result<Option<Gate>> {
         sqlx::query(
             "SELECT id, task_id, gate_kind, scope_kind, scope_id, active_policy_revision, created_at
@@ -525,6 +663,30 @@ impl GateRepo for SqliteDb {
                 Ok((gate, policy))
             })
             .collect()
+    }
+
+    async fn get_gate_evaluation_for_cause(
+        &self,
+        gate_id: &str,
+        causation_event_id: &str,
+    ) -> Result<Option<GateEvaluation>> {
+        let row = sqlx::query(
+            "SELECT e.id, e.gate_id, e.task_id, e.policy_revision, e.outcome,
+                    e.input_digest, e.result_json, e.evaluated_at
+             FROM gate_evaluation e
+             JOIN domain_event event
+               ON event.entity_type = 'gate_evaluation'
+              AND event.entity_id = e.id
+              AND event.event_type = 'gate.evaluated'
+              AND event.causation_id = ?
+             WHERE e.gate_id = ?
+             ORDER BY event.sequence LIMIT 1",
+        )
+        .bind(causation_event_id)
+        .bind(gate_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_evaluation).transpose()
     }
 
     async fn get_gate_policy_revision(
@@ -715,7 +877,47 @@ impl GateRepo for SqliteDb {
         .await?
         .as_ref()
         .map(map_evaluation)
-        .transpose()
+            .transpose()
+    }
+
+    async fn is_latest_gate_evaluation(
+        &self,
+        gate_id: &str,
+        revision: i64,
+        evaluation_id: &str,
+    ) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM gate_evaluation current
+                WHERE current.id = ? AND current.gate_id = ?
+                  AND current.policy_revision = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM gate_evaluation newer
+                      WHERE newer.gate_id = current.gate_id
+                        AND newer.policy_revision = current.policy_revision
+                        AND newer.rowid > current.rowid
+                  )
+             )",
+        )
+        .bind(evaluation_id)
+        .bind(gate_id)
+        .bind(revision)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn gate_evaluation_inputs_are_current(&self, evaluation_id: &str) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT COALESCE((
+                SELECT inputs_current FROM gate_evaluation_currentness
+                WHERE evaluation_id = ?
+             ), 0)",
+        )
+        .bind(evaluation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     async fn list_gate_evaluation_inputs(

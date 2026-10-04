@@ -1,13 +1,13 @@
 use crate::{
     daemon_transport::DaemonConnectionRegistry, embedded_daemon::is_embedded_daemon_machine,
-    workflow::engine::WorkflowEngine, DomainEventService, Result, ServiceError, TaskService,
+    DomainEventService, Result, ServiceError, TaskService,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, Daemon, DaemonRepo, Execution,
     ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo, ResumePolicy, SortBy,
-    SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, UpdateAgent, UpdateExecution,
-    UpdateTaskStatus, WorkspaceLeaseRepo, WorkspaceRepo,
+    SortOrder, SqliteDb, StopReason, Task, TaskLifecycleRepo, TaskLifecycleState, TaskListQuery,
+    TaskRepo, UpdateAgent, UpdateExecution, UpdateTaskStatus, WorkspaceLeaseRepo, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -50,6 +50,7 @@ impl CrashRecovery {
         for task in tasks {
             let outcome = recover_task(
                 &self.db,
+                &self.event_bus,
                 task,
                 StopReason::CrashRecovery,
                 &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
@@ -242,6 +243,7 @@ impl HeartbeatMonitor {
             for task in list_in_progress_tasks(&self.db, Some(&agent.id)).await? {
                 let outcome = recover_task(
                     &self.db,
+                    &self.event_bus,
                     task,
                     StopReason::AgentTimeout,
                     &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor),
@@ -710,16 +712,6 @@ pub(crate) struct RecoverTaskOutcome {
 async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
     for project in list_projects(db).await? {
-        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let statuses: Vec<String> = workflow
-            .states
-            .iter()
-            .filter(|state| state.kind == api_types::StateKind::Active)
-            .map(|state| state.name.clone())
-            .collect();
-        if statuses.is_empty() {
-            continue;
-        }
         let mut cursor = None;
         loop {
             let page = TaskRepo::list(
@@ -727,7 +719,7 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
                 TaskListQuery {
                     project_id: project.id.clone(),
                     q: None,
-                    statuses: statuses.clone(),
+                    statuses: vec![TaskLifecycleState::Active.legacy_projection().to_owned()],
                     agent_ids: agent_id.map(str::to_owned).into_iter().collect(),
                     assignee_types: Vec::new(),
                     assignee_ids: Vec::new(),
@@ -739,11 +731,18 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
                 },
             )
             .await?;
-            tasks.extend(
-                page.items
-                    .into_iter()
-                    .filter(|task| task.assignee_type.as_deref() != Some("user")),
-            );
+            for task in page
+                .items
+                .into_iter()
+                .filter(|task| task.assignee_type.as_deref() != Some("user"))
+            {
+                if TaskLifecycleRepo::get_task_lifecycle(db, &task.id)
+                    .await?
+                    .is_some_and(|lifecycle| lifecycle.state == TaskLifecycleState::Active)
+                {
+                    tasks.push(task);
+                }
+            }
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
@@ -754,24 +753,19 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
 }
 
 async fn recover_task(
-    db: &SqliteDb,
+    db: &Arc<SqliteDb>,
+    event_bus: &Arc<EventBus>,
     task: Task,
     stop_reason: StopReason,
     stopped_by: &api_types::Actor,
 ) -> Result<RecoverTaskOutcome> {
-    let project = ProjectRepo::get_by_id(db, &task.project_id)
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db.as_ref(), &task.id)
         .await?
-        .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-    let workflow =
-        WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, stopped_by);
-    if workflow
-        .states
-        .iter()
-        .all(|state| state.name != task.status)
-    {
+        .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+    if lifecycle.state != TaskLifecycleState::Active {
         return Err(ServiceError::invalid_operation(format!(
-            "workflow has no state named {}",
-            task.status
+            "cannot recover execution for Task lifecycle {}",
+            lifecycle.state
         )));
     }
     let cancelled = cancel_running_executions(
@@ -806,7 +800,7 @@ async fn recover_task(
         has_resumable_execution = true;
         if should_auto_resume {
             ExecutionRepo::update(
-                db,
+                db.as_ref(),
                 UpdateExecution {
                     id: execution.execution_id.clone(),
                     status: None,
@@ -867,8 +861,29 @@ async fn recover_task(
         "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
     })
     .to_string();
+    let reason_ref = blocked_execution_id
+        .clone()
+        .unwrap_or_else(|| format!("task-version:{}", task.version));
+    let cause = blocked_execution_id
+        .clone()
+        .map(crate::task_lifecycle::LifecycleCause::Execution)
+        .unwrap_or_else(|| crate::task_lifecycle::LifecycleCause::Actor(stopped_by.clone()));
+    let task =
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(db), Arc::clone(event_bus))
+            .block(
+                &task.id,
+                cause,
+                blocking_reason,
+                reason_ref.clone(),
+                format!(
+                    "recovery-required:{}:{blocking_reason}:{reason_ref}",
+                    task.id
+                ),
+            )
+            .await?
+            .task;
     let task = TaskRepo::update_status(
-        db,
+        db.as_ref(),
         UpdateTaskStatus {
             id: task.id.clone(),
             expected_version: task.version,
@@ -1718,43 +1733,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery_blocks_interrupted_entry_barriers() {
+    async fn crash_recovery_keeps_ambiguous_legacy_review_blocked() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let task = seed_task(&db, project_id, repo_id, "review".to_owned(), None).await;
-        TaskRepo::set_entry_barrier(
-            &*db,
-            &task.id,
-            task.version,
-            Some(
-                r#"{"state":"review","status":"running","started_at":"2026-04-28T00:00:00Z"}"#
-                    .to_owned(),
-            ),
-            &now_rfc3339(),
-        )
-        .await
-        .expect("barrier sets");
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
             .run_recovery()
             .await
             .expect("recovery runs");
 
-        assert_eq!(recovered, 1);
+        assert_eq!(recovered, 0);
         let recovered_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(recovered_task.status, "review");
-        let barrier: Value =
-            serde_json::from_str(recovered_task.entry_barrier_json.as_deref().unwrap()).unwrap();
-        assert_eq!(barrier["state"], "review");
-        assert_eq!(barrier["status"], "blocked");
-        assert_eq!(
-            barrier["blocking_reason"],
-            "crash recovery: before_enter was interrupted"
-        );
+        assert_eq!(recovered_task.status, "blocked");
+        assert_eq!(recovered_task.entry_barrier_json, None);
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle loads")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(lifecycle.reason_kind.as_deref(), Some("ambiguous_review"));
     }
 
     #[tokio::test]
@@ -1793,7 +1795,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(recovered_task.status, "in_progress".to_owned());
+        assert_eq!(recovered_task.status, "blocked");
         assert_eq!(recovered_task.assignee_id, task.assignee_id);
         let annotation: Value =
             serde_json::from_str(recovered_task.error_annotation.as_deref().unwrap()).unwrap();
@@ -1811,8 +1813,11 @@ mod tests {
 
         let mut event_types = Vec::new();
         let mut recovered_event_id = None;
-        for _ in 0..3 {
-            let event = rx.recv().await.expect("recovery event receives");
+        while recovered_event_id.is_none() {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recovery event arrives")
+                .expect("recovery event receives");
             if event.event_type == "task.recovered" {
                 recovered_event_id = Some(event.entity_id);
             }
@@ -1891,7 +1896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_monitor_marks_stalled_executions_and_schedules_retry() {
+    async fn heartbeat_monitor_marks_stalled_executions_without_legacy_retry_authority() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
@@ -1962,26 +1967,30 @@ mod tests {
             updated_execution.stop_reason,
             Some(StopReason::ExecutionStalled)
         );
-        assert_eq!(updated_execution.resume_policy, Some(ResumePolicy::Auto));
+        assert_eq!(updated_execution.resume_policy, Some(ResumePolicy::Manual));
 
         let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
             .expect("task exists");
-        let metadata: Value = serde_json::from_str(updated_task.metadata_json.as_deref().unwrap())
-            .expect("metadata parses");
-        assert_eq!(metadata["execution_retry_count"], 1);
-        assert_eq!(
-            metadata["deferred_dispatch"]["reason"],
-            "execution retry (attempt 1)"
-        );
+        let metadata = updated_task
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .unwrap_or(Value::Null);
+        assert!(metadata.get("execution_retry_count").is_none());
+        assert!(metadata
+            .get("deferred_dispatch")
+            .and_then(Value::as_object)
+            .is_none_or(|dispatch| dispatch.get("reason").and_then(Value::as_str)
+                != Some("execution retry (attempt 1)")));
 
         let mut event_types = Vec::new();
         for _ in 0..3 {
             event_types.push(rx.recv().await.expect("event receives").event_type);
         }
         assert!(event_types.iter().any(|event| event == "execution.stalled"));
-        assert!(event_types
+        assert!(!event_types
             .iter()
             .any(|event| event == "task.execution_retry"));
     }
@@ -2054,7 +2063,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(t2.status, "merge_failed");
+        assert_eq!(t2.status, "blocked");
     }
 
     #[tokio::test]
@@ -2081,7 +2090,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(updated_task.status, "in_progress");
+        assert_eq!(updated_task.status, "blocked");
         let annotation: Value =
             serde_json::from_str(updated_task.error_annotation.as_deref().unwrap()).unwrap();
         assert_eq!(annotation["blocked_execution_id"], execution.id);

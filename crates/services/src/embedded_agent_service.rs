@@ -12,9 +12,8 @@ use db::{
     AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo, AgentStatus,
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
     CredentialHandle, CredentialHandleRepo, ExecutionRepo, ExecutionStatus, PageRequest,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RotateAgentSession,
-    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo, UpdateAgentSession,
-    UpsertAgentConnectionHealth,
+    ProjectAgentBindingRepo, ProjectMemberRepo, RotateAgentSession, SelectAgentProfile, SortBy,
+    SortOrder, SqliteDb, TaskRepo, UpdateAgentSession, UpsertAgentConnectionHealth,
 };
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType,
@@ -26,10 +25,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    agent_chat_policy::guard_runtime_content,
-    native_tools::CoordinationToolProvider,
-    workflow::{default_roles, effective_role, engine::WorkflowEngine},
-    Result, ServiceError,
+    agent_chat_policy::guard_runtime_content, native_tools::CoordinationToolProvider,
+    workflow::default_roles, Result, ServiceError,
 };
 
 const NATIVE_EXECUTOR_TYPE: &str = "embedded";
@@ -1256,83 +1253,38 @@ impl EmbeddedAgentService {
                 ProjectMemberRepo::get_member(&*self.db, &task.project_id, actor_user_id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-                let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
                     .await?
-                    .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-                let workflow = WorkflowEngine::resolve_workflow_for_task(
-                    &task,
-                    &project.workflow_definition,
-                    &api_types::Actor::system(api_types::SystemComponent::Executor),
-                );
-                let active_role = workflow
-                    .states
-                    .iter()
-                    .find(|state| state.name == task.status)
-                    .and_then(effective_role);
-                if !task_role_admitted_by_workflow(active_role, role) {
+                    .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.clone()))?;
+                if lifecycle.state != db::TaskLifecycleState::Active {
                     return Err(ServiceError::invalid_operation(
-                        "embedded Task scope is not admitted by the current workflow state",
+                        "embedded Task scope requires active aggregate lifecycle",
                     ));
                 }
-                // The default Forge workflow calls its implementation role
-                // `coder`, while the target TaskRole calls it `implementer`.
-                // Once a TaskRole exists, only current membership admits this
-                // scope; the old row is consulted only for pre-V088 data.
-                let membership_role = if role == "worker" {
-                    "implementer"
-                } else {
-                    role.as_str()
-                };
-                match crate::task_service::current_role_memberships_authoritative(
-                    &self.db,
-                    task_id,
-                    membership_role,
-                )
-                .await?
-                {
-                    Some(memberships) => {
-                        if !memberships.iter().any(|membership| {
-                            membership.actor_kind == db::ActorKind::Agent
-                                && membership.actor_id == identity.id
-                                && membership.status == db::RoleMembershipStatus::Active
-                        }) {
-                            return Err(ServiceError::not_found(
-                                "role_membership",
-                                task_id.clone(),
-                            ));
-                        }
-                    }
-                    None => {
-                        let assigned = sqlx::query_scalar::<_, i64>(
-                            "SELECT EXISTS(
-                                SELECT 1 FROM task_role_assignment
-                                WHERE task_id = ? AND assignee_type = 'agent'
-                                  AND assignee_id = ?
-                                  AND (role_name = ? OR (? = 'worker' AND role_name IN ('worker', 'coder')))
-                            )",
-                        )
-                        .bind(task_id)
-                        .bind(&identity.id)
-                        .bind(role)
-                        .bind(role)
-                        .fetch_one(self.db.pool())
-                        .await?;
-                        if assigned == 0 {
-                            return Err(ServiceError::not_found(
-                                "task_role_assignment",
-                                task_id.clone(),
-                            ));
-                        }
-                    }
+                let membership_role = task_role_for_embedded_role(role).ok_or_else(|| {
+                    ServiceError::invalid_operation("unsupported embedded Task role")
+                })?;
+                let task_role =
+                    db::TaskRoleRepo::get_by_task_and_role(&*self.db, task_id, membership_role)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task_role", membership_role))?;
+                let memberships =
+                    db::RoleMembershipRepo::list_by_role(&*self.db, &task_role.id, false).await?;
+                if !memberships.iter().any(|membership| {
+                    membership.actor_kind == db::ActorKind::Agent
+                        && membership.actor_id == identity.id
+                        && membership.status == db::RoleMembershipStatus::Active
+                }) {
+                    return Err(ServiceError::not_found("role_membership", task_id.clone()));
                 }
                 let access = if role == "reviewer" {
                     WorkspaceAccess::TaskRead
                 } else {
                     WorkspaceAccess::TaskWrite
                 };
-                // A role-table preassignment is not itself a workspace grant.
-                // The workflow must have admitted the task and a live
-                // execution must exist for this identity.  This prevents a
+                // A role membership is not itself a workspace grant. The
+                // aggregate must be active and a live execution must exist
+                // for this identity. This prevents a
                 // caller from creating a durable write-capable Task session
                 // before the normal claim/dispatch transaction runs.
                 let active_execution = ExecutionRepo::list_by_task(
@@ -1358,7 +1310,7 @@ impl EmbeddedAgentService {
                         } else {
                             matches!(
                                 execution.role.as_str(),
-                                default_roles::WORKER | default_roles::CODER
+                                "implementer" | default_roles::WORKER | default_roles::CODER
                             )
                         }
                 });
@@ -2075,14 +2027,11 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
     }
 }
 
-fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &str) -> bool {
+fn task_role_for_embedded_role(requested_role: &str) -> Option<&'static str> {
     match requested_role {
-        "reviewer" => active_role == Some(default_roles::REVIEWER),
-        "worker" => matches!(
-            active_role,
-            Some(default_roles::WORKER | default_roles::CODER)
-        ),
-        _ => false,
+        "reviewer" => Some(default_roles::REVIEWER),
+        "worker" => Some("implementer"),
+        _ => None,
     }
 }
 
@@ -2154,28 +2103,10 @@ mod tests {
     }
 
     #[test]
-    fn task_role_requires_the_current_workflow_state() {
-        assert!(task_role_admitted_by_workflow(
-            Some(default_roles::CODER),
-            "worker"
-        ));
-        assert!(task_role_admitted_by_workflow(
-            Some(default_roles::WORKER),
-            "worker"
-        ));
-        assert!(task_role_admitted_by_workflow(
-            Some(default_roles::REVIEWER),
-            "reviewer"
-        ));
-        assert!(!task_role_admitted_by_workflow(None, "worker"));
-        assert!(!task_role_admitted_by_workflow(
-            Some(default_roles::PLANNER),
-            "worker"
-        ));
-        assert!(!task_role_admitted_by_workflow(
-            Some(default_roles::CODER),
-            "reviewer"
-        ));
+    fn embedded_task_role_names_resolve_to_task_roles() {
+        assert_eq!(task_role_for_embedded_role("worker"), Some("implementer"));
+        assert_eq!(task_role_for_embedded_role("reviewer"), Some("reviewer"));
+        assert_eq!(task_role_for_embedded_role("planner"), None);
     }
 
     #[test]

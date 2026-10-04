@@ -40,6 +40,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   per-Task claim. Other server processes receive a conflict while integration,
   final merge, publication, or another exclusive integration-workspace
   operation is active.
+- A `merge_readiness` Gate may require only passing ValidationRuns and
+  approving Decisions. Reviewer TaskRole snapshots are invalidated by role or
+  membership changes. Gate creation commits its first policy atomically, and
+  merge admission rechecks the exact current evaluation and source while
+  holding the cross-process Task integration lock.
+
+- Terminal daemon routing now requires a live WorkspaceLease and its exact
+  Execution. Without one, a user-started terminal runs in the guarded local
+  workspace; legacy workflow state and singular assignment no longer select a
+  remote Agent daemon.
+
+- An exhausted exact-failure retry budget now fences transitions back to
+  `ready` or `active`, including board and recovery paths. A failed merge can
+  re-enter rework only from the Blocked state caused by that exact merge
+  operation. Automatic execution retry attempts now come from durable exact
+  failure receipts instead of the legacy Task metadata counter.
 
 - New Execution snapshots no longer write harness-native resume flags such as
   `resume_thread_id` or `resume_session_id` into config. Continuity is expressed

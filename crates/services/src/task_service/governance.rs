@@ -608,6 +608,15 @@ impl TaskService {
     /// workspace.  This keeps claim, manual launch, role dispatch, retry, and
     /// follow-up execution behind the same gate.
     pub(super) async fn ensure_task_runnable(&self, task: &db::Task) -> Result<()> {
+        if crate::task_failure_retry::TaskFailureRetryService::has_exhausted_retry_budget(
+            &self.db, &task.id,
+        )
+        .await?
+        {
+            return Err(ServiceError::invalid_operation(
+                "Task retry budget is exhausted; further Execution dispatch is blocked",
+            ));
+        }
         if task.repo_id.is_none() {
             return Ok(());
         }

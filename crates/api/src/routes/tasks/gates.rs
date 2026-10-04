@@ -113,18 +113,16 @@ pub async fn create_task_gate(
     let policy = serde_json::from_value(request.policy)
         .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
     let engine = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus));
-    let gate = engine
-        .create_gate(&task_id, &request.gate_kind, GateScopeKind::Task, &task_id)
+    let (gate, revision) = engine
+        .create_gate_with_initial_policy(
+            &task_id,
+            &request.gate_kind,
+            GateScopeKind::Task,
+            &task_id,
+            policy,
+        )
         .await
         .map_err(ApiError::from)?;
-    let gate_id = gate.id.clone();
-    let revision = engine
-        .revise_policy(&gate_id, None, policy)
-        .await
-        .map_err(ApiError::from)?;
-    let gate = GateRepo::get_gate(&*state.db, &gate_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Gate", gate_id))?;
     Ok(Json(GateResponse {
         gate: gate_response(gate),
         active_policy: Some(policy_response(revision)?),

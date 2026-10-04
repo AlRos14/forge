@@ -16,7 +16,13 @@ use std::{
 // action receipt with each effect; V098 adds immutable Execution Artifact
 // outputs/inputs and migrates verifiable legacy plan provenance; V099 adds
 // Review Execution outputs, actor-free ValidationRuns, and exact Evidence;
-// V100 adds aggregate Task lifecycle and deterministic Gate records.
+// V100 adds aggregate Task lifecycle and deterministic Gate records; V101 adds
+// immutable retry receipts over exact failure facts; V102 adds TaskRole Gate
+// revision events and permits receipt removal only in guarded Project teardown;
+// V103 prevents exhausted retry budgets from reopening runnable lifecycle states;
+// V104 fences exact mutable Gate inputs at lifecycle and merge admission; V105
+// permits rework only from a current exact retry receipt and fences replay
+// after a later lifecycle transition.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

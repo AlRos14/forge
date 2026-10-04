@@ -40,6 +40,9 @@ SELECT t.id, t.status,
            WHEN t.status = 'backlog' THEN 'backlog'
            WHEN t.status = 'todo' THEN 'ready'
            WHEN t.status = 'ready' THEN 'ready'
+           WHEN t.status IN ('planning', 'in_progress', 'working')
+             AND (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                  OR length(trim(COALESCE(t.error_annotation, ''))) > 0) THEN 'blocked'
            WHEN t.status IN ('planning', 'in_progress', 'working') THEN 'active'
            WHEN t.status IN ('done', 'cancelled', 'blocked') THEN t.status
            WHEN t.status = 'merging' AND EXISTS (
@@ -49,6 +52,9 @@ SELECT t.id, t.status,
            ELSE 'blocked'
        END,
        CASE
+           WHEN t.status IN ('planning', 'in_progress', 'working')
+             AND (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                  OR length(trim(COALESCE(t.error_annotation, ''))) > 0) THEN 'legacy_active_block_metadata'
            WHEN t.status IN ('backlog', 'todo', 'ready', 'planning', 'in_progress', 'working', 'done', 'cancelled', 'blocked')
                THEN 'mapped'
            WHEN t.status = 'review' THEN 'ambiguous_review'
@@ -61,6 +67,9 @@ SELECT t.id, t.status,
            ELSE 'unknown_custom_state'
        END,
        CASE
+           WHEN t.status IN ('planning', 'in_progress', 'working')
+             AND (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                  OR length(trim(COALESCE(t.error_annotation, ''))) > 0) THEN 'legacy_blocked_task_metadata'
            WHEN t.status = 'review' THEN 'legacy_review_without_gate_proof'
            WHEN t.status = 'merging' AND EXISTS (
                SELECT 1 FROM task_integration_operation op
@@ -74,6 +83,9 @@ SELECT t.id, t.status,
            ELSE NULL
        END,
        CASE
+           WHEN t.status IN ('planning', 'in_progress', 'working')
+             AND (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                  OR length(trim(COALESCE(t.error_annotation, ''))) > 0) THEN t.id
            WHEN t.status = 'merging' AND EXISTS (
                SELECT 1 FROM task_integration_operation op
                WHERE op.task_id = t.id AND op.kind = 'task_merge' AND op.status = 'running'
@@ -399,6 +411,120 @@ CREATE TABLE gate_evaluation (
 CREATE INDEX idx_gate_evaluation_task_created
     ON gate_evaluation(task_id, evaluated_at DESC, id DESC);
 
+-- Membership changes advance the TaskRole fence and emit a general domain
+-- fact, including for non-orchestrator roles used by Gate reviewer policies.
+-- This keeps Gate re-evaluation event-driven and lets merge admission reject
+-- evaluations whose frozen reviewer set has since changed.
+CREATE TRIGGER pr9_task_role_membership_insert_fence
+AFTER INSERT ON role_membership
+BEGIN
+    UPDATE task_role SET version = version + 1, updated_at = NEW.updated_at
+    WHERE id = NEW.task_role_id;
+    INSERT INTO domain_event (
+        id, event_type, entity_type, entity_id, actor_type, actor_id,
+        scope_type, scope_id, correlation_id, causation_id, causation_depth,
+        dedupe_key, payload_json, created_at
+    )
+    SELECT
+        lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' ||
+            substr('89ab', 1 + (abs(random()) % 4), 1) ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
+        'gate.task_role_changed', 'role_membership', NEW.id, 'system', NULL,
+        'task', role.task_id, NEW.id, NULL, 0,
+        'pr9-gate-role-membership:' || NEW.id || ':' || NEW.version,
+        json_object(
+            'task_role_id', role.id,
+            'task_role_version', role.version,
+            'membership_version', NEW.version,
+            'status', NEW.status
+        ),
+        NEW.created_at
+    FROM task_role AS role WHERE role.id = NEW.task_role_id;
+END;
+
+CREATE TRIGGER pr9_task_role_membership_update_fence
+AFTER UPDATE OF status, actor_kind, actor_id, task_role_id ON role_membership
+WHEN OLD.status IS NOT NEW.status
+  OR OLD.actor_kind IS NOT NEW.actor_kind
+  OR OLD.actor_id IS NOT NEW.actor_id
+  OR OLD.task_role_id IS NOT NEW.task_role_id
+BEGIN
+    UPDATE task_role SET version = version + 1, updated_at = NEW.updated_at
+    WHERE id = NEW.task_role_id;
+    UPDATE task_role SET version = version + 1, updated_at = NEW.updated_at
+    WHERE id = OLD.task_role_id AND OLD.task_role_id != NEW.task_role_id;
+    INSERT INTO domain_event (
+        id, event_type, entity_type, entity_id, actor_type, actor_id,
+        scope_type, scope_id, correlation_id, causation_id, causation_depth,
+        dedupe_key, payload_json, created_at
+    )
+    SELECT
+        lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' ||
+            substr('89ab', 1 + (abs(random()) % 4), 1) ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
+        'gate.task_role_changed', 'role_membership', NEW.id, 'system', NULL,
+        'task', role.task_id, NEW.id, NULL, 0,
+        'pr9-gate-role-membership:' || NEW.id || ':' || NEW.version,
+        json_object(
+            'task_role_id', role.id,
+            'task_role_version', role.version,
+            'membership_version', NEW.version,
+            'status', NEW.status
+        ),
+        NEW.updated_at
+    FROM task_role AS role WHERE role.id = NEW.task_role_id;
+    INSERT INTO domain_event (
+        id, event_type, entity_type, entity_id, actor_type, actor_id,
+        scope_type, scope_id, correlation_id, causation_id, causation_depth,
+        dedupe_key, payload_json, created_at
+    )
+    SELECT
+        lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' ||
+            substr('89ab', 1 + (abs(random()) % 4), 1) ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
+        'gate.task_role_changed', 'role_membership', OLD.id, 'system', NULL,
+        'task', role.task_id, OLD.id, NULL, 0,
+        'pr9-gate-role-membership:' || OLD.id || ':' || OLD.version || ':removed',
+        json_object(
+            'task_role_id', role.id,
+            'task_role_version', role.version,
+            'membership_removed', 1
+        ),
+        NEW.updated_at
+    FROM task_role AS role WHERE role.id = OLD.task_role_id
+      AND OLD.task_role_id != NEW.task_role_id;
+END;
+
+CREATE TRIGGER pr9_task_role_membership_delete_fence
+AFTER DELETE ON role_membership
+BEGIN
+    UPDATE task_role SET version = version + 1, updated_at = OLD.updated_at
+    WHERE id = OLD.task_role_id;
+    INSERT INTO domain_event (
+        id, event_type, entity_type, entity_id, actor_type, actor_id,
+        scope_type, scope_id, correlation_id, causation_id, causation_depth,
+        dedupe_key, payload_json, created_at
+    )
+    SELECT
+        lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' ||
+            substr('89ab', 1 + (abs(random()) % 4), 1) ||
+            lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
+        'gate.task_role_changed', 'role_membership', OLD.id, 'system', NULL,
+        'task', role.task_id, OLD.id, NULL, 0,
+        'pr9-gate-role-membership:' || OLD.id || ':' || OLD.version || ':deleted',
+        json_object(
+            'task_role_id', role.id,
+            'task_role_version', role.version,
+            'membership_removed', 1
+        ),
+        OLD.updated_at
+    FROM task_role AS role WHERE role.id = OLD.task_role_id;
+END;
+
 ALTER TABLE task_integration_operation
     ADD COLUMN gate_evaluation_id TEXT REFERENCES gate_evaluation(id) ON DELETE RESTRICT;
 
@@ -422,12 +548,17 @@ WHEN NEW.kind = 'task_merge' AND (
           AND g.gate_kind = 'merge_readiness'
           AND g.scope_kind = 'task' AND g.scope_id = e.task_id
           AND g.active_policy_revision = e.policy_revision
-          AND l.state = 'ready_to_merge'
+          AND l.state = 'ready_to_merge' AND l.reason_ref = e.id
           AND NOT EXISTS (
               SELECT 1 FROM gate_evaluation_input i
               LEFT JOIN work_unit w ON w.id = i.input_id AND w.task_id = i.task_id
               WHERE i.evaluation_id = e.id AND i.input_kind = 'work_unit'
                 AND (w.id IS NULL OR w.version != i.input_version)
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM gate_evaluation_input i
+              WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+                AND i.status != 'passed'
           )
           AND NOT EXISTS (
               SELECT 1 FROM gate_evaluation_input i
@@ -438,10 +569,15 @@ WHEN NEW.kind = 'task_merge' AND (
                      OR p.status != 'resolved')
           )
           AND NOT EXISTS (
+              SELECT 1 FROM gate_evaluation_input i
+              LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+              WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+                AND (r.id IS NULL OR r.version != i.input_version)
+          )
+          AND NOT EXISTS (
               SELECT 1 FROM gate_evaluation newer
               WHERE newer.gate_id = e.gate_id AND newer.policy_revision = e.policy_revision
-                AND (newer.evaluated_at > e.evaluated_at
-                     OR (newer.evaluated_at = e.evaluated_at AND newer.id > e.id))
+                AND newer.rowid > e.rowid
           )
     )
 )
@@ -462,12 +598,17 @@ WHEN NEW.kind = 'publish_pr' AND (
           AND g.gate_kind = 'merge_readiness'
           AND g.scope_kind = 'task' AND g.scope_id = e.task_id
           AND g.active_policy_revision = e.policy_revision
-          AND l.state = 'ready_to_merge'
+          AND l.state = 'ready_to_merge' AND l.reason_ref = e.id
           AND NOT EXISTS (
               SELECT 1 FROM gate_evaluation_input i
               LEFT JOIN work_unit w ON w.id = i.input_id AND w.task_id = i.task_id
               WHERE i.evaluation_id = e.id AND i.input_kind = 'work_unit'
                 AND (w.id IS NULL OR w.version != i.input_version)
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM gate_evaluation_input i
+              WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+                AND i.status != 'passed'
           )
           AND NOT EXISTS (
               SELECT 1 FROM gate_evaluation_input i
@@ -478,10 +619,15 @@ WHEN NEW.kind = 'publish_pr' AND (
                      OR p.status != 'resolved')
           )
           AND NOT EXISTS (
+              SELECT 1 FROM gate_evaluation_input i
+              LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+              WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+                AND (r.id IS NULL OR r.version != i.input_version)
+          )
+          AND NOT EXISTS (
               SELECT 1 FROM gate_evaluation newer
               WHERE newer.gate_id = e.gate_id AND newer.policy_revision = e.policy_revision
-                AND (newer.evaluated_at > e.evaluated_at
-                     OR (newer.evaluated_at = e.evaluated_at AND newer.id > e.id))
+                AND newer.rowid > e.rowid
           )
     )
 )
@@ -568,10 +714,8 @@ WHEN NOT EXISTS (
         AND i.version = NEW.input_version AND i.outcome = NEW.status
   ))
   OR (NEW.input_kind = 'task_role_snapshot' AND NOT EXISTS (
-      -- The role/member set is frozen into the immutable policy revision. The
-      -- live TaskRole may advance after that revision without rewriting its
-      -- historical evaluation inputs.
       SELECT 1 FROM task_role r WHERE r.id = NEW.input_id AND r.task_id = NEW.task_id
+        AND r.version = NEW.input_version
   ))
   OR (NEW.input_kind = 'merge_operation' AND NOT EXISTS (
       SELECT 1 FROM task_integration_operation op
@@ -624,7 +768,9 @@ WHEN NOT EXISTS (
     SELECT 1 FROM task_lifecycle l
     WHERE l.task_id = NEW.task_id AND l.state = NEW.from_state AND l.version = NEW.from_version
 )
-  OR (NEW.to_state = 'ready_to_merge' AND NOT EXISTS (
+  OR (NEW.to_state = 'ready_to_merge' AND (
+      NEW.reason_ref IS NOT NEW.gate_evaluation_id
+      OR NOT EXISTS (
       SELECT 1 FROM gate_evaluation e
       JOIN gate g ON g.id = e.gate_id AND g.task_id = e.task_id
       WHERE e.id = NEW.gate_evaluation_id AND e.task_id = NEW.task_id
@@ -634,8 +780,7 @@ WHEN NOT EXISTS (
         AND NOT EXISTS (
             SELECT 1 FROM gate_evaluation newer
             WHERE newer.gate_id = e.gate_id AND newer.policy_revision = e.policy_revision
-              AND (newer.evaluated_at > e.evaluated_at
-                   OR (newer.evaluated_at = e.evaluated_at AND newer.id > e.id))
+              AND newer.rowid > e.rowid
         )
         AND NOT EXISTS (
             SELECT 1 FROM gate_evaluation_input i
@@ -645,12 +790,70 @@ WHEN NOT EXISTS (
         )
         AND NOT EXISTS (
             SELECT 1 FROM gate_evaluation_input i
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+              AND i.status != 'passed'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
             LEFT JOIN decision d ON d.id = i.input_id AND d.task_id = i.task_id
             LEFT JOIN proposal p ON p.id = d.proposal_id AND p.task_id = d.task_id
             WHERE i.evaluation_id = e.id AND i.input_kind = 'decision'
               AND (d.id IS NULL OR p.id IS NULL OR p.content_version != d.proposal_version
                    OR p.status != 'resolved')
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+              AND (r.id IS NULL OR r.version != i.input_version)
+        )
+  )))
+  OR (NEW.cause_kind = 'gate_evaluation' AND NEW.to_state != 'ready_to_merge' AND (
+      NEW.from_state != 'ready_to_merge'
+      OR NEW.to_state != 'active'
+      OR NEW.cause_ref IS NOT NEW.gate_evaluation_id
+      OR NEW.reason_ref IS NOT NEW.gate_evaluation_id
+      OR NOT EXISTS (
+          SELECT 1 FROM gate_evaluation e
+          JOIN gate g ON g.id = e.gate_id AND g.task_id = e.task_id
+          JOIN task_lifecycle l ON l.task_id = e.task_id
+          WHERE e.id = NEW.gate_evaluation_id AND e.task_id = NEW.task_id
+            AND g.gate_kind = 'merge_readiness'
+            AND g.scope_kind = 'task' AND g.scope_id = e.task_id
+            AND g.active_policy_revision = e.policy_revision
+            AND l.state = 'ready_to_merge' AND l.reason_ref IS NOT e.id
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation newer
+                WHERE newer.gate_id = e.gate_id
+                  AND newer.policy_revision = e.policy_revision
+                  AND newer.rowid > e.rowid
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                LEFT JOIN work_unit w ON w.id = i.input_id AND w.task_id = i.task_id
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'work_unit'
+                  AND (w.id IS NULL OR w.version != i.input_version OR w.status != i.status)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+                  AND i.status != 'passed'
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                LEFT JOIN decision d ON d.id = i.input_id AND d.task_id = i.task_id
+                LEFT JOIN proposal p ON p.id = d.proposal_id AND p.task_id = d.task_id
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'decision'
+                  AND (d.id IS NULL OR p.id IS NULL OR p.content_version != d.proposal_version
+                       OR p.status != 'resolved')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+                  AND (r.id IS NULL OR r.version != i.input_version)
+            )
+      )
   ))
   OR (NEW.to_state = 'merging' AND (
       NEW.cause_kind != 'merge_operation'
@@ -670,8 +873,7 @@ WHEN NOT EXISTS (
         AND NOT EXISTS (
             SELECT 1 FROM gate_evaluation newer
             WHERE newer.gate_id = e.gate_id AND newer.policy_revision = e.policy_revision
-              AND (newer.evaluated_at > e.evaluated_at
-                   OR (newer.evaluated_at = e.evaluated_at AND newer.id > e.id))
+              AND newer.rowid > e.rowid
         )
         AND NOT EXISTS (
             SELECT 1 FROM gate_evaluation_input i
@@ -681,11 +883,22 @@ WHEN NOT EXISTS (
         )
         AND NOT EXISTS (
             SELECT 1 FROM gate_evaluation_input i
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+              AND i.status != 'passed'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
             LEFT JOIN decision d ON d.id = i.input_id AND d.task_id = i.task_id
             LEFT JOIN proposal p ON p.id = d.proposal_id AND p.task_id = d.task_id
             WHERE i.evaluation_id = e.id AND i.input_kind = 'decision'
               AND (d.id IS NULL OR p.id IS NULL OR p.content_version != d.proposal_version
                    OR p.status != 'resolved')
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+              AND (r.id IS NULL OR r.version != i.input_version)
         )
       )
   ))
@@ -702,7 +915,7 @@ WHEN NOT EXISTS (
         AND NEW.cause_kind = 'merge_operation'
   ))
   OR NOT (
-      (NEW.from_state = 'backlog' AND NEW.to_state IN ('ready', 'cancelled'))
+      (NEW.from_state = 'backlog' AND NEW.to_state IN ('ready', 'blocked', 'cancelled'))
       OR (NEW.from_state = 'ready' AND NEW.to_state IN ('active', 'blocked', 'cancelled'))
       OR (NEW.from_state = 'active' AND NEW.to_state IN ('ready', 'blocked', 'ready_to_merge', 'cancelled'))
       OR (NEW.from_state = 'blocked' AND NEW.to_state IN ('ready', 'active', 'cancelled'))
