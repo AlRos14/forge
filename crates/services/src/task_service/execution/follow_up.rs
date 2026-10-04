@@ -117,11 +117,34 @@ fn dispatch_role_follow_up_impl(
             }
             agent_id
         } else if let Some(memberships) = authoritative_memberships.as_ref() {
-            // Actor selection is authoritative and happens before continuity.
-            // A usable lineage Agent is not automatically the current role's
-            // selected Actor; a membership change must therefore be able to
-            // force a fresh Agent-owned session.
-            let selected = if task.repo_id.is_some() {
+            // Preserve causal continuity only while the parent Agent remains
+            // an active, usable member of this exact role. A suspended or
+            // unavailable lineage Agent falls back to deterministic current
+            // membership selection.
+            let lineage_agent_id = match lineage_parent.actor_ref() {
+                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+                Some(db::ActorRef::Human(_)) => None,
+                None => lineage_parent.agent_id.clone(),
+            };
+            let lineage_is_usable = if let Some(agent_id) = lineage_agent_id.as_deref() {
+                if task.repo_id.is_some() {
+                    crate::task_service::is_usable_repository_agent(
+                        &service.db,
+                        &task.project_id,
+                        memberships,
+                        agent_id,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::is_usable_active_agent(&service.db, memberships, agent_id)
+                        .await?
+                }
+            } else {
+                false
+            };
+            let selected = if lineage_is_usable {
+                lineage_agent_id
+            } else if task.repo_id.is_some() {
                 crate::task_service::select_usable_repository_agent_id(
                     &service.db,
                     &task.project_id,

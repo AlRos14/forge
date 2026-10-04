@@ -2774,6 +2774,185 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
 }
 
 #[tokio::test]
+async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, role_agent_id) = seed_project_repo_agent(&db).await;
+    let stale_legacy_agent_id = seed_agent(&db, "stale interactive assignee", "global", None).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "in_progress".to_owned(),
+        "Interactive TaskRole lease",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
+    )
+    .bind(&stale_legacy_agent_id)
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("legacy singleton assignment creates");
+    let task = TaskRepo::get_by_id(&db, &task_id, true)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let now = chrono::Utc::now();
+    let execution = ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            agent_id: Some(stale_legacy_agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(stale_legacy_agent_id.clone())),
+            purpose: Some(crate::ExecutionPurpose::General),
+            harness_session_id: None,
+            role: "interactive".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some(now.to_rfc3339()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        },
+    )
+    .await
+    .expect("legacy interactive Execution runs");
+    let make_lease = |id: String,
+                      operation_idempotency_key: String,
+                      task_version: i64,
+                      issued_at: String,
+                      expires_at: String| CreateWorkspaceLease {
+        id,
+        project_id: project_id.clone(),
+        task_id: task_id.clone(),
+        work_unit_id: None,
+        workspace_id: None,
+        task_version,
+        execution_id: execution.id.clone(),
+        operation_idempotency_key,
+        repository_binding_id: repo_id.clone(),
+        base_ref: "main".to_owned(),
+        role: "worker".to_owned(),
+        capabilities_json: r#"["repository_write"]"#.to_owned(),
+        assigned_principal_type: "agent".to_owned(),
+        assigned_principal_id: stale_legacy_agent_id.clone(),
+        capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+        capability_profile_digest:
+            "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8".to_owned(),
+        issuing_principal_type: "system".to_owned(),
+        issuing_principal_id: "task-service-scheduler".to_owned(),
+        issued_at: issued_at.clone(),
+        expires_at,
+        created_at: issued_at.clone(),
+        updated_at: issued_at,
+    };
+    let initial_lease = WorkspaceLeaseRepo::issue(
+        &db,
+        make_lease(
+            new_uuid_v4(),
+            new_uuid_v4(),
+            task.version,
+            now.to_rfc3339(),
+            (now + chrono::Duration::minutes(1)).to_rfc3339(),
+        ),
+    )
+    .await
+    .expect("legacy Task without TaskRole may use singleton assignment");
+
+    let role_now = now_rfc3339();
+    let task_role = TaskRoleRepo::create(
+        &db,
+        CreateTaskRole {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role: "implementer".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: role_now.clone(),
+            updated_at: role_now.clone(),
+        },
+    )
+    .await
+    .expect("canonical TaskRole creates");
+    RoleMembershipRepo::add(
+        &db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: task_role.id,
+            actor_kind: crate::ActorKind::Agent,
+            actor_id: role_agent_id,
+            status: RoleMembershipStatus::Active,
+            created_at: role_now.clone(),
+            updated_at: role_now,
+        },
+    )
+    .await
+    .expect("canonical Agent membership creates");
+    sqlx::query(
+        "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
+    )
+    .bind(&stale_legacy_agent_id)
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("contradictory legacy projection is restored for trigger coverage");
+
+    let renewed = WorkspaceLeaseRepo::renew_active(
+        &db,
+        &now.to_rfc3339(),
+        &(now + chrono::Duration::minutes(5)).to_rfc3339(),
+        &(now + chrono::Duration::minutes(15)).to_rfc3339(),
+        10,
+    )
+    .await
+    .expect("stale interactive lease ages out");
+    assert!(renewed.is_empty());
+    WorkspaceLeaseRepo::revoke(
+        &db,
+        &initial_lease.id,
+        initial_lease.version,
+        &(now + chrono::Duration::seconds(1)).to_rfc3339(),
+    )
+    .await
+    .expect("legacy lease can be revoked");
+
+    let current_task = TaskRepo::get_by_id(&db, &task_id, true)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let rejected_insert = WorkspaceLeaseRepo::issue(
+        &db,
+        make_lease(
+            new_uuid_v4(),
+            new_uuid_v4(),
+            current_task.version,
+            (now + chrono::Duration::seconds(2)).to_rfc3339(),
+            (now + chrono::Duration::minutes(20)).to_rfc3339(),
+        ),
+    )
+    .await;
+    let error = rejected_insert.expect_err("SQLite rejects the stale interactive principal");
+    assert!(error
+        .to_string()
+        .contains("Workspace lease interactive TaskRole membership is stale"));
+}
+
+#[tokio::test]
 async fn prebaseline_discovery_task_is_admitted_to_running_execution() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;

@@ -319,10 +319,33 @@ impl TaskService {
             }
             requested_agent_id
         } else if let Some(memberships) = authoritative_memberships.as_ref() {
-            // Select the current role Actor before checking whether lineage
-            // continuity is reusable. Parent eligibility alone is not Actor
-            // selection and must not preserve a previous Agent's session.
-            let selected_agent = if task.repo_id.is_some() {
+            // Keep the causal Agent when it remains active and usable in the
+            // current role. If its membership or runtime eligibility ended,
+            // choose the first usable current member instead.
+            let lineage_agent_id = match parent_execution.actor_ref() {
+                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+                Some(db::ActorRef::Human(_)) => None,
+                None => parent_execution.agent_id.clone(),
+            };
+            let lineage_is_usable = if let Some(agent_id) = lineage_agent_id.as_deref() {
+                if task.repo_id.is_some() {
+                    crate::task_service::is_usable_repository_agent(
+                        &self.db,
+                        &task.project_id,
+                        memberships,
+                        agent_id,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::is_usable_active_agent(&self.db, memberships, agent_id)
+                        .await?
+                }
+            } else {
+                false
+            };
+            let selected_agent = if lineage_is_usable {
+                lineage_agent_id
+            } else if task.repo_id.is_some() {
                 crate::task_service::select_usable_repository_agent_id(
                     &self.db,
                     &task.project_id,
@@ -623,10 +646,38 @@ impl TaskService {
             .await?
             {
                 Some(memberships) => {
-                    // Re-execute is a new Execution: select the current
-                    // eligible Actor first and do not preserve the old
-                    // Actor merely because that Agent is still usable.
-                    let selected = if task.repo_id.is_some() {
+                    // A re-execution is causal to the parent. Preserve its
+                    // Agent only while that Agent remains an active, usable
+                    // member of the authoritative role; otherwise select a
+                    // currently usable member deterministically.
+                    let lineage_agent_id = match parent_execution.actor_ref() {
+                        Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+                        Some(db::ActorRef::Human(_)) => None,
+                        None => parent_execution.agent_id.clone(),
+                    };
+                    let lineage_is_usable = if let Some(agent_id) = lineage_agent_id.as_deref() {
+                        if task.repo_id.is_some() {
+                            crate::task_service::is_usable_repository_agent(
+                                &self.db,
+                                &task.project_id,
+                                &memberships,
+                                agent_id,
+                            )
+                            .await?
+                        } else {
+                            crate::task_service::is_usable_active_agent(
+                                &self.db,
+                                &memberships,
+                                agent_id,
+                            )
+                            .await?
+                        }
+                    } else {
+                        false
+                    };
+                    let selected = if lineage_is_usable {
+                        lineage_agent_id
+                    } else if task.repo_id.is_some() {
                         crate::task_service::select_usable_repository_agent_id(
                             &self.db,
                             &task.project_id,

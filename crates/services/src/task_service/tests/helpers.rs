@@ -2,10 +2,9 @@ use super::*;
 
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, CreateExecution,
-    CreateProject, CreateRepo, CreateReview, CreateTask, CreateTaskRoleAssignment,
-    CreateTransitionLog, DaemonRepo, DaemonStatus, ExecutionRepo, ProjectRepo, RepoRepo,
-    ReviewRepo, ReviewStatus, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo, UpdateProject,
-    UpsertDaemon,
+    CreateProject, CreateRepo, CreateReview, CreateTask, CreateTaskRoleAssignment, DaemonRepo,
+    DaemonStatus, ExecutionRepo, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
 };
 use tempfile::TempDir;
 
@@ -300,75 +299,4 @@ pub(super) async fn seed_passed_review(
     )
     .await
     .expect("passed review creates")
-}
-
-pub(super) async fn seed_review_rejection_log(
-    db: &SqliteDb,
-    task_id: &str,
-    reason: &str,
-) -> String {
-    let log = TransitionLogRepo::insert(
-        db,
-        CreateTransitionLog {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            from_state: crate::workflow::default_states::REVIEW.to_owned(),
-            to_state: crate::workflow::default_states::IN_PROGRESS.to_owned(),
-            trigger_name: Some("reject".to_owned()),
-            triggered_by: api_types::Actor::system(api_types::SystemComponent::Test).display(),
-            trigger_reason: reason.to_owned(),
-            hook_results_json: None,
-            rejection: true,
-            created_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("transition log creates");
-    log.id
-}
-
-pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> Task {
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::ReviewBudgetExhausted,
-        blocking_reason: "review retry budget exhausted".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("review retry budget exhausted".to_owned()),
-        hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::ProceedOnce,
-            api_types::RecoveryAction::CancelTask,
-        ],
-    });
-    TaskRepo::update(
-        db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: Some(Some(
-                json!({
-                    "reason": "review retry budget exhausted",
-                    "created_at": now_rfc3339(),
-                    "kind": "review_gate_failed"
-                })
-                .to_string(),
-            )),
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("retry-exhausted metadata sets")
 }

@@ -194,6 +194,12 @@ Decision, WorkUnit, exact TaskMerge operation, and exact lifecycle transition
 requirements. Durable fact events drive evaluation; EventBus is only a wake
 hint. A Gate-caused transition stores the exact GateEvaluation, and replay
 applies that persisted evaluation rather than recomputing against newer facts.
+V106 fences Running Execution insertion/resumption against terminal Task
+lifecycle in SQLite. V107 binds an `interactive` Execution's WorkspaceLease to
+the TaskRole selected by Task type when that role exists, and checks active
+Agent membership on lease issue and renewal. The old singleton fallback stays
+available only when the matching canonical TaskRole does not exist.
+
 PR9 does not create HumanApproval, copy review or validation verdicts, or
 convert legacy workflow definitions into Gate policies.
 

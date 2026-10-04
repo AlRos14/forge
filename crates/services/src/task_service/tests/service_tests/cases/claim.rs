@@ -121,6 +121,45 @@ async fn claim_recovers_task_branch_left_by_a_rejected_workspace_attempt() {
 }
 
 #[tokio::test]
+async fn claim_returns_the_persisted_execution_after_dispatch_start_fails() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Report failed dispatch accurately",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("the durable claim remains available for recovery");
+    let persisted = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+
+    assert_eq!(claimed.execution.status, persisted.status);
+    assert_eq!(claimed.execution.status, ExecutionStatus::Failed);
+    assert!(claimed
+        .execution
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("task executor is not configured")));
+}
+
+#[tokio::test]
 async fn create_claim_and_transition_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

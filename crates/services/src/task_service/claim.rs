@@ -514,6 +514,11 @@ impl TaskService {
             {
                 claimed.task = current_task;
             }
+            if let Some(current_execution) =
+                db::ExecutionRepo::get_by_id(&*self.db, &claimed.execution.id).await?
+            {
+                claimed.execution = current_execution;
+            }
         }
 
         Ok(claimed)

@@ -463,7 +463,30 @@ impl TaskService {
             None
         };
         let agent_id = if let Some(memberships) = authoritative_memberships.as_ref() {
-            let selected = if task.repo_id.is_some() {
+            let lineage_agent_id = match blocked_execution.actor_ref() {
+                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+                Some(db::ActorRef::Human(_)) => None,
+                None => blocked_execution.agent_id.clone(),
+            };
+            let lineage_is_usable = if let Some(agent_id) = lineage_agent_id.as_deref() {
+                if task.repo_id.is_some() {
+                    crate::task_service::is_usable_repository_agent(
+                        &self.db,
+                        &task.project_id,
+                        memberships,
+                        agent_id,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::is_usable_active_agent(&self.db, memberships, agent_id)
+                        .await?
+                }
+            } else {
+                false
+            };
+            let selected = if lineage_is_usable {
+                lineage_agent_id
+            } else if task.repo_id.is_some() {
                 crate::task_service::select_usable_repository_agent_id(
                     &self.db,
                     &task.project_id,

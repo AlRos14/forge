@@ -93,7 +93,7 @@ impl WorkflowEngine {
         )
     )]
     #[allow(clippy::too_many_arguments)]
-    pub async fn transition(
+    pub(crate) async fn transition(
         &self,
         task_id: &str,
         target_state: &str,
@@ -117,7 +117,7 @@ impl WorkflowEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn transition_with_deferred_dispatch(
+    pub(crate) async fn transition_with_deferred_dispatch(
         &self,
         task_id: &str,
         target_state: &str,
@@ -146,65 +146,7 @@ impl WorkflowEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn transition_with_execution_cause(
-        &self,
-        task_id: &str,
-        target_state: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: &Actor,
-        reason: &str,
-        rejection: bool,
-        defer_dispatch_until: Option<String>,
-        causing_execution_id: &str,
-    ) -> crate::Result<TransitionResult> {
-        self.transition_inner(
-            task_id.to_owned(),
-            target_state.to_owned(),
-            version,
-            workflow,
-            actor.clone(),
-            reason.to_owned(),
-            rejection,
-            false,
-            defer_dispatch_until,
-            None,
-            0,
-            Some(causing_execution_id.to_owned()),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn move_task(
-        &self,
-        task_id: &str,
-        target_state: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: &Actor,
-        reason: &str,
-        move_request: BoardMoveRequest,
-    ) -> crate::Result<TransitionResult> {
-        self.transition_inner(
-            task_id.to_owned(),
-            target_state.to_owned(),
-            version,
-            workflow,
-            actor.clone(),
-            reason.to_owned(),
-            false,
-            false,
-            None,
-            Some(move_request),
-            0,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn manual_override_transition(
+    pub(crate) async fn manual_override_transition(
         &self,
         task_id: &str,
         target_state: &str,
@@ -231,7 +173,7 @@ impl WorkflowEngine {
         .await
     }
 
-    pub async fn retry_entry_barrier(
+    pub(crate) async fn retry_entry_barrier(
         &self,
         task_id: &str,
         version: i64,
@@ -511,49 +453,6 @@ impl WorkflowEngine {
             cascaded: false,
             board_move: None,
         })
-    }
-
-    #[tracing::instrument(
-        skip(self, workflow),
-        fields(task_id = %task_id, target_state = %target_state, version = version, actor = %actor, reason = %reason)
-    )]
-    pub async fn reset_to_initial(
-        &self,
-        task_id: &str,
-        target_state: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: &Actor,
-        reason: &str,
-    ) -> crate::Result<db::Task> {
-        let to_state = Self::find_state(workflow, target_state).ok_or_else(|| {
-            ServiceError::InvalidOperation {
-                message: Self::undefined_state_message(target_state, workflow),
-            }
-        })?;
-        if to_state.kind != StateKind::Initial {
-            return Err(ServiceError::InvalidOperation {
-                message: format!("state '{target_state}' is not the workflow initial state"),
-            });
-        }
-
-        let result = self
-            .transition_inner(
-                task_id.to_string(),
-                target_state.to_string(),
-                version,
-                workflow,
-                actor.clone(),
-                reason.to_string(),
-                false,
-                true,
-                None,
-                None,
-                0,
-                None,
-            )
-            .await?;
-        Ok(result.task)
     }
 
     pub fn validate_claimable(

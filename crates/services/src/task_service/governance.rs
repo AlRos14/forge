@@ -1454,16 +1454,32 @@ impl TaskService {
         role: &str,
         principal_id: Option<&str>,
     ) -> Result<String> {
-        let target_role = db::canonical_task_role_name(role.trim()).ok_or_else(|| {
-            ServiceError::invalid_operation("WorkspaceLease role is not a TaskRole")
-        })?;
-        let task_role_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM task_role WHERE task_id = ? AND role = ?",
-        )
-        .bind(&task.id)
-        .bind(&target_role)
-        .fetch_optional(self.db.pool())
-        .await?;
+        // `interactive` labels a direct Execution, but its WorkspaceLease is
+        // still governed by the TaskRole for the Task's operation whenever
+        // that canonical role exists. Only Tasks without that role may use
+        // the bounded pre-TaskRole singleton fallback below.
+        let target_role = match db::canonical_task_role_name(role.trim()) {
+            Some(role) => Some(role),
+            None if role.trim().eq_ignore_ascii_case("interactive") => Some(
+                crate::task_service::execution::task_role_for_task_type(&task.task_type).to_owned(),
+            ),
+            None => {
+                return Err(ServiceError::invalid_operation(
+                    "WorkspaceLease role is not a TaskRole",
+                ));
+            }
+        };
+        let task_role_id = if let Some(target_role) = target_role {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM task_role WHERE task_id = ? AND role = ?",
+            )
+            .bind(&task.id)
+            .bind(&target_role)
+            .fetch_optional(self.db.pool())
+            .await?
+        } else {
+            None
+        };
         if let Some(task_role_id) = task_role_id {
             let members = sqlx::query(
                 "SELECT actor_kind, actor_id, status

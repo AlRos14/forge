@@ -11,7 +11,7 @@ unchanged.
 - PR8 HEAD: `834b6c486b56c9abbf63fe26248eacacea0e0d74`; ancestry verified in `main`.
 - PR9 branch: `feat/plan-pr9-gate-engine-task-lifecycle`.
 - PR9 initial HEAD: `6367cc257f9a6ccc1febcce9b4ab6abefd4161d8`.
-- Migration head at PR9 base: V099. PR9 adds V100–V106; each migration is additive.
+- Migration head at PR9 base: V099. PR9 adds V100–V107; each migration is additive.
 - PR8 was merged as repository PR #11; resulting `main` is the PR9 base above.
 
 ### CHECKPOINT 1 — PR8 merged
@@ -29,7 +29,7 @@ the post-merge `main`. PR9 started at that exact `main`.
 | NEW AUTHORITY | Immutable GatePolicyRevision, GateEvaluation, ordered GateEvaluationInput, TaskLifecycle and transition receipt | Deterministic policy and aggregate progress now own readiness and Task lifecycle. |
 | COMPATIBILITY | `task.status`, finite legacy Task transition route, workflow-definition read/configuration views | `task.status` is a one-way SQLite-guarded projection of TaskLifecycle. Legacy Task transition input maps to aggregate states only. No workflow hook writes lifecycle. Public projection alignment remains PR12. |
 | HISTORICAL STORAGE | `transition_log`, `blocked_json`, `entry_barrier_json`, `review_passed_at`, workflow/state definitions, GateConfig, old review rows | Retained as historical/configuration data. Retry counts, old review state, and GateConfig do not authorize a Gate or lifecycle transition. Physical removal belongs to PR13. |
-| BOUNDED COMPATIBILITY | Workflow resolution used by workflow read/configuration and prompt-preview surfaces; private legacy recovery/cascade code with no active production transition caller | It cannot write TaskLifecycle or certify Gate. Public-surface alignment is PR12; physical code/table cleanup is PR13. |
+| BOUNDED COMPATIBILITY | Workflow resolution used by workflow read/configuration and prompt-preview surfaces; crate-private legacy recovery/cascade code | WorkflowEngine transition entrypoints are no longer public outside `services`; three unused mutation entrypoints were removed. Retired recovery actions are rejected at the public service boundary. Remaining config/read projections belong to PR12; physical engine/table cleanup belongs to PR13. |
 | PR10+ | Embedded agent/host cognition and process ownership | Unchanged. |
 | PR12 | Full REST/MCP/CLI/UI lifecycle and Gate projection | Only minimum REST Gate/lifecycle surface is present here. |
 | PR13 CLEANUP | Legacy columns/tables, WorkflowEngine implementation, ReviewRunner/storage, old transition rows | Preserve source data until the destructive cleanup plan. |
@@ -96,6 +96,11 @@ admission against terminal lifecycle writes: an insert or resume must observe
 the durable TaskLifecycle in the same SQLite write transaction, so a launch
 that loses a cancellation/done/merge race cannot leave a Running Execution on
 a terminal Task.
+
+V107 binds the `interactive` Execution label to the TaskRole selected by the
+Task operation type whenever that canonical role exists. SQLite rejects a
+WorkspaceLease insert or renewal whose Agent is not an active member; the
+pre-TaskRole singleton fallback remains available only when the role is absent.
 
 The existing `task.status` column is preserved and normalized as a lossy
 projection. The migration audit preserves the original state, workflow
@@ -209,10 +214,12 @@ membership/version, and Gate policy revision facts.
 ### CHECKPOINT 3 — schema/lifecycle
 
 V100 adds the lifecycle aggregate, immutable transition facts, audit mapping,
-Gate identity and versioned policy/evaluation/input tables. V101–V106 add exact
+Gate identity and versioned policy/evaluation/input tables. V101–V107 add exact
 retry receipts, TaskRole revision events, retry exhaustion fences, mutable Gate
 input currentness, exact retry-rework demotion authority with replay fencing,
-and Running Execution admission fencing for terminal Task lifecycle. Task
+and Running Execution admission fencing for terminal Task lifecycle. V107
+fences interactive WorkspaceLease admission/renewal against canonical
+TaskRole membership. Task
 lifecycle writes use optimistic Task/lifecycle versions, durable idempotency
 receipts, and one-way `task.status` projection.
 
@@ -269,6 +276,9 @@ Commands and results from this review:
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS. |
 | `git diff --check` | PASS. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo check -p services --locked --offline` | PASS without warnings after removing three unused legacy mutation entrypoints. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo check -p api --locked --offline` | PASS; product crates compile without access to the crate-private WorkflowEngine mutators. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib --no-run --locked --offline` | PASS; all services unit-test callsites compile after the legacy mutation cutover. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests:: --locked --offline` | PASS, 9 tests, including concurrent version fencing, exact validation mismatch, rejection of Actor re-entry from merge-ready, and exact retry-receipt rework. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib gate_engine::tests:: --locked --offline` | PASS, 5 tests, including wrong reviewer, Human-required, N-of-M, all-required, and stale TaskRole membership. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_failure_retry::tests:: --locked --offline` | PASS, 2 tests. |
@@ -284,6 +294,10 @@ Commands and results from this review:
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::actions::tests:: --locked --offline` | PASS, 1 test; merge lifecycle no longer advertises invalid Resume/Cancel actions. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib orchestrator_runtime::tests:: --locked --offline` | PASS, 23 tests, including TaskRole revision fencing, the Gate membership event, and the single-wake retry regression. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db --test file_backed_migration pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambiguity --locked --offline` | PASS, 1 test. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db --lib interactive_workspace_lease_uses_task_role_for_insert_and_renewal --locked --offline` | PASS, 1 test; the legacy lease cannot renew or be reissued after the canonical TaskRole contradicts its singleton assignee. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::service_tests::cases::executions::interactive_workspace_lease_uses_the_canonical_task_role_when_present --locked --offline` | PASS, 1 test; a stale singleton Agent is terminalized before adapter dispatch and receives no WorkspaceLease. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::service_tests::cases::executions:: --locked --offline` | PASS, 54 tests, including the interactive TaskRole authority regression and the PR8 review/session execution cases. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::service_tests::cases::claim::claim_returns_the_persisted_execution_after_dispatch_start_fails --locked --offline` | PASS, 1 test; the claim response reflects the durable failed Execution after dispatch denial. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p api --test gate_engine_api --locked --offline` | PASS, 3 tests after aligning the JSON expectation for nullable `scope_requirement`. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p api --test happy_path --locked --offline` | PASS, 2 tests. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib orchestrator_runtime::tests::exact_failure_has_one_wake_after_retry_lifecycle_effect --locked --offline` | PASS, 1 regression test: a failure's derived GateEvaluation and source event do not add wakes beside its exact rework receipt. |
@@ -306,8 +320,10 @@ they do not claim provider/live acceptance or full workspace acceptance.
   Workspace/Lease, durable DomainEvent.
 - **BOUNDED COMPATIBILITY / PR12:** `task.status` projection; finite legacy
   status input mapped to aggregate lifecycle; workflow definition read/config
-  views and existing response fields. None can write lifecycle or certify a
-  Gate.
+  views and existing response fields. WorkflowEngine mutation methods are
+  crate-private; unused execution-cause, board-move, and reset mutators were
+  removed, and retired recovery actions reject before reaching retained
+  private recovery code. None can write lifecycle or certify a Gate.
 - **HISTORICAL STORAGE / PR13:** transition log, blocked/entry-barrier/review
   columns, workflow/state configuration, GateConfig and legacy hook records.
 - **PR10+:** embedded agent host and cognition/process ownership.
@@ -334,7 +350,12 @@ they do not claim provider/live acceptance or full workspace acceptance.
   and TaskAction API replay repeat execution cleanup. A separate provenance
   check requires the exact retry
   event to carry both the persisted source `causation_id` and matching payload
-  `source_event_id` before it can authorize rework.
+  `source_event_id` before it can authorize rework. The final role-authority
+  pass found that `interactive` could be interpreted as “no TaskRole” and
+  inherit a contradictory singleton assignee. Service admission now resolves
+  the Task's operation role before adapter dispatch, and V107 repeats active membership checks on
+  WorkspaceLease insertion and renewal. Legacy singleton authority remains
+  bounded to Tasks with no matching canonical TaskRole.
 
 Physical removal of `task.status`, workflow/state tables, GateConfig,
 `transition_log`, old review storage and broad API/MCP/UI alignment is deferred
@@ -347,4 +368,8 @@ authority.
 - P2: 0
 - P3: 0
 
-PR9 is ready for review and remains unmerged.
+The final authority pass found and fixed one P2: `interactive` WorkspaceLease
+admission could inherit a contradictory legacy assignee despite a canonical
+TaskRole. V107 and service validation now require active membership, with
+insert, renewal, and service regressions. PR9 is ready for review and remains
+unmerged.

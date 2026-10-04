@@ -2,108 +2,42 @@ use super::helpers::*;
 use super::*;
 
 #[tokio::test]
-async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
+async fn retired_workflow_recovery_publishes_no_recovery_or_lifecycle_effect() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Completed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    seed_failed_review(
-        &db,
-        &task.id,
-        &execution.id,
-        1,
-        json!({ "ci_steps": [{"command": "cargo test", "exit_code": 1}] }),
-    )
-    .await;
-    seed_review_rejection_log(&db, &task.id, "review failed once").await;
-    seed_review_rejection_log(&db, &task.id, "review failed twice").await;
-    let task = set_retry_exhausted_metadata(&db, &task).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo").await;
     let mut rx = event_bus.subscribe();
 
-    service
+    let error = service
         .recover_task(
             task.id.clone(),
             api_types::RecoveryAction::ResetRetryWindow,
-            Some("reason".to_owned()),
+            Some("legacy request".to_owned()),
             None,
         )
         .await
-        .expect("reset retry window succeeds");
-
-    let mut events = Vec::new();
-    while let Ok(Ok(event)) =
-        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
-    {
-        events.push(event);
-    }
-
-    let recovery_events = events
-        .iter()
-        .filter(|event| event.event_type == "task.recovery_applied")
-        .collect::<Vec<_>>();
-    assert_eq!(recovery_events.len(), 2);
-    let event = recovery_events
-        .iter()
-        .find(|event| {
-            matches!(
-                &event.context,
-                EventContext::RecoveryApplied { action, .. } if action == "reset_retry_window"
-            )
-        })
-        .expect("reset retry window recovery event");
-    assert_eq!(event.entity_id, task.id);
-    match &event.context {
-        EventContext::RecoveryApplied {
-            project_id: event_project_id,
-            task_id,
-            action,
-            state,
-            transition_log_id,
-        } => {
-            assert_eq!(event_project_id, &project_id);
-            assert_eq!(task_id, &task.id);
-            assert_eq!(action, "reset_retry_window");
-            assert_eq!(
-                state.as_deref(),
-                Some(crate::workflow::default_states::REVIEW)
-            );
-            assert!(transition_log_id.is_some());
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
+        .expect_err("retry-window recovery is retired");
+    assert!(error
+        .to_string()
+        .contains("legacy workflow recovery actions are retired"));
 
     assert!(
-        events.iter().any(|event| {
-            matches!(
-                &event.context,
-                EventContext::RecoveryApplied { action, .. } if action == "resume_process"
-            )
-        }),
-        "reset_retry_window should resume process and publish resume_process recovery event"
+        tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv())
+            .await
+            .is_err()
     );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.event_type == "task.status_changed"),
-        "reset_retry_window should resume work and publish task.status_changed"
-    );
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("lifecycle loads")
+        .expect("lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Ready);
+    assert_eq!(lifecycle.version, 1);
+    assert!(TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("transition log loads")
+        .is_empty());
 }
 
 async fn seed_assigned_task(
@@ -149,8 +83,6 @@ async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
     let task = seed_assigned_task(&db, &project_id, &repo_id, &agent_id).await;
     assert_eq!(task.assignee_id.as_deref(), Some(agent_id.as_str()));
 
-    // The workspace-failure path ends in fail_task, which clears any blocking
-    // annotation; the reset decision must survive on the failed metadata kind.
     service
         .fail_task(
             task.id.clone(),
