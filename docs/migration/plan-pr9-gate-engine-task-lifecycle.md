@@ -279,6 +279,7 @@ Commands and results from this review:
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo check -p services --locked --offline` | PASS without warnings after removing three unused legacy mutation entrypoints. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo check -p api --locked --offline` | PASS; product crates compile without access to the crate-private WorkflowEngine mutators. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib --no-run --locked --offline` | PASS; all services unit-test callsites compile after the legacy mutation cutover. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::service_tests::cases::move_task:: --locked --offline` | PASS, 3 tests; board moves atomically advance aggregate lifecycle and its legacy projection, while retired workflow hooks do not cascade. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests:: --locked --offline` | PASS, 9 tests, including concurrent version fencing, exact validation mismatch, rejection of Actor re-entry from merge-ready, and exact retry-receipt rework. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests::exact_validation_gate_moves_to_merge_ready_and_new_policy_revokes_stale_readiness --locked --offline` | PASS, 1 test; a failed TaskMerge produces the durable `task.lifecycle_changed` event, exact retry reopens only its own blocked Task, and replay leaves the lifecycle version unchanged. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib gate_engine::tests:: --locked --offline` | PASS, 5 tests, including wrong reviewer, Human-required, N-of-M, all-required, and stale TaskRole membership. |
@@ -332,6 +333,8 @@ they do not claim provider/live acceptance or full workspace acceptance.
   terminality readers now use aggregate lifecycle; legacy recursive/retry
   paths no longer own execution rework; exact failure receipts authorize
   redispatch while permanent executor-unavailable blocks remain effective;
+  board moves write the lifecycle transition and `task.status` projection in
+  one transaction, with retired WorkflowEngine hooks unable to cascade;
   stale GateEvaluations cannot revoke readiness; replayed retry receipts cannot
   regress a later lifecycle decision; coordination outcomes, agent focus and
   shutdown selection now read lifecycle or exact Execution facts. The review

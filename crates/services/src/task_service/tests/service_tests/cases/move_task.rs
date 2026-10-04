@@ -73,7 +73,7 @@ async fn board_reorder_is_idempotent_and_emits_one_move_event() {
 }
 
 #[tokio::test]
-async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
+async fn cross_column_move_projects_aggregate_lifecycle_without_workflow_cascade() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(64));
     let mut events = event_bus.subscribe();
@@ -94,16 +94,18 @@ async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
     assert_eq!(result.old_status, default_states::TODO);
     assert_eq!(result.task.status, default_states::IN_PROGRESS);
     assert!(result.board_revision > revision);
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("aggregate lifecycle loads")
+        .expect("Task lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
 
     let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
         .await
         .expect("transition logs load");
-    assert!(logs.iter().any(|log| {
-        log.from_state == default_states::TODO && log.to_state == default_states::PLANNING
-    }));
-    assert!(logs.iter().any(|log| {
-        log.from_state == default_states::PLANNING && log.to_state == default_states::IN_PROGRESS
-    }));
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].from_state, default_states::TODO);
+    assert_eq!(logs[0].to_state, default_states::IN_PROGRESS);
 
     let drained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
     let moved_events = drained
@@ -114,24 +116,18 @@ async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
     match &moved_events[0].context {
         EventContext::TaskMoved(payload) => {
             assert_eq!(payload.old_status, default_states::TODO);
-            assert_eq!(payload.new_status, default_states::PLANNING);
+            assert_eq!(payload.new_status, default_states::IN_PROGRESS);
             assert_eq!(payload.task_version, task.version + 1);
         }
         context => panic!("expected task moved context, got {context:?}"),
     }
-    assert!(drained.iter().any(|event| {
-        event.event_type == "task.status_changed"
-            && matches!(
-                &event.context,
-                EventContext::TaskStatusChanged { old_status, new_status, .. }
-                    if old_status == default_states::PLANNING
-                        && new_status == default_states::IN_PROGRESS
-            )
-    }));
+    assert!(drained
+        .iter()
+        .all(|event| event.event_type != "task.status_changed"));
 }
 
 #[tokio::test]
-async fn board_move_conflicts_and_guard_rejection_write_nothing() {
+async fn board_move_conflicts_and_retired_workflow_hooks_do_not_write() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -222,7 +218,7 @@ async fn board_move_conflicts_and_guard_rejection_write_nothing() {
         .await
         .expect("revision loads");
     let operation_id = new_uuid_v4();
-    let rejected = service
+    let moved = service
         .move_task(
             task.id.clone(),
             MoveTaskRequest {
@@ -235,21 +231,30 @@ async fn board_move_conflicts_and_guard_rejection_write_nothing() {
             },
         )
         .await;
-    assert!(matches!(rejected, Err(ServiceError::GuardRejection { .. })));
+    let moved = moved.expect("retired WorkflowEngine hooks do not govern lifecycle moves");
+    assert_eq!(moved.task.status, default_states::IN_PROGRESS);
+    assert_eq!(moved.task.version, current.version + 1);
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("aggregate lifecycle loads")
+        .expect("Task lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
+    assert_eq!(lifecycle.reason_kind.as_deref(), Some("board_move"));
+    assert_eq!(lifecycle.reason_ref.as_deref(), Some(operation_id.as_str()));
     let after = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
         .expect("task exists");
-    assert_eq!(after.status, current.status);
-    assert_eq!(after.version, current.version);
+    assert_eq!(after.status, moved.task.status);
+    assert_eq!(after.version, moved.task.version);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM task_move_operation WHERE operation_id = ?",
+            "SELECT COUNT(*) FROM task_move_operation WHERE operation_id = ? AND state = 'completed'",
         )
         .bind(operation_id)
         .fetch_one(db.pool())
         .await
         .expect("operation count loads"),
-        0
+        1
     );
 }
