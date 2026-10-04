@@ -280,6 +280,7 @@ Commands and results from this review:
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo check -p api --locked --offline` | PASS; product crates compile without access to the crate-private WorkflowEngine mutators. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib --no-run --locked --offline` | PASS; all services unit-test callsites compile after the legacy mutation cutover. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests:: --locked --offline` | PASS, 9 tests, including concurrent version fencing, exact validation mismatch, rejection of Actor re-entry from merge-ready, and exact retry-receipt rework. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests::exact_validation_gate_moves_to_merge_ready_and_new_policy_revokes_stale_readiness --locked --offline` | PASS, 1 test; a failed TaskMerge produces the durable `task.lifecycle_changed` event, exact retry reopens only its own blocked Task, and replay leaves the lifecycle version unchanged. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib gate_engine::tests:: --locked --offline` | PASS, 5 tests, including wrong reviewer, Human-required, N-of-M, all-required, and stale TaskRole membership. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_failure_retry::tests:: --locked --offline` | PASS, 2 tests. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib coordination_consumer::tests:: --locked --offline` | PASS, 1 test for exact lifecycle outcomes and stale-reason isolation. |
@@ -368,8 +369,13 @@ authority.
 - P2: 0
 - P3: 0
 
-The final authority pass found and fixed one P2: `interactive` WorkspaceLease
-admission could inherit a contradictory legacy assignee despite a canonical
-TaskRole. V107 and service validation now require active membership, with
-insert, renewal, and service regressions. PR9 is ready for review and remains
-unmerged.
+The earlier PR draft's three P2s are closed: exact failure/rework receipts are
+consumed from durable events; legacy WorkflowEngine mutators have no product
+crate entrypoint and retired recovery actions reject before legacy code; and
+the focused matrix now includes reviewer quorum, exact Decisions/WorkUnits,
+stale inputs, merge failure/recovery replay, and retry exhaustion. The final
+authority pass found one additional P2: `interactive` WorkspaceLease
+admission could inherit a contradictory singleton assignee despite a
+canonical TaskRole. V107 and service validation now require active membership,
+with insert, renewal, and service regressions. PR9 is ready for review and
+remains unmerged.

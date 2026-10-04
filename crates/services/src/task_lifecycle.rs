@@ -517,6 +517,7 @@ mod tests {
         TaskLifecycleRepo, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceRepo,
         WorkspaceStatus,
     };
+    use serde_json::Value;
     use sha2::Digest;
 
     async fn seeded_ready_task() -> (Arc<SqliteDb>, Arc<EventBus>, Task) {
@@ -1197,24 +1198,51 @@ mod tests {
             GateEvaluationOutcome::Unsatisfied
         );
 
-        let ready_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        assert_eq!(merge_finished_event.event_type, "task.lifecycle_changed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&merge_finished_event.payload_json)
+                .expect("merge lifecycle event payload")
+                .get("task_merge_status")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&merge_finished_event)
+                .await
+                .expect("real TaskMerge failure event creates and applies its exact retry receipt"),
+            1
+        );
+        let reworked = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
             .await
-            .expect("Task lookup")
-            .expect("Task");
-        TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .transition(TransitionLifecycleInput {
-                task_id: task.id.clone(),
-                expected_task_version: ready_task.version,
-                to_state: TaskLifecycleState::Active,
-                cause: LifecycleCause::Actor(api_types::Actor::user(
-                    api_types::UserActionSource::Test,
-                )),
-                reason_kind: Some("reopen_after_readiness".to_owned()),
-                reason_ref: Some("exercise exact evaluation replay".to_owned()),
-                idempotency_key: "test:reopen-after-readiness".to_owned(),
-            })
+            .expect("Task lifecycle after merge failure rework")
+            .expect("Task lifecycle");
+        assert_eq!(reworked.state, TaskLifecycleState::Active);
+        assert_eq!(
+            reworked.reason_kind.as_deref(),
+            Some("merge_failure_rework")
+        );
+        assert_eq!(
+            reworked.reason_ref.as_deref(),
+            Some(merge_operation_id.as_str())
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&merge_finished_event)
+                .await
+                .expect("merge failure event replay reuses its durable retry receipt"),
+            1
+        );
+        let replayed_rework = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
             .await
-            .expect("explicit re-entry to active lifecycle");
+            .expect("Task lifecycle after merge failure replay")
+            .expect("Task lifecycle");
+        assert_eq!(replayed_rework.version, reworked.version);
+
         gate_engine
             .process_domain_event(&evaluation_event)
             .await
