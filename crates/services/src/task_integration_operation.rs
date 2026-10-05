@@ -1027,6 +1027,247 @@ mod tests {
         metadata
     }
 
+    async fn set_test_provider_identity(
+        fixture: &Fixture,
+        merge: &TaskIntegrationOperationGuard,
+        publish: &TaskIntegrationOperationGuard,
+        provider_pr_id: &str,
+        pr_url: &str,
+        pr_state: &str,
+    ) -> db::PrMetadata {
+        let current = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("PR metadata lookup")
+            .expect("PR metadata exists");
+        PrMetadataRepo::update(
+            &*fixture.db,
+            db::UpdatePrMetadata {
+                id: current.id,
+                provider_type: None,
+                provider_pr_id: Some(Some(provider_pr_id.to_owned())),
+                pr_url: Some(Some(pr_url.to_owned())),
+                source_branch: None,
+                target_branch: None,
+                pr_state: Some(pr_state.to_owned()),
+                merge_status: None,
+                task_merge_operation_id: None,
+                publish_operation_id: None,
+                last_synced_at: Some(Some(now_rfc3339())),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("provider identity is stored in current projection");
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("updated PR metadata lookup")
+            .expect("PR metadata remains");
+        assert_eq!(
+            metadata.task_merge_operation_id.as_deref(),
+            Some(merge.id())
+        );
+        assert_eq!(metadata.publish_operation_id.as_deref(), Some(publish.id()));
+        metadata
+    }
+
+    async fn satisfy_followup_gate(
+        fixture: &Fixture,
+        event_bus: Arc<EventBus>,
+        gate_id: &str,
+        source_sha: &str,
+        policy: &crate::gate_engine::GatePolicyDocument,
+    ) -> crate::Result<db::GateEvaluation> {
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: fixture.task_id.clone(),
+            expected_task_version: task.version,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::Actor(api_types::Actor::User {
+                user_id: Some(fixture.user_id.clone()),
+                source: api_types::UserActionSource::Api,
+            }),
+            reason_kind: Some("human_approved_pr_rework".to_owned()),
+            reason_ref: Some(source_sha.to_owned()),
+            idempotency_key: format!("human-pr-rework:{source_sha}"),
+        })
+        .await?;
+        let engine =
+            crate::gate_engine::GateEngine::new(Arc::clone(&fixture.db), Arc::clone(&event_bus));
+        let previous_decision = policy
+            .decisions
+            .first()
+            .cloned()
+            .ok_or_else(|| ServiceError::invalid_operation("test Gate needs a decision"))?;
+        let collaboration = crate::collaboration_service::CollaborationService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        );
+        let proposal = collaboration
+            .create_proposal(
+                crate::collaboration_service::CollaborationActorSource::Human(
+                    fixture.user_id.clone(),
+                ),
+                crate::collaboration_service::CreateProposalInput {
+                    task_id: fixture.task_id.clone(),
+                    target: db::ProposalTarget {
+                        kind: db::ProposalTargetKind::Task,
+                        id: fixture.task_id.clone(),
+                    },
+                    action: "merge".to_owned(),
+                    reason: format!("Approve the follow-up PR rework {source_sha}"),
+                    target_version: None,
+                    target_digest: None,
+                    required_policy_ref: previous_decision.policy_ref.clone(),
+                    required_policy_version: previous_decision.policy_version,
+                    required_policy_digest: previous_decision.policy_digest.clone(),
+                    supersedes_proposal_id: None,
+                    artifact_ids: Vec::new(),
+                },
+            )
+            .await?;
+        let decision = collaboration
+            .record_decision(
+                crate::collaboration_service::CreateDecisionInput {
+                    task_id: fixture.task_id.clone(),
+                    proposal_id: proposal.id.clone(),
+                    proposal_version: proposal.content_version,
+                    outcome: db::DecisionOutcome::Approve,
+                    rationale: format!("Approve follow-up PR rework {source_sha}"),
+                    policy_ref: previous_decision.policy_ref,
+                    policy_version: previous_decision.policy_version,
+                    policy_digest: previous_decision.policy_digest,
+                },
+                vec![
+                    crate::collaboration_service::CollaborationActorSource::Human(
+                        fixture.user_id.clone(),
+                    ),
+                ],
+            )
+            .await?;
+        let mut followup_policy = policy.clone();
+        let requirement = followup_policy
+            .decisions
+            .first_mut()
+            .ok_or_else(|| ServiceError::invalid_operation("test Gate needs a decision"))?;
+        requirement.proposal_id = proposal.id;
+        requirement.proposal_version = decision.proposal_version;
+        requirement.decision_id = decision.id.clone();
+        let gate = db::GateRepo::get_gate(&*fixture.db, gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        engine
+            .revise_policy(gate_id, gate.active_policy_revision, followup_policy)
+            .await?;
+        let evaluation = engine.evaluate_active(gate_id).await?;
+        if !evaluation
+            .inputs
+            .iter()
+            .any(|input| input.input_kind == "decision" && input.input_id == decision.id)
+        {
+            return Err(ServiceError::invalid_operation(
+                "follow-up GateEvaluation did not capture its new human Decision",
+            ));
+        }
+        if let Some(event) = evaluation.event.as_ref() {
+            engine.process_domain_event(event).await?;
+        }
+        if evaluation.evaluation.outcome != db::GateEvaluationOutcome::Satisfied {
+            return Err(ServiceError::invalid_operation(
+                "follow-up PR requires a satisfied exact GateEvaluation",
+            ));
+        }
+        Ok(evaluation.evaluation)
+    }
+
+    async fn admit_followup_pr_from_gate(
+        fixture: &Fixture,
+        root: &Path,
+        source_sha: &str,
+        evaluation: &db::GateEvaluation,
+    ) -> crate::Result<(
+        TaskIntegrationOperationManager,
+        TaskIntegrationOperationGuard,
+        TaskIntegrationOperationGuard,
+    )> {
+        let provider_config = PrProviderConfigRepo::get_by_repo_id(&*fixture.db, &fixture.repo_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let manager =
+            TaskIntegrationOperationManager::new(Arc::clone(&fixture.db), root.to_path_buf());
+        let lock = manager.lock_for_gate_admission(&fixture.task_id).await?;
+        let (merge, publish) = manager
+            .admit_pull_request_publication_with_lock(
+                &fixture.task_id,
+                &new_uuid_v4(),
+                &evaluation.id,
+                &provider_config,
+                "https://example.invalid/repo.git",
+                &format!("task/{}", &fixture.task_id[..8]),
+                "main",
+                source_sha,
+                lock,
+            )
+            .await?;
+        Ok((manager, merge, publish))
+    }
+
+    async fn record_test_remote_outcome(
+        fixture: &Fixture,
+        merge_id: &str,
+        status: &str,
+        provider_event_id: Option<&str>,
+        provider_pr_id: Option<&str>,
+        pr_url: Option<&str>,
+        observed_head_sha: Option<&str>,
+        merged_commit_sha: Option<&str>,
+        reconciliation_reason: Option<&str>,
+    ) -> crate::Result<db::DomainEvent> {
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, merge_id)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+        TaskIntegrationOperationRepo::record_remote_pr_outcome(
+            &*fixture.db,
+            db::RecordRemotePrOutcome {
+                expected_task_id: fixture.task_id.clone(),
+                task_merge_operation_id: admission.task_merge_operation_id.clone(),
+                publish_operation_id: admission.publish_operation_id.clone(),
+                metadata_id: admission.metadata_id.clone(),
+                provider_config_id: admission.provider_config_id.clone(),
+                provider_config_digest: admission.provider_config_digest.clone(),
+                remote_repo_identity: admission.remote_repo_identity.clone(),
+                source_branch: admission.source_branch.clone(),
+                target_branch: admission.target_branch.clone(),
+                status: status.to_owned(),
+                provider_event_id: provider_event_id.map(str::to_owned),
+                provider_pr_id: provider_pr_id.map(str::to_owned),
+                pr_url: pr_url.map(str::to_owned),
+                observed_head_sha: observed_head_sha.map(str::to_owned),
+                merged_commit_sha: merged_commit_sha.map(str::to_owned),
+                reconciliation_reason: reconciliation_reason.map(str::to_owned),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?
+        .ok_or_else(|| ServiceError::not_found("remote PR result event", merge_id.to_owned()))
+    }
+
+    async fn fixture_at_v115(database_url: &str, root: &Path) -> Fixture {
+        let prefix = root.join("migrations-v115");
+        copy_migrations_up_to(115, &prefix);
+        let pool = create_sqlite_pool(database_url).await.expect("pool");
+        db::run_migrations_from(&pool, &prefix)
+            .await
+            .expect("V115 migration baseline");
+        seed_fixture(Arc::new(SqliteDb::new(pool)), root).await
+    }
+
     async fn assert_no_terminal_pr_merge_has_pending_metadata(fixture: &Fixture) {
         let inconsistent: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
@@ -1045,6 +1286,593 @@ mod tests {
             inconsistent, 0,
             "atomic remote results cannot commit terminal TaskMerge with pending PR metadata"
         );
+    }
+
+    struct V113WrongHeadRework {
+        _temp: TempDir,
+        fixture: Fixture,
+        task_merge_id: String,
+        provider_result_event_id: String,
+        source_event_id: String,
+        retry_receipt_id: String,
+        retry_event_id: String,
+        rework_transition_id: String,
+    }
+
+    fn copy_migrations_up_to(max_version: i64, destination: &Path) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates directory")
+            .join("db/migrations");
+        fs::create_dir_all(destination).expect("migration directory");
+        for entry in fs::read_dir(source).expect("migration directory reads") {
+            let path = entry.expect("migration entry reads").path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(version) = name
+                .strip_prefix('V')
+                .and_then(|name| name.split_once("__"))
+                .and_then(|(version, _)| version.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if version <= max_version {
+                fs::copy(&path, destination.join(name)).expect("migration copies");
+            }
+        }
+    }
+
+    async fn v113_wrong_head_rework(later_authority: bool, label: &str) -> V113WrongHeadRework {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("v113.db").display());
+        let v113_dir = temp.path().join("migrations-v113");
+        copy_migrations_up_to(113, &v113_dir);
+        let pool = create_sqlite_pool(&database_url)
+            .await
+            .expect("file-backed pool");
+        db::run_migrations_from(&pool, &v113_dir)
+            .await
+            .expect("file-backed V113 baseline");
+        let fixture = seed_fixture(Arc::new(SqliteDb::new(pool.clone())), temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(64));
+        let (_manager, merge, publish, _evaluation, _gate, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+                .await
+                .expect("exact remote admission at V113");
+        let task_merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        let admission = sqlx::query(
+            "SELECT metadata_id, provider_config_id, provider_type,
+                    provider_config_revision, provider_config_digest,
+                    remote_repo_identity, source_branch, target_branch,
+                    admitted_source_sha
+             FROM remote_pr_admission WHERE task_merge_operation_id = ?",
+        )
+        .bind(&task_merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("V113 frozen remote admission");
+        let metadata_id: String = admission.try_get("metadata_id").expect("metadata id");
+        let provider_config_id: String = admission
+            .try_get("provider_config_id")
+            .expect("provider config id");
+        let provider_type: String = admission.try_get("provider_type").expect("provider type");
+        let provider_config_revision: String = admission
+            .try_get("provider_config_revision")
+            .expect("provider config revision");
+        let provider_config_digest: String = admission
+            .try_get("provider_config_digest")
+            .expect("provider config digest");
+        let remote_repo_identity: String = admission
+            .try_get("remote_repo_identity")
+            .expect("remote repo identity");
+        let source_branch: String = admission.try_get("source_branch").expect("source branch");
+        let target_branch: String = admission.try_get("target_branch").expect("target branch");
+        let admitted_source_sha: String = admission
+            .try_get("admitted_source_sha")
+            .expect("admitted source SHA");
+        publish
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("publication completes before its provider callback");
+
+        let provider_event_id = format!("old-merged-wrong-head-{label}");
+        let provider_pr_id = format!("old-provider-pr-{label}");
+        let pr_url = format!("https://example.invalid/{label}/pull/1");
+        let observed_head_sha = format!("force-pushed-head-{label}");
+        let merged_commit_sha = format!("wrong-head-merge-commit-{label}");
+        let now = now_rfc3339();
+        let provider_result_event_id = new_uuid_v4();
+        db::DomainEventRepo::append_event(
+            &*fixture.db,
+            db::CreateDomainEvent {
+                id: provider_result_event_id.clone(),
+                event_type: "pr.status_changed".to_owned(),
+                entity_type: "pr_metadata".to_owned(),
+                entity_id: metadata_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: fixture.task_id.clone(),
+                correlation_id: task_merge_id.clone(),
+                causation_id: Some(publish_id.clone()),
+                causation_depth: 1,
+                dedupe_key: Some(format!(
+                    "remote-pr-result:{task_merge_id}:{provider_event_id}"
+                )),
+                payload_json: serde_json::json!({
+                    "task_id": fixture.task_id,
+                    "pr_metadata_id": metadata_id,
+                    "provider_pr_id": provider_pr_id,
+                    "provider_type": provider_type,
+                    "provider_config_id": provider_config_id,
+                    "provider_config_revision": provider_config_revision,
+                    "provider_config_digest": provider_config_digest,
+                    "remote_repo_identity": remote_repo_identity,
+                    "source_branch": source_branch,
+                    "target_branch": target_branch,
+                    "admitted_source_sha": admitted_source_sha,
+                    "head_sha": observed_head_sha,
+                    "merged_commit_sha": merged_commit_sha,
+                    "provider_event_id": provider_event_id,
+                    "pr_url": pr_url,
+                    "reconciliation_reason": "provider merged a head other than the admitted source SHA",
+                    "status": "head_mismatch",
+                    "task_merge_operation_id": task_merge_id,
+                    "publish_operation_id": publish_id,
+                })
+                .to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("old provider result event commits");
+        sqlx::query(
+            "UPDATE remote_pr_admission
+             SET state = 'head_mismatch',
+                 reconciliation_reason = 'provider merged a head other than the admitted source SHA',
+                 provider_event_id = ?, observed_head_sha = ?, merged_commit_sha = ?,
+                 result_event_id = ?, updated_at = ?
+             WHERE task_merge_operation_id = ? AND state = 'admitted'",
+        )
+        .bind(&provider_event_id)
+        .bind(&observed_head_sha)
+        .bind(&merged_commit_sha)
+        .bind(&provider_result_event_id)
+        .bind(&now)
+        .bind(&task_merge_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("old code records head_mismatch after provider Merged");
+        sqlx::query(
+            "UPDATE pr_metadata
+             SET provider_pr_id = ?, pr_url = ?, pr_state = 'head_mismatch',
+                 merge_status = 'merged', admission_status = 'failed',
+                 last_synced_at = ?, updated_at = ?
+             WHERE id = ? AND task_merge_operation_id = ? AND publish_operation_id = ?",
+        )
+        .bind(&provider_pr_id)
+        .bind(&pr_url)
+        .bind(&now)
+        .bind(&now)
+        .bind(&metadata_id)
+        .bind(&task_merge_id)
+        .bind(&publish_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("old PR projection records the provider observation");
+        let merge = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &task_merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge exists");
+        sqlx::query(
+            "UPDATE task_integration_operation
+             SET status = 'failed', result_event_id = ?, version = version + 1,
+                 updated_at = ?, finished_at = ?
+             WHERE id = ? AND status = 'running' AND version = ? AND remote_waiting = 1",
+        )
+        .bind(&provider_result_event_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&task_merge_id)
+        .bind(merge.version)
+        .execute(fixture.db.pool())
+        .await
+        .expect("old code terminalizes the exact TaskMerge");
+
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+            .await
+            .expect("Task lookup")
+            .expect("Task exists");
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        let terminal_key = format!("task-merge-terminal:{task_merge_id}");
+        let terminal_event = db::CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "task.lifecycle_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: fixture.task_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: fixture.task_id.clone(),
+            correlation_id: terminal_key.clone(),
+            causation_id: Some(task_merge_id.clone()),
+            causation_depth: 1,
+            dedupe_key: Some(format!("task-lifecycle:{terminal_key}")),
+            payload_json: serde_json::json!({
+                "task_id": fixture.task_id,
+                "from_state": lifecycle.state,
+                "to_state": "blocked",
+                "cause_kind": "merge_operation",
+                "cause_ref": task_merge_id,
+                "task_merge_status": "failed",
+                "provider_status": "head_mismatch",
+                "result_classification": null,
+                "publish_operation_id": publish_id,
+                "provider_result_event_id": provider_result_event_id,
+            })
+            .to_string(),
+            created_at: now.clone(),
+        };
+        db::TaskLifecycleRepo::transition_task_lifecycle(
+            &*fixture.db,
+            db::TransitionTaskLifecycle {
+                id: new_uuid_v4(),
+                task_id: fixture.task_id.clone(),
+                expected_task_version: task.version,
+                expected_lifecycle_version: lifecycle.version,
+                expected_state: lifecycle.state,
+                to_state: db::TaskLifecycleState::Blocked,
+                cause_kind: "merge_operation".to_owned(),
+                cause_ref: Some(task_merge_id.clone()),
+                gate_evaluation_id: None,
+                reason_kind: Some("task_merge_failed".to_owned()),
+                reason_ref: Some(task_merge_id.clone()),
+                idempotency_key: terminal_key,
+                updated_at: now.clone(),
+                event: terminal_event,
+            },
+        )
+        .await
+        .expect("old terminal merge lifecycle transition");
+        let source_event_id: String = sqlx::query_scalar(
+            "SELECT domain_event_id FROM task_lifecycle_transition
+             WHERE task_id = ? AND cause_kind = 'merge_operation' AND cause_ref = ?
+               AND from_state = 'merging' AND to_state = 'blocked'",
+        )
+        .bind(&fixture.task_id)
+        .bind(&task_merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("exact old terminal lifecycle event");
+
+        let policy_digest = hex::encode(Sha256::digest(
+            b"forge.task_failure_retry:v3:review_request_changes=3;validation_failed=2;execution_failed=3;work_unit_integration_failed=1;task_merge_failed=1;scoped_retry_epochs=true",
+        ));
+        let retry_receipt_id = new_uuid_v4();
+        let retry_event_id = new_uuid_v4();
+        let retry_key = format!(
+            "task-failure-retry:{}:task_merge_failed:{}",
+            fixture.task_id, task_merge_id
+        );
+        let retry_event = db::CreateDomainEvent {
+            id: retry_event_id.clone(),
+            event_type: "task.rework_requested".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: fixture.task_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: fixture.task_id.clone(),
+            correlation_id: retry_key.clone(),
+            causation_id: Some(source_event_id.clone()),
+            causation_depth: 2,
+            dedupe_key: Some(retry_key),
+            payload_json: serde_json::json!({
+                "task_id": fixture.task_id,
+                "failure_kind": "task_merge_failed",
+                "failure_ref": task_merge_id,
+                "source_event_id": source_event_id,
+                "attempt_number": 1,
+                "retry_budget": 1,
+                "retry_epoch": 0,
+                "disposition": "rework",
+                "policy_ref": "forge.task_failure_retry",
+                "policy_version": 3,
+                "policy_digest": policy_digest,
+            })
+            .to_string(),
+            created_at: now.clone(),
+        };
+        db::DomainEventRepo::append_event(&*fixture.db, retry_event)
+            .await
+            .expect("old retry event commits");
+        sqlx::query(
+            "INSERT INTO task_failure_retry_receipt (
+                id, task_id, failure_kind, failure_ref, source_event_id,
+                attempt_number, retry_budget, disposition, policy_ref,
+                policy_version, policy_digest, receipt_event_id, created_at,
+                retry_epoch
+             ) VALUES (?, ?, 'task_merge_failed', ?, ?, 1, 1, 'rework',
+                       'forge.task_failure_retry', 3, ?, ?, ?, 0)",
+        )
+        .bind(&retry_receipt_id)
+        .bind(&fixture.task_id)
+        .bind(&task_merge_id)
+        .bind(&source_event_id)
+        .bind(&policy_digest)
+        .bind(&retry_event_id)
+        .bind(&now)
+        .execute(fixture.db.pool())
+        .await
+        .expect("old retry receipt commits");
+        let blocked_task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+            .await
+            .expect("Task lookup after old terminal result")
+            .expect("Task exists");
+        let reworked = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: fixture.task_id.clone(),
+            expected_task_version: blocked_task.version,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::DomainEvent(retry_event_id.clone()),
+            reason_kind: Some("merge_failure_rework".to_owned()),
+            reason_ref: Some(task_merge_id.clone()),
+            idempotency_key: format!(
+                "task-failure-lifecycle:{}:task_merge_failed:{}",
+                fixture.task_id, task_merge_id
+            ),
+        })
+        .await
+        .expect("old V113 consumer reopens the Task");
+        let rework_transition_id = reworked
+            .transition
+            .as_ref()
+            .expect("old retry transition is applied")
+            .transition_id
+            .clone();
+        if later_authority {
+            crate::task_lifecycle::TaskLifecycleService::new(
+                Arc::clone(&fixture.db),
+                Arc::clone(&event_bus),
+            )
+            .transition(crate::task_lifecycle::TransitionLifecycleInput {
+                task_id: fixture.task_id.clone(),
+                expected_task_version: reworked.task.version,
+                to_state: db::TaskLifecycleState::Ready,
+                cause: crate::task_lifecycle::LifecycleCause::Actor(api_types::Actor::user(
+                    api_types::UserActionSource::Api,
+                )),
+                reason_kind: Some("later_human_lifecycle_action".to_owned()),
+                reason_ref: Some(format!("human-followup-{label}")),
+                idempotency_key: format!("later-human-transition-{label}"),
+            })
+            .await
+            .expect("later legitimate Human lifecycle action");
+        }
+
+        V113WrongHeadRework {
+            _temp: temp,
+            fixture,
+            task_merge_id,
+            provider_result_event_id,
+            source_event_id,
+            retry_receipt_id,
+            retry_event_id,
+            rework_transition_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn v113_wrong_head_auto_rework_is_repaired_and_old_replay_stays_blocked() {
+        let history = v113_wrong_head_rework(false, "repair").await;
+        let migrations = history._temp.path().join("migrations-v115");
+        copy_migrations_up_to(115, &migrations);
+        db::run_migrations_from(history.fixture.db.pool(), &migrations)
+            .await
+            .expect("file-backed V113 database upgrades through V115");
+        db::run_migrations(history.fixture.db.pool())
+            .await
+            .expect("repaired V113 database upgrades through V116 history backfill");
+
+        let admission: (String, String, String, String, String, String, String) = sqlx::query_as(
+            "SELECT state, provider_status, result_classification,
+                        admitted_source_sha, observed_head_sha, merged_commit_sha,
+                        result_event_id
+                 FROM remote_pr_admission WHERE task_merge_operation_id = ?",
+        )
+        .bind(&history.task_merge_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("remote PR history after migration");
+        assert_eq!(admission.0, "head_mismatch");
+        assert_eq!(admission.1, "merged");
+        assert_eq!(admission.2, "head_mismatch");
+        assert_eq!(admission.3, "source-commit");
+        assert_eq!(admission.4, "force-pushed-head-repair");
+        assert_eq!(admission.5, "wrong-head-merge-commit-repair");
+        assert_eq!(admission.6, history.provider_result_event_id);
+
+        let historical_pr: (String, String, String, String, String, String) = sqlx::query_as(
+            "SELECT provider_status, result_classification, observed_head_sha,
+                    merged_commit_sha, pr_state, merge_status
+             FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&history.task_merge_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("V116 preserves the old V113 Merged result snapshot");
+        assert_eq!(historical_pr.0, "merged");
+        assert_eq!(historical_pr.1, "head_mismatch");
+        assert_eq!(historical_pr.2, "force-pushed-head-repair");
+        assert_eq!(historical_pr.3, "wrong-head-merge-commit-repair");
+        assert_eq!(historical_pr.4, "head_mismatch");
+        assert_eq!(historical_pr.5, "merged");
+
+        let preserved: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ?),
+                 (SELECT COUNT(*) FROM domain_event WHERE id = ?),
+                 (SELECT COUNT(*) FROM task_lifecycle_transition WHERE id = ?),
+                 (SELECT COUNT(*) FROM task_lifecycle_transition
+                  WHERE domain_event_id = ?)",
+        )
+        .bind(&history.retry_receipt_id)
+        .bind(&history.retry_event_id)
+        .bind(&history.rework_transition_id)
+        .bind(&history.source_event_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("old receipt, events, and transitions remain queryable");
+        assert_eq!(preserved, (1, 1, 1, 1));
+
+        let repair: (String, String, String) = sqlx::query_as(
+            "SELECT id, entity_id, payload_json FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired'
+               AND scope_type = 'task' AND scope_id = ?",
+        )
+        .bind(&history.fixture.task_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("durable repair event");
+        assert_eq!(repair.1, history.fixture.task_id);
+        let payload: serde_json::Value = serde_json::from_str(&repair.2).expect("repair payload");
+        assert_eq!(payload["task_merge_operation_id"], history.task_merge_id);
+        assert_eq!(
+            payload["provider_result_event_id"],
+            history.provider_result_event_id
+        );
+        assert_eq!(payload["wrong_retry_receipt_id"], history.retry_receipt_id);
+        assert_eq!(payload["wrong_rework_event_id"], history.retry_event_id);
+        assert_eq!(
+            payload["prior_lifecycle_transition_id"],
+            history.rework_transition_id
+        );
+        assert_eq!(payload["migration_version"], "V115");
+
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("repaired lifecycle lookup")
+        .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            lifecycle.reason_kind.as_deref(),
+            Some("remote_pr_head_mismatch")
+        );
+        assert_eq!(
+            lifecycle.reason_ref.as_deref(),
+            Some(history.provider_result_event_id.as_str())
+        );
+
+        let retry_event =
+            db::DomainEventRepo::get_event(&*history.fixture.db, &history.retry_event_id)
+                .await
+                .expect("old retry event lookup")
+                .expect("old retry event remains");
+        assert!(
+            !crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+                &history.fixture.db,
+                &retry_event,
+            )
+            .await
+            .expect("superseded rework event check"),
+            "the repair transition supersedes replay of the old retry receipt"
+        );
+        let old_transition: (i64, String, String) = sqlx::query_as(
+            "SELECT expected_task_version, reason_kind, reason_ref
+             FROM task_lifecycle_transition WHERE id = ?",
+        )
+        .bind(&history.rework_transition_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("old transition replay identity");
+        let replay = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&history.fixture.db),
+            Arc::new(EventBus::new(8)),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: history.fixture.task_id.clone(),
+            expected_task_version: old_transition.0,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::DomainEvent(
+                history.retry_event_id.clone(),
+            ),
+            reason_kind: Some(old_transition.1),
+            reason_ref: Some(old_transition.2),
+            idempotency_key: format!(
+                "task-failure-lifecycle:{}:task_merge_failed:{}",
+                history.fixture.task_id, history.task_merge_id
+            ),
+        })
+        .await
+        .expect("replay resolves the old transition receipt");
+        assert_eq!(replay.lifecycle.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            replay.lifecycle.reason_ref.as_deref(),
+            Some(history.provider_result_event_id.as_str())
+        );
+        let repairs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired' AND scope_id = ?",
+        )
+        .bind(&history.fixture.task_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("repair is emitted once");
+        assert_eq!(repairs, 1);
+    }
+
+    #[tokio::test]
+    async fn v115_does_not_replace_a_later_lifecycle_authority() {
+        let history = v113_wrong_head_rework(true, "later-authority").await;
+        let migrations = history._temp.path().join("migrations-v115");
+        copy_migrations_up_to(115, &migrations);
+        db::run_migrations_from(history.fixture.db.pool(), &migrations)
+            .await
+            .expect("file-backed V113 database upgrades through V115");
+
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("lifecycle lookup")
+        .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Ready);
+        assert_eq!(
+            lifecycle.reason_kind.as_deref(),
+            Some("later_human_lifecycle_action")
+        );
+        assert_eq!(
+            lifecycle.reason_ref.as_deref(),
+            Some("human-followup-later-authority")
+        );
+        let repairs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired' AND scope_id = ?",
+        )
+        .bind(&history.fixture.task_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("no repair event after newer lifecycle authority");
+        assert_eq!(repairs, 0);
+        let old_receipt: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ?")
+                .bind(&history.retry_receipt_id)
+                .fetch_one(history.fixture.db.pool())
+                .await
+                .expect("old retry receipt remains historical");
+        assert_eq!(old_receipt, 1);
     }
 
     #[tokio::test]
@@ -2747,5 +3575,782 @@ mod tests {
                 .await
                 .expect("remote admission teardown count");
         assert_eq!(remaining_remote_admissions, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_modern_pr_history_survives_third_admission_and_old_callbacks() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("multi-pr.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(64));
+
+        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+                .await
+                .expect("PR1 admission");
+        let merge1_id = merge1.id().to_owned();
+        let metadata1 = set_test_provider_identity(
+            &fixture,
+            &merge1,
+            &publish1,
+            "provider-pr-1",
+            "https://github.example.invalid/pull/101",
+            "open",
+        )
+        .await;
+        publish1
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("PR1 publication succeeds");
+        let admission1 =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge1_id)
+                .await
+                .expect("PR1 admission lookup")
+                .expect("PR1 admission remains durable");
+        let pr1_result = record_test_remote_outcome(
+            &fixture,
+            &merge1_id,
+            "closed",
+            Some("provider-event-pr1"),
+            Some("provider-pr-1"),
+            Some("https://github.example.invalid/pull/101"),
+            Some(&admission1.admitted_source_sha),
+            None,
+            None,
+        )
+        .await
+        .expect("PR1 Closed result commits");
+        drop(merge1);
+
+        // Fail after the old terminal PR has been snapshotted but before the
+        // current projection can be rebound. SQLite must roll back both writes.
+        let evaluation2 = satisfy_followup_gate(
+            &fixture,
+            Arc::clone(&event_bus),
+            &gate_id,
+            "source-sha-pr2",
+            &policy,
+        )
+        .await
+        .expect("human rework and exact Gate2");
+        sqlx::query(
+            "CREATE TRIGGER test_fail_pr_history_rebind
+             BEFORE UPDATE OF task_merge_operation_id ON pr_metadata
+             BEGIN SELECT RAISE(ABORT, 'simulated crash after PR snapshot'); END",
+        )
+        .execute(fixture.db.pool())
+        .await
+        .expect("fault injection trigger");
+        assert!(
+            admit_followup_pr_from_gate(&fixture, temp.path(), "source-sha-pr2", &evaluation2,)
+                .await
+                .is_err(),
+            "failed rebind rolls back the snapshot and the new admission"
+        );
+        sqlx::query("DROP TRIGGER test_fail_pr_history_rebind")
+            .execute(fixture.db.pool())
+            .await
+            .expect("remove fault injection trigger");
+        let history_after_rollback: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge1_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("history after rolled-back admission");
+        assert_eq!(history_after_rollback, 0);
+        let old_projection = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("PR1 projection after rollback")
+            .expect("current PR metadata remains");
+        assert_eq!(old_projection.id, metadata1.id);
+        assert_eq!(
+            old_projection.task_merge_operation_id.as_deref(),
+            Some(merge1_id.as_str())
+        );
+        let task_merge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_integration_operation
+             WHERE task_id = ? AND kind = 'task_merge'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("TaskMerge count after rollback");
+        assert_eq!(task_merge_count, 1);
+        let lifecycle_after_rollback =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("lifecycle after rolled-back admission")
+                .expect("lifecycle remains");
+        assert_eq!(
+            lifecycle_after_rollback.state,
+            db::TaskLifecycleState::ReadyToMerge
+        );
+        assert_eq!(
+            lifecycle_after_rollback.reason_ref.as_deref(),
+            Some(evaluation2.id.as_str())
+        );
+
+        let (_manager2, merge2, publish2) =
+            admit_followup_pr_from_gate(&fixture, temp.path(), "source-sha-pr2", &evaluation2)
+                .await
+                .expect("PR2 admission after rolled-back attempt");
+        let merge2_id = merge2.id().to_owned();
+        let publish2_id = publish2.id().to_owned();
+        let history1: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT provider_pr_id, pr_url, admission_state, provider_status,
+                    provider_event_id, result_event_id, pr_state, merge_status,
+                    admitted_source_sha
+             FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge1_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("immutable PR1 terminal snapshot");
+        assert_eq!(history1.0, "provider-pr-1");
+        assert_eq!(history1.1, "https://github.example.invalid/pull/101");
+        assert_eq!(history1.2, "closed");
+        assert_eq!(history1.3, "closed");
+        assert_eq!(history1.4.as_deref(), Some("provider-event-pr1"));
+        assert_eq!(history1.5.as_deref(), Some(pr1_result.id.as_str()));
+        assert_eq!(history1.6, "closed");
+        assert_eq!(history1.7, "closed_without_merge");
+        assert_eq!(history1.8, admission1.admitted_source_sha);
+        let admission1_after_pr2 =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge1_id)
+                .await
+                .expect("PR1 admission after PR2")
+                .expect("PR1 admission remains");
+        assert_eq!(admission1_after_pr2.metadata_id, metadata1.id);
+        assert_eq!(
+            admission1_after_pr2.result_event_id.as_deref(),
+            Some(pr1_result.id.as_str())
+        );
+        let projection2 = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("PR2 current projection")
+            .expect("current projection remains present");
+        assert_eq!(
+            projection2.id, metadata1.id,
+            "the current row may be reused"
+        );
+        assert_eq!(
+            projection2.task_merge_operation_id.as_deref(),
+            Some(merge2_id.as_str())
+        );
+        assert_eq!(
+            projection2.publish_operation_id.as_deref(),
+            Some(publish2_id.as_str())
+        );
+        assert_eq!(projection2.provider_pr_id, None);
+        assert_eq!(projection2.merge_status, "pending");
+        let lifecycle2_before_pr1_callbacks =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR2 lifecycle before PR1 callbacks")
+                .expect("PR2 lifecycle is present");
+        assert_eq!(
+            lifecycle2_before_pr1_callbacks.state,
+            db::TaskLifecycleState::Merging
+        );
+
+        let exact_pr1_replay = record_test_remote_outcome(
+            &fixture,
+            &merge1_id,
+            "closed",
+            Some("provider-event-pr1"),
+            Some("provider-pr-1"),
+            Some("https://github.example.invalid/pull/101"),
+            Some(&admission1.admitted_source_sha),
+            None,
+            None,
+        )
+        .await
+        .expect("exact PR1 callback replays after PR2");
+        assert_eq!(exact_pr1_replay.id, pr1_result.id);
+        let conflicting_pr1_replay = record_test_remote_outcome(
+            &fixture,
+            &merge1_id,
+            "closed",
+            Some("provider-event-pr1"),
+            Some("provider-pr-1"),
+            Some("https://github.example.invalid/pull/changed"),
+            Some(&admission1.admitted_source_sha),
+            None,
+            None,
+        )
+        .await;
+        assert!(conflicting_pr1_replay.is_err());
+        assert!(
+            record_test_remote_outcome(
+                &fixture,
+                &merge1_id,
+                "closed",
+                Some("provider-event-pr1-late"),
+                Some("provider-pr-1"),
+                Some("https://github.example.invalid/pull/101"),
+                Some(&admission1.admitted_source_sha),
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "a new terminal callback for PR1 is rejected"
+        );
+        let projection2_after_pr1_callbacks =
+            PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR2 projection after PR1 callbacks")
+                .expect("PR2 projection remains present");
+        assert_eq!(
+            projection2_after_pr1_callbacks
+                .task_merge_operation_id
+                .as_deref(),
+            Some(merge2_id.as_str())
+        );
+        assert_eq!(
+            projection2_after_pr1_callbacks
+                .publish_operation_id
+                .as_deref(),
+            Some(publish2_id.as_str())
+        );
+        assert_eq!(projection2_after_pr1_callbacks.merge_status, "pending");
+        let lifecycle2_after_pr1_callbacks =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR2 lifecycle after PR1 callbacks")
+                .expect("PR2 lifecycle remains present");
+        assert_eq!(
+            lifecycle2_after_pr1_callbacks.state,
+            lifecycle2_before_pr1_callbacks.state
+        );
+        assert_eq!(
+            lifecycle2_after_pr1_callbacks.version,
+            lifecycle2_before_pr1_callbacks.version
+        );
+
+        let pr2_failure = record_test_remote_outcome(
+            &fixture,
+            &merge2_id,
+            "publication_failed",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("provider definitively rejected PR2 publication"),
+        )
+        .await
+        .expect("PR2 publication failure commits");
+        drop(merge2);
+        drop(publish2);
+        let evaluation3 = satisfy_followup_gate(
+            &fixture,
+            Arc::clone(&event_bus),
+            &gate_id,
+            "source-sha-pr3",
+            &policy,
+        )
+        .await
+        .expect("human rework and exact Gate3");
+        let (_manager3, merge3, publish3) =
+            admit_followup_pr_from_gate(&fixture, temp.path(), "source-sha-pr3", &evaluation3)
+                .await
+                .expect("third remote admission preserves earlier PRs");
+        let merge3_id = merge3.id().to_owned();
+        let publish3_id = publish3.id().to_owned();
+        let history2: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT provider_config_digest, admission_state, provider_status,
+                    pr_state, provider_event_id, result_event_id
+             FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge2_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("PR2 publication failure snapshot");
+        assert_eq!(history2.0, admission1_after_pr2.provider_config_digest);
+        assert_eq!(history2.1, "publication_failed");
+        assert_eq!(history2.2, "publication_failed");
+        assert_eq!(history2.3, "failed");
+        assert_eq!(history2.4, None);
+        assert_eq!(history2.5.as_deref(), Some(pr2_failure.id.as_str()));
+        let history_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_history WHERE task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("PR1 and PR2 history count");
+        assert_eq!(history_count, 2);
+
+        // Reuse PR1's provider event ID for a different admission to prove the
+        // durable dedupe identity remains scoped to the exact TaskMerge.
+        let admission3 =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge3_id)
+                .await
+                .expect("PR3 admission lookup")
+                .expect("PR3 admission exists");
+        let metadata3 = set_test_provider_identity(
+            &fixture,
+            &merge3,
+            &publish3,
+            "provider-pr-3",
+            "https://github.example.invalid/pull/103",
+            "open",
+        )
+        .await;
+        publish3
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("PR3 publication succeeds");
+        let pr3_result = record_test_remote_outcome(
+            &fixture,
+            &merge3_id,
+            "closed",
+            Some("provider-event-pr1"),
+            Some("provider-pr-3"),
+            Some("https://github.example.invalid/pull/103"),
+            Some(&admission3.admitted_source_sha),
+            None,
+            None,
+        )
+        .await
+        .expect("same provider event identity on PR3 remains scoped to PR3");
+        assert_ne!(pr3_result.id, pr1_result.id);
+        drop(merge3);
+
+        let current_before_old_replays =
+            PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR3 projection before old replays")
+                .expect("PR3 current projection exists");
+        assert_eq!(current_before_old_replays.id, metadata3.id);
+        assert_eq!(
+            current_before_old_replays
+                .task_merge_operation_id
+                .as_deref(),
+            Some(merge3_id.as_str())
+        );
+        let lifecycle_before_old_replays =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR3 lifecycle before old replays")
+                .expect("lifecycle exists");
+        assert_eq!(
+            lifecycle_before_old_replays.state,
+            db::TaskLifecycleState::Blocked
+        );
+        let replay_pr1_after_pr3 = record_test_remote_outcome(
+            &fixture,
+            &merge1_id,
+            "closed",
+            Some("provider-event-pr1"),
+            Some("provider-pr-1"),
+            Some("https://github.example.invalid/pull/101"),
+            Some(&admission1.admitted_source_sha),
+            None,
+            None,
+        )
+        .await
+        .expect("PR1 exact replay after PR3");
+        let replay_pr2_after_pr3 = record_test_remote_outcome(
+            &fixture,
+            &merge2_id,
+            "publication_failed",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("provider definitively rejected PR2 publication"),
+        )
+        .await
+        .expect("PR2 publication failure replay after PR3");
+        assert_eq!(replay_pr1_after_pr3.id, pr1_result.id);
+        assert_eq!(replay_pr2_after_pr3.id, pr2_failure.id);
+        let current_after_old_replays =
+            PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR3 projection after old replays")
+                .expect("PR3 projection remains");
+        assert_eq!(
+            current_after_old_replays.task_merge_operation_id.as_deref(),
+            Some(merge3_id.as_str())
+        );
+        assert_eq!(
+            current_after_old_replays.publish_operation_id.as_deref(),
+            Some(publish3_id.as_str())
+        );
+        assert_eq!(
+            current_after_old_replays.provider_pr_id.as_deref(),
+            Some("provider-pr-3")
+        );
+        assert_eq!(current_after_old_replays.pr_state, "closed");
+        let lifecycle_after_old_replays =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("PR3 lifecycle after old replays")
+                .expect("lifecycle remains");
+        assert_eq!(
+            lifecycle_after_old_replays.version,
+            lifecycle_before_old_replays.version
+        );
+        assert_eq!(
+            lifecycle_after_old_replays.state,
+            lifecycle_before_old_replays.state
+        );
+
+        let duplicate_snapshot = sqlx::query(
+            "INSERT INTO remote_pr_history (
+                history_id, task_id, original_metadata_id, history_origin,
+                task_merge_operation_id, publish_operation_id,
+                provider_config_id, provider_type, provider_config_revision,
+                provider_config_digest, provider_base_url, token_secret_ref,
+                provider_pr_id, pr_url, remote_repo_identity, source_branch,
+                target_branch, admitted_source_sha, admission_state, provider_status,
+                result_classification, observed_head_sha, merged_commit_sha,
+                pr_state, merge_status, admission_status, provider_event_id,
+                result_event_id, admission_created_at, result_created_at, archived_at
+             )
+             SELECT ?, task_id, original_metadata_id, history_origin,
+                    task_merge_operation_id, publish_operation_id,
+                    provider_config_id, provider_type, provider_config_revision,
+                    provider_config_digest, provider_base_url, token_secret_ref,
+                    provider_pr_id, pr_url, remote_repo_identity, source_branch,
+                    target_branch, admitted_source_sha, admission_state, provider_status,
+                    result_classification, observed_head_sha, merged_commit_sha,
+                    pr_state, merge_status, admission_status, provider_event_id,
+                    result_event_id, admission_created_at, result_created_at, archived_at
+             FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(new_uuid_v4())
+        .bind(&merge1_id)
+        .execute(fixture.db.pool())
+        .await;
+        assert!(
+            duplicate_snapshot.is_err(),
+            "one terminal TaskMerge has one snapshot"
+        );
+        assert!(
+            sqlx::query("DELETE FROM remote_pr_history WHERE task_merge_operation_id = ?")
+                .bind(&merge1_id)
+                .execute(fixture.db.pool())
+                .await
+                .is_err(),
+            "history deletion is rejected outside guarded Project teardown"
+        );
+
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("Project lookup before teardown");
+        ProjectRepo::delete(&*fixture.db, &project_id)
+            .await
+            .expect("guarded teardown removes the remote PR history");
+        let remaining_history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_history")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("history count after Project teardown");
+        assert_eq!(remaining_history, 0);
+    }
+
+    #[tokio::test]
+    async fn active_remote_pr_admission_blocks_a_second_admission() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("active-pr.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), event_bus)
+                .await
+                .expect("active PR1 admission");
+        let merge_id = merge.id().to_owned();
+        drop(publish);
+        drop(merge);
+
+        let contender = TaskIntegrationOperationManager::new(
+            Arc::clone(&fixture.db),
+            temp.path().to_path_buf(),
+        );
+        assert!(
+            matches!(
+                contender.lock_for_gate_admission(&fixture.task_id).await,
+                Err(ServiceError::Conflict(_))
+            ),
+            "running remote PublishPr prevents a second TaskMerge admission"
+        );
+        let admissions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_admission WHERE task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("remote admission count");
+        assert_eq!(admissions, 1);
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
+        let current = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("current PR metadata lookup")
+            .expect("PR metadata remains");
+        assert_eq!(
+            current.task_merge_operation_id.as_deref(),
+            Some(merge_id.as_str())
+        );
+        assert_eq!(current.merge_status, "pending");
+        assert_eq!(evaluation.outcome, db::GateEvaluationOutcome::Satisfied);
+    }
+
+    #[tokio::test]
+    async fn v116_backfill_is_reused_idempotently_before_projection_rebind() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("v115-pr.db").display());
+        let fixture = fixture_at_v115(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+                .await
+                .expect("PR1 admission on V115");
+        let merge1_id = merge1.id().to_owned();
+        let metadata1 = set_test_provider_identity(
+            &fixture,
+            &merge1,
+            &publish1,
+            "provider-pr-v115",
+            "https://github.example.invalid/pull/115",
+            "open",
+        )
+        .await;
+        publish1
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("PR1 publication succeeds on V115");
+        let admission1 =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge1_id)
+                .await
+                .expect("V115 PR1 admission")
+                .expect("admission exists");
+        let result1 = record_test_remote_outcome(
+            &fixture,
+            &merge1_id,
+            "closed",
+            Some("provider-event-v115"),
+            Some("provider-pr-v115"),
+            Some("https://github.example.invalid/pull/115"),
+            Some(&admission1.admitted_source_sha),
+            None,
+            None,
+        )
+        .await
+        .expect("terminal PR1 result on V115");
+        drop(merge1);
+
+        db::run_migrations(fixture.db.pool())
+            .await
+            .expect("upgrade terminal V115 database through V116");
+        let backfilled: (String, String, String, String) = sqlx::query_as(
+            "SELECT history_origin, provider_pr_id, pr_url, result_event_id
+             FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge1_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("V116 reconstructs the exact frozen PR1 result");
+        assert_eq!(backfilled.0, "v116_backfill");
+        assert_eq!(backfilled.1, "provider-pr-v115");
+        assert_eq!(backfilled.2, "https://github.example.invalid/pull/115");
+        assert_eq!(backfilled.3, result1.id);
+
+        let evaluation2 = satisfy_followup_gate(
+            &fixture,
+            Arc::clone(&event_bus),
+            &gate_id,
+            "source-sha-v116-followup",
+            &policy,
+        )
+        .await
+        .expect("human rework and exact GateEvaluation");
+        let (_manager2, merge2, _publish2) = admit_followup_pr_from_gate(
+            &fixture,
+            temp.path(),
+            "source-sha-v116-followup",
+            &evaluation2,
+        )
+        .await
+        .expect("existing V116 snapshot is reused before projection rebind");
+        assert_ne!(merge2.id(), merge1_id);
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge1_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("one backfilled snapshot after later admission");
+        assert_eq!(history_count, 1);
+        let still_backfilled: String = sqlx::query_scalar(
+            "SELECT history_origin FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge1_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("snapshot origin is immutable");
+        assert_eq!(still_backfilled, "v116_backfill");
+        let projection2 = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("rebound current projection")
+            .expect("PR2 current projection exists");
+        assert_eq!(projection2.id, metadata1.id);
+        assert_eq!(
+            projection2.task_merge_operation_id.as_deref(),
+            Some(merge2.id())
+        );
+    }
+
+    #[tokio::test]
+    async fn v112_file_backed_schema_upgrades_sequentially_through_v115_and_v116() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("v112.db").display());
+        let v112_migrations = temp.path().join("migrations-v112");
+        copy_migrations_up_to(112, &v112_migrations);
+        let pool = create_sqlite_pool(&database_url).await.expect("V112 pool");
+        db::run_migrations_from(&pool, &v112_migrations)
+            .await
+            .expect("file-backed V112 schema");
+        let baseline: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+            .fetch_one(&pool)
+            .await
+            .expect("V112 migration marker");
+        assert_eq!(baseline, 112);
+
+        db::run_migrations(&pool)
+            .await
+            .expect("V112 database upgrades through all current migrations");
+        let applied: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migration WHERE version BETWEEN 113 AND 116
+             ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("follow-up migration markers");
+        assert_eq!(applied, vec![113, 114, 115, 116]);
+        let history_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'remote_pr_history'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("modern PR history schema");
+        assert_eq!(history_table, 1);
+    }
+
+    #[tokio::test]
+    async fn head_mismatch_snapshot_preserves_provider_merged_and_integrity_classification() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!(
+            "sqlite://{}",
+            temp.path().join("mismatch-history.db").display()
+        );
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+                .await
+                .expect("PR1 admission");
+        let merge1_id = merge1.id().to_owned();
+        set_test_provider_identity(
+            &fixture,
+            &merge1,
+            &publish1,
+            "provider-pr-mismatch",
+            "https://github.example.invalid/pull/116",
+            "open",
+        )
+        .await;
+        publish1
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("PR1 publication succeeds");
+        let admission1 =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge1_id)
+                .await
+                .expect("PR1 admission")
+                .expect("admission exists");
+        let mismatch_result = record_test_remote_outcome(
+            &fixture,
+            &merge1_id,
+            "merged",
+            Some("provider-event-mismatch"),
+            Some("provider-pr-mismatch"),
+            Some("https://github.example.invalid/pull/116"),
+            Some("observed-wrong-head"),
+            Some("provider-merged-commit"),
+            None,
+        )
+        .await
+        .expect("provider Merged wrong-head result commits");
+        drop(merge1);
+        let evaluation2 = satisfy_followup_gate(
+            &fixture,
+            Arc::clone(&event_bus),
+            &gate_id,
+            "source-sha-after-mismatch",
+            &policy,
+        )
+        .await
+        .expect("human rework and exact GateEvaluation");
+        let (_manager2, _merge2, _publish2) = admit_followup_pr_from_gate(
+            &fixture,
+            temp.path(),
+            "source-sha-after-mismatch",
+            &evaluation2,
+        )
+        .await
+        .expect("new admission snapshots the terminal mismatch");
+        let history: (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT admission_state, provider_status, result_classification,
+                    observed_head_sha, merged_commit_sha, provider_event_id,
+                    result_event_id, admitted_source_sha
+             FROM remote_pr_history WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge1_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("head mismatch history snapshot");
+        assert_eq!(history.0, "head_mismatch");
+        assert_eq!(history.1, "merged");
+        assert_eq!(history.2, "head_mismatch");
+        assert_eq!(history.3.as_deref(), Some("observed-wrong-head"));
+        assert_eq!(history.4.as_deref(), Some("provider-merged-commit"));
+        assert_eq!(history.5.as_deref(), Some("provider-event-mismatch"));
+        assert_eq!(history.6.as_deref(), Some(mismatch_result.id.as_str()));
+        assert_eq!(history.7, admission1.admitted_source_sha);
     }
 }

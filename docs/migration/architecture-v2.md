@@ -200,6 +200,15 @@ the TaskRole selected by Task type when that role exists, and checks active
 Agent membership on lease issue and renewal. The old singleton fallback stays
 available only when the matching canonical TaskRole does not exist.
 
+V115 repairs the narrowly identifiable historical case where provider Merged
+on a different PR head was turned into automatic Task rework, but only when
+that exact rework still owns the current lifecycle. It preserves the old retry,
+event, and transition facts and appends a durable integrity repair plus a
+blocking lifecycle transition. V116 snapshots terminal modern PR facts before
+reusing the Task's mutable `pr_metadata` projection. Exact historical provider
+callback replay resolves against the frozen admission and result event, so a
+later PR cannot invalidate replay of an earlier terminal result.
+
 PR9 does not create HumanApproval, copy review or validation verdicts, or
 convert legacy workflow definitions into Gate policies.
 

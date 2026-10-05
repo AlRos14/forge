@@ -30,7 +30,9 @@ use std::{
 // V112 freezes remote PR subjects and result authority; V113 separates PR
 // admission provenance from historical provider outcomes; V114 preserves
 // provider outcomes separately from integrity classification and archives
-// terminal legacy PR history before a new modern admission.
+// terminal legacy PR history before a new modern admission; V115 repairs only
+// the exact historical wrong-head retry that still owns the current lifecycle;
+// V116 snapshots terminal modern PR history before reusing its current projection.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

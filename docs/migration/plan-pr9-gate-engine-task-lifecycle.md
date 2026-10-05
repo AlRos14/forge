@@ -1,7 +1,7 @@
 # Plan PR9: Gate Engine and aggregate Task lifecycle
 
-Status: **READY FOR REVIEW**. This follow-up closes five P2 findings and one
-P3 finding; PR9 is not merged. The
+Status: **READY FOR REVIEW**. This iteration closes the two residual P2
+findings from the last HEAD review; PR9 is not merged. The
 merge-readiness decision is a deterministic evaluation of immutable exact
 facts; Task lifecycle stores aggregate progress. The PR8 ReviewReport and
 ValidationRun authority remains unchanged.
@@ -13,9 +13,10 @@ ValidationRun authority remains unchanged.
 - PR9 branch: `feat/plan-pr9-gate-engine-task-lifecycle`.
 - PR9 initial HEAD: `6367cc257f9a6ccc1febcce9b4ab6abefd4161d8`.
 - Deep-review follow-up starting HEAD: `453a412a6c2a2c7878a48edc3006e7df89512788`.
-- Migration head at PR9 base: V099. PR9 adds V100–V107; this follow-up adds
-  V108–V113. Each migration is additive and preserves existing retry receipts,
-  provider PR outcomes, and exact admission history.
+- Latest residual-review starting HEAD: `3d3a7eeedf588033482586a5b17135963020e618`.
+- Migration head at PR9 base: V099. PR9 adds V100–V107; subsequent PR9
+  follow-ups add V108–V116. The migrations are additive and preserve existing
+  retry receipts, provider PR outcomes, and exact admission history.
 - V109's admission marker did not preserve the separate historical outcome.
   V113 restores merged/closed outcomes from the retained provider state and
   records `admission_status = legacy_unadmitted` independently. No remote
@@ -155,6 +156,68 @@ Validation for this follow-up:
 - PASS — `cargo check -p db -p services --locked --offline`, `cargo fmt --all`, and `git diff --check`.
 
 Workspace-wide tests and Clippy were not run; no PR10+ files changed.
+
+### CHECKPOINT 7 — close the two residual P2 findings
+
+#### Design
+
+V115 selects only the exact historical chain: a terminal modern TaskMerge;
+its remote admission/result event proving provider `merged` plus
+`head_mismatch`; the exact `task_merge_failed` retry receipt and
+`task.rework_requested` event; and the applied Blocked-to-Active transition
+caused by that receipt. It repairs only while that rework transition still
+owns the current Active lifecycle. A later lifecycle transition, later Human
+Decision, or later retry fact prevents repair. V115 preserves every old event,
+receipt, and transition, then appends `task.remote_pr_integrity_repaired`, a
+`task.lifecycle_changed` event, and an Active-to-Blocked transition whose
+reason references the exact provider result event.
+
+V116 adds immutable `remote_pr_history` snapshots keyed by TaskMerge. A
+terminal modern admission is copied with its exact PR identity, provider
+configuration digest, remote subject, admitted/observed/merged SHAs, provider
+status/classification, projection status, and exact result event before a
+later admission can rebind the single current `pr_metadata` row. Existing
+terminal admissions are backfilled from their frozen admission and provider
+result event. Snapshot and projection rebind share one transaction. Terminal
+callback replay is resolved against the immutable admission/result event
+before reading current `pr_metadata`; exact replay returns the same event,
+while conflicting or new terminal callbacks are rejected. Active admissions
+continue to block another admission. Project teardown removes snapshots only
+inside the existing guarded transaction.
+
+#### Migration audit
+
+- V112→V115: migrations apply in version order; V113 admission separation and
+  V114 provider-result normalization precede the V115 selector. A file-backed
+  V112 database also applies V113–V116 sequentially. No historical migration is
+  edited.
+- V113→V116: PASS, a file-backed V113 wrong-head/old-rework database upgrades
+  through V114/V115, receives the exact repair, and V116 preserves its old
+  provider Merged result as `merge_status=merged` plus mismatch classification.
+- V114→V115: the selector accepts the V114-normalized
+  `provider_status=merged` plus `result_classification=head_mismatch` form and
+  checks the exact terminal event; the same file-backed V113 upgrade exercises
+  that normalized state immediately before V115.
+- Fresh DB→V115: PASS, file-backed fixture applies all migrations through V115.
+- V115→V116: PASS, a terminal PR on a file-backed V115 database is backfilled
+  and its snapshot is reused when admitting the next PR.
+
+#### Focused verification
+
+| Command | Result |
+| --- | --- |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services v113_wrong_head_auto_rework_is_repaired_and_old_replay_stays_blocked --locked --offline` | PASS, file-backed V113→V116 upgrade; V115 repairs the old wrong rework and V116 snapshots Merged plus mismatch classification. Old retry/lifecycle replay stays Blocked. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services v115_does_not_replace_a_later_lifecycle_authority --locked --offline` | PASS; later lifecycle authority is retained. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services task_integration_operation::tests:: --locked --offline` | PASS, 23 tests, including third PR, Closed and publication_failed history, old exact/conflicting/new callbacks, provider event collision, rollback, active-admission exclusion, and guarded teardown. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services v116_backfill_is_reused_idempotently_before_projection_rebind --locked --offline` | PASS, file-backed V115→V116 backfill is reused without duplicate snapshot. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services head_mismatch_snapshot_preserves_provider_merged_and_integrity_classification --locked --offline` | PASS; history retains provider Merged, mismatch classification, both SHAs, merged commit, and provider result event. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services task_failure_retry::tests:: --locked --offline` | PASS, 5 tests, including current head-mismatch retry exclusion and V101 historical receipt behavior. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services active_remote_pr_admission_blocks_a_second_admission --locked --offline` | PASS; an active remote PublishPr blocks another TaskMerge admission. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services v112_file_backed_schema_upgrades_sequentially_through_v115_and_v116 --locked --offline` | PASS; V112 file-backed baseline applies V113, V114, V115, and V116 in order. |
+
+No Gate, Review, Validation, WorkUnit, retry budget/override, TaskRole,
+WorkspaceLease, Host/Agent, UI, or PR10+ behavior changed. Workspace-wide
+tests, global Clippy, provider/live acceptance, and release checks were not run.
 
 ## Invariants
 
@@ -570,7 +633,7 @@ recorded above, which identified five P2s and one P3. The current status is the
 follow-up checkpoint and verification record above; do not infer readiness
 from this historical section.
 
-## Deep-review close
+## Earlier deep-review close (superseded)
 
 - P1: 0
 - P2: 0 residual of 5
@@ -578,3 +641,12 @@ from this historical section.
 
 PR #12 remains open and unmerged. The merge decision remains with a human
 reviewer. Workspace-wide tests and provider/live acceptance were not run.
+
+## Latest residual-review close
+
+- P1: 0
+- P2: 0 residual of 2
+- P3: 0
+
+PR #12 remains open and unmerged. V115/V116 are on the same PR9 branch; the
+merge decision remains with a human reviewer.

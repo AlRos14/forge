@@ -58,6 +58,145 @@ async fn load_remote_pr_admission(
     map_remote_pr_admission(row)
 }
 
+async fn snapshot_terminal_remote_pr_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    metadata_id: &str,
+    archived_at: &str,
+) -> Result<()> {
+    let current = sqlx::query(
+        "SELECT task_id, task_merge_operation_id, publish_operation_id
+         FROM pr_metadata WHERE id = ?",
+    )
+    .bind(metadata_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    let current_task_id: String = current.try_get("task_id")?;
+    let previous_merge_id: Option<String> = current.try_get("task_merge_operation_id")?;
+    let previous_publish_id: Option<String> = current.try_get("publish_operation_id")?;
+    let previous_merge_id = previous_merge_id.ok_or(DbError::InvalidTransition)?;
+    let previous_publish_id = previous_publish_id.ok_or(DbError::InvalidTransition)?;
+    if current_task_id != task_id {
+        return Err(DbError::InvalidTransition);
+    }
+    let admission = load_remote_pr_admission(tx, &previous_merge_id).await?;
+    if admission.task_id != task_id
+        || admission.metadata_id != metadata_id
+        || admission.publish_operation_id != previous_publish_id
+        || !matches!(
+            admission.state.as_str(),
+            "merged" | "closed" | "head_mismatch" | "publication_failed"
+        )
+    {
+        return Err(DbError::InvalidTransition);
+    }
+
+    sqlx::query(
+        "INSERT INTO remote_pr_history (
+            history_id, task_id, original_metadata_id, history_origin,
+            task_merge_operation_id, publish_operation_id,
+            provider_config_id, provider_type, provider_config_revision,
+            provider_config_digest, provider_base_url, token_secret_ref,
+            provider_pr_id, pr_url, remote_repo_identity, source_branch,
+            target_branch, admitted_source_sha, admission_state, provider_status,
+            result_classification, observed_head_sha, merged_commit_sha,
+            pr_state, merge_status, admission_status, provider_event_id,
+            result_event_id, admission_created_at, result_created_at, archived_at
+         )
+         SELECT ?, admission.task_id, admission.metadata_id, 'terminal_snapshot',
+                admission.task_merge_operation_id, admission.publish_operation_id,
+                admission.provider_config_id, admission.provider_type,
+                admission.provider_config_revision, admission.provider_config_digest,
+                admission.provider_base_url, admission.token_secret_ref,
+                metadata.provider_pr_id, metadata.pr_url,
+                admission.remote_repo_identity, admission.source_branch,
+                admission.target_branch, admission.admitted_source_sha,
+                admission.state, admission.provider_status,
+                admission.result_classification, admission.observed_head_sha,
+                admission.merged_commit_sha, metadata.pr_state, metadata.merge_status,
+                metadata.admission_status, admission.provider_event_id,
+                admission.result_event_id, admission.created_at, event.created_at, ?
+         FROM remote_pr_admission admission
+         JOIN pr_metadata metadata
+           ON metadata.id = admission.metadata_id
+          AND metadata.task_id = admission.task_id
+          AND metadata.task_merge_operation_id = admission.task_merge_operation_id
+          AND metadata.publish_operation_id = admission.publish_operation_id
+         JOIN domain_event event ON event.id = admission.result_event_id
+         WHERE admission.task_merge_operation_id = ?
+           AND admission.task_id = ?
+           AND admission.state IN ('merged', 'closed', 'head_mismatch', 'publication_failed')
+           AND NOT EXISTS (
+               SELECT 1 FROM remote_pr_history history
+               WHERE history.task_merge_operation_id = admission.task_merge_operation_id
+           )",
+    )
+    .bind(new_uuid_v4())
+    .bind(archived_at)
+    .bind(&previous_merge_id)
+    .bind(task_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+
+    let exact_snapshot: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM remote_pr_history history
+             JOIN remote_pr_admission admission
+               ON admission.task_merge_operation_id = history.task_merge_operation_id
+             JOIN domain_event result_event
+               ON result_event.id = admission.result_event_id
+             JOIN pr_metadata metadata
+               ON metadata.id = history.original_metadata_id
+              AND metadata.task_id = history.task_id
+             WHERE history.task_merge_operation_id = ?
+               AND history.task_id = ?
+               AND history.original_metadata_id = ?
+               AND history.publish_operation_id = ?
+               AND history.provider_config_id = admission.provider_config_id
+               AND history.provider_type = admission.provider_type
+               AND history.provider_config_revision = admission.provider_config_revision
+               AND history.provider_config_digest = admission.provider_config_digest
+               AND history.provider_base_url IS admission.provider_base_url
+               AND history.token_secret_ref IS admission.token_secret_ref
+               AND history.remote_repo_identity = admission.remote_repo_identity
+               AND history.source_branch = admission.source_branch
+               AND history.target_branch = admission.target_branch
+               AND history.admitted_source_sha = admission.admitted_source_sha
+               AND history.admission_state = admission.state
+               AND history.provider_status = admission.provider_status
+               AND history.result_classification IS admission.result_classification
+               AND history.observed_head_sha IS admission.observed_head_sha
+               AND history.merged_commit_sha IS admission.merged_commit_sha
+               AND history.provider_event_id IS admission.provider_event_id
+               AND history.result_event_id = admission.result_event_id
+               AND history.admission_created_at = admission.created_at
+               AND history.result_created_at = result_event.created_at
+               AND history.provider_pr_id IS metadata.provider_pr_id
+               AND history.pr_url IS metadata.pr_url
+               AND history.provider_type = metadata.provider_type
+               AND history.source_branch = metadata.source_branch
+               AND history.target_branch = metadata.target_branch
+               AND history.pr_state = metadata.pr_state
+               AND history.merge_status = metadata.merge_status
+               AND history.admission_status = metadata.admission_status
+               AND metadata.task_merge_operation_id = admission.task_merge_operation_id
+               AND metadata.publish_operation_id = admission.publish_operation_id
+         )",
+    )
+    .bind(&previous_merge_id)
+    .bind(task_id)
+    .bind(metadata_id)
+    .bind(&previous_publish_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if exact_snapshot != 1 {
+        return Err(DbError::InvalidTransition);
+    }
+    Ok(())
+}
+
 fn operation_write_error(error: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(database_error) = &error {
         let message = database_error.message().to_ascii_lowercase();
@@ -495,7 +634,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         admit_merge_lifecycle_in_tx(self, &mut tx, &merge).await?;
         insert_operation(&mut tx, &publish).await?;
         let existing_pr = sqlx::query(
-            "SELECT id, merge_status, admission_status FROM pr_metadata WHERE task_id = ?",
+            "SELECT id, merge_status, admission_status, task_merge_operation_id,
+                    publish_operation_id
+             FROM pr_metadata WHERE task_id = ?",
         )
         .bind(&metadata.task_id)
         .fetch_optional(&mut *tx)
@@ -562,9 +703,35 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 super::pr_metadata::insert_pr_metadata_in_tx(&mut tx, &metadata).await?;
                 metadata.id.clone()
             } else {
-                if merge_status == "pending" {
+                let previous_merge_id: Option<String> =
+                    existing_pr.try_get("task_merge_operation_id")?;
+                let previous_publish_id: Option<String> =
+                    existing_pr.try_get("publish_operation_id")?;
+                let Some(previous_merge_id) = previous_merge_id else {
+                    return Err(DbError::InvalidTransition);
+                };
+                let Some(previous_publish_id) = previous_publish_id else {
+                    return Err(DbError::InvalidTransition);
+                };
+                let previous_admission =
+                    load_remote_pr_admission(&mut tx, &previous_merge_id).await?;
+                if previous_admission.task_id != metadata.task_id
+                    || previous_admission.metadata_id != metadata_id
+                    || previous_admission.publish_operation_id != previous_publish_id
+                    || !matches!(
+                        previous_admission.state.as_str(),
+                        "merged" | "closed" | "head_mismatch" | "publication_failed"
+                    )
+                {
                     return Err(DbError::InvalidTransition);
                 }
+                snapshot_terminal_remote_pr_in_tx(
+                    &mut tx,
+                    &metadata.task_id,
+                    &metadata_id,
+                    &metadata.updated_at,
+                )
+                .await?;
                 sqlx::query(
                     "UPDATE pr_metadata
                      SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
@@ -683,6 +850,110 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         {
             return Err(DbError::InvalidTransition);
         }
+
+        let terminal_admission = matches!(
+            admission.state.as_str(),
+            "merged" | "closed" | "head_mismatch" | "publication_failed"
+        );
+        if terminal_admission || merge.status != TaskIntegrationOperationStatus::Running {
+            if input.status == "reconciliation_required" {
+                return Err(DbError::InvalidTransition);
+            }
+            if input.status == "merged"
+                && input.merged_commit_sha.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(DbError::Check(
+                    "merged PR result requires the provider merged commit SHA".to_owned(),
+                ));
+            }
+            if input.status != "publication_failed"
+                && (input.provider_event_id.as_deref().is_none_or(str::is_empty)
+                    || input.provider_pr_id.as_deref().is_none_or(str::is_empty))
+            {
+                return Err(DbError::Check(
+                    "provider PR observations require exact provider event and PR identities"
+                        .to_owned(),
+                ));
+            }
+            if input.remote_repo_identity != admission.remote_repo_identity {
+                return Err(DbError::InvalidTransition);
+            }
+            let result_classification = if input.status == "merged"
+                && input.observed_head_sha.as_deref()
+                    != Some(admission.admitted_source_sha.as_str())
+            {
+                Some("head_mismatch")
+            } else {
+                None
+            };
+            let provider_event_key = input
+                .provider_event_id
+                .as_deref()
+                .unwrap_or("definitive-publication-rejection");
+            let dedupe_key = format!(
+                "remote-pr-result:{}:{}",
+                admission.task_merge_operation_id, provider_event_key
+            );
+            let mut incoming_payload = serde_json::json!({
+                "task_id": admission.task_id,
+                "pr_metadata_id": admission.metadata_id,
+                "provider_pr_id": input.provider_pr_id,
+                "provider_type": admission.provider_type,
+                "provider_config_id": admission.provider_config_id,
+                "provider_config_revision": admission.provider_config_revision,
+                "provider_config_digest": admission.provider_config_digest,
+                "remote_repo_identity": admission.remote_repo_identity,
+                "source_branch": admission.source_branch,
+                "target_branch": admission.target_branch,
+                "admitted_source_sha": admission.admitted_source_sha,
+                "head_sha": input.observed_head_sha,
+                "merged_commit_sha": input.merged_commit_sha,
+                "provider_event_id": input.provider_event_id,
+                "pr_url": input.pr_url,
+                "reconciliation_reason": input.reconciliation_reason,
+                "status": input.status,
+                "task_merge_operation_id": admission.task_merge_operation_id,
+                "publish_operation_id": admission.publish_operation_id,
+            });
+            if let Some(classification) = result_classification {
+                incoming_payload["result_classification"] =
+                    serde_json::Value::String(classification.to_owned());
+            }
+            let prior_event =
+                sqlx::query("SELECT id, payload_json FROM domain_event WHERE dedupe_key = ?")
+                    .bind(&dedupe_key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(prior_event) = prior_event else {
+                return Err(DbError::InvalidTransition);
+            };
+            let prior_event_id: String = prior_event.try_get("id")?;
+            let prior_payload: String = prior_event.try_get("payload_json")?;
+            let mut prior_payload: serde_json::Value = serde_json::from_str(&prior_payload)
+                .map_err(|error| DbError::Check(format!("invalid stored PR result: {error}")))?;
+            if admission.result_event_id.as_deref() == Some(prior_event_id.as_str())
+                && admission.state == "head_mismatch"
+                && admission.provider_status.as_deref() == Some("merged")
+                && admission.result_classification.as_deref() == Some("head_mismatch")
+                && input.status == "merged"
+                && input.observed_head_sha.as_deref()
+                    != Some(admission.admitted_source_sha.as_str())
+                && prior_payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("head_mismatch")
+            {
+                prior_payload["status"] = serde_json::Value::String("merged".to_owned());
+                prior_payload["result_classification"] =
+                    serde_json::Value::String("head_mismatch".to_owned());
+            }
+            if prior_payload != incoming_payload {
+                return Err(DbError::InvalidTransition);
+            }
+            tx.commit().await?;
+            return DomainEventRepo::get_event(self, &prior_event_id).await;
+        }
+
         let metadata_row = sqlx::query(
             "SELECT task_id, task_merge_operation_id, publish_operation_id,
                     source_branch, target_branch, pr_state
