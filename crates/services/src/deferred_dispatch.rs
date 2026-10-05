@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use db::{now_rfc3339, Task, TaskMetadata, TaskRepo};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -47,16 +46,6 @@ pub(crate) fn pending_until(task: &Task) -> Option<DeferredDispatch> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).ok()?;
     let value = metadata.extra.get(METADATA_KEY)?.clone();
     serde_json::from_value(value).ok()
-}
-
-pub(crate) fn is_pending(task: &Task, now: DateTime<Utc>) -> bool {
-    let Some(deferred) = pending_until(task) else {
-        return false;
-    };
-    let Ok(not_before) = DateTime::parse_from_rfc3339(&deferred.not_before) else {
-        return false;
-    };
-    now < not_before.with_timezone(&Utc)
 }
 
 fn parse_metadata(task: &Task) -> Result<TaskMetadata> {

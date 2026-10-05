@@ -1,7 +1,10 @@
+use crate::gate_engine::GateEngine;
 use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 use db::{
-    now_rfc3339, Execution, ExecutionRepo, PageRequest, RepoRepo, SortBy, SortOrder, SqliteDb,
+    now_rfc3339, Execution, ExecutionRepo, GateEvaluation, GateEvaluationInput,
+    GateEvaluationOutcome, GateRepo, PageRequest, PrProviderConfigRepo, RepoRepo, SortBy,
+    SortOrder, SqliteDb, TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState,
     TaskRepo, WorkMode, WorkUnitRepo, WorkspaceRepo,
 };
 use events::EventBus;
@@ -9,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 use tokio::process::Command;
 
@@ -18,6 +21,7 @@ pub struct MergeService {
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
     workspace_exec_locks: Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>,
+    cleanup_scheduler: RwLock<Option<Arc<crate::WorkspaceCleanupScheduler>>>,
     integration_operations: TaskIntegrationOperationManager,
 }
 
@@ -25,6 +29,13 @@ struct TaskMergeSource {
     workspace: db::Workspace,
     execution: Option<Execution>,
     branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeCandidateSubject {
+    workspace_id: String,
+    commit_sha: String,
+    snapshot_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +82,7 @@ impl MergeService {
             workspace_exec_locks: Arc::new(
                 crate::workspace_execution_lock::WorkspaceExecutionLockManager::default(),
             ),
+            cleanup_scheduler: RwLock::new(None),
             integration_operations,
         }
     }
@@ -81,7 +93,37 @@ impl MergeService {
         Arc::clone(&self.workspace_exec_locks)
     }
 
+    pub fn set_cleanup_scheduler(&self, cleanup_scheduler: Arc<crate::WorkspaceCleanupScheduler>) {
+        match self.cleanup_scheduler.write() {
+            Ok(mut configured) => *configured = Some(cleanup_scheduler),
+            Err(error) => {
+                tracing::warn!(%error, "merge cleanup scheduler configuration lock poisoned")
+            }
+        }
+    }
+
+    /// Legacy entry point retained for pull-request publication. Direct local
+    /// merges and PR publication require an exact GateEvaluation reference.
     pub async fn merge(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
+        let task_id = task_id.into();
+        if TaskIntegrationOperationRepo::get_active_for_task(&*self.db, &task_id)
+            .await?
+            .is_some()
+        {
+            return Err(ServiceError::Conflict(
+                "Task integration operation already active".to_owned(),
+            ));
+        }
+        Err(ServiceError::invalid_operation(
+            "Task merge requires an exact satisfied merge-readiness GateEvaluation",
+        ))
+    }
+
+    pub async fn merge_after_gate(
+        &self,
+        task_id: impl Into<String>,
+        gate_evaluation_id: &str,
+    ) -> Result<MergeOutcome> {
         let _ = self.event_bus.receiver_count();
         let task_id = task_id.into();
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -105,34 +147,72 @@ impl MergeService {
                 entity: "repo",
                 id: repo_id.to_owned(),
             })?;
+        let evaluation = GateRepo::get_gate_evaluation(&*self.db, gate_evaluation_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("GateEvaluation", gate_evaluation_id.to_owned())
+            })?;
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.clone()))?;
+        if evaluation.task_id != task_id
+            || evaluation.outcome != GateEvaluationOutcome::Satisfied
+            || gate.gate_kind != "merge_readiness"
+            || gate.scope_kind != db::GateScopeKind::Task
+            || gate.scope_id != task_id
+            || gate.active_policy_revision != Some(evaluation.policy_revision)
+            || lifecycle.state != TaskLifecycleState::ReadyToMerge
+        {
+            return Err(ServiceError::invalid_operation(
+                "merge admission requires the current satisfied merge-readiness GateEvaluation",
+            ));
+        }
         if repo.work_mode == WorkMode::PullRequest {
-            return self.publish_pr(&task_id).await;
+            return self
+                .publish_pr_after_gate(&task_id, gate_evaluation_id)
+                .await;
         }
         let _local_task_lock = self
             .workspace_exec_locks
             .acquire(&format!("task-integration:{task_id}"))
             .await;
+        let task_operation_file = self
+            .integration_operations
+            .lock_for_gate_admission(&task_id)
+            .await?;
+        let source = task_merge_source(&self.db, &task_id).await?;
+        let _workspace_guard = self
+            .workspace_exec_locks
+            .acquire(&source.workspace.id)
+            .await;
+        self.ensure_current_gate_evaluation(&task_id, &evaluation)
+            .await?;
+        self.validate_gate_candidate(&task_id, &evaluation, &source)
+            .await?;
+        self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
+            .await?;
         let operation = self
             .integration_operations
-            .acquire(
+            .acquire_kind_after_gate_with_lock(
                 &task_id,
                 db::TaskIntegrationOperationKind::TaskMerge,
                 &db::new_uuid_v4(),
+                gate_evaluation_id,
+                task_operation_file,
             )
             .await?;
+        self.publish_domain_event_by_dedupe(&format!("task-merge-admission:{}", operation.id()))
+            .await;
         let result = async {
-            let source = task_merge_source(&self.db, &task_id).await?;
             let workspace = &source.workspace;
             if work_unit_integration_is_running(&self.db, &task_id).await? {
                 return Err(ServiceError::invalid_operation(
                     "Task integration is currently incorporating a WorkUnit result",
                 ));
             }
-            let _integration_workspace_guard = if source.execution.is_none() {
-                Some(self.workspace_exec_locks.acquire(&workspace.id).await)
-            } else {
-                None
-            };
             let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
             let repo_source = self.resolve_repo_source(&repo).await?;
             let repo_path = Path::new(&repo_source);
@@ -226,15 +306,68 @@ impl MergeService {
         .await;
         let status = merge_operation_status(&result);
         let finish_result = operation.finish(status).await;
+        if let Ok(operation) = finish_result.as_ref() {
+            self.publish_domain_event_by_dedupe(&format!("task-merge-terminal:{}", operation.id))
+                .await;
+        }
+        drop(_workspace_guard);
+        drop(_local_task_lock);
+        if matches!(&result, Ok(MergeOutcome::Done { .. })) && finish_result.is_ok() {
+            let cleanup_scheduler = self
+                .cleanup_scheduler
+                .read()
+                .ok()
+                .and_then(|configured| configured.clone());
+            if let Some(cleanup_scheduler) = cleanup_scheduler {
+                match WorkspaceRepo::get_by_task_id(&*self.db, &task_id).await {
+                    Ok(Some(workspace)) => {
+                        if let Err(error) = cleanup_scheduler.cleanup_now(&workspace.id).await {
+                            tracing::warn!(task_id = %task_id, workspace_id = %workspace.id, %error, "post-merge workspace cleanup failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(task_id = %task_id, %error, "post-merge workspace lookup failed");
+                    }
+                }
+            }
+        }
         match (result, finish_result) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(outcome), Ok(_)) => Ok(outcome),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
     }
 
+    async fn publish_domain_event_by_dedupe(&self, dedupe_key: &str) {
+        let service =
+            crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
+            tracing::warn!(dedupe_key, %error, "failed to hint committed Task merge lifecycle event");
+        }
+    }
+
     pub async fn publish_pr(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
         let task_id = task_id.into();
+        if TaskIntegrationOperationRepo::get_active_for_task(&*self.db, &task_id)
+            .await?
+            .is_some()
+        {
+            return Err(ServiceError::Conflict(
+                "Task integration operation already active".to_owned(),
+            ));
+        }
+        Err(ServiceError::invalid_operation(
+            "PR publication requires an exact satisfied merge-readiness GateEvaluation",
+        ))
+    }
+
+    async fn publish_pr_after_gate(
+        &self,
+        task_id: &str,
+        gate_evaluation_id: &str,
+    ) -> Result<MergeOutcome> {
+        let task_id = task_id.to_owned();
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
@@ -259,39 +392,97 @@ impl MergeService {
             .workspace_exec_locks
             .acquire(&format!("task-integration:{task_id}"))
             .await;
-        let operation = self
+        let task_operation_file = self
             .integration_operations
-            .acquire(
+            .lock_for_gate_admission(&task_id)
+            .await?;
+        let evaluation = GateRepo::get_gate_evaluation(&*self.db, gate_evaluation_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("GateEvaluation", gate_evaluation_id.to_owned())
+            })?;
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.clone()))?;
+        if evaluation.task_id != task_id
+            || evaluation.outcome != GateEvaluationOutcome::Satisfied
+            || gate.gate_kind != "merge_readiness"
+            || gate.scope_kind != db::GateScopeKind::Task
+            || gate.scope_id != task_id
+            || gate.active_policy_revision != Some(evaluation.policy_revision)
+            || lifecycle.state != TaskLifecycleState::ReadyToMerge
+        {
+            return Err(ServiceError::invalid_operation(
+                "PR publication requires the current satisfied merge-readiness GateEvaluation",
+            ));
+        }
+        let source = task_merge_source(&self.db, &task_id).await?;
+        let _workspace_guard = self
+            .workspace_exec_locks
+            .acquire(&source.workspace.id)
+            .await;
+        self.ensure_current_gate_evaluation(&task_id, &evaluation)
+            .await?;
+        self.validate_gate_candidate(&task_id, &evaluation, &source)
+            .await?;
+        self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
+            .await?;
+        if work_unit_integration_is_running(&self.db, &task_id).await? {
+            return Err(ServiceError::invalid_operation(
+                "Task integration is currently incorporating a WorkUnit result",
+            ));
+        }
+        let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
+        let source_branch = source.branch.clone();
+        let worktree_path = Path::new(&source.workspace.worktree_path);
+        if !git::is_worktree_clean(worktree_path).await? {
+            return Ok(MergeOutcome::Dirty {
+                files: git::status_porcelain(worktree_path).await?,
+            });
+        }
+        // Push the pinned source before persisting the PR admission. A crash
+        // after admission therefore always leaves a provider-ready branch and
+        // an atomic PublishPr plus metadata intent for startup recovery.
+        push_branch(worktree_path, &source_branch).await?;
+        self.ensure_current_gate_evaluation(&task_id, &evaluation)
+            .await?;
+        let source_sha = self
+            .validate_gate_candidate(&task_id, &evaluation, &source)
+            .await?;
+        self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
+            .await?;
+        let provider_config = PrProviderConfigRepo::get_by_repo_id(&*self.db, &repo.id)
+            .await?
+            .ok_or_else(|| ServiceError::PrProviderMissing {
+                repo_id: repo.id.clone(),
+            })?;
+        let (merge_admission, publication) = self
+            .integration_operations
+            .admit_pull_request_publication_with_lock(
                 &task_id,
-                db::TaskIntegrationOperationKind::PublishPr,
                 &db::new_uuid_v4(),
+                gate_evaluation_id,
+                &provider_config,
+                &repo.remote_url,
+                &source_branch,
+                &target_branch,
+                &source_sha,
+                task_operation_file,
             )
             .await?;
+        self.publish_domain_event_by_dedupe(&format!(
+            "task-merge-admission:{}",
+            merge_admission.id()
+        ))
+        .await;
         let result = async {
-            let source = task_merge_source(&self.db, &task_id).await?;
-            let workspace = &source.workspace;
-            if work_unit_integration_is_running(&self.db, &task_id).await? {
-                return Err(ServiceError::invalid_operation(
-                    "Task integration is currently incorporating a WorkUnit result",
-                ));
-            }
-            let _integration_workspace_guard = if source.execution.is_none() {
-                Some(self.workspace_exec_locks.acquire(&workspace.id).await)
-            } else {
-                None
-            };
-            let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
-            let source_branch = source.branch;
-            let worktree_path = Path::new(&workspace.worktree_path);
-
-            if !git::is_worktree_clean(worktree_path).await? {
-                return Ok(MergeOutcome::Dirty {
-                    files: git::status_porcelain(worktree_path).await?,
-                });
-            }
-
-            push_branch(worktree_path, &source_branch).await?;
-            let pr_service = crate::pr_service::PrService::new(Arc::clone(&self.db));
+            let pr_service = crate::pr_service::PrService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
             let published = pr_service
                 .publish_pr(&task, &repo, &source_branch, &target_branch)
                 .await?;
@@ -303,13 +494,216 @@ impl MergeService {
             })
         }
         .await;
-        let status = merge_operation_status(&result);
-        let finish_result = operation.finish(status).await;
-        match (result, finish_result) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), _) => Err(error),
+        // The provider result writer owns the single transaction that may
+        // finish PublishPr, TaskMerge, metadata, and lifecycle. Dropping these
+        // guards releases local locks only; an unknown outcome remains running.
+        drop(publication);
+        drop(merge_admission);
+        result
+    }
+
+    async fn validate_gate_candidate(
+        &self,
+        task_id: &str,
+        evaluation: &GateEvaluation,
+        source: &TaskMergeSource,
+    ) -> Result<String> {
+        if evaluation.task_id != task_id || evaluation.outcome != GateEvaluationOutcome::Satisfied {
+            return Err(ServiceError::Conflict(
+                "merge candidate requires the exact satisfied GateEvaluation".to_owned(),
+            ));
         }
+        let inputs = GateRepo::list_gate_evaluation_inputs(&*self.db, &evaluation.id).await?;
+        let work_units = WorkUnitRepo::list_by_task(&*self.db, task_id).await?;
+        let candidate = if work_units.is_empty() {
+            let mut candidate: Option<MergeCandidateSubject> = None;
+            for input in inputs.iter().filter(|input| {
+                matches!(
+                    input.input_kind.as_str(),
+                    "review_report" | "validation_run"
+                )
+            }) {
+                let subject = merge_candidate_subject(input)?;
+                if candidate
+                    .as_ref()
+                    .is_some_and(|current| current != &subject)
+                {
+                    return Err(ServiceError::Conflict(
+                        "merge Gate inputs refer to different workspace commits or snapshots"
+                            .to_owned(),
+                    ));
+                }
+                candidate = Some(subject);
+            }
+            candidate.ok_or_else(|| {
+                ServiceError::Conflict(
+                    "merge-readiness evaluation has no exact ReviewReport or ValidationRun candidate"
+                        .to_owned(),
+                )
+            })?
+        } else {
+            let mut integrations = Vec::new();
+            for input in inputs
+                .iter()
+                .filter(|input| input.input_kind == "work_unit_integration")
+            {
+                let integration = WorkUnitRepo::get_integration_by_id(&*self.db, &input.input_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::not_found("WorkUnitIntegration", input.input_id.clone())
+                    })?;
+                let subject = merge_candidate_subject(input)?;
+                if integration.task_id != task_id
+                    || integration.version != input.input_version
+                    || integration.outcome != db::WorkUnitIntegrationOutcome::Success
+                    || integration.target_workspace_id != subject.workspace_id
+                    || integration.target_after_sha.as_deref() != Some(subject.commit_sha.as_str())
+                {
+                    return Err(ServiceError::Conflict(
+                        "merge Gate WorkUnitIntegration input is no longer the exact successful integration"
+                            .to_owned(),
+                    ));
+                }
+                integrations.push((integration.created_at, integration.id, subject));
+            }
+            integrations.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+            let (_, _, candidate) = integrations.pop().ok_or_else(|| {
+                ServiceError::Conflict(
+                    "Task with WorkUnits requires an exact successful WorkUnitIntegration input before merge"
+                        .to_owned(),
+                )
+            })?;
+            let mut verifier_subject: Option<MergeCandidateSubject> = None;
+            for input in inputs.iter().filter(|input| {
+                matches!(
+                    input.input_kind.as_str(),
+                    "review_report" | "validation_run"
+                )
+            }) {
+                let subject = merge_candidate_subject(input)?;
+                if subject.workspace_id != candidate.workspace_id
+                    || subject.commit_sha != candidate.commit_sha
+                {
+                    return Err(ServiceError::Conflict(
+                        "merge Gate ReviewReport or ValidationRun does not cover the exact integrated WorkUnit commit"
+                            .to_owned(),
+                    ));
+                }
+                if verifier_subject
+                    .as_ref()
+                    .is_some_and(|existing| existing != &subject)
+                {
+                    return Err(ServiceError::Conflict(
+                        "merge Gate ReviewReport and ValidationRun refer to different snapshots"
+                            .to_owned(),
+                    ));
+                }
+                verifier_subject = Some(subject);
+            }
+            candidate
+        };
+
+        if source.workspace.id != candidate.workspace_id {
+            return Err(ServiceError::Conflict(
+                "merge source Workspace differs from the exact GateEvaluation candidate".to_owned(),
+            ));
+        }
+        if let Some(execution) = source.execution.as_ref() {
+            if execution.status != db::ExecutionStatus::Completed
+                || execution.workspace_id.as_deref() != Some(candidate.workspace_id.as_str())
+                || execution
+                    .after_sha
+                    .as_deref()
+                    .is_some_and(|sha| sha != candidate.commit_sha)
+            {
+                return Err(ServiceError::Conflict(
+                    "merge source Execution does not match the exact GateEvaluation candidate"
+                        .to_owned(),
+                ));
+            }
+        } else if work_units.is_empty() {
+            return Err(ServiceError::Conflict(
+                "merge candidate has no exact completed source Execution".to_owned(),
+            ));
+        }
+        let current_sha = git::get_current_sha(Path::new(&source.workspace.worktree_path)).await?;
+        if current_sha != candidate.commit_sha {
+            return Err(ServiceError::Conflict(
+                "merge source commit is stale relative to the exact GateEvaluation candidate"
+                    .to_owned(),
+            ));
+        }
+        let executions = ExecutionRepo::list_by_task(
+            &*self.db,
+            task_id,
+            PageRequest {
+                cursor: None,
+                limit: 500,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?;
+        if executions
+            .items
+            .iter()
+            .any(|execution| execution.status == db::ExecutionStatus::Running)
+        {
+            return Err(ServiceError::Conflict(
+                "Task has a running Execution and cannot enter merge admission".to_owned(),
+            ));
+        }
+        Ok(candidate.commit_sha)
+    }
+
+    async fn ensure_current_gate_evaluation(
+        &self,
+        task_id: &str,
+        evaluation: &GateEvaluation,
+    ) -> Result<()> {
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        if gate.task_id != task_id
+            || gate.gate_kind != "merge_readiness"
+            || gate.scope_kind != db::GateScopeKind::Task
+            || gate.scope_id != task_id
+            || gate.active_policy_revision != Some(evaluation.policy_revision)
+        {
+            return Err(ServiceError::Conflict(
+                "merge-readiness policy changed after the supplied GateEvaluation".to_owned(),
+            ));
+        }
+        let current = GateEngine::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .evaluate_revision(gate, evaluation.policy_revision)
+            .await?;
+        if current.evaluation.id != evaluation.id
+            || current.evaluation.outcome != GateEvaluationOutcome::Satisfied
+        {
+            return Err(ServiceError::Conflict(
+                "supplied GateEvaluation is stale; use the current satisfied evaluation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_ready_lifecycle_cause(
+        &self,
+        task_id: &str,
+        gate_evaluation_id: &str,
+    ) -> Result<()> {
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+        if lifecycle.state != TaskLifecycleState::ReadyToMerge
+            || lifecycle.reason_ref.as_deref() != Some(gate_evaluation_id)
+        {
+            return Err(ServiceError::Conflict(
+                "Task is not ready to merge from the supplied GateEvaluation".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn resolve_repo_source(&self, repo: &db::Repo) -> Result<String> {
@@ -437,11 +831,80 @@ async fn latest_executor_execution(db: &SqliteDb, task_id: &str) -> Result<Execu
         .into_iter()
         .find(|execution| {
             execution.work_unit_id.is_none()
-                && matches!(execution.role.as_str(), "executor" | "coder" | "worker")
+                && execution.status == db::ExecutionStatus::Completed
+                && matches!(
+                    execution.role.as_str(),
+                    "executor" | "coder" | "worker" | "implementer"
+                )
         })
         .ok_or_else(|| ServiceError::InvalidOperation {
             message: format!("task {task_id} has no executor execution"),
         })
+}
+
+fn merge_candidate_subject(input: &GateEvaluationInput) -> Result<MergeCandidateSubject> {
+    let subject: Value = serde_json::from_str(&input.subject_json).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "GateEvaluation input {} has invalid subject JSON: {error}",
+            input.input_id
+        ))
+    })?;
+    let (workspace_key, commit_key, snapshot_key) = match input.input_kind.as_str() {
+        "review_report" => (
+            "workspace_id",
+            "head_commit_sha",
+            Some("workspace_snapshot_digest"),
+        ),
+        "validation_run" => (
+            "workspace_id",
+            "commit_sha",
+            Some("workspace_snapshot_digest"),
+        ),
+        "work_unit_integration" => ("workspace_id", "commit_sha", None),
+        _ => {
+            return Err(ServiceError::invalid_operation(
+                "GateEvaluation input is not a merge candidate subject",
+            ));
+        }
+    };
+    let workspace_id = subject
+        .get(workspace_key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "GateEvaluation input {} has no exact Workspace subject",
+                input.input_id
+            ))
+        })?
+        .to_owned();
+    let commit_sha = subject
+        .get(commit_key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "GateEvaluation input {} has no exact commit subject",
+                input.input_id
+            ))
+        })?
+        .to_owned();
+    let snapshot_digest = snapshot_key
+        .and_then(|key| subject.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    if snapshot_key.is_some() && snapshot_digest.is_none() {
+        return Err(ServiceError::invalid_operation(format!(
+            "GateEvaluation input {} has no exact Workspace snapshot subject",
+            input.input_id
+        )));
+    }
+    Ok(MergeCandidateSubject {
+        workspace_id,
+        commit_sha,
+        snapshot_digest,
+    })
 }
 
 fn merge_operation_status(result: &Result<MergeOutcome>) -> db::TaskIntegrationOperationStatus {
@@ -521,350 +984,28 @@ fn target_branch(merge_config: &Option<String>, repo_default_branch: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{
-        create_sqlite_pool, new_uuid_v4, run_migrations, CreateExecution, CreateProject,
-        CreateRepo, CreateTask, CreateWorkspace, ExecutionStatus, ProjectRepo, RepoRepo,
-        UpdateProject, WorkspaceStatus,
-    };
-    use std::process::Stdio;
-    use tempfile::TempDir;
-    use tokio::process::Command;
 
-    async fn sqlite_db() -> Arc<SqliteDb> {
-        let pool = create_sqlite_pool("sqlite::memory:")
+    #[tokio::test]
+    async fn legacy_merge_entry_requires_exact_gate_evaluation() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
-        run_migrations(&pool).await.expect("migrations run");
-        Arc::new(SqliteDb::new(pool))
-    }
-
-    async fn run_git(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {} failed\nstdout: {}\nstderr: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        db::run_migrations(&pool).await.expect("migrations run");
+        let database = Arc::new(SqliteDb::new(pool));
+        let service = MergeService::new(
+            Arc::clone(&database),
+            Arc::new(EventBus::new(4)),
+            PathBuf::from("/tmp/forge-merge-test"),
         );
-    }
 
-    async fn setup_repo(temp: &TempDir) -> std::path::PathBuf {
-        let repo_path = temp.path().join("repo");
-        std::fs::create_dir_all(&repo_path).expect("repo dir creates");
-        git::init(&repo_path).await.expect("repo initializes");
-        run_git(&repo_path, &["checkout", "-B", "main"]).await;
-        std::fs::write(repo_path.join("file.txt"), "base\n").expect("file writes");
-        git::commit_all(&repo_path, "initial")
+        let error = service
+            .merge("task-without-gate")
             .await
-            .expect("initial commit creates");
-        repo_path
-    }
-
-    async fn seed_merge_rows(
-        db: &SqliteDb,
-        repo_path: &Path,
-        worktree_path: &Path,
-        task_id: &str,
-    ) -> String {
-        let now = now_rfc3339();
-        let project_id = new_uuid_v4();
-        let repo_id = new_uuid_v4();
-        let workspace_id = new_uuid_v4();
-        ProjectRepo::create(
-            db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Forge".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project creates");
-        RepoRepo::create(
-            db,
-            CreateRepo {
-                id: repo_id.clone(),
-                project_id: project_id.clone(),
-                name: "repo".to_owned(),
-                remote_url: repo_path.to_string_lossy().into_owned(),
-                local_path: Some(repo_path.to_string_lossy().into_owned()),
-                work_mode: db::WorkMode::DirectMerge,
-                default_branch: "main".to_owned(),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("repo creates");
-        ProjectRepo::update(
-            db,
-            UpdateProject {
-                id: project_id.clone(),
-                name: None,
-                settings: None,
-                primary_repo_id: Some(Some(repo_id.clone())),
-                paused_at: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await
-        .expect("project primary repo updates");
-        TaskRepo::create(
-            db,
-            CreateTask {
-                id: task_id.to_owned(),
-                project_id: RepoRepo::get_by_id(db, &repo_id)
-                    .await
-                    .expect("repo loads")
-                    .expect("repo exists")
-                    .project_id,
-                repo_id: Some(repo_id.clone()),
-                parent_task_id: None,
-                subtask_order: None,
-                assignee_type: None,
-                assignee_id: None,
-                title: "task".to_owned(),
-                description: None,
-                task_type: "implementation".to_owned(),
-                status: "review".to_owned(),
-                is_automation: false,
-                priority: 0,
-                task_state_config: None,
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("task creates");
-        WorkspaceRepo::create(
-            db,
-            CreateWorkspace {
-                id: workspace_id.clone(),
-                task_id: task_id.to_owned(),
-                repo_id,
-                worktree_path: worktree_path.to_string_lossy().into_owned(),
-                branch: workspace::task_branch_name(task_id),
-                status: WorkspaceStatus::Ready,
-                before_sha: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("workspace creates");
-        let execution_id = new_uuid_v4();
-        ExecutionRepo::create(
-            db,
-            CreateExecution {
-                id: execution_id.clone(),
-                task_id: task_id.to_owned(),
-                agent_id: None,
-                actor_ref: None,
-                purpose: None,
-                harness_session_id: None,
-                role: "executor".to_owned(),
-                status: ExecutionStatus::Completed,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: Some(workspace_id),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .expect("execution creates");
-        execution_id
-    }
-
-    #[tokio::test]
-    async fn clean_merge_returns_done() {
-        let db = sqlite_db().await;
-        let event_bus = Arc::new(EventBus::new(16));
-        let temp = TempDir::new().expect("temp creates");
-        let repo_path = setup_repo(&temp).await;
-        let task_id = new_uuid_v4();
-        let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
-        git::create_worktree(
-            &repo_path,
-            &workspace::task_branch_name(&task_id),
-            &worktree_path,
-        )
-        .await
-        .expect("worktree creates");
-        std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("feature writes");
-        let worktree_sha = git::commit_all(&worktree_path, "feature")
-            .await
-            .expect("feature commits");
-        let execution_id = seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
-        let before_sha = git::get_current_sha(&repo_path)
-            .await
-            .expect("before sha reads");
-
-        let service = MergeService::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
-        let outcome = service.merge(task_id).await.expect("merge succeeds");
-
-        match outcome {
-            MergeOutcome::Done {
-                before_sha: actual_before,
-                after_sha,
-                branch: _,
-            } => {
-                assert_eq!(actual_before, before_sha);
-                assert_eq!(after_sha, worktree_sha);
-            }
-            other => panic!("expected done, got {other:?}"),
-        }
-        let execution = ExecutionRepo::get_by_id(&*db, &execution_id)
-            .await
-            .expect("execution loads")
-            .expect("execution exists");
-        assert_eq!(execution.before_sha, Some(worktree_sha.clone()));
-        assert_eq!(execution.after_sha, Some(worktree_sha));
-    }
-
-    #[tokio::test]
-    async fn conflicting_merge_returns_conflict_and_aborts() {
-        let db = sqlite_db().await;
-        let event_bus = Arc::new(EventBus::new(16));
-        let temp = TempDir::new().expect("temp creates");
-        let repo_path = setup_repo(&temp).await;
-        let task_id = new_uuid_v4();
-        let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
-        git::create_worktree(
-            &repo_path,
-            &workspace::task_branch_name(&task_id),
-            &worktree_path,
-        )
-        .await
-        .expect("worktree creates");
-        std::fs::write(worktree_path.join("file.txt"), "feature\n").expect("feature writes");
-        git::commit_all(&worktree_path, "feature")
-            .await
-            .expect("feature commits");
-        std::fs::write(repo_path.join("file.txt"), "main\n").expect("main writes");
-        let repo_head = git::commit_all(&repo_path, "main")
-            .await
-            .expect("main commits");
-        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
-
-        let service = MergeService::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
-        let outcome = service.merge(task_id).await.expect("merge returns outcome");
-
-        match outcome {
-            MergeOutcome::Conflict {
-                details,
-                conflict_paths,
-            } => {
-                assert!(details.contains("CONFLICT"));
-                assert_eq!(conflict_paths, vec![PathBuf::from("file.txt")]);
-            }
-            other => panic!("expected conflict, got {other:?}"),
-        }
-        assert_eq!(
-            git::get_current_sha(&repo_path).await.expect("head reads"),
-            repo_head
-        );
-        assert!(!git::detect_interrupted_merge(&repo_path)
-            .await
-            .expect("merge state reads"));
-    }
-
-    #[tokio::test]
-    async fn dirty_worktree_returns_dirty() {
-        let db = sqlite_db().await;
-        let event_bus = Arc::new(EventBus::new(16));
-        let temp = TempDir::new().expect("temp creates");
-        let repo_path = setup_repo(&temp).await;
-        let task_id = new_uuid_v4();
-        let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
-        git::create_worktree(
-            &repo_path,
-            &workspace::task_branch_name(&task_id),
-            &worktree_path,
-        )
-        .await
-        .expect("worktree creates");
-        std::fs::write(worktree_path.join("dirty.txt"), "dirty\n").expect("dirty writes");
-        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
-
-        let service = MergeService::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
-        let outcome = service.merge(task_id).await.expect("merge returns outcome");
-
-        match outcome {
-            MergeOutcome::Dirty { files } => assert!(files.contains(&"dirty.txt".to_owned())),
-            other => panic!("expected dirty, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn dirty_target_repo_returns_target_dirty() {
-        let db = sqlite_db().await;
-        let event_bus = Arc::new(EventBus::new(16));
-        let temp = TempDir::new().expect("temp creates");
-        let repo_path = setup_repo(&temp).await;
-        let task_id = new_uuid_v4();
-        let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
-        git::create_worktree(
-            &repo_path,
-            &workspace::task_branch_name(&task_id),
-            &worktree_path,
-        )
-        .await
-        .expect("worktree creates");
-        std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("feature writes");
-        git::commit_all(&worktree_path, "feature")
-            .await
-            .expect("feature commits");
-        std::fs::write(repo_path.join("target-dirty.txt"), "dirty\n").expect("dirty writes");
-        let before_sha = git::get_current_sha(&repo_path)
-            .await
-            .expect("before sha reads");
-        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
-
-        let service = MergeService::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
-        let outcome = service.merge(task_id).await.expect("merge returns outcome");
-
-        match outcome {
-            MergeOutcome::TargetDirty { files } => {
-                assert!(
-                    files.iter().any(|file| file.contains("target-dirty.txt")),
-                    "{files:?}"
-                )
-            }
-            other => panic!("expected target dirty, got {other:?}"),
-        }
-        assert_eq!(
-            git::get_current_sha(&repo_path).await.expect("head reads"),
-            before_sha
-        );
+            .expect_err("legacy merge cannot bypass Gate admission");
+        assert!(matches!(
+            error,
+            ServiceError::InvalidOperation { message }
+                if message.contains("exact satisfied merge-readiness GateEvaluation")
+        ));
     }
 }

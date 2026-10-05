@@ -332,8 +332,8 @@ impl TaskService {
             });
         }
 
-        let is_coder_role =
-            self.active_work_role(&task).await?.as_deref() == Some(input.role_name.as_str());
+        let is_coder_role = db::canonical_task_role_name(&input.role_name).as_deref()
+            == self.active_work_role(&task).await?.as_deref();
 
         if !is_coder_role {
             let assignment = self.assign_role_assignment(input).await?;
@@ -372,19 +372,6 @@ impl TaskService {
         .await?;
 
         let assignment = self.assign_role_assignment(input).await?;
-
-        let workflow = self.workflow_for_task(&task).await?;
-        let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
-            .reset_to_initial(
-                &task.id,
-                &initial_state,
-                task.version,
-                &workflow,
-                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
-                "coder reassigned",
-            )
-            .await?;
 
         let (effective_reset_workspace, effective_reset_worktree) = self
             .apply_reassignment_reset(&task, &active_execution, reset_workspace, reset_worktree)
@@ -436,7 +423,8 @@ impl TaskService {
             return Ok(());
         };
 
-        let is_coder_role = self.active_work_role(&task).await?.as_deref() == Some(role_name);
+        let is_coder_role = db::canonical_task_role_name(role_name).as_deref()
+            == self.active_work_role(&task).await?.as_deref();
         if !is_coder_role {
             TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
             self.publish_role_reassigned(
@@ -472,19 +460,6 @@ impl TaskService {
         .await?;
         TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
 
-        let workflow = self.workflow_for_task(&task).await?;
-        let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
-            .reset_to_initial(
-                &task.id,
-                &initial_state,
-                task.version,
-                &workflow,
-                &api_types::Actor::user(api_types::UserActionSource::Reassignment),
-                "coder reassigned",
-            )
-            .await?;
-
         let (effective_reset_workspace, effective_reset_worktree) = self
             .apply_reassignment_reset(&task, &active_execution, reset_workspace, reset_worktree)
             .await?;
@@ -509,19 +484,16 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        if workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .is_some_and(|state| state.kind == api_types::StateKind::Terminal)
-        {
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if matches!(
+            lifecycle.state,
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
+        ) {
             return Err(ServiceError::invalid_operation(format!(
-                "task {} is in terminal state {}; cannot reassign role",
-                task.id, task.status
+                "task {} is in terminal lifecycle {}; cannot reassign role",
+                task.id, lifecycle.state
             )));
         }
         Ok(task)
@@ -581,15 +553,6 @@ impl TaskService {
         Ok(())
     }
 
-    async fn workflow_for_task(&self, task: &Task) -> Result<api_types::WorkflowDefinition> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        Ok(WorkflowEngine::resolve_workflow(
-            &project.workflow_definition,
-        ))
-    }
-
     async fn enforce_mode_specific_role_guards(
         &self,
         task: &Task,
@@ -624,7 +587,7 @@ impl TaskService {
                 ));
             }
         }
-        if role_name != "coder" {
+        if db::canonical_task_role_name(role_name).as_deref() != Some("implementer") {
             return Ok(RoleGuardAction::Continue);
         }
 
@@ -634,16 +597,18 @@ impl TaskService {
             ));
         }
 
-        if TaskRepo::list_subtasks_ordered(&*self.db, &task.id)
-            .await?
-            .iter()
-            .any(|s| {
-                s.status != default_states::TODO
-                    && s.status != default_states::DONE
-                    && s.status != default_states::CANCELLED
-            })
-        {
-            return Err(ServiceError::task_sequence_already_started(task.id.clone()));
+        for subtask in TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await? {
+            let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &subtask.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", subtask.id.clone()))?;
+            if !matches!(
+                lifecycle.state,
+                db::TaskLifecycleState::Ready
+                    | db::TaskLifecycleState::Done
+                    | db::TaskLifecycleState::Cancelled
+            ) {
+                return Err(ServiceError::task_sequence_already_started(task.id.clone()));
+            }
         }
 
         Ok(RoleGuardAction::Continue)
@@ -663,21 +628,8 @@ impl TaskService {
     }
 
     async fn active_work_role(&self, task: &Task) -> Result<Option<String>> {
-        let workflow = self.workflow_for_task(task).await?;
-        Ok(workflow
-            .states
-            .iter()
-            .find(|state| state.name == default_states::IN_PROGRESS)
-            .and_then(crate::workflow::effective_role)
-            .map(str::to_owned)
-            .or_else(|| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.kind == api_types::StateKind::Active)
-                    .and_then(crate::workflow::effective_role)
-                    .map(str::to_owned)
-            }))
+        let _ = task;
+        Ok(Some("implementer".to_owned()))
     }
 
     async fn active_execution_for_role(
@@ -685,9 +637,6 @@ impl TaskService {
         task: &Task,
         role_name: &str,
     ) -> Result<Option<Execution>> {
-        if self.role_for_state(task, &task.status).await?.as_deref() != Some(role_name) {
-            return Ok(None);
-        }
         let page = ExecutionRepo::list_by_task(
             &*self.db,
             &task.id,
@@ -700,10 +649,11 @@ impl TaskService {
             },
         )
         .await?;
+        let requested_role = db::canonical_task_role_name(role_name);
         Ok(page.items.into_iter().find(|execution| {
             execution.work_unit_id.is_none()
                 && execution.status == ExecutionStatus::Running
-                && (execution.role == role_name || execution.role == "executor")
+                && db::canonical_task_role_name(&execution.role) == requested_role
         }))
     }
 
@@ -847,23 +797,6 @@ impl TaskService {
         Ok((false, false))
     }
 
-    fn workflow_engine(&self) -> WorkflowEngine {
-        WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
-            adapter_registry: self.adapter_registry.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        }
-    }
-
     fn publish_role_reassigned(
         &self,
         task_id: &str,
@@ -939,15 +872,6 @@ fn snapshot(assignment: &TaskRoleAssignment) -> RoleAssignmentSnapshot {
         assignee_type: assignment.assignee_type.as_ref().map(ToString::to_string),
         assignee_id: assignment.assignee_id.clone(),
     }
-}
-
-fn workflow_initial_state(workflow: &api_types::WorkflowDefinition) -> Result<String> {
-    workflow
-        .states
-        .iter()
-        .find(|state| state.kind == api_types::StateKind::Initial)
-        .map(|state| state.name.clone())
-        .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))
 }
 
 fn reassignment_repo_name(repo_url: &str) -> String {

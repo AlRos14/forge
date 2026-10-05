@@ -35,7 +35,6 @@ const EXCEPTION_RETRY_FAMILY: RecoveryAction[] = [
   'update_workspace_and_retry_hook',
   'reexecute',
   'resume_session',
-  'reset_retry_window',
   'skip_hook_once',
   'proceed_once',
 ]
@@ -46,7 +45,6 @@ const EXCEPTION_RETRY_PRIMARY_ORDER: RecoveryAction[] = [
   'reexecute',
   'resume_session',
   'update_workspace_and_retry_hook',
-  'reset_retry_window',
   'skip_hook_once',
   'proceed_once',
 ]

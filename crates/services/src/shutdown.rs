@@ -48,7 +48,11 @@ impl GracefulShutdown {
         sleep(transaction_drain_wait()).await;
 
         let rows = sqlx::query(
-            "SELECT id, project_id FROM task WHERE status = 'in_progress' AND deleted_at IS NULL",
+            "SELECT DISTINCT task.id, task.project_id
+             FROM task
+             JOIN execution ON execution.task_id = task.id AND execution.status = 'running'
+             WHERE task.deleted_at IS NULL
+             ORDER BY task.id",
         )
         .fetch_all(self.db.pool())
         .await?;

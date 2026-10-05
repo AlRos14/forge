@@ -517,10 +517,12 @@ impl TaskRepo for SqliteDb {
         entry_barrier_json: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if entry_barrier_json.is_some() {
+            return Err(DbError::InvalidTransition);
+        }
         let result = sqlx::query(
-            "UPDATE task SET entry_barrier_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
+            "UPDATE task SET entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
-        .bind(entry_barrier_json.as_deref())
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -578,9 +580,6 @@ impl TaskRepo for SqliteDb {
         if task.status != input.source_status {
             return Err(DbError::InvalidTransition);
         }
-        if task.entry_barrier_json.is_some() {
-            return Err(DbError::InvalidTransition);
-        }
         // Claim and its Running execution are one transaction. Re-check the
         // active baseline here, before mutating Task assignment/status; the
         // service's earlier read gate is only an optimization for avoiding
@@ -633,64 +632,122 @@ impl TaskRepo for SqliteDb {
         }
 
         if let Some(agent_id) = assignee_agent_id {
-            let active_count = if input.capacity_statuses.is_empty() {
-                0
-            } else {
-                let placeholders = vec!["?"; input.capacity_statuses.len()].join(", ");
-                let sql = format!(
-                    "SELECT
-                        (
-                            SELECT COUNT(DISTINCT task.id) FROM task
-                            WHERE (
-                                EXISTS (
-                                SELECT 1
-                                FROM task_role
-                                JOIN role_membership
-                                  ON role_membership.task_role_id = task_role.id
-                                WHERE task_role.task_id = task.id
-                                  AND role_membership.actor_kind = 'agent'
-                                  AND role_membership.actor_id = ?
-                                  AND role_membership.status = 'active'
-                                )
-                                OR (
-                                NOT EXISTS (SELECT 1 FROM task_role WHERE task_role.task_id = task.id)
-                                AND EXISTS (
-                                    SELECT 1 FROM task_role_assignment
-                                    WHERE task_role_assignment.task_id = task.id
-                                      AND task_role_assignment.assignee_type = 'agent'
-                                      AND task_role_assignment.assignee_id = ?
-                                )
-                                )
+            let active_count = sqlx::query_scalar::<_, i64>(
+                "SELECT
+                    (
+                        SELECT COUNT(DISTINCT task.id) FROM task
+                        JOIN task_lifecycle lifecycle ON lifecycle.task_id = task.id
+                        WHERE (
+                            EXISTS (
+                            SELECT 1
+                            FROM task_role
+                            JOIN role_membership
+                              ON role_membership.task_role_id = task_role.id
+                            WHERE task_role.task_id = task.id
+                              AND role_membership.actor_kind = 'agent'
+                              AND role_membership.actor_id = ?
+                              AND role_membership.status = 'active'
                             )
-                              AND task.id != ?
-                              AND task.deleted_at IS NULL
-                              AND task.status IN ({placeholders})
-                        ) +
-                        (
-                            SELECT COUNT(*) FROM agent_chat_turn_job
-                            WHERE responder_identity_id = ?
-                              AND status IN ('leased', 'running')
-                        )"
-                );
-                let mut query = sqlx::query_scalar::<_, i64>(&sql)
-                    .bind(agent_id)
-                    .bind(agent_id)
-                    .bind(&input.task_id);
-                for status in &input.capacity_statuses {
-                    query = query.bind(status);
-                }
-                query = query.bind(agent_id);
-                query.fetch_one(&mut **transaction).await?
-            };
+                            OR (
+                            NOT EXISTS (SELECT 1 FROM task_role WHERE task_role.task_id = task.id)
+                            AND EXISTS (
+                                SELECT 1 FROM task_role_assignment
+                                WHERE task_role_assignment.task_id = task.id
+                                  AND task_role_assignment.assignee_type = 'agent'
+                                  AND task_role_assignment.assignee_id = ?
+                            )
+                            )
+                        )
+                          AND task.id != ?
+                          AND task.deleted_at IS NULL
+                          AND lifecycle.state = 'active'
+                    ) +
+                    (
+                        SELECT COUNT(*) FROM agent_chat_turn_job
+                        WHERE responder_identity_id = ?
+                          AND status IN ('leased', 'running')
+                    )",
+            )
+            .bind(agent_id)
+            .bind(agent_id)
+            .bind(&input.task_id)
+            .bind(agent_id)
+            .fetch_one(&mut **transaction)
+            .await?;
             if active_count >= input.max_concurrent_tasks {
                 return Err(DbError::AgentAtCapacity);
             }
         }
 
+        let target_lifecycle = TaskLifecycleState::from_legacy_status(&input.target_status)
+            .ok_or(DbError::InvalidTransition)?;
+        if target_lifecycle != TaskLifecycleState::Active {
+            return Err(DbError::InvalidTransition);
+        }
+        let lifecycle_row = sqlx::query(
+            "SELECT task_id, state, version, reason_kind, reason_ref, created_at, updated_at
+             FROM task_lifecycle WHERE task_id = ?",
+        )
+        .bind(&input.task_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
+        if lifecycle.state != target_lifecycle {
+            let actor = input.execution.actor_ref.as_ref();
+            let event_key = format!("task-claim:{}:{}", input.task_id, input.execution.id);
+            let event = CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.lifecycle_changed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: input.task_id.clone(),
+                actor_type: actor
+                    .map(|actor| actor.kind().to_string())
+                    .unwrap_or_else(|| "system".to_owned()),
+                actor_id: actor.map(|actor| actor.id().to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: input.task_id.clone(),
+                correlation_id: event_key.clone(),
+                causation_id: Some(input.execution.id.clone()),
+                causation_depth: 1,
+                dedupe_key: Some(event_key.clone()),
+                payload_json: serde_json::json!({
+                    "task_id": input.task_id,
+                    "from_state": lifecycle.state,
+                    "to_state": target_lifecycle,
+                    "cause_kind": "execution",
+                    "cause_ref": input.execution.id,
+                })
+                .to_string(),
+                created_at: input.claimed_at.clone(),
+            };
+            super::gate_lifecycle::record_lifecycle_transition_in_tx(
+                self,
+                transaction,
+                &TransitionTaskLifecycle {
+                    id: new_uuid_v4(),
+                    task_id: input.task_id.clone(),
+                    expected_task_version: input.expected_version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_state: lifecycle.state,
+                    to_state: target_lifecycle,
+                    cause_kind: "execution".to_owned(),
+                    cause_ref: Some(input.execution.id.clone()),
+                    reason_kind: Some("task_claim".to_owned()),
+                    reason_ref: Some(input.execution.id.clone()),
+                    gate_evaluation_id: None,
+                    idempotency_key: event_key,
+                    updated_at: input.claimed_at.clone(),
+                    event,
+                },
+            )
+            .await?;
+        }
+
         let result = sqlx::query("UPDATE task SET assignee_type = ?, assignee_id = ?, status = ?, entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
             .bind(&input.assignee_type)
             .bind(input.assignee_id.as_deref())
-            .bind(&input.target_status)
+            .bind(target_lifecycle.legacy_projection())
             .bind(&input.claimed_at)
             .bind(&input.task_id)
             .bind(input.expected_version)
@@ -701,7 +758,7 @@ impl TaskRepo for SqliteDb {
         }
         task.assignee_type = Some(input.assignee_type);
         task.assignee_id = input.assignee_id;
-        task.status = input.target_status;
+        task.status = target_lifecycle.legacy_projection().to_owned();
         task.entry_barrier_json = None;
         task.version += 1;
         task.updated_at = input.claimed_at;
@@ -724,7 +781,21 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         let previous_status = task.status.clone();
-        let target_status = input.status.clone();
+        let target_state = TaskLifecycleState::from_legacy_status(&input.status)
+            .ok_or(DbError::InvalidTransition)?;
+        let target_status = target_state.legacy_projection().to_owned();
+        let lifecycle_row = sqlx::query(
+            "SELECT task_id, state, version, reason_kind, reason_ref, created_at, updated_at
+             FROM task_lifecycle WHERE task_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
+        if lifecycle.state != target_state {
+            return Err(DbError::InvalidTransition);
+        }
         task.status = target_status;
         // After V088 the task-level assignee is only the bounded projection of
         // the implementer TaskRole.  A status/recovery caller may still pass

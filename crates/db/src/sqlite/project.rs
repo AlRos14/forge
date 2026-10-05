@@ -415,7 +415,36 @@ impl ProjectRepo for SqliteDb {
                    (SELECT id FROM task WHERE project_id = ?))",
             "DELETE FROM orchestrator_wake WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM remote_pr_history WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM remote_pr_admission WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM legacy_pr_history WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM pr_metadata WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM pr_provider_config WHERE repo_id IN
+                 (SELECT id FROM repo WHERE project_id = ?)",
+            "DELETE FROM task_retry_override WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_failure_retry_receipt WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_integration_operation WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_lifecycle_transition WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM gate_evaluation_input WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM gate_evaluation WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM gate_policy_revision WHERE gate_id IN
+                 (SELECT g.id FROM gate g JOIN task t ON t.id = g.task_id
+                  WHERE t.project_id = ?)",
+            "DELETE FROM gate WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_lifecycle_migration_audit WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_lifecycle WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM message_work_unit WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",

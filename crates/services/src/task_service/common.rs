@@ -72,6 +72,7 @@ impl TaskService {
         Ok(())
     }
 
+    #[allow(dead_code)] // Legacy completion cascade writer retained until PR13 cleanup.
     pub(super) async fn create_agent_comment(
         &self,
         task_id: &str,

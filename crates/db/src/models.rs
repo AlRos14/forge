@@ -1,6 +1,6 @@
 use std::{fmt, str::FromStr};
 
-use crate::pagination::PageRequest;
+use crate::{pagination::PageRequest, CreateDomainEvent};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row};
 
@@ -230,7 +230,43 @@ pub struct PrMetadata {
     pub target_branch: String,
     pub pr_state: String,
     pub merge_status: String,
+    pub admission_status: String,
+    pub task_merge_operation_id: Option<String>,
+    pub publish_operation_id: Option<String>,
     pub last_synced_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Immutable provider, repository, branch, and commit identity captured when
+/// a remote TaskMerge is admitted. Mutable observation fields point at the
+/// exact provider result event currently attached to that admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrAdmission {
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub task_id: String,
+    pub provider_config_id: String,
+    pub provider_type: String,
+    pub provider_config_revision: String,
+    pub provider_config_digest: String,
+    pub provider_base_url: Option<String>,
+    pub token_secret_ref: Option<String>,
+    pub remote_repo_identity: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub admitted_source_sha: String,
+    pub state: String,
+    /// The outcome the provider reported, independent from Forge's integrity
+    /// classification of whether it affected the admitted subject.
+    pub provider_status: Option<String>,
+    pub result_classification: Option<String>,
+    pub reconciliation_reason: Option<String>,
+    pub provider_event_id: Option<String>,
+    pub observed_head_sha: Option<String>,
+    pub merged_commit_sha: Option<String>,
+    pub result_event_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -889,6 +925,10 @@ pub struct TaskIntegrationOperation {
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
     pub status: TaskIntegrationOperationStatus,
+    pub gate_evaluation_id: Option<String>,
+    pub remote_waiting: bool,
+    pub parent_operation_id: Option<String>,
+    pub result_event_id: Option<String>,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -3562,4 +3602,252 @@ pub struct CreateDecision {
 pub struct CollaborationWrite<T> {
     pub record: T,
     pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycleState {
+    Backlog,
+    Ready,
+    Active,
+    Blocked,
+    ReadyToMerge,
+    Merging,
+    Done,
+    Cancelled,
+}
+
+enum_strings!(TaskLifecycleState {
+    Backlog => "backlog",
+    Ready => "ready",
+    Active => "active",
+    Blocked => "blocked",
+    ReadyToMerge => "ready_to_merge",
+    Merging => "merging",
+    Done => "done",
+    Cancelled => "cancelled",
+});
+
+impl TaskLifecycleState {
+    pub fn from_legacy_status(status: &str) -> Option<Self> {
+        match status {
+            "backlog" => Some(Self::Backlog),
+            "todo" => Some(Self::Ready),
+            "planning" | "in_progress" => Some(Self::Active),
+            "review" => Some(Self::Blocked),
+            "blocked" | "merge_failed" => Some(Self::Blocked),
+            "ready_to_merge" => Some(Self::ReadyToMerge),
+            "merging" => Some(Self::Merging),
+            "done" => Some(Self::Done),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn legacy_projection(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Ready => "todo",
+            Self::Active | Self::ReadyToMerge | Self::Merging => "in_progress",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLifecycle {
+    pub task_id: String,
+    pub state: TaskLifecycleState,
+    pub version: i64,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLifecycleMigrationAudit {
+    pub task_id: String,
+    pub legacy_state: String,
+    pub mapped_state: TaskLifecycleState,
+    pub mapping_status: String,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub task_state_config: Option<String>,
+    pub workflow_definition: String,
+    pub details_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateScopeKind {
+    Task,
+    WorkUnit,
+    MergeOperation,
+    LifecycleOperation,
+}
+
+enum_strings!(GateScopeKind {
+    Task => "task",
+    WorkUnit => "work_unit",
+    MergeOperation => "merge_operation",
+    LifecycleOperation => "lifecycle_operation",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateEvaluationOutcome {
+    Satisfied,
+    Unsatisfied,
+    Indeterminate,
+}
+
+enum_strings!(GateEvaluationOutcome {
+    Satisfied => "satisfied",
+    Unsatisfied => "unsatisfied",
+    Indeterminate => "indeterminate",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gate {
+    pub id: String,
+    pub task_id: String,
+    pub gate_kind: String,
+    pub scope_kind: GateScopeKind,
+    pub scope_id: String,
+    pub active_policy_revision: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatePolicyRevision {
+    pub gate_id: String,
+    pub revision: i64,
+    pub schema_version: i64,
+    pub policy_json: String,
+    pub policy_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateEvaluation {
+    pub id: String,
+    pub gate_id: String,
+    pub task_id: String,
+    pub policy_revision: i64,
+    pub outcome: GateEvaluationOutcome,
+    pub input_digest: String,
+    pub result_json: String,
+    pub evaluated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateEvaluationInput {
+    pub evaluation_id: String,
+    pub ordinal: i64,
+    pub input_kind: String,
+    pub input_id: String,
+    pub input_version: i64,
+    pub input_digest: String,
+    pub producer_ref: Option<String>,
+    pub subject_json: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateGate {
+    pub id: String,
+    pub task_id: String,
+    pub gate_kind: String,
+    pub scope_kind: GateScopeKind,
+    pub scope_id: String,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateGatePolicyRevision {
+    pub gate_id: String,
+    pub expected_active_revision: Option<i64>,
+    pub revision: i64,
+    pub schema_version: i64,
+    pub policy_json: String,
+    pub policy_digest: String,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreGateEvaluation {
+    pub evaluation: GateEvaluation,
+    pub inputs: Vec<GateEvaluationInput>,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateEvaluationWrite {
+    pub evaluation: GateEvaluation,
+    pub inputs: Vec<GateEvaluationInput>,
+    /// `None` means an identical evaluation already existed.
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionTaskLifecycle {
+    pub id: String,
+    pub task_id: String,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_version: i64,
+    pub expected_state: TaskLifecycleState,
+    pub to_state: TaskLifecycleState,
+    pub cause_kind: String,
+    pub cause_ref: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub gate_evaluation_id: Option<String>,
+    pub idempotency_key: String,
+    pub updated_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLifecycleTransitionIdentity {
+    pub task_id: String,
+    pub idempotency_key: String,
+    pub expected_task_version: i64,
+    pub to_state: TaskLifecycleState,
+    pub cause_kind: String,
+    pub cause_ref: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub gate_evaluation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLifecycleTransitionFact {
+    pub id: String,
+    pub task_id: String,
+    pub from_state: TaskLifecycleState,
+    pub to_state: TaskLifecycleState,
+    pub from_version: i64,
+    pub to_version: i64,
+    pub cause_kind: String,
+    pub cause_ref: Option<String>,
+    pub gate_evaluation_id: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub domain_event_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLifecycleTransitionWrite {
+    pub lifecycle: TaskLifecycle,
+    pub transition_id: String,
+    pub gate_evaluation_id: Option<String>,
+    pub replayed: bool,
+    pub event: Option<DomainEvent>,
 }

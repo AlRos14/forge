@@ -85,13 +85,19 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
         task_id: task_id.clone(),
         kind: TaskIntegrationOperationKind::WorkUnitIntegration,
         owner_id: "integration-attempt-a".to_owned(),
+        gate_evaluation_id: None,
+        remote_waiting: false,
+        parent_operation_id: None,
         created_at: db::now_rfc3339(),
     };
     let second_claim = CreateTaskIntegrationOperation {
         id: db::new_uuid_v4(),
         task_id: task_id.clone(),
-        kind: TaskIntegrationOperationKind::TaskMerge,
+        kind: TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
         owner_id: "merge-attempt-b".to_owned(),
+        gate_evaluation_id: None,
+        remote_waiting: false,
+        parent_operation_id: None,
         created_at: db::now_rfc3339(),
     };
     let (first, second) = tokio::join!(
@@ -113,6 +119,173 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
         .expect("active operation query")
         .expect("one durable active claim");
     assert_eq!(active.status, TaskIntegrationOperationStatus::Running);
+}
+
+#[tokio::test]
+async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambiguity() {
+    let base_dir = unique_temp_path("pr9-v099-migrations");
+    let final_dir = unique_temp_path("pr9-v100-migrations");
+    fs::create_dir_all(&base_dir).expect("base migration dir");
+    fs::create_dir_all(&final_dir).expect("final migration dir");
+    copy_migrations_up_to(99, &base_dir);
+    copy_migrations_up_to(100, &final_dir);
+
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    run_migrations_from(&pool, &base_dir)
+        .await
+        .expect("V099 baseline");
+    let db = SqliteDb::new(pool.clone());
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "PR9 lifecycle migration".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+
+    let expected = [
+        ("backlog", "backlog", "mapped"),
+        ("todo", "ready", "mapped"),
+        ("ready", "ready", "mapped"),
+        ("planning", "active", "mapped"),
+        ("in_progress", "active", "mapped"),
+        ("working", "active", "mapped"),
+        ("review", "blocked", "ambiguous_review"),
+        ("merge_failed", "blocked", "merge_failed"),
+        ("merging", "blocked", "ambiguous_merge"),
+        ("custom_state", "blocked", "unknown_custom_state"),
+        ("done", "done", "mapped"),
+        ("cancelled", "cancelled", "mapped"),
+    ];
+    let mut task_ids = Vec::new();
+    for (legacy_state, _, _) in expected {
+        let task_id = db::new_uuid_v4();
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: format!("legacy {legacy_state}"),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: legacy_state.to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: Some("{\"legacy\":true}".to_owned()),
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy Task");
+        task_ids.push((task_id, legacy_state));
+    }
+    let review_task_id = task_ids
+        .iter()
+        .find(|(_, status)| *status == "review")
+        .expect("review migration fixture exists");
+    sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+        .bind("{\"status\":\"running\",\"state\":\"review\"}")
+        .bind(&review_task_id.0)
+        .execute(&pool)
+        .await
+        .expect("legacy entry barrier setup");
+    let blocked_active_id = db::new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: blocked_active_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: None,
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "active Task with legacy block metadata".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("active blocked Task");
+    sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+        .bind("{\"type\":\"manual_stop\"}")
+        .bind(&blocked_active_id)
+        .execute(&pool)
+        .await
+        .expect("legacy active blocker setup");
+
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("V100 migration");
+    for ((task_id, _), (_, mapped, status)) in task_ids.iter().zip(expected) {
+        let actual: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT l.state, a.mapping_status, t.entry_barrier_json
+             FROM task_lifecycle l
+             JOIN task_lifecycle_migration_audit a ON a.task_id = l.task_id
+             JOIN task t ON t.id = l.task_id
+             WHERE l.task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("mapped lifecycle lookup");
+        assert_eq!(actual, (mapped.to_owned(), status.to_owned(), None));
+    }
+    let audit_details: String = sqlx::query_scalar(
+        "SELECT details_json FROM task_lifecycle_migration_audit WHERE task_id = ?",
+    )
+    .bind(&review_task_id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy uncertainty audit");
+    assert!(audit_details.contains("legacy_entry_barrier_json"));
+    assert!(audit_details.contains("running"));
+    let blocked_mapping: (String, String, String, String) = sqlx::query_as(
+        "SELECT l.state, a.mapping_status, a.reason_kind, a.reason_ref
+         FROM task_lifecycle l
+         JOIN task_lifecycle_migration_audit a ON a.task_id = l.task_id
+         WHERE l.task_id = ?",
+    )
+    .bind(&blocked_active_id)
+    .fetch_one(&pool)
+    .await
+    .expect("active legacy blocker maps fail closed");
+    assert_eq!(
+        blocked_mapping,
+        (
+            "blocked".to_owned(),
+            "legacy_active_block_metadata".to_owned(),
+            "legacy_blocked_task_metadata".to_owned(),
+            blocked_active_id,
+        )
+    );
+
+    let _ = fs::remove_dir_all(base_dir);
+    let _ = fs::remove_dir_all(final_dir);
 }
 
 #[tokio::test]
@@ -1336,6 +1509,428 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
 
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(migration_dir);
+}
+
+#[tokio::test]
+async fn v114_preserves_legacy_pr_outcomes_without_granting_admission_authority() {
+    let base_dir = unique_temp_path("pr9-v108-migrations");
+    let final_dir = unique_temp_path("pr9-v114-migrations");
+    fs::create_dir_all(&base_dir).expect("base migration dir");
+    fs::create_dir_all(&final_dir).expect("final migration dir");
+    copy_migrations_up_to(108, &base_dir);
+    copy_migrations_up_to(114, &final_dir);
+
+    let db_path = unique_temp_path("pr9-v109-existing-pr").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &base_dir)
+        .await
+        .expect("V108 baseline");
+    let db = SqliteDb::new(pool.clone());
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    let repo_id = db::new_uuid_v4();
+    let task_ids = [
+        db::new_uuid_v4(),
+        db::new_uuid_v4(),
+        db::new_uuid_v4(),
+        db::new_uuid_v4(),
+    ];
+    db::ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Existing PR migration".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+    db::RepoRepo::create(
+        &db,
+        db::CreateRepo {
+            id: repo_id.clone(),
+            project_id,
+            name: "existing-pr-repo".to_owned(),
+            remote_url: "https://example.invalid/existing-pr.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::PullRequest,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Repo");
+    let repo_project_id: String = sqlx::query_scalar("SELECT project_id FROM repo WHERE id = ?")
+        .bind(&repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("repo project id");
+    let cases = [
+        ("merged", "merged"),
+        ("closed", "closed_without_merge"),
+        ("open", "pending"),
+        // V109 replaces this old status with the legacy marker, and V113's
+        // generic fallback loses it. V114 restores only this recognized
+        // terminal provider state from pr_state.
+        ("failed", "publication_failed"),
+    ];
+    let mut metadata_ids = Vec::new();
+    for (index, (pr_state, merge_status)) in cases.into_iter().enumerate() {
+        let task_id = &task_ids[index];
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: repo_project_id.clone(),
+                repo_id: Some(repo_id.clone()),
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: format!("Task with historical {pr_state} PR"),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: "todo".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task");
+        let metadata_id = db::new_uuid_v4();
+        let provider_pr_id = format!("old-provider-pr-{index}");
+        let pr_url = format!("https://example.invalid/pr/{index}");
+        sqlx::query(
+            "INSERT INTO pr_metadata (
+                id, task_id, provider_type, provider_pr_id, pr_url,
+                source_branch, target_branch, pr_state, merge_status,
+                last_synced_at, created_at, updated_at
+             ) VALUES (?, ?, 'github', ?, ?, 'task/existing', 'main', ?, ?, NULL, ?, ?)",
+        )
+        .bind(&metadata_id)
+        .bind(task_id)
+        .bind(&provider_pr_id)
+        .bind(&pr_url)
+        .bind(pr_state)
+        .bind(merge_status)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("pre-V109 provider PR metadata");
+        metadata_ids.push((metadata_id, pr_state, merge_status, provider_pr_id, pr_url));
+    }
+
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("upgrade from V108 through V114");
+    for (metadata_id, pr_state, merge_status, provider_pr_id, pr_url) in metadata_ids {
+        let legacy: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT merge_status, admission_status, task_merge_operation_id,
+                                   publish_operation_id, provider_pr_id, pr_url
+                            FROM pr_metadata WHERE id = ?",
+        )
+        .bind(&metadata_id)
+        .fetch_one(&pool)
+        .await
+        .expect("existing PR remains queryable");
+        let expected_merge_status = match pr_state {
+            "merged" => "merged",
+            "closed" => "closed_without_merge",
+            "failed" => "publication_failed",
+            _ => "pending",
+        };
+        assert_eq!(
+            legacy.0, expected_merge_status,
+            "{pr_state} outcome retained"
+        );
+        assert_eq!(legacy.1, "legacy_unadmitted");
+        assert_eq!(legacy.2, None);
+        assert_eq!(legacy.3, None);
+        assert_eq!(legacy.4, provider_pr_id);
+        assert_eq!(legacy.5, pr_url);
+        assert_eq!(merge_status, expected_merge_status);
+    }
+    let retroactive_admissions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_admission")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy PRs do not gain remote admission rows");
+    assert_eq!(retroactive_admissions, 0);
+
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(base_dir);
+    let _ = fs::remove_dir_all(final_dir);
+}
+
+#[tokio::test]
+async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
+    let v108_dir = unique_temp_path("pr9-v110-crash-v108");
+    let v110_dir = unique_temp_path("pr9-v110-crash-v110");
+    let v114_dir = unique_temp_path("pr9-v110-crash-v114");
+    fs::create_dir_all(&v108_dir).expect("V108 migration dir");
+    fs::create_dir_all(&v110_dir).expect("V110 migration dir");
+    fs::create_dir_all(&v114_dir).expect("V114 migration dir");
+    copy_migrations_up_to(108, &v108_dir);
+    copy_migrations_up_to(110, &v110_dir);
+    copy_migrations_up_to(114, &v114_dir);
+
+    let db_path = unique_temp_path("pr9-v110-crash-window").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("file-backed pool");
+    run_migrations_from(&pool, &v108_dir)
+        .await
+        .expect("V108 baseline");
+    let db = SqliteDb::new(pool.clone());
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    let repo_id = db::new_uuid_v4();
+    let task_id = db::new_uuid_v4();
+    let metadata_id = db::new_uuid_v4();
+    let merge_id = db::new_uuid_v4();
+    let publish_id = db::new_uuid_v4();
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "V110 terminal PR recovery".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
+    db::RepoRepo::create(
+        &db,
+        db::CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "v110-pr-repo".to_owned(),
+            remote_url: "https://example.invalid/v110-pr.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::PullRequest,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("PullRequest Repo");
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: Some(repo_id),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "V110 PR merge".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Task");
+    sqlx::query(
+        "INSERT INTO pr_metadata (
+            id, task_id, provider_type, provider_pr_id, pr_url, source_branch,
+            target_branch, pr_state, merge_status, last_synced_at, created_at,
+            updated_at
+         ) VALUES (?, ?, 'github', 'existing-v110-pr',
+                   'https://example.invalid/pr/v110', 'task/v110', 'main',
+                   'open', 'pending', NULL, ?, ?)",
+    )
+    .bind(&metadata_id)
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("pre-V109 PR metadata");
+
+    run_migrations_from(&pool, &v110_dir)
+        .await
+        .expect("upgrade through V110");
+
+    // Model the V110 crash window after its exact provider event and terminal
+    // operation write, before the separate PR metadata update ran. Drop only
+    // the product write guards while constructing this already-committed old
+    // state; V113 then has to trust the stored exact operation/event links.
+    let trigger_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'trigger'
+           AND tbl_name IN ('task_integration_operation', 'pr_metadata')",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("legacy PR write guards");
+    for trigger_name in trigger_names {
+        if trigger_name == "task_integration_operation_provider_result_guard" {
+            continue;
+        }
+        let escaped = trigger_name.replace('"', "\"\"");
+        sqlx::query(&format!("DROP TRIGGER \"{escaped}\""))
+            .execute(&pool)
+            .await
+            .expect("drop guard for historical crash fixture");
+    }
+    let status_event = DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "pr.status_changed".to_owned(),
+            entity_type: "pr_metadata".to_owned(),
+            entity_id: metadata_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: metadata_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("v110-exact-merged-result".to_owned()),
+            payload_json: serde_json::json!({
+                "task_id": task_id,
+                "pr_metadata_id": metadata_id,
+                "status": "merged",
+                "task_merge_operation_id": merge_id,
+                "publish_operation_id": publish_id,
+            })
+            .to_string(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("exact historical provider result event");
+    sqlx::query(
+        "INSERT INTO task_integration_operation (
+            id, task_id, kind, owner_id, status, version, created_at,
+            updated_at, finished_at, gate_evaluation_id, remote_waiting,
+            parent_operation_id, result_event_id
+         ) VALUES (?, ?, 'task_merge', 'v110-fixture', 'succeeded', 2, ?, ?, ?,
+                   NULL, 1, NULL, ?)",
+    )
+    .bind(&merge_id)
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&status_event.id)
+    .execute(&pool)
+    .await
+    .expect("terminal V110 TaskMerge");
+    sqlx::query(
+        "INSERT INTO task_integration_operation (
+            id, task_id, kind, owner_id, status, version, created_at,
+            updated_at, finished_at, gate_evaluation_id, remote_waiting,
+            parent_operation_id, result_event_id
+         ) VALUES (?, ?, 'publish_pr', 'v110-fixture', 'succeeded', 2, ?, ?, ?,
+                   NULL, 0, ?, NULL)",
+    )
+    .bind(&publish_id)
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&merge_id)
+    .execute(&pool)
+    .await
+    .expect("terminal V110 PublishPr");
+    sqlx::query(
+        "UPDATE pr_metadata
+         SET task_merge_operation_id = ?, publish_operation_id = ?
+         WHERE id = ?",
+    )
+    .bind(&merge_id)
+    .bind(&publish_id)
+    .bind(&metadata_id)
+    .execute(&pool)
+    .await
+    .expect("exact old operation links");
+    let before: (String, String) = sqlx::query_as(
+        "SELECT merge_op.status, metadata.merge_status
+         FROM pr_metadata metadata
+         JOIN task_integration_operation merge_op
+           ON merge_op.id = metadata.task_merge_operation_id
+         WHERE metadata.id = ?",
+    )
+    .bind(&metadata_id)
+    .fetch_one(&pool)
+    .await
+    .expect("V110 crash-window state");
+    assert_eq!(
+        before,
+        ("succeeded".to_owned(), "legacy_unadmitted".to_owned())
+    );
+
+    run_migrations_from(&pool, &v114_dir)
+        .await
+        .expect("upgrade exact V110 crash window through V114");
+    let after: (String, String, String, String) = sqlx::query_as(
+        "SELECT merge_op.status, metadata.merge_status, metadata.pr_state,
+                metadata.admission_status
+         FROM pr_metadata metadata
+         JOIN task_integration_operation merge_op
+           ON merge_op.id = metadata.task_merge_operation_id
+         WHERE metadata.id = ?",
+    )
+    .bind(&metadata_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy terminal result stays queryable");
+    assert_eq!(
+        after,
+        (
+            "succeeded".to_owned(),
+            "merged".to_owned(),
+            "merged".to_owned(),
+            "legacy_unadmitted".to_owned(),
+        )
+    );
+    let remote_admissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_admission")
+        .fetch_one(&pool)
+        .await
+        .expect("no retrospective remote admission");
+    assert_eq!(remote_admissions, 0);
+
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(v108_dir);
+    let _ = fs::remove_dir_all(v110_dir);
+    let _ = fs::remove_dir_all(v114_dir);
 }
 
 fn copy_migrations_up_to(max_version: i64, destination: &Path) {

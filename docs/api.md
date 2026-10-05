@@ -143,20 +143,30 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/start` | Start task work (claims an available agent and dispatches the first active state) |
 | POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
 | POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
-| POST   | `/api/v1/tasks/{id}/submit` | Fire the current active state's `accept` trigger |
-| POST   | `/api/v1/tasks/{id}/request-changes` | Request changes on supported workflow gates; task-level Review decisions use an exact Review Execution |
-| POST   | `/api/v1/tasks/{id}/approve` | Approve supported workflow gates; task-level Review decisions use an exact Review Execution |
+| POST   | `/api/v1/tasks/{id}/submit` | Retired workflow action; returns `409` |
+| POST   | `/api/v1/tasks/{id}/request-changes` | Retired workflow action; returns `409` |
+| POST   | `/api/v1/tasks/{id}/approve` | Retired workflow action; returns `409` |
 | POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
+| POST   | `/api/v1/tasks/{id}/advance` | Retired workflow override; returns `409` because lifecycle changes require aggregate authority |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
-| POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns the Task projection without a legacy Review authority |
+| POST   | `/api/v1/tasks/{id}/transition` | Compatibility input mapped to aggregate lifecycle; no workflow hooks execute |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
-| POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
+| POST   | `/api/v1/tasks/{id}/recover` | Apply a supported recovery action to a blocked/failed task |
 | POST   | `/api/v1/tasks/{id}/review` | Start a Human reviewer Execution for the assigned Human reviewer |
 | GET    | `/api/v1/tasks/{id}/reviews` | List reviewer Executions and their exact ReviewReport Artifacts (display projection) |
 | GET    | `/api/v1/reviews/{execution_id}` | Read one exact reviewer Execution and its ReviewReport Artifact |
 | POST   | `/api/v1/reviews/{execution_id}` | Submit a structured Human ReviewReport to that exact Human reviewer Execution |
-| POST   | `/api/v1/tasks/{id}/gates/review/approve` | Compatibility adapter: submit PASS to the caller's one running Human reviewer Execution when Task version matches |
-| POST   | `/api/v1/tasks/{id}/gates/review/reject` | Compatibility adapter: submit request-changes to the caller's one running Human reviewer Execution when Task version matches |
+| POST   | `/api/v1/tasks/{id}/gates/review/approve` | Retired compatibility path; returns `409` and cannot author Gate state |
+| POST   | `/api/v1/tasks/{id}/gates/review/reject` | Retired compatibility path; returns `409` and cannot author Gate state |
+| POST   | `/api/v1/tasks/{id}/gates/{state_name}/approve` | Retired legacy workflow Gate; returns `409` and cannot advance lifecycle |
+| POST   | `/api/v1/tasks/{id}/gates/{state_name}/reject` | Retired legacy workflow Gate; returns `409` and cannot advance lifecycle |
+| POST   | `/api/v1/tasks/{id}/gates` | Create a Task-scoped Gate with its immutable initial policy revision |
+| GET    | `/api/v1/gates/{id}` | Read the Gate and its active policy revision |
+| PUT    | `/api/v1/gates/{id}/policy` | Append an immutable policy revision using active-revision fencing |
+| POST   | `/api/v1/gates/{id}/evaluate` | Evaluate the exact active revision and return its immutable input set |
+| GET    | `/api/v1/gate-evaluations/{id}` | Read one exact GateEvaluation and its frozen inputs |
+| POST   | `/api/v1/tasks/{id}/merge` | Admit merge using the exact satisfied merge-readiness GateEvaluation ID |
+| GET    | `/api/v1/tasks/{id}/lifecycle` | Read the aggregate Task lifecycle state and version |
 | GET    | `/api/v1/tasks/{id}/validations` | List exact ValidationRuns for a Task |
 | GET    | `/api/v1/validations/{id}` | Read one exact ValidationRun, its Evidence IDs, and optional validation-report Artifact ID |
 | GET    | `/api/v1/evidence/{id}` | Read exact deterministic Evidence and its producing ValidationRun ID |
@@ -272,10 +282,21 @@ the output authority. Human reports are submitted to one exact Human reviewer
 Execution. The older `/api/v1/tasks/{id}/review/{approve,reject}` URLs remain
 retired and return `409`; clients should submit reports to
 `/api/v1/reviews/{execution_id}`. The generic
-`/api/v1/tasks/{id}/gates/review/{approve,reject}` URLs remain as a bounded
-adapter: they require one running Human reviewer Execution for the caller and
-the matching Task version, then produce a ReviewReport on that exact Execution.
-They never write a legacy Review row.
+`/api/v1/tasks/{id}/gates/review/{approve,reject}` URLs are also retired and
+return `409`; they cannot author a Gate result or write a legacy Review row.
+
+Task-scoped Gates can be created at `POST /api/v1/tasks/{id}/gates` with a
+versioned policy document. `PUT /api/v1/gates/{id}/policy` appends an immutable
+revision and requires the expected active revision. `POST
+/api/v1/gates/{id}/evaluate` returns one immutable evaluation with its frozen
+input IDs, versions, digests, producers, and subjects; durable fact events also
+reevaluate affected active policies. `GET /api/v1/gate-evaluations/{id}` reads
+that exact record after a lost response. Merge admission requires its exact ID
+at `POST /api/v1/tasks/{id}/merge`, and the service verifies the current
+satisfied Task-scoped merge-readiness policy before entering the existing
+serialized TaskIntegrationOperation flow. `GET /api/v1/tasks/{id}/lifecycle`
+exposes the aggregate state while the older Task response status remains a
+compatibility projection until PR12.
 
 Deterministic checks are separate ValidationRuns. Each response exposes the
 exact Task, check/command identity, Workspace, commit and working-tree snapshot,
@@ -935,14 +956,20 @@ Both fields are optional. Successful responses are the normal `TaskResponse`.
 An omitted body, an empty or whitespace-only payload, and JSON `null` all use
 the request defaults, including when the client sends
 `Content-Type: application/json` with no bytes.
-The action service resolves the project's workflow at request time, so clients
-do not need to encode concrete state names. `start` claims an available agent
-when needed and enters the first claimable active/gate state; `submit` follows
-the active state's `accept` trigger; `approve` and `request-changes` use the
-latest awaiting-human review when present and otherwise use gate capabilities.
-`pause` stops the running execution without a state transition and records a
-manual-stop annotation plus an audit comment. `resume` uses the existing
-session-follow-up/recovery primitives and falls back to a fresh dispatch.
+Task actions use aggregate lifecycle and exact Execution records. `start` is
+available from `ready`, claims the Task as `active`, and starts the exact
+admitted Execution. `pause` stops the running Execution without a lifecycle
+transition. `resume` uses the existing exact session-follow-up/recovery
+primitives and falls back to a fresh Execution. `cancel` records aggregate
+`cancelled`. `submit`, `approve`, and `request-changes` cannot set Gate results
+or advance lifecycle and return `409` while their legacy workflow actions are
+retired. The `RecoveryAction` wire value `reset_retry_window` has been removed;
+older clients receive HTTP `422` during request decoding. A Task blocked by retry
+exhaustion can be reopened only by an exact same-Task Proposal and approved
+Decision for that exhaustion receipt. `remaining_retries` remains an empty
+compatibility projection. PR9's durable failure-budget consumer records exact
+failure receipts; legacy workflow retries do not authorize Task lifecycle or
+Gate results.
 
 When an action is not available, the endpoint returns `409` with
 `code: "task_action.unavailable"` and structured `details`:
@@ -954,7 +981,13 @@ When an action is not available, the endpoint returns `409` with
 }
 ```
 
-The raw `/transition` endpoint remains available for advanced workflow clients.
+The raw `/transition` endpoint remains as a bounded compatibility adapter. It
+maps `backlog`, `todo`, `in_progress`, `review`, `blocked`, `done`, and
+`cancelled` to aggregate lifecycle meanings; `planning` maps to `active`, and
+`review` maps conservatively to `blocked`. `ready_to_merge`, `merging`, and
+`done` require their exact GateEvaluation or successful TaskMerge evidence.
+The endpoint does not run hooks. New clients should use the aggregate Task
+response and lifecycle operations delivered in PR12.
 
 ## Task board snapshots and moves
 

@@ -516,6 +516,9 @@ async fn active_task_operation_blocks_work_unit_cleanup_claim() {
             task_id: fixture.task_id.clone(),
             kind: db::TaskIntegrationOperationKind::WorkUnitWorkspacePrepare,
             owner_id: fixture.work_unit_id.clone(),
+            gate_evaluation_id: None,
+            remote_waiting: false,
+            parent_operation_id: None,
             created_at: now_rfc3339(),
         },
     )
@@ -538,6 +541,7 @@ async fn active_task_operation_blocks_work_unit_cleanup_claim() {
             id: operation.id,
             expected_version: operation.version,
             status: db::TaskIntegrationOperationStatus::Failed,
+            result_event_id: None,
             updated_at: now_rfc3339(),
             finished_at: now_rfc3339(),
         },
@@ -1692,8 +1696,11 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         db::CreateTaskIntegrationOperation {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
-            kind: db::TaskIntegrationOperationKind::TaskMerge,
+            kind: db::TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
             owner_id: "project-teardown-guard".into(),
+            gate_evaluation_id: None,
+            remote_waiting: false,
+            parent_operation_id: None,
             created_at: now_rfc3339(),
         },
     )
@@ -1707,6 +1714,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             id: active_operation.id,
             expected_version: active_operation.version,
             status: db::TaskIntegrationOperationStatus::Abandoned,
+            result_event_id: None,
             updated_at: finished_at.clone(),
             finished_at,
         },

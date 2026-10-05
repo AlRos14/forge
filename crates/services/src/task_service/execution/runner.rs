@@ -1456,10 +1456,7 @@ impl TaskService {
             .task_state_config
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| {
-                max_turns_from_value(&value)
-                    .or_else(|| value.get(&task.status).and_then(max_turns_from_value))
-            })
+            .and_then(|value| max_turns_from_value(&value))
         {
             return Ok(Some(value));
         }
@@ -1467,20 +1464,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Executor),
-        );
-        if let Some(value) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(|state| max_turns_from_value(&state.config))
-        {
-            return Ok(Some(value));
-        }
-
         Ok(serde_json::from_str::<Value>(&project.settings)
             .ok()
             .and_then(|value| max_turns_from_value(&value)))

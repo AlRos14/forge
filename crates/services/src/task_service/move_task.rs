@@ -1,17 +1,12 @@
 use super::*;
-use crate::{
-    workflow::engine::{BoardMoveOutcome, BoardMoveRequest},
-    DomainEventService,
-};
+use crate::DomainEventService;
 use api_types::{Actor, MoveTaskRequest, TaskMovedEventPayload, UserActionSource};
 use db::{
     CompareAndMoveTask, MoveTaskIdentity, MoveTaskPersistence, MoveTaskResult, TaskBoardRepo,
 };
 use events::TASK_MOVED_EVENT;
 
-use super::transition::{
-    clear_manual_review_awaiting_metadata, should_clear_transient_error_annotation,
-};
+use super::transition::should_clear_transient_error_annotation;
 
 impl TaskService {
     pub async fn move_task(
@@ -52,6 +47,23 @@ impl TaskService {
         let source_task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let target_lifecycle =
+            db::TaskLifecycleState::from_legacy_status(&request.target_status)
+                .ok_or_else(|| ServiceError::invalid_operation("unknown Task lifecycle state"))?;
+        if matches!(
+            target_lifecycle,
+            db::TaskLifecycleState::ReadyToMerge
+                | db::TaskLifecycleState::Merging
+                | db::TaskLifecycleState::Done
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "board moves cannot satisfy a Gate or authorize merge completion",
+            ));
+        }
+        let target_status = target_lifecycle.legacy_projection().to_owned();
+        let target_column_statuses = vec![target_status.clone()];
+        let mut request = request;
+        request.target_status = target_status.clone();
         let identity = MoveTaskIdentity {
             project_id: source_task.project_id.clone(),
             task_id: task_id.clone(),
@@ -83,46 +95,11 @@ impl TaskService {
             }
             .into());
         }
-
-        let project = ProjectRepo::get_by_id(&*self.db, &source_task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", source_task.project_id.clone()))?;
-        let actor = Actor::user(UserActionSource::BoardDrag);
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &source_task,
-            &project.workflow_definition,
-            &actor,
-        );
-        let target_state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == request.target_status)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
-                    &request.target_status,
-                    &workflow,
-                ))
-            })?;
-        let target_column_statuses = workflow
-            .states
-            .iter()
-            .filter(|state| state.column == target_state.column)
-            .map(|state| state.name.clone())
-            .collect::<Vec<_>>();
-
-        if source_task.status == request.target_status {
+        if source_task.status == target_status {
             return self
                 .reorder_within_column(source_task, request, target_column_statuses)
                 .await;
         }
-
-        self.cancel_active_execution_for_user_transition(
-            &source_task,
-            &request.target_status,
-            &workflow,
-            &actor,
-        )
-        .await?;
 
         let previous_status = source_task.status.clone();
         let was_blocked = source_task.blocked_json.is_some();
@@ -136,69 +113,70 @@ impl TaskService {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
-            adapter_registry: self.adapter_registry.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
-        let engine_result = engine
-            .move_task(
-                &task_id,
-                &request.target_status,
-                request.task_version,
-                &workflow,
-                &actor,
-                "board drag",
-                BoardMoveRequest {
-                    operation_id: request.operation_id.clone(),
-                    project_id: source_task.project_id.clone(),
-                    board_revision: request.board_revision,
-                    target_column_statuses,
-                    before_id: request.before_id.clone(),
-                    after_id: request.after_id.clone(),
-                },
-            )
-            .await?;
-        let direct_result = match engine_result.board_move {
-            Some(BoardMoveOutcome::Replayed(result)) => return Ok(result),
-            Some(BoardMoveOutcome::Committed(result)) => result,
-            None => {
-                return Err(ServiceError::invalid_operation(
-                    "workflow move did not return a board persistence result",
-                ));
+        let persistence = TaskBoardRepo::compare_and_move_task(
+            &*self.db,
+            CompareAndMoveTask {
+                operation_id: request.operation_id.clone(),
+                project_id: source_task.project_id.clone(),
+                task_id: source_task.id.clone(),
+                task_version: request.task_version,
+                board_revision: request.board_revision,
+                target_status,
+                target_column_statuses,
+                before_id: request.before_id.clone(),
+                after_id: request.after_id.clone(),
+                entry_barrier_json: None,
+                transition_log_id: new_uuid_v4(),
+                trigger_name: None,
+                triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
+                trigger_reason: "board move".to_owned(),
+                rejection: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        let mut result = match persistence {
+            MoveTaskPersistence::Replayed(result) => return Ok(*result),
+            MoveTaskPersistence::Committed {
+                result,
+                transition_log,
+            } => {
+                if let Some(event) =
+                    db::DomainEventRepo::get_event(&*self.db, &transition_log.id).await?
+                {
+                    DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                        .publish_committed(&event);
+                }
+                *result
             }
         };
-        let mut task = engine_result.task;
-
+        self.publish_domain_event_by_dedupe(&format!("task-board-move:{}", request.operation_id))
+            .await;
+        if target_lifecycle == db::TaskLifecycleState::Cancelled {
+            self.cancel_running_executions_for_task(
+                &result.task,
+                "cancelled by board lifecycle",
+                Actor::user(UserActionSource::BoardDrag),
+            )
+            .await?;
+        }
         if was_blocked {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
-                entity_id: task.id.clone(),
+                entity_id: result.task.id.clone(),
                 timestamp: event_timestamp(),
                 context: EventContext::TaskUnblocked {
-                    project_id: task.project_id.clone(),
+                    project_id: result.task.project_id.clone(),
                     previous_reason: blocked_previous_reason,
                 },
             });
         }
-        if previous_status == default_states::REVIEW && task.status != default_states::REVIEW {
-            task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
-        }
-        if should_clear_transient_error_annotation(&task) {
+        if should_clear_transient_error_annotation(&result.task) {
             match TaskRepo::update(
                 &*self.db,
                 db::UpdateTask {
-                    id: task.id.clone(),
-                    expected_version: task.version,
+                    id: result.task.id.clone(),
+                    expected_version: result.task.version,
                     title: None,
                     description: None,
                     priority: None,
@@ -213,26 +191,24 @@ impl TaskService {
             )
             .await
             {
-                Ok(updated) => task = updated,
+                Ok(updated) => result.task = updated,
                 Err(DbError::VersionConflict) => {
-                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    result.task = TaskRepo::get_by_id(&*self.db, &result.task.id, false)
                         .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                        .ok_or_else(|| ServiceError::not_found("task", result.task.id.clone()))?;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        if previous_status != task.status {
-            super::execution::clear_execution_retry_metadata(&self.db, &task).await?;
-            task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+        if previous_status != result.task.status {
+            super::execution::clear_execution_retry_metadata(&self.db, &result.task).await?;
+            result.task = TaskRepo::get_by_id(&*self.db, &result.task.id, false)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                .ok_or_else(|| ServiceError::not_found("task", result.task.id.clone()))?;
         }
-
-        let mut result = direct_result;
-        result.task = task;
         result.board_revision =
             TaskBoardRepo::board_revision(&*self.db, &source_task.project_id).await?;
+        self.publish_move_event(&result);
         TaskBoardRepo::complete_move_operation(
             &*self.db,
             &request.operation_id,
@@ -261,7 +237,7 @@ impl TaskService {
                 target_column_statuses,
                 before_id: request.before_id,
                 after_id: request.after_id,
-                entry_barrier_json: task.entry_barrier_json,
+                entry_barrier_json: None,
                 transition_log_id: new_uuid_v4(),
                 trigger_name: None,
                 triggered_by: Actor::user(UserActionSource::BoardDrag).display(),

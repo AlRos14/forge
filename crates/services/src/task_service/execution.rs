@@ -1,8 +1,7 @@
 use super::*;
 use crate::agent_capacity::count_running_executions;
 use crate::workflow::dispatch::{
-    build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
-    loader::load_agent_dispatch_context,
+    build_effective_prompt, effective_prompt_selection, loader::load_agent_dispatch_context,
 };
 use db::{ExecutionUsageRepo, UpdateTask, UpdateTaskStatus};
 
@@ -45,6 +44,18 @@ pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> Ex
         "validation" => ExecutionPurpose::Validate,
         "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
         _ => execution_purpose_for_role(role),
+    }
+}
+
+/// Resolve the responsible TaskRole from the Task's requested operation type.
+/// Project workflow states do not select execution roles.
+pub(crate) fn task_role_for_task_type(task_type: &str) -> &'static str {
+    match task_type.trim().to_ascii_lowercase().as_str() {
+        "planning" => "planner",
+        "review" => "reviewer",
+        "validation" => "validator",
+        "discovery" => "investigator",
+        _ => "implementer",
     }
 }
 

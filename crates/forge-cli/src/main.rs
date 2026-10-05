@@ -240,6 +240,12 @@ async fn main() {
     }
     let project_hook_service_handle = Arc::clone(&state.project_hook_service).start();
     let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    let _pr_reconciler_handle = services::pr_service::PrReconciler::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        None,
+    )
+    .run();
     let shared_media_cleanup_handle =
         Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
     let task_dispatcher = Arc::new(services::TaskDispatcher::new(

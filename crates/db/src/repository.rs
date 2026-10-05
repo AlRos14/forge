@@ -52,6 +52,92 @@ pub trait TaskRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait TaskLifecycleRepo: Send + Sync {
+    async fn get_task_lifecycle(&self, task_id: &str) -> Result<Option<TaskLifecycle>>;
+    async fn get_task_lifecycle_transition_fact(
+        &self,
+        transition_id: &str,
+    ) -> Result<Option<TaskLifecycleTransitionFact>>;
+    async fn has_task_lifecycle_transition(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool>;
+    async fn get_task_lifecycle_transition(
+        &self,
+        identity: TaskLifecycleTransitionIdentity,
+    ) -> Result<Option<TaskLifecycleTransitionWrite>>;
+    async fn list_lifecycle_migration_audit(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskLifecycleMigrationAudit>>;
+    /// The Task projection, lifecycle CAS, causal receipt, and domain event
+    /// commit as one transaction. Replays return the original receipt.
+    async fn transition_task_lifecycle(
+        &self,
+        input: TransitionTaskLifecycle,
+    ) -> Result<TaskLifecycleTransitionWrite>;
+}
+
+#[async_trait]
+pub trait GateRepo: Send + Sync {
+    async fn create_gate(&self, input: CreateGate) -> Result<CollaborationWrite<Gate>>;
+    /// Create a Gate and its first immutable policy revision with both durable
+    /// events in one transaction. API creation must not leave an unusable Gate
+    /// when policy validation or persistence fails.
+    async fn create_gate_with_initial_policy(
+        &self,
+        gate: CreateGate,
+        policy: CreateGatePolicyRevision,
+    ) -> Result<(
+        CollaborationWrite<Gate>,
+        CollaborationWrite<GatePolicyRevision>,
+    )>;
+    async fn get_gate(&self, id: &str) -> Result<Option<Gate>>;
+    async fn list_active_gate_policies(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<(Gate, GatePolicyRevision)>>;
+    /// Find the immutable evaluation emitted while consuming one exact source
+    /// event. A replay of that source must leave the evaluation event to apply
+    /// its already frozen inputs rather than evaluating newer facts again.
+    async fn get_gate_evaluation_for_cause(
+        &self,
+        gate_id: &str,
+        causation_event_id: &str,
+    ) -> Result<Option<GateEvaluation>>;
+    async fn get_gate_policy_revision(
+        &self,
+        gate_id: &str,
+        revision: i64,
+    ) -> Result<Option<GatePolicyRevision>>;
+    /// Appends one immutable policy revision and changes the active revision
+    /// pointer under compare-and-swap in the same event transaction.
+    async fn create_gate_policy_revision(
+        &self,
+        input: CreateGatePolicyRevision,
+    ) -> Result<CollaborationWrite<GatePolicyRevision>>;
+    async fn create_gate_evaluation(
+        &self,
+        input: StoreGateEvaluation,
+    ) -> Result<GateEvaluationWrite>;
+    async fn get_gate_evaluation(&self, id: &str) -> Result<Option<GateEvaluation>>;
+    async fn is_latest_gate_evaluation(
+        &self,
+        gate_id: &str,
+        revision: i64,
+        evaluation_id: &str,
+    ) -> Result<bool>;
+    /// Mutable exact inputs (TaskRole, WorkUnit, and Proposal fences) must
+    /// still match before a satisfied evaluation changes lifecycle.
+    async fn gate_evaluation_inputs_are_current(&self, evaluation_id: &str) -> Result<bool>;
+    async fn list_gate_evaluation_inputs(
+        &self,
+        evaluation_id: &str,
+    ) -> Result<Vec<GateEvaluationInput>>;
+}
+
+#[async_trait]
 pub trait TaskBoardRepo: Send + Sync {
     async fn board_revision(&self, project_id: &str) -> Result<i64>;
     async fn replay_move_task(
@@ -759,10 +845,32 @@ pub trait WorkUnitRepo: Send + Sync {
 /// atomic across independent SQLite connections/processes.
 #[async_trait]
 pub trait TaskIntegrationOperationRepo: Send + Sync {
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskIntegrationOperation>>;
     async fn begin(
         &self,
         input: CreateTaskIntegrationOperation,
     ) -> Result<TaskIntegrationOperation>;
+    /// Atomically admit a PullRequest TaskMerge, create its PublishPr child,
+    /// and persist publication intent so a restart can always resume provider
+    /// reconciliation from durable rows.
+    async fn begin_pull_request_publication(
+        &self,
+        merge: CreateTaskIntegrationOperation,
+        publish: CreateTaskIntegrationOperation,
+        metadata: CreatePrMetadata,
+        remote_admission: CreateRemotePrAdmission,
+    ) -> Result<(TaskIntegrationOperation, TaskIntegrationOperation)>;
+    async fn get_remote_pr_admission(
+        &self,
+        task_merge_operation_id: &str,
+    ) -> Result<Option<RemotePrAdmission>>;
+    /// Persist a provider observation and its metadata, operation, and
+    /// lifecycle effects in one SQLite transaction. Reconciliation-required
+    /// outcomes only update the durable admission state.
+    async fn record_remote_pr_outcome(
+        &self,
+        input: RecordRemotePrOutcome,
+    ) -> Result<Option<DomainEvent>>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<TaskIntegrationOperation>>;
     /// Called only while holding the Task's OS operation lock. It marks the
     /// current process-dead `running` row abandoned without starting a new
@@ -1805,8 +1913,55 @@ pub struct CreatePrMetadata {
     pub target_branch: String,
     pub pr_state: String,
     pub merge_status: String,
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
     pub last_synced_at: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRemotePrAdmission {
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub task_id: String,
+    pub provider_config_id: String,
+    pub provider_type: String,
+    pub provider_config_revision: String,
+    pub provider_config_digest: String,
+    pub provider_base_url: Option<String>,
+    pub token_secret_ref: Option<String>,
+    pub remote_repo_identity: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub admitted_source_sha: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordRemotePrOutcome {
+    pub expected_task_id: String,
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub provider_config_id: String,
+    pub provider_config_digest: String,
+    pub remote_repo_identity: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    /// Provider outcome: open, merged, closed, publication_failed, or
+    /// reconciliation_required. A merged result whose observed head differs
+    /// from the admitted SHA remains provider status `merged`; the repository
+    /// derives `head_mismatch` as a separate integrity classification.
+    pub status: String,
+    pub provider_event_id: Option<String>,
+    pub provider_pr_id: Option<String>,
+    pub pr_url: Option<String>,
+    pub observed_head_sha: Option<String>,
+    pub merged_commit_sha: Option<String>,
+    pub reconciliation_reason: Option<String>,
     pub updated_at: String,
 }
 
@@ -1820,6 +1975,8 @@ pub struct UpdatePrMetadata {
     pub target_branch: Option<String>,
     pub pr_state: Option<String>,
     pub merge_status: Option<String>,
+    pub task_merge_operation_id: Option<String>,
+    pub publish_operation_id: Option<String>,
     pub last_synced_at: Option<Option<String>>,
     pub updated_at: String,
 }
@@ -2021,6 +2178,9 @@ pub struct CreateTaskIntegrationOperation {
     pub task_id: String,
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
+    pub gate_evaluation_id: Option<String>,
+    pub remote_waiting: bool,
+    pub parent_operation_id: Option<String>,
     pub created_at: String,
 }
 
@@ -2029,6 +2189,7 @@ pub struct FinishTaskIntegrationOperation {
     pub id: String,
     pub expected_version: i64,
     pub status: TaskIntegrationOperationStatus,
+    pub result_event_id: Option<String>,
     pub updated_at: String,
     pub finished_at: String,
 }
@@ -2264,7 +2425,6 @@ pub struct ClaimTask {
     pub expected_version: i64,
     pub source_status: String,
     pub target_status: String,
-    pub capacity_statuses: Vec<String>,
     pub execution: CreateExecution,
     pub max_concurrent_tasks: i64,
     pub claimed_at: String,

@@ -1,39 +1,25 @@
-use std::collections::HashSet;
-
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
-use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
+use db::{
+    AgentRepo, DbError, Project, Task, TaskLifecycleRepo, TaskRoleAssignment,
+    TaskRoleAssignmentRepo,
+};
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
-    task_service::TransitionOptions,
-    Result, ServiceError,
+    Assignee, Result, ServiceError,
 };
 
-use super::{helpers, TaskDispatcher};
+use super::TaskDispatcher;
 
 #[derive(Debug)]
 pub(super) struct InitialScheduleTarget {
-    pub(super) transition_to: String,
     pub(super) agent_id: String,
 }
 
 impl TaskDispatcher {
-    pub(super) async fn dispatch_initial_tasks(
-        &self,
-        project: &Project,
-        workflow: &WorkflowDefinition,
-    ) -> Result<u64> {
-        let initial_states: Vec<String> = workflow
-            .states
-            .iter()
-            .filter(|state| state.kind == StateKind::Initial)
-            .map(|state| state.name.clone())
-            .collect();
-        if initial_states.is_empty() {
-            return Ok(0);
-        }
-
-        let mut tasks = self.list_tasks(&project.id, initial_states).await?;
+    pub(super) async fn dispatch_initial_tasks(&self, project: &Project) -> Result<u64> {
+        let mut tasks = self
+            .list_tasks(&project.id, vec!["todo".to_owned()])
+            .await?;
         tasks.sort_by(|left, right| {
             right
                 .priority
@@ -47,17 +33,14 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
-            let Some(target) = self
-                .resolve_initial_schedule_target(workflow, &task)
-                .await?
-            else {
+            let Some(target) = self.resolve_initial_schedule_target(&task).await? else {
                 continue;
             };
             match self.dispatch_initial_task(&task, &target).await {
                 Ok(true) => dispatched += 1,
                 Ok(false) => {}
                 Err(ServiceError::Db(DbError::VersionConflict)) => {
-                    tracing::debug!(task_id = %task.id, "task dispatcher initial transition lost version race");
+                    tracing::debug!(task_id = %task.id, "task dispatcher initial claim lost version race");
                 }
                 Err(error) => {
                     tracing::warn!(task_id = %task.id, %error, "task dispatcher initial dispatch failed");
@@ -72,13 +55,7 @@ impl TaskDispatcher {
         task: &Task,
         target: &InitialScheduleTarget,
     ) -> Result<bool> {
-        if self.is_stopped() {
-            return Ok(false);
-        }
-        if helpers::has_blocking_annotation(task) {
-            return Ok(false);
-        }
-        if task.repo_id.is_none() {
+        if self.is_stopped() || task.repo_id.is_none() {
             return Ok(false);
         }
         let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
@@ -87,18 +64,20 @@ impl TaskDispatcher {
         if compute_effective_status(&self.db, &agent).await? != EffectiveStatus::Active {
             return Ok(false);
         }
-
+        if TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .is_none_or(|lifecycle| lifecycle.state != db::TaskLifecycleState::Ready)
+        {
+            return Ok(false);
+        }
+        if self.is_stopped() {
+            return Ok(false);
+        }
         self.task_service
-            .transition(
+            .claim_task(
                 task.id.clone(),
-                target.transition_to.clone(),
-                TransitionOptions {
-                    version: task.version,
-                    reason: Some("scheduled by task dispatcher".to_owned()),
-                    triggered_by: Actor::system(SystemComponent::TaskDispatcher),
-                    rejection: false,
-                    defer_dispatch_seconds: None,
-                },
+                Assignee::Agent(target.agent_id.clone()),
+                None,
             )
             .await?;
         Ok(true)
@@ -106,111 +85,59 @@ impl TaskDispatcher {
 
     pub(super) async fn resolve_initial_schedule_target(
         &self,
-        workflow: &WorkflowDefinition,
         task: &Task,
     ) -> Result<Option<InitialScheduleTarget>> {
-        let mut cursor_state = task.status.clone();
-        let mut target_kinds = vec![StateKind::Active, StateKind::Gate];
-        let mut visited = HashSet::new();
-        let mut first_hop: Option<String> = None;
+        let role = crate::task_service::execution::task_role_for_task_type(&task.task_type);
+        let memberships =
+            crate::task_service::current_role_memberships_authoritative(&self.db, &task.id, role)
+                .await?;
+        let agent_id = if let Some(memberships) = memberships {
+            if task.repo_id.is_some() {
+                crate::task_service::select_usable_repository_agent_id(
+                    &self.db,
+                    &task.project_id,
+                    &memberships,
+                )
+                .await?
+            } else {
+                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
+            }
+        } else {
+            self.legacy_assigned_agent_for_initial_schedule(task, role)
+                .await?
+        };
+        Ok(agent_id.map(|agent_id| InitialScheduleTarget { agent_id }))
+    }
 
-        loop {
-            if !visited.insert(cursor_state.clone()) {
-                return Ok(None);
-            }
-            let Some(target_state) =
-                helpers::first_transition_to_kind(workflow, &cursor_state, &target_kinds)
-            else {
-                return Ok(None);
-            };
-            let transition_to = first_hop
-                .get_or_insert_with(|| target_state.name.clone())
-                .clone();
-            let Some(role_name) = crate::workflow::effective_role(target_state) else {
-                return Ok(None);
-            };
-            // PR6 owns orchestrator cognition through durable domain-event
-            // wakes. The workflow dispatcher remains responsible for the
-            // legacy planning/review/execution roles until their named PRs.
-            if role_name == "orchestrator" {
-                return Ok(None);
-            }
-            match crate::task_service::current_role_memberships_authoritative(
-                &self.db, &task.id, role_name,
-            )
-            .await?
-            {
-                Some(memberships) => {
-                    let selected = if task.repo_id.is_some() {
-                        crate::task_service::select_usable_repository_agent_id(
-                            &self.db,
-                            &task.project_id,
-                            &memberships,
-                        )
-                        .await?
-                    } else {
-                        crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
-                    };
-                    if let Some(agent_id) = selected {
-                        // Existing dispatch remains the bounded compatibility
-                        // selector until WorkUnit/orchestrator scheduling: the
-                        // stable membership order supplies a deterministic
-                        // candidate without making the representative the
-                        // source of eligibility.
-                        return Ok(Some(InitialScheduleTarget {
-                            transition_to,
-                            agent_id,
-                        }));
-                    }
-                    if !memberships
-                        .iter()
-                        .any(|membership| membership.status == db::RoleMembershipStatus::Active)
-                        && crate::workflow::auto_cascades_on_unassigned_role(target_state)
-                    {
-                        cursor_state = target_state.name.clone();
-                        target_kinds = vec![StateKind::Active];
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                None => {
-                    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-                        &*self.db, &task.id, role_name,
-                    )
-                    .await?;
-                    match assignment {
-                        Some(assignment)
-                            if assignment.assignee_type == Some(db::AssigneeKind::Agent)
-                                && assignment.assignee_id.is_some() =>
-                        {
-                            return Ok(Some(InitialScheduleTarget {
-                                transition_to,
-                                agent_id: assignment.assignee_id.expect("checked by match guard"),
-                            }));
-                        }
-                        Some(assignment)
-                            if assignment.assignee_type == Some(db::AssigneeKind::User) =>
-                        {
-                            return Ok(None);
-                        }
-                        Some(assignment)
-                            if helpers::role_assignment_unassigned(Some(&assignment))
-                                && crate::workflow::auto_cascades_on_unassigned_role(
-                                    target_state,
-                                ) =>
-                        {
-                            cursor_state = target_state.name.clone();
-                            target_kinds = vec![StateKind::Active];
-                        }
-                        Some(_) => return Ok(None),
-                        None if crate::workflow::auto_cascades_on_unassigned_role(target_state) => {
-                            cursor_state = target_state.name.clone();
-                            target_kinds = vec![StateKind::Active];
-                        }
-                        None => return Ok(None),
-                    }
-                }
+    async fn legacy_assigned_agent_for_initial_schedule(
+        &self,
+        task: &Task,
+        role: &str,
+    ) -> Result<Option<String>> {
+        let aliases: &[&str] = if role == "implementer" {
+            &["implementer", "coder", "worker", "assignee", "executor"]
+        } else {
+            &[role]
+        };
+        for alias in aliases {
+            let assignment =
+                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, alias).await?;
+            if let Some(agent_id) = assignment.and_then(legacy_agent_assignment) {
+                return Ok(Some(agent_id));
             }
         }
+        if role == "implementer"
+            && task.assignee_type.as_deref() == Some("agent")
+            && task.assignee_id.is_some()
+        {
+            return Ok(task.assignee_id.clone());
+        }
+        Ok(None)
     }
+}
+
+fn legacy_agent_assignment(assignment: TaskRoleAssignment) -> Option<String> {
+    (assignment.assignee_type == Some(db::AssigneeKind::Agent))
+        .then_some(assignment.assignee_id)
+        .flatten()
 }

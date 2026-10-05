@@ -80,38 +80,20 @@ impl TaskService {
             ));
         }
         let now = now_rfc3339();
-        let workflow = WorkflowEngine::resolve_workflow_for_type(
-            &project.workflow_definition,
-            &effective_task_type,
-            is_subtask,
-        );
         let no_repo = repo_id.is_none();
-        let initial_status = if no_repo {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Backlog)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no backlog state"))?
-        } else {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Initial)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
-        };
+        // New Task progress starts in the aggregate lifecycle directly. A
+        // project workflow state name must not decide whether the Task is
+        // ready, active, or blocked.
+        let initial_status = if no_repo { "backlog" } else { "todo" }.to_owned();
         let prepared_governance = self
             .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, governance)
             .await?;
-        let workflow_roles: std::collections::HashSet<&str> =
-            workflow.roles.iter().map(|r| r.name.as_str()).collect();
         let validated_assignments = if let Some(ref assignments) = role_assignments {
             let mut validated = Vec::with_capacity(assignments.len());
             for assignment in assignments {
-                if !workflow_roles.contains(assignment.role_name.as_str()) {
+                if db::canonical_task_role_name(&assignment.role_name).is_none() {
                     return Err(ServiceError::invalid_operation(format!(
-                        "unknown role: {}",
+                        "role is not a TaskRole: {}",
                         assignment.role_name
                     )));
                 }
@@ -148,13 +130,12 @@ impl TaskService {
             .map(|assignments| {
                 assignments
                     .iter()
-                    .map(|(role_name, _, _)| role_name.clone())
+                    .filter_map(|(role_name, _, _)| db::canonical_task_role_name(role_name))
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
         let default_assignments = if is_root {
-            let assignments =
-                project_default_role_assignments(&project, &workflow_roles, &explicit_roles)?;
+            let assignments = project_default_role_assignments(&project, &explicit_roles)?;
             for (_, assignee_type, assignee_id) in &assignments {
                 if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
                     self.validate_actor_for_project(&project, &actor_ref)
@@ -270,22 +251,7 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
         let repo_id = project.primary_repo_id.clone();
-        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let initial_status = if repo_id.is_none() {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Backlog)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no backlog state"))?
-        } else {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Initial)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
-        };
+        let initial_status = if repo_id.is_none() { "backlog" } else { "todo" }.to_owned();
 
         let now = now_rfc3339();
         let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
@@ -388,7 +354,6 @@ impl TaskService {
 
 fn project_default_role_assignments(
     project: &db::Project,
-    workflow_roles: &HashSet<&str>,
     covered_roles: &HashSet<String>,
 ) -> Result<Vec<(String, AssigneeKind, String)>> {
     let settings = serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
@@ -398,7 +363,12 @@ fn project_default_role_assignments(
     let mut result = Vec::new();
     for assignment in settings.default_role_assignments {
         let role_name = assignment.role_name;
-        if !workflow_roles.contains(role_name.as_str()) || covered_roles.contains(&role_name) {
+        let canonical_role = db::canonical_task_role_name(&role_name).ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "default role assignment is not a TaskRole: {role_name}"
+            ))
+        })?;
+        if covered_roles.contains(&canonical_role) {
             continue;
         }
         if !matches!(assignment.assignee_type.as_str(), "agent" | "user") {
@@ -419,7 +389,7 @@ fn project_default_role_assignments(
             .parse::<AssigneeKind>()
             .map_err(ServiceError::invalid_operation)?;
         result.push((role_name.clone(), assignee_type, assignee_id));
-        covered_roles.insert(role_name);
+        covered_roles.insert(canonical_role);
     }
     Ok(result)
 }

@@ -1,245 +1,143 @@
-use std::sync::Arc;
-
-use api_types::{StateKind, WorkflowDefinition};
-use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
-
-use crate::{
-    agent_capacity::has_running_execution_capacity,
-    agent_service::{compute_effective_status, EffectiveStatus},
-    deferred_dispatch,
-    workflow::{
-        dispatch::{
-            build_effective_prompt, dispatch_intent_from_workflow_dispatch,
-            effective_prompt_selection, loader::load_agent_dispatch_context,
-        },
-        effective_role,
-    },
-    Result, ServiceError,
+use db::{
+    DbError, ExecutionRepo, ExecutionStatus, Project, ResumePolicy, StopReason, TaskLifecycleRepo,
+    TaskLifecycleState,
 };
 
-use super::{helpers, TaskDispatcher};
+use crate::{Result, ServiceError};
+
+use super::TaskDispatcher;
 
 impl TaskDispatcher {
-    pub(super) async fn recover_active_tasks(
-        &self,
-        project: &Project,
-        workflow: &WorkflowDefinition,
-    ) -> Result<u64> {
-        let active_states: Vec<String> = workflow
-            .states
+    /// Resume only an exact Task-scoped Execution that the shutdown/recovery
+    /// authority explicitly marked for automatic recovery. Task lifecycle,
+    /// TaskType, workflow state, and retry receipts never direct rework here.
+    pub(super) async fn recover_auto_cancelled_tasks(&self, project: &Project) -> Result<u64> {
+        let tasks = self
+            .list_tasks(&project.id, vec!["in_progress".to_owned()])
+            .await?;
+        let task_ids = tasks
             .iter()
-            .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
-            .map(|state| state.name.clone())
-            .collect();
-        if active_states.is_empty() {
-            return Ok(0);
-        }
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        let latest_executions =
+            ExecutionRepo::list_latest_executions_for_tasks(&*self.db, &task_ids).await?;
+        let latest_by_task = latest_executions
+            .into_iter()
+            .map(|execution| (execution.task_id.clone(), execution))
+            .collect::<std::collections::HashMap<_, _>>();
 
-        let tasks = self.list_tasks(&project.id, active_states).await?;
-        let mut dispatched = 0;
+        let mut resumed = 0;
         for task in tasks {
             if self.is_stopped() {
                 break;
             }
-            match self.recover_active_task(project, workflow, &task).await {
-                Ok(true) => dispatched += 1,
-                Ok(false) => {}
-                Err(ServiceError::Db(DbError::VersionConflict)) => {
-                    tracing::debug!(task_id = %task.id, "task dispatcher recovery lost version race");
-                }
-                Err(ref error @ ServiceError::WorkspaceResetRequired { .. }) => {
-                    tracing::warn!(task_id = %task.id, %error, "task branch lost, blocking for user reset");
-                    if let Err(block_error) =
-                        self.block_task_for_workspace_reset(&task, error).await
-                    {
-                        tracing::warn!(task_id = %task.id, %block_error, "failed to block task for workspace reset");
-                    }
-                }
-                Err(error) if helpers::is_io_or_workspace_error(&error) => {
-                    tracing::error!(task_id = %task.id, %error, "task dispatcher recovery blocked task due to workspace error");
-                    if let Err(block_error) =
-                        self.block_task_on_workspace_error(&task, &error).await
-                    {
-                        tracing::warn!(task_id = %task.id, %block_error, "failed to block task after workspace error");
-                    }
+            let Some(lifecycle) =
+                TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id).await?
+            else {
+                continue;
+            };
+            if lifecycle.state != TaskLifecycleState::Active {
+                continue;
+            }
+            let Some(execution) = latest_by_task.get(&task.id) else {
+                continue;
+            };
+            if !is_exact_auto_recovery_candidate(execution) {
+                continue;
+            }
+
+            let result = async {
+                let launch = self
+                    .task_service
+                    .re_execute_execution(execution.id.clone())
+                    .await?;
+                self.task_service
+                    .start_execution(launch.execution.id.clone())
+                    .await
+            }
+            .await;
+            match result {
+                Ok(start) if start.accepted => resumed += 1,
+                Ok(_) => {}
+                Err(ServiceError::Db(DbError::VersionConflict))
+                | Err(ServiceError::Db(DbError::TaskVersionConflict { .. })) => {
+                    tracing::debug!(
+                        task_id = %task.id,
+                        execution_id = %execution.id,
+                        "automatic execution recovery lost a version race"
+                    );
                 }
                 Err(error) => {
-                    tracing::warn!(task_id = %task.id, %error, "task dispatcher recovery failed");
+                    tracing::warn!(
+                        task_id = %task.id,
+                        execution_id = %execution.id,
+                        %error,
+                        "automatic execution recovery failed"
+                    );
                 }
             }
         }
-        Ok(dispatched)
+        Ok(resumed)
     }
+}
 
-    async fn recover_active_task(
-        &self,
-        project: &Project,
-        workflow: &WorkflowDefinition,
-        task: &Task,
-    ) -> Result<bool> {
-        let Some(state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(false);
-        };
-        if !matches!(state.kind, StateKind::Active | StateKind::Gate) {
-            return Ok(false);
-        }
-        if self.is_stopped() {
-            return Ok(false);
-        }
-        if !state
-            .hooks
-            .on_enter
-            .iter()
-            .any(|hook| hook.action == "dispatch_role_agent")
-        {
-            return Ok(false);
-        }
-        if helpers::has_blocking_annotation(task) {
-            return Ok(false);
-        }
-        if task.repo_id.is_none() {
-            return Ok(false);
-        }
-        if deferred_dispatch::is_pending(task, chrono::Utc::now()) {
-            return Ok(false);
-        }
-        let Some(role_name) = effective_role(state) else {
-            return Ok(false);
-        };
-        if role_name == "orchestrator" {
-            return Ok(false);
-        }
-        if crate::workflow::auto_cascades_on_unassigned_role(state) {
-            let role_unassigned = match crate::task_service::current_role_memberships_authoritative(
-                &self.db, &task.id, role_name,
-            )
-            .await?
-            {
-                Some(memberships) => !memberships
-                    .iter()
-                    .any(|membership| membership.status == db::RoleMembershipStatus::Active),
-                None => {
-                    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-                        &*self.db, &task.id, role_name,
-                    )
-                    .await?;
-                    helpers::role_assignment_unassigned(assignment.as_ref())
-                }
-            };
-            if role_unassigned {
-                let Some(target) = self.resolve_initial_schedule_target(workflow, task).await?
-                else {
-                    return Ok(false);
-                };
-                return self.dispatch_initial_task(task, &target).await;
-            }
-        }
-        if helpers::latest_stopped_execution_blocks_dispatch(&self.db, &task.id, role_name).await? {
-            return Ok(false);
-        }
-        let agent_id = match crate::task_service::current_role_memberships_authoritative(
-            &self.db, &task.id, role_name,
+fn is_exact_auto_recovery_candidate(execution: &db::Execution) -> bool {
+    execution.work_unit_id.is_none()
+        && execution.status == ExecutionStatus::Cancelled
+        && execution.resume_policy == Some(ResumePolicy::Auto)
+        && matches!(
+            execution.stop_reason,
+            Some(StopReason::CrashRecovery | StopReason::GracefulShutdown)
         )
-        .await?
-        {
-            Some(memberships) => {
-                crate::task_service::select_usable_repository_agent_id(
-                    &self.db,
-                    &task.project_id,
-                    &memberships,
-                )
-                .await?
-            }
-            None => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                .await?
-                .filter(|assignment| assignment.assignee_type == Some(db::AssigneeKind::Agent))
-                .and_then(|assignment| assignment.assignee_id),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_exact_auto_recovery_candidate;
+    use db::{ExecutionStatus, ResumePolicy, StopReason};
+
+    #[test]
+    fn automatic_recovery_requires_exact_cancelled_task_execution_and_authorized_stop_reason() {
+        let mut execution = db::Execution {
+            id: "execution".to_owned(),
+            task_id: "task".to_owned(),
+            agent_id: Some("agent".to_owned()),
+            actor_kind: None,
+            actor_id: None,
+            role: "implementer".to_owned(),
+            purpose: None,
+            status: ExecutionStatus::Cancelled,
+            stop_reason: Some(StopReason::CrashRecovery),
+            stopped_by: Some("system:recovery".to_owned()),
+            resume_policy: Some(ResumePolicy::Auto),
+            stopped_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            prompt: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            work_unit_id: None,
+            work_unit_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
         };
-        let Some(agent_id) = agent_id else {
-            return Ok(false);
-        };
-        if helpers::has_running_execution_for_roles(
-            &self.db,
-            &task.id,
-            &helpers::execution_guard_roles(role_name),
-        )
-        .await?
-        {
-            return Ok(false);
-        }
+        assert!(is_exact_auto_recovery_candidate(&execution));
 
-        let state_config =
-            helpers::merged_state_config(state, project, task.task_state_config.as_deref());
-        if task.entry_barrier_json.is_some() {
-            return Ok(false);
-        }
-        if role_name == crate::workflow::default_roles::REVIEWER
-            && !helpers::reviewer_dispatch_ready(&self.db, &task.id, &state_config).await?
-        {
-            return Ok(false);
-        }
-
-        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        match compute_effective_status(&self.db, &agent).await? {
-            EffectiveStatus::Error
-            | EffectiveStatus::Paused
-            | EffectiveStatus::DaemonOffline
-            | EffectiveStatus::DaemonUnavailable
-            | EffectiveStatus::ConnectionDegraded
-            | EffectiveStatus::ConnectionUnavailable
-            | EffectiveStatus::Deactivated => return Ok(false),
-            EffectiveStatus::Active | EffectiveStatus::Busy => {}
-        }
-        if !has_running_execution_capacity(&self.db, &agent).await? {
-            return Ok(false);
-        }
-        if deferred_dispatch::pending_until(task).is_some() {
-            deferred_dispatch::clear(&self.db, task).await?;
-        }
-
-        let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
-        let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
-        let dispatch_ctx = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &state.name,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            None,
-            workflow,
-        )
-        .await?;
-        let (prompt, _selection) =
-            build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
-        let dispatch_metadata = serde_json::json!({
-            "target_role": role_name,
-            "builder_id": selection.builder_id,
-            "execution_policy": selection.execution_policy,
-        });
-        if self.is_stopped() {
-            return Ok(false);
-        }
-        self.task_service
-            .dispatch_initial_role_execution_with_metadata(
-                &task.id,
-                &agent.id,
-                role_name,
-                crate::task_service::execution::execution_purpose_for_workflow_state(
-                    &task.task_type,
-                    &state.name,
-                    role_name,
-                ),
-                prompt.user,
-                Some(dispatch_metadata),
-            )
-            .await?;
-        Ok(true)
+        execution.stop_reason = Some(StopReason::ExecutorFailed);
+        assert!(!is_exact_auto_recovery_candidate(&execution));
+        execution.stop_reason = Some(StopReason::CrashRecovery);
+        execution.status = ExecutionStatus::Failed;
+        assert!(!is_exact_auto_recovery_candidate(&execution));
+        execution.status = ExecutionStatus::Cancelled;
+        execution.work_unit_id = Some("work-unit".to_owned());
+        assert!(!is_exact_auto_recovery_candidate(&execution));
     }
 }

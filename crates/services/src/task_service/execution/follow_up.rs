@@ -45,38 +45,6 @@ impl TaskService {
         )
         .await
     }
-
-    async fn active_state_for_role(&self, task: &Task, role: &str) -> Result<String> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Dispatch),
-        );
-        if workflow
-            .states
-            .iter()
-            .any(|state| state.name == task.status && state.role.as_deref() == Some(role))
-        {
-            return Ok(task.status.clone());
-        }
-        Ok(workflow
-            .states
-            .iter()
-            .find(|state| {
-                state.kind == api_types::StateKind::Active && state.role.as_deref() == Some(role)
-            })
-            .or_else(|| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.role.as_deref() == Some(role))
-            })
-            .map(|state| state.name.clone())
-            .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned()))
-    }
 }
 
 fn dispatch_role_follow_up_impl(
@@ -149,11 +117,34 @@ fn dispatch_role_follow_up_impl(
             }
             agent_id
         } else if let Some(memberships) = authoritative_memberships.as_ref() {
-            // Actor selection is authoritative and happens before continuity.
-            // A usable lineage Agent is not automatically the current role's
-            // selected Actor; a membership change must therefore be able to
-            // force a fresh Agent-owned session.
-            let selected = if task.repo_id.is_some() {
+            // Preserve causal continuity only while the parent Agent remains
+            // an active, usable member of this exact role. A suspended or
+            // unavailable lineage Agent falls back to deterministic current
+            // membership selection.
+            let lineage_agent_id = match lineage_parent.actor_ref() {
+                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
+                Some(db::ActorRef::Human(_)) => None,
+                None => lineage_parent.agent_id.clone(),
+            };
+            let lineage_is_usable = if let Some(agent_id) = lineage_agent_id.as_deref() {
+                if task.repo_id.is_some() {
+                    crate::task_service::is_usable_repository_agent(
+                        &service.db,
+                        &task.project_id,
+                        memberships,
+                        agent_id,
+                    )
+                    .await?
+                } else {
+                    crate::task_service::is_usable_active_agent(&service.db, memberships, agent_id)
+                        .await?
+                }
+            } else {
+                false
+            };
+            let selected = if lineage_is_usable {
+                lineage_agent_id
+            } else if task.repo_id.is_some() {
                 crate::task_service::select_usable_repository_agent_id(
                     &service.db,
                     &task.project_id,
@@ -254,14 +245,10 @@ fn dispatch_role_follow_up_impl(
         // Establish the final Task state/version before minting the
         // execution-scoped WorkspaceLease. A transition after issuance would
         // immediately make the exact-version authority stale.
-        let active_state = service.active_state_for_role(&task, &role).await?;
-        let task = if task.status != active_state {
-            service
-                .transition(task_id.clone(), active_state, task.version)
-                .await?
-                .task
-        } else if task.error_annotation.is_some() {
-            match TaskRepo::update(
+        service.ensure_task_runnable(&task).await?;
+        let task = service.activate_task_for_execution(task).await?;
+        if task.error_annotation.is_some() {
+            if let Err(error) = TaskRepo::update(
                 &*service.db,
                 UpdateTask {
                     id: task.id.clone(),
@@ -280,18 +267,9 @@ fn dispatch_role_follow_up_impl(
             )
             .await
             {
-                Ok(updated) => updated,
-                Err(error) => {
-                    tracing::warn!(%error, task_id = %task_id, "failed to clear error annotation before follow-up dispatch");
-                    TaskRepo::get_by_id(&*service.db, &task_id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?
-                }
+                tracing::warn!(%error, task_id = %task_id, "failed to clear error annotation before follow-up dispatch");
             }
-        } else {
-            task
-        };
-        service.ensure_task_runnable(&task).await?;
+        }
         let artifact_input_ids = service
             .inherit_plan_artifact_inputs(&supplied_parent_execution.id, &task_id)
             .await?;

@@ -1,5 +1,5 @@
 use super::super::*;
-use db::{RoleMembershipRepo, TaskRoleRepo};
+use db::{RoleMembershipRepo, TaskLifecycleRepo, TaskRoleRepo};
 
 #[tokio::test]
 async fn orchestration_identity_claim_fails_before_workspace_or_branch_creation() {
@@ -121,6 +121,45 @@ async fn claim_recovers_task_branch_left_by_a_rejected_workspace_attempt() {
 }
 
 #[tokio::test]
+async fn claim_returns_the_persisted_execution_after_dispatch_start_fails() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Report failed dispatch accurately",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("the durable claim remains available for recovery");
+    let persisted = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+
+    assert_eq!(claimed.execution.status, persisted.status);
+    assert_eq!(claimed.execution.status, ExecutionStatus::Failed);
+    assert!(claimed
+        .execution
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("task executor is not configured")));
+}
+
+#[tokio::test]
 async fn create_claim_and_transition_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -174,13 +213,13 @@ async fn create_claim_and_transition_task() {
         .await
         .expect("task enters review");
     assert!(review.review.is_none());
-    assert_eq!(review.task.status, "merging".to_owned());
+    assert_eq!(review.task.status, "blocked".to_owned());
     let event = rx.recv().await.unwrap();
     assert_eq!(event.event_type, "task.status_changed");
 }
 
 #[tokio::test]
-async fn claim_assigns_implicit_assignee_and_uses_claim_execution() {
+async fn claim_uses_task_type_role_independent_of_implicit_workflow_assignment() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
@@ -207,25 +246,35 @@ async fn claim_assigns_implicit_assignee_and_uses_claim_execution() {
         .await
         .expect("task claims");
 
-    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
+    let assignment =
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &claimed.task.id, default_roles::CODER)
+            .await
+            .expect("assignment loads")
+            .expect("single compatibility projection exists");
+    assert_eq!(assignment.assignee_type, Some(db::AssigneeKind::Agent));
+    assert_eq!(assignment.assignee_id.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(claimed.execution.role, "implementer");
+    assert_eq!(
+        claimed.execution.agent_id.as_deref(),
+        Some(agent_id.as_str())
+    );
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &claimed.task.id)
+        .await
+        .expect("lifecycle loads")
+        .expect("lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
+    assert!(TaskRoleAssignmentRepo::get_by_task_and_role(
         &*db,
         &claimed.task.id,
         default_roles::ASSIGNEE,
     )
     .await
-    .expect("assignment loads")
-    .expect("assignee assignment exists");
-    assert_eq!(assignment.assignee_type, Some(db::AssigneeKind::Agent));
-    assert_eq!(assignment.assignee_id.as_deref(), Some(agent_id.as_str()));
-    assert_eq!(claimed.execution.role, default_roles::ASSIGNEE);
-    assert_eq!(
-        claimed.execution.agent_id.as_deref(),
-        Some(agent_id.as_str())
-    );
+    .expect("old implicit role lookup succeeds")
+    .is_none());
 }
 
 #[tokio::test]
-async fn claim_uses_custom_workflow_active_target() {
+async fn claim_uses_aggregate_lifecycle_instead_of_custom_workflow_state() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
@@ -284,25 +333,30 @@ async fn claim_uses_custom_workflow_active_target() {
         )
         .await
         .expect("task creates");
-    assert_eq!(task.status, "ready");
+    assert_eq!(task.status, "todo");
 
     let claimed = service
         .claim_task(task.id, Assignee::Agent(agent_id.clone()), None)
         .await
         .expect("task claims");
 
-    assert_eq!(claimed.task.status, "coding");
-    let assignment =
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &claimed.task.id, "implementer")
-            .await
-            .expect("assignment loads")
-            .expect("implementer assignment exists");
+    assert_eq!(claimed.task.status, "in_progress");
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &claimed.task.id, "coder")
+        .await
+        .expect("assignment loads")
+        .expect("single compatibility projection exists");
     assert_eq!(assignment.assignee_type, Some(db::AssigneeKind::Agent));
     assert_eq!(assignment.assignee_id.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(claimed.execution.role, "implementer");
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &claimed.task.id)
+        .await
+        .expect("lifecycle loads")
+        .expect("lifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
 }
 
 #[tokio::test]
-async fn claim_ignores_system_only_active_edges() {
+async fn claim_does_not_require_legacy_workflow_edges() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -348,22 +402,18 @@ async fn claim_ignores_system_only_active_edges() {
     };
     update_project_workflow(&db, &project_id, &workflow).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "stalled".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
 
-    let result = service
+    let claimed = service
         .claim_task(task.id, Assignee::Agent(agent_id), None)
         .await;
-
-    match result {
-        Err(ServiceError::InvalidOperation { message }) => {
-            assert!(message.contains("no claimable active transition"));
-        }
-        other => panic!("expected invalid operation, got {other:?}"),
-    }
+    let claimed = claimed.expect("claim is governed by aggregate lifecycle");
+    assert_eq!(claimed.task.status, "in_progress");
+    assert_eq!(claimed.execution.role, "implementer");
 }
 
 #[tokio::test]
-async fn claim_rejects_conflicting_implicit_assignee_assignment() {
+async fn claim_uses_role_membership_as_authority_over_legacy_assignment() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -393,21 +443,34 @@ async fn claim_rejects_conflicting_implicit_assignee_assignment() {
     .expect("assignee role preassigns");
 
     let result = service
-        .claim_task(task.id.clone(), Assignee::Agent(agent_b), None)
+        .claim_task(task.id.clone(), Assignee::Agent(agent_b.clone()), None)
         .await;
 
-    match result {
-        Err(ServiceError::Conflict(message)) => {
-            assert!(message.contains("role 'assignee' is assigned to a different agent"));
-        }
-        Err(error) => panic!("expected conflict, got {error:?}"),
-        Ok(_) => panic!("expected conflict, got successful claim"),
-    }
+    let claimed = result.expect("legacy singleton assignment does not authorize or reject claim");
+    assert_eq!(
+        claimed.execution.agent_id.as_deref(),
+        Some(agent_b.as_str())
+    );
+    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("TaskRole loads")
+        .expect("TaskRole exists");
+    let memberships = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
+        .await
+        .expect("authoritative memberships load");
+    assert_eq!(memberships.len(), 1);
+    assert_eq!(memberships[0].actor_kind, db::ActorKind::Agent);
+    assert_eq!(memberships[0].actor_id, agent_b);
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "assignee")
+        .await
+        .expect("legacy projection loads")
+        .expect("existing alias is preserved as one projection");
+    assert_eq!(assignment.assignee_id.as_deref(), Some(agent_b.as_str()));
     let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
         .expect("task exists");
-    assert_eq!(task_after.status, "todo");
+    assert_eq!(task_after.status, "in_progress");
 }
 
 #[tokio::test]
@@ -518,7 +581,7 @@ async fn claim_root_with_subtask_does_not_dispatch_parent_coder_prompt() {
     let executions = ExecutionRepo::list_by_task_and_role(
         &*db,
         &root.id,
-        default_roles::CODER,
+        "implementer",
         PageRequest {
             cursor: None,
             limit: 10,

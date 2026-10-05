@@ -261,13 +261,9 @@ async fn validate_role_name(
     let task = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
-    let project = ProjectRepo::get_by_id(db, &task.project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-    if !workflow.roles.iter().any(|role| role.name == role_name) {
+    if db::canonical_task_role_name(role_name).is_none() {
         return Err(ApiError::bad_request(format!(
-            "role '{role_name}' is not defined in workflow"
+            "role '{role_name}' is not a canonical TaskRole"
         )));
     }
     Ok(task.project_id)

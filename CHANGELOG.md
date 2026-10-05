@@ -8,6 +8,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Task progress is now owned by the aggregate `task_lifecycle` record. Legacy
+  `task.status` is a one-way compatibility projection; old workflow states,
+  gates, hooks, and reviewer verdicts cannot advance lifecycle. Existing rows
+  migrate conservatively, with ambiguous review/custom states recorded as
+  blocked migration audit entries. Gate results are immutable evaluations over
+  exact policy revisions and inputs. Callers that used Task status transitions
+  to run workflow hooks must use lifecycle-owned operations or wait for the
+  PR12 public-surface migration. Manual workflow advancement and legacy
+  review/hook recovery actions return `409`; `remaining_retries` is retained as
+  an empty response projection until PR12 replaces that public field. The
+  `reset_retry_window` member is removed from `RecoveryAction`; older request
+  payloads fail decoding, and reopening exhaustion now requires an exact
+  same-Task Proposal and approved Decision.
+
 - Review decisions now come from an exact `role=reviewer`, `purpose=review`
   Execution and its immutable `review_report` Artifact. Task-level approve and
   reject review endpoints return `409`; callers start or select a Human Review
@@ -29,6 +43,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   per-Task claim. Other server processes receive a conflict while integration,
   final merge, publication, or another exclusive integration-workspace
   operation is active.
+- A `merge_readiness` Gate may require only passing ValidationRuns and
+  approving Decisions. Reviewer TaskRole snapshots are invalidated by role or
+  membership changes. Gate creation commits its first policy atomically, and
+  merge admission rechecks the exact current evaluation and source while
+  holding the cross-process Task integration lock.
+
+- Terminal daemon routing now requires a live WorkspaceLease and its exact
+  Execution. Without one, a user-started terminal runs in the guarded local
+  workspace; legacy workflow state and singular assignment no longer select a
+  remote Agent daemon.
+
+- An exhausted exact-failure retry budget now fences transitions back to
+  `ready` or `active`, including board and recovery paths. A failed merge can
+  re-enter rework only from the Blocked state caused by that exact merge
+  operation. Automatic execution retry attempts now come from durable exact
+  failure receipts instead of the legacy Task metadata counter.
 
 - New Execution snapshots no longer write harness-native resume flags such as
   `resume_thread_id` or `resume_session_id` into config. Continuity is expressed
@@ -113,6 +143,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   real "Update model" path for CLI-harness agents there (previously they had
   no way to change their model at all from `/agents`; only the removed
   launch-dialog checkbox could touch it).
+
+### Fixed
+
+- WorkUnit integration failures and final TaskMerge failures now consume
+  separate retry budgets. PullRequest publication first records the exact
+  durable TaskMerge admission, PublishPr child, and provider intent in one
+  transaction, then leaves lifecycle in `merging` while the provider owns an
+  open PR. Exact Merged/Closed results finish that same admission; publication
+  failure results are operation-scoped and replay-safe. A provider `Merged`
+  result whose observed head differs from the admitted SHA remains recorded as
+  `Merged` with a separate `head_mismatch` integrity classification; it blocks
+  the Task without consuming automatic retry budget. Terminal legacy PR rows
+  without an admission are archived before a new modern projection is created;
+  active or unrecognized legacy rows remain fail-closed and cannot acquire
+  retrospective authority. Retry-exhaustion replay rechecks the current blocked
+  lifecycle and Task version, so a Task edit between authorization and effect
+  does not strand the durable override. Generic operation APIs cannot create
+  or finish remote TaskMerge rows, and stale-process cleanup skips a running
+  PublishPr child while its remote TaskMerge is active. Exhaustion remains
+  immutable and can be superseded only by an exact same-Task Human Decision
+  that opens a scoped retry epoch. The unused
+  `TaskService::unblock_task()` primitive was removed because it changed
+  legacy blocked metadata without changing TaskLifecycle;
+  clearing such metadata no longer publishes `task.unblocked` while the
+  lifecycle remains blocked.
 
 ### Added
 

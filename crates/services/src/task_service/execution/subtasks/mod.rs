@@ -82,103 +82,10 @@ pub async fn record_subtask_commit_result(
     })
 }
 
+#[allow(dead_code)] // Legacy completion-driven handoff retired; PR6 consumes durable facts.
 pub enum NextTurn {
     Prompt { user_prompt: String },
     AllDone,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreditResult {
-    /// Parent has no subtasks, no in-progress subtask, or `before_sha` was missing —
-    /// caller should fall through to its normal failure handling.
-    Skipped,
-    /// In-progress subtask exists but the worktree shows no progress.
-    NotCommitted,
-    /// In-progress subtask had a commit; subtask transitioned to `done`.
-    /// `all_done` is true iff every ordered subtask is now terminal.
-    Committed { all_done: bool },
-}
-
-/// Inspect the parent's worktree and credit any commit that the in-progress subtask
-/// produced before its agent thread died. Used by failure paths that would otherwise
-/// throw away a real commit because the executor exited non-zero.
-pub async fn credit_in_progress_subtask_commit(
-    db: &db::SqliteDb,
-    event_bus: &Arc<EventBus>,
-    workspace_root: &Path,
-    parent_id: &str,
-) -> Result<CreditResult, ServiceError> {
-    let workspace = match WorkspaceRepo::get_by_task_id(db, parent_id).await? {
-        Some(workspace) => workspace,
-        None => return Ok(CreditResult::Skipped),
-    };
-    let wt_path = worktree_path(workspace_root, &workspace.worktree_path);
-
-    let ordered_subtasks = list_active_subtasks(db, parent_id).await?;
-    if ordered_subtasks.is_empty() {
-        return Ok(CreditResult::Skipped);
-    }
-    let Some(subtask) = ordered_subtasks
-        .iter()
-        .find(|s| s.status == default_states::IN_PROGRESS)
-        .cloned()
-    else {
-        return Ok(CreditResult::Skipped);
-    };
-
-    let metadata = subtask.metadata().map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid subtask metadata: {error}"))
-    })?;
-    let before_sha = metadata
-        .extra
-        .get(ORDERED_TURN_BEFORE_SHA)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    if before_sha.is_empty() {
-        return Ok(CreditResult::Skipped);
-    }
-
-    let commit_result =
-        record_subtask_commit_result(&wt_path, &before_sha, &subtask.id, &subtask.title).await?;
-
-    event_bus.publish(ForgeEvent {
-        event_type: "task.subtask_commit_recorded".to_owned(),
-        entity_id: parent_id.to_owned(),
-        timestamp: event_timestamp(),
-        context: EventContext::TaskSubtaskCommitRecorded {
-            task_id: parent_id.to_owned(),
-            subtask_id: subtask.id.clone(),
-            result_type: commit_result.result_type().to_owned(),
-            commit_sha: commit_sha(&commit_result),
-        },
-    });
-
-    if matches!(commit_result, SubtaskCommitResult::NoDiff) {
-        return Ok(CreditResult::NotCommitted);
-    }
-
-    let workflow = inherited_subtask_workflow();
-    subtask_engine(db, event_bus, workspace_root)
-        .transition(
-            &subtask.id,
-            default_states::DONE,
-            subtask.version,
-            &workflow,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-            "credit subtask commit despite executor failure",
-            false,
-        )
-        .await?;
-
-    let refreshed = list_active_subtasks(db, parent_id).await?;
-    let all_done = refreshed.iter().all(|s| {
-        matches!(
-            s.status.as_str(),
-            default_states::DONE | default_states::CANCELLED
-        )
-    });
-    Ok(CreditResult::Committed { all_done })
 }
 
 #[allow(dead_code)]
@@ -364,6 +271,7 @@ async fn start_turn_for(
     Ok((subtask, before_sha))
 }
 
+#[allow(dead_code)] // Historical ordered-Task subtask flow; executable scope is a PR5 WorkUnit.
 pub async fn begin_next_turn(
     db: &db::SqliteDb,
     event_bus: &Arc<EventBus>,
@@ -421,6 +329,7 @@ pub async fn begin_next_turn(
     }))
 }
 
+#[allow(dead_code)] // Legacy recursive cascade entry point, retained until PR13 cleanup.
 pub async fn finish_current_turn_and_begin_next(
     db: &db::SqliteDb,
     event_bus: &Arc<EventBus>,

@@ -282,8 +282,10 @@ defect; a formal review requires a separate reviewer Execution.
 Gates express deterministic constraints such as required validation, required
 reviewers, human authorization, merge readiness, or a policy decision. A Gate
 can require several independent, partitioned, or collaborative reviewers.
-Review failure produces rework collaboration and may resume the original
-implementer's exact session.
+Review failure remains an exact ReviewReport input and makes the Gate
+unsatisfied. PR9's exact-failure retry consumer records a durable receipt and
+rework event; the Orchestrator reacts to that event without changing the
+review verdict or Gate outcome.
 
 See [review-and-validation.md](concepts/review-and-validation.md) and
 [gates.md](concepts/gates.md).
@@ -330,6 +332,25 @@ planner thinking, coder thinking, or reviewer thinking. Planning, implementing,
 reviewing, validating, and orchestrating may overlap. UI activity such as
 Planning, three Implementers active, Reviewing, or Waiting for Human is a
 derived projection.
+
+PR9 implements `task_lifecycle`, an optimistic version, and immutable
+transition receipts. The existing `task.status` column is a one-way projection
+of aggregate lifecycle. WorkflowEngine, StateDefinition, GateConfig, hooks,
+and transition-log retry counts no longer advance Task lifecycle or authorize
+Gate outcomes. Gate identity covers Task, WorkUnit, exact merge operation, and
+exact lifecycle transition scopes. Immutable policies and exact-input
+evaluations provide deterministic readiness evidence. Merge readiness rejects
+failed ValidationRuns and non-approving Decisions. TaskRole reviewer snapshots
+use a version fence, and merge admission holds the cross-process Task
+integration lock while rechecking the exact current evaluation and source
+commit. Exact failure receipts own retry consumption outside Gate evaluation.
+A verified retry receipt may direct exact rework from `ready_to_merge` to
+`active`; Actor and status transitions cannot clear merge readiness. V100
+preserves ambiguous legacy states in a migration audit and fails closed. V104
+rechecks mutable exact Gate inputs at lifecycle and merge admission, and V105
+fences merge-ready rework against arbitrary causes. A Gate does not perform
+review, validation, orchestration, or merge work. PR12 owns public endpoint/UI
+alignment, and PR13 owns physical legacy-schema cleanup.
 
 The scheduler starts eligible requested Executions while respecting dependency
 edges, Actor capacity, WorkUnit scope, workspace leases, Gates, Task lifecycle,

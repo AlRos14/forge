@@ -15,7 +15,26 @@ use std::{
 // TaskRole policy snapshots; V096 guards typed-action effects; V097 commits the
 // action receipt with each effect; V098 adds immutable Execution Artifact
 // outputs/inputs and migrates verifiable legacy plan provenance; V099 adds
-// Review Execution outputs, actor-free ValidationRuns, and exact Evidence.
+// Review Execution outputs, actor-free ValidationRuns, and exact Evidence;
+// V100 adds aggregate Task lifecycle and deterministic Gate records; V101 adds
+// immutable retry receipts over exact failure facts; V102 adds TaskRole Gate
+// revision events and permits receipt removal only in guarded Project teardown;
+// V103 prevents exhausted retry budgets from reopening runnable lifecycle states;
+// V104 fences exact mutable Gate inputs at lifecycle and merge admission; V105
+// permits rework only from a current exact retry receipt and fences replay
+// after a later lifecycle transition; V108 separates WorkUnitIntegration and
+// TaskMerge retry domains while retaining V101 merge_failed history; V109
+// durably admits PullRequest TaskMerges before provider publication; V110
+// authorizes exact, failure-kind-scoped retry exhaustion override epochs; V111
+// allows independent exact overrides for every pending exhausted receipt;
+// V112 freezes remote PR subjects and result authority; V113 separates PR
+// admission provenance from historical provider outcomes; V114 preserves
+// provider outcomes separately from integrity classification and archives
+// terminal legacy PR history before a new modern admission; V115 repairs only
+// the exact historical wrong-head retry that still owns the current lifecycle;
+// V116 snapshots terminal modern PR history before reusing its current projection;
+// V117 repairs V115 false-negatives only while the exact wrong rework transition
+// remains current, regardless of unrelated later Task-scoped events.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

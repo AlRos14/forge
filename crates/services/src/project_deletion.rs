@@ -28,8 +28,9 @@ pub async fn delete_project(
 mod tests {
     use super::*;
     use db::{
-        create_sqlite_pool, now_rfc3339, run_migrations, CreateProject, CreateTask, ProjectRepo,
-        TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskRepo,
+        create_sqlite_pool, now_rfc3339, run_migrations, CreateDomainEvent, CreateProject,
+        CreateTask, DomainEventRepo, ProjectRepo, TaskIntegrationOperationKind,
+        TaskIntegrationOperationRepo, TaskRepo,
     };
     use tempfile::TempDir;
 
@@ -81,13 +82,76 @@ mod tests {
         )
         .await
         .expect("task");
+        let source_event = DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "execution.failed".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: db::new_uuid_v4(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: "project-delete-retry-source".to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some("project-delete-retry-source".to_owned()),
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("retry source event");
+        let receipt_event = DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "task.rework_requested".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: "project-delete-retry-receipt".to_owned(),
+                causation_id: Some(source_event.id.clone()),
+                causation_depth: 1,
+                dedupe_key: Some("project-delete-retry-receipt".to_owned()),
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("retry receipt event");
+        sqlx::query(
+            "INSERT INTO task_failure_retry_receipt (
+                id, task_id, failure_kind, failure_ref, source_event_id,
+                attempt_number, retry_budget, disposition, policy_ref,
+                policy_version, policy_digest, receipt_event_id, created_at
+             ) VALUES (?, ?, 'execution_failed', ?, ?, 1, 3, 'rework',
+                       'forge.task_failure_retry', 1, ?, ?, ?)",
+        )
+        .bind(db::new_uuid_v4())
+        .bind(&task_id)
+        .bind(db::new_uuid_v4())
+        .bind(&source_event.id)
+        .bind("a".repeat(64))
+        .bind(&receipt_event.id)
+        .bind(now_rfc3339())
+        .execute(db.pool())
+        .await
+        .expect("durable retry receipt");
         let active = TaskIntegrationOperationRepo::begin(
             &*db,
             db::CreateTaskIntegrationOperation {
                 id: db::new_uuid_v4(),
                 task_id: task_id.clone(),
-                kind: TaskIntegrationOperationKind::TaskMerge,
+                kind: TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
                 owner_id: "crashed-project-owner".to_owned(),
+                gate_evaluation_id: None,
+                remote_waiting: false,
+                parent_operation_id: None,
                 created_at: now_rfc3339(),
             },
         )

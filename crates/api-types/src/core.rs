@@ -83,7 +83,6 @@ pub enum RecoveryAction {
     ResumeProcess,
     UpdateWorkspaceAndRetryHook,
     SkipHookOnce,
-    ResetRetryWindow,
     ProceedOnce,
     OpenInteractive,
 }

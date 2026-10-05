@@ -291,7 +291,7 @@ impl WorkUnitService {
             })
             .await;
         match (result, finish_result) {
-            (Ok(unit), Ok(())) => Ok(unit),
+            (Ok(unit), Ok(_)) => Ok(unit),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
@@ -915,7 +915,7 @@ impl WorkUnitService {
             })
             .await;
         match (result, finish_result) {
-            (Ok(workspace), Ok(())) => Ok(workspace),
+            (Ok(workspace), Ok(_)) => Ok(workspace),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
@@ -1209,7 +1209,7 @@ impl WorkUnitService {
         };
         let finish_result = operation.finish(operation_status).await;
         match (result, finish_result) {
-            (Ok(record), Ok(())) => Ok(record),
+            (Ok(record), Ok(_)) => Ok(record),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
@@ -2182,6 +2182,48 @@ mod tests {
         assert_eq!(conflict.source_workspace_id, second_workspace.id);
         assert_eq!(conflict.target_before_sha, before_conflict);
         assert!(conflict.conflict_metadata_json.is_some());
+        let conflict_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE entity_type = 'work_unit_integration' AND entity_id = ?
+               AND event_type = 'work_unit.integration_conflicted'",
+        )
+        .bind(&conflict.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("exact WorkUnitIntegration conflict event");
+        let conflict_event = db::DomainEventRepo::get_event(&*db, &conflict_event_id)
+            .await
+            .expect("conflict event lookup")
+            .expect("conflict event");
+        let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&conflict_event)
+                .await
+                .expect("consume exact WorkUnitIntegration conflict"),
+            1
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&conflict_event)
+                .await
+                .expect("replay exact WorkUnitIntegration conflict"),
+            1
+        );
+        let integration_attempt: i64 = sqlx::query_scalar(
+            "SELECT attempt_number FROM task_failure_retry_receipt
+             WHERE task_id = ? AND failure_kind = 'work_unit_integration_failed'
+               AND failure_ref = ?",
+        )
+        .bind(&task_id)
+        .bind(&conflict.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("exact WorkUnitIntegration retry attempt");
+        assert_eq!(integration_attempt, 1);
         assert_eq!(
             git::get_current_sha(&integration_path).await.unwrap(),
             before_conflict
@@ -2335,7 +2377,7 @@ mod tests {
             .integration_operations
             .acquire(
                 &task_id,
-                db::TaskIntegrationOperationKind::TaskMerge,
+                db::TaskIntegrationOperationKind::WorkUnitIntegration,
                 "recovery-after-process-exit",
             )
             .await
@@ -2628,19 +2670,22 @@ mod tests {
         )
         .await
         .expect("failed attempt remains historical");
-        let failed_lease =
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+        assert!(
+            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id,)
                 .await
                 .expect("failed attempt lease lookup")
-                .expect("failed attempt lease remains active until runner cleanup");
-        db::WorkspaceLeaseRepo::revoke(
-            &*db,
-            &failed_lease.id,
-            failed_lease.version,
-            &now_rfc3339(),
-        )
-        .await
-        .expect("failed attempt authority is revoked before workspace cleanup");
+                .is_none()
+        );
+        let failed_lease_status: String =
+            sqlx::query_scalar("SELECT status FROM workspace_lease WHERE execution_id = ?")
+                .bind(&first_attempt_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("failed attempt lease remains auditable");
+        assert_eq!(
+            failed_lease_status, "revoked",
+            "terminal Execution commits lease revocation atomically"
+        );
         WorkspaceRepo::claim_work_unit_cleanup(
             &*db,
             &original_workspace.id,
@@ -2750,14 +2795,22 @@ mod tests {
         )
         .await
         .expect("retry attempt can stop");
-        let retry_lease =
+        assert!(
             db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
                 .await
                 .expect("retry lease lookup")
-                .expect("retry lease remains active until runner cleanup");
-        db::WorkspaceLeaseRepo::revoke(&*db, &retry_lease.id, retry_lease.version, &now_rfc3339())
-            .await
-            .expect("retry authority is revoked before cleanup");
+                .is_none()
+        );
+        let retry_lease_status: String =
+            sqlx::query_scalar("SELECT status FROM workspace_lease WHERE execution_id = ?")
+                .bind(&retry_attempt_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("cancelled retry lease remains auditable");
+        assert_eq!(
+            retry_lease_status, "revoked",
+            "terminal Execution commits lease revocation atomically"
+        );
         cleanup
             .cleanup_now(recovered_workspace.id.clone())
             .await

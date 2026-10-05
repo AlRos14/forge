@@ -93,6 +93,87 @@ async fn transition_rejects_invalid_move_and_cancel_is_idempotent() {
 }
 
 #[tokio::test]
+async fn replayed_cancel_reconciles_execution_after_lifecycle_commit() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Cancellation replay",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    db::ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            actor_ref: None,
+            purpose: None,
+            harness_session_id: None,
+            role: "interactive".to_owned(),
+            status: db::ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Running Execution creates before cancellation");
+
+    crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), event_bus)
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: task.id.clone(),
+            expected_task_version: task.version,
+            to_state: db::TaskLifecycleState::Cancelled,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::CancelTask,
+            ),
+            reason_kind: Some("test_crash_window".to_owned()),
+            reason_ref: Some(execution_id.clone()),
+            idempotency_key: format!("test-cancel-crash-window:{execution_id}"),
+        })
+        .await
+        .expect("lifecycle cancellation commits before simulated cleanup crash");
+
+    service
+        .perform_task_action(task.id, api_types::TaskAction::Cancel, None, None)
+        .await
+        .expect("replayed API cancellation reconciles remaining work");
+    let execution = db::ExecutionRepo::get_by_id(&*db, &execution_id)
+        .await
+        .expect("Execution loads")
+        .expect("Execution exists");
+    assert_eq!(execution.status, db::ExecutionStatus::Cancelled);
+}
+
+#[tokio::test]
 async fn transition_from_planning_does_not_require_plan_approval_or_checklist() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

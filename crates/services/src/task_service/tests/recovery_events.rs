@@ -2,108 +2,51 @@ use super::helpers::*;
 use super::*;
 
 #[tokio::test]
-async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
+async fn clearing_blocked_metadata_does_not_publish_unblocked_while_lifecycle_is_blocked() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Completed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    seed_failed_review(
-        &db,
-        &task.id,
-        &execution.id,
-        1,
-        json!({ "ci_steps": [{"command": "cargo test", "exit_code": 1}] }),
-    )
-    .await;
-    seed_review_rejection_log(&db, &task.id, "review failed once").await;
-    seed_review_rejection_log(&db, &task.id, "review failed twice").await;
-    let task = set_retry_exhausted_metadata(&db, &task).await;
-    let mut rx = event_bus.subscribe();
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "blocked").await;
+    sqlx::query("UPDATE task SET blocked_json = ? WHERE id = ?")
+        .bind(format!(
+            r#"{{"kind":"retry_exhausted","reason":"test exhaustion","created_at":"{}"}}"#,
+            now_rfc3339()
+        ))
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("legacy blocking metadata persists for the regression");
+    let mut events = event_bus.subscribe();
 
     service
         .recover_task(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
-            Some("reason".to_owned()),
+            api_types::RecoveryAction::CancelTask,
+            Some("close the blocked Task".to_owned()),
             None,
         )
         .await
-        .expect("reset retry window succeeds");
+        .expect("the authorized lifecycle cancellation completes");
 
-    let mut events = Vec::new();
-    while let Ok(Ok(event)) =
-        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
-    {
-        events.push(event);
-    }
-
-    let recovery_events = events
-        .iter()
-        .filter(|event| event.event_type == "task.recovery_applied")
-        .collect::<Vec<_>>();
-    assert_eq!(recovery_events.len(), 2);
-    let event = recovery_events
-        .iter()
-        .find(|event| {
-            matches!(
-                &event.context,
-                EventContext::RecoveryApplied { action, .. } if action == "reset_retry_window"
-            )
-        })
-        .expect("reset retry window recovery event");
-    assert_eq!(event.entity_id, task.id);
-    match &event.context {
-        EventContext::RecoveryApplied {
-            project_id: event_project_id,
-            task_id,
-            action,
-            state,
-            transition_log_id,
-        } => {
-            assert_eq!(event_project_id, &project_id);
-            assert_eq!(task_id, &task.id);
-            assert_eq!(action, "reset_retry_window");
-            assert_eq!(
-                state.as_deref(),
-                Some(crate::workflow::default_states::REVIEW)
-            );
-            assert!(transition_log_id.is_some());
+    assert_eq!(
+        db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle loads")
+            .expect("lifecycle exists")
+            .state,
+        db::TaskLifecycleState::Cancelled
+    );
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(20), events.recv()).await {
+            Ok(Ok(event)) => assert_ne!(
+                event.event_type, "task.unblocked",
+                "clearing legacy metadata cannot claim a blocked lifecycle was reopened"
+            ),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
         }
-        other => panic!("unexpected event context: {other:?}"),
     }
-
-    assert!(
-        events.iter().any(|event| {
-            matches!(
-                &event.context,
-                EventContext::RecoveryApplied { action, .. } if action == "resume_process"
-            )
-        }),
-        "reset_retry_window should resume process and publish resume_process recovery event"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.event_type == "task.status_changed"),
-        "reset_retry_window should resume work and publish task.status_changed"
-    );
 }
 
 async fn seed_assigned_task(
@@ -149,8 +92,6 @@ async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
     let task = seed_assigned_task(&db, &project_id, &repo_id, &agent_id).await;
     assert_eq!(task.assignee_id.as_deref(), Some(agent_id.as_str()));
 
-    // The workspace-failure path ends in fail_task, which clears any blocking
-    // annotation; the reset decision must survive on the failed metadata kind.
     service
         .fail_task(
             task.id.clone(),

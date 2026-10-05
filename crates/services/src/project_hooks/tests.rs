@@ -5,7 +5,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateProjectHookRun, CreateTask, DaemonRepo, DaemonStatus,
     ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, SqliteDb, Task,
-    TaskRepo, UpdateDaemonReport, UpdateTaskStatus, UpsertDaemon,
+    TaskRepo, UpdateDaemonReport, UpsertDaemon,
 };
 use events::EventBus;
 use serde_json::json;
@@ -339,21 +339,38 @@ async fn all_work_completed_ignores_running_automation_task_and_automation_does_
         )
         .await
         .expect("automation task creates");
-    TaskRepo::update_status(
-        &*db,
-        UpdateTaskStatus {
-            id: automation_task.id,
-            expected_version: automation_task.version,
-            status: "in_progress".to_owned(),
-            assignee_id: None,
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("automation task is marked running");
+    let lifecycle_service = crate::task_lifecycle::TaskLifecycleService::new(
+        Arc::clone(&db),
+        Arc::clone(&service.event_bus),
+    );
+    let ready = lifecycle_service
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: automation_task.id.clone(),
+            expected_task_version: automation_task.version,
+            to_state: db::TaskLifecycleState::Ready,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::General,
+            ),
+            reason_kind: Some("automation_test".to_owned()),
+            reason_ref: Some("queued automation".to_owned()),
+            idempotency_key: format!("automation-ready:{}", automation_task.id),
+        })
+        .await
+        .expect("automation task lifecycle is ready");
+    lifecycle_service
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: automation_task.id.clone(),
+            expected_task_version: ready.task.version,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::General,
+            ),
+            reason_kind: Some("automation_test".to_owned()),
+            reason_ref: Some("dispatcher is active".to_owned()),
+            idempotency_key: format!("automation-active:{}", automation_task.id),
+        })
+        .await
+        .expect("automation task lifecycle is active");
 
     let project_after_automation = ProjectRepo::get_by_id(&*db, &project.id)
         .await
@@ -412,6 +429,54 @@ async fn all_work_completed_matches_when_all_visible_tasks_are_cancelled() {
     assert_eq!(
         trigger_match.source_task_id.as_deref(),
         Some(cancelled_task.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn all_work_completed_uses_aggregate_lifecycle_over_custom_workflow_terminality() {
+    let (db, _service) = test_service().await;
+    let mut project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "in_progress", false).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    let active_projection = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "in_progress")
+        .expect("legacy active projection exists");
+    active_projection.kind = api_types::StateKind::Terminal;
+    let definition = serde_json::to_string(&workflow).expect("workflow serializes");
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(&definition)
+        .bind(&project.id)
+        .execute(db.pool())
+        .await
+        .expect("custom workflow stores");
+    project.workflow_definition = definition;
+    assert_eq!(
+        db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle loads")
+            .expect("lifecycle exists")
+            .state,
+        db::TaskLifecycleState::Active
+    );
+    let cause = EvaluationCause::TaskTransitioned {
+        task_id: task.id.clone(),
+    };
+    let trigger_context = TriggerContext {
+        db: db.as_ref(),
+        project: &project,
+        cause: &cause,
+    };
+
+    let trigger_match = AllWorkCompletedTrigger
+        .evaluate(&trigger_context)
+        .await
+        .expect("trigger evaluates");
+
+    assert!(
+        trigger_match.is_none(),
+        "a workflow cannot make active aggregate work terminal"
     );
 }
 

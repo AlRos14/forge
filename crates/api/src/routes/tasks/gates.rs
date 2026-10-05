@@ -1,337 +1,309 @@
 use super::*;
+use api_types::{
+    CreateTaskGateRequest, GateEvaluationInputResponse, GateEvaluationResponse,
+    GatePolicyRevisionResponse, GateResponse, MergeAfterGateRequest, MergeAfterGateResponse,
+    ReviseGatePolicyRequest, TaskGateResponse, TaskLifecycleResponse,
+};
+use db::{
+    Gate, GateEvaluation, GateEvaluationInput, GatePolicyRevision, GateRepo, GateScopeKind,
+    TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState,
+};
+use services::gate_engine::GateEngine;
+use std::sync::Arc;
+
+fn gate_response(gate: Gate) -> TaskGateResponse {
+    TaskGateResponse {
+        id: gate.id,
+        task_id: gate.task_id,
+        gate_kind: gate.gate_kind,
+        scope_kind: gate.scope_kind.to_string(),
+        scope_id: gate.scope_id,
+        active_policy_revision: gate.active_policy_revision,
+        created_at: gate.created_at,
+    }
+}
+
+fn lifecycle_response(lifecycle: db::TaskLifecycle) -> TaskLifecycleResponse {
+    TaskLifecycleResponse {
+        task_id: lifecycle.task_id,
+        state: match lifecycle.state {
+            DbTaskLifecycleState::Backlog => api_types::TaskLifecycleState::Backlog,
+            DbTaskLifecycleState::Ready => api_types::TaskLifecycleState::Ready,
+            DbTaskLifecycleState::Active => api_types::TaskLifecycleState::Active,
+            DbTaskLifecycleState::Blocked => api_types::TaskLifecycleState::Blocked,
+            DbTaskLifecycleState::ReadyToMerge => api_types::TaskLifecycleState::ReadyToMerge,
+            DbTaskLifecycleState::Merging => api_types::TaskLifecycleState::Merging,
+            DbTaskLifecycleState::Done => api_types::TaskLifecycleState::Done,
+            DbTaskLifecycleState::Cancelled => api_types::TaskLifecycleState::Cancelled,
+        },
+        version: lifecycle.version,
+        reason_kind: lifecycle.reason_kind,
+        reason_ref: lifecycle.reason_ref,
+        created_at: lifecycle.created_at,
+        updated_at: lifecycle.updated_at,
+    }
+}
+
+pub async fn get_task_lifecycle(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+) -> ApiResult<Json<TaskLifecycleResponse>> {
+    require_task_visible(&state, &task_id, &user).await?;
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*state.db, &task_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task lifecycle", task_id))?;
+    Ok(Json(lifecycle_response(lifecycle)))
+}
+
+fn policy_response(policy: GatePolicyRevision) -> ApiResult<GatePolicyRevisionResponse> {
+    Ok(GatePolicyRevisionResponse {
+        gate_id: policy.gate_id,
+        revision: policy.revision,
+        schema_version: policy.schema_version,
+        policy: serde_json::from_str(&policy.policy_json)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        policy_digest: policy.policy_digest,
+        created_at: policy.created_at,
+    })
+}
+
+fn evaluation_response(
+    evaluation: GateEvaluation,
+    inputs: Vec<GateEvaluationInput>,
+) -> ApiResult<GateEvaluationResponse> {
+    Ok(GateEvaluationResponse {
+        id: evaluation.id,
+        gate_id: evaluation.gate_id,
+        task_id: evaluation.task_id,
+        policy_revision: evaluation.policy_revision,
+        outcome: evaluation.outcome.to_string(),
+        input_digest: evaluation.input_digest,
+        result: serde_json::from_str(&evaluation.result_json)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        evaluated_at: evaluation.evaluated_at,
+        inputs: inputs
+            .into_iter()
+            .map(evaluation_input_response)
+            .collect::<ApiResult<Vec<_>>>()?,
+    })
+}
+
+fn evaluation_input_response(input: GateEvaluationInput) -> ApiResult<GateEvaluationInputResponse> {
+    Ok(GateEvaluationInputResponse {
+        ordinal: input.ordinal,
+        input_kind: input.input_kind,
+        input_id: input.input_id,
+        input_version: input.input_version,
+        input_digest: input.input_digest,
+        producer_ref: input.producer_ref,
+        subject: serde_json::from_str(&input.subject_json)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        status: input.status,
+    })
+}
+
+pub async fn create_task_gate(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Json(request): Json<CreateTaskGateRequest>,
+) -> ApiResult<Json<GateResponse>> {
+    require_task_visible(&state, &task_id, &user).await?;
+    let policy = serde_json::from_value(request.policy)
+        .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
+    let engine = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus));
+    let (gate, revision) = engine
+        .create_gate_with_initial_policy(
+            &task_id,
+            &request.gate_kind,
+            GateScopeKind::Task,
+            &task_id,
+            policy,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(GateResponse {
+        gate: gate_response(gate),
+        active_policy: Some(policy_response(revision)?),
+    }))
+}
+
+pub async fn get_gate(
+    State(state): State<AppState>,
+    Path(gate_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+) -> ApiResult<Json<GateResponse>> {
+    let gate = GateRepo::get_gate(&*state.db, &gate_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Gate", gate_id.clone()))?;
+    require_task_visible(&state, &gate.task_id, &user).await?;
+    let active_policy = match gate.active_policy_revision {
+        Some(revision) => Some(policy_response(
+            GateRepo::get_gate_policy_revision(&*state.db, &gate.id, revision)
+                .await?
+                .ok_or_else(|| ApiError::not_found("Gate policy revision", gate.id.clone()))?,
+        )?),
+        None => None,
+    };
+    Ok(Json(GateResponse {
+        gate: gate_response(gate),
+        active_policy,
+    }))
+}
+
+pub async fn revise_gate_policy(
+    State(state): State<AppState>,
+    Path(gate_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Json(request): Json<ReviseGatePolicyRequest>,
+) -> ApiResult<Json<GatePolicyRevisionResponse>> {
+    let gate = GateRepo::get_gate(&*state.db, &gate_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Gate", gate_id.clone()))?;
+    require_task_visible(&state, &gate.task_id, &user).await?;
+    let policy = serde_json::from_value(request.policy)
+        .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
+    let revision = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
+        .revise_policy(&gate_id, request.expected_active_revision, policy)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(policy_response(revision)?))
+}
+
+pub async fn evaluate_gate(
+    State(state): State<AppState>,
+    Path(gate_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+) -> ApiResult<Json<GateEvaluationResponse>> {
+    let gate = GateRepo::get_gate(&*state.db, &gate_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Gate", gate_id.clone()))?;
+    require_task_visible(&state, &gate.task_id, &user).await?;
+    let evaluation = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
+        .evaluate_active(&gate_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(evaluation_response(
+        evaluation.evaluation,
+        evaluation.inputs,
+    )?))
+}
+
+pub async fn get_gate_evaluation(
+    State(state): State<AppState>,
+    Path(evaluation_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+) -> ApiResult<Json<GateEvaluationResponse>> {
+    let evaluation = GateRepo::get_gate_evaluation(&*state.db, &evaluation_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("GateEvaluation", evaluation_id.clone()))?;
+    require_task_visible(&state, &evaluation.task_id, &user).await?;
+    let inputs = GateRepo::list_gate_evaluation_inputs(&*state.db, &evaluation.id).await?;
+    Ok(Json(evaluation_response(evaluation, inputs)?))
+}
+
+pub async fn merge_after_gate(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Json(request): Json<MergeAfterGateRequest>,
+) -> ApiResult<Json<MergeAfterGateResponse>> {
+    require_task_visible(&state, &task_id, &user).await?;
+    let outcome = state
+        .merge_service
+        .merge_after_gate(task_id, &request.gate_evaluation_id)
+        .await
+        .map_err(ApiError::from)?;
+    let response = match outcome {
+        services::MergeOutcome::Done {
+            before_sha,
+            after_sha,
+            branch,
+        } => MergeAfterGateResponse {
+            outcome: "done".to_owned(),
+            before_sha: Some(before_sha),
+            after_sha: Some(after_sha),
+            branch: Some(branch),
+            pr_url: None,
+            target_branch: None,
+            details: None,
+            files: Vec::new(),
+        },
+        services::MergeOutcome::PullRequest {
+            pr_url,
+            branch,
+            target_branch,
+        } => MergeAfterGateResponse {
+            outcome: "pull_request".to_owned(),
+            before_sha: None,
+            after_sha: None,
+            branch: Some(branch),
+            pr_url,
+            target_branch: Some(target_branch),
+            details: None,
+            files: Vec::new(),
+        },
+        services::MergeOutcome::Conflict {
+            details,
+            conflict_paths,
+        } => MergeAfterGateResponse {
+            outcome: "conflict".to_owned(),
+            before_sha: None,
+            after_sha: None,
+            branch: None,
+            pr_url: None,
+            target_branch: None,
+            details: Some(details),
+            files: conflict_paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        },
+        services::MergeOutcome::Dirty { files } => MergeAfterGateResponse {
+            outcome: "dirty".to_owned(),
+            before_sha: None,
+            after_sha: None,
+            branch: None,
+            pr_url: None,
+            target_branch: None,
+            details: None,
+            files,
+        },
+        services::MergeOutcome::TargetDirty { files } => MergeAfterGateResponse {
+            outcome: "target_dirty".to_owned(),
+            before_sha: None,
+            after_sha: None,
+            branch: None,
+            pr_url: None,
+            target_branch: None,
+            details: None,
+            files,
+        },
+    };
+    Ok(Json(response))
+}
 
 pub async fn approve_gate(
     State(state): State<AppState>,
     user: crate::routes::auth::AuthenticatedUser,
-    Path((id, state_name)): Path<(String, String)>,
-    Json(request): Json<ApproveGateRequest>,
+    Path((task_id, _state_name)): Path<(String, String)>,
+    Json(_request): Json<api_types::ApproveGateRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
-    if state_name == default_states::REVIEW {
-        return project_review_gate_decision(
-            &state,
-            &user,
-            &id,
-            request.version,
-            GateDecision::Approve,
-            request.reason,
-        )
-        .await
-        .map(Json);
-    }
-    let task = transition_gate(
-        &state,
-        id,
-        state_name,
-        request.version,
-        request.reason,
-        GateDecision::Approve,
-    )
-    .await?;
-    Ok(Json(task))
+    require_task_visible(&state, &task_id, &user).await?;
+    Err(ApiError::invalid_operation_conflict(
+        "Legacy workflow Gate approval is retired; use an exact GateEvaluation and Decision or ReviewReport",
+    ))
 }
 
 pub async fn reject_gate(
     State(state): State<AppState>,
     user: crate::routes::auth::AuthenticatedUser,
-    Path((id, state_name)): Path<(String, String)>,
-    Json(request): Json<RejectGateRequest>,
+    Path((task_id, _state_name)): Path<(String, String)>,
+    Json(_request): Json<api_types::RejectGateRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
-    if state_name == default_states::REVIEW {
-        return project_review_gate_decision(
-            &state,
-            &user,
-            &id,
-            request.version,
-            GateDecision::Reject,
-            Some(request.reason),
-        )
-        .await
-        .map(Json);
-    }
-    let task = transition_gate(
-        &state,
-        id,
-        state_name,
-        request.version,
-        Some(required_reject_reason(request.reason)?),
-        GateDecision::Reject,
-    )
-    .await?;
-    Ok(Json(task))
-}
-
-/// The legacy generic gate URL has no Execution id in its request. Preserve
-/// it only as a projection when exactly one live Human reviewer Execution for
-/// this user exists; the durable verdict is still its exact ReviewReport.
-async fn project_review_gate_decision(
-    state: &AppState,
-    user: &crate::routes::auth::AuthenticatedUser,
-    task_id: &str,
-    expected_version: i64,
-    decision: GateDecision,
-    reason: Option<String>,
-) -> ApiResult<TaskResponse> {
-    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
-    if task.status != default_states::REVIEW {
-        return Err(ApiError::invalid_operation_conflict(format!(
-            "task {task_id} is in {} state; expected review",
-            task.status
-        )));
-    }
-    if task.version != expected_version {
-        return Err(ApiError::invalid_operation_conflict(
-            "Task changed since the review decision was prepared",
-        ));
-    }
-
-    let page = ExecutionRepo::list_by_task_and_role(
-        &*state.db,
-        task_id,
-        services::workflow::default_roles::REVIEWER,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    let mut candidates = page.items.into_iter().filter(|execution| {
-        execution.purpose == Some(db::ExecutionPurpose::Review)
-            && execution.status == ExecutionStatus::Running
-            && execution.actor_ref() == Some(db::ActorRef::Human(user.user_id.clone()))
-    });
-    let Some(execution) = candidates.next() else {
-        return Err(ApiError::invalid_operation_conflict(
-            "Review decision requires one running Human reviewer Execution for this user",
-        ));
-    };
-    if candidates.next().is_some() || page.next_cursor.is_some() {
-        return Err(ApiError::invalid_operation_conflict(
-            "Review decision is ambiguous; submit a ReviewReport to the exact Execution id",
-        ));
-    }
-
-    let (verdict, summary, findings) = match decision {
-        GateDecision::Approve => (
-            api_types::ReviewReportVerdict::Pass,
-            reason
-                .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or_else(|| "Human reviewer approved this Task.".to_owned()),
-            Vec::new(),
-        ),
-        GateDecision::Reject => {
-            let reason = reason
-                .filter(|reason| !reason.trim().is_empty())
-                .ok_or_else(|| ApiError::bad_request("Review changes require a reason"))?;
-            (
-                api_types::ReviewReportVerdict::RequestChanges,
-                reason.clone(),
-                vec![reason],
-            )
-        }
-    };
-    state
-        .task_service
-        .submit_human_review_report(
-            &execution.id,
-            &user.user_id,
-            api_types::SubmitReviewReportRequest {
-                verdict,
-                summary,
-                criteria: vec!["Human review decision".to_owned()],
-                findings,
-                questions: Vec::new(),
-                evidence_ids: Vec::new(),
-                artifact_ids: Vec::new(),
-            },
-        )
-        .await?;
-    let updated = TaskRepo::get_by_id(&*state.db, task_id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
-    let mut response = task_response(&state.db, updated).await?;
-    response.awaiting_human = state
-        .task_service
-        .is_awaiting_human(task_id.to_owned())
-        .await?;
-    Ok(response)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateDecision {
-    Approve,
-    Reject,
-}
-
-async fn transition_gate(
-    state: &AppState,
-    task_id: String,
-    state_name: String,
-    version: i64,
-    reason: Option<String>,
-    decision: GateDecision,
-) -> ApiResult<TaskResponse> {
-    let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", task_id.clone()))?;
-    let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow_for_task(
-        &task,
-        &project.workflow_definition,
-        &api_types::Actor::user(api_types::UserActionSource::Api),
-    );
-    let gate_state = workflow
-        .states
-        .iter()
-        .find(|state| state.name == state_name)
-        .ok_or_else(|| ApiError::bad_request(format!("state '{state_name}' is not defined")))?;
-    if gate_state.kind != StateKind::Gate {
-        return Err(ApiError::bad_request(format!(
-            "state '{state_name}' is not a gate"
-        )));
-    }
-    if task.status != state_name {
-        return Err(ApiError::invalid_operation_conflict(format!(
-            "task {task_id} is in {} state; expected {state_name}",
-            task.status
-        )));
-    }
-    if state_name == default_states::REVIEW {
-        return Err(ApiError::invalid_operation_conflict(
-            "Review gates require a completed reviewer Execution and exact ReviewReport; task-level approval is retired",
-        ));
-    }
-    ensure_gate_decision_ready(state, &task_id, gate_state).await?;
-
-    let target_state = gate_decision_target(&workflow, &state_name, decision)?;
-    let trigger_reason = gate_decision_reason(decision, reason);
-    let result = state
-        .task_service
-        .transition(
-            task_id.clone(),
-            target_state,
-            (
-                version,
-                Some(trigger_reason.clone()),
-                decision == GateDecision::Reject,
-            ),
-        )
-        .await?;
-
-    let mut response = task_response(&state.db, result.task).await?;
-    response.awaiting_human = state
-        .task_service
-        .is_awaiting_human(response.id.clone())
-        .await?;
-    Ok(response)
-}
-
-async fn ensure_gate_decision_ready(
-    state: &AppState,
-    task_id: &str,
-    gate_state: &api_types::StateDefinition,
-) -> ApiResult<()> {
-    let Some(role) = gate_state.role.as_deref() else {
-        return Ok(());
-    };
-    let page = ExecutionRepo::list_by_task(
-        &*state.db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    if page.items.iter().any(|execution| {
-        execution.work_unit_id.is_none()
-            && execution.role == role
-            && execution.status == ExecutionStatus::Running
-    }) {
-        return Err(ApiError::invalid_operation_conflict(format!(
-            "gate '{}' is still running {role} execution; wait for it to finish before approving or rejecting",
-            gate_state.name
-        )));
-    }
-    Ok(())
-}
-
-fn gate_decision_target(
-    workflow: &WorkflowDefinition,
-    gate_state: &str,
-    decision: GateDecision,
-) -> ApiResult<String> {
-    let gate = workflow
-        .states
-        .iter()
-        .find(|state| state.name == gate_state)
-        .ok_or_else(|| ApiError::bad_request(format!("unknown gate state '{gate_state}'")))?;
-
-    let trigger_target = |trigger: WorkflowTrigger| {
-        gate.triggers
-            .get(&trigger)
-            .map(|definition| definition.to.as_str())
-    };
-
-    match decision {
-        GateDecision::Approve => {
-            if let Some(target) = trigger_target(WorkflowTrigger::Accept) {
-                return Ok(target.to_owned());
-            }
-
-            Err(ApiError::bad_request(format!(
-                "gate '{gate_state}' has no approve target"
-            )))
-        }
-        GateDecision::Reject => {
-            if let Some(reject_target) = workflow
-                .states
-                .iter()
-                .find(|state| state.name == gate_state)
-                .and_then(|state| state.gate_config.as_ref())
-                .and_then(|config| config.reject_target.as_deref())
-            {
-                if trigger_target(WorkflowTrigger::Reject) == Some(reject_target) {
-                    return Ok(reject_target.to_owned());
-                }
-            }
-
-            if let Some(target) = trigger_target(WorkflowTrigger::Reject) {
-                return Ok(target.to_owned());
-            }
-
-            Err(ApiError::bad_request(format!(
-                "gate '{gate_state}' has no reject target"
-            )))
-        }
-    }
-}
-
-fn gate_decision_reason(decision: GateDecision, reason: Option<String>) -> String {
-    let prefix = match decision {
-        GateDecision::Approve => "gate approved",
-        GateDecision::Reject => "gate rejected",
-    };
-    reason
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("{prefix}: {value}"))
-        .unwrap_or_else(|| prefix.to_owned())
-}
-
-fn required_reject_reason(reason: String) -> ApiResult<String> {
-    let reason = reason.trim().to_owned();
-    if reason.is_empty() {
-        return Err(ApiError::bad_request("rejection reason is required"));
-    }
-    Ok(reason)
+    require_task_visible(&state, &task_id, &user).await?;
+    Err(ApiError::invalid_operation_conflict(
+        "Legacy workflow Gate rejection is retired; use an exact GateEvaluation and Decision or ReviewReport",
+    ))
 }

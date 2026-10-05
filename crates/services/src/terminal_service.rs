@@ -10,7 +10,7 @@ use std::{
 };
 
 use api_types::{
-    StateKind, TerminalAttachTokenResponse, TerminalAvailability, TerminalExitedNotification,
+    TerminalAttachTokenResponse, TerminalAvailability, TerminalExitedNotification,
     TerminalInputParams, TerminalInputResult, TerminalOutputNotification, TerminalResizeParams,
     TerminalResizeResult, TerminalServerFrame, TerminalSessionResponse,
     TerminalSessionStatus as ApiTerminalSessionStatus, TerminalStartParams, TerminalStartResult,
@@ -23,11 +23,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use config::TerminalConfig;
 use db::{
-    new_uuid_v4, now_rfc3339, AgentRepo, AssigneeKind, CreateTerminalSession, ExecutionRepo,
-    ProjectRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, TaskRoleRepo, TerminalSession,
-    TerminalSessionRepo, TerminalSessionStatus as DbTerminalSessionStatus,
-    UpdateTerminalSessionStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
+    new_uuid_v4, now_rfc3339, AgentRepo, CreateTerminalSession, ExecutionRepo, SqliteDb, Task,
+    TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TerminalSession, TerminalSessionRepo,
+    TerminalSessionStatus as DbTerminalSessionStatus, UpdateTerminalSessionStatus,
+    WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceScopeKind,
+    WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -40,7 +40,6 @@ use tokio::{
 use crate::{
     daemon_transport::{DaemonConnectionRegistry, DaemonTerminalEventHandler},
     task_integration_operation::TaskIntegrationOperationManager,
-    workflow::{effective_role, engine::WorkflowEngine},
     workspace_cleanup::WorkspaceCleanupObserver,
     ServiceError, WorkspaceExecutionLockManager,
 };
@@ -774,26 +773,12 @@ impl TerminalService {
         if workspace.status != WorkspaceStatus::Ready || workspace.worktree_path.trim().is_empty() {
             return Ok(false);
         }
-
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::General),
-        );
-        let state_kind = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .map(|state| &state.kind);
-
-        // Decision: the spec says "ready/active"; current workflows model ready work
-        // as the Initial state kind and active work as the Active state kind.
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
         Ok(matches!(
-            state_kind,
-            Some(StateKind::Initial | StateKind::Active)
+            lifecycle.state,
+            TaskLifecycleState::Ready | TaskLifecycleState::Active
         ))
     }
 
@@ -816,10 +801,8 @@ impl TerminalService {
         task: &Task,
         _workspace: &Workspace,
     ) -> Result<Option<String>, ServiceError> {
-        // A live lease/execution is the concrete workspace authority.  A
-        // membership is never used to grant terminal or embedded workspace
-        // access.  Legacy daemon routing remains available only for tasks
-        // which have not acquired a replacement TaskRole yet.
+        // A live lease/execution is the concrete workspace authority. A
+        // TaskRole or legacy assignment cannot grant terminal access by itself.
         if let Some(lease) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await? {
             if let Some(execution) =
                 ExecutionRepo::get_by_id(&*self.db, &lease.execution_id).await?
@@ -829,42 +812,10 @@ impl TerminalService {
             return Err(ServiceError::TerminalWorkspaceNotReady);
         }
 
-        if !TaskRoleRepo::list_by_task(&*self.db, &task.id)
-            .await?
-            .is_empty()
-        {
-            return Err(ServiceError::TerminalWorkspaceNotReady);
-        }
-
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::General),
-        );
-        let Some(role_name) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(effective_role)
-        else {
-            return Ok(None);
-        };
-        if task.assignee_type.as_deref() == Some("agent") {
-            return self.agent_daemon_id(task.assignee_id.as_deref()).await;
-        }
-        let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name).await?
-        else {
-            return Ok(None);
-        };
-        if assignment.assignee_type != Some(AssigneeKind::Agent) {
-            return Ok(None);
-        }
-        self.agent_daemon_id(assignment.assignee_id.as_deref())
-            .await
+        // With no live Execution lease, a user-started terminal uses the
+        // guarded local workspace process; legacy workflow state and a
+        // singular assignment cannot route it to a remote Agent daemon.
+        Ok(None)
     }
 
     async fn agent_daemon_id(

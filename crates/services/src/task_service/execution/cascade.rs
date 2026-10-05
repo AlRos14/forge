@@ -1,125 +1,18 @@
+// Legacy retry/review cascade helpers remain stored until PR13 cleanup. The
+// public completion entry point below is intentionally a no-op after PR9.
+#![allow(dead_code)]
+
 use super::*;
 use db::WorkspaceRepo;
 use sha2::{Digest, Sha256};
 
 impl TaskService {
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
-        let execution = match ExecutionRepo::get_by_id(&*self.db, execution_id).await? {
-            Some(execution) => execution,
-            None => return Ok(()),
-        };
-        if execution.role == crate::workflow::default_roles::REVIEWER {
-            if execution.purpose != Some(ExecutionPurpose::Review) {
-                return Ok(());
-            }
-            if execution.status == ExecutionStatus::Running {
-                return Ok(());
-            }
-            return self.maybe_cascade_reviewer_completion(&execution).await;
-        }
-        if execution.status != ExecutionStatus::Completed {
-            return Ok(());
-        }
-
-        if execution.role == "interactive" {
-            return Ok(());
-        }
-
-        let task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
-            Some(task) => task,
-            None => return Ok(()),
-        };
-        let project = match ProjectRepo::get_by_id(&*self.db, &task.project_id).await? {
-            Some(project) => project,
-            None => return Ok(()),
-        };
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let Some(current_state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(());
-        };
-        let Some(effective_role) = crate::workflow::effective_role(current_state) else {
-            return Ok(());
-        };
-        let role_matches = execution.role == effective_role
-            || (effective_role == crate::workflow::default_roles::CODER
-                && execution.role == "executor");
-        if !role_matches {
-            return Ok(());
-        }
-        if workflow.state_kind(&task.status) != Some(api_types::StateKind::Active) {
-            return Ok(());
-        }
-        let Some(target) = workflow
-            .auto_transition_target(&task.status)
-            .map(str::to_owned)
-        else {
-            return Ok(());
-        };
-        if let Some(summary) = execution.summary.as_deref().map(str::trim) {
-            if !summary.is_empty() {
-                let content = format!("Agent completed execution: {summary}");
-                if let Some(agent_id) = execution.agent_id.as_deref() {
-                    self.create_agent_comment(&task.id, agent_id, content)
-                        .await?;
-                } else {
-                    self.create_system_comment(&task.id, content).await?;
-                }
-            }
-        }
-
-        let from = task.status.clone();
-        match self
-            .transition(task.id.clone(), target.clone(), task.version)
-            .await
-        {
-            Ok(_) => {
-                if let Err(error) = self.clear_workflow_guard_retry_metadata(&task.id).await {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        %error,
-                        "failed to clear workflow guard retry metadata"
-                    );
-                }
-                self.publish(ForgeEvent {
-                    event_type: "task.auto_transitioned".to_owned(),
-                    entity_id: task.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::TaskAutoTransitioned {
-                        task_id: task.id,
-                        from,
-                        to: target,
-                        reason: "executor_completed".to_owned(),
-                    },
-                });
-                Ok(())
-            }
-            Err(ServiceError::Db(DbError::VersionConflict)) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    "executor completion cascade version conflict"
-                );
-                Ok(())
-            }
-            Err(ServiceError::GuardRejection { guard, reason }) => {
-                self.handle_executor_completion_guard_rejection(
-                    &execution,
-                    &task,
-                    current_state,
-                    &guard,
-                    &reason,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        }
+        // Execution completion is a durable fact consumed by event-driven
+        // orchestration and Gate evaluation. It cannot advance aggregate Task
+        // lifecycle or turn a reviewer execution into a verdict.
+        let _ = execution_id;
+        Ok(())
     }
 
     async fn handle_executor_completion_guard_rejection(
@@ -592,16 +485,14 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<()> {
-        self.annotate_executor_failure_block_with_retry(execution, true)
-            .await
+        self.annotate_executor_failure_block_inner(execution).await
     }
 
     pub(crate) async fn annotate_dispatch_failure_block(
         &self,
         execution: &Execution,
     ) -> Result<()> {
-        self.annotate_executor_failure_block_with_retry(execution, false)
-            .await
+        self.annotate_executor_failure_block_inner(execution).await
     }
 
     /// Handle an execution that failed because no executor candidate could
@@ -618,15 +509,13 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if matches!(
+            lifecycle.state,
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
+        ) {
             return Ok(());
         }
 
@@ -718,6 +607,20 @@ impl TaskService {
             },
         });
 
+        let task = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .block(
+            &task.id,
+            crate::task_lifecycle::LifecycleCause::Execution(execution.id.clone()),
+            "executor_unavailable",
+            execution.id.clone(),
+            format!("executor-unavailable:{}", execution.id),
+        )
+        .await?
+        .task;
+
         let updated = TaskRepo::update_status(
             &*self.db,
             UpdateTaskStatus {
@@ -761,84 +664,18 @@ impl TaskService {
         Ok(())
     }
 
-    async fn annotate_executor_failure_block_with_retry(
-        &self,
-        execution: &Execution,
-        allow_retry: bool,
-    ) -> Result<()> {
+    async fn annotate_executor_failure_block_inner(&self, execution: &Execution) -> Result<()> {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if matches!(
+            lifecycle.state,
+            db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
+        ) {
             return Ok(());
-        }
-        let current_state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        if allow_retry
-            && self
-                .maybe_schedule_execution_retry(
-                    execution,
-                    &task,
-                    current_state.map(|state| &state.config),
-                    current_state.and_then(|state| state.gate_config.as_ref()),
-                )
-                .await?
-        {
-            return Ok(());
-        }
-
-        // Even on executor failure the agent may have committed real work for the
-        // current subtask before its process died. Credit that commit so the
-        // subtask isn't stuck `in_progress` and the parent doesn't miss progress.
-        if task.parent_task_id.is_none() {
-            match super::subtasks::credit_in_progress_subtask_commit(
-                &self.db,
-                &self.event_bus,
-                &self.workspace_root,
-                &task.id,
-            )
-            .await
-            {
-                Ok(super::subtasks::CreditResult::Committed { all_done: true }) => {
-                    tracing::info!(
-                        task_id = %task.id,
-                        execution_id = %execution.id,
-                        "executor failed but final subtask was committed; cascading parent to next state"
-                    );
-                    let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                    return self.retry_parent_cascade_after_last_subtask(&task).await;
-                }
-                Ok(super::subtasks::CreditResult::Committed { all_done: false }) => {
-                    tracing::info!(
-                        task_id = %task.id,
-                        execution_id = %execution.id,
-                        "executor failed but a subtask was committed; crediting and falling through to block"
-                    );
-                    // Fall through to the original block-annotation path. The
-                    // user can resume to dispatch the next subtask.
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %execution.id,
-                        %error,
-                        "failed to credit in-progress subtask commit on executor failure"
-                    );
-                }
-            }
         }
 
         let mut recovery_actions = vec![
@@ -939,114 +776,6 @@ impl TaskService {
             },
         });
         Ok(())
-    }
-
-    async fn maybe_schedule_execution_retry(
-        &self,
-        execution: &Execution,
-        task: &Task,
-        state_config: Option<&Value>,
-        gate_config: Option<&api_types::GateConfig>,
-    ) -> Result<bool> {
-        if execution.role == "interactive" {
-            // Interactive runs are user-prompted and do not have a durable dispatcher target yet.
-            return Ok(false);
-        }
-
-        let budget = crate::task_service::config::runtime_retry_budget(
-            task,
-            crate::task_service::config::RetryBudgetKind::Execution,
-            state_config,
-            gate_config,
-        )?;
-        if budget <= 0 {
-            return Ok(false);
-        }
-
-        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "invalid task metadata for {}: {error}",
-                task.id
-            ))
-        })?;
-        let retry_count = metadata
-            .extra
-            .get("execution_retry_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if retry_count >= budget as u64 {
-            return Ok(false);
-        }
-
-        let attempt = retry_count + 1;
-        let delay_seconds =
-            (10_u64.saturating_mul(2_u64.saturating_pow(retry_count as u32))).min(300);
-        let next_dispatch_at = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
-        metadata.extra.insert(
-            "execution_retry_count".to_owned(),
-            Value::Number(serde_json::Number::from(attempt)),
-        );
-        metadata.extra.insert(
-            "last_execution_failure_at".to_owned(),
-            Value::String(now_rfc3339()),
-        );
-        TaskRepo::set_metadata_json(&*self.db, &task.id, metadata.to_json(), &now_rfc3339())
-            .await?;
-        let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        crate::deferred_dispatch::set(
-            &self.db,
-            &task,
-            &task.status,
-            &next_dispatch_at.to_rfc3339(),
-            &format!("execution retry (attempt {attempt})"),
-        )
-        .await?;
-        ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution.id.clone(),
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: Some(Some(db::ResumePolicy::Auto)),
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-
-        tracing::info!(
-            task_id = %task.id,
-            execution_id = %execution.id,
-            attempt,
-            delay_seconds,
-            next_dispatch_at = %next_dispatch_at.to_rfc3339(),
-            "scheduling execution retry"
-        );
-        self.publish(ForgeEvent {
-            event_type: "task.execution_retry".to_owned(),
-            entity_id: task.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskExecutionRetry {
-                task_id: task.id.clone(),
-                execution_id: execution.id.clone(),
-                attempt: attempt as u32,
-                delay_seconds,
-                next_dispatch_at: next_dispatch_at.to_rfc3339(),
-            },
-        });
-        Ok(true)
     }
 
     async fn maybe_cascade_reviewer_completion(&self, execution: &Execution) -> Result<()> {
