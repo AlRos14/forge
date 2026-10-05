@@ -22,7 +22,10 @@ use std::{
 // V103 prevents exhausted retry budgets from reopening runnable lifecycle states;
 // V104 fences exact mutable Gate inputs at lifecycle and merge admission; V105
 // permits rework only from a current exact retry receipt and fences replay
-// after a later lifecycle transition.
+// after a later lifecycle transition; V108 separates WorkUnitIntegration and
+// TaskMerge retry domains while retaining V101 merge_failed history; V109
+// durably admits PullRequest TaskMerges before provider publication; V110
+// authorizes exact, failure-kind-scoped retry exhaustion override epochs.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

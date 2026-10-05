@@ -61,7 +61,6 @@ export type RecoveryAction =
   | 'resume_process'
   | 'update_workspace_and_retry_hook'
   | 'skip_hook_once'
-  | 'reset_retry_window'
   | 'proceed_once'
   | 'open_interactive'
 export type AgentStatus = 'idle' | 'busy' | 'error' | 'offline'

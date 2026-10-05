@@ -723,6 +723,8 @@ mod tests {
                 kind: TaskIntegrationOperationKind::TaskMerge,
                 owner_id: "no-gate-admission".to_owned(),
                 gate_evaluation_id: None,
+                remote_waiting: false,
+                parent_operation_id: None,
                 created_at: now_rfc3339(),
             },
         )
@@ -1101,6 +1103,8 @@ mod tests {
                 kind: TaskIntegrationOperationKind::TaskMerge,
                 owner_id: "gate-scope-test".to_owned(),
                 gate_evaluation_id: Some(exact_evaluation_id.clone()),
+                remote_waiting: false,
+                parent_operation_id: None,
                 created_at: now_rfc3339(),
             },
         )
@@ -1159,6 +1163,7 @@ mod tests {
                 id: merge_operation_id.clone(),
                 expected_version: merge_operation.version,
                 status: TaskIntegrationOperationStatus::Failed,
+                result_event_id: None,
                 updated_at: now_rfc3339(),
                 finished_at: now_rfc3339(),
             },

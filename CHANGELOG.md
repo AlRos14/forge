@@ -17,7 +17,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   to run workflow hooks must use lifecycle-owned operations or wait for the
   PR12 public-surface migration. Manual workflow advancement and legacy
   review/hook recovery actions return `409`; `remaining_retries` is retained as
-  an empty response projection until PR12 replaces that public field.
+  an empty response projection until PR12 replaces that public field. The
+  `reset_retry_window` member is removed from `RecoveryAction`; older request
+  payloads fail decoding, and reopening exhaustion now requires an exact
+  same-Task Proposal and approved Decision.
 
 - Review decisions now come from an exact `role=reviewer`, `purpose=review`
   Execution and its immutable `review_report` Artifact. Task-level approve and
@@ -140,6 +143,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   real "Update model" path for CLI-harness agents there (previously they had
   no way to change their model at all from `/agents`; only the removed
   launch-dialog checkbox could touch it).
+
+### Fixed
+
+- WorkUnit integration failures and final TaskMerge failures now consume
+  separate retry budgets. PullRequest publication first records the exact
+  durable TaskMerge admission, PublishPr child, and provider intent in one
+  transaction, then leaves lifecycle in `merging` while the provider owns an
+  open PR. Exact Merged/Closed results finish that same admission; publication
+  failure results are operation-scoped and replay-safe. Pre-existing PR rows
+  without an admission stay visible as `legacy_unadmitted` and cannot acquire
+  retrospective merge authority. Exhaustion remains immutable and can be
+  superseded only by an exact same-Task Human Decision that opens a scoped
+  retry epoch. The unused `TaskService::unblock_task()` primitive was removed
+  because it changed legacy blocked metadata without changing TaskLifecycle;
+  clearing such metadata no longer publishes `task.unblocked` while the
+  lifecycle remains blocked.
 
 ### Added
 

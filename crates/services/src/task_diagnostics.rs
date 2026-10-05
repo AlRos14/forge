@@ -248,7 +248,6 @@ fn is_retired_workflow_recovery_action(action: RecoveryAction) -> bool {
             | RecoveryAction::ResumeProcess
             | RecoveryAction::UpdateWorkspaceAndRetryHook
             | RecoveryAction::SkipHookOnce
-            | RecoveryAction::ResetRetryWindow
             | RecoveryAction::ProceedOnce
     )
 }
@@ -449,40 +448,23 @@ fn derive_legacy_workflow_exception(
                     resume_role,
                     None,
                 ));
-                actions.extend([
-                    action(
-                        RecoveryAction::ResetRetryWindow,
-                        "Reset Retry Window",
-                        current_retry_window_exhausted,
-                        disabled_unless(
-                            current_retry_window_exhausted,
-                            "Retry window is not exhausted for the current state",
-                        ),
-                        false,
-                        false,
-                        false,
-                        Some(task.status.clone()),
-                        role.clone(),
-                        None,
-                    ),
-                    action(
-                        RecoveryAction::ProceedOnce,
-                        "Proceed Once",
+                actions.push(action(
+                    RecoveryAction::ProceedOnce,
+                    "Proceed Once",
+                    task.status == crate::workflow::default_states::REVIEW
+                        && current_retry_window_exhausted,
+                    disabled_unless(
                         task.status == crate::workflow::default_states::REVIEW
                             && current_retry_window_exhausted,
-                        disabled_unless(
-                            task.status == crate::workflow::default_states::REVIEW
-                                && current_retry_window_exhausted,
-                            "Proceed once is only available for exhausted review retry windows",
-                        ),
-                        true,
-                        true,
-                        true,
-                        gate_reject_target(workflow, task),
-                        role.clone(),
-                        None,
+                        "Proceed once is only available for exhausted review retry windows",
                     ),
-                ]);
+                    true,
+                    true,
+                    true,
+                    gate_reject_target(workflow, task),
+                    role.clone(),
+                    None,
+                ));
                 actions.push(open_interactive_action(
                     task,
                     role.clone(),
@@ -755,99 +737,17 @@ fn blocked_metadata_exception(
 
 fn retry_budget_exhausted_annotation_actions(
     task: &Task,
-    workflow: &WorkflowDefinition,
-    role: Option<String>,
-    latest_execution: Option<&Execution>,
+    _workflow: &WorkflowDefinition,
+    _role: Option<String>,
+    _latest_execution: Option<&Execution>,
 ) -> Vec<WorkflowExceptionAction> {
-    let resume_target = gate_reject_target(workflow, task);
-    let resume_role = resume_target
-        .as_deref()
-        .and_then(|target| workflow_role(workflow, target));
-    let reset_resumes_process = matches!(
-        task.status.as_str(),
-        crate::workflow::default_states::REVIEW | crate::workflow::default_states::MERGING
-    );
-    vec![
-        action(
-            RecoveryAction::RetryHook,
-            gate_retry_label(task),
-            task.status == crate::workflow::default_states::MERGING,
-            disabled_unless(
-                task.status == crate::workflow::default_states::MERGING,
-                "Retry budget exhausted; reset the retry window first",
-            ),
-            false,
-            false,
-            true,
-            if task.status == crate::workflow::default_states::MERGING {
-                resume_target.clone()
-            } else {
-                Some(task.status.clone())
-            },
-            if task.status == crate::workflow::default_states::MERGING {
-                resume_role.clone()
-            } else {
-                role.clone()
-            },
-            latest_execution.map(|execution| execution.id.clone()),
+    vec![cancel_action(
+        false,
+        matches!(
+            task.status.as_str(),
+            crate::workflow::default_states::DONE | crate::workflow::default_states::CANCELLED
         ),
-        action(
-            RecoveryAction::ResumeProcess,
-            "Resume Process",
-            false,
-            Some("Retry budget exhausted; reset the retry window first".to_owned()),
-            false,
-            false,
-            true,
-            resume_target.clone(),
-            resume_role.clone(),
-            None,
-        ),
-        action(
-            RecoveryAction::ResetRetryWindow,
-            "Reset Retry Window",
-            true,
-            None,
-            false,
-            false,
-            reset_resumes_process,
-            if reset_resumes_process {
-                resume_target.clone()
-            } else {
-                Some(task.status.clone())
-            },
-            if reset_resumes_process {
-                resume_role.clone()
-            } else {
-                role.clone()
-            },
-            None,
-        ),
-        action(
-            RecoveryAction::ProceedOnce,
-            "Proceed Once",
-            task.status == crate::workflow::default_states::REVIEW,
-            disabled_unless(
-                task.status == crate::workflow::default_states::REVIEW,
-                "Proceed once is only available for exhausted review retry windows",
-            ),
-            true,
-            true,
-            true,
-            resume_target,
-            role.clone(),
-            None,
-        ),
-        open_interactive_action(task, role, latest_execution),
-    ]
-}
-
-fn gate_retry_label(task: &Task) -> &'static str {
-    match task.status.as_str() {
-        crate::workflow::default_states::REVIEW => "Retry Review",
-        crate::workflow::default_states::MERGING => "Retry Merge",
-        _ => "Retry",
-    }
+    )]
 }
 
 fn is_recoverable_merge_gate_annotation(task: &Task, annotation: &TaskBlockingAnnotation) -> bool {
@@ -878,18 +778,6 @@ fn merge_gate_annotation_actions(
             Some(task.status.clone()),
             role.clone(),
             latest_execution.map(|execution| execution.id.clone()),
-        ),
-        action(
-            RecoveryAction::ResetRetryWindow,
-            "Reset Retry Window",
-            false,
-            Some("Retry window is not exhausted for the current state".to_owned()),
-            false,
-            false,
-            false,
-            Some(task.status.clone()),
-            role.clone(),
-            None,
         ),
         open_interactive_action(task, role, latest_execution),
     ]
@@ -1125,7 +1013,6 @@ fn recovery_label(kind: RecoveryAction) -> &'static str {
         RecoveryAction::ResumeProcess => "Resume Process",
         RecoveryAction::UpdateWorkspaceAndRetryHook => "Update Workspace and Retry Hook",
         RecoveryAction::SkipHookOnce => "Skip Hook Once",
-        RecoveryAction::ResetRetryWindow => "Reset Retry Window",
         RecoveryAction::ProceedOnce => "Proceed Once",
         RecoveryAction::OpenInteractive => "Open Interactive",
     }

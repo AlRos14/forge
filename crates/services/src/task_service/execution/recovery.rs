@@ -18,7 +18,6 @@ impl TaskService {
             api_types::RecoveryAction::MarkReviewed
                 | api_types::RecoveryAction::RetryHook
                 | api_types::RecoveryAction::ProceedOnce
-                | api_types::RecoveryAction::ResetRetryWindow
                 | api_types::RecoveryAction::ResumeProcess
                 | api_types::RecoveryAction::UpdateWorkspaceAndRetryHook
                 | api_types::RecoveryAction::SkipHookOnce
@@ -79,8 +78,7 @@ impl TaskService {
                 api_types::RecoveryAction::SkipHookOnce => {
                     self.recover_skip_hook_once(task, reason).await
                 }
-                api_types::RecoveryAction::ResetRetryWindow
-                | api_types::RecoveryAction::ProceedOnce
+                api_types::RecoveryAction::ProceedOnce
                 | api_types::RecoveryAction::OpenInteractive
                 | api_types::RecoveryAction::RetryHook
                 | api_types::RecoveryAction::ResumeProcess => unreachable!(),
@@ -88,9 +86,6 @@ impl TaskService {
         }
         let annotation = annotation.ok();
         match action {
-            api_types::RecoveryAction::ResetRetryWindow => {
-                self.recover_reset_retry_window(task, reason).await
-            }
             api_types::RecoveryAction::ProceedOnce => {
                 self.recover_proceed_once(task, reason, context).await
             }
@@ -140,13 +135,7 @@ impl TaskService {
             if let Some(raw_blocked) = task.blocked_json.as_deref() {
                 return metadata_recovery_annotation(
                     raw_blocked,
-                    &[
-                        api_types::RecoveryAction::RetryHook,
-                        api_types::RecoveryAction::ResumeProcess,
-                        api_types::RecoveryAction::ResetRetryWindow,
-                        api_types::RecoveryAction::OpenInteractive,
-                        api_types::RecoveryAction::CancelTask,
-                    ],
+                    &[api_types::RecoveryAction::CancelTask],
                 );
             }
         }
@@ -253,7 +242,17 @@ impl TaskService {
         )
         .await?;
         super::clear_execution_retry_metadata(&self.db, &updated).await?;
-        if task.blocked_json.is_some() {
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if task.blocked_json.is_some()
+            && matches!(
+                lifecycle.state,
+                db::TaskLifecycleState::Ready
+                    | db::TaskLifecycleState::Active
+                    | db::TaskLifecycleState::ReadyToMerge
+            )
+        {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
                 entity_id: updated.id.clone(),
@@ -264,52 +263,6 @@ impl TaskService {
                 },
             });
         }
-        Ok(updated)
-    }
-
-    pub async fn unblock_task(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.blocked_json.is_none() {
-            return Err(ServiceError::invalid_operation("task is not blocked"));
-        }
-        let previous_reason = interruption_reason(task.blocked_json.as_deref());
-        let updated = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                error_annotation: Some(None),
-                blocked_json: Some(None),
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        super::clear_execution_retry_metadata(&self.db, &updated).await?;
-        self.publish(ForgeEvent {
-            event_type: "task.unblocked".to_owned(),
-            entity_id: updated.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskUnblocked {
-                project_id: updated.project_id.clone(),
-                previous_reason: previous_reason.clone(),
-            },
-        });
-        tracing::info!(
-            task_id = %updated.id,
-            status = %updated.status,
-            previous_reason = ?previous_reason,
-            "task unblocked"
-        );
         Ok(updated)
     }
 
@@ -908,48 +861,6 @@ impl TaskService {
         Ok(())
     }
 
-    async fn recover_reset_retry_window(&self, task: Task, reason: Option<String>) -> Result<Task> {
-        let reason = optional_recovery_reason(reason, "reset_retry_window");
-        let has_exhausted_annotation = self
-            .parse_blocking_annotation(&task)
-            .as_ref()
-            .is_some_and(crate::task_diagnostics::is_retry_budget_exhausted);
-        let (gate_state, budget, count) = self.current_gate_retry_budget(&task).await?;
-        if count < i64::from(budget) && !has_exhausted_annotation {
-            return Err(ServiceError::conflict(format!(
-                "retry window for state {gate_state} is not exhausted: {count}/{budget}"
-            )));
-        }
-        let transition_log = TransitionLogRepo::insert_recovery_marker(
-            &*self.db,
-            &task.id,
-            &gate_state,
-            "reset_retry_window",
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResetRetryWindow,
-            ))
-            .display(),
-            &reason,
-        )
-        .await?;
-        let updated = self.clear_retry_exhausted_blocking_metadata(&task).await?;
-        self.publish_recovery_applied(
-            &updated,
-            "reset_retry_window",
-            Some(&gate_state),
-            Some(&transition_log.id),
-        );
-        if gate_state == crate::workflow::default_states::MERGING {
-            return self
-                .recover_resume_process(updated, Some(reason), None)
-                .await;
-        }
-        // Planning and other non-review gates stay in the gate. Re-enter so
-        // role dispatch can start a revision run against the refreshed budget.
-        self.recover_retry_current_state_hooks(updated, Some(reason))
-            .await
-    }
-
     async fn recover_proceed_once(
         &self,
         task: Task,
@@ -1304,39 +1215,6 @@ impl TaskService {
         Ok((task.status.clone(), budget, count))
     }
 
-    async fn clear_retry_exhausted_blocking_metadata(&self, task: &Task) -> Result<Task> {
-        let clear_error = task
-            .error_annotation
-            .as_deref()
-            .is_some_and(is_retry_exhausted_annotation);
-        let clear_blocked = task
-            .blocked_json
-            .as_deref()
-            .is_some_and(is_retry_exhausted_blocked_metadata);
-        if !clear_error && !clear_blocked {
-            return Ok(task.clone());
-        }
-        TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                error_annotation: if clear_error { Some(None) } else { None },
-                blocked_json: if clear_blocked { Some(None) } else { None },
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await
-        .map_err(Into::into)
-    }
-
     async fn interactive_follow_up_execution(
         &self,
         task: &Task,
@@ -1679,7 +1557,9 @@ impl TaskService {
         if task.status == crate::workflow::default_states::MERGING
             && crate::task_diagnostics::is_retry_budget_exhausted(annotation)
         {
-            return self.recover_reset_retry_window(task, reason).await;
+            return Err(ServiceError::invalid_operation(
+                "retry exhaustion requires an exact external Decision override",
+            ));
         }
         if task.status == crate::workflow::default_states::MERGING
             && is_recoverable_merge_gate_annotation(annotation)
@@ -2236,8 +2116,7 @@ fn execution_matches_role(execution: &Execution, role: &str) -> bool {
 fn self_validating_recovery_action(action: api_types::RecoveryAction) -> bool {
     matches!(
         action,
-        api_types::RecoveryAction::ResetRetryWindow
-            | api_types::RecoveryAction::ProceedOnce
+        api_types::RecoveryAction::ProceedOnce
             | api_types::RecoveryAction::OpenInteractive
             | api_types::RecoveryAction::MarkReviewed
             | api_types::RecoveryAction::RetryHook
@@ -2270,10 +2149,7 @@ struct ResumeProcessPlan {
 
 fn gate_rejections_since_recovery_boundary(entries: &[db::TransitionLog], gate_state: &str) -> i64 {
     let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == gate_state
-            && !entry.rejection
-            && (entry.to_state != gate_state
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
+        entry.from_state == gate_state && !entry.rejection && entry.to_state != gate_state
     });
     let entries = boundary
         .and_then(|index| entries.get(index + 1..))
@@ -2282,15 +2158,6 @@ fn gate_rejections_since_recovery_boundary(entries: &[db::TransitionLog], gate_s
         .iter()
         .filter(|entry| entry.from_state == gate_state && entry.rejection)
         .count() as i64
-}
-
-fn is_retry_exhausted_annotation(raw_annotation: &str) -> bool {
-    match serde_json::from_str::<api_types::TaskAnnotation>(raw_annotation) {
-        Ok(api_types::TaskAnnotation::Blocking(ref annotation)) => {
-            crate::task_diagnostics::is_retry_budget_exhausted(annotation)
-        }
-        _ => false,
-    }
 }
 
 fn blocked_metadata_kind(raw_metadata: &str) -> Option<api_types::FailureKind> {

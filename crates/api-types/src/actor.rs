@@ -190,7 +190,6 @@ impl fmt::Display for RecoveryAction {
             Self::ResumeProcess => "resume_process",
             Self::UpdateWorkspaceAndRetryHook => "update_workspace_and_retry_hook",
             Self::SkipHookOnce => "skip_hook_once",
-            Self::ResetRetryWindow => "reset_retry_window",
             Self::ProceedOnce => "proceed_once",
             Self::OpenInteractive => "open_interactive",
         };

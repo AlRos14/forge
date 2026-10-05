@@ -3,9 +3,9 @@ use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 use db::{
     now_rfc3339, Execution, ExecutionRepo, GateEvaluation, GateEvaluationInput,
-    GateEvaluationOutcome, GateRepo, PageRequest, RepoRepo, SortBy, SortOrder, SqliteDb,
-    TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, WorkMode,
-    WorkUnitRepo, WorkspaceRepo,
+    GateEvaluationOutcome, GateRepo, PageRequest, PrProviderConfigRepo, RepoRepo, SortBy,
+    SortOrder, SqliteDb, TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState,
+    TaskRepo, WorkMode, WorkUnitRepo, WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -430,35 +430,56 @@ impl MergeService {
             .await?;
         self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
             .await?;
-        let operation = self
+        if work_unit_integration_is_running(&self.db, &task_id).await? {
+            return Err(ServiceError::invalid_operation(
+                "Task integration is currently incorporating a WorkUnit result",
+            ));
+        }
+        let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
+        let source_branch = source.branch.clone();
+        let worktree_path = Path::new(&source.workspace.worktree_path);
+        if !git::is_worktree_clean(worktree_path).await? {
+            return Ok(MergeOutcome::Dirty {
+                files: git::status_porcelain(worktree_path).await?,
+            });
+        }
+        // Push the pinned source before persisting the PR admission. A crash
+        // after admission therefore always leaves a provider-ready branch and
+        // an atomic PublishPr plus metadata intent for startup recovery.
+        push_branch(worktree_path, &source_branch).await?;
+        self.ensure_current_gate_evaluation(&task_id, &evaluation)
+            .await?;
+        self.validate_gate_candidate(&task_id, &evaluation, &source)
+            .await?;
+        self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
+            .await?;
+        let provider_config = PrProviderConfigRepo::get_by_repo_id(&*self.db, &repo.id)
+            .await?
+            .ok_or_else(|| ServiceError::PrProviderMissing {
+                repo_id: repo.id.clone(),
+            })?;
+        let (merge_admission, publication) = self
             .integration_operations
-            .acquire_kind_after_gate_with_lock(
+            .admit_pull_request_publication_with_lock(
                 &task_id,
-                db::TaskIntegrationOperationKind::PublishPr,
                 &db::new_uuid_v4(),
                 gate_evaluation_id,
+                &provider_config.provider_type,
+                &source_branch,
+                &target_branch,
                 task_operation_file,
             )
             .await?;
+        self.publish_domain_event_by_dedupe(&format!(
+            "task-merge-admission:{}",
+            merge_admission.id()
+        ))
+        .await;
         let result = async {
-            let workspace = &source.workspace;
-            if work_unit_integration_is_running(&self.db, &task_id).await? {
-                return Err(ServiceError::invalid_operation(
-                    "Task integration is currently incorporating a WorkUnit result",
-                ));
-            }
-            let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
-            let source_branch = source.branch;
-            let worktree_path = Path::new(&workspace.worktree_path);
-
-            if !git::is_worktree_clean(worktree_path).await? {
-                return Ok(MergeOutcome::Dirty {
-                    files: git::status_porcelain(worktree_path).await?,
-                });
-            }
-
-            push_branch(worktree_path, &source_branch).await?;
-            let pr_service = crate::pr_service::PrService::new(Arc::clone(&self.db));
+            let pr_service = crate::pr_service::PrService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
             let published = pr_service
                 .publish_pr(&task, &repo, &source_branch, &target_branch)
                 .await?;
@@ -471,11 +492,62 @@ impl MergeService {
         }
         .await;
         let status = merge_operation_status(&result);
-        let finish_result = operation.finish(status).await;
-        match (result, finish_result) {
-            (Ok(outcome), Ok(_)) => Ok(outcome),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), _) => Err(error),
+        let publication_finish = if status == db::TaskIntegrationOperationStatus::Failed {
+            let event = crate::pr_service::PrService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .record_publication_failure(&task_id, merge_admission.id(), publication.id())
+            .await?;
+            publication
+                .finish_with_result_event(status, Some(event.id))
+                .await
+        } else {
+            publication.finish(status).await
+        };
+        match result {
+            Ok(outcome @ MergeOutcome::PullRequest { .. }) => {
+                match publication_finish {
+                    Ok(_) => {
+                        // The durable TaskMerge admission remains running and
+                        // owns the frozen GateEvaluation while the provider
+                        // controls the open PR. Dropping the guard releases
+                        // only the short-lived local file lock.
+                        drop(merge_admission);
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        drop(merge_admission);
+                        Err(error)
+                    }
+                }
+            }
+            Ok(outcome) => {
+                if publication_finish.is_err() {
+                    drop(merge_admission);
+                    return publication_finish.map(|_| outcome);
+                }
+                self.publish_domain_event_by_dedupe(&format!(
+                    "task-merge-terminal:{}",
+                    merge_admission.id()
+                ))
+                .await;
+                drop(merge_admission);
+                Ok(outcome)
+            }
+            Err(error) => {
+                if let Err(publication_error) = publication_finish {
+                    drop(merge_admission);
+                    return Err(publication_error);
+                }
+                self.publish_domain_event_by_dedupe(&format!(
+                    "task-merge-terminal:{}",
+                    merge_admission.id()
+                ))
+                .await;
+                drop(merge_admission);
+                Err(error)
+            }
         }
     }
 

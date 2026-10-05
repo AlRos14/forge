@@ -319,6 +319,8 @@ fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
         target_branch: row.try_get("target_branch")?,
         pr_state: row.try_get("pr_state")?,
         merge_status: row.try_get("merge_status")?,
+        task_merge_operation_id: row.try_get("task_merge_operation_id")?,
+        publish_operation_id: row.try_get("publish_operation_id")?,
         last_synced_at: row.try_get("last_synced_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

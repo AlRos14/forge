@@ -150,6 +150,8 @@ mod tests {
                 kind: TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
                 owner_id: "crashed-project-owner".to_owned(),
                 gate_evaluation_id: None,
+                remote_waiting: false,
+                parent_operation_id: None,
                 created_at: now_rfc3339(),
             },
         )

@@ -850,6 +850,15 @@ pub trait TaskIntegrationOperationRepo: Send + Sync {
         &self,
         input: CreateTaskIntegrationOperation,
     ) -> Result<TaskIntegrationOperation>;
+    /// Atomically admit a PullRequest TaskMerge, create its PublishPr child,
+    /// and persist publication intent so a restart can always resume provider
+    /// reconciliation from durable rows.
+    async fn begin_pull_request_publication(
+        &self,
+        merge: CreateTaskIntegrationOperation,
+        publish: CreateTaskIntegrationOperation,
+        metadata: CreatePrMetadata,
+    ) -> Result<(TaskIntegrationOperation, TaskIntegrationOperation)>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<TaskIntegrationOperation>>;
     /// Called only while holding the Task's OS operation lock. It marks the
     /// current process-dead `running` row abandoned without starting a new
@@ -1892,6 +1901,8 @@ pub struct CreatePrMetadata {
     pub target_branch: String,
     pub pr_state: String,
     pub merge_status: String,
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
     pub last_synced_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -1907,6 +1918,8 @@ pub struct UpdatePrMetadata {
     pub target_branch: Option<String>,
     pub pr_state: Option<String>,
     pub merge_status: Option<String>,
+    pub task_merge_operation_id: Option<String>,
+    pub publish_operation_id: Option<String>,
     pub last_synced_at: Option<Option<String>>,
     pub updated_at: String,
 }
@@ -2109,6 +2122,8 @@ pub struct CreateTaskIntegrationOperation {
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
     pub gate_evaluation_id: Option<String>,
+    pub remote_waiting: bool,
+    pub parent_operation_id: Option<String>,
     pub created_at: String,
 }
 
@@ -2117,6 +2132,7 @@ pub struct FinishTaskIntegrationOperation {
     pub id: String,
     pub expected_version: i64,
     pub status: TaskIntegrationOperationStatus,
+    pub result_event_id: Option<String>,
     pub updated_at: String,
     pub finished_at: String,
 }

@@ -151,7 +151,7 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Compatibility input mapped to aggregate lifecycle; no workflow hooks execute |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
-| POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
+| POST   | `/api/v1/tasks/{id}/recover` | Apply a supported recovery action to a blocked/failed task |
 | POST   | `/api/v1/tasks/{id}/review` | Start a Human reviewer Execution for the assigned Human reviewer |
 | GET    | `/api/v1/tasks/{id}/reviews` | List reviewer Executions and their exact ReviewReport Artifacts (display projection) |
 | GET    | `/api/v1/reviews/{execution_id}` | Read one exact reviewer Execution and its ReviewReport Artifact |
@@ -963,10 +963,13 @@ transition. `resume` uses the existing exact session-follow-up/recovery
 primitives and falls back to a fresh Execution. `cancel` records aggregate
 `cancelled`. `submit`, `approve`, and `request-changes` cannot set Gate results
 or advance lifecycle and return `409` while their legacy workflow actions are
-retired. `remaining_retries` is an empty compatibility projection. The PR9
-replacement failure-budget consumer is not implemented yet, and legacy recovery
-paths still read workflow retry settings and transition history; this blocks
-PR9 readiness. Those values never authorize a Gate result.
+retired. The `RecoveryAction` wire value `reset_retry_window` has been removed;
+older clients receive HTTP `422` during request decoding. A Task blocked by retry
+exhaustion can be reopened only by an exact same-Task Proposal and approved
+Decision for that exhaustion receipt. `remaining_retries` remains an empty
+compatibility projection. PR9's durable failure-budget consumer records exact
+failure receipts; legacy workflow retries do not authorize Task lifecycle or
+Gate results.
 
 When an action is not available, the endpoint returns `409` with
 `code: "task_action.unavailable"` and structured `details`:

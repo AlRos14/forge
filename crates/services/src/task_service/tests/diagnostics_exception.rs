@@ -138,11 +138,11 @@ async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annot
                 .to_owned()
         })
         .collect::<Vec<_>>();
-    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
-    assert!(action_kinds.iter().any(|kind| kind == "resume_process"));
-    assert!(action_kinds.iter().any(|kind| kind == "reset_retry_window"));
-    assert!(action_kinds.iter().any(|kind| kind == "proceed_once"));
-    assert!(action_kinds.iter().any(|kind| kind == "open_interactive"));
+    assert_eq!(
+        action_kinds,
+        vec!["cancel_task"],
+        "exhaustion leaves the Task waiting for an exact external Decision"
+    );
 }
 
 #[tokio::test]
@@ -228,59 +228,15 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
                 .to_owned()
         })
         .collect::<Vec<_>>();
-    let retry_hook = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("retry_hook")
-        })
-        .expect("retry_hook action exists");
-    assert_eq!(retry_hook.label, "Retry Merge");
-    assert!(
-        retry_hook.enabled,
-        "retry merge should reset the retry window and resume merge-fix work in one action"
-    );
     assert_eq!(
-        retry_hook.target_state.as_deref(),
-        Some(crate::workflow::default_states::MERGE_FAILED)
-    );
-    assert_eq!(
-        retry_hook.target_role.as_deref(),
-        Some(crate::workflow::default_roles::CODER)
-    );
-    assert!(
-        action_kinds.iter().any(|kind| kind == "resume_process"),
-        "resume_process should be visible for exhausted merge gates"
-    );
-    let reset_retry_window = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("reset_retry_window")
-        })
-        .expect("reset_retry_window action exists");
-    assert!(
-        reset_retry_window.propagates,
-        "reset_retry_window should indicate that it resumes merge-fix work"
-    );
-    assert!(
-        action_kinds.iter().any(|kind| kind == "reset_retry_window"),
-        "reset_retry_window should be offered instead of falling back to cancel only"
-    );
-    assert!(
-        action_kinds.iter().all(|kind| kind != "cancel_task"),
-        "retry exhaustion actions should not collapse to cancel_task"
+        action_kinds,
+        vec!["cancel_task"],
+        "exhausted merge work remains blocked until an exact external Decision"
     );
 }
 
 #[tokio::test]
-async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available() {
+async fn test_merge_gate_stale_error_annotation_does_not_offer_legacy_retry() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
@@ -342,23 +298,6 @@ async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_a
     )
     .expect("workflow exception derives");
 
-    let retry_hook = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("retry_hook")
-        })
-        .expect("retry_hook action exists");
-    assert_eq!(retry_hook.label, "Retry Merge");
-    assert!(retry_hook.enabled);
-    assert_eq!(
-        retry_hook.target_state.as_deref(),
-        Some(crate::workflow::default_states::MERGING)
-    );
-
     assert!(
         exception.actions.iter().all(|action| {
             serde_json::to_value(action.kind)
@@ -366,12 +305,12 @@ async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_a
                 .as_str()
                 != Some("resume_process")
         }),
-        "target-repo dirty recovery should retry the merge gate, not dispatch merge-fix work"
+        "target-repo dirty recovery cannot restore a legacy retry action"
     );
 }
 
 #[tokio::test]
-async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
+async fn test_legacy_reviewer_execution_does_not_create_workflow_recovery() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
@@ -415,22 +354,11 @@ async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
         Some(&review),
         Some(&execution),
         &remaining_retries,
-    )
-    .expect("workflow exception derives");
-
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(action_kinds, vec!["retry_hook", "mark_reviewed"]);
-    assert_eq!(exception.actions[1].label, "Pass Review");
+    );
+    assert!(
+        exception.is_none(),
+        "the lossy legacy review projection cannot create workflow recovery actions"
+    );
 }
 
 #[tokio::test]

@@ -25,11 +25,6 @@ type RepoResponse = {
   project_id: string
 }
 
-type AgentResponse = {
-  id: string
-  name: string
-}
-
 type TaskResponse = {
   id: string
   project_id: string
@@ -71,22 +66,6 @@ type TaskResponse = {
     assignee_type: string | null
     assignee_id: string | null
   }>
-}
-
-type TransitionLogEntry = {
-  id: string
-  task_id: string
-  from_state: string
-  to_state: string
-  triggered_by: string
-  trigger_name?: string | null
-  trigger_reason: string
-  rejection: boolean
-  created_at: string
-}
-
-function enabledRecoveryAction(task: TaskResponse, kind: string) {
-  return task.workflow_exception?.actions.find((action) => action.kind === kind && action.enabled)
 }
 
 async function api<T>(
@@ -354,7 +333,7 @@ function budgetExhaustedTask(): TaskResponse {
       artifact: null,
       message: 'Review retry budget exhausted after 2 attempts',
       hook: null,
-      recovery_actions: ['reset_retry_window', 'proceed_once', 'cancel_task'],
+      recovery_actions: ['cancel_task'],
     },
     blocked: {
       reason: 'review retry budget exhausted',
@@ -384,54 +363,6 @@ function budgetExhaustedTask(): TaskResponse {
       },
       related_evidence: [],
       actions: [
-        {
-          kind: 'retry_hook',
-          label: 'Retry Review',
-          enabled: false,
-          disabled_reason: 'Retry budget exhausted; reset the retry window first',
-          requires_reason: false,
-          requires_guidance: false,
-          propagates: false,
-          target_state: null,
-          target_role: null,
-          target_execution_id: null,
-        },
-        {
-          kind: 'reset_retry_window',
-          label: 'Reset Retry Window',
-          enabled: true,
-          disabled_reason: null,
-          requires_reason: false,
-          requires_guidance: false,
-          propagates: false,
-          target_state: null,
-          target_role: null,
-          target_execution_id: null,
-        },
-        {
-          kind: 'proceed_once',
-          label: 'Proceed Once',
-          enabled: true,
-          disabled_reason: null,
-          requires_reason: true,
-          requires_guidance: true,
-          propagates: true,
-          target_state: 'in_progress',
-          target_role: 'coder',
-          target_execution_id: null,
-        },
-        {
-          kind: 'open_interactive',
-          label: 'Open Interactive Session',
-          enabled: true,
-          disabled_reason: null,
-          requires_reason: false,
-          requires_guidance: false,
-          propagates: false,
-          target_state: null,
-          target_role: null,
-          target_execution_id: null,
-        },
         {
           kind: 'cancel_task',
           label: 'Cancel Task',
@@ -494,18 +425,6 @@ function reviewFailedTask(): TaskResponse {
           label: 'Retry Review',
           enabled: false,
           disabled_reason: 'No blocking annotation to retry',
-          requires_reason: false,
-          requires_guidance: false,
-          propagates: false,
-          target_state: null,
-          target_role: null,
-          target_execution_id: null,
-        },
-        {
-          kind: 'reset_retry_window',
-          label: 'Reset Retry Window',
-          enabled: false,
-          disabled_reason: 'Retry window is not exhausted for the current state',
           requires_reason: false,
           requires_guidance: false,
           propagates: false,
@@ -601,7 +520,7 @@ async function mockExceptionTaskRoutes(page: Page, task: TaskResponse) {
 }
 
 test.describe('workflow exception diagnostics (mock)', () => {
-  test('renders budget-exhausted exception panel with recovery actions', async ({ page }) => {
+  test('exhausted exception waits for an external decision without retry actions', async ({ page }) => {
     const task = budgetExhaustedTask()
     await mockExceptionTaskRoutes(page, task)
 
@@ -615,7 +534,9 @@ test.describe('workflow exception diagnostics (mock)', () => {
     await expect(page.getByText('exit 1', { exact: false }).first()).toBeVisible()
     await expect(page.getByText('Cannot find module ./missing', { exact: false })).toBeVisible()
 
-    await expect(page.getByRole('button', { name: 'Reset Retry Window' }).first()).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Reset Retry Window' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Resume Process' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Retry Review' })).toHaveCount(0)
     await expect(
       page.getByRole('button', { name: 'Cancel Task', exact: true }).first(),
     ).toBeVisible()
@@ -639,80 +560,28 @@ test.describe('workflow exception diagnostics (mock)', () => {
     ).toBeVisible()
   })
 
-  test('proceed-once prompts for reason and guidance before submitting', async ({ page }) => {
+  test('exhausted task has no retry reset action to submit', async ({ page }) => {
     const task = budgetExhaustedTask()
     const getRecoverBody = await mockExceptionTaskRoutes(page, task)
 
     await page.goto(`/tasks/${TASK_ID}`)
 
-    await expect(page.getByRole('button', { name: 'Reset Retry Window' }).first()).toBeVisible({ timeout: 15000 })
-    const dropdownTrigger = page.locator('button[class*="rounded-l-none"]').first()
-    if (await dropdownTrigger.isVisible().catch(() => false)) {
-      await dropdownTrigger.click()
-      const proceedItem = page.getByRole('button', { name: 'Proceed Once' })
-      await expect(proceedItem).toBeVisible({ timeout: 3000 })
-      await proceedItem.click()
-    } else {
-      const proceedButton = page.getByRole('button', { name: 'Proceed Once' }).first()
-      await expect(proceedButton).toBeVisible({ timeout: 5000 })
-      await proceedButton.click()
-    }
-
-    const dialogTitle = page.getByText('Proceed Once', { exact: true }).nth(0)
-    await expect(dialogTitle).toBeVisible({ timeout: 5000 })
-
-    const reasonInput = page.getByPlaceholder('Why is this recovery action needed?')
-    await expect(reasonInput).toBeVisible()
-    await reasonInput.fill('Allowing one more fix attempt')
-
-    const guidanceInput = page.getByPlaceholder('Add instructions for the next workflow step')
-    if (await guidanceInput.isVisible().catch(() => false)) {
-      await guidanceInput.fill('Focus on the missing module import')
-    }
-
-    const confirmButton = page.getByRole('button', { name: 'Confirm' })
-    await confirmButton.click()
-
-    await expect.poll(() => getRecoverBody()).not.toBeNull()
-    const body = getRecoverBody()
-    expect(body?.action).toBe('proceed_once')
-    expect(body?.reason).toBeTruthy()
+    await expect(page.getByRole('button', { name: 'Reset Retry Window' })).toHaveCount(0)
+    expect(getRecoverBody()).toBeNull()
   })
 
-  test('reset-retry-window calls recovery endpoint', async ({ page }) => {
-    const task = budgetExhaustedTask()
-    const getRecoverBody = await mockExceptionTaskRoutes(page, task)
-
-    await page.goto(`/tasks/${TASK_ID}`)
-
-    const resetButton = page.getByRole('button', { name: 'Reset Retry Window' }).first()
-    await expect(resetButton).toBeVisible({ timeout: 15000 })
-    await resetButton.click()
-
-    await expect.poll(() => getRecoverBody(), { timeout: 10000 }).not.toBeNull()
-    const body = getRecoverBody()
-    expect(body?.action).toBe('reset_retry_window')
-  })
-
-  test('dropdown shows secondary recovery actions', async ({ page }) => {
+  test('exhaustion has no secondary recovery menu', async ({ page }) => {
     const task = budgetExhaustedTask()
     await mockExceptionTaskRoutes(page, task)
 
     await page.goto(`/tasks/${TASK_ID}`)
 
-    await expect(
-      page.getByRole('button', { name: 'Reset Retry Window' }).first(),
-    ).toBeVisible({ timeout: 15000 })
-
     const dropdownTrigger = page.locator('button[class*="rounded-l-none"]').first()
-    await expect(dropdownTrigger).toBeVisible()
-    await dropdownTrigger.click()
-
-    await expect(page.getByRole('button', { name: 'Proceed Once' })).toBeVisible({ timeout: 3000 })
+    await expect(dropdownTrigger).toHaveCount(0)
   })
 
   test('open-interactive action is visible and clickable', async ({ page }) => {
-    const task = budgetExhaustedTask()
+    const task = reviewFailedTask()
     await mockExceptionTaskRoutes(page, task)
 
     await page.goto(`/tasks/${TASK_ID}`)
@@ -991,35 +860,7 @@ test.describe('workflow exception recovery (integration)', () => {
     }
   })
 
-  test('proceed_once requires reason (400 without)', async ({ request }) => {
-    test.setTimeout(2 * 60 * 1000)
-    const runId = `proceed-${Date.now()}`
-    const createdTaskIds: string[] = []
-    const fixturePath = await createGitFixture(runId)
-
-    try {
-      const { projectId } = await createTestProject(request, runId, fixturePath)
-      const task = await api<TaskResponse>(
-        request, 'POST', `/api/v1/projects/${projectId}/tasks`,
-        { title: `Proceed test ${runId}`, description: 'Test', task_type: 'task', priority: 0 },
-      )
-      createdTaskIds.push(task.id)
-
-      const resp = await request.fetch(`/api/v1/tasks/${task.id}/recover`, {
-        method: 'POST',
-        data: { action: 'proceed_once', reason: null, context: null },
-        failOnStatusCode: false,
-      })
-      expect(resp.status()).toBe(400)
-      const error = (await resp.json()) as { message: string }
-      expect(error.message.toLowerCase()).toContain('reason')
-    } finally {
-      for (const taskId of createdTaskIds.reverse()) await cleanupTask(request, taskId)
-      await rm(fixturePath, { recursive: true, force: true })
-    }
-  })
-
-  test('reset_retry_window rejected when budget is not exhausted (409)', async ({ request }) => {
+  test('retired reset_retry_window wire value is rejected during request decoding', async ({ request }) => {
     test.setTimeout(2 * 60 * 1000)
     const runId = `reset-reject-${Date.now()}`
     const createdTaskIds: string[] = []
@@ -1038,242 +879,12 @@ test.describe('workflow exception recovery (integration)', () => {
         data: { action: 'reset_retry_window', reason: 'should fail' },
         failOnStatusCode: false,
       })
-      expect(resp.status()).toBe(409)
+      expect(resp.status()).toBe(422)
     } finally {
       for (const taskId of createdTaskIds.reverse()) await cleanupTask(request, taskId)
       await rm(fixturePath, { recursive: true, force: true })
     }
   })
 
-  test('full agent cycle: CI failure → retry → exhaust → reset → exhaust → proceed_once', async ({
-    page,
-    request,
-  }) => {
-    test.setTimeout(15 * 60 * 1000)
 
-    const projectsResponse = await request.get('/api/v1/projects', { failOnStatusCode: false })
-    await expectOk(
-      projectsResponse,
-      'GET /api/v1/projects. Start the Forge API server on localhost:8080 before running this integration test',
-    )
-
-    const runId = `full-recovery-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const createdTaskIds: string[] = []
-    const createdAgentIds: string[] = []
-    const fixturePath = await createGitFixture(runId)
-
-    try {
-      // --- Setup: project with always-failing CI and budget=2 ---
-      const project = await api<ProjectResponse>(request, 'POST', '/api/v1/projects', {
-        name: `Full Recovery E2E ${runId}`,
-        default_review_config: { ci_steps: ['exit 1'], review_prompt: null },
-      })
-      await api<unknown>(request, 'PUT', `/api/v1/projects/${project.id}/workflow`, {
-        template_name: 'no-user-approval',
-      })
-      await api<RepoResponse>(request, 'POST', `/api/v1/projects/${project.id}/repos`, {
-        name: `recovery-full-${runId}`,
-        remote_url: fixturePath,
-        local_path: fixturePath,
-        work_mode: 'direct_merge',
-        default_branch: 'main',
-      })
-
-      const coder = await api<AgentResponse>(request, 'POST', '/api/v1/agents', {
-        name: `Recovery Coder ${runId}`,
-        executor_type: 'codex',
-        model: 'gpt-5.3-codex',
-        permission_policy: 'supervised',
-        max_concurrent_tasks: 1,
-      })
-      createdAgentIds.push(coder.id)
-
-      await api<ProjectResponse>(request, 'PATCH', `/api/v1/projects/${project.id}`, {
-        name: project.name,
-        settings: {
-          default_role_assignments: [
-            { role_name: 'coder', assignee_type: 'agent', assignee_id: coder.id },
-          ],
-          retry_budgets: { review: 2 },
-        },
-        default_review_config: { ci_steps: ['exit 1'], review_prompt: null },
-      })
-
-      // --- Create task and wait for it to reach review with a failed CI ---
-      const task = await api<TaskResponse>(
-        request, 'POST', `/api/v1/projects/${project.id}/tasks`,
-        {
-          title: `Full recovery cycle ${runId}`,
-          description: 'Create hello.txt with "hello". Do not create other files.',
-          task_type: 'task',
-          priority: 0,
-        },
-      )
-      createdTaskIds.push(task.id)
-
-      // Wait for the task to reach review with a failed review (CI always fails)
-      const stuckTask = await poll(
-        'task stuck in review with failed CI',
-        async () => {
-          const t = await getTask(request, task.id)
-          if (t.status === 'review' && t.workflow_exception?.type === 'review_failed') return t
-          return null
-        },
-        { timeoutMs: 10 * 60 * 1000, intervalMs: 5000 },
-      )
-      expect(stuckTask.workflow_exception).not.toBeNull()
-      expect(stuckTask.workflow_health?.kind).toBeTruthy()
-
-      // --- Phase 1: retry_hook while budget remains ---
-      const retryAction = stuckTask.workflow_exception!.actions.find((a) => a.kind === 'retry_hook')
-      if (retryAction?.enabled) {
-        const retryResp = await request.fetch(`/api/v1/tasks/${task.id}/recover`, {
-          method: 'POST',
-          data: { action: 'retry_hook', reason: 'e2e: retry while budget remains' },
-          failOnStatusCode: false,
-        })
-        expect(retryResp.status()).toBe(200)
-
-        // Wait for review to fail again after retry
-        await poll(
-          'review to fail after retry',
-          async () => {
-            const t = await getTask(request, task.id)
-            return t.status === 'review' && t.workflow_exception?.type === 'review_failed' ? t : null
-          },
-          { timeoutMs: 2 * 60 * 1000, intervalMs: 3000 },
-        )
-      }
-
-      // --- Phase 2: exhaust budget by retrying until remaining = 0 ---
-      await poll(
-        'review budget to exhaust with proceed_once available',
-        async () => {
-          const t = await getTask(request, task.id)
-          if (t.status === 'review' && enabledRecoveryAction(t, 'proceed_once')) return t
-          const retry = enabledRecoveryAction(t, 'retry_hook')
-          if (retry) {
-            await request.fetch(`/api/v1/tasks/${task.id}/recover`, {
-              method: 'POST',
-              data: { action: 'retry_hook', reason: 'e2e: exhaust budget' },
-              failOnStatusCode: false,
-            })
-          }
-          return null
-        },
-        { timeoutMs: 5 * 60 * 1000, intervalMs: 5000 },
-      )
-
-      const exhaustedTask = await getTask(request, task.id)
-      expect(exhaustedTask.remaining_retries?.review).toBe(0)
-      const exhaustedActions = exhaustedTask.workflow_exception?.actions ?? []
-      expect(exhaustedActions.find((a) => a.kind === 'retry_hook')?.enabled).toBe(false)
-      expect(exhaustedActions.find((a) => a.kind === 'reset_retry_window')?.enabled).toBe(true)
-      expect(exhaustedActions.find((a) => a.kind === 'proceed_once')?.enabled).toBe(true)
-
-      // --- Phase 3: UI shows exception panel with correct actions ---
-      await page.goto(`/tasks/${task.id}`)
-      await expect(page.getByText(/review failed/i).first()).toBeVisible({ timeout: 15000 })
-      await expect(page.getByText('exit 1').first()).toBeVisible()
-      await expect(page.getByRole('button', { name: 'Reset Retry Window' }).first()).toBeVisible()
-
-      // --- Phase 4: reset_retry_window restores the budget ---
-      const resetResp = await request.fetch(`/api/v1/tasks/${task.id}/recover`, {
-        method: 'POST',
-        data: { action: 'reset_retry_window', reason: 'e2e: testing reset' },
-        failOnStatusCode: false,
-      })
-      expect(resetResp.status()).toBe(200)
-      const resetTask = (await resetResp.json()) as TaskResponse
-      expect(resetTask.status).toBe('in_progress')
-      expect(resetTask.remaining_retries?.review).toBe(1)
-
-      // Verify recovery marker in transition log. Reset immediately resumes work, consuming one
-      // refreshed retry through the resume_process rejection transition.
-      const transResp = await request.get(`/api/v1/tasks/${task.id}/transitions?limit=50`, { failOnStatusCode: false })
-      if (transResp.ok()) {
-        const body = await transResp.json()
-        const transitions = (Array.isArray(body) ? body : (body as Record<string, unknown>).items) as TransitionLogEntry[]
-        const resetMarker = transitions.find(
-          (t) => t.from_state === t.to_state && t.triggered_by.includes('reset_retry_window'),
-        )
-        expect(resetMarker).toBeDefined()
-        expect(resetMarker?.trigger_reason).toContain('e2e: testing reset')
-        const resumeTransition = transitions.find(
-          (t) =>
-            t.from_state === 'review' &&
-            t.to_state === 'in_progress' &&
-            t.triggered_by.includes('resume_process') &&
-            t.rejection,
-        )
-        expect(resumeTransition).toBeDefined()
-      }
-
-      // --- Phase 5: reset has already spent the refreshed retry; wait for its failure ---
-      await poll(
-        'review budget to exhaust with proceed_once available (second time)',
-        async () => {
-          const t = await getTask(request, task.id)
-          if (t.status === 'review' && enabledRecoveryAction(t, 'proceed_once')) return t
-          const retry = enabledRecoveryAction(t, 'retry_hook')
-          if (retry) {
-            await request.fetch(`/api/v1/tasks/${task.id}/recover`, {
-              method: 'POST',
-              data: { action: 'retry_hook', reason: 'e2e: exhaust for proceed_once' },
-              failOnStatusCode: false,
-            })
-          }
-          return null
-        },
-        { timeoutMs: 5 * 60 * 1000, intervalMs: 5000 },
-      )
-
-      const preProceeed = await getTask(request, task.id)
-      expect(preProceeed.remaining_retries?.review).toBe(0)
-      expect(preProceeed.workflow_exception?.actions.find((a) => a.kind === 'proceed_once')?.enabled).toBe(true)
-      const versionBeforeProceed = preProceeed.version
-
-      // --- Phase 6: proceed_once bypasses the guard and bounces the task ---
-      const proceedResp = await request.fetch(`/api/v1/tasks/${task.id}/recover`, {
-        method: 'POST',
-        data: {
-          action: 'proceed_once',
-          reason: 'e2e: bypass exhausted guard',
-          context: 'Focus on making the CI step pass',
-        },
-        failOnStatusCode: false,
-      })
-      expect(proceedResp.status()).toBe(200)
-      const afterProceed = (await proceedResp.json()) as TaskResponse
-      expect(afterProceed.version).toBeGreaterThan(versionBeforeProceed)
-
-      // Verify proceed_once marker in transition log
-      const transResp2 = await request.get(`/api/v1/tasks/${task.id}/transitions?limit=50`, { failOnStatusCode: false })
-      if (transResp2.ok()) {
-        const body = await transResp2.json()
-        const transitions = (Array.isArray(body) ? body : (body as Record<string, unknown>).items) as TransitionLogEntry[]
-        const proceedMarker = transitions.find(
-          (t) => t.from_state === t.to_state && t.triggered_by.includes('proceed_once'),
-        )
-        expect(proceedMarker).toBeDefined()
-      }
-
-      // --- Phase 7: verify UI refreshed on review tab ---
-      await page.goto(`/tasks/${task.id}/review`)
-      await expect(page.getByText(/review failed/i).first()).toBeVisible({ timeout: 15000 })
-
-    } finally {
-      let canRemoveBackingResources = true
-      for (const taskId of createdTaskIds.reverse()) {
-        canRemoveBackingResources =
-          (await cleanupTask(request, taskId)) && canRemoveBackingResources
-      }
-      if (canRemoveBackingResources) {
-        for (const agentId of createdAgentIds.reverse()) {
-          await request.delete(`/api/v1/agents/${agentId}`, { failOnStatusCode: false })
-        }
-        await rm(fixturePath, { recursive: true, force: true })
-      }
-    }
-  })
 })

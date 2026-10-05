@@ -1,9 +1,10 @@
 # Plan PR9: Gate Engine and aggregate Task lifecycle
 
-Status: **READY FOR REVIEW**. PR9 is not merged. The merge-readiness decision
-is a deterministic evaluation of immutable exact facts; Task lifecycle stores
-aggregate progress. The PR8 ReviewReport and ValidationRun authority remains
-unchanged.
+Status: **READY FOR REVIEW**. The three assigned P2 fixes and P3 fix are
+implemented with focused deterministic coverage. PR9 is not merged. The
+merge-readiness decision is a deterministic evaluation of immutable exact
+facts; Task lifecycle stores aggregate progress. The PR8 ReviewReport and
+ValidationRun authority remains unchanged.
 
 ## Baseline and checkpoints
 
@@ -11,7 +12,13 @@ unchanged.
 - PR8 HEAD: `834b6c486b56c9abbf63fe26248eacacea0e0d74`; ancestry verified in `main`.
 - PR9 branch: `feat/plan-pr9-gate-engine-task-lifecycle`.
 - PR9 initial HEAD: `6367cc257f9a6ccc1febcce9b4ab6abefd4161d8`.
-- Migration head at PR9 base: V099. PR9 adds V100–V107; each migration is additive.
+- Follow-up review starting HEAD: `390e356ec3af1d6c2eba03da6cf557b80672693c`.
+- Migration head at PR9 base: V099. PR9 adds V100–V107; this follow-up adds
+  V108–V110. Each migration is additive and preserves existing receipts.
+- V109 marks pre-existing PR metadata without exact TaskMerge and PublishPr
+  operation links as `legacy_unadmitted`. It remains visible, but automatic
+  reconciliation and later publication cannot attach that external PR to a
+  new Gate admission or infer merge authority after the fact.
 - PR8 was merged as repository PR #11; resulting `main` is the PR9 base above.
 
 ### CHECKPOINT 1 — PR8 merged
@@ -102,6 +109,17 @@ Task operation type whenever that canonical role exists. SQLite rejects a
 WorkspaceLease insert or renewal whose Agent is not an active member; the
 pre-TaskRole singleton fallback remains available only when the role is absent.
 
+V108 separates `work_unit_integration_failed` from `task_merge_failed`, keeps
+old `merge_failed` receipts as immutable history, and scopes retry uniqueness
+to a per-kind retry epoch. V109 atomically commits the PR-mode TaskMerge,
+PublishPr child, and provider publication intent, and links each result to that
+exact admission. The source branch is pushed and the exact Gate is rechecked
+before the transaction; a restart can resume provider work from the committed
+intent. Publication failures persist an operation-scoped `pr.status_changed`
+event before the same child and parent operations become terminal. V110 adds
+an immutable, Human-Decision-authorized override for one exact exhausted
+receipt and starts a new retry epoch only for that failure kind.
+
 The existing `task.status` column is preserved and normalized as a lossy
 projection. The migration audit preserves the original state, workflow
 definition, configuration, and relevant failure details.
@@ -156,20 +174,41 @@ repeats exact-input and retry-receipt checks at the durable write boundary.
 The retry policy is versioned and separate from Gate policy. V101 receipts
 identify the failure kind and exact source ref, record the attempt and policy
 digest, and deduplicate replay. Current budgets are 3 review request-changes,
-2 validation failures, 3 Execution failures, and 1 merge failure. The same
+2 validation failures, 3 Execution failures, 1 WorkUnit integration failure,
+and 1 TaskMerge failure. These last two budgets are independent. The same
 failure replay cannot spend another attempt. While budget remains, the
 `task.rework_requested` fact wakes the orchestrator; after exhaustion the
 Task is blocked and V103 prevents direct repository/API re-entry to runnable
-states. `transition_log` rejection counts and `max_rejections` no longer
-authorize retries.
+states. A same-Task Human Decision must approve the exact exhausted receipt
+under the retry-override policy before a new epoch can reopen the Task. The
+receipt stays immutable and historical, and the new epoch applies only to
+that failure kind. Each failure event is assigned to the epoch that was
+active at its durable event sequence, so delayed delivery of an older failure
+cannot spend the newly authorized epoch. The durable `decision.recorded`
+consumer recognizes the exact override Proposal action and issues/replays the
+authority automatically.
+The `reset_retry_window` wire value is removed from `RecoveryAction`, and an
+exhausted Task's diagnostics expose no resume/reset/retry action while it waits
+for that external Decision. Direct Actor transitions are rejected. Historical
+`transition_log` rejection counts and `max_rejections` do not authorize retries.
 
 Merge flow is current satisfied merge-readiness Gate → `ready_to_merge` →
-atomic TaskMerge admission → `merging` → existing MergeService/PR operation →
+durable TaskMerge admission → `merging` → direct merge or PR publication →
 `done` on exact success or `blocked` on exact failure. Admission revalidates
 the current evaluation and merge candidate while holding the shared
-TaskIntegrationOperation/workspace lock. A stale subject cannot be silently
-replaced. Workspace isolation, leases, integration serialization, and
-recovery remain PR5 behavior.
+TaskIntegrationOperation/workspace lock. In PullRequest mode one transaction
+commits the durable TaskMerge, its `PublishPr` child, and initial provider
+metadata before the provider call. Once the provider reports Open, the local
+lock is released but the TaskMerge remains running and lifecycle stays
+`merging`. Provider Merged/Closed status finishes that same operation using a
+status event keyed to its exact TaskMerge and PublishPr IDs. Later facts or
+policy revisions cannot revoke an admission already in `merging`. SQLite
+rejects terminal completion of a remote TaskMerge without that exact provider
+result event. A provider failure is replay-safe and recoverable after a crash
+between recording the failure and finishing the operations. Pre-V109 PR metadata remains visible as
+`legacy_unadmitted`; reconciliation cannot attach it to a later Gate or
+reconstruct authority retrospectively. Workspace isolation, leases,
+integration serialization, and direct-merge recovery remain PR5 behavior.
 
 ## Events, concurrency, and crash recovery
 
@@ -188,6 +227,11 @@ membership/version, and Gate policy revision facts.
   recovered from that exact evaluation event. A crash after lifecycle commit
   returns the existing transition receipt and does not transition, dispatch,
   or merge twice.
+- A PullRequest admission commits the TaskMerge, PublishPr, and provider intent
+  atomically. Restart resumes the existing intent whether the provider still
+  reports Open or has since reported Merged. Provider status and publication
+  failure events include the exact operation identities; replay cannot finish
+  a different admission or create a second one.
 - A policy revision remains historical. Its evaluation cannot authorize the
   active revision. Currentness and exact input fences run before lifecycle and
   TaskMerge admission.
@@ -214,14 +258,15 @@ membership/version, and Gate policy revision facts.
 ### CHECKPOINT 3 — schema/lifecycle
 
 V100 adds the lifecycle aggregate, immutable transition facts, audit mapping,
-Gate identity and versioned policy/evaluation/input tables. V101–V107 add exact
+Gate identity and versioned policy/evaluation/input tables. V101–V110 add exact
 retry receipts, TaskRole revision events, retry exhaustion fences, mutable Gate
 input currentness, exact retry-rework demotion authority with replay fencing,
-and Running Execution admission fencing for terminal Task lifecycle. V107
-fences interactive WorkspaceLease admission/renewal against canonical
-TaskRole membership. Task
-lifecycle writes use optimistic Task/lifecycle versions, durable idempotency
-receipts, and one-way `task.status` projection.
+Running Execution admission fencing for terminal Task lifecycle, independent
+retry failure domains, durable PullRequest TaskMerge admission, and exact
+retry-exhaustion override epochs. V107 fences interactive WorkspaceLease
+admission/renewal against canonical TaskRole membership. Task lifecycle writes
+use optimistic Task/lifecycle versions, durable idempotency receipts, and
+one-way `task.status` projection.
 
 ### CHECKPOINT 4 — Gate Engine
 
@@ -283,7 +328,10 @@ Commands and results from this review:
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests:: --locked --offline` | PASS, 9 tests, including concurrent version fencing, exact validation mismatch, rejection of Actor re-entry from merge-ready, and exact retry-receipt rework. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_lifecycle::tests::exact_validation_gate_moves_to_merge_ready_and_new_policy_revokes_stale_readiness --locked --offline` | PASS, 1 test; a failed TaskMerge produces the durable `task.lifecycle_changed` event, exact retry reopens only its own blocked Task, and replay leaves the lifecycle version unchanged. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib gate_engine::tests:: --locked --offline` | PASS, 5 tests, including wrong reviewer, Human-required, N-of-M, all-required, and stale TaskRole membership. |
-| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_failure_retry::tests:: --locked --offline` | PASS, 2 tests. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_failure_retry::tests:: --locked --offline` | PASS, 4 tests: separate retry domains, exact Decision override, execution failure replay/exhaustion, and ReviewReport rework. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_failure_retry::tests::work_unit_integration_failure_does_not_spend_task_merge_budget --locked --offline` | PASS, 1 test: conflict receipt/replay, repair fact, first TaskMerge failure is attempt 1, and its replay adds no attempt. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_failure_retry::tests::retry_exhaustion_override_is_exact_scoped_and_replay_safe --locked --offline` | PASS, 1 test: Actor transition is rejected; retired `reset_retry_window` cannot deserialize on an exhausted Task; exact same-Task Decision replay is idempotent; cross-Task/receipt reuse is rejected; exhaustion history remains; only the scoped kind starts epoch 1; a delayed pre-override event remains in its original epoch. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::diagnostics_exception:: --locked --offline -- --test-threads=1` | PASS, 10 tests; exhausted diagnostics expose only cancellation, stale legacy merge state does not offer RetryHook/Resume, and legacy reviewer rows do not recreate workflow recovery. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib coordination_consumer::tests:: --locked --offline` | PASS, 1 test for exact lifecycle outcomes and stale-reason isolation. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib shutdown::tests:: --locked --offline` | PASS, 4 tests; shutdown selects actual running Executions rather than the lossy status projection. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_dispatcher::tests::dispatcher_retries_failed_execution_only_with_exact_durable_rework_receipt --locked --offline` | PASS, 1 test. |
@@ -292,10 +340,20 @@ Commands and results from this review:
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib project_hooks::tests:: --locked --offline` | PASS, 11 tests. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib recovery::tests::heartbeat_monitor_marks_stalled_executions_without_legacy_retry_authority --locked --offline` | PASS, 1 test. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib merge_service::tests:: --locked --offline` | PASS, 1 test. |
-| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests:: --locked --offline` | PASS, 6 tests, including cross-process Gate admission and operation recovery. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests:: --locked --offline` | PASS, 12 tests, including atomic PR publication intent, Open/restart/Merged, Closed, publication failure recovery, exact-result terminal fencing, legacy PR fencing, and cross-process admission. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests::remote_task_merge_cannot_finish_without_exact_provider_result --locked --offline` | PASS, 1 test: a status-only success is rejected by SQLite and leaves the exact admission and lifecycle in `merging`. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests::publication_intent_recovers_after_restart_before_provider_call --locked --offline` | PASS, 1 test: restart resumes the committed provider intent and reuses the same TaskMerge/PublishPr operations. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests::pull_request_admission_survives_open_restart_gate_change_and_merged_replay --locked --offline` | PASS, 1 test: admission remains `merging` through Open, restart, and policy revision; Merged finishes the same operation once. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests::closed_pull_request_blocks_with_exact_provider_provenance_without_retry --locked --offline` | PASS, 1 test: Closed blocks against its exact provider event without a TaskMerge retry. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests::publication_failure_blocks_exact_merge_and_consumes_only_task_merge_retry --locked --offline` | PASS, 1 test: exact failure event replay survives restart, closes the same child/parent operations, and creates one TaskMerge retry receipt. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests::legacy_unadmitted_pull_request_cannot_be_rebound_under_a_new_gate --locked --offline` | PASS, 1 test: old PR metadata cannot be rebound to a later Gate admission. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib work_unit_service::tests::integration_pins_success_and_aborts_conflict_without_losing_workunit_workspace --locked --offline` | PASS, 1 test: WorkUnit conflict receipt/replay is attempt 1; terminal Executions durably revoke their leases in the same transaction, and workspace/branch recovery succeeds. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::actions::tests:: --locked --offline` | PASS, 1 test; merge lifecycle no longer advertises invalid Resume/Cancel actions. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::recovery_events::clearing_blocked_metadata_does_not_publish_unblocked_while_lifecycle_is_blocked --locked --offline` | PASS, 1 test: clearing legacy block metadata during cancellation does not publish `task.unblocked` while TaskLifecycle is still blocked. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib orchestrator_runtime::tests:: --locked --offline` | PASS, 23 tests, including TaskRole revision fencing, the Gate membership event, and the single-wake retry regression. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db --test file_backed_migration pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambiguity --locked --offline` | PASS, 1 test. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db --test file_backed_migration file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_pools --locked --offline` | PASS, 1 test; applies V108–V110 and preserves cross-pool integration-claim exclusion. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db --test file_backed_migration v109_marks_existing_pull_requests_as_unadmitted_without_rebinding --locked --offline` | PASS, 1 test; a V108 database upgrades without losing old PR metadata or inventing merge admission links. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p db --lib interactive_workspace_lease_uses_task_role_for_insert_and_renewal --locked --offline` | PASS, 1 test; the legacy lease cannot renew or be reissued after the canonical TaskRole contradicts its singleton assignee. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::service_tests::cases::executions::interactive_workspace_lease_uses_the_canonical_task_role_when_present --locked --offline` | PASS, 1 test; a stale singleton Agent is terminalized before adapter dispatch and receives no WorkspaceLease. |
 | `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_service::tests::service_tests::cases::executions:: --locked --offline` | PASS, 54 tests, including the interactive TaskRole authority regression and the PR8 review/session execution cases. |
@@ -366,7 +424,7 @@ Physical removal of `task.status`, workflow/state tables, GateConfig,
 to PR12/PR13 as assigned. These retained records have no contradictory
 authority.
 
-## Findings at review close
+## Findings at the earlier review close
 
 - P1: 0
 - P2: 0
@@ -380,5 +438,12 @@ stale inputs, merge failure/recovery replay, and retry exhaustion. The final
 authority pass found one additional P2: `interactive` WorkspaceLease
 admission could inherit a contradictory singleton assignee despite a
 canonical TaskRole. V107 and service validation now require active membership,
-with insert, renewal, and service regressions. PR9 is ready for review and
-remains unmerged.
+with insert, renewal, and service regressions. That earlier review marked PR9
+ready for review; the current follow-up supersedes that status. The three
+assigned P2 fixes and the P3 `unblock_task()` authority removal are
+implemented. The WorkUnit integration test originally expected a lease to stay
+active after a terminal Execution, while `ExecutionRepo::update` already
+revoked that lease atomically; both expectations now assert the persisted
+revocation. Focused retry, PR recovery, migration, lifecycle, formatting, and
+diff checks pass. PR9 is READY FOR REVIEW and remains unmerged. Provider/live
+acceptance and workspace-wide tests were not run.

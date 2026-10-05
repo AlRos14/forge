@@ -61,6 +61,41 @@ impl TaskIntegrationOperationManager {
         Ok(file)
     }
 
+    /// PR polling and publication recovery use the same per-Task process lock
+    /// as Git integration, but do not abandon the durable remote admission.
+    pub(crate) async fn try_pr_recovery_lock(
+        &self,
+        task_id: &str,
+        merge_operation_id: &str,
+        publish_operation_id: &str,
+    ) -> crate::Result<Option<File>> {
+        let file = match self.try_process_lock(task_id).await? {
+            Ok(file) => file,
+            Err(()) => return Ok(None),
+        };
+        let Some(merge) =
+            TaskIntegrationOperationRepo::get_by_id(&*self.db, merge_operation_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(publish) =
+            TaskIntegrationOperationRepo::get_by_id(&*self.db, publish_operation_id).await?
+        else {
+            return Ok(None);
+        };
+        if merge.task_id != task_id
+            || merge.kind != TaskIntegrationOperationKind::TaskMerge
+            || !merge.remote_waiting
+            || publish.task_id != task_id
+            || publish.kind != TaskIntegrationOperationKind::PublishPr
+            || publish.parent_operation_id.as_deref() != Some(merge_operation_id)
+            || publish.gate_evaluation_id != merge.gate_evaluation_id
+        {
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+
     pub(crate) async fn acquire_kind_after_gate_with_lock(
         &self,
         task_id: &str,
@@ -75,6 +110,8 @@ impl TaskIntegrationOperationManager {
             kind,
             owner_id: owner_id.to_owned(),
             gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
+            remote_waiting: false,
+            parent_operation_id: None,
             created_at: now_rfc3339(),
         };
         let operation = match TaskIntegrationOperationRepo::begin(&*self.db, input.clone()).await {
@@ -96,50 +133,74 @@ impl TaskIntegrationOperationManager {
         })
     }
 
-    /// Finish an operation when an external provider has durably confirmed
-    /// that the exact admitted merge completed. If a prior process crashed
-    /// after admission, resume that same operation under the Task lock.
-    pub(crate) async fn record_provider_confirmed_merge(
+    pub(crate) async fn admit_pull_request_publication_with_lock(
         &self,
         task_id: &str,
         owner_id: &str,
         gate_evaluation_id: &str,
-    ) -> crate::Result<TaskIntegrationOperation> {
-        let file = match self.try_process_lock(task_id).await? {
-            Ok(file) => file,
-            Err(()) => return Err(busy(task_id)),
+        provider_type: &str,
+        source_branch: &str,
+        target_branch: &str,
+        file: File,
+    ) -> crate::Result<(TaskIntegrationOperationGuard, TaskIntegrationOperationGuard)> {
+        let now = now_rfc3339();
+        let merge_id = new_uuid_v4();
+        let publish_id = new_uuid_v4();
+        let merge_input = CreateTaskIntegrationOperation {
+            id: merge_id.clone(),
+            task_id: task_id.to_owned(),
+            kind: TaskIntegrationOperationKind::TaskMerge,
+            owner_id: owner_id.to_owned(),
+            gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
+            remote_waiting: true,
+            parent_operation_id: None,
+            created_at: now.clone(),
         };
-        let operation =
-            match TaskIntegrationOperationRepo::get_active_for_task(&*self.db, task_id).await? {
-                Some(operation)
-                    if operation.kind == TaskIntegrationOperationKind::TaskMerge
-                        && operation.gate_evaluation_id.as_deref() == Some(gate_evaluation_id) =>
-                {
-                    operation
-                }
-                Some(_) => return Err(busy(task_id)),
-                None => {
-                    TaskIntegrationOperationRepo::begin(
-                        &*self.db,
-                        CreateTaskIntegrationOperation {
-                            id: new_uuid_v4(),
-                            task_id: task_id.to_owned(),
-                            kind: TaskIntegrationOperationKind::TaskMerge,
-                            owner_id: owner_id.to_owned(),
-                            gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
-                            created_at: now_rfc3339(),
-                        },
-                    )
-                    .await?
-                }
-            };
-        TaskIntegrationOperationGuard {
-            db: Arc::clone(&self.db),
-            operation,
-            _file: Some(file),
-        }
-        .finish(TaskIntegrationOperationStatus::Succeeded)
-        .await
+        let publish_input = CreateTaskIntegrationOperation {
+            id: publish_id.clone(),
+            task_id: task_id.to_owned(),
+            kind: TaskIntegrationOperationKind::PublishPr,
+            owner_id: owner_id.to_owned(),
+            gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
+            remote_waiting: false,
+            parent_operation_id: Some(merge_id.clone()),
+            created_at: now.clone(),
+        };
+        let metadata_input = db::CreatePrMetadata {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            provider_type: provider_type.to_owned(),
+            provider_pr_id: None,
+            pr_url: None,
+            source_branch: source_branch.to_owned(),
+            target_branch: target_branch.to_owned(),
+            pr_state: "publishing".to_owned(),
+            merge_status: "pending".to_owned(),
+            task_merge_operation_id: merge_id,
+            publish_operation_id: publish_id,
+            last_synced_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let (merge, publish) = TaskIntegrationOperationRepo::begin_pull_request_publication(
+            &*self.db,
+            merge_input,
+            publish_input,
+            metadata_input,
+        )
+        .await?;
+        Ok((
+            TaskIntegrationOperationGuard {
+                db: Arc::clone(&self.db),
+                operation: merge,
+                _file: Some(file),
+            },
+            TaskIntegrationOperationGuard {
+                db: Arc::clone(&self.db),
+                operation: publish,
+                _file: None,
+            },
+        ))
     }
 
     async fn acquire_with_gate(
@@ -155,6 +216,8 @@ impl TaskIntegrationOperationManager {
             kind,
             owner_id: owner_id.to_owned(),
             gate_evaluation_id: gate_evaluation_id.map(str::to_owned),
+            remote_waiting: false,
+            parent_operation_id: None,
             created_at: now_rfc3339(),
         };
 
@@ -308,6 +371,14 @@ impl TaskIntegrationOperationGuard {
         self,
         status: TaskIntegrationOperationStatus,
     ) -> crate::Result<TaskIntegrationOperation> {
+        self.finish_with_result_event(status, None).await
+    }
+
+    pub(crate) async fn finish_with_result_event(
+        self,
+        status: TaskIntegrationOperationStatus,
+        result_event_id: Option<String>,
+    ) -> crate::Result<TaskIntegrationOperation> {
         let now = now_rfc3339();
         let result = TaskIntegrationOperationRepo::finish(
             &*self.db,
@@ -315,6 +386,7 @@ impl TaskIntegrationOperationGuard {
                 id: self.operation.id.clone(),
                 expected_version: self.operation.version,
                 status,
+                result_event_id,
                 updated_at: now.clone(),
                 finished_at: now,
             },
@@ -335,17 +407,19 @@ fn busy(task_id: &str) -> ServiceError {
 mod tests {
     use super::*;
     use db::{
-        create_sqlite_pool, run_migrations, CreateProject, CreateRepo, CreateTask,
-        CreateTerminalSession, CreateWorkspace, ProjectRepo, RepoRepo,
-        TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo, UserRepo, WorkMode,
-        WorkspaceRepo, WorkspaceStatus,
+        create_sqlite_pool, run_migrations, CreatePrProviderConfig, CreateProject, CreateRepo,
+        CreateTask, CreateTerminalSession, CreateWorkspace, PrMetadataRepo, PrProviderConfigRepo,
+        ProjectRepo, RepoRepo, TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo,
+        UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
     };
+    use events::EventBus;
     use std::path::Path;
     use tempfile::TempDir;
 
     struct Fixture {
         db: Arc<SqliteDb>,
         task_id: String,
+        repo_id: String,
         user_id: String,
         workspace_id: String,
     }
@@ -437,7 +511,7 @@ mod tests {
             CreateWorkspace {
                 id: workspace_id.clone(),
                 task_id: task_id.clone(),
-                repo_id,
+                repo_id: repo_id.clone(),
                 worktree_path: root.join("task-worktree").to_string_lossy().into_owned(),
                 branch: format!("task/{}", &task_id[..8]),
                 status: WorkspaceStatus::Ready,
@@ -451,6 +525,7 @@ mod tests {
         Fixture {
             db,
             task_id,
+            repo_id,
             user_id,
             workspace_id,
         }
@@ -465,11 +540,267 @@ mod tests {
                 kind: TaskIntegrationOperationKind::WorkUnitIntegration,
                 owner_id: "simulated-operation-owner".to_owned(),
                 gate_evaluation_id: None,
+                remote_waiting: false,
+                parent_operation_id: None,
                 created_at: now_rfc3339(),
             },
         )
         .await
         .expect("durable running operation")
+    }
+
+    struct TestTokenEnv(String);
+
+    impl TestTokenEnv {
+        fn set() -> Self {
+            let key = format!("FORGE_TEST_PR_TOKEN_{}", new_uuid_v4().replace('-', "_"));
+            std::env::set_var(&key, "test-token");
+            Self(key)
+        }
+    }
+
+    impl Drop for TestTokenEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(&self.0);
+        }
+    }
+
+    async fn prepare_pr_admission(
+        fixture: &Fixture,
+        root: &Path,
+        event_bus: Arc<EventBus>,
+    ) -> (
+        TaskIntegrationOperationManager,
+        TaskIntegrationOperationGuard,
+        TaskIntegrationOperationGuard,
+        db::GateEvaluation,
+        String,
+        crate::gate_engine::GatePolicyDocument,
+        TestTokenEnv,
+    ) {
+        RepoRepo::update(
+            &*fixture.db,
+            db::UpdateRepo {
+                id: fixture.repo_id.clone(),
+                name: None,
+                local_path: None,
+                remote_url: None,
+                work_mode: Some(WorkMode::PullRequest),
+                default_branch: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("repository enters pull-request mode");
+        let token_env = TestTokenEnv::set();
+        PrProviderConfigRepo::create(
+            &*fixture.db,
+            CreatePrProviderConfig {
+                id: new_uuid_v4(),
+                repo_id: fixture.repo_id.clone(),
+                provider_type: "github".to_owned(),
+                base_url: Some("https://github.example.invalid".to_owned()),
+                polling_interval_seconds: 1,
+                token_secret_ref: Some(token_env.0.clone()),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("PR provider config");
+
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: fixture.task_id.clone(),
+            expected_task_version: task.version,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::System(api_types::SystemComponent::Test),
+            reason_kind: Some("test_work_started".to_owned()),
+            reason_ref: Some("test".to_owned()),
+            idempotency_key: format!("test-active:{}", fixture.task_id),
+        })
+        .await
+        .expect("Task enters active work");
+        let collaboration = crate::collaboration_service::CollaborationService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        );
+        let proposal = collaboration
+            .create_proposal(
+                crate::collaboration_service::CollaborationActorSource::Human(
+                    fixture.user_id.clone(),
+                ),
+                crate::collaboration_service::CreateProposalInput {
+                    task_id: fixture.task_id.clone(),
+                    target: db::ProposalTarget {
+                        kind: db::ProposalTargetKind::Task,
+                        id: fixture.task_id.clone(),
+                    },
+                    action: "merge".to_owned(),
+                    reason: "Approve the exact readiness decision for this test".to_owned(),
+                    target_version: None,
+                    target_digest: None,
+                    required_policy_ref: None,
+                    required_policy_version: None,
+                    required_policy_digest: None,
+                    supersedes_proposal_id: None,
+                    artifact_ids: Vec::new(),
+                },
+            )
+            .await
+            .expect("merge Proposal");
+        let decision = collaboration
+            .record_decision(
+                crate::collaboration_service::CreateDecisionInput {
+                    task_id: fixture.task_id.clone(),
+                    proposal_id: proposal.id.clone(),
+                    proposal_version: proposal.content_version,
+                    outcome: db::DecisionOutcome::Approve,
+                    rationale: "Approve this exact merge readiness test".to_owned(),
+                    policy_ref: None,
+                    policy_version: None,
+                    policy_digest: None,
+                },
+                vec![
+                    crate::collaboration_service::CollaborationActorSource::Human(
+                        fixture.user_id.clone(),
+                    ),
+                ],
+            )
+            .await
+            .expect("exact Human Decision");
+        let policy = crate::gate_engine::GatePolicyDocument {
+            schema_version: 1,
+            scope_requirement: None,
+            review: None,
+            validations: Vec::new(),
+            decisions: vec![crate::gate_engine::DecisionRequirement {
+                proposal_id: proposal.id,
+                proposal_version: decision.proposal_version,
+                decision_id: decision.id,
+                outcome: db::DecisionOutcome::Approve,
+                policy_ref: None,
+                policy_version: None,
+                policy_digest: None,
+                permitted_deciders: vec![db::ActorRef::Human(fixture.user_id.clone())],
+            }],
+            work_units: Vec::new(),
+        };
+        let engine =
+            crate::gate_engine::GateEngine::new(Arc::clone(&fixture.db), Arc::clone(&event_bus));
+        let (gate, _) = engine
+            .create_gate_with_initial_policy(
+                &fixture.task_id,
+                "merge_readiness",
+                db::GateScopeKind::Task,
+                &fixture.task_id,
+                policy.clone(),
+            )
+            .await
+            .expect("exact merge-readiness Gate");
+        let evaluation = engine
+            .evaluate_active(&gate.id)
+            .await
+            .expect("Gate evaluation");
+        assert_eq!(
+            evaluation.evaluation.outcome,
+            db::GateEvaluationOutcome::Satisfied
+        );
+        let evaluation_event = evaluation
+            .event
+            .as_ref()
+            .expect("Gate evaluation has a durable event");
+        engine
+            .process_domain_event(evaluation_event)
+            .await
+            .expect("exact GateEvaluation event admits merge readiness");
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("merge-readiness lifecycle lookup")
+            .expect("Task lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::ReadyToMerge);
+        assert_eq!(
+            lifecycle.reason_ref.as_deref(),
+            Some(evaluation.evaluation.id.as_str())
+        );
+        let manager =
+            TaskIntegrationOperationManager::new(Arc::clone(&fixture.db), root.to_path_buf());
+        let lock = manager
+            .lock_for_gate_admission(&fixture.task_id)
+            .await
+            .expect("per-Task lock before PR admission");
+        let (merge, publish) = manager
+            .admit_pull_request_publication_with_lock(
+                &fixture.task_id,
+                &new_uuid_v4(),
+                &evaluation.evaluation.id,
+                "github",
+                &format!("task/{}", &fixture.task_id[..8]),
+                "main",
+                lock,
+            )
+            .await
+            .expect("TaskMerge, PublishPr, and publication intent commit atomically");
+        (
+            manager,
+            merge,
+            publish,
+            evaluation.evaluation,
+            gate.id,
+            policy,
+            token_env,
+        )
+    }
+
+    async fn create_test_pr_metadata(
+        fixture: &Fixture,
+        merge: &TaskIntegrationOperationGuard,
+        publish: &TaskIntegrationOperationGuard,
+        pr_state: &str,
+    ) -> db::PrMetadata {
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("PR metadata reload")
+            .expect("PR metadata exists from the atomic admission");
+        PrMetadataRepo::update(
+            &*fixture.db,
+            db::UpdatePrMetadata {
+                id: metadata.id,
+                provider_type: None,
+                provider_pr_id: Some(Some(format!("provider-{}", fixture.task_id))),
+                pr_url: Some(Some(format!(
+                    "https://github.example.invalid/pull/{}",
+                    fixture.task_id
+                ))),
+                source_branch: None,
+                target_branch: None,
+                pr_state: Some(pr_state.to_owned()),
+                merge_status: None,
+                task_merge_operation_id: None,
+                publish_operation_id: None,
+                last_synced_at: Some(Some(now_rfc3339())),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("exact provider response is stored over durable publication intent");
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("PR metadata reload")
+            .expect("PR metadata remains present");
+        assert_eq!(
+            metadata.task_merge_operation_id.as_deref(),
+            Some(merge.id())
+        );
+        assert_eq!(metadata.publish_operation_id.as_deref(), Some(publish.id()));
+        metadata
     }
 
     #[tokio::test]
@@ -738,5 +1069,517 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn publication_intent_recovers_after_restart_before_provider_call() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("pr-intent.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        let intent = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("publication intent lookup")
+            .expect("intent committed with operation admission");
+        assert_eq!(intent.merge_status, "pending");
+        assert_eq!(intent.pr_state, "publishing");
+        assert_eq!(intent.provider_pr_id, None);
+        drop(publish);
+        drop(merge);
+
+        crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .reconcile_once()
+            .await
+            .expect("restart resumes the exact publication intent");
+
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("reconciled PR metadata")
+            .expect("PR metadata remains");
+        assert_eq!(metadata.pr_state, "open");
+        assert!(metadata.provider_pr_id.is_some());
+        assert_eq!(
+            metadata.task_merge_operation_id.as_deref(),
+            Some(merge_id.as_str())
+        );
+        assert_eq!(
+            metadata.publish_operation_id.as_deref(),
+            Some(publish_id.as_str())
+        );
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+                .await
+                .expect("merge lookup")
+                .expect("TaskMerge remains durable")
+                .status,
+            TaskIntegrationOperationStatus::Running
+        );
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &publish_id)
+                .await
+                .expect("publish lookup")
+                .expect("PublishPr remains durable")
+                .status,
+            TaskIntegrationOperationStatus::Succeeded
+        );
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
+        let admissions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_integration_operation
+             WHERE task_id = ? AND kind = 'task_merge'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("admission count");
+        assert_eq!(admissions, 1, "restart does not create another admission");
+    }
+
+    #[tokio::test]
+    async fn remote_task_merge_cannot_finish_without_exact_provider_result() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!(
+            "sqlite://{}",
+            temp.path().join("pr-terminal-guard.db").display()
+        );
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, _publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), event_bus).await;
+        let current = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, merge.id())
+            .await
+            .expect("TaskMerge lookup")
+            .expect("durable PR admission exists");
+
+        let result = TaskIntegrationOperationRepo::finish(
+            &*fixture.db,
+            FinishTaskIntegrationOperation {
+                id: current.id.clone(),
+                expected_version: current.version,
+                status: TaskIntegrationOperationStatus::Succeeded,
+                result_event_id: None,
+                updated_at: now_rfc3339(),
+                finished_at: now_rfc3339(),
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a remote merge needs exact provider evidence"
+        );
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &current.id)
+                .await
+                .expect("TaskMerge lookup")
+                .expect("admission remains")
+                .status,
+            TaskIntegrationOperationStatus::Running
+        );
+        assert_eq!(
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("lifecycle lookup")
+                .expect("lifecycle exists")
+                .state,
+            db::TaskLifecycleState::Merging,
+            "rejected completion leaves the admitted Task in merging"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_admission_survives_open_restart_gate_change_and_merged_replay() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("pr-open.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, evaluation, gate_id, policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        let metadata = create_test_pr_metadata(&fixture, &merge, &publish, "open").await;
+        publish
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("publication completes without finishing remote TaskMerge");
+        drop(merge);
+
+        let recovery_manager = TaskIntegrationOperationManager::new(
+            Arc::clone(&fixture.db),
+            temp.path().to_path_buf(),
+        );
+        let recovered_lock = recovery_manager
+            .try_pr_recovery_lock(&fixture.task_id, &merge_id, &publish_id)
+            .await
+            .expect("recovery lock lookup")
+            .expect("restart recovers the exact still-open admission");
+        drop(recovered_lock);
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
+        assert_eq!(lifecycle.reason_ref.as_deref(), Some(merge_id.as_str()));
+        let task_merge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_integration_operation
+             WHERE task_id = ? AND kind = 'task_merge'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("TaskMerge history count");
+        assert_eq!(task_merge_count, 1, "recovery reuses one admission");
+
+        let reconciler = crate::pr_service::PrReconciler::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+            None,
+        );
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("provider Open is reconciled after restart");
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("open lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
+
+        let engine =
+            crate::gate_engine::GateEngine::new(Arc::clone(&fixture.db), Arc::clone(&event_bus));
+        let mut changed_policy = policy;
+        changed_policy.decisions[0].permitted_deciders = vec![db::ActorRef::Human(
+            "policy-revision-after-admission".to_owned(),
+        )];
+        engine
+            .revise_policy(&gate_id, Some(1), changed_policy)
+            .await
+            .expect("new Gate policy revision after PR admission");
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("post-policy-change lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
+        assert_eq!(lifecycle.reason_ref.as_deref(), Some(merge_id.as_str()));
+
+        PrMetadataRepo::update(
+            &*fixture.db,
+            db::UpdatePrMetadata {
+                id: metadata.id.clone(),
+                provider_type: None,
+                provider_pr_id: None,
+                pr_url: None,
+                source_branch: None,
+                target_branch: None,
+                pr_state: Some("merged".to_owned()),
+                merge_status: None,
+                task_merge_operation_id: None,
+                publish_operation_id: None,
+                last_synced_at: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("provider reports Merged");
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("exact admitted TaskMerge completes");
+        let finished = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge persists");
+        assert_eq!(finished.status, TaskIntegrationOperationStatus::Succeeded);
+        assert_eq!(
+            finished.gate_evaluation_id.as_deref(),
+            Some(evaluation.id.as_str())
+        );
+        assert!(finished.result_event_id.is_some());
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("merged lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Done);
+
+        let result_event_id = finished
+            .result_event_id
+            .clone()
+            .expect("exact provider result");
+        let replay = TaskIntegrationOperationRepo::finish(
+            &*fixture.db,
+            db::FinishTaskIntegrationOperation {
+                id: merge_id.clone(),
+                expected_version: finished.version,
+                status: TaskIntegrationOperationStatus::Succeeded,
+                result_event_id: Some(result_event_id),
+                updated_at: now_rfc3339(),
+                finished_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("duplicate Merged callback replays same operation");
+        assert_eq!(replay.id, merge_id);
+        let done_transitions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND cause_kind = 'merge_operation'
+               AND cause_ref = ? AND to_state = 'done'",
+        )
+        .bind(&fixture.task_id)
+        .bind(&finished.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("terminal lifecycle transition count");
+        assert_eq!(done_transitions, 1, "replay cannot finish lifecycle twice");
+    }
+
+    #[tokio::test]
+    async fn closed_pull_request_blocks_with_exact_provider_provenance_without_retry() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("pr-closed.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let metadata = create_test_pr_metadata(&fixture, &merge, &publish, "closed").await;
+        publish
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("PR was published");
+        drop(merge);
+
+        crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .reconcile_once()
+            .await
+            .expect("provider Closed finishes exact admission");
+        let terminal = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge exists");
+        assert_eq!(terminal.status, TaskIntegrationOperationStatus::Failed);
+        let result_event_id = terminal
+            .result_event_id
+            .as_deref()
+            .expect("Closed callback provenance is durable");
+        let result_event = db::DomainEventRepo::get_event(&*fixture.db, result_event_id)
+            .await
+            .expect("Closed callback event lookup")
+            .expect("Closed callback event exists");
+        assert_eq!(result_event.event_type, "pr.status_changed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result_event.payload_json)
+                .ok()
+                .and_then(|payload| payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned))
+                .as_deref(),
+            Some("closed")
+        );
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("closed lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            lifecycle.reason_kind.as_deref(),
+            Some("pr_closed_without_merge")
+        );
+        assert_eq!(
+            lifecycle.reason_ref.as_deref(),
+            Some(result_event.id.as_str())
+        );
+        let terminal_event = db::DomainEventRepo::get_event_by_dedupe(
+            &*fixture.db,
+            &format!("task-merge-terminal:{merge_id}"),
+        )
+        .await
+        .expect("terminal event lookup")
+        .expect("TaskMerge terminal event");
+        let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&terminal_event)
+                .await
+                .expect("closed PR is not a TaskMerge retry failure"),
+            0
+        );
+        let _ = metadata;
+    }
+
+    #[tokio::test]
+    async fn publication_failure_blocks_exact_merge_and_consumes_only_task_merge_retry() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("pr-failed.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        let failure_service =
+            crate::pr_service::PrService::new(Arc::clone(&fixture.db), Arc::clone(&event_bus));
+        let failure_event = failure_service
+            .record_publication_failure(&fixture.task_id, &merge_id, publish.id())
+            .await
+            .expect("exact provider failure is durable before operation completion");
+        let replayed_failure = failure_service
+            .record_publication_failure(&fixture.task_id, &merge_id, publish.id())
+            .await
+            .expect("publication failure replay");
+        assert_eq!(failure_event.id, replayed_failure.id);
+        drop(merge);
+        drop(publish);
+        crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .reconcile_once()
+            .await
+            .expect("restart closes the exact failed publication and TaskMerge");
+        let blocked = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("failure lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(blocked.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(blocked.reason_kind.as_deref(), Some("task_merge_failed"));
+        assert_eq!(blocked.reason_ref.as_deref(), Some(merge_id.as_str()));
+        let finished_merge = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge exists");
+        let finished_publish = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &publish_id)
+            .await
+            .expect("PublishPr lookup")
+            .expect("PublishPr exists");
+        assert_eq!(
+            finished_merge.status,
+            TaskIntegrationOperationStatus::Failed
+        );
+        assert_eq!(
+            finished_merge.result_event_id.as_deref(),
+            Some(failure_event.id.as_str())
+        );
+        assert_eq!(
+            finished_publish.status,
+            TaskIntegrationOperationStatus::Failed
+        );
+        assert_eq!(
+            finished_publish.result_event_id.as_deref(),
+            Some(failure_event.id.as_str())
+        );
+        let terminal_event = db::DomainEventRepo::get_event_by_dedupe(
+            &*fixture.db,
+            &format!("task-merge-terminal:{merge_id}"),
+        )
+        .await
+        .expect("terminal event lookup")
+        .expect("exact TaskMerge failure event");
+        let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&terminal_event)
+                .await
+                .expect("publication failure consumes TaskMerge budget"),
+            1
+        );
+        assert_eq!(
+            retry_service
+                .process_domain_event(&terminal_event)
+                .await
+                .expect("terminal event replay is idempotent"),
+            1
+        );
+        let attempt: i64 = sqlx::query_scalar(
+            "SELECT attempt_number FROM task_failure_retry_receipt
+             WHERE task_id = ? AND failure_kind = 'task_merge_failed'
+               AND failure_ref = ?",
+        )
+        .bind(&fixture.task_id)
+        .bind(&merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("exact TaskMerge retry attempt");
+        assert_eq!(attempt, 1);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_failure_retry_receipt
+             WHERE task_id = ? AND failure_kind = 'task_merge_failed'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("TaskMerge retry receipt count");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_unadmitted_pull_request_cannot_be_rebound_under_a_new_gate() {
+        let temp = TempDir::new().expect("temporary directory");
+        let db_fixture = fixture("sqlite::memory:", temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&db_fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let metadata = create_test_pr_metadata(&db_fixture, &merge, &publish, "open").await;
+        PrMetadataRepo::update(
+            &*db_fixture.db,
+            db::UpdatePrMetadata {
+                id: metadata.id.clone(),
+                provider_type: None,
+                provider_pr_id: None,
+                pr_url: None,
+                source_branch: None,
+                target_branch: None,
+                pr_state: None,
+                merge_status: Some("legacy_unadmitted".to_owned()),
+                task_merge_operation_id: None,
+                publish_operation_id: None,
+                last_synced_at: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("legacy provider metadata state persists");
+
+        let task = TaskRepo::get_by_id(&*db_fixture.db, &db_fixture.task_id, false)
+            .await
+            .expect("Task lookup")
+            .expect("Task exists");
+        let repo = RepoRepo::get_by_id(&*db_fixture.db, &db_fixture.repo_id)
+            .await
+            .expect("Repo lookup")
+            .expect("Repo exists");
+        let error = match crate::pr_service::PrService::new(
+            Arc::clone(&db_fixture.db),
+            Arc::clone(&event_bus),
+        )
+        .publish_pr(&task, &repo, "task/legacy", "main")
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a pre-V109 PR must not be rebound to a later Gate"),
+        };
+        assert!(error
+            .to_string()
+            .contains("legacy PR has no durable TaskMerge admission"));
+
+        let metadata = PrMetadataRepo::get_by_task_id(&*db_fixture.db, &db_fixture.task_id)
+            .await
+            .expect("PR metadata lookup")
+            .expect("legacy PR metadata remains visible");
+        assert_eq!(metadata.merge_status, "legacy_unadmitted");
+        assert_eq!(
+            metadata.task_merge_operation_id.as_deref(),
+            Some(merge.id())
+        );
+        assert_eq!(metadata.publish_operation_id.as_deref(), Some(publish.id()));
     }
 }
