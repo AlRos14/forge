@@ -118,6 +118,44 @@ identity are frozen and checked. V101, V108, V110, and legacy PR upgrade routes
 are covered by file-backed tests. Project teardown removes the new history only
 under its existing guarded transaction.
 
+### CHECKPOINT 6 — post-V111–V113 deep-review findings
+
+V114 lets an exact, durable retry override replay its lifecycle effect using
+the current Task version after rechecking that the Task remains blocked for
+retry exhaustion and every exhaustion receipt has its own exact override. The
+historical authorization version stays recorded for audit. A version conflict
+leaves the authorization intact for replay; a stale lifecycle state does not
+force `ready`.
+
+Remote provider status and Forge integrity classification are separate facts.
+For provider `Merged` with an observed head different from the admitted source,
+the result event and admission retain provider status `merged`, classification
+`head_mismatch`, the admitted and observed SHAs, and the merged commit SHA. The
+Task remains blocked, and the retry consumer excludes that exact result. V114
+also fences every generic terminal status for a remote TaskMerge; only the
+exact provider-result primitive can complete it. Process-lock stale recovery
+continues to select local operations only, and it leaves a running PublishPr
+child under the active remote TaskMerge for provider reconciliation to resolve.
+
+V114 adds immutable `legacy_pr_history`. Before a new modern admission replaces
+a terminal `legacy_unadmitted` projection, it snapshots the old provider,
+branch, outcome, operation-reference, and timestamp fields in the same
+transaction, then creates a fresh current projection and admission. The old
+provider PR identity is never linked to the new TaskMerge. Active and unknown
+legacy outcomes remain fail-closed. The migration restores the recognized
+legacy `publication_failed` outcome without assigning historical authority.
+
+Validation for this follow-up:
+
+- PASS — `cargo test -p services --lib task_failure_retry::tests::retry_exhaustion_override_is_exact_scoped_and_replay_safe --locked --offline` (1 test): crash window, Task version drift, concurrent Decisions, one transition, and stale lifecycle replay.
+- PASS — `cargo test -p db --test file_backed_migration v114_ --locked --offline` (2 tests): exact V110 recovery and V108 merged/closed/open/publication-failed history.
+- PASS — `cargo test -p services --lib legacy_pr_ --locked --offline` (2 tests): terminal archive/new admission, active legacy rejection, and guarded Project teardown.
+- PASS — `cargo test -p services --lib task_integration_operation::tests:: --locked --offline` (16 tests): remote outcome, mismatch retry suppression, generic API fences, stale reconciliation, publication retry, duplicate/conflicting callbacks, and teardown.
+- PASS — `cargo test -p services --lib task_lifecycle::tests::lifecycle_operation_gate_pins_the_exact_transition_fact --locked --offline` (1 test): direct/local generic TaskMerge lifecycle.
+- PASS — `cargo check -p db -p services --locked --offline`, `cargo fmt --all`, and `git diff --check`.
+
+Workspace-wide tests and Clippy were not run; no PR10+ files changed.
+
 ## Invariants
 
 PR9 enforces INV-007 and the applicable collaboration, exact-provenance,

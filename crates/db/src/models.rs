@@ -258,6 +258,10 @@ pub struct RemotePrAdmission {
     pub target_branch: String,
     pub admitted_source_sha: String,
     pub state: String,
+    /// The outcome the provider reported, independent from Forge's integrity
+    /// classification of whether it affected the admitted subject.
+    pub provider_status: Option<String>,
+    pub result_classification: Option<String>,
     pub reconciliation_reason: Option<String>,
     pub provider_event_id: Option<String>,
     pub observed_head_sha: Option<String>,

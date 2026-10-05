@@ -28,7 +28,9 @@ use std::{
 // authorizes exact, failure-kind-scoped retry exhaustion override epochs; V111
 // allows independent exact overrides for every pending exhausted receipt;
 // V112 freezes remote PR subjects and result authority; V113 separates PR
-// admission provenance from historical provider outcomes.
+// admission provenance from historical provider outcomes; V114 preserves
+// provider outcomes separately from integrity classification and archives
+// terminal legacy PR history before a new modern admission.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -35,6 +35,8 @@ fn map_remote_pr_admission(row: SqliteRow) -> Result<RemotePrAdmission> {
         target_branch: row.try_get("target_branch")?,
         admitted_source_sha: row.try_get("admitted_source_sha")?,
         state: row.try_get("state")?,
+        provider_status: row.try_get("provider_status")?,
+        result_classification: row.try_get("result_classification")?,
         reconciliation_reason: row.try_get("reconciliation_reason")?,
         provider_event_id: row.try_get("provider_event_id")?,
         observed_head_sha: row.try_get("observed_head_sha")?,
@@ -231,10 +233,12 @@ async fn finish_merge_lifecycle_in_tx(
             .await?
             .ok_or(DbError::NotFound)?;
     let terminal_status = lifecycle_operation.status;
-    let provider_status: Option<String> =
+    let provider_result: Option<(String, Option<String>)> =
         if let Some(event_id) = lifecycle_operation.result_event_id.as_deref() {
-            sqlx::query_scalar(
-                "SELECT json_extract(payload_json, '$.status') FROM domain_event WHERE id = ?",
+            sqlx::query_as(
+                "SELECT json_extract(payload_json, '$.status'),
+                        json_extract(payload_json, '$.result_classification')
+                 FROM domain_event WHERE id = ?",
             )
             .bind(event_id)
             .fetch_optional(&mut **tx)
@@ -242,6 +246,10 @@ async fn finish_merge_lifecycle_in_tx(
         } else {
             None
         };
+    let provider_status = provider_result.as_ref().map(|result| result.0.as_str());
+    let result_classification = provider_result
+        .as_ref()
+        .and_then(|result| result.1.as_deref());
     let target = if terminal_status == TaskIntegrationOperationStatus::Succeeded {
         TaskLifecycleState::Done
     } else {
@@ -268,6 +276,8 @@ async fn finish_merge_lifecycle_in_tx(
             "cause_kind": "merge_operation",
             "cause_ref": lifecycle_operation.id,
             "task_merge_status": terminal_status.to_string(),
+            "provider_status": provider_status,
+            "result_classification": result_classification,
             "publish_operation_id": publication_operation_id,
             "provider_result_event_id": lifecycle_operation.result_event_id,
         })
@@ -289,19 +299,25 @@ async fn finish_merge_lifecycle_in_tx(
                 cause_ref: Some(lifecycle_operation.id.clone()),
                 reason_kind: Some(if target == TaskLifecycleState::Done {
                     "task_merge_succeeded".to_owned()
-                } else if provider_status.as_deref() == Some("closed") {
+                } else if result_classification == Some("head_mismatch") {
+                    "remote_pr_head_mismatch".to_owned()
+                } else if provider_status == Some("closed") {
                     "pr_closed_without_merge".to_owned()
                 } else {
                     "task_merge_failed".to_owned()
                 }),
-                reason_ref: Some(if provider_status.as_deref() == Some("closed") {
-                    lifecycle_operation
-                        .result_event_id
-                        .clone()
-                        .expect("closed PR result is exact")
-                } else {
-                    lifecycle_operation.id.clone()
-                }),
+                reason_ref: Some(
+                    if provider_status == Some("closed")
+                        || result_classification == Some("head_mismatch")
+                    {
+                        lifecycle_operation
+                            .result_event_id
+                            .clone()
+                            .expect("terminal provider result is exact")
+                    } else {
+                        lifecycle_operation.id.clone()
+                    },
+                ),
                 gate_evaluation_id: None,
                 idempotency_key: key,
                 updated_at: updated_at.to_owned(),
@@ -370,7 +386,17 @@ async fn abandon_running_in_tx(
 ) -> Result<Option<TaskIntegrationOperation>> {
     let Some(active) = sqlx::query(
         "SELECT * FROM task_integration_operation
-         WHERE task_id = ? AND status = 'running' AND remote_waiting = 0",
+         WHERE task_id = ? AND status = 'running' AND remote_waiting = 0
+           AND NOT (
+               kind = 'publish_pr' AND EXISTS (
+                   SELECT 1 FROM task_integration_operation remote_merge
+                   WHERE remote_merge.id = task_integration_operation.parent_operation_id
+                     AND remote_merge.task_id = task_integration_operation.task_id
+                     AND remote_merge.kind = 'task_merge'
+                     AND remote_merge.remote_waiting = 1
+                     AND remote_merge.status = 'running'
+               )
+           )",
     )
     .bind(task_id)
     .fetch_optional(&mut **tx)
@@ -421,6 +447,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         &self,
         input: CreateTaskIntegrationOperation,
     ) -> Result<TaskIntegrationOperation> {
+        if input.kind == TaskIntegrationOperationKind::TaskMerge && input.remote_waiting {
+            return Err(DbError::InvalidTransition);
+        }
         let mut tx = self.pool.begin().await?;
         insert_operation(&mut tx, &input).await?;
         if input.kind == TaskIntegrationOperationKind::TaskMerge {
@@ -474,29 +503,88 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         let metadata_id = if let Some(existing_pr) = existing_pr {
             let merge_status: String = existing_pr.try_get("merge_status")?;
             let admission_status: String = existing_pr.try_get("admission_status")?;
-            if merge_status == "pending" || admission_status == "legacy_unadmitted" {
-                return Err(DbError::InvalidTransition);
-            }
             let metadata_id: String = existing_pr.try_get("id")?;
-            sqlx::query(
-                "UPDATE pr_metadata
-                 SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
-                     source_branch = ?, target_branch = ?, pr_state = 'publishing',
-                     merge_status = 'pending', task_merge_operation_id = ?,
-                     publish_operation_id = ?, last_synced_at = NULL, updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(&metadata.provider_type)
-            .bind(&metadata.source_branch)
-            .bind(&metadata.target_branch)
-            .bind(&metadata.task_merge_operation_id)
-            .bind(&metadata.publish_operation_id)
-            .bind(&metadata.updated_at)
-            .bind(&metadata_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(check_error)?;
-            metadata_id
+            if admission_status == "legacy_unadmitted" {
+                if !matches!(
+                    merge_status.as_str(),
+                    "merged" | "closed_without_merge" | "publication_failed"
+                ) {
+                    return Err(DbError::InvalidTransition);
+                }
+                let archived_at = metadata.updated_at.clone();
+                let archived = sqlx::query(
+                    "INSERT INTO legacy_pr_history (
+                         history_id, task_id, legacy_metadata_id, provider_type,
+                         provider_pr_id, pr_url, source_branch, target_branch,
+                         pr_state, merge_status, admission_status,
+                         task_merge_operation_id, publish_operation_id,
+                         last_synced_at, metadata_created_at, metadata_updated_at,
+                         archived_at
+                     )
+                     SELECT ?, task_id, id, provider_type, provider_pr_id, pr_url,
+                            source_branch, target_branch, pr_state, merge_status,
+                            admission_status, task_merge_operation_id,
+                            publish_operation_id, last_synced_at, created_at,
+                            updated_at, ?
+                     FROM pr_metadata
+                     WHERE id = ? AND task_id = ?
+                       AND admission_status = 'legacy_unadmitted'
+                       AND merge_status IN ('merged', 'closed_without_merge',
+                                            'publication_failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM remote_pr_admission admission
+                           WHERE admission.metadata_id = pr_metadata.id
+                       )",
+                )
+                .bind(new_uuid_v4())
+                .bind(&archived_at)
+                .bind(&metadata_id)
+                .bind(&metadata.task_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(check_error)?
+                .rows_affected();
+                if archived != 1 {
+                    return Err(DbError::InvalidTransition);
+                }
+                let deleted = sqlx::query(
+                    "DELETE FROM pr_metadata
+                     WHERE id = ? AND task_id = ? AND admission_status = 'legacy_unadmitted'",
+                )
+                .bind(&metadata_id)
+                .bind(&metadata.task_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if deleted != 1 {
+                    return Err(DbError::VersionConflict);
+                }
+                super::pr_metadata::insert_pr_metadata_in_tx(&mut tx, &metadata).await?;
+                metadata.id.clone()
+            } else {
+                if merge_status == "pending" {
+                    return Err(DbError::InvalidTransition);
+                }
+                sqlx::query(
+                    "UPDATE pr_metadata
+                     SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
+                         source_branch = ?, target_branch = ?, pr_state = 'publishing',
+                         merge_status = 'pending', task_merge_operation_id = ?,
+                         publish_operation_id = ?, last_synced_at = NULL, updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(&metadata.provider_type)
+                .bind(&metadata.source_branch)
+                .bind(&metadata.target_branch)
+                .bind(&metadata.task_merge_operation_id)
+                .bind(&metadata.publish_operation_id)
+                .bind(&metadata.updated_at)
+                .bind(&metadata_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(check_error)?;
+                metadata_id
+            }
         } else {
             super::pr_metadata::insert_pr_metadata_in_tx(&mut tx, &metadata).await?;
             metadata.id.clone()
@@ -620,13 +708,19 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         }
         let current_pr_state: String = metadata_row.try_get("pr_state")?;
 
-        let mut external_status = input.status.clone();
+        let provider_status = input.status.clone();
         let mut resulting_state = input.status.clone();
         let mut resulting_reason = input.reconciliation_reason.clone();
+        let result_classification = if input.status == "merged"
+            && input.observed_head_sha.as_deref() != Some(admission.admitted_source_sha.as_str())
+        {
+            Some("head_mismatch")
+        } else {
+            None
+        };
         if input.status == "merged"
             && input.observed_head_sha.as_deref() != Some(admission.admitted_source_sha.as_str())
         {
-            external_status = "head_mismatch".to_owned();
             resulting_state = "head_mismatch".to_owned();
             resulting_reason =
                 Some("provider merged a head other than the admitted source SHA".to_owned());
@@ -668,6 +762,31 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 "remote-pr-result:{}:{}",
                 admission.task_merge_operation_id, provider_event_key
             );
+            let mut result_payload = serde_json::json!({
+                "task_id": admission.task_id,
+                "pr_metadata_id": admission.metadata_id,
+                "provider_pr_id": input.provider_pr_id,
+                "provider_type": admission.provider_type,
+                "provider_config_id": admission.provider_config_id,
+                "provider_config_revision": admission.provider_config_revision,
+                "provider_config_digest": admission.provider_config_digest,
+                "remote_repo_identity": admission.remote_repo_identity,
+                "source_branch": admission.source_branch,
+                "target_branch": admission.target_branch,
+                "admitted_source_sha": admission.admitted_source_sha,
+                "head_sha": input.observed_head_sha,
+                "merged_commit_sha": input.merged_commit_sha,
+                "provider_event_id": input.provider_event_id,
+                "pr_url": input.pr_url,
+                "reconciliation_reason": input.reconciliation_reason,
+                "status": provider_status,
+                "task_merge_operation_id": admission.task_merge_operation_id,
+                "publish_operation_id": admission.publish_operation_id,
+            });
+            if let Some(classification) = result_classification {
+                result_payload["result_classification"] =
+                    serde_json::Value::String(classification.to_owned());
+            }
             let create_event = CreateDomainEvent {
                 id: new_uuid_v4(),
                 event_type: "pr.status_changed".to_owned(),
@@ -681,28 +800,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 causation_id: Some(admission.publish_operation_id.clone()),
                 causation_depth: 1,
                 dedupe_key: Some(dedupe_key.clone()),
-                payload_json: serde_json::json!({
-                    "task_id": admission.task_id,
-                    "pr_metadata_id": admission.metadata_id,
-                    "provider_pr_id": input.provider_pr_id,
-                    "provider_type": admission.provider_type,
-                    "provider_config_id": admission.provider_config_id,
-                    "provider_config_revision": admission.provider_config_revision,
-                    "provider_config_digest": admission.provider_config_digest,
-                    "remote_repo_identity": admission.remote_repo_identity,
-                    "source_branch": admission.source_branch,
-                    "target_branch": admission.target_branch,
-                    "admitted_source_sha": admission.admitted_source_sha,
-                    "head_sha": input.observed_head_sha,
-                    "merged_commit_sha": input.merged_commit_sha,
-                    "provider_event_id": input.provider_event_id,
-                    "pr_url": input.pr_url,
-                    "reconciliation_reason": input.reconciliation_reason,
-                    "status": external_status,
-                    "task_merge_operation_id": admission.task_merge_operation_id,
-                    "publish_operation_id": admission.publish_operation_id,
-                })
-                .to_string(),
+                payload_json: result_payload.to_string(),
                 created_at: input.updated_at.clone(),
             };
             let prior_event =
@@ -721,7 +819,24 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                     serde_json::from_str(&create_event.payload_json).map_err(|error| {
                         DbError::Check(format!("invalid incoming PR result: {error}"))
                     })?;
-                if prior_payload != incoming_payload {
+                let mut comparable_prior = prior_payload.clone();
+                if admission.result_event_id.as_deref() == Some(prior_event_id.as_str())
+                    && admission.state == "head_mismatch"
+                    && admission.provider_status.as_deref() == Some("merged")
+                    && admission.result_classification.as_deref() == Some("head_mismatch")
+                    && input.status == "merged"
+                    && input.observed_head_sha.as_deref()
+                        != Some(admission.admitted_source_sha.as_str())
+                    && comparable_prior
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("head_mismatch")
+                {
+                    comparable_prior["status"] = serde_json::Value::String("merged".to_owned());
+                    comparable_prior["result_classification"] =
+                        serde_json::Value::String("head_mismatch".to_owned());
+                }
+                if comparable_prior != incoming_payload {
                     return Err(DbError::InvalidTransition);
                 }
                 tx.commit().await?;
@@ -744,6 +859,8 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         sqlx::query(
             "UPDATE remote_pr_admission
              SET state = ?, reconciliation_reason = ?,
+                 provider_status = COALESCE(?, provider_status),
+                 result_classification = COALESCE(?, result_classification),
                  provider_event_id = COALESCE(?, provider_event_id),
                  observed_head_sha = COALESCE(?, observed_head_sha),
                  merged_commit_sha = COALESCE(?, merged_commit_sha),
@@ -752,6 +869,12 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         )
         .bind(&resulting_state)
         .bind(resulting_reason.as_deref())
+        .bind(if input.status == "reconciliation_required" {
+            None
+        } else {
+            Some(provider_status.as_str())
+        })
+        .bind(result_classification)
         .bind(input.provider_event_id.as_deref())
         .bind(input.observed_head_sha.as_deref())
         .bind(input.merged_commit_sha.as_deref())
@@ -771,21 +894,20 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             "head_mismatch" | "publication_failed" => "failed",
             _ => return Err(DbError::InvalidTransition),
         };
-        let merge_status = match external_status.as_str() {
+        let merge_status = match provider_status.as_str() {
             "open" => "pending",
             "merged" => "merged",
             "closed" => "closed_without_merge",
-            "head_mismatch" => "head_mismatch",
             "publication_failed" => "publication_failed",
             _ if resulting_state == "reconciliation_required" => "pending",
             _ => return Err(DbError::InvalidTransition),
         };
         let pr_state = if resulting_state == "reconciliation_required" {
             current_pr_state.as_str()
-        } else if external_status == "publication_failed" {
+        } else if provider_status == "publication_failed" {
             "failed"
         } else {
-            external_status.as_str()
+            provider_status.as_str()
         };
         sqlx::query(
             "UPDATE pr_metadata
@@ -809,7 +931,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         .await
         .map_err(check_error)?;
 
-        if external_status == "publication_failed" {
+        if provider_status == "publication_failed" {
             if publish.status != TaskIntegrationOperationStatus::Running {
                 return Err(DbError::InvalidTransition);
             }
@@ -840,7 +962,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 &input.updated_at,
             )
             .await?;
-        } else if external_status == "reconciliation_required" {
+        } else if provider_status == "reconciliation_required" {
             // An unavailable or ambiguous provider outcome updates only the
             // reconciliation marker. PublishPr and TaskMerge stay running.
         } else {
@@ -941,6 +1063,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         input: CreateTaskIntegrationOperation,
         updated_at: &str,
     ) -> Result<TaskIntegrationOperation> {
+        if input.kind == TaskIntegrationOperationKind::TaskMerge && input.remote_waiting {
+            return Err(DbError::InvalidTransition);
+        }
         let mut tx = self.pool.begin().await?;
         let abandoned = abandon_running_in_tx(self, &mut tx, &input.task_id, updated_at).await?;
         if abandoned
@@ -974,6 +1099,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         }
         let mut tx = self.pool.begin().await?;
         let current = load_operation(&mut tx, &input.id).await?;
+        if current.kind == TaskIntegrationOperationKind::TaskMerge && current.remote_waiting {
+            return Err(DbError::InvalidTransition);
+        }
         if current.status != TaskIntegrationOperationStatus::Running {
             if current.status == input.status && current.result_event_id == input.result_event_id {
                 tx.commit().await?;

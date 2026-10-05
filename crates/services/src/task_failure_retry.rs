@@ -57,6 +57,15 @@ struct FailureReceipt {
     event_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct RetryOverrideTransitionPlan {
+    task_id: String,
+    expected_task_version: i64,
+    authorization_event_id: String,
+    exhaustion_receipt_id: String,
+    idempotency_key: String,
+}
+
 impl TaskFailureRetryService {
     pub fn new(db: Arc<db::SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self { db, event_bus }
@@ -68,6 +77,21 @@ impl TaskFailureRetryService {
         exhaustion_receipt_id: &str,
         decision_id: &str,
     ) -> Result<TaskLifecycleTransitionResult> {
+        if let Some(event) = self
+            .persist_retry_exhaustion_override(task_id, exhaustion_receipt_id, decision_id)
+            .await?
+        {
+            DomainEventService::publish_committed_hint(&self.event_bus, &event);
+        }
+        self.resume_retry_exhaustion_effect(task_id).await
+    }
+
+    async fn persist_retry_exhaustion_override(
+        &self,
+        task_id: &str,
+        exhaustion_receipt_id: &str,
+        decision_id: &str,
+    ) -> Result<Option<DomainEvent>> {
         let override_digest = override_policy_digest();
         let retry_digest = policy_digest();
         let mut tx = self.db.pool().begin().await?;
@@ -274,15 +298,38 @@ impl TaskFailureRetryService {
             (event.id.clone(), expected_task_version, Some(event))
         };
         tx.commit().await?;
-        if let Some(event) = created_event.as_ref() {
-            DomainEventService::publish_committed_hint(&self.event_bus, event);
-        }
+        Ok(created_event)
+    }
+
+    async fn resume_retry_exhaustion_effect(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskLifecycleTransitionResult> {
+        let Some(plan) = self.prepare_retry_exhaustion_transition(task_id).await? else {
+            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+            let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+            return Ok(TaskLifecycleTransitionResult {
+                task,
+                lifecycle,
+                transition: None,
+            });
+        };
+        self.apply_retry_exhaustion_transition(plan).await
+    }
+
+    async fn prepare_retry_exhaustion_transition(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<RetryOverrideTransitionPlan>> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
         // Exhaustion receipts are independent fences. An override for one
         // receipt must commit even when another exhausted receipt remains.
-        // Reopen only after the final fence is superseded, using the latest
-        // exact override as the transition provenance. This query also lets a
-        // replay finish a transition after a crash between authorization and
-        // lifecycle persistence.
         let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
@@ -300,17 +347,10 @@ impl TaskFailureRetryService {
         .fetch_one(self.db.pool())
         .await?;
         if pending_exhaustions > 0 {
-            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-            return Ok(TaskLifecycleTransitionResult {
-                task,
-                lifecycle,
-                transition: None,
-            });
+            return Ok(None);
         }
         let latest_override = sqlx::query(
-            "SELECT override.authorization_event_id, override.expected_task_version,
+            "SELECT override.authorization_event_id,
                     receipt.id AS exhaustion_receipt_id
              FROM task_retry_override override
              JOIN task_failure_retry_receipt receipt
@@ -319,7 +359,38 @@ impl TaskFailureRetryService {
               AND receipt.failure_kind = override.failure_kind
              JOIN domain_event authorization
                ON authorization.id = override.authorization_event_id
-             WHERE override.task_id = ?
+              AND authorization.event_type = 'task.retry_override_authorized'
+              AND authorization.entity_type = 'task'
+              AND authorization.entity_id = override.task_id
+              AND authorization.scope_type = 'task'
+              AND authorization.scope_id = override.task_id
+              AND authorization.causation_id = override.decision_id
+              AND json_valid(authorization.payload_json)
+              AND json_extract(authorization.payload_json, '$.task_id') = override.task_id
+              AND json_extract(authorization.payload_json, '$.exhaustion_receipt_id') = receipt.id
+              AND json_extract(authorization.payload_json, '$.failure_kind') = receipt.failure_kind
+              AND json_extract(authorization.payload_json, '$.decision_id') = override.decision_id
+             JOIN decision ON decision.id = override.decision_id
+                          AND decision.task_id = override.task_id
+                          AND decision.outcome = 'approve'
+             JOIN proposal ON proposal.id = decision.proposal_id
+                           AND proposal.task_id = decision.task_id
+                           AND proposal.action = 'retry_exhaustion_override:'
+                                || receipt.failure_kind || ':' || receipt.id
+                           AND proposal.target_kind = 'task'
+                           AND proposal.target_id = override.task_id
+             JOIN domain_event decision_event
+               ON decision_event.event_type = 'decision.recorded'
+              AND decision_event.entity_type = 'decision'
+              AND decision_event.entity_id = decision.id
+              AND decision_event.scope_type = 'task'
+              AND decision_event.scope_id = override.task_id
+              AND decision_event.sequence > (
+                  SELECT exhaustion_event.sequence FROM domain_event exhaustion_event
+                  WHERE exhaustion_event.id = receipt.receipt_event_id
+              )
+             WHERE receipt.disposition = 'exhausted'
+               AND override.task_id = ?
              ORDER BY authorization.sequence DESC
              LIMIT 1",
         )
@@ -328,34 +399,47 @@ impl TaskFailureRetryService {
         .await?
         .ok_or_else(|| ServiceError::invalid_operation("Task has no retry override provenance"))?;
         let authorization_event_id: String = latest_override.try_get("authorization_event_id")?;
-        let transition_task_version: i64 = latest_override.try_get("expected_task_version")?;
         let exhaustion_receipt_id: String = latest_override.try_get("exhaustion_receipt_id")?;
         let idempotency_key = format!("task-retry-override:{exhaustion_receipt_id}");
-        let transition_already_recorded =
-            TaskLifecycleRepo::has_task_lifecycle_transition(&*self.db, task_id, &idempotency_key)
-                .await?;
-        if !transition_already_recorded
+        // Reuse the version captured by a committed lifecycle transition only
+        // for idempotent receipt lookup. A not-yet-applied effect always uses
+        // the Task's current version, never the historical authorization CAS.
+        let recorded_task_version: Option<i64> = sqlx::query_scalar(
+            "SELECT expected_task_version FROM task_lifecycle_transition
+             WHERE task_id = ? AND idempotency_key = ?",
+        )
+        .bind(task_id)
+        .bind(&idempotency_key)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if recorded_task_version.is_none()
             && (lifecycle.state != TaskLifecycleState::Blocked
                 || lifecycle.reason_kind.as_deref() != Some("retry_budget_exhausted"))
         {
-            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-            return Ok(TaskLifecycleTransitionResult {
-                task,
-                lifecycle,
-                transition: None,
-            });
+            return Ok(None);
         }
+        Ok(Some(RetryOverrideTransitionPlan {
+            task_id: task_id.to_owned(),
+            expected_task_version: recorded_task_version.unwrap_or(task.version),
+            authorization_event_id,
+            exhaustion_receipt_id,
+            idempotency_key,
+        }))
+    }
+
+    async fn apply_retry_exhaustion_transition(
+        &self,
+        plan: RetryOverrideTransitionPlan,
+    ) -> Result<TaskLifecycleTransitionResult> {
         TaskLifecycleService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
             .transition(TransitionLifecycleInput {
-                task_id: task_id.to_owned(),
-                expected_task_version: transition_task_version,
+                task_id: plan.task_id,
+                expected_task_version: plan.expected_task_version,
                 to_state: TaskLifecycleState::Ready,
-                cause: LifecycleCause::DomainEvent(authorization_event_id),
+                cause: LifecycleCause::DomainEvent(plan.authorization_event_id),
                 reason_kind: Some("retry_exhaustion_superseded".to_owned()),
-                reason_ref: Some(exhaustion_receipt_id),
-                idempotency_key,
+                reason_ref: Some(plan.exhaustion_receipt_id),
+                idempotency_key: plan.idempotency_key,
             })
             .await
     }
@@ -814,6 +898,20 @@ impl TaskFailureRetryService {
                     } else {
                         false
                     };
+                let remote_head_mismatch = if operation.remote_waiting {
+                    TaskIntegrationOperationRepo::get_remote_pr_admission(&*self.db, &operation.id)
+                        .await?
+                        .is_some_and(|admission| {
+                            admission.state == "head_mismatch"
+                                && admission.provider_status.as_deref() == Some("merged")
+                                && admission.result_classification.as_deref()
+                                    == Some("head_mismatch")
+                                && admission.result_event_id.as_deref()
+                                    == operation.result_event_id.as_deref()
+                        })
+                } else {
+                    false
+                };
                 if operation.task_id == event.scope_id
                     && operation.kind == TaskIntegrationOperationKind::TaskMerge
                     && matches!(
@@ -824,6 +922,7 @@ impl TaskFailureRetryService {
                     )
                     && failed_status
                     && !provider_closed
+                    && !remote_head_mismatch
                 {
                     failures.push(FailureFact {
                         kind: "task_merge_failed",
@@ -1186,7 +1285,7 @@ mod tests {
         ActorKind, AgentRepo, CoordinationMode, CreateAgentIdentity, CreateAgentProfile,
         CreateExecution, CreateProject, CreateRoleMembership, CreateTask, CreateTaskRole,
         ExecutionStatus, ProjectRepo, RoleMembershipRepo, RoleMembershipStatus, TaskLifecycleRepo,
-        TaskRoleRepo, UserRepo,
+        TaskRoleRepo, UpdateTask, UserRepo,
     };
     use std::{
         fs,
@@ -1206,6 +1305,7 @@ mod tests {
         let project_id = new_uuid_v4();
         let task_id = new_uuid_v4();
         let other_task_id = new_uuid_v4();
+        let stale_task_id = new_uuid_v4();
         let user_id = new_uuid_v4();
         UserRepo::create_user(
             &*db,
@@ -1236,7 +1336,7 @@ mod tests {
         )
         .await
         .expect("Project");
-        for id in [&task_id, &other_task_id] {
+        for id in [&task_id, &other_task_id, &stale_task_id] {
             TaskRepo::create(
                 &*db,
                 CreateTask {
@@ -1446,10 +1546,69 @@ mod tests {
             .await
             .expect("second Decision event lookup")
             .expect("second Decision event exists");
+
+        // Simulate a crash after durable authorization, then a legitimate
+        // Task PATCH before lifecycle replay. The old CAS plan conflicts;
+        // replay must load the current Task version and apply once.
+        service
+            .persist_retry_exhaustion_override(&task_id, &second_receipt_id, &second_decision.id)
+            .await
+            .expect("final override commits before its lifecycle effect");
+        let lifecycle_before_replay = TaskLifecycleRepo::get_task_lifecycle(&*db, &task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle_before_replay.state, TaskLifecycleState::Blocked);
+        let override_count_before_replay: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_retry_override
+             WHERE task_id = ? AND exhaustion_receipt_id = ? AND decision_id = ?",
+        )
+        .bind(&task_id)
+        .bind(&second_receipt_id)
+        .bind(&second_decision.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("durable final override");
+        assert_eq!(override_count_before_replay, 1);
+        let stale_plan = service
+            .prepare_retry_exhaustion_transition(&task_id)
+            .await
+            .expect("prepare final transition")
+            .expect("all exhaustion fences are superseded");
+        let task_before_patch = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("Task lookup")
+            .expect("Task exists");
+        TaskRepo::update(
+            &*db,
+            UpdateTask {
+                id: task_id.clone(),
+                expected_version: task_before_patch.version,
+                title: Some("Task changed after retry authorization".to_owned()),
+                description: None,
+                priority: None,
+                merge_config: None,
+                error_annotation: None,
+                blocked_json: None,
+                failed_json: None,
+                task_state_config: None,
+                parent_task_id: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("legitimate Task update advances its version");
+        assert!(
+            service
+                .apply_retry_exhaustion_transition(stale_plan)
+                .await
+                .is_err(),
+            "the pre-mutation CAS plan loses to the Task PATCH"
+        );
         let reopened = service
             .authorize_retry_exhaustion_override(&task_id, &second_receipt_id, &second_decision.id)
             .await
-            .expect("last override supersedes the remaining fence");
+            .expect("same Decision replay uses the current Task version");
         assert_eq!(reopened.lifecycle.state, TaskLifecycleState::Ready);
         let transition_id = reopened
             .transition
@@ -1474,6 +1633,53 @@ mod tests {
             Some(second_override_event_id.as_str()),
             "the final exact override owns the lifecycle transition"
         );
+        let task_after_replay = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("Task lookup after replay")
+            .expect("Task exists");
+        assert_eq!(
+            task_after_replay.title,
+            "Task changed after retry authorization"
+        );
+        let (authorized_version, authorization_event_id): (i64, String) = sqlx::query_as(
+            "SELECT expected_task_version, authorization_event_id
+             FROM task_retry_override WHERE exhaustion_receipt_id = ?",
+        )
+        .bind(&second_receipt_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("historical authorization version remains durable");
+        assert_eq!(authorized_version, task_before_patch.version);
+        assert!(task_after_replay.version > authorized_version);
+        let authorization_event = DomainEventRepo::get_event(&*db, &authorization_event_id)
+            .await
+            .expect("authorization event lookup")
+            .expect("exact authorization event remains durable");
+        let authorization_payload = parse_payload(&authorization_event);
+        assert_eq!(
+            authorization_payload["expected_task_version"], authorized_version,
+            "replay keeps the original Human authorization provenance"
+        );
+        let final_override_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_retry_override
+             WHERE task_id = ? AND exhaustion_receipt_id = ?",
+        )
+        .bind(&task_id)
+        .bind(&second_receipt_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("one final exact override");
+        assert_eq!(final_override_count, 1);
+        let override_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND idempotency_key = ?",
+        )
+        .bind(&task_id)
+        .bind(format!("task-retry-override:{second_receipt_id}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("one lifecycle transition for the final override");
+        assert_eq!(override_transition_count, 1);
         let replay = service
             .process_domain_event(&second_decision_event)
             .await
@@ -1678,26 +1884,145 @@ mod tests {
             crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
         )
         .await;
-        let reverse_blocked = service
-            .authorize_retry_exhaustion_override(
+        let (_concurrent_a, _concurrent_b) = tokio::join!(
+            service.authorize_retry_exhaustion_override(
+                &other_task_id,
+                &reverse_order_receipts[0],
+                &first_reverse_decision.id,
+            ),
+            service.authorize_retry_exhaustion_override(
                 &other_task_id,
                 &reverse_order_receipts[1],
                 &second_reverse_decision.id,
-            )
-            .await
-            .expect("receipt B may be overridden first");
-        assert_eq!(reverse_blocked.lifecycle.state, TaskLifecycleState::Blocked);
-        assert!(reverse_blocked.transition.is_none());
-        let reverse_ready = service
+            ),
+        );
+        // A concurrent writer may lose its CAS after the other override
+        // applies. Replay both exact Decisions and require one converged
+        // Ready transition with both authorization facts retained.
+        let reverse_a = service
             .authorize_retry_exhaustion_override(
                 &other_task_id,
                 &reverse_order_receipts[0],
                 &first_reverse_decision.id,
             )
             .await
-            .expect("receipt A clears the final fence when B was approved first");
-        assert_eq!(reverse_ready.lifecycle.state, TaskLifecycleState::Ready);
-        assert!(reverse_ready.transition.is_some());
+            .expect("receipt A replays after concurrent final Decisions");
+        let reverse_b = service
+            .authorize_retry_exhaustion_override(
+                &other_task_id,
+                &reverse_order_receipts[1],
+                &second_reverse_decision.id,
+            )
+            .await
+            .expect("receipt B replays after concurrent final Decisions");
+        assert_eq!(reverse_a.lifecycle.state, TaskLifecycleState::Ready);
+        assert_eq!(reverse_b.lifecycle.state, TaskLifecycleState::Ready);
+        let reverse_override_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_retry_override WHERE task_id = ?")
+                .bind(&other_task_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("both concurrent override facts are durable");
+        assert_eq!(reverse_override_count, 2);
+        let reverse_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND reason_kind = 'retry_exhaustion_superseded'",
+        )
+        .bind(&other_task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("one lifecycle effect wins concurrent CAS");
+        assert_eq!(reverse_transition_count, 1);
+
+        let mut stale_receipt_id = None;
+        for attempt in 0..2 {
+            let (source, failure) = retry_test_failure(
+                &db,
+                &stale_task_id,
+                "work_unit_integration_failed",
+                &format!("stale-override-{attempt}-{}", new_uuid_v4()),
+            )
+            .await;
+            let receipt = service
+                .consume(&source, &failure)
+                .await
+                .expect("stale-state retry receipt");
+            service
+                .apply_lifecycle_effect(&receipt)
+                .await
+                .expect("stale-state retry effect");
+            if receipt.disposition == "exhausted" {
+                stale_receipt_id = Some(
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT id FROM task_failure_retry_receipt
+                         WHERE task_id = ? AND failure_kind = ? AND failure_ref = ?",
+                    )
+                    .bind(&stale_task_id)
+                    .bind(&failure.kind)
+                    .bind(&failure.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("stale-state exact exhaustion"),
+                );
+            }
+        }
+        let stale_receipt_id = stale_receipt_id.expect("the second failure exhausts its budget");
+        let stale_decision = retry_override_decision(
+            &db,
+            &event_bus,
+            &stale_task_id,
+            &user_id,
+            "work_unit_integration_failed",
+            &stale_receipt_id,
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
+        service
+            .persist_retry_exhaustion_override(
+                &stale_task_id,
+                &stale_receipt_id,
+                &stale_decision.id,
+            )
+            .await
+            .expect("durable override precedes the lifecycle effect");
+        let blocked_task = TaskRepo::get_by_id(&*db, &stale_task_id, false)
+            .await
+            .expect("blocked Task lookup")
+            .expect("Task exists");
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .transition(crate::task_lifecycle::TransitionLifecycleInput {
+                task_id: stale_task_id.clone(),
+                expected_task_version: blocked_task.version,
+                to_state: TaskLifecycleState::Cancelled,
+                cause: LifecycleCause::Actor(api_types::Actor::user(
+                    api_types::UserActionSource::Api,
+                )),
+                reason_kind: Some("cancelled_after_retry_authorization".to_owned()),
+                reason_ref: Some(stale_receipt_id.clone()),
+                idempotency_key: "cancel-after-retry-authorization".to_owned(),
+            })
+            .await
+            .expect("valid cancellation supersedes the pending effect");
+        let stale_replay = service
+            .authorize_retry_exhaustion_override(
+                &stale_task_id,
+                &stale_receipt_id,
+                &stale_decision.id,
+            )
+            .await
+            .expect("replay observes the newer lifecycle state");
+        assert_eq!(stale_replay.lifecycle.state, TaskLifecycleState::Cancelled);
+        assert!(stale_replay.transition.is_none());
+        let stale_effect_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND idempotency_key = ?",
+        )
+        .bind(&stale_task_id)
+        .bind(format!("task-retry-override:{stale_receipt_id}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("stale lifecycle state gets no forced Ready transition");
+        assert_eq!(stale_effect_count, 0);
 
         let historical: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ? AND disposition = 'exhausted'",

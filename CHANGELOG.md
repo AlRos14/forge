@@ -151,12 +151,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   durable TaskMerge admission, PublishPr child, and provider intent in one
   transaction, then leaves lifecycle in `merging` while the provider owns an
   open PR. Exact Merged/Closed results finish that same admission; publication
-  failure results are operation-scoped and replay-safe. Pre-existing PR rows
-  without an admission stay visible as `legacy_unadmitted` and cannot acquire
-  retrospective merge authority. Exhaustion remains immutable and can be
-  superseded only by an exact same-Task Human Decision that opens a scoped
-  retry epoch. The unused `TaskService::unblock_task()` primitive was removed
-  because it changed legacy blocked metadata without changing TaskLifecycle;
+  failure results are operation-scoped and replay-safe. A provider `Merged`
+  result whose observed head differs from the admitted SHA remains recorded as
+  `Merged` with a separate `head_mismatch` integrity classification; it blocks
+  the Task without consuming automatic retry budget. Terminal legacy PR rows
+  without an admission are archived before a new modern projection is created;
+  active or unrecognized legacy rows remain fail-closed and cannot acquire
+  retrospective authority. Retry-exhaustion replay rechecks the current blocked
+  lifecycle and Task version, so a Task edit between authorization and effect
+  does not strand the durable override. Generic operation APIs cannot create
+  or finish remote TaskMerge rows, and stale-process cleanup skips a running
+  PublishPr child while its remote TaskMerge is active. Exhaustion remains
+  immutable and can be superseded only by an exact same-Task Human Decision
+  that opens a scoped retry epoch. The unused
+  `TaskService::unblock_task()` primitive was removed because it changed
+  legacy blocked metadata without changing TaskLifecycle;
   clearing such metadata no longer publishes `task.unblocked` while the
   lifecycle remains blocked.
 

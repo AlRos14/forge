@@ -1951,8 +1951,10 @@ pub struct RecordRemotePrOutcome {
     pub remote_repo_identity: String,
     pub source_branch: String,
     pub target_branch: String,
-    /// open, merged, closed, head_mismatch, publication_failed, or
-    /// reconciliation_required.
+    /// Provider outcome: open, merged, closed, publication_failed, or
+    /// reconciliation_required. A merged result whose observed head differs
+    /// from the admitted SHA remains provider status `merged`; the repository
+    /// derives `head_mismatch` as a separate integrity classification.
     pub status: String,
     pub provider_event_id: Option<String>,
     pub provider_pr_id: Option<String>,

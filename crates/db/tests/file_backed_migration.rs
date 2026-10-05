@@ -1512,13 +1512,13 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
 }
 
 #[tokio::test]
-async fn v113_preserves_legacy_pr_outcomes_without_granting_admission_authority() {
+async fn v114_preserves_legacy_pr_outcomes_without_granting_admission_authority() {
     let base_dir = unique_temp_path("pr9-v108-migrations");
-    let final_dir = unique_temp_path("pr9-v113-migrations");
+    let final_dir = unique_temp_path("pr9-v114-migrations");
     fs::create_dir_all(&base_dir).expect("base migration dir");
     fs::create_dir_all(&final_dir).expect("final migration dir");
     copy_migrations_up_to(108, &base_dir);
-    copy_migrations_up_to(113, &final_dir);
+    copy_migrations_up_to(114, &final_dir);
 
     let db_path = unique_temp_path("pr9-v109-existing-pr").with_extension("db");
     let url = format!("sqlite://{}", db_path.display());
@@ -1530,7 +1530,12 @@ async fn v113_preserves_legacy_pr_outcomes_without_granting_admission_authority(
     let now = db::now_rfc3339();
     let project_id = db::new_uuid_v4();
     let repo_id = db::new_uuid_v4();
-    let task_ids = [db::new_uuid_v4(), db::new_uuid_v4(), db::new_uuid_v4()];
+    let task_ids = [
+        db::new_uuid_v4(),
+        db::new_uuid_v4(),
+        db::new_uuid_v4(),
+        db::new_uuid_v4(),
+    ];
     db::ProjectRepo::create(
         &db,
         CreateProject {
@@ -1571,6 +1576,10 @@ async fn v113_preserves_legacy_pr_outcomes_without_granting_admission_authority(
         ("merged", "merged"),
         ("closed", "closed_without_merge"),
         ("open", "pending"),
+        // V109 replaces this old status with the legacy marker, and V113's
+        // generic fallback loses it. V114 restores only this recognized
+        // terminal provider state from pr_state.
+        ("failed", "publication_failed"),
     ];
     let mut metadata_ids = Vec::new();
     for (index, (pr_state, merge_status)) in cases.into_iter().enumerate() {
@@ -1625,7 +1634,7 @@ async fn v113_preserves_legacy_pr_outcomes_without_granting_admission_authority(
 
     run_migrations_from(&pool, &final_dir)
         .await
-        .expect("upgrade from V108 through V113");
+        .expect("upgrade from V108 through V114");
     for (metadata_id, pr_state, merge_status, provider_pr_id, pr_url) in metadata_ids {
         let legacy: (
             String,
@@ -1646,6 +1655,7 @@ async fn v113_preserves_legacy_pr_outcomes_without_granting_admission_authority(
         let expected_merge_status = match pr_state {
             "merged" => "merged",
             "closed" => "closed_without_merge",
+            "failed" => "publication_failed",
             _ => "pending",
         };
         assert_eq!(
@@ -1673,16 +1683,16 @@ async fn v113_preserves_legacy_pr_outcomes_without_granting_admission_authority(
 }
 
 #[tokio::test]
-async fn v113_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
+async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
     let v108_dir = unique_temp_path("pr9-v110-crash-v108");
     let v110_dir = unique_temp_path("pr9-v110-crash-v110");
-    let v113_dir = unique_temp_path("pr9-v110-crash-v113");
+    let v114_dir = unique_temp_path("pr9-v110-crash-v114");
     fs::create_dir_all(&v108_dir).expect("V108 migration dir");
     fs::create_dir_all(&v110_dir).expect("V110 migration dir");
-    fs::create_dir_all(&v113_dir).expect("V113 migration dir");
+    fs::create_dir_all(&v114_dir).expect("V114 migration dir");
     copy_migrations_up_to(108, &v108_dir);
     copy_migrations_up_to(110, &v110_dir);
-    copy_migrations_up_to(113, &v113_dir);
+    copy_migrations_up_to(114, &v114_dir);
 
     let db_path = unique_temp_path("pr9-v110-crash-window").with_extension("db");
     let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
@@ -1886,9 +1896,9 @@ async fn v113_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
         ("succeeded".to_owned(), "legacy_unadmitted".to_owned())
     );
 
-    run_migrations_from(&pool, &v113_dir)
+    run_migrations_from(&pool, &v114_dir)
         .await
-        .expect("upgrade exact V110 crash window through V113");
+        .expect("upgrade exact V110 crash window through V114");
     let after: (String, String, String, String) = sqlx::query_as(
         "SELECT merge_op.status, metadata.merge_status, metadata.pr_state,
                 metadata.admission_status
@@ -1920,7 +1930,7 @@ async fn v113_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(v108_dir);
     let _ = fs::remove_dir_all(v110_dir);
-    let _ = fs::remove_dir_all(v113_dir);
+    let _ = fs::remove_dir_all(v114_dir);
 }
 
 fn copy_migrations_up_to(max_version: i64, destination: &Path) {
