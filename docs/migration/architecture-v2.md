@@ -209,6 +209,13 @@ reusing the Task's mutable `pr_metadata` projection. Exact historical provider
 callback replay resolves against the frozen admission and result event, so a
 later PR cannot invalidate replay of an earlier terminal result.
 
+V117 revisits only V115's missed wrong-head rework cases. It repairs when the
+exact erroneous Blocked-to-Active transition still owns the current lifecycle
+and no later lifecycle transition exists. Unrelated Decisions and retry events
+without a lifecycle effect do not supersede that authority; a later real
+lifecycle transition still does. The repair preserves existing retry and
+lifecycle history and appends a versioned repair fact and blocking transition.
+
 PR9 does not create HumanApproval, copy review or validation verdicts, or
 convert legacy workflow definitions into Gate policies.
 

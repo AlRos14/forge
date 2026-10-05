@@ -1,7 +1,7 @@
 # Plan PR9: Gate Engine and aggregate Task lifecycle
 
-Status: **READY FOR REVIEW**. This iteration closes the two residual P2
-findings from the last HEAD review; PR9 is not merged. The
+Status: **READY FOR REVIEW**. This iteration closes the one residual P2
+found after HEAD `9a2033d3730ef5d9bba256d0606b44178ff7544d`; PR9 is not merged. The
 merge-readiness decision is a deterministic evaluation of immutable exact
 facts; Task lifecycle stores aggregate progress. The PR8 ReviewReport and
 ValidationRun authority remains unchanged.
@@ -14,8 +14,9 @@ ValidationRun authority remains unchanged.
 - PR9 initial HEAD: `6367cc257f9a6ccc1febcce9b4ab6abefd4161d8`.
 - Deep-review follow-up starting HEAD: `453a412a6c2a2c7878a48edc3006e7df89512788`.
 - Latest residual-review starting HEAD: `3d3a7eeedf588033482586a5b17135963020e618`.
+- V117 follow-up starting HEAD: `9a2033d3730ef5d9bba256d0606b44178ff7544d`.
 - Migration head at PR9 base: V099. PR9 adds V100–V107; subsequent PR9
-  follow-ups add V108–V116. The migrations are additive and preserve existing
+  follow-ups add V108–V117. The migrations are additive and preserve existing
   retry receipts, provider PR outcomes, and exact admission history.
 - V109's admission marker did not preserve the separate historical outcome.
   V113 restores merged/closed outcomes from the retained provider state and
@@ -167,7 +168,8 @@ its remote admission/result event proving provider `merged` plus
 `task.rework_requested` event; and the applied Blocked-to-Active transition
 caused by that receipt. It repairs only while that rework transition still
 owns the current Active lifecycle. A later lifecycle transition, later Human
-Decision, or later retry fact prevents repair. V115 preserves every old event,
+Decision after the provider result, or later retry event initially prevented
+repair in V115. V115 preserves every old event,
 receipt, and transition, then appends `task.remote_pr_integrity_repaired`, a
 `task.lifecycle_changed` event, and an Active-to-Blocked transition whose
 reason references the exact provider result event.
@@ -184,6 +186,17 @@ before reading current `pr_metadata`; exact replay returns the same event,
 while conflicting or new terminal callbacks are rejected. Active admissions
 continue to block another admission. Project teardown removes snapshots only
 inside the existing guarded transaction.
+
+V117 corrects only those V115 false-negatives. It repeats the exact remote
+admission/result, TaskMerge, receipt, rework event, and applied Blocked-to-Active
+transition checks. The repair selector now treats the current lifecycle state,
+version, reason, and absence of a later lifecycle transition as the authority
+boundary. A human Decision or later retry event without a newer lifecycle
+transition does not supersede that authority. A later real lifecycle transition
+still prevents repair. A per-Task unique index makes ambiguous current
+candidates fail closed. V117 reuses the durable repair event type with distinct
+V117 dedupe keys and `migration_version=V117`; its corrective transition makes
+the old retry event superseded under the existing replay rule.
 
 #### Migration audit
 
@@ -642,7 +655,7 @@ from this historical section.
 PR #12 remains open and unmerged. The merge decision remains with a human
 reviewer. Workspace-wide tests and provider/live acceptance were not run.
 
-## Latest residual-review close
+## Previous residual-review close — V115/V116
 
 - P1: 0
 - P2: 0 residual of 2
@@ -650,3 +663,32 @@ reviewer. Workspace-wide tests and provider/live acceptance were not run.
 
 PR #12 remains open and unmerged. V115/V116 are on the same PR9 branch; the
 merge decision remains with a human reviewer.
+
+## Current residual-review close — V117
+
+V117 repairs only the V115 false-negatives where unrelated Task-scoped
+activity followed the wrong-head result but did not change lifecycle
+authority. The exact provider result, terminal TaskMerge lifecycle event,
+retry receipt, rework event, applied Blocked-to-Active transition, current
+Active lifecycle version/reason, and absence of any later lifecycle
+transition are all required. A later real transition remains authoritative.
+V115 and V116 were not modified.
+
+The file-backed V116→V117 fixtures cover an unrelated Human Decision before
+the old retry, a later execution retry request with its own receipt but no
+lifecycle transition, a real later transition to Ready, a Task already
+repaired by V115, a current V114+ modern mismatch, and two affected Tasks in
+one migration. The tests verify history retention, one repair per matching
+Task, no duplicate repair on migration replay, and old-retry replay remaining
+Blocked. The existing V112→V117 upgrade test applies V113–V117 in order.
+
+| Command | Result |
+| --- | --- |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib v117_ --locked --offline` | PASS, 6 V117 tests: the two false-negative causes, later lifecycle authority, prior V115 repair, modern mismatch, and multiple Tasks. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo test -p services --lib task_integration_operation::tests:: --locked --offline` | PASS, 28 tests, including V112→V117, PR1→PR2→PR3 replay/history, and Project teardown. |
+| `CARGO_TARGET_DIR=/home/alejandro/Proyectos/forge/target cargo check -p db -p services --locked --offline` | PASS. |
+| `cargo fmt --all -- --check` and `git diff --check` | PASS. |
+
+Workspace-wide tests, Clippy, release, and provider/live acceptance were not
+run. PR #12 remains open and unmerged; the human reviewer retains the merge
+decision. Current scoped findings: P1 = 0, P2 = 0, P3 = 0.

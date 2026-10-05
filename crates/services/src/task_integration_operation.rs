@@ -1268,6 +1268,16 @@ mod tests {
         seed_fixture(Arc::new(SqliteDb::new(pool)), root).await
     }
 
+    async fn fixture_at_v116(database_url: &str, root: &Path) -> Fixture {
+        let prefix = root.join("migrations-v116");
+        copy_migrations_up_to(116, &prefix);
+        let pool = create_sqlite_pool(database_url).await.expect("pool");
+        db::run_migrations_from(&pool, &prefix)
+            .await
+            .expect("V116 migration baseline");
+        seed_fixture(Arc::new(SqliteDb::new(pool)), root).await
+    }
+
     async fn assert_no_terminal_pr_merge_has_pending_metadata(fixture: &Fixture) {
         let inconsistent: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
@@ -1289,7 +1299,7 @@ mod tests {
     }
 
     struct V113WrongHeadRework {
-        _temp: TempDir,
+        _temp: Option<TempDir>,
         fixture: Fixture,
         task_merge_id: String,
         provider_result_event_id: String,
@@ -1297,6 +1307,16 @@ mod tests {
         retry_receipt_id: String,
         retry_event_id: String,
         rework_transition_id: String,
+        unrelated_decision_id: Option<String>,
+        later_retry_receipt_id: Option<String>,
+        later_retry_event_id: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct V113WrongHeadScenario {
+        later_authority: bool,
+        unrelated_human_decision_before_rework: bool,
+        later_retry_without_transition: bool,
     }
 
     fn copy_migrations_up_to(max_version: i64, destination: &Path) {
@@ -1323,7 +1343,114 @@ mod tests {
         }
     }
 
+    async fn migrate_v113_history_through(history: &V113WrongHeadRework, version: i64) {
+        let prefix = history
+            ._temp
+            .as_ref()
+            .expect("file-backed V113 database owner")
+            .path()
+            .join(format!("migrations-v{version}"));
+        copy_migrations_up_to(version, &prefix);
+        db::run_migrations_from(history.fixture.db.pool(), &prefix)
+            .await
+            .unwrap_or_else(|error| panic!("file-backed migration through V{version}: {error}"));
+    }
+
+    async fn v117_repair_count(fixture: &Fixture, task_merge_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired'
+               AND scope_type = 'task' AND scope_id = ?
+               AND json_extract(payload_json, '$.task_merge_operation_id') = ?
+               AND json_extract(payload_json, '$.migration_version') = 'V117'",
+        )
+        .bind(&fixture.task_id)
+        .bind(task_merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("V117 repair fact count")
+    }
+
+    async fn v117_repair_payload(fixture: &Fixture, task_merge_id: &str) -> serde_json::Value {
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired'
+               AND scope_type = 'task' AND scope_id = ?
+               AND json_extract(payload_json, '$.task_merge_operation_id') = ?
+               AND json_extract(payload_json, '$.migration_version') = 'V117'",
+        )
+        .bind(&fixture.task_id)
+        .bind(task_merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("V117 repair payload");
+        serde_json::from_str(&payload).expect("valid V117 repair payload")
+    }
+
+    async fn assert_old_wrong_retry_replay_stays_blocked(history: &V113WrongHeadRework) {
+        let retry_event =
+            db::DomainEventRepo::get_event(&*history.fixture.db, &history.retry_event_id)
+                .await
+                .expect("old retry event lookup")
+                .expect("old retry event remains");
+        assert!(
+            !crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+                &history.fixture.db,
+                &retry_event,
+            )
+            .await
+            .expect("repaired old rework is superseded")
+        );
+        let old_transition: (i64, String, String) = sqlx::query_as(
+            "SELECT expected_task_version, reason_kind, reason_ref
+             FROM task_lifecycle_transition WHERE id = ?",
+        )
+        .bind(&history.rework_transition_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("old transition replay identity");
+        let replay = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&history.fixture.db),
+            Arc::new(EventBus::new(8)),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: history.fixture.task_id.clone(),
+            expected_task_version: old_transition.0,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::DomainEvent(
+                history.retry_event_id.clone(),
+            ),
+            reason_kind: Some(old_transition.1),
+            reason_ref: Some(old_transition.2),
+            idempotency_key: format!(
+                "task-failure-lifecycle:{}:task_merge_failed:{}",
+                history.fixture.task_id, history.task_merge_id
+            ),
+        })
+        .await
+        .expect("old retry replay resolves to the current lifecycle");
+        assert_eq!(replay.lifecycle.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            replay.lifecycle.reason_ref.as_deref(),
+            Some(history.provider_result_event_id.as_str())
+        );
+    }
+
     async fn v113_wrong_head_rework(later_authority: bool, label: &str) -> V113WrongHeadRework {
+        v113_wrong_head_rework_scenario(
+            V113WrongHeadScenario {
+                later_authority,
+                ..V113WrongHeadScenario::default()
+            },
+            label,
+        )
+        .await
+    }
+
+    async fn v113_wrong_head_rework_scenario(
+        scenario: V113WrongHeadScenario,
+        label: &str,
+    ) -> V113WrongHeadRework {
         let temp = TempDir::new().expect("temporary directory");
         let database_url = format!("sqlite://{}", temp.path().join("v113.db").display());
         let v113_dir = temp.path().join("migrations-v113");
@@ -1334,10 +1461,21 @@ mod tests {
         db::run_migrations_from(&pool, &v113_dir)
             .await
             .expect("file-backed V113 baseline");
-        let fixture = seed_fixture(Arc::new(SqliteDb::new(pool.clone())), temp.path()).await;
+        let fixture = seed_fixture(Arc::new(SqliteDb::new(pool)), temp.path()).await;
+        let mut history = build_v113_wrong_head_rework(fixture, temp.path(), scenario, label).await;
+        history._temp = Some(temp);
+        history
+    }
+
+    async fn build_v113_wrong_head_rework(
+        fixture: Fixture,
+        root: &Path,
+        scenario: V113WrongHeadScenario,
+        label: &str,
+    ) -> V113WrongHeadRework {
         let event_bus = Arc::new(EventBus::new(64));
-        let (_manager, merge, publish, _evaluation, _gate, _policy, _token_env) =
-            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+        let (_manager, merge, publish, _evaluation, _gate, policy, _token_env) =
+            prepare_pr_admission(&fixture, root, Arc::clone(&event_bus))
                 .await
                 .expect("exact remote admission at V113");
         let task_merge_id = merge.id().to_owned();
@@ -1550,6 +1688,69 @@ mod tests {
         .await
         .expect("exact old terminal lifecycle event");
 
+        let unrelated_decision_id = if scenario.unrelated_human_decision_before_rework {
+            let prior_decision = policy
+                .decisions
+                .first()
+                .expect("initial Gate decision exists");
+            let collaboration = crate::collaboration_service::CollaborationService::new(
+                Arc::clone(&fixture.db),
+                Arc::clone(&event_bus),
+            );
+            let proposal = collaboration
+                .create_proposal(
+                    crate::collaboration_service::CollaborationActorSource::Human(
+                        fixture.user_id.clone(),
+                    ),
+                    crate::collaboration_service::CreateProposalInput {
+                        task_id: fixture.task_id.clone(),
+                        target: db::ProposalTarget {
+                            kind: db::ProposalTargetKind::Task,
+                            id: fixture.task_id.clone(),
+                        },
+                        action: "record_unrelated_task_note".to_owned(),
+                        reason: "Record an unrelated human decision before retry consumption"
+                            .to_owned(),
+                        target_version: None,
+                        target_digest: None,
+                        required_policy_ref: prior_decision.policy_ref.clone(),
+                        required_policy_version: prior_decision.policy_version,
+                        required_policy_digest: prior_decision.policy_digest.clone(),
+                        supersedes_proposal_id: None,
+                        artifact_ids: Vec::new(),
+                    },
+                )
+                .await
+                .expect("unrelated human Proposal");
+            Some(
+                collaboration
+                    .record_decision(
+                        crate::collaboration_service::CreateDecisionInput {
+                            task_id: fixture.task_id.clone(),
+                            proposal_id: proposal.id.clone(),
+                            proposal_version: proposal.content_version,
+                            outcome: db::DecisionOutcome::Reject,
+                            rationale:
+                                "This unrelated task note does not accept the remote PR head"
+                                    .to_owned(),
+                            policy_ref: prior_decision.policy_ref.clone(),
+                            policy_version: prior_decision.policy_version,
+                            policy_digest: prior_decision.policy_digest.clone(),
+                        },
+                        vec![
+                            crate::collaboration_service::CollaborationActorSource::Human(
+                                fixture.user_id.clone(),
+                            ),
+                        ],
+                    )
+                    .await
+                    .expect("unrelated human Decision before old rework")
+                    .id,
+            )
+        } else {
+            None
+        };
+
         let policy_digest = hex::encode(Sha256::digest(
             b"forge.task_failure_retry:v3:review_request_changes=3;validation_failed=2;execution_failed=3;work_unit_integration_failed=1;task_merge_failed=1;scoped_retry_epochs=true",
         ));
@@ -1638,7 +1839,106 @@ mod tests {
             .expect("old retry transition is applied")
             .transition_id
             .clone();
-        if later_authority {
+        let (later_retry_receipt_id, later_retry_event_id) =
+            if scenario.later_retry_without_transition {
+                let execution_id = new_uuid_v4();
+                let failed_at = now_rfc3339();
+                let (_execution, failure_event) = db::ExecutionRepo::create_with_event(
+                    &*fixture.db,
+                    db::CreateExecution {
+                        id: execution_id.clone(),
+                        task_id: fixture.task_id.clone(),
+                        agent_id: None,
+                        actor_ref: None,
+                        role: "implementer".to_owned(),
+                        purpose: Some(db::ExecutionPurpose::Implement),
+                        status: db::ExecutionStatus::Failed,
+                        stop_reason: None,
+                        stopped_by: None,
+                        resume_policy: None,
+                        stopped_at: None,
+                        parent_execution_id: None,
+                        agent_session_id: None,
+                        harness_session_id: None,
+                        agent_message_id: None,
+                        last_activity_at: None,
+                        summary: None,
+                        logs_path: None,
+                        before_sha: None,
+                        after_sha: None,
+                        error: Some("unrelated later execution failure".to_owned()),
+                        executor_config_snapshot_json: None,
+                        workspace_id: None,
+                        created_at: failed_at.clone(),
+                        updated_at: failed_at.clone(),
+                    },
+                    db::CreateDomainEvent {
+                        id: new_uuid_v4(),
+                        event_type: "execution.failed".to_owned(),
+                        entity_type: "execution".to_owned(),
+                        entity_id: execution_id.clone(),
+                        actor_type: "system".to_owned(),
+                        actor_id: None,
+                        scope_type: "task".to_owned(),
+                        scope_id: fixture.task_id.clone(),
+                        correlation_id: format!("unrelated-execution-failure:{execution_id}"),
+                        causation_id: None,
+                        causation_depth: 0,
+                        dedupe_key: Some(format!("unrelated-execution-failure:{execution_id}")),
+                        payload_json: serde_json::json!({
+                            "task_id": fixture.task_id,
+                            "execution_id": execution_id,
+                            "failure": "unrelated later failure",
+                        })
+                        .to_string(),
+                        created_at: failed_at,
+                    },
+                )
+                .await
+                .expect("later unrelated failed Execution");
+                let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
+                    Arc::clone(&fixture.db),
+                    Arc::clone(&event_bus),
+                );
+                assert_eq!(
+                    retry_service
+                        .process_domain_event(&failure_event)
+                        .await
+                        .expect("active Task records retry request without transition"),
+                    1
+                );
+                let event = db::DomainEventRepo::get_event_by_dedupe(
+                    &*fixture.db,
+                    &format!(
+                        "task-failure-retry:{}:execution_failed:{}",
+                        fixture.task_id, execution_id
+                    ),
+                )
+                .await
+                .expect("later retry event lookup")
+                .expect("later retry event remains durable");
+                let receipt_id: String = sqlx::query_scalar(
+                    "SELECT id FROM task_failure_retry_receipt WHERE receipt_event_id = ?",
+                )
+                .bind(&event.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("later retry receipt remains durable");
+                let transition_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM task_lifecycle_transition
+                     WHERE task_id = ? AND cause_kind = 'domain_event' AND cause_ref = ?",
+                )
+                .bind(&fixture.task_id)
+                .bind(&event.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("later retry lifecycle transition count");
+                assert_eq!(transition_count, 0);
+                (Some(receipt_id), Some(event.id))
+            } else {
+                (None, None)
+            };
+        if scenario.later_authority {
             crate::task_lifecycle::TaskLifecycleService::new(
                 Arc::clone(&fixture.db),
                 Arc::clone(&event_bus),
@@ -1659,7 +1959,7 @@ mod tests {
         }
 
         V113WrongHeadRework {
-            _temp: temp,
+            _temp: None,
             fixture,
             task_merge_id,
             provider_result_event_id,
@@ -1667,20 +1967,16 @@ mod tests {
             retry_receipt_id,
             retry_event_id,
             rework_transition_id,
+            unrelated_decision_id,
+            later_retry_receipt_id,
+            later_retry_event_id,
         }
     }
 
     #[tokio::test]
     async fn v113_wrong_head_auto_rework_is_repaired_and_old_replay_stays_blocked() {
         let history = v113_wrong_head_rework(false, "repair").await;
-        let migrations = history._temp.path().join("migrations-v115");
-        copy_migrations_up_to(115, &migrations);
-        db::run_migrations_from(history.fixture.db.pool(), &migrations)
-            .await
-            .expect("file-backed V113 database upgrades through V115");
-        db::run_migrations(history.fixture.db.pool())
-            .await
-            .expect("repaired V113 database upgrades through V116 history backfill");
+        migrate_v113_history_through(&history, 116).await;
 
         let admission: (String, String, String, String, String, String, String) = sqlx::query_as(
             "SELECT state, provider_status, result_classification,
@@ -1833,13 +2129,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v115_does_not_replace_a_later_lifecycle_authority() {
+    async fn v117_does_not_replace_a_later_lifecycle_authority() {
         let history = v113_wrong_head_rework(true, "later-authority").await;
-        let migrations = history._temp.path().join("migrations-v115");
-        copy_migrations_up_to(115, &migrations);
-        db::run_migrations_from(history.fixture.db.pool(), &migrations)
-            .await
-            .expect("file-backed V113 database upgrades through V115");
+        migrate_v113_history_through(&history, 117).await;
 
         let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(
             &*history.fixture.db,
@@ -1857,7 +2149,11 @@ mod tests {
             lifecycle.reason_ref.as_deref(),
             Some("human-followup-later-authority")
         );
-        let repairs: i64 = sqlx::query_scalar(
+        assert_eq!(
+            v117_repair_count(&history.fixture, &history.task_merge_id).await,
+            0
+        );
+        let any_repair_facts: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM domain_event
              WHERE event_type = 'task.remote_pr_integrity_repaired' AND scope_id = ?",
         )
@@ -1865,7 +2161,7 @@ mod tests {
         .fetch_one(history.fixture.db.pool())
         .await
         .expect("no repair event after newer lifecycle authority");
-        assert_eq!(repairs, 0);
+        assert_eq!(any_repair_facts, 0);
         let old_receipt: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ?")
                 .bind(&history.retry_receipt_id)
@@ -1873,6 +2169,476 @@ mod tests {
                 .await
                 .expect("old retry receipt remains historical");
         assert_eq!(old_receipt, 1);
+    }
+
+    #[tokio::test]
+    async fn v117_repairs_when_unrelated_human_decision_precedes_old_rework() {
+        let history = v113_wrong_head_rework_scenario(
+            V113WrongHeadScenario {
+                unrelated_human_decision_before_rework: true,
+                ..V113WrongHeadScenario::default()
+            },
+            "human-decision-before-rework",
+        )
+        .await;
+        let decision_id = history
+            .unrelated_decision_id
+            .as_deref()
+            .expect("unrelated Human Decision was recorded");
+        let sequences: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT result.sequence, decision_event.sequence,
+                    retry.sequence, transition_event.sequence
+             FROM domain_event result
+             JOIN domain_event decision_event
+               ON decision_event.event_type = 'decision.recorded'
+              AND decision_event.entity_id = ?
+             JOIN domain_event retry ON retry.id = ?
+             JOIN task_lifecycle_transition transition
+               ON transition.id = ?
+             JOIN domain_event transition_event
+               ON transition_event.id = transition.domain_event_id
+             WHERE result.id = ?",
+        )
+        .bind(decision_id)
+        .bind(&history.retry_event_id)
+        .bind(&history.rework_transition_id)
+        .bind(&history.provider_result_event_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("provider result, unrelated Decision, retry, and transition order");
+        assert!(sequences.0 < sequences.1);
+        assert!(sequences.1 < sequences.2);
+        assert!(sequences.2 < sequences.3);
+
+        migrate_v113_history_through(&history, 116).await;
+        let before_v117 = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("V116 lifecycle lookup")
+        .expect("Task lifecycle exists");
+        assert_eq!(before_v117.state, db::TaskLifecycleState::Active);
+        assert_eq!(
+            before_v117.reason_kind.as_deref(),
+            Some("merge_failure_rework")
+        );
+        assert_eq!(
+            before_v117.reason_ref.as_deref(),
+            Some(history.task_merge_id.as_str())
+        );
+        assert_eq!(
+            v117_repair_count(&history.fixture, &history.task_merge_id).await,
+            0
+        );
+
+        migrate_v113_history_through(&history, 117).await;
+        let after_v117 = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("V117 lifecycle lookup")
+        .expect("Task lifecycle exists");
+        assert_eq!(after_v117.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            after_v117.reason_kind.as_deref(),
+            Some("remote_pr_head_mismatch")
+        );
+        assert_eq!(
+            after_v117.reason_ref.as_deref(),
+            Some(history.provider_result_event_id.as_str())
+        );
+        let repair = v117_repair_payload(&history.fixture, &history.task_merge_id).await;
+        assert_eq!(repair["task_id"], history.fixture.task_id);
+        assert_eq!(repair["task_merge_operation_id"], history.task_merge_id);
+        assert_eq!(
+            repair["provider_result_event_id"],
+            history.provider_result_event_id
+        );
+        assert_eq!(repair["wrong_retry_receipt_id"], history.retry_receipt_id);
+        assert_eq!(repair["wrong_rework_event_id"], history.retry_event_id);
+        assert_eq!(
+            repair["prior_lifecycle_transition_id"],
+            history.rework_transition_id
+        );
+        assert_eq!(repair["migration_version"], "V117");
+        assert_eq!(
+            v117_repair_count(&history.fixture, &history.task_merge_id).await,
+            1
+        );
+        let retained: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM decision WHERE id = ? AND task_id = ?),
+                 (SELECT COUNT(*) FROM decision_actor
+                  WHERE decision_id = ? AND task_id = ? AND actor_kind = 'human'),
+                 (SELECT COUNT(*) FROM domain_event
+                  WHERE event_type = 'decision.recorded'
+                    AND entity_type = 'decision' AND entity_id = ?
+                    AND scope_type = 'task' AND scope_id = ?),
+                 (SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ?),
+                 (SELECT COUNT(*) FROM domain_event WHERE id = ?),
+                 (SELECT COUNT(*) FROM task_lifecycle_transition WHERE id = ?)",
+        )
+        .bind(decision_id)
+        .bind(&history.fixture.task_id)
+        .bind(decision_id)
+        .bind(&history.fixture.task_id)
+        .bind(decision_id)
+        .bind(&history.fixture.task_id)
+        .bind(&history.retry_receipt_id)
+        .bind(&history.retry_event_id)
+        .bind(&history.rework_transition_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("V117 preserves Decision and wrong-rework history");
+        assert_eq!(retained, (1, 1, 1, 1, 1, 1));
+        assert_old_wrong_retry_replay_stays_blocked(&history).await;
+    }
+
+    #[tokio::test]
+    async fn v117_repairs_when_later_retry_event_did_not_change_lifecycle() {
+        let history = v113_wrong_head_rework_scenario(
+            V113WrongHeadScenario {
+                later_retry_without_transition: true,
+                ..V113WrongHeadScenario::default()
+            },
+            "later-retry-without-transition",
+        )
+        .await;
+        let later_retry_id = history
+            .later_retry_event_id
+            .as_deref()
+            .expect("later retry event exists");
+        let later_receipt_id = history
+            .later_retry_receipt_id
+            .as_deref()
+            .expect("later retry receipt exists");
+        let event_order: (i64, i64) = sqlx::query_as(
+            "SELECT wrong_transition_event.sequence, later_retry.sequence
+             FROM task_lifecycle_transition wrong_transition
+             JOIN domain_event wrong_transition_event
+               ON wrong_transition_event.id = wrong_transition.domain_event_id
+             JOIN domain_event later_retry ON later_retry.id = ?
+             WHERE wrong_transition.id = ?",
+        )
+        .bind(later_retry_id)
+        .bind(&history.rework_transition_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("later retry event follows the wrong rework transition");
+        assert!(event_order.0 < event_order.1);
+        let current = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("current lifecycle lookup")
+        .expect("Task lifecycle exists");
+        assert_eq!(current.state, db::TaskLifecycleState::Active);
+        assert_eq!(current.reason_kind.as_deref(), Some("merge_failure_rework"));
+        assert_eq!(
+            current.reason_ref.as_deref(),
+            Some(history.task_merge_id.as_str())
+        );
+
+        migrate_v113_history_through(&history, 116).await;
+        let before_v117 = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("V116 lifecycle lookup")
+        .expect("Task lifecycle exists");
+        assert_eq!(before_v117.state, db::TaskLifecycleState::Active);
+        assert_eq!(
+            v117_repair_count(&history.fixture, &history.task_merge_id).await,
+            0
+        );
+
+        migrate_v113_history_through(&history, 117).await;
+        let after_v117 = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("V117 lifecycle lookup")
+        .expect("Task lifecycle exists");
+        assert_eq!(after_v117.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            after_v117.reason_kind.as_deref(),
+            Some("remote_pr_head_mismatch")
+        );
+        assert_eq!(
+            after_v117.reason_ref.as_deref(),
+            Some(history.provider_result_event_id.as_str())
+        );
+        assert_eq!(
+            v117_repair_count(&history.fixture, &history.task_merge_id).await,
+            1
+        );
+        let retained: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ?),
+                 (SELECT COUNT(*) FROM domain_event WHERE id = ?),
+                 (SELECT COUNT(*) FROM task_lifecycle_transition
+                  WHERE task_id = ? AND cause_kind = 'domain_event' AND cause_ref = ?)",
+        )
+        .bind(later_receipt_id)
+        .bind(later_retry_id)
+        .bind(&history.fixture.task_id)
+        .bind(later_retry_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("later retry receipt and event remain without a transition");
+        assert_eq!(retained, (1, 1, 0));
+        let later_retry = db::DomainEventRepo::get_event(&*history.fixture.db, later_retry_id)
+            .await
+            .expect("later retry event lookup")
+            .expect("later retry event remains");
+        assert!(
+            !crate::task_failure_retry::TaskFailureRetryService::is_rework_request_event(
+                &history.fixture.db,
+                &later_retry,
+            )
+            .await
+            .expect("V117 transition supersedes the later retry without authority")
+        );
+        assert_old_wrong_retry_replay_stays_blocked(&history).await;
+    }
+
+    #[tokio::test]
+    async fn v117_does_not_duplicate_a_task_repaired_by_v115() {
+        let history = v113_wrong_head_rework(false, "already-repaired-v115").await;
+        migrate_v113_history_through(&history, 115).await;
+        let repaired_by_v115 = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("V115 lifecycle lookup")
+        .expect("Task lifecycle exists");
+        assert_eq!(repaired_by_v115.state, db::TaskLifecycleState::Blocked);
+        let v115_repairs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired'
+               AND scope_id = ? AND json_extract(payload_json, '$.migration_version') = 'V115'",
+        )
+        .bind(&history.fixture.task_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("existing V115 repair fact");
+        assert_eq!(v115_repairs, 1);
+
+        migrate_v113_history_through(&history, 117).await;
+        let after_v117 = db::TaskLifecycleRepo::get_task_lifecycle(
+            &*history.fixture.db,
+            &history.fixture.task_id,
+        )
+        .await
+        .expect("lifecycle after V117")
+        .expect("Task lifecycle exists");
+        assert_eq!(after_v117.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(after_v117.version, repaired_by_v115.version);
+        assert_eq!(
+            after_v117.reason_ref.as_deref(),
+            Some(history.provider_result_event_id.as_str())
+        );
+        assert_eq!(
+            v117_repair_count(&history.fixture, &history.task_merge_id).await,
+            0
+        );
+        let correction_transitions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND reason_kind = 'remote_pr_head_mismatch'
+               AND reason_ref = ?",
+        )
+        .bind(&history.fixture.task_id)
+        .bind(&history.provider_result_event_id)
+        .fetch_one(history.fixture.db.pool())
+        .await
+        .expect("single V115 correction transition");
+        assert_eq!(correction_transitions, 1);
+    }
+
+    #[tokio::test]
+    async fn v117_repairs_multiple_tasks_independently() {
+        let first = v113_wrong_head_rework_scenario(
+            V113WrongHeadScenario {
+                unrelated_human_decision_before_rework: true,
+                ..V113WrongHeadScenario::default()
+            },
+            "batch-human-decision",
+        )
+        .await;
+        let temp_root = first
+            ._temp
+            .as_ref()
+            .expect("shared file-backed database owner")
+            .path();
+        let second_root = temp_root.join("second-task-root");
+        fs::create_dir_all(&second_root).expect("second Task fixture root");
+        let second_fixture = seed_fixture(Arc::clone(&first.fixture.db), &second_root).await;
+        let second = build_v113_wrong_head_rework(
+            second_fixture,
+            &second_root,
+            V113WrongHeadScenario {
+                later_retry_without_transition: true,
+                ..V113WrongHeadScenario::default()
+            },
+            "batch-later-retry",
+        )
+        .await;
+        assert_ne!(first.fixture.task_id, second.fixture.task_id);
+
+        migrate_v113_history_through(&first, 116).await;
+        for (history, reason) in [
+            (&first, "merge_failure_rework"),
+            (&second, "merge_failure_rework"),
+        ] {
+            let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(
+                &*history.fixture.db,
+                &history.fixture.task_id,
+            )
+            .await
+            .expect("pre-V117 lifecycle lookup")
+            .expect("Task lifecycle exists");
+            assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
+            assert_eq!(lifecycle.reason_kind.as_deref(), Some(reason));
+            assert_eq!(
+                v117_repair_count(&history.fixture, &history.task_merge_id).await,
+                0
+            );
+        }
+
+        migrate_v113_history_through(&first, 117).await;
+        for history in [&first, &second] {
+            let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(
+                &*history.fixture.db,
+                &history.fixture.task_id,
+            )
+            .await
+            .expect("post-V117 lifecycle lookup")
+            .expect("Task lifecycle exists");
+            assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
+            assert_eq!(
+                lifecycle.reason_kind.as_deref(),
+                Some("remote_pr_head_mismatch")
+            );
+            assert_eq!(
+                lifecycle.reason_ref.as_deref(),
+                Some(history.provider_result_event_id.as_str())
+            );
+            assert_eq!(
+                v117_repair_count(&history.fixture, &history.task_merge_id).await,
+                1
+            );
+            assert_old_wrong_retry_replay_stays_blocked(history).await;
+        }
+        let v117_repairs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired'
+               AND json_extract(payload_json, '$.migration_version') = 'V117'",
+        )
+        .fetch_one(first.fixture.db.pool())
+        .await
+        .expect("batch V117 repair fact count");
+        assert_eq!(v117_repairs, 2);
+        migrate_v113_history_through(&first, 117).await;
+        let repeated_v117_repairs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.remote_pr_integrity_repaired'
+               AND json_extract(payload_json, '$.migration_version') = 'V117'",
+        )
+        .fetch_one(first.fixture.db.pool())
+        .await
+        .expect("idempotent V117 migration marker");
+        assert_eq!(repeated_v117_repairs, 2);
+    }
+
+    #[tokio::test]
+    async fn v117_does_not_repair_a_modern_head_mismatch() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!("sqlite://{}", temp.path().join("modern-v116.db").display());
+        let fixture = fixture_at_v116(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+                .await
+                .expect("modern V116 remote admission");
+        let merge_id = merge.id().to_owned();
+        set_test_provider_identity(
+            &fixture,
+            &merge,
+            &publish,
+            "modern-provider-pr-v117",
+            "https://github.example.invalid/pull/117",
+            "open",
+        )
+        .await;
+        publish
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("modern PR publication succeeds");
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("modern admission lookup")
+                .expect("modern admission exists");
+        let result = record_test_remote_outcome(
+            &fixture,
+            &merge_id,
+            "merged",
+            Some("modern-provider-event-v117"),
+            Some("modern-provider-pr-v117"),
+            Some("https://github.example.invalid/pull/117"),
+            Some("modern-observed-wrong-head"),
+            Some("modern-provider-merged-commit"),
+            None,
+        )
+        .await
+        .expect("modern provider Merged mismatch result");
+        drop(merge);
+        let before = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("modern mismatch lifecycle lookup")
+            .expect("Task lifecycle exists");
+        assert_eq!(before.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(
+            before.reason_kind.as_deref(),
+            Some("remote_pr_head_mismatch")
+        );
+        assert_eq!(before.reason_ref.as_deref(), Some(result.id.as_str()));
+        let admission_result: (String, String, String) = sqlx::query_as(
+            "SELECT state, provider_status, result_classification
+             FROM remote_pr_admission WHERE task_merge_operation_id = ?",
+        )
+        .bind(&merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("modern mismatch admission facts");
+        assert_eq!(admission_result.0, "head_mismatch");
+        assert_eq!(admission_result.1, "merged");
+        assert_eq!(admission_result.2, "head_mismatch");
+        assert_eq!(admission.admitted_source_sha, "source-commit");
+
+        let prefix = temp.path().join("migrations-v117");
+        copy_migrations_up_to(117, &prefix);
+        db::run_migrations_from(fixture.db.pool(), &prefix)
+            .await
+            .expect("file-backed modern V116 database upgrades through V117");
+        let after = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle after V117")
+            .expect("Task lifecycle exists");
+        assert_eq!(after.state, db::TaskLifecycleState::Blocked);
+        assert_eq!(after.version, before.version);
+        assert_eq!(
+            after.reason_kind.as_deref(),
+            Some("remote_pr_head_mismatch")
+        );
+        assert_eq!(after.reason_ref.as_deref(), Some(result.id.as_str()));
+        assert_eq!(v117_repair_count(&fixture, &merge_id).await, 0);
     }
 
     #[tokio::test]
@@ -4226,7 +4992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v112_file_backed_schema_upgrades_sequentially_through_v115_and_v116() {
+    async fn v112_file_backed_schema_upgrades_sequentially_through_v117() {
         let temp = TempDir::new().expect("temporary directory");
         let database_url = format!("sqlite://{}", temp.path().join("v112.db").display());
         let v112_migrations = temp.path().join("migrations-v112");
@@ -4245,13 +5011,13 @@ mod tests {
             .await
             .expect("V112 database upgrades through all current migrations");
         let applied: Vec<i64> = sqlx::query_scalar(
-            "SELECT version FROM _migration WHERE version BETWEEN 113 AND 116
+            "SELECT version FROM _migration WHERE version BETWEEN 113 AND 117
              ORDER BY version",
         )
         .fetch_all(&pool)
         .await
         .expect("follow-up migration markers");
-        assert_eq!(applied, vec![113, 114, 115, 116]);
+        assert_eq!(applied, vec![113, 114, 115, 116, 117]);
         let history_table: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type = 'table' AND name = 'remote_pr_history'",
