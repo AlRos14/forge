@@ -79,7 +79,7 @@ impl TaskFailureRetryService {
         .bind(decision_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (authorization_event_id, expected_task_version, created_event) = if let Some(row) =
+        let (_authorization_event_id, _expected_task_version, created_event) = if let Some(row) =
             existing
         {
             if row.try_get::<String, _>("task_id")? != task_id
@@ -98,7 +98,7 @@ impl TaskFailureRetryService {
             let facts = sqlx::query(
                 "SELECT receipt.failure_kind, receipt.failure_ref,
                             receipt.disposition, lifecycle.state,
-                            lifecycle.reason_kind, lifecycle.reason_ref,
+                            lifecycle.reason_kind,
                             task.version AS expected_task_version,
                             decision.proposal_id,
                             decision.proposal_version,
@@ -169,14 +169,23 @@ impl TaskFailureRetryService {
                     .try_get::<Option<String>, _>("proposal_policy_digest")?
                     .as_deref()
                     == Some(override_digest.as_str());
+            let already_overridden: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM task_retry_override
+                     WHERE exhaustion_receipt_id = ? AND task_id = ?
+                 )",
+            )
+            .bind(exhaustion_receipt_id)
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
             if facts.try_get::<String, _>("disposition")? != "exhausted"
                 || facts.try_get::<String, _>("state")? != "blocked"
                 || facts
                     .try_get::<Option<String>, _>("reason_kind")?
                     .as_deref()
                     != Some("retry_budget_exhausted")
-                || facts.try_get::<Option<String>, _>("reason_ref")?.as_deref()
-                    != Some(failure_ref.as_str())
+                || already_overridden != 0
                 || facts.try_get::<String, _>("outcome")? != "approve"
                 || facts.try_get::<i64, _>("proposal_version")?
                     != facts.try_get::<i64, _>("content_version")?
@@ -190,7 +199,7 @@ impl TaskFailureRetryService {
                 || !policy_matches
             {
                 return Err(ServiceError::invalid_operation(
-                        "retry override Decision must approve this Task's exact exhausted receipt under the current override policy",
+                        "retry override Decision must approve an exact pending exhausted receipt for this Task under the current override policy",
                     ));
             }
             let retry_epoch: i64 = sqlx::query_scalar(
@@ -268,42 +277,76 @@ impl TaskFailureRetryService {
         if let Some(event) = created_event.as_ref() {
             DomainEventService::publish_committed_hint(&self.event_bus, event);
         }
+        // Exhaustion receipts are independent fences. An override for one
+        // receipt must commit even when another exhausted receipt remains.
+        // Reopen only after the final fence is superseded, using the latest
+        // exact override as the transition provenance. This query also lets a
+        // replay finish a transition after a crash between authorization and
+        // lifecycle persistence.
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+        let pending_exhaustions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_failure_retry_receipt receipt
+             WHERE receipt.task_id = ? AND receipt.disposition = 'exhausted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_retry_override override
+                   WHERE override.exhaustion_receipt_id = receipt.id
+                     AND override.task_id = receipt.task_id
+                     AND override.failure_kind = receipt.failure_kind
+               )",
+        )
+        .bind(task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if pending_exhaustions > 0 {
+            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+            return Ok(TaskLifecycleTransitionResult {
+                task,
+                lifecycle,
+                transition: None,
+            });
+        }
+        let latest_override = sqlx::query(
+            "SELECT override.authorization_event_id, override.expected_task_version,
+                    receipt.id AS exhaustion_receipt_id
+             FROM task_retry_override override
+             JOIN task_failure_retry_receipt receipt
+               ON receipt.id = override.exhaustion_receipt_id
+              AND receipt.task_id = override.task_id
+              AND receipt.failure_kind = override.failure_kind
+             JOIN domain_event authorization
+               ON authorization.id = override.authorization_event_id
+             WHERE override.task_id = ?
+             ORDER BY authorization.sequence DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| ServiceError::invalid_operation("Task has no retry override provenance"))?;
+        let authorization_event_id: String = latest_override.try_get("authorization_event_id")?;
+        let transition_task_version: i64 = latest_override.try_get("expected_task_version")?;
+        let exhaustion_receipt_id: String = latest_override.try_get("exhaustion_receipt_id")?;
         let idempotency_key = format!("task-retry-override:{exhaustion_receipt_id}");
         let transition_already_recorded =
             TaskLifecycleRepo::has_task_lifecycle_transition(&*self.db, task_id, &idempotency_key)
                 .await?;
-        let transition_task_version = if transition_already_recorded {
-            expected_task_version
-        } else {
-            let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+        if !transition_already_recorded
+            && (lifecycle.state != TaskLifecycleState::Blocked
+                || lifecycle.reason_kind.as_deref() != Some("retry_budget_exhausted"))
+        {
+            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
-            let receipt_failure_ref: Option<String> = sqlx::query_scalar(
-                "SELECT failure_ref FROM task_failure_retry_receipt
-                 WHERE id = ? AND task_id = ? AND disposition = 'exhausted'",
-            )
-            .bind(exhaustion_receipt_id)
-            .bind(task_id)
-            .fetch_optional(self.db.pool())
-            .await?;
-            let Some(receipt_failure_ref) = receipt_failure_ref else {
-                return Err(ServiceError::invalid_operation(
-                    "retry override exhaustion receipt is no longer present",
-                ));
-            };
-            if lifecycle.state != TaskLifecycleState::Blocked
-                || lifecycle.reason_kind.as_deref() != Some("retry_budget_exhausted")
-                || lifecycle.reason_ref.as_deref() != Some(receipt_failure_ref.as_str())
-            {
-                return Err(ServiceError::invalid_operation(
-                    "retry override can reopen only the Task still blocked by its exact exhaustion receipt",
-                ));
-            }
-            TaskRepo::get_by_id(&*self.db, task_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?
-                .version
-        };
+                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+            return Ok(TaskLifecycleTransitionResult {
+                task,
+                lifecycle,
+                transition: None,
+            });
+        }
         TaskLifecycleService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
             .transition(TransitionLifecycleInput {
                 task_id: task_id.to_owned(),
@@ -311,7 +354,7 @@ impl TaskFailureRetryService {
                 to_state: TaskLifecycleState::Ready,
                 cause: LifecycleCause::DomainEvent(authorization_event_id),
                 reason_kind: Some("retry_exhaustion_superseded".to_owned()),
-                reason_ref: Some(exhaustion_receipt_id.to_owned()),
+                reason_ref: Some(exhaustion_receipt_id),
                 idempotency_key,
             })
             .await
@@ -457,7 +500,7 @@ impl TaskFailureRetryService {
         let Some((failure_kind, receipt_id)) = exact_target.split_once(':') else {
             return Ok(0);
         };
-        if retry_budget(failure_kind) == 0 {
+        if !supports_retry_exhaustion_override(failure_kind) {
             return Ok(0);
         }
         let exact_exhaustion: bool = sqlx::query_scalar(
@@ -465,11 +508,23 @@ impl TaskFailureRetryService {
                  SELECT 1 FROM task_failure_retry_receipt
                  WHERE id = ? AND task_id = ? AND failure_kind = ?
                    AND disposition = 'exhausted'
+                   AND (
+                       NOT EXISTS (
+                           SELECT 1 FROM task_retry_override existing
+                           WHERE existing.exhaustion_receipt_id = task_failure_retry_receipt.id
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM task_retry_override replay
+                           WHERE replay.exhaustion_receipt_id = task_failure_retry_receipt.id
+                             AND replay.decision_id = ?
+                       )
+                   )
              )",
         )
         .bind(receipt_id)
         .bind(&event.scope_id)
         .bind(failure_kind)
+        .bind(&event.entity_id)
         .fetch_one(self.db.pool())
         .await?;
         if !exact_exhaustion {
@@ -782,7 +837,12 @@ impl TaskFailureRetryService {
     }
 
     async fn consume(&self, source: &DomainEvent, failure: &FailureFact) -> Result<FailureReceipt> {
-        let budget = retry_budget(failure.kind);
+        let budget = new_retry_receipt_budget(failure.kind).ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "failure kind {} cannot create new retry receipts",
+                failure.kind
+            ))
+        })?;
         let digest = policy_digest();
         let mut transaction = self.db.pool().begin().await?;
         if let Some(receipt) = load_receipt(
@@ -1050,17 +1110,28 @@ async fn load_receipt(
     .transpose()
 }
 
-fn retry_budget(kind: &str) -> i64 {
+fn new_retry_receipt_budget(kind: &str) -> Option<i64> {
     match kind {
-        "review_request_changes" => 3,
-        "validation_failed" => 2,
-        "execution_failed" => 3,
-        "work_unit_integration_failed" | "task_merge_failed" => 1,
-        // Read existing V101 receipts for replay only. No new failure is
-        // classified under this pre-split value.
-        "merge_failed" => 0,
-        _ => 0,
+        "review_request_changes" => Some(3),
+        "validation_failed" => Some(2),
+        "execution_failed" => Some(3),
+        "work_unit_integration_failed" | "task_merge_failed" => Some(1),
+        // V101 receipts remain immutable history, but V108 split future
+        // failures into their exact WorkUnit/TaskMerge domains.
+        _ => None,
     }
+}
+
+fn supports_retry_exhaustion_override(kind: &str) -> bool {
+    matches!(
+        kind,
+        "review_request_changes"
+            | "validation_failed"
+            | "execution_failed"
+            | "work_unit_integration_failed"
+            | "task_merge_failed"
+            | "merge_failed"
+    )
 }
 
 fn execution_is_executor_unavailable(execution: &db::Execution) -> bool {
@@ -1112,9 +1183,15 @@ fn parse_payload(event: &DomainEvent) -> Value {
 mod tests {
     use super::*;
     use db::{
+        ActorKind, AgentRepo, CoordinationMode, CreateAgentIdentity, CreateAgentProfile,
         CreateExecution, CreateProject, CreateRoleMembership, CreateTask, CreateTaskRole,
         ExecutionStatus, ProjectRepo, RoleMembershipRepo, RoleMembershipStatus, TaskLifecycleRepo,
         TaskRoleRepo, UserRepo,
+    };
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     #[tokio::test]
@@ -1224,6 +1301,32 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("exact exhaustion receipt");
+        let (second_exhaustion_source, second_failure) = retry_test_failure(
+            &db,
+            &task_id,
+            "work_unit_integration_failed",
+            &new_uuid_v4(),
+        )
+        .await;
+        let second_exhausted = service
+            .consume(&second_exhaustion_source, &second_failure)
+            .await
+            .expect("another same-epoch failure is an independent exhaustion");
+        assert_eq!(second_exhausted.disposition, "exhausted");
+        service
+            .apply_lifecycle_effect(&second_exhausted)
+            .await
+            .expect("another exhaustion keeps the Task fenced");
+        let second_receipt_id: String = sqlx::query_scalar(
+            "SELECT id FROM task_failure_retry_receipt
+             WHERE task_id = ? AND failure_kind = ? AND failure_ref = ?",
+        )
+        .bind(&task_id)
+        .bind(&second_failure.kind)
+        .bind(&second_failure.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("second exact exhaustion receipt");
         let (delayed_source, delayed_failure) = retry_test_failure(
             &db,
             &task_id,
@@ -1261,49 +1364,26 @@ mod tests {
             "an exhausted Task cannot deserialize the retired reset action"
         );
 
-        let override_digest = override_policy_digest();
-        let collaboration = crate::collaboration_service::CollaborationService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-        );
-        let proposal = collaboration
-            .create_proposal(
-                crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
-                crate::collaboration_service::CreateProposalInput {
-                    task_id: task_id.clone(),
-                    target: db::ProposalTarget {
-                        kind: db::ProposalTargetKind::Task,
-                        id: task_id.clone(),
-                    },
-                    action: retry_override_action("work_unit_integration_failed", &receipt_id),
-                    reason: format!("Authorize a new epoch for exhausted receipt {receipt_id}"),
-                    target_version: None,
-                    target_digest: None,
-                    required_policy_ref: Some(OVERRIDE_POLICY_REF.to_owned()),
-                    required_policy_version: Some(OVERRIDE_POLICY_VERSION),
-                    required_policy_digest: Some(override_digest.clone()),
-                    supersedes_proposal_id: None,
-                    artifact_ids: Vec::new(),
-                },
-            )
-            .await
-            .expect("exact retry override proposal");
-        let decision = collaboration
-            .record_decision(
-                crate::collaboration_service::CreateDecisionInput {
-                    task_id: task_id.clone(),
-                    proposal_id: proposal.id,
-                    proposal_version: proposal.content_version,
-                    outcome: db::DecisionOutcome::Approve,
-                    rationale: "Authorize this exact retry epoch".to_owned(),
-                    policy_ref: Some(OVERRIDE_POLICY_REF.to_owned()),
-                    policy_version: Some(OVERRIDE_POLICY_VERSION),
-                    policy_digest: Some(override_digest),
-                },
-                vec![crate::collaboration_service::CollaborationActorSource::Human(user_id)],
-            )
-            .await
-            .expect("approved Human Decision");
+        let decision = retry_override_decision(
+            &db,
+            &event_bus,
+            &task_id,
+            &user_id,
+            "work_unit_integration_failed",
+            &receipt_id,
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
+        let second_decision = retry_override_decision(
+            &db,
+            &event_bus,
+            &task_id,
+            &user_id,
+            "work_unit_integration_failed",
+            &second_receipt_id,
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
         assert!(
             service
                 .authorize_retry_exhaustion_override(&other_task_id, &receipt_id, &decision.id)
@@ -1332,10 +1412,44 @@ mod tests {
                 .expect("Decision event authorizes its exact retry override"),
             1
         );
-        let reopened = service
+        let still_blocked = service
             .authorize_retry_exhaustion_override(&task_id, &receipt_id, &decision.id)
             .await
-            .expect("exact override replay returns the original transition");
+            .expect("first override persists while another exhaustion is pending");
+        assert_eq!(still_blocked.lifecycle.state, TaskLifecycleState::Blocked);
+        assert!(still_blocked.transition.is_none());
+        let first_override_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_retry_override WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("first override is durable");
+        assert_eq!(first_override_count, 1);
+        assert!(
+            service
+                .authorize_retry_exhaustion_override(&task_id, &second_receipt_id, &decision.id)
+                .await
+                .is_err(),
+            "one Decision cannot authorize another exact receipt"
+        );
+        let second_decision_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE event_type = 'decision.recorded' AND entity_type = 'decision'
+               AND entity_id = ? AND scope_type = 'task' AND scope_id = ?",
+        )
+        .bind(&second_decision.id)
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("durable second Decision event");
+        let second_decision_event = DomainEventRepo::get_event(&*db, &second_decision_event_id)
+            .await
+            .expect("second Decision event lookup")
+            .expect("second Decision event exists");
+        let reopened = service
+            .authorize_retry_exhaustion_override(&task_id, &second_receipt_id, &second_decision.id)
+            .await
+            .expect("last override supersedes the remaining fence");
         assert_eq!(reopened.lifecycle.state, TaskLifecycleState::Ready);
         let transition_id = reopened
             .transition
@@ -1343,15 +1457,32 @@ mod tests {
             .expect("override transition receipt")
             .transition_id
             .clone();
+        let second_override_event_id: String = sqlx::query_scalar(
+            "SELECT authorization_event_id FROM task_retry_override
+             WHERE exhaustion_receipt_id = ?",
+        )
+        .bind(&second_receipt_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("second exact override event");
+        assert_eq!(
+            reopened
+                .transition
+                .as_ref()
+                .and_then(|write| write.event.as_ref())
+                .and_then(|event| event.causation_id.as_deref()),
+            Some(second_override_event_id.as_str()),
+            "the final exact override owns the lifecycle transition"
+        );
         let replay = service
-            .process_domain_event(&decision_event)
+            .process_domain_event(&second_decision_event)
             .await
-            .expect("same Decision event replay");
+            .expect("same final Decision event replay");
         assert_eq!(replay, 1);
         let replay = service
             .authorize_retry_exhaustion_override(&task_id, &receipt_id, &decision.id)
             .await
-            .expect("same override replay returns existing transition");
+            .expect("earlier override replay returns the final transition");
         assert_eq!(
             replay
                 .transition
@@ -1359,6 +1490,22 @@ mod tests {
                 .map(|write| write.transition_id.as_str()),
             Some(transition_id.as_str())
         );
+        assert_eq!(
+            service
+                .process_domain_event(&decision_event)
+                .await
+                .expect("first Decision replay"),
+            1
+        );
+        let exhaustion_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_failure_retry_receipt
+             WHERE task_id = ? AND disposition = 'exhausted'",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("exhaustion receipts remain immutable");
+        assert_eq!(exhaustion_count, 2);
 
         let delayed_receipt = service
             .consume(&delayed_source, &delayed_failure)
@@ -1374,7 +1521,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("late failure receipt");
-        assert_eq!(delayed_epoch_and_attempt, (0, 3));
+        assert_eq!(delayed_epoch_and_attempt, (0, 4));
         assert_eq!(delayed_receipt.disposition, "exhausted");
 
         let (next_event, next_failure) = retry_test_failure(
@@ -1399,7 +1546,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("new epoch receipt");
-        assert_eq!(epoch_and_attempt, (1, 1));
+        assert_eq!(epoch_and_attempt, (2, 1));
 
         let other_kind_failure_id = new_uuid_v4();
         for _ in 0..3 {
@@ -1455,6 +1602,103 @@ mod tests {
                 .is_err(),
             "an override cannot be reused for a different failure kind or receipt"
         );
+        let agent_execution_id = retry_test_agent_execution(&db, &task_id, &user_id).await;
+        let non_human_decision = retry_override_decision(
+            &db,
+            &event_bus,
+            &task_id,
+            &user_id,
+            "validation_failed",
+            &other_kind_receipt,
+            crate::collaboration_service::CollaborationActorSource::Execution(agent_execution_id),
+        )
+        .await;
+        assert!(
+            service
+                .authorize_retry_exhaustion_override(
+                    &task_id,
+                    &other_kind_receipt,
+                    &non_human_decision.id,
+                )
+                .await
+                .is_err(),
+            "an Agent-only Decision cannot override exhaustion"
+        );
+
+        let mut reverse_order_receipts = Vec::new();
+        for attempt in 0..3 {
+            let (event, failure) = retry_test_failure(
+                &db,
+                &other_task_id,
+                "work_unit_integration_failed",
+                &format!("reverse-order-{attempt}-{}", new_uuid_v4()),
+            )
+            .await;
+            let receipt = service
+                .consume(&event, &failure)
+                .await
+                .expect("reverse-order retry receipt");
+            if receipt.disposition == "exhausted" {
+                reverse_order_receipts.push(
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT id FROM task_failure_retry_receipt
+                         WHERE task_id = ? AND failure_kind = ? AND failure_ref = ?",
+                    )
+                    .bind(&other_task_id)
+                    .bind(failure.kind)
+                    .bind(failure.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("reverse-order exact exhaustion"),
+                );
+                service
+                    .apply_lifecycle_effect(&receipt)
+                    .await
+                    .expect("reverse-order exhaustion lifecycle effect");
+            }
+        }
+        assert_eq!(reverse_order_receipts.len(), 2);
+        let first_reverse_decision = retry_override_decision(
+            &db,
+            &event_bus,
+            &other_task_id,
+            &user_id,
+            "work_unit_integration_failed",
+            &reverse_order_receipts[0],
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
+        let second_reverse_decision = retry_override_decision(
+            &db,
+            &event_bus,
+            &other_task_id,
+            &user_id,
+            "work_unit_integration_failed",
+            &reverse_order_receipts[1],
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
+        let reverse_blocked = service
+            .authorize_retry_exhaustion_override(
+                &other_task_id,
+                &reverse_order_receipts[1],
+                &second_reverse_decision.id,
+            )
+            .await
+            .expect("receipt B may be overridden first");
+        assert_eq!(reverse_blocked.lifecycle.state, TaskLifecycleState::Blocked);
+        assert!(reverse_blocked.transition.is_none());
+        let reverse_ready = service
+            .authorize_retry_exhaustion_override(
+                &other_task_id,
+                &reverse_order_receipts[0],
+                &first_reverse_decision.id,
+            )
+            .await
+            .expect("receipt A clears the final fence when B was approved first");
+        assert_eq!(reverse_ready.lifecycle.state, TaskLifecycleState::Ready);
+        assert!(reverse_ready.transition.is_some());
+
         let historical: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM task_failure_retry_receipt WHERE id = ? AND disposition = 'exhausted'",
         )
@@ -1484,6 +1728,408 @@ mod tests {
                 .await
                 .expect("retry override table remains usable");
         assert_eq!(remaining_overrides, 0);
+    }
+
+    #[tokio::test]
+    async fn v101_merge_failed_exhaustion_survives_upgrade_and_can_be_overridden() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("forge-v101-retry-{}-{nonce}", std::process::id()));
+        let baseline_dir = root.join("v101");
+        let v110_dir = root.join("v110");
+        let latest_dir = root.join("latest");
+        fs::create_dir_all(&baseline_dir).expect("V101 migration dir");
+        fs::create_dir_all(&v110_dir).expect("V110 migration dir");
+        fs::create_dir_all(&latest_dir).expect("latest migration dir");
+        let migration_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../db/migrations");
+        for entry in fs::read_dir(migration_source).expect("db migration dir") {
+            let entry = entry.expect("migration entry");
+            let path = entry.path();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(version) = filename
+                .strip_prefix('V')
+                .and_then(|name| name.split_once("__"))
+                .and_then(|(version, _)| version.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if version <= 101 {
+                fs::copy(&path, baseline_dir.join(filename)).expect("copy V101 migration");
+            }
+            if version <= 110 {
+                fs::copy(&path, v110_dir.join(filename)).expect("copy V110 migration");
+            }
+            fs::copy(&path, latest_dir.join(filename)).expect("copy latest migration");
+        }
+        let db_path = root.join("legacy.db");
+        let url = format!("sqlite://{}", db_path.display());
+        let pool = db::create_sqlite_pool(&url)
+            .await
+            .expect("file-backed pool");
+        db::run_migrations_from(&pool, &baseline_dir)
+            .await
+            .expect("create V101 database");
+        let db = Arc::new(db::SqliteDb::new(pool.clone()));
+        let now = now_rfc3339();
+        let project_id = new_uuid_v4();
+        let task_id = new_uuid_v4();
+        let user_id = new_uuid_v4();
+        UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: user_id.clone(),
+                email: "v101-retry@example.invalid".to_owned(),
+                password_hash: "unused".to_owned(),
+                display_name: Some("Legacy retry owner".to_owned()),
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy database Human");
+        ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "V101 retry migration".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(user_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy Project");
+        TaskRepo::create(
+            &*db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Legacy merge failure".to_owned(),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy Task");
+        let source_event = DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "legacy.merge_failed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: "legacy-merge-failure-source".to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy failure source");
+        let failure_ref = "legacy-task-merge-op";
+        let receipt_event = DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.retry_budget_exhausted".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: "legacy-merge-failed-exhaustion".to_owned(),
+                causation_id: Some(source_event.id.clone()),
+                causation_depth: 1,
+                dedupe_key: None,
+                payload_json: json!({
+                    "task_id": task_id,
+                    "failure_kind": "merge_failed",
+                    "failure_ref": failure_ref,
+                    "source_event_id": source_event.id,
+                    "attempt_number": 2,
+                    "retry_budget": 1,
+                    "disposition": "exhausted",
+                    "policy_ref": POLICY_REF,
+                    "policy_version": 1,
+                    "policy_digest": policy_digest_v1(),
+                })
+                .to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("legacy exhaustion event");
+        let receipt_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO task_failure_retry_receipt (
+                 id, task_id, failure_kind, failure_ref, source_event_id,
+                 attempt_number, retry_budget, disposition, policy_ref,
+                 policy_version, policy_digest, receipt_event_id, created_at
+             ) VALUES (?, ?, 'merge_failed', ?, ?, 2, 1, 'exhausted', ?, 1, ?, ?, ?)",
+        )
+        .bind(&receipt_id)
+        .bind(&task_id)
+        .bind(failure_ref)
+        .bind(&source_event.id)
+        .bind(POLICY_REF)
+        .bind(policy_digest_v1())
+        .bind(&receipt_event.id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("V101 merge_failed exhaustion receipt");
+        crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(8)),
+        )
+        .block(
+            &task_id,
+            LifecycleCause::DomainEvent(receipt_event.id.clone()),
+            "retry_budget_exhausted",
+            failure_ref,
+            "v101-merge-failed-exhaustion",
+        )
+        .await
+        .expect("legacy exhausted Task is blocked");
+
+        db::run_migrations_from(&pool, &v110_dir)
+            .await
+            .expect("upgrade legacy database through V110");
+        let v110_task_id = new_uuid_v4();
+        TaskRepo::create(
+            &*db,
+            CreateTask {
+                id: v110_task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "V110 override history".to_owned(),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("V110 Task");
+        let v110_bus = Arc::new(EventBus::new(8));
+        let v110_service = TaskFailureRetryService::new(Arc::clone(&db), Arc::clone(&v110_bus));
+        for attempt in 0..2 {
+            let (event, failure) = retry_test_failure(
+                &db,
+                &v110_task_id,
+                "work_unit_integration_failed",
+                &format!("v110-failure-{attempt}-{}", new_uuid_v4()),
+            )
+            .await;
+            let receipt = v110_service
+                .consume(&event, &failure)
+                .await
+                .expect("V110 retry receipt");
+            if receipt.disposition == "exhausted" {
+                v110_service
+                    .apply_lifecycle_effect(&receipt)
+                    .await
+                    .expect("V110 retry exhaustion blocks Task");
+            }
+        }
+        let v110_receipt_id: String = sqlx::query_scalar(
+            "SELECT id FROM task_failure_retry_receipt
+             WHERE task_id = ? AND disposition = 'exhausted'",
+        )
+        .bind(&v110_task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("V110 exhausted receipt");
+        let v110_decision = retry_override_decision(
+            &db,
+            &v110_bus,
+            &v110_task_id,
+            &user_id,
+            "work_unit_integration_failed",
+            &v110_receipt_id,
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
+        v110_service
+            .authorize_retry_exhaustion_override(&v110_task_id, &v110_receipt_id, &v110_decision.id)
+            .await
+            .expect("V110 override history is created before table rebuild");
+
+        db::run_migrations_from(&pool, &latest_dir)
+            .await
+            .expect("upgrade incrementally through latest PR9 migrations");
+        let preserved: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT failure_kind, disposition, policy_version, retry_epoch
+             FROM task_failure_retry_receipt WHERE id = ?",
+        )
+        .bind(&receipt_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy exhaustion remains after upgrade");
+        assert_eq!(
+            preserved,
+            ("merge_failed".to_owned(), "exhausted".to_owned(), 1, 0)
+        );
+        let v110_override_preserved: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(retry_epoch) FROM task_retry_override
+             WHERE task_id = ? AND exhaustion_receipt_id = ? AND decision_id = ?",
+        )
+        .bind(&v110_task_id)
+        .bind(&v110_receipt_id)
+        .bind(&v110_decision.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("V110 override history survives the V111 table rebuild");
+        assert_eq!(v110_override_preserved, (1, 1));
+        assert!(
+            TaskFailureRetryService::has_exhausted_retry_budget(&db, &task_id)
+                .await
+                .expect("legacy receipt fence query")
+        );
+        let ready_attempt = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(8)),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: task_id.clone(),
+            expected_task_version: TaskRepo::get_by_id(&*db, &task_id, false)
+                .await
+                .expect("Task query")
+                .expect("Task exists")
+                .version,
+            to_state: TaskLifecycleState::Ready,
+            cause: LifecycleCause::DomainEvent(receipt_event.id.clone()),
+            reason_kind: Some("manual_retry".to_owned()),
+            reason_ref: Some(receipt_id.clone()),
+            idempotency_key: "v101-legacy-merge-failed-bypass".to_owned(),
+        })
+        .await;
+        assert!(
+            ready_attempt.is_err(),
+            "the upgraded DB preserves the fence"
+        );
+
+        let bus = Arc::new(EventBus::new(8));
+        let decision = retry_override_decision(
+            &db,
+            &bus,
+            &task_id,
+            &user_id,
+            "merge_failed",
+            &receipt_id,
+            crate::collaboration_service::CollaborationActorSource::Human(user_id.clone()),
+        )
+        .await;
+        let reopened = TaskFailureRetryService::new(Arc::clone(&db), bus)
+            .authorize_retry_exhaustion_override(&task_id, &receipt_id, &decision.id)
+            .await
+            .expect("legacy merge_failed exact Human Decision recovers the Task");
+        assert_eq!(reopened.lifecycle.state, TaskLifecycleState::Ready);
+        let override_epoch: i64 = sqlx::query_scalar(
+            "SELECT retry_epoch FROM task_retry_override
+             WHERE exhaustion_receipt_id = ?",
+        )
+        .bind(&receipt_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy override audit epoch");
+        assert_eq!(override_epoch, 1);
+        assert_eq!(new_retry_receipt_budget("merge_failed"), None);
+
+        let new_merge_source = DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task_merge.failed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: "post-upgrade-task-merge-failure".to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("new TaskMerge failure source");
+        let new_merge_receipt =
+            TaskFailureRetryService::new(Arc::clone(&db), Arc::new(EventBus::new(8)))
+                .consume(
+                    &new_merge_source,
+                    &FailureFact {
+                        kind: "task_merge_failed",
+                        id: "post-upgrade-task-merge-op".to_owned(),
+                    },
+                )
+                .await
+                .expect("new TaskMerge uses its split retry kind");
+        assert_eq!(new_merge_receipt.kind, "task_merge_failed");
+        let merge_failed_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_failure_retry_receipt
+             WHERE task_id = ? AND failure_kind = 'merge_failed'",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy merge_failed receipt count");
+        assert_eq!(merge_failed_receipts, 1);
+        assert!(
+            TaskFailureRetryService::new(Arc::clone(&db), Arc::new(EventBus::new(8)))
+                .consume(
+                    &new_merge_source,
+                    &FailureFact {
+                        kind: "merge_failed",
+                        id: "forbidden-new-legacy-merge-failure".to_owned(),
+                    },
+                )
+                .await
+                .is_err()
+        );
+
+        pool.close().await;
+        let _ = fs::remove_dir_all(root);
     }
 
     async fn retry_test_failure(
@@ -1520,6 +2166,158 @@ mod tests {
                 id: failure_ref.to_owned(),
             },
         )
+    }
+
+    async fn retry_override_decision(
+        db: &Arc<db::SqliteDb>,
+        event_bus: &Arc<EventBus>,
+        task_id: &str,
+        proposer_user_id: &str,
+        failure_kind: &str,
+        receipt_id: &str,
+        decider: crate::collaboration_service::CollaborationActorSource,
+    ) -> db::Decision {
+        let collaboration = crate::collaboration_service::CollaborationService::new(
+            Arc::clone(db),
+            Arc::clone(event_bus),
+        );
+        let digest = override_policy_digest();
+        let proposal = collaboration
+            .create_proposal(
+                crate::collaboration_service::CollaborationActorSource::Human(
+                    proposer_user_id.to_owned(),
+                ),
+                crate::collaboration_service::CreateProposalInput {
+                    task_id: task_id.to_owned(),
+                    target: db::ProposalTarget {
+                        kind: db::ProposalTargetKind::Task,
+                        id: task_id.to_owned(),
+                    },
+                    action: retry_override_action(failure_kind, receipt_id),
+                    reason: format!("Authorize retry for exact exhaustion {receipt_id}"),
+                    target_version: None,
+                    target_digest: None,
+                    required_policy_ref: Some(OVERRIDE_POLICY_REF.to_owned()),
+                    required_policy_version: Some(OVERRIDE_POLICY_VERSION),
+                    required_policy_digest: Some(digest.clone()),
+                    supersedes_proposal_id: None,
+                    artifact_ids: Vec::new(),
+                },
+            )
+            .await
+            .expect("exact retry override Proposal");
+        collaboration
+            .record_decision(
+                crate::collaboration_service::CreateDecisionInput {
+                    task_id: task_id.to_owned(),
+                    proposal_id: proposal.id,
+                    proposal_version: proposal.content_version,
+                    outcome: db::DecisionOutcome::Approve,
+                    rationale: "Authorize this exact exhausted receipt".to_owned(),
+                    policy_ref: Some(OVERRIDE_POLICY_REF.to_owned()),
+                    policy_version: Some(OVERRIDE_POLICY_VERSION),
+                    policy_digest: Some(digest),
+                },
+                vec![decider],
+            )
+            .await
+            .expect("exact retry override Decision")
+    }
+
+    async fn retry_test_agent_execution(
+        db: &db::SqliteDb,
+        task_id: &str,
+        owner_user_id: &str,
+    ) -> String {
+        let agent_id = new_uuid_v4();
+        let profile_id = new_uuid_v4();
+        let role_id = new_uuid_v4();
+        let execution_id = new_uuid_v4();
+        let now = now_rfc3339();
+        AgentRepo::create_identity_with_profile(
+            db,
+            CreateAgentIdentity {
+                id: agent_id.clone(),
+                name: "Retry test Agent".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner_user_id.to_owned()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: profile_id,
+                identity_id: agent_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: "test".to_owned(),
+                provider: Some("test".to_owned()),
+                model: Some("test".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("retry-test Agent");
+        TaskRoleRepo::create(
+            db,
+            CreateTaskRole {
+                id: role_id.clone(),
+                task_id: task_id.to_owned(),
+                role: "implementer".to_owned(),
+                coordination_mode: Some(CoordinationMode::Collaborative),
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("retry-test TaskRole");
+        RoleMembershipRepo::add(
+            db,
+            CreateRoleMembership {
+                id: new_uuid_v4(),
+                task_role_id: role_id,
+                actor_kind: ActorKind::Agent,
+                actor_id: agent_id.clone(),
+                status: RoleMembershipStatus::Active,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("retry-test Agent membership");
+        sqlx::query(
+            "INSERT INTO execution (
+                 id, task_id, agent_id, role, status, created_at, updated_at,
+                 actor_kind, actor_id, purpose
+             ) VALUES (?, ?, ?, 'implementer', 'completed', ?, ?, 'agent', ?, 'implement')",
+        )
+        .bind(&execution_id)
+        .bind(task_id)
+        .bind(&agent_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("retry-test Agent Execution");
+        execution_id
     }
 
     #[tokio::test]

@@ -449,7 +449,8 @@ impl MergeService {
         push_branch(worktree_path, &source_branch).await?;
         self.ensure_current_gate_evaluation(&task_id, &evaluation)
             .await?;
-        self.validate_gate_candidate(&task_id, &evaluation, &source)
+        let source_sha = self
+            .validate_gate_candidate(&task_id, &evaluation, &source)
             .await?;
         self.ensure_ready_lifecycle_cause(&task_id, gate_evaluation_id)
             .await?;
@@ -464,9 +465,11 @@ impl MergeService {
                 &task_id,
                 &db::new_uuid_v4(),
                 gate_evaluation_id,
-                &provider_config.provider_type,
+                &provider_config,
+                &repo.remote_url,
                 &source_branch,
                 &target_branch,
+                &source_sha,
                 task_operation_file,
             )
             .await?;
@@ -491,64 +494,12 @@ impl MergeService {
             })
         }
         .await;
-        let status = merge_operation_status(&result);
-        let publication_finish = if status == db::TaskIntegrationOperationStatus::Failed {
-            let event = crate::pr_service::PrService::new(
-                Arc::clone(&self.db),
-                Arc::clone(&self.event_bus),
-            )
-            .record_publication_failure(&task_id, merge_admission.id(), publication.id())
-            .await?;
-            publication
-                .finish_with_result_event(status, Some(event.id))
-                .await
-        } else {
-            publication.finish(status).await
-        };
-        match result {
-            Ok(outcome @ MergeOutcome::PullRequest { .. }) => {
-                match publication_finish {
-                    Ok(_) => {
-                        // The durable TaskMerge admission remains running and
-                        // owns the frozen GateEvaluation while the provider
-                        // controls the open PR. Dropping the guard releases
-                        // only the short-lived local file lock.
-                        drop(merge_admission);
-                        Ok(outcome)
-                    }
-                    Err(error) => {
-                        drop(merge_admission);
-                        Err(error)
-                    }
-                }
-            }
-            Ok(outcome) => {
-                if publication_finish.is_err() {
-                    drop(merge_admission);
-                    return publication_finish.map(|_| outcome);
-                }
-                self.publish_domain_event_by_dedupe(&format!(
-                    "task-merge-terminal:{}",
-                    merge_admission.id()
-                ))
-                .await;
-                drop(merge_admission);
-                Ok(outcome)
-            }
-            Err(error) => {
-                if let Err(publication_error) = publication_finish {
-                    drop(merge_admission);
-                    return Err(publication_error);
-                }
-                self.publish_domain_event_by_dedupe(&format!(
-                    "task-merge-terminal:{}",
-                    merge_admission.id()
-                ))
-                .await;
-                drop(merge_admission);
-                Err(error)
-            }
-        }
+        // The provider result writer owns the single transaction that may
+        // finish PublishPr, TaskMerge, metadata, and lifecycle. Dropping these
+        // guards releases local locks only; an unknown outcome remains running.
+        drop(publication);
+        drop(merge_admission);
+        result
     }
 
     async fn validate_gate_candidate(
@@ -556,7 +507,7 @@ impl MergeService {
         task_id: &str,
         evaluation: &GateEvaluation,
         source: &TaskMergeSource,
-    ) -> Result<()> {
+    ) -> Result<String> {
         if evaluation.task_id != task_id || evaluation.outcome != GateEvaluationOutcome::Satisfied {
             return Err(ServiceError::Conflict(
                 "merge candidate requires the exact satisfied GateEvaluation".to_owned(),
@@ -703,7 +654,7 @@ impl MergeService {
                 "Task has a running Execution and cannot enter merge admission".to_owned(),
             ));
         }
-        Ok(())
+        Ok(candidate.commit_sha)
     }
 
     async fn ensure_current_gate_evaluation(

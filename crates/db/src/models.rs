@@ -230,9 +230,39 @@ pub struct PrMetadata {
     pub target_branch: String,
     pub pr_state: String,
     pub merge_status: String,
+    pub admission_status: String,
     pub task_merge_operation_id: Option<String>,
     pub publish_operation_id: Option<String>,
     pub last_synced_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Immutable provider, repository, branch, and commit identity captured when
+/// a remote TaskMerge is admitted. Mutable observation fields point at the
+/// exact provider result event currently attached to that admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrAdmission {
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub task_id: String,
+    pub provider_config_id: String,
+    pub provider_type: String,
+    pub provider_config_revision: String,
+    pub provider_config_digest: String,
+    pub provider_base_url: Option<String>,
+    pub token_secret_ref: Option<String>,
+    pub remote_repo_identity: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub admitted_source_sha: String,
+    pub state: String,
+    pub reconciliation_reason: Option<String>,
+    pub provider_event_id: Option<String>,
+    pub observed_head_sha: Option<String>,
+    pub merged_commit_sha: Option<String>,
+    pub result_event_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

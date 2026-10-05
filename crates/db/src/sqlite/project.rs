@@ -415,8 +415,12 @@ impl ProjectRepo for SqliteDb {
                    (SELECT id FROM task WHERE project_id = ?))",
             "DELETE FROM orchestrator_wake WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM remote_pr_admission WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM pr_metadata WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM pr_provider_config WHERE repo_id IN
+                 (SELECT id FROM repo WHERE project_id = ?)",
             "DELETE FROM task_retry_override WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_failure_retry_receipt WHERE task_id IN

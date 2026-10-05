@@ -25,7 +25,10 @@ use std::{
 // after a later lifecycle transition; V108 separates WorkUnitIntegration and
 // TaskMerge retry domains while retaining V101 merge_failed history; V109
 // durably admits PullRequest TaskMerges before provider publication; V110
-// authorizes exact, failure-kind-scoped retry exhaustion override epochs.
+// authorizes exact, failure-kind-scoped retry exhaustion override epochs; V111
+// allows independent exact overrides for every pending exhausted receipt;
+// V112 freezes remote PR subjects and result authority; V113 separates PR
+// admission provenance from historical provider outcomes.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

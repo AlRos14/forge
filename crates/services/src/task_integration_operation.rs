@@ -138,9 +138,11 @@ impl TaskIntegrationOperationManager {
         task_id: &str,
         owner_id: &str,
         gate_evaluation_id: &str,
-        provider_type: &str,
+        provider_config: &db::PrProviderConfig,
+        remote_repo_identity: &str,
         source_branch: &str,
         target_branch: &str,
+        source_sha: &str,
         file: File,
     ) -> crate::Result<(TaskIntegrationOperationGuard, TaskIntegrationOperationGuard)> {
         let now = now_rfc3339();
@@ -169,24 +171,54 @@ impl TaskIntegrationOperationManager {
         let metadata_input = db::CreatePrMetadata {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
-            provider_type: provider_type.to_owned(),
+            provider_type: provider_config.provider_type.clone(),
             provider_pr_id: None,
             pr_url: None,
             source_branch: source_branch.to_owned(),
             target_branch: target_branch.to_owned(),
             pr_state: "publishing".to_owned(),
             merge_status: "pending".to_owned(),
-            task_merge_operation_id: merge_id,
-            publish_operation_id: publish_id,
+            task_merge_operation_id: merge_id.clone(),
+            publish_operation_id: publish_id.clone(),
             last_synced_at: None,
             created_at: now.clone(),
             updated_at: now,
+        };
+        let config_digest_payload = serde_json::json!({
+            "id": provider_config.id,
+            "repo_id": provider_config.repo_id,
+            "provider_type": provider_config.provider_type,
+            "base_url": provider_config.base_url,
+            "polling_interval_seconds": provider_config.polling_interval_seconds,
+            "token_secret_ref": provider_config.token_secret_ref,
+            "updated_at": provider_config.updated_at,
+        });
+        let remote_admission = db::CreateRemotePrAdmission {
+            task_merge_operation_id: merge_id,
+            publish_operation_id: publish_id,
+            metadata_id: metadata_input.id.clone(),
+            task_id: task_id.to_owned(),
+            provider_config_id: provider_config.id.clone(),
+            provider_type: provider_config.provider_type.clone(),
+            provider_config_revision: provider_config.updated_at.clone(),
+            provider_config_digest: hex::encode(Sha256::digest(
+                config_digest_payload.to_string().as_bytes(),
+            )),
+            provider_base_url: provider_config.base_url.clone(),
+            token_secret_ref: provider_config.token_secret_ref.clone(),
+            remote_repo_identity: remote_repo_identity.to_owned(),
+            source_branch: source_branch.to_owned(),
+            target_branch: target_branch.to_owned(),
+            admitted_source_sha: source_sha.to_owned(),
+            created_at: metadata_input.created_at.clone(),
+            updated_at: metadata_input.updated_at.clone(),
         };
         let (merge, publish) = TaskIntegrationOperationRepo::begin_pull_request_publication(
             &*self.db,
             merge_input,
             publish_input,
             metadata_input,
+            remote_admission,
         )
         .await?;
         Ok((
@@ -413,8 +445,131 @@ mod tests {
         UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
     };
     use events::EventBus;
-    use std::path::Path;
+    use std::{
+        collections::VecDeque,
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct ScriptedPrProvider {
+        remote: Mutex<Option<crate::pr_service::PrRecord>>,
+        status_script: Mutex<
+            VecDeque<
+                std::result::Result<
+                    crate::pr_service::RemotePrStatus,
+                    crate::pr_service::PrProviderError,
+                >,
+            >,
+        >,
+        unknown_create_once: AtomicBool,
+        create_count: AtomicUsize,
+        find_count: AtomicUsize,
+        last_request: Mutex<Option<crate::pr_service::PrCreateRequest>>,
+        last_admission: Mutex<Option<db::RemotePrAdmission>>,
+    }
+
+    impl ScriptedPrProvider {
+        fn unknown_once() -> Self {
+            Self {
+                unknown_create_once: AtomicBool::new(true),
+                ..Self::default()
+            }
+        }
+
+        fn record(request: &crate::pr_service::PrCreateRequest) -> crate::pr_service::PrRecord {
+            crate::pr_service::PrRecord {
+                provider_pr_id: format!("provider-pr-{}", request.idempotency_key),
+                pr_url: Some(format!("{}/pull/1", request.repo_remote_url)),
+                status: crate::pr_service::RemotePrStatus::Open(crate::pr_service::PrObservation {
+                    provider_event_id: format!("created:{}", request.idempotency_key),
+                    remote_repo_identity: request.repo_remote_url.clone(),
+                    source_branch: request.source_branch.clone(),
+                    target_branch: request.target_branch.clone(),
+                    head_sha: request.source_sha.clone(),
+                    merged_commit_sha: None,
+                }),
+            }
+        }
+
+        fn push_status(
+            &self,
+            status: std::result::Result<
+                crate::pr_service::RemotePrStatus,
+                crate::pr_service::PrProviderError,
+            >,
+        ) {
+            self.status_script
+                .lock()
+                .expect("provider status lock")
+                .push_back(status);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::pr_service::PrProvider for ScriptedPrProvider {
+        async fn find_pr(
+            &self,
+            request: &crate::pr_service::PrCreateRequest,
+        ) -> std::result::Result<
+            Option<crate::pr_service::PrRecord>,
+            crate::pr_service::PrProviderError,
+        > {
+            self.find_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_request.lock().expect("request lock") = Some(request.clone());
+            Ok(self.remote.lock().expect("remote lock").clone())
+        }
+
+        async fn create_pr(
+            &self,
+            request: crate::pr_service::PrCreateRequest,
+        ) -> std::result::Result<crate::pr_service::PrRecord, crate::pr_service::PrProviderError>
+        {
+            self.create_count.fetch_add(1, Ordering::SeqCst);
+            let record = Self::record(&request);
+            *self.remote.lock().expect("remote lock") = Some(record.clone());
+            if self.unknown_create_once.swap(false, Ordering::SeqCst) {
+                return Err(crate::pr_service::PrProviderError::OutcomeUnknown(
+                    "simulated lost create response".to_owned(),
+                ));
+            }
+            Ok(record)
+        }
+
+        async fn get_pr_status(
+            &self,
+            admission: &db::RemotePrAdmission,
+            _metadata: &db::PrMetadata,
+        ) -> std::result::Result<
+            crate::pr_service::RemotePrStatus,
+            crate::pr_service::PrProviderError,
+        > {
+            *self.last_admission.lock().expect("admission lock") = Some(admission.clone());
+            self.status_script
+                .lock()
+                .expect("provider status lock")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(crate::pr_service::RemotePrStatus::Open(
+                        crate::pr_service::PrObservation {
+                            provider_event_id: format!(
+                                "open:{}",
+                                admission.task_merge_operation_id
+                            ),
+                            remote_repo_identity: admission.remote_repo_identity.clone(),
+                            source_branch: admission.source_branch.clone(),
+                            target_branch: admission.target_branch.clone(),
+                            head_sha: admission.admitted_source_sha.clone(),
+                            merged_commit_sha: None,
+                        },
+                    ))
+                })
+        }
+    }
 
     struct Fixture {
         db: Arc<SqliteDb>,
@@ -593,7 +748,7 @@ mod tests {
         .await
         .expect("repository enters pull-request mode");
         let token_env = TestTokenEnv::set();
-        PrProviderConfigRepo::create(
+        let provider_config = PrProviderConfigRepo::create(
             &*fixture.db,
             CreatePrProviderConfig {
                 id: new_uuid_v4(),
@@ -741,9 +896,11 @@ mod tests {
                 &fixture.task_id,
                 &new_uuid_v4(),
                 &evaluation.evaluation.id,
-                "github",
+                &provider_config,
+                "https://example.invalid/repo.git",
                 &format!("task/{}", &fixture.task_id[..8]),
                 "main",
+                "source-commit",
                 lock,
             )
             .await
@@ -801,6 +958,26 @@ mod tests {
         );
         assert_eq!(metadata.publish_operation_id.as_deref(), Some(publish.id()));
         metadata
+    }
+
+    async fn assert_no_terminal_pr_merge_has_pending_metadata(fixture: &Fixture) {
+        let inconsistent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM task_integration_operation merge_op
+             JOIN pr_metadata metadata
+               ON metadata.task_merge_operation_id = merge_op.id
+             WHERE merge_op.task_id = ? AND merge_op.kind = 'task_merge'
+               AND merge_op.remote_waiting = 1 AND merge_op.status != 'running'
+               AND metadata.merge_status = 'pending'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("terminal TaskMerge/PR metadata consistency query");
+        assert_eq!(
+            inconsistent, 0,
+            "atomic remote results cannot commit terminal TaskMerge with pending PR metadata"
+        );
     }
 
     #[tokio::test]
@@ -1336,6 +1513,7 @@ mod tests {
         .await
         .expect("terminal lifecycle transition count");
         assert_eq!(done_transitions, 1, "replay cannot finish lifecycle twice");
+        assert_no_terminal_pr_merge_has_pending_metadata(&fixture).await;
     }
 
     #[tokio::test]
@@ -1395,6 +1573,7 @@ mod tests {
             lifecycle.reason_ref.as_deref(),
             Some(result_event.id.as_str())
         );
+        assert_no_terminal_pr_merge_has_pending_metadata(&fixture).await;
         let terminal_event = db::DomainEventRepo::get_event_by_dedupe(
             &*fixture.db,
             &format!("task-merge-terminal:{merge_id}"),
@@ -1426,23 +1605,45 @@ mod tests {
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
         let merge_id = merge.id().to_owned();
         let publish_id = publish.id().to_owned();
-        let failure_service =
-            crate::pr_service::PrService::new(Arc::clone(&fixture.db), Arc::clone(&event_bus));
-        let failure_event = failure_service
-            .record_publication_failure(&fixture.task_id, &merge_id, publish.id())
-            .await
-            .expect("exact provider failure is durable before operation completion");
-        let replayed_failure = failure_service
-            .record_publication_failure(&fixture.task_id, &merge_id, publish.id())
-            .await
-            .expect("publication failure replay");
-        assert_eq!(failure_event.id, replayed_failure.id);
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("remote admission lookup")
+                .expect("remote admission exists");
+        let outcome = db::RecordRemotePrOutcome {
+            expected_task_id: fixture.task_id.clone(),
+            task_merge_operation_id: merge_id.clone(),
+            publish_operation_id: publish_id.clone(),
+            metadata_id: admission.metadata_id.clone(),
+            provider_config_id: admission.provider_config_id.clone(),
+            provider_config_digest: admission.provider_config_digest.clone(),
+            remote_repo_identity: admission.remote_repo_identity.clone(),
+            source_branch: admission.source_branch.clone(),
+            target_branch: admission.target_branch.clone(),
+            status: "publication_failed".to_owned(),
+            provider_event_id: None,
+            provider_pr_id: None,
+            pr_url: None,
+            observed_head_sha: None,
+            merged_commit_sha: None,
+            reconciliation_reason: Some("provider definitively rejected creation".to_owned()),
+            updated_at: now_rfc3339(),
+        };
+        let failure_event =
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(&*fixture.db, outcome.clone())
+                .await
+                .expect("exact provider failure atomically finishes the operations");
+        let failure_event = failure_event.expect("durable failure event");
+        let replayed_failure =
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(&*fixture.db, outcome)
+                .await
+                .expect("publication failure replay");
+        assert_eq!(
+            failure_event.id,
+            replayed_failure.expect("replayed event").id
+        );
         drop(merge);
         drop(publish);
-        crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
-            .reconcile_once()
-            .await
-            .expect("restart closes the exact failed publication and TaskMerge");
         let blocked = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
             .await
             .expect("failure lifecycle lookup")
@@ -1474,6 +1675,7 @@ mod tests {
             finished_publish.result_event_id.as_deref(),
             Some(failure_event.id.as_str())
         );
+        assert_no_terminal_pr_merge_has_pending_metadata(&fixture).await;
         let terminal_event = db::DomainEventRepo::get_event_by_dedupe(
             &*fixture.db,
             &format!("task-merge-terminal:{merge_id}"),
@@ -1522,64 +1724,548 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_unadmitted_pull_request_cannot_be_rebound_under_a_new_gate() {
+    async fn remote_pr_lost_response_and_provider_outage_recover_same_frozen_admission() {
         let temp = TempDir::new().expect("temporary directory");
-        let db_fixture = fixture("sqlite::memory:", temp.path()).await;
+        let database_url = format!("sqlite://{}", temp.path().join("pr-unknown.db").display());
+        let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
         let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
-            prepare_pr_admission(&db_fixture, temp.path(), Arc::clone(&event_bus)).await;
-        let metadata = create_test_pr_metadata(&db_fixture, &merge, &publish, "open").await;
-        PrMetadataRepo::update(
-            &*db_fixture.db,
-            db::UpdatePrMetadata {
-                id: metadata.id.clone(),
-                provider_type: None,
-                provider_pr_id: None,
-                pr_url: None,
-                source_branch: None,
-                target_branch: None,
-                pr_state: None,
-                merge_status: Some("legacy_unadmitted".to_owned()),
-                task_merge_operation_id: None,
-                publish_operation_id: None,
-                last_synced_at: None,
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("frozen admission lookup")
+                .expect("frozen admission exists");
+        drop(publish);
+        drop(merge);
+
+        // Current repo/provider configuration is mutable. Reconciliation must
+        // continue addressing the exact identity recorded at admission.
+        sqlx::query("UPDATE repo SET remote_url = 'https://drift.invalid/other.git' WHERE id = ?")
+            .bind(&fixture.repo_id)
+            .execute(fixture.db.pool())
+            .await
+            .expect("simulate repo remote drift");
+        sqlx::query(
+            "UPDATE pr_provider_config
+             SET provider_type = 'gitlab', base_url = 'https://drift.invalid',
+                 token_secret_ref = 'MISSING_ROTATED_SECRET'
+             WHERE repo_id = ?",
+        )
+        .bind(&fixture.repo_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("simulate provider configuration drift");
+
+        let provider = Arc::new(ScriptedPrProvider::unknown_once());
+        let reconciler = crate::pr_service::PrReconciler::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+            None,
+        )
+        .with_provider_for_test(provider.clone());
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("lost create response remains a live reconciliation obligation");
+        let after_lost_response =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission remains");
+        assert_eq!(after_lost_response.state, "reconciliation_required");
+        assert_eq!(
+            after_lost_response.remote_repo_identity,
+            admission.remote_repo_identity
+        );
+        assert_eq!(
+            after_lost_response.provider_config_digest,
+            admission.provider_config_digest
+        );
+        assert_eq!(provider.create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+                .await
+                .expect("TaskMerge lookup")
+                .expect("TaskMerge exists")
+                .status,
+            TaskIntegrationOperationStatus::Running
+        );
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &publish_id)
+                .await
+                .expect("PublishPr lookup")
+                .expect("PublishPr exists")
+                .status,
+            TaskIntegrationOperationStatus::Running
+        );
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("metadata lookup")
+            .expect("metadata exists");
+        assert_eq!(metadata.merge_status, "pending");
+        assert_eq!(metadata.admission_status, "reconciliation_required");
+
+        // The provider created the PR but lost its response. find_pr adopts it
+        // under the same idempotency key, so no second create occurs.
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("provider lookup adopts the already-created PR");
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("metadata lookup")
+            .expect("metadata exists");
+        assert_eq!(metadata.admission_status, "open");
+        assert_eq!(metadata.pr_state, "open");
+        assert_eq!(
+            metadata.task_merge_operation_id.as_deref(),
+            Some(merge_id.as_str())
+        );
+        assert_eq!(
+            metadata.publish_operation_id.as_deref(),
+            Some(publish_id.as_str())
+        );
+        assert_eq!(provider.create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.find_count.load(Ordering::SeqCst), 2);
+        let frozen_request = provider
+            .last_request
+            .lock()
+            .expect("request lock")
+            .clone()
+            .expect("provider lookup request");
+        assert_eq!(
+            frozen_request.repo_remote_url,
+            admission.remote_repo_identity
+        );
+        assert_eq!(frozen_request.source_sha, admission.admitted_source_sha);
+        assert_eq!(frozen_request.idempotency_key, merge_id);
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &publish_id)
+                .await
+                .expect("PublishPr lookup")
+                .expect("PublishPr exists")
+                .status,
+            TaskIntegrationOperationStatus::Succeeded
+        );
+
+        provider.push_status(Err(crate::pr_service::PrProviderError::Unavailable(
+            "temporary frozen provider endpoint outage".to_owned(),
+        )));
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("provider outage does not finish TaskMerge");
+        let unavailable =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission remains");
+        assert_eq!(unavailable.state, "reconciliation_required");
+        assert_eq!(
+            unavailable.remote_repo_identity,
+            admission.remote_repo_identity
+        );
+        assert_eq!(unavailable.provider_config_id, admission.provider_config_id);
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+                .await
+                .expect("TaskMerge lookup")
+                .expect("TaskMerge exists")
+                .status,
+            TaskIntegrationOperationStatus::Running
+        );
+        assert_eq!(
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("lifecycle lookup")
+                .expect("lifecycle exists")
+                .state,
+            db::TaskLifecycleState::Merging
+        );
+        let retries_during_outage: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_failure_retry_receipt WHERE task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("provider outage retry receipt count");
+        assert_eq!(retries_during_outage, 0);
+
+        provider.push_status(Ok(crate::pr_service::RemotePrStatus::Merged(
+            crate::pr_service::PrObservation {
+                provider_event_id: "provider-merge-result-1".to_owned(),
+                remote_repo_identity: admission.remote_repo_identity.clone(),
+                source_branch: admission.source_branch.clone(),
+                target_branch: admission.target_branch.clone(),
+                head_sha: admission.admitted_source_sha.clone(),
+                merged_commit_sha: Some("provider-created-merge-commit".to_owned()),
+            },
+        )));
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("provider availability and exact merge result finish the admission");
+        let finished = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge exists");
+        assert_eq!(finished.status, TaskIntegrationOperationStatus::Succeeded);
+        let final_admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission remains historical");
+        assert_eq!(final_admission.state, "merged");
+        assert_eq!(
+            final_admission.observed_head_sha.as_deref(),
+            Some(admission.admitted_source_sha.as_str())
+        );
+        assert_eq!(
+            final_admission.merged_commit_sha.as_deref(),
+            Some("provider-created-merge-commit")
+        );
+        let final_metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("metadata lookup")
+            .expect("metadata exists");
+        assert_eq!(final_metadata.merge_status, "merged");
+        assert_eq!(final_metadata.admission_status, "merged");
+        assert_ne!(
+            final_admission.merged_commit_sha.as_deref(),
+            final_admission.observed_head_sha.as_deref()
+        );
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Done);
+        let replay = TaskIntegrationOperationRepo::record_remote_pr_outcome(
+            &*fixture.db,
+            db::RecordRemotePrOutcome {
+                expected_task_id: fixture.task_id.clone(),
+                task_merge_operation_id: merge_id.clone(),
+                publish_operation_id: publish_id.clone(),
+                metadata_id: final_admission.metadata_id.clone(),
+                provider_config_id: final_admission.provider_config_id.clone(),
+                provider_config_digest: final_admission.provider_config_digest.clone(),
+                remote_repo_identity: final_admission.remote_repo_identity.clone(),
+                source_branch: final_admission.source_branch.clone(),
+                target_branch: final_admission.target_branch.clone(),
+                status: "merged".to_owned(),
+                provider_event_id: Some("provider-merge-result-1".to_owned()),
+                provider_pr_id: final_metadata.provider_pr_id.clone(),
+                pr_url: final_metadata.pr_url.clone(),
+                observed_head_sha: Some(final_admission.admitted_source_sha.clone()),
+                merged_commit_sha: Some("provider-created-merge-commit".to_owned()),
+                reconciliation_reason: None,
                 updated_at: now_rfc3339(),
             },
         )
         .await
-        .expect("legacy provider metadata state persists");
-
-        let task = TaskRepo::get_by_id(&*db_fixture.db, &db_fixture.task_id, false)
-            .await
-            .expect("Task lookup")
-            .expect("Task exists");
-        let repo = RepoRepo::get_by_id(&*db_fixture.db, &db_fixture.repo_id)
-            .await
-            .expect("Repo lookup")
-            .expect("Repo exists");
-        let error = match crate::pr_service::PrService::new(
-            Arc::clone(&db_fixture.db),
-            Arc::clone(&event_bus),
-        )
-        .publish_pr(&task, &repo, "task/legacy", "main")
-        .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("a pre-V109 PR must not be rebound to a later Gate"),
+        .expect("duplicate provider callback replays exact durable result")
+        .expect("replayed provider event exists");
+        assert_eq!(
+            replay.id,
+            finished
+                .result_event_id
+                .as_deref()
+                .expect("TaskMerge result event")
+        );
+        let conflicting_same_event_id = db::RecordRemotePrOutcome {
+            expected_task_id: fixture.task_id.clone(),
+            task_merge_operation_id: merge_id.clone(),
+            publish_operation_id: publish_id.clone(),
+            metadata_id: final_admission.metadata_id.clone(),
+            provider_config_id: final_admission.provider_config_id.clone(),
+            provider_config_digest: final_admission.provider_config_digest.clone(),
+            remote_repo_identity: final_admission.remote_repo_identity.clone(),
+            source_branch: final_admission.source_branch.clone(),
+            target_branch: final_admission.target_branch.clone(),
+            status: "merged".to_owned(),
+            provider_event_id: Some("provider-merge-result-1".to_owned()),
+            provider_pr_id: final_metadata.provider_pr_id.clone(),
+            pr_url: final_metadata.pr_url.clone(),
+            observed_head_sha: Some(final_admission.admitted_source_sha.clone()),
+            merged_commit_sha: Some("conflicting-merge-commit".to_owned()),
+            reconciliation_reason: None,
+            updated_at: now_rfc3339(),
         };
-        assert!(error
-            .to_string()
-            .contains("legacy PR has no durable TaskMerge admission"));
-
-        let metadata = PrMetadataRepo::get_by_task_id(&*db_fixture.db, &db_fixture.task_id)
+        assert!(
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(
+                &*fixture.db,
+                conflicting_same_event_id,
+            )
             .await
-            .expect("PR metadata lookup")
-            .expect("legacy PR metadata remains visible");
-        assert_eq!(metadata.merge_status, "legacy_unadmitted");
+            .is_err(),
+            "provider event identity cannot replay a conflicting result payload"
+        );
+        let transitions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND cause_ref = ? AND to_state = 'done'",
+        )
+        .bind(&fixture.task_id)
+        .bind(&merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("exact terminal transition count");
+        assert_eq!(transitions, 1);
+    }
+
+    #[tokio::test]
+    async fn remote_pr_persistence_failure_replays_find_and_never_opens_a_second_admission() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!(
+            "sqlite://{}",
+            temp.path().join("pr-persist-fail.db").display()
+        );
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        drop(publish);
+        drop(merge);
+        let provider = Arc::new(ScriptedPrProvider::default());
+        let reconciler = crate::pr_service::PrReconciler::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+            None,
+        )
+        .with_provider_for_test(provider.clone());
+        sqlx::query(
+            "CREATE TRIGGER test_fail_pr_result_persistence
+             BEFORE UPDATE ON pr_metadata
+             WHEN NEW.provider_pr_id IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'simulated local PR metadata write failure'); END",
+        )
+        .execute(fixture.db.pool())
+        .await
+        .expect("install deterministic persistence fault");
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("reconciler retains the admission after local result write failure");
+        let pending =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission remains");
+        assert_eq!(pending.state, "admitted");
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("metadata lookup")
+            .expect("metadata remains");
+        assert_eq!(metadata.provider_pr_id, None);
+        assert_eq!(metadata.merge_status, "pending");
+        assert_eq!(provider.create_count.load(Ordering::SeqCst), 1);
+        sqlx::query("DROP TRIGGER test_fail_pr_result_persistence")
+            .execute(fixture.db.pool())
+            .await
+            .expect("remove persistence fault");
+
+        reconciler
+            .reconcile_once()
+            .await
+            .expect("restart finds and adopts the remote PR under the same admission");
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("metadata lookup")
+            .expect("metadata remains");
+        assert_eq!(metadata.pr_state, "open");
         assert_eq!(
             metadata.task_merge_operation_id.as_deref(),
-            Some(merge.id())
+            Some(merge_id.as_str())
         );
-        assert_eq!(metadata.publish_operation_id.as_deref(), Some(publish.id()));
+        assert_eq!(
+            metadata.publish_operation_id.as_deref(),
+            Some(publish_id.as_str())
+        );
+        assert_eq!(provider.create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.find_count.load(Ordering::SeqCst), 2);
+        let admissions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_integration_operation
+             WHERE task_id = ? AND kind = 'task_merge'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("TaskMerge admission count");
+        assert_eq!(admissions, 1);
+    }
+
+    #[tokio::test]
+    async fn remote_merge_with_force_pushed_head_is_blocked_and_conflicting_result_rejected() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_url = format!(
+            "sqlite://{}",
+            temp.path().join("pr-head-mismatch.db").display()
+        );
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus)).await;
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission exists");
+        let exact_scope = db::RecordRemotePrOutcome {
+            expected_task_id: fixture.task_id.clone(),
+            task_merge_operation_id: merge_id.clone(),
+            publish_operation_id: publish_id.clone(),
+            metadata_id: admission.metadata_id.clone(),
+            provider_config_id: admission.provider_config_id.clone(),
+            provider_config_digest: admission.provider_config_digest.clone(),
+            remote_repo_identity: admission.remote_repo_identity.clone(),
+            source_branch: admission.source_branch.clone(),
+            target_branch: admission.target_branch.clone(),
+            status: "reconciliation_required".to_owned(),
+            provider_event_id: None,
+            provider_pr_id: None,
+            pr_url: None,
+            observed_head_sha: None,
+            merged_commit_sha: None,
+            reconciliation_reason: Some("scope rejection probe".to_owned()),
+            updated_at: now_rfc3339(),
+        };
+        let mut wrong_task = exact_scope.clone();
+        wrong_task.expected_task_id = "another-task".to_owned();
+        assert!(
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(&*fixture.db, wrong_task,)
+                .await
+                .is_err()
+        );
+        let mut wrong_pr = exact_scope.clone();
+        wrong_pr.metadata_id = "another-pr".to_owned();
+        assert!(
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(&*fixture.db, wrong_pr,)
+                .await
+                .is_err()
+        );
+        let mut wrong_operation = exact_scope.clone();
+        wrong_operation.publish_operation_id = "another-publish-operation".to_owned();
+        assert!(TaskIntegrationOperationRepo::record_remote_pr_outcome(
+            &*fixture.db,
+            wrong_operation,
+        )
+        .await
+        .is_err());
+        let mut wrong_repo = exact_scope;
+        wrong_repo.remote_repo_identity = "https://drift.invalid/repo.git".to_owned();
+        assert!(
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(&*fixture.db, wrong_repo,)
+                .await
+                .is_err()
+        );
+        let _metadata = create_test_pr_metadata(&fixture, &merge, &publish, "open").await;
+        publish
+            .finish(TaskIntegrationOperationStatus::Succeeded)
+            .await
+            .expect("publication succeeds");
+        drop(merge);
+        let provider = Arc::new(ScriptedPrProvider::default());
+        provider.push_status(Ok(crate::pr_service::RemotePrStatus::Merged(
+            crate::pr_service::PrObservation {
+                provider_event_id: "provider-merged-wrong-head".to_owned(),
+                remote_repo_identity: admission.remote_repo_identity.clone(),
+                source_branch: admission.source_branch.clone(),
+                target_branch: admission.target_branch.clone(),
+                head_sha: "force-pushed-sha-B".to_owned(),
+                merged_commit_sha: Some("wrong-head-merge-commit".to_owned()),
+            },
+        )));
+        crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .with_provider_for_test(provider)
+            .reconcile_once()
+            .await
+            .expect("mismatched provider head is a terminal fail-closed result");
+
+        let finished = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, &merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge exists");
+        assert_eq!(finished.status, TaskIntegrationOperationStatus::Failed);
+        let final_admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission history remains");
+        assert_eq!(final_admission.state, "head_mismatch");
+        assert_eq!(
+            final_admission.observed_head_sha.as_deref(),
+            Some("force-pushed-sha-B")
+        );
+        let metadata = PrMetadataRepo::get_by_task_id(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("metadata lookup")
+            .expect("metadata remains");
+        assert_eq!(metadata.merge_status, "head_mismatch");
+        assert_eq!(metadata.admission_status, "failed");
+        assert_eq!(
+            db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("lifecycle lookup")
+                .expect("lifecycle exists")
+                .state,
+            db::TaskLifecycleState::Blocked
+        );
+        assert_no_terminal_pr_merge_has_pending_metadata(&fixture).await;
+
+        let conflicting = db::RecordRemotePrOutcome {
+            expected_task_id: fixture.task_id.clone(),
+            task_merge_operation_id: merge_id.clone(),
+            publish_operation_id: publish_id,
+            metadata_id: final_admission.metadata_id.clone(),
+            provider_config_id: final_admission.provider_config_id.clone(),
+            provider_config_digest: final_admission.provider_config_digest.clone(),
+            remote_repo_identity: final_admission.remote_repo_identity.clone(),
+            source_branch: final_admission.source_branch.clone(),
+            target_branch: final_admission.target_branch.clone(),
+            status: "closed".to_owned(),
+            provider_event_id: Some("conflicting-closed-callback".to_owned()),
+            provider_pr_id: metadata.provider_pr_id,
+            pr_url: metadata.pr_url,
+            observed_head_sha: Some("force-pushed-sha-B".to_owned()),
+            merged_commit_sha: None,
+            reconciliation_reason: None,
+            updated_at: now_rfc3339(),
+        };
+        assert!(
+            TaskIntegrationOperationRepo::record_remote_pr_outcome(&*fixture.db, conflicting,)
+                .await
+                .is_err()
+        );
+        let task_merge_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition
+             WHERE task_id = ? AND cause_ref = ? AND to_state IN ('done', 'blocked')",
+        )
+        .bind(&fixture.task_id)
+        .bind(&merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("terminal transition count");
+        assert_eq!(
+            task_merge_events, 1,
+            "conflicting callback cannot retarget lifecycle"
+        );
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("Task project lookup");
+        ProjectRepo::delete(&*fixture.db, &project_id)
+            .await
+            .expect("guarded Project teardown cascades remote admission history");
+        let remaining_remote_admissions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_admission")
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("remote admission teardown count");
+        assert_eq!(remaining_remote_admissions, 0);
     }
 }

@@ -858,7 +858,19 @@ pub trait TaskIntegrationOperationRepo: Send + Sync {
         merge: CreateTaskIntegrationOperation,
         publish: CreateTaskIntegrationOperation,
         metadata: CreatePrMetadata,
+        remote_admission: CreateRemotePrAdmission,
     ) -> Result<(TaskIntegrationOperation, TaskIntegrationOperation)>;
+    async fn get_remote_pr_admission(
+        &self,
+        task_merge_operation_id: &str,
+    ) -> Result<Option<RemotePrAdmission>>;
+    /// Persist a provider observation and its metadata, operation, and
+    /// lifecycle effects in one SQLite transaction. Reconciliation-required
+    /// outcomes only update the durable admission state.
+    async fn record_remote_pr_outcome(
+        &self,
+        input: RecordRemotePrOutcome,
+    ) -> Result<Option<DomainEvent>>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<TaskIntegrationOperation>>;
     /// Called only while holding the Task's OS operation lock. It marks the
     /// current process-dead `running` row abandoned without starting a new
@@ -1905,6 +1917,49 @@ pub struct CreatePrMetadata {
     pub publish_operation_id: String,
     pub last_synced_at: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRemotePrAdmission {
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub task_id: String,
+    pub provider_config_id: String,
+    pub provider_type: String,
+    pub provider_config_revision: String,
+    pub provider_config_digest: String,
+    pub provider_base_url: Option<String>,
+    pub token_secret_ref: Option<String>,
+    pub remote_repo_identity: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub admitted_source_sha: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordRemotePrOutcome {
+    pub expected_task_id: String,
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub provider_config_id: String,
+    pub provider_config_digest: String,
+    pub remote_repo_identity: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    /// open, merged, closed, head_mismatch, publication_failed, or
+    /// reconciliation_required.
+    pub status: String,
+    pub provider_event_id: Option<String>,
+    pub provider_pr_id: Option<String>,
+    pub pr_url: Option<String>,
+    pub observed_head_sha: Option<String>,
+    pub merged_commit_sha: Option<String>,
+    pub reconciliation_reason: Option<String>,
     pub updated_at: String,
 }
 
