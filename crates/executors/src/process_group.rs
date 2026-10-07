@@ -9,9 +9,9 @@ use tokio::process::{Child, Command};
 ///
 /// On Unix this stores the dedicated PGID separately because command-group's
 /// cached leader status does not report whether orphaned group descendants are
-/// still present. On other platforms command-group supplies its Job Object
-/// boundary, but its public API cannot verify that the whole job has exited;
-/// termination therefore fails closed there.
+/// still present. On non-Unix platforms, Forge cannot currently verify that
+/// every process in the execution boundary has exited, so production CLI
+/// HarnessAdapter launch fails closed before spawning.
 pub struct ProcessGroupChild {
     child: AsyncGroupChild,
     #[cfg(unix)]
@@ -48,7 +48,7 @@ impl ProcessGroupChild {
             let _ = command;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "remote harness execution requires verified Unix process-group retirement",
+                "production CLI HarnessAdapter execution requires a verified Unix process-group boundary",
             ))
         }
     }
@@ -139,7 +139,7 @@ impl ProcessGroupChild {
             let _ = self.child.wait().await?;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "the command-group Job Object API cannot verify that every job member exited",
+                "complete non-Unix process-boundary termination cannot be verified",
             ))
         }
     }

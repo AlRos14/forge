@@ -8,11 +8,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- Remote harness execution now fails closed before spawning on non-Unix hosts.
-  Unix executions use an execution-owned process group and successful
-  generation retirement verifies that the group is gone. Windows Job Object
-  termination remains unavailable until Forge can verify that every job member
-  has exited.
+- Production CLI HarnessAdapter execution that uses the shared process-group
+  boundary fails closed before spawning on non-Unix hosts, for both local and
+  remote execution paths. Unix executions use an execution-owned process group
+  and successful retirement verifies that the group is gone. This applies to
+  CLI harness execution using this boundary, not every Forge execution path.
 
 - Plan PR10 removes the Forge-owned Agent Host and keeps Main/Project Agent
   Chat messages, turn jobs, binding/profile provenance, and history durable.

@@ -622,9 +622,9 @@ pub fn build_ordered_fallback_routing(
             .ok_or_else(|| {
                 ExecutorError::Other(format!("fallbacks[{index}] is missing executor_type"))
             })?;
-        let kind = executor_type.parse::<ExecutorKind>().map_err(|_| {
+        let kind = executor_type.parse::<ExecutorKind>().map_err(|error| {
             ExecutorError::Other(format!(
-                "fallbacks[{index}] names unknown executor type: {executor_type}"
+                "fallbacks[{index}] has invalid executor type `{executor_type}`: {error}"
             ))
         })?;
         let raw_config = object
@@ -913,7 +913,7 @@ mod tests {
             &[serde_json::json!({"executor_type": "warp", "config": {}})],
         )
         .expect_err("unknown type rejects");
-        assert!(unknown.to_string().contains("unknown executor type"));
+        assert!(unknown.to_string().contains("unknown executor kind: warp"));
 
         let non_object = build_ordered_fallback_routing(
             ExecutorKind::Smith,

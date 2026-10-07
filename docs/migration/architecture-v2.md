@@ -611,25 +611,26 @@ launched through its `DaemonRuntime`, `FallbackExecutor`, and adapter process
 maps. When dispatch ends because the socket is lost or the daemon is shutting
 down, that runtime closes Start admission, cancels its active tasks through
 the same executor and adapters, and waits for bounded task termination before
-reconnect. On Unix, each remote harness Execution starts in a dedicated
-process group whose ID is retained only by that generation's in-memory adapter
+reconnect. On Unix, each production CLI HarnessAdapter Execution starts in a
+dedicated process group whose ID is retained only by its in-memory adapter
 handle. Successful adapter cancellation sends SIGKILL to that group, reaps the
 leader, and waits until the group no longer exists; a cached leader exit is not
-evidence that descendants have exited. Therefore successful Unix generation
-retirement proves that no process in those Execution groups can continue work.
-Drop guards send a last-resort group signal but do not prove termination. If a
-task must be aborted, or process termination cannot be verified, retirement
-fails closed. On non-Unix hosts the current command-group API creates a Windows
-Job Object but does not expose a reliable active-member check, so remote harness
-launch fails before spawning until Forge can verify that the Job Object is
-empty. No Windows process-tree retirement guarantee is claimed. The connect
-loop returns teardown failure to
-the daemon supervisor, which stops reporting readiness, shuts down the daemon,
-and does not create a replacement generation. A replacement connection for
-the same daemon ID starts with a new runtime and never adopts old process
-handles. If the old socket is already gone, its final log or terminal
-notification may be lost; daemon reports and the existing recovery path
-reconcile durable Execution state.
+evidence that descendants have exited. Therefore successful retirement proves
+that no process in those Execution groups can continue work. Drop guards send a
+last-resort group signal but do not prove termination. If a task must be
+aborted, or process termination cannot be verified, retirement fails closed.
+The same adapter process boundary is used by local and remote HarnessAdapter
+execution. On non-Unix hosts, production CLI HarnessAdapter launch fails before
+spawning because Forge cannot verify complete process-tree retirement through
+the available process-boundary API. This restriction applies to those adapter
+paths and does not make every Forge execution path Unix-only; it remains until
+Forge can prove that all execution members have exited. The remote connect loop
+returns teardown failure to the daemon supervisor, which stops reporting
+readiness, shuts down the daemon, and does not create a replacement generation.
+A replacement connection for the same daemon ID starts with a new runtime and
+never adopts old process handles. If the old socket is already gone, its final
+log or terminal notification may be lost; daemon reports and the existing
+recovery path reconcile durable Execution state.
 
 An Execution's `credential_ref` is immutable invocation identity. Credential
 resolution may verify current Agent ownership and credential status, but it
