@@ -95,6 +95,438 @@ fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+struct RoutingTestEventHandler;
+
+#[async_trait::async_trait]
+impl crate::daemon_transport::DaemonExecutionEventHandler for RoutingTestEventHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+fn routing_test_registry() -> Arc<crate::daemon_transport::DaemonConnectionRegistry> {
+    Arc::new(crate::daemon_transport::DaemonConnectionRegistry::new(
+        Arc::new(EventBus::new(16)),
+        Arc::new(RoutingTestEventHandler),
+    ))
+}
+
+async fn add_remote_executor_daemon(db: &db::SqliteDb, machine_id: &str) -> String {
+    let now = now_rfc3339();
+    let daemon_id = db::new_uuid_v4();
+    db::DaemonRepo::upsert_by_machine_id(
+        db,
+        db::UpsertDaemon {
+            id: daemon_id.clone(),
+            machine_id: machine_id.to_owned(),
+            hostname: machine_id.to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: None,
+            labels_json: "{}".to_owned(),
+            status: db::DaemonStatus::Online,
+            registration_token_hash: None,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("additional daemon creates");
+    db::DaemonRepo::update_report(
+        db,
+        db::UpdateDaemonReport {
+            id: daemon_id.clone(),
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            status: db::DaemonStatus::Online,
+            last_report_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("additional daemon reports shell adapter");
+    daemon_id
+}
+
+async fn change_agent_daemon(
+    db: &db::SqliteDb,
+    agent_id: &str,
+    daemon_id: Option<&str>,
+) -> db::Agent {
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    AgentRepo::update(
+        db,
+        db::UpdateAgent {
+            id: agent.id.clone(),
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(daemon_id.map(ToOwned::to_owned)),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Agent daemon binding updates")
+}
+
+fn register_routing_test_daemon(
+    registry: &crate::daemon_transport::DaemonConnectionRegistry,
+    daemon_id: &str,
+) -> tokio::sync::mpsc::Receiver<api_types::DaemonFrame> {
+    let (connection, outbound) =
+        crate::daemon_transport::DaemonConnection::new(daemon_id.to_owned());
+    registry.register(daemon_id.to_owned(), connection);
+    outbound
+}
+
+async fn answer_routing_test_daemon(
+    registry: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    daemon_id: String,
+    mut outbound: tokio::sync::mpsc::Receiver<api_types::DaemonFrame>,
+    wait: std::time::Duration,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut methods = Vec::new();
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, outbound.recv()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) | Err(_) => break,
+        };
+        let api_types::DaemonFrame::Request { id, method, params } = frame else {
+            continue;
+        };
+        methods.push(method.clone());
+        let result = match method.as_str() {
+            api_types::METHOD_PROTOCOL_CAPABILITIES => serde_json::json!({
+                "schema_version": 1,
+                "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+            }),
+            api_types::METHOD_EXECUTION_START => serde_json::json!({
+                "execution_id": params["execution_id"],
+                "accepted": true
+            }),
+            api_types::METHOD_EXECUTION_CANCEL => serde_json::json!({
+                "execution_id": params["execution_id"],
+                "cancelled": true
+            }),
+            _ => serde_json::json!({}),
+        };
+        registry.dispatch_incoming(&daemon_id, api_types::DaemonFrame::Response { id, result });
+        if method == api_types::METHOD_EXECUTION_START
+            || method == api_types::METHOD_EXECUTION_CANCEL
+        {
+            break;
+        }
+    }
+    methods
+}
+
+#[tokio::test]
+async fn start_execution_uses_frozen_daemon_after_agent_is_rebound() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let agent_at_admission = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let daemon_a = agent_at_admission
+        .daemon_id
+        .clone()
+        .expect("initial daemon binding");
+    let daemon_b = add_remote_executor_daemon(&db, "frozen-host-replacement").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let registry = routing_test_registry();
+    let _outbound_a = register_routing_test_daemon(&registry, &daemon_a);
+    let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_daemon_connections(Arc::clone(&registry));
+
+    let snapshot = crate::task_service::config::build_executor_config_snapshot(
+        &db,
+        &task,
+        &agent_at_admission,
+        None,
+        None,
+    )
+    .await
+    .expect("Execution snapshot builds")
+    .expect("Agent snapshot exists");
+    let snapshot_value: Value = serde_json::from_str(&snapshot).expect("snapshot parses");
+    assert_eq!(snapshot_value["resolved_daemon_id"], daemon_a);
+    let (execution, _workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("frozen host start".to_owned()),
+        Some(snapshot),
+    )
+    .await;
+    change_agent_daemon(&db, &agent_id, Some(&daemon_b)).await;
+    registry.unregister(&daemon_a);
+    let outbound_a = register_routing_test_daemon(&registry, &daemon_a);
+
+    let responder_a = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_a.clone(),
+        outbound_a,
+        std::time::Duration::from_secs(2),
+    ));
+    let responder_b = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_b,
+        outbound_b,
+        std::time::Duration::from_millis(150),
+    ));
+    let result = service
+        .start_execution(execution.id)
+        .await
+        .expect("Start dispatches through the admitted daemon");
+    assert!(result.accepted);
+    assert_eq!(
+        responder_a.await.expect("daemon A responder joins"),
+        vec![
+            api_types::METHOD_PROTOCOL_CAPABILITIES,
+            api_types::METHOD_EXECUTION_START
+        ]
+    );
+    assert!(
+        responder_b
+            .await
+            .expect("daemon B observer joins")
+            .is_empty(),
+        "mutable Agent daemon B received no Execution request"
+    );
+}
+
+#[tokio::test]
+async fn unpinned_start_fails_closed_when_frozen_daemon_disappears() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let daemon_a = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists")
+        .daemon_id
+        .expect("initial daemon binding");
+    change_agent_daemon(&db, &agent_id, None).await;
+    let daemon_b = add_remote_executor_daemon(&db, "unpinned-host-fallback").await;
+    sqlx::query("UPDATE daemon SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&daemon_a)
+        .execute(db.pool())
+        .await
+        .expect("daemon A is first for admission");
+    sqlx::query("UPDATE daemon SET created_at = '2001-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&daemon_b)
+        .execute(db.pool())
+        .await
+        .expect("daemon B follows daemon A");
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let registry = routing_test_registry();
+    let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_daemon_connections(Arc::clone(&registry));
+    let agent_at_admission = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("unpinned Agent loads")
+        .expect("unpinned Agent exists");
+    let snapshot = crate::task_service::config::build_executor_config_snapshot(
+        &db,
+        &task,
+        &agent_at_admission,
+        None,
+        None,
+    )
+    .await
+    .expect("Execution snapshot builds")
+    .expect("Agent snapshot exists");
+    let snapshot_value: Value = serde_json::from_str(&snapshot).expect("snapshot parses");
+    assert_eq!(snapshot_value["resolved_daemon_id"], daemon_a);
+    assert!(snapshot_value["agent_daemon_id"].is_null());
+    let (execution, _workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("frozen unpinned host start".to_owned()),
+        Some(snapshot),
+    )
+    .await;
+
+    let daemon_a_row = db::DaemonRepo::get_by_id(&*db, &daemon_a)
+        .await
+        .expect("daemon A loads")
+        .expect("daemon A exists");
+    db::DaemonRepo::update_report(
+        &*db,
+        db::UpdateDaemonReport {
+            id: daemon_a.clone(),
+            detected_clis_json: daemon_a_row.detected_clis_json,
+            labels_json: None,
+            status: db::DaemonStatus::Offline,
+            last_report_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("daemon A goes offline after admission");
+    let current_agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("current Agent loads")
+        .expect("current Agent exists");
+    assert_eq!(
+        crate::agent_service::resolve_daemon_for_agent(&db, &current_agent)
+            .await
+            .expect("current unpinned resolver now selects B")
+            .id,
+        daemon_b
+    );
+
+    let responder_b = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_b,
+        outbound_b,
+        std::time::Duration::from_millis(150),
+    ));
+    let error = service
+        .start_execution(execution.id)
+        .await
+        .expect_err("unavailable frozen daemon fails closed");
+    assert!(matches!(
+        error,
+        ServiceError::DaemonUnavailable { daemon_id } if daemon_id == daemon_a
+    ));
+    assert!(
+        responder_b
+            .await
+            .expect("daemon B observer joins")
+            .is_empty(),
+        "daemon B was not selected as an implicit replacement"
+    );
+}
+
+#[tokio::test]
+async fn cancel_execution_uses_frozen_daemon_after_agent_is_rebound() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let daemon_a = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists")
+        .daemon_id
+        .expect("initial daemon binding");
+    let daemon_b = add_remote_executor_daemon(&db, "cancel-host-replacement").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let registry = routing_test_registry();
+    let outbound_a = register_routing_test_daemon(&registry, &daemon_a);
+    let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_daemon_connections(Arc::clone(&registry));
+    let agent_at_admission = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let snapshot = crate::task_service::config::build_executor_config_snapshot(
+        &db,
+        &task,
+        &agent_at_admission,
+        None,
+        None,
+    )
+    .await
+    .expect("Execution snapshot builds")
+    .expect("Agent snapshot exists");
+    let (execution, _workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("frozen host cancel".to_owned()),
+        Some(snapshot),
+    )
+    .await;
+    change_agent_daemon(&db, &agent_id, Some(&daemon_b)).await;
+
+    let responder_a = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_a,
+        outbound_a,
+        std::time::Duration::from_secs(2),
+    ));
+    let responder_b = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_b,
+        outbound_b,
+        std::time::Duration::from_millis(150),
+    ));
+    service
+        .cancel_execution_with_provider(&execution, "test cancellation")
+        .await
+        .expect("Cancel is sent through the admitted daemon");
+    assert_eq!(
+        responder_a.await.expect("daemon A responder joins"),
+        vec![api_types::METHOD_EXECUTION_CANCEL]
+    );
+    assert!(
+        responder_b
+            .await
+            .expect("daemon B observer joins")
+            .is_empty(),
+        "mutable Agent daemon B received no Cancel request"
+    );
+}
+
 async fn create_claimed_review_execution(
     db: &db::SqliteDb,
     event_bus: Arc<EventBus>,

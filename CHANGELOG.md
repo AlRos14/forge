@@ -8,6 +8,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Plan PR10 removes the Forge-owned Agent Host and keeps Main/Project Agent
+  Chat messages, turn jobs, binding/profile provenance, and history durable.
+  Current production HarnessAdapters cannot prove a no-filesystem boundary,
+  so Agent Chat model invocation and native typed Forge operations fail closed
+  until PR11 retires or migrates those verticals. Task Executions now keep the
+  daemon selected at admission for Start, Resume, Cancel, and recovery; a
+  missing frozen host fails closed rather than routing through a changed
+  Agent binding. Execution credentials remain snapshot-bound, local-only for
+  secret injection, and fail closed for remote credential-backed Start.
+
 - Task progress is now owned by the aggregate `task_lifecycle` record. Legacy
   `task.status` is a one-way compatibility projection; old workflow states,
   gates, hooks, and reviewer verdicts cannot advance lifecycle. Existing rows

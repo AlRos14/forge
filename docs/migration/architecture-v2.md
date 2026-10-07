@@ -583,7 +583,7 @@ fallback is authorized by Plan PR0.
 | Plan PR7 | Plan Execution and plan Artifact | Canonical plan revisions, planner retry/prompt machinery | Artifact authoritative; remove old plan APIs/persistence in Plan PR13 |
 | Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence | ReviewRunner, special review rows, FORGE_RESULT-centric flow | Generic review/validation authoritative; remove special runtime in Plan PR13 |
 | Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | New lifecycle authoritative; remove workflow tables/branches in Plan PR13 |
-| Plan PR10 | External harness cognition, immutable credential identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat uses the exact durable job profile and requires the adapter to report `permission_policy=deny` and `isolation_posture=no-filesystem`; current adapters do not prove this, so they are rejected. |
+| Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task dispatch and cancellation use the Execution snapshot's exact `resolved_daemon_id`; a missing host fails closed. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat storage and provenance remain readable, but every current production adapter fails closed because none proves `permission_policy=deny` and `isolation_posture=no-filesystem`. PR11 owns vertical retirement or migration. |
 | Plan PR11 | Project/Repo/Task plus generic collaboration | Main/Project Agent and Project OS verticals | Remove old services/tables after migration fixtures |
 | Plan PR12 | Public surfaces over target domain | Old API/MCP/CLI/UI endpoints | Remove obsolete endpoints and UI |
 | Plan PR13 | Destructive persistence cleanup | None if preconditions hold | Drop old schema and compatibility code |
@@ -594,7 +594,17 @@ Plan PRs are not combined merely because adjacent code is convenient to edit.
 A later Plan PR may be blocked or reordered only by a concrete repository dependency
 that is documented and reviewed.
 
-### PR10 Agent Chat and credential boundary
+### PR10 Execution identity and Agent Chat transition
+
+At admission, Forge may resolve an Agent's current daemon binding or select an
+available daemon for an unpinned Agent. The resulting daemon ID is stored as
+`resolved_daemon_id` in that Execution's immutable config snapshot. Later
+Start, Resume, Cancel, graceful shutdown, and same-attempt recovery route
+through that ID; they do not inspect the current Agent daemon binding or choose from current daemon
+availability order. A host that is missing, malformed, or unavailable causes
+a closed failure. Reconnecting the same logical daemon remains valid under
+PR3's connection-generation checks. The daemon ID identifies the host chosen
+for an Execution; it is separate from a socket connection generation.
 
 An Execution's `credential_ref` is immutable invocation identity. Credential
 resolution may verify current Agent ownership and credential status, but it
@@ -604,24 +614,28 @@ generic daemon Start payload does not carry raw credentials; a remote
 credential-backed Execution is rejected until a protocol can establish the
 same credential identity at the daemon.
 
-Agent Chat has no Task Workspace. A temporary working directory and prompt
-instructions do not establish filesystem isolation. Its server-owned deny
-marker is admitted only when the concrete HarnessAdapter reports both
-`permission_policy=deny` and `isolation_posture=no-filesystem`, with no
-workspace root, custom command override, scoped tools, or MCP servers. The
-current Codex, Claude Code, Cursor, Gemini, OpenCode, and Smith adapters do not
-provide that posture; Agent Chat invocation therefore fails closed for those
-profiles until a supported process boundary exists.
+Agent Chat persistence is retained: immutable messages, durable turn jobs,
+binding/profile provenance, operating-context provenance, retry outcomes, and
+historical reads remain available. A Main or Project Chat job does not imply a
+model call. Agent Chat has no Task Workspace, and a temporary working
+directory or prompt instructions do not establish filesystem isolation. Its
+server-owned deny marker is admitted only when the concrete HarnessAdapter
+reports both `permission_policy=deny` and `isolation_posture=no-filesystem`,
+with no workspace root, custom command override, scoped tools, or MCP
+servers. The current production adapter registry cannot prove this posture,
+so productive Main/Project Agent Chat model invocation fails closed.
 
-The generic MCP endpoint is not an Agent Chat tool channel: it uses an
-authenticated user and optional Project scope, while the CLI turn runner does
-not bind that endpoint to the durable job, profile, or Main/Project binding.
-The current descriptor set has generic Project/Task/chat/handoff operations,
-but no Main Product Genesis Charter approval protocol and no full Project
-document, decision, baseline, milestone, evidence, or readiness operation set.
-Do not recreate the removed native tool catalog in PR10. PR11 owns migration of
-these vertical operations to generic collaboration and artifact capabilities;
-until then, Agent Chat cannot claim those operations were performed.
+No native typed Forge operations or scoped native tool catalog are available
+through these jobs. The generic MCP endpoint is not an Agent Chat tool channel:
+it uses an authenticated user and optional Project scope, while the CLI turn
+runner does not bind that endpoint to the durable job, profile, or
+Main/Project binding. Its descriptor set has generic Project/Task/chat/handoff
+operations, but no Main Product Genesis Charter approval protocol and no full
+Project document, decision, baseline, milestone, evidence, or readiness
+operation set. PR10 does not rebuild the removed tool catalog or add
+sandbox/process-isolation infrastructure. PR11 owns retirement or migration
+of Main Agent, Project Agent, and Project OS vertical operations; until then,
+Agent Chat cannot claim those operations were performed.
 
 ## Documentation acceptance questions
 

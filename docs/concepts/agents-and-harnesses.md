@@ -131,3 +131,24 @@ Credential storage, environment injection, daemon lifecycle, usage snapshots,
 quota, cooldown, and failover remain platform infrastructure. Failover may
 select another Agent only when that fact is explicit in Execution history; it
 must not impersonate the original Agent or mutate its identity.
+
+## Frozen Execution host (Plan PR10)
+
+Admission may resolve an Agent's pinned daemon or select an available daemon
+for an unpinned Agent. The Execution snapshot stores that exact host as
+`resolved_daemon_id`. Start, Resume, Cancel, graceful shutdown, and recovery
+for that Execution use the stored ID. Changes to the Agent's current daemon
+binding or daemon availability cannot silently move the Execution to another host. A missing or
+invalid host fails closed. Reconnecting the same daemon is allowed and remains
+subject to PR3's connection-generation checks.
+
+## Agent Chat transition (Plan PR10)
+
+Agent Chat messages, durable turn jobs, binding/profile provenance,
+operating-context provenance, retry state, and historical reads remain
+available. Current production HarnessAdapters cannot prove a real
+no-filesystem posture, so Main and Project Agent Chat jobs fail closed before
+model invocation. Prompt text and a temporary directory do not establish that
+boundary. The removed native typed Forge tool catalog is not available through
+Chat. PR11 owns retirement or migration of Main Agent, Project Agent, and
+Project OS.

@@ -3,8 +3,8 @@
 //! Chat jobs intentionally do not share the Task worker's workspace contract.
 //! The worker claims one FIFO job per responder/scope, renews an expiring
 //! lease while the backend is running, and commits the response through the
-//! atomic Agent Chat service composite.  A failed adapter call is persisted on
-//! the job with a bounded error and a finite retry budget.
+//! atomic Agent Chat service composite. A failed admission or adapter call is
+//! persisted on the job with a bounded error and a finite retry budget.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -3701,18 +3701,21 @@ mod tests {
             self.kind.clone()
         }
 
+        fn normalize_config(
+            &self,
+            config: &Value,
+            overrides: &executors::ExecutionOverrides,
+        ) -> std::result::Result<Value, executors::ExecutorError> {
+            cli_adapters::default_registry()
+                .get(&self.kind)
+                .expect("recording adapter kind is registered in production")
+                .normalize_config(config, overrides)
+        }
+
         fn interpret_execution_policy(
             &self,
             config: &Value,
         ) -> executors::HarnessPolicyInterpretation {
-            if config.get("permission_policy").and_then(Value::as_str) == Some("deny")
-                && config.get("sandbox").and_then(Value::as_str) == Some("no-filesystem")
-            {
-                return executors::HarnessPolicyInterpretation {
-                    permission_policy: "deny".to_owned(),
-                    isolation_posture: "no-filesystem".to_owned(),
-                };
-            }
             cli_adapters::default_registry()
                 .get(&self.kind)
                 .map(|adapter| adapter.interpret_execution_policy(config))
@@ -3752,6 +3755,52 @@ mod tests {
                 .lock()
                 .expect("cancellation log lock")
                 .push(execution_id.to_owned());
+            Ok(())
+        }
+    }
+
+    struct GenericNoWorkspaceContractAdapter;
+
+    #[async_trait]
+    impl executors::HarnessAdapter for GenericNoWorkspaceContractAdapter {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Codex
+        }
+
+        fn interpret_execution_policy(
+            &self,
+            _config: &Value,
+        ) -> executors::HarnessPolicyInterpretation {
+            // Generic contract fixture only. This declaration is not evidence
+            // that any production adapter provides filesystem isolation.
+            executors::HarnessPolicyInterpretation {
+                permission_policy: "deny".to_owned(),
+                isolation_posture: "no-filesystem".to_owned(),
+            }
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: executors::DiscoverContext,
+        ) -> std::result::Result<executors::DiscoveredOptions, executors::ExecutorError> {
+            Ok(executors::DiscoveredOptions::default())
+        }
+
+        async fn execute(
+            &self,
+            _ctx: ExecutionContext,
+        ) -> std::result::Result<ExecutionResult, executors::ExecutorError> {
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                assistant_output: Some("generic contract accepted".to_owned()),
+                ..Default::default()
+            })
+        }
+
+        async fn cancel(
+            &self,
+            _execution_id: &str,
+        ) -> std::result::Result<(), executors::ExecutorError> {
             Ok(())
         }
     }
@@ -3883,6 +3932,83 @@ mod tests {
             .await
             .expect("chat turn admitted");
         (db, event_bus, admitted.turn_job, identity_id, profile_id)
+    }
+
+    #[tokio::test]
+    async fn generic_no_workspace_contract_accepts_adapter_declared_posture() {
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(GenericNoWorkspaceContractAdapter));
+        let executor = executors::AdapterExecutor::new(Arc::new(registry));
+        let mut agent_config = serde_json::json!({
+            "executor_type": "codex",
+            "config": {}
+        });
+        executors::mark_workspace_access_denied(&mut agent_config);
+        let result = executor
+            .execute(ExecutionContext {
+                task_id: "contract-task".to_owned(),
+                execution_id: "contract-execution".to_owned(),
+                role: "interactive".to_owned(),
+                worktree_path: String::new(),
+                description: "generic contract fixture".to_owned(),
+                agent_config,
+                invocation: executors::HarnessInvocation::Start,
+                logs_path: "/tmp/generic-no-workspace-contract.jsonl".to_owned(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await
+            .expect("generic fence accepts an adapter declaring the required posture");
+        assert_eq!(
+            result.assistant_output.as_deref(),
+            Some("generic contract accepted")
+        );
+    }
+
+    #[test]
+    fn production_adapter_registry_does_not_prove_agent_chat_no_workspace() {
+        let registry = cli_adapters::default_registry();
+        let kinds = registry.kinds();
+        assert!(
+            !kinds.is_empty(),
+            "built-in production registry is populated"
+        );
+        let claimed_no_workspace_config = serde_json::json!({
+            "permission_policy": "deny",
+            "sandbox": "no-filesystem"
+        });
+
+        for kind in kinds {
+            let adapter = registry.get(&kind).expect("registered kind has adapter");
+            match adapter.normalize_config(
+                &claimed_no_workspace_config,
+                &executors::ExecutionOverrides::default(),
+            ) {
+                Err(_) => {
+                    // Unsupported config fails closed before adapter execution.
+                }
+                Ok(config) => {
+                    let interpretation = adapter.interpret_execution_policy(&config);
+                    let policy = executors::effective_policy::from_adapter_interpretation(
+                        &kind,
+                        &interpretation,
+                        None,
+                        None,
+                        &config,
+                    );
+                    assert!(
+                        executors::effective_policy::validate_agent_chat_no_workspace_policy(
+                            &kind,
+                            &policy,
+                            &config,
+                        )
+                        .is_err(),
+                        "production adapter {kind} accepted string configuration as a no-filesystem proof"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4731,61 +4857,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_chat_turn_uses_the_profile_harness_and_no_agent_session() {
+    async fn main_chat_turn_keeps_durable_provenance_and_fails_closed_for_production_adapter() {
         let (db, event_bus, admitted, identity_id, profile_id) =
             setup_main_chat("cli", "codex", None, None).await;
-        let executions = Arc::new(Mutex::new(Vec::new()));
-        let alternate_executions = Arc::new(Mutex::new(Vec::new()));
-        let cancellations = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = executors::HarnessAdapterRegistry::new();
-        registry.register(Box::new(RecordingChatHarnessAdapter {
-            kind: ExecutorKind::Codex,
-            executions: Arc::clone(&executions),
-            cancellations: Arc::clone(&cancellations),
-        }));
-        registry.register(Box::new(RecordingChatHarnessAdapter {
-            kind: ExecutorKind::ClaudeCode,
-            executions: Arc::clone(&alternate_executions),
-            cancellations: Arc::new(Mutex::new(Vec::new())),
-        }));
-        let task_executor: Arc<dyn TaskExecutor> =
-            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let task_executor: Arc<dyn TaskExecutor> = Arc::new(executors::AdapterExecutor::new(
+            Arc::new(cli_adapters::default_registry()),
+        ));
         let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
 
-        assert_eq!(worker.run_once().await.expect("worker runs once"), 1);
-        let completed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
             .await
             .expect("job query succeeds")
             .expect("turn job exists");
-        assert_eq!(completed.status, db::AgentChatTurnState::Succeeded);
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
         assert_eq!(
-            completed.responder_identity_id.as_deref(),
+            failed.responder_identity_id.as_deref(),
             Some(identity_id.as_str())
         );
-        assert_eq!(completed.profile_id.as_deref(), Some(profile_id.as_str()));
-        let response_id = completed
-            .response_message_id
-            .expect("successful chat has a response message");
-        let response = AgentChatMessageRepo::get_agent_chat_message(&*db, &response_id)
-            .await
-            .expect("response query succeeds")
-            .expect("response message exists");
-        assert_eq!(response.content, "external harness response");
-        assert!(response.session_id.is_none());
-        assert!(response.context_manifest_id.is_some());
-
-        let manifest_session: Option<String> =
-            sqlx::query_scalar("SELECT agent_session_id FROM context_manifest WHERE id = ?")
-                .bind(
-                    response
-                        .context_manifest_id
-                        .as_deref()
-                        .expect("context manifest"),
-                )
-                .fetch_one(db.pool())
-                .await
-                .expect("manifest is queryable");
-        assert!(manifest_session.is_none());
+        assert_eq!(failed.profile_id.as_deref(), Some(profile_id.as_str()));
+        assert!(failed.response_message_id.is_none());
+        assert!(failed.error_message.is_some());
         let session_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_session WHERE identity_id = ?")
                 .bind(&identity_id)
@@ -4793,25 +4885,6 @@ mod tests {
                 .await
                 .expect("AgentSession table is queryable");
         assert_eq!(session_count, 0);
-
-        let executions = executions.lock().expect("execution log lock");
-        assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].task_id, admitted.chat_id);
-        assert_eq!(executions[0].execution_id, admitted.id);
-        assert_eq!(
-            executions[0].invocation,
-            executors::HarnessInvocation::Start
-        );
-        assert_eq!(executions[0].agent_config["model"], "profile-model");
-        assert_eq!(executions[0].agent_config["permission_policy"], "deny");
-        assert_eq!(executions[0].agent_config["sandbox"], "no-filesystem");
-        assert!(executions[0]
-            .description
-            .contains("SERVER-OWNED OPERATING INSTRUCTION"));
-        assert!(alternate_executions
-            .lock()
-            .expect("alternate execution log lock")
-            .is_empty());
     }
 
     #[tokio::test]
@@ -4888,8 +4961,13 @@ mod tests {
     #[tokio::test]
     async fn agent_chat_uses_the_job_profile_credential_after_current_profile_changes() {
         let secret_a = "durable-profile-credential-a";
-        let (db, event_bus, admitted, identity_id, profile_a_id) =
-            setup_main_chat("cli", "codex", Some(secret_a), None).await;
+        let (db, event_bus, admitted, identity_id, profile_a_id) = setup_main_chat(
+            "cli",
+            "codex",
+            Some(secret_a),
+            Some(("plan", r#"{"model":"profile-model","sandbox":"read-only"}"#)),
+        )
+        .await;
         let credentials = Arc::new(CredentialService::new(
             Arc::clone(&db),
             b"agent-chat-credential-test-key",
@@ -4985,24 +5063,19 @@ mod tests {
             Some(Arc::clone(&credentials)),
         );
 
-        assert_eq!(worker.run_once().await.expect("worker runs once"), 1);
-        let completed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
             .await
             .expect("job query succeeds")
             .expect("job exists");
-        assert_eq!(completed.status, db::AgentChatTurnState::Succeeded);
-        assert_eq!(completed.profile_id.as_deref(), Some(profile_a_id.as_str()));
-        let executions = executions.lock().expect("execution log lock");
-        assert_eq!(executions.len(), 1);
-        assert_eq!(
-            executions[0].agent_config["env"]["OPENAI_API_KEY"],
-            secret_a
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert_eq!(failed.profile_id.as_deref(), Some(profile_a_id.as_str()));
+        assert_ne!(
+            failed.error_code.as_deref(),
+            Some("credential_unavailable"),
+            "the revoked current-profile credential B was not selected for the durable job"
         );
-        assert!(!executions[0].description.contains(secret_a));
-        assert!(!executions[0]
-            .agent_config
-            .to_string()
-            .contains("current-profile-credential-b"));
+        assert!(executions.lock().expect("execution log lock").is_empty());
     }
 
     #[tokio::test]

@@ -482,7 +482,7 @@ The migration is one reviewed Plan PR at a time:
 | Plan PR7 | Harness-native planning Executions and plan Artifacts |
 | Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence |
 | Plan PR9 | Aggregate Task lifecycle and simplified gates/scheduler |
-| Plan PR10 | Remove agent-host and embedded cognition; Execution credential identity is snapshot-bound and local-only; remote credential-backed dispatch fails closed without exact-identity support. Agent Chat requires an adapter-proven no-filesystem policy; current CLI adapters do not provide one. |
+| Plan PR10 | Remove agent-host and embedded cognition; Execution credential and resolved daemon identities are snapshot-bound; remote credential-backed dispatch fails closed without exact-identity support. Agent Chat persistence and provenance remain readable, while current production adapters fail closed before model invocation because they cannot prove no-filesystem isolation. PR11 owns vertical retirement or migration. |
 | Plan PR11 | Retirement of Main Agent/Project Agent/Project OS verticals |
 | Plan PR12 | REST, MCP, CLI, web, and event surface alignment |
 | Plan PR13 | Legacy persistence and compatibility cleanup |

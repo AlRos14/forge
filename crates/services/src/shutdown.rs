@@ -1,5 +1,5 @@
-use crate::{recovery::cancel_running_executions, Result};
-use db::{ResumePolicy, SqliteDb, StopReason};
+use crate::{recovery::cancel_running_executions, Result, TaskService};
+use db::{ExecutionRepo, ResumePolicy, SqliteDb, StopReason};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use std::{
@@ -20,6 +20,7 @@ pub struct GracefulShutdown {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
+    task_service: Option<Arc<TaskService>>,
 }
 
 impl GracefulShutdown {
@@ -29,11 +30,17 @@ impl GracefulShutdown {
             db,
             event_bus,
             task_executor: None,
+            task_service: None,
         }
     }
 
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {
         self.task_executor = Some(task_executor);
+        self
+    }
+
+    pub fn with_task_service(mut self, task_service: Arc<TaskService>) -> Self {
+        self.task_service = Some(task_service);
         self
     }
 
@@ -94,9 +101,9 @@ impl GracefulShutdown {
     }
 
     async fn cancel_executor_processes_for_task(&self, task_id: &str) -> Result<()> {
-        let Some(task_executor) = self.task_executor.as_ref() else {
+        if self.task_executor.is_none() && self.task_service.is_none() {
             return Ok(());
-        };
+        }
         let rows = sqlx::query("SELECT id FROM execution WHERE task_id = ? AND status = 'running'")
             .bind(task_id)
             .fetch_all(self.db.pool())
@@ -105,12 +112,24 @@ impl GracefulShutdown {
             use sqlx::Row;
 
             let execution_id: String = row.get("id");
-            if let Err(error) = task_executor.cancel(&execution_id).await {
+            let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? else {
+                continue;
+            };
+            if let Err(error) = crate::recovery::cancel_execution_on_frozen_host(
+                &self.db,
+                &execution,
+                "graceful shutdown",
+                None,
+                self.task_service.as_deref(),
+                self.task_executor.as_deref(),
+            )
+            .await
+            {
                 tracing::warn!(
                     task_id = %task_id,
                     execution_id = %execution_id,
                     %error,
-                    "executor cancellation failed during graceful shutdown"
+                    "execution cancellation failed on its admitted daemon during graceful shutdown"
                 );
             }
         }
@@ -148,7 +167,7 @@ mod tests {
         create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
         CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask, DaemonRepo,
         DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskStatus,
-        UpdateProject, UpsertDaemon,
+        UpdateAgent, UpdateProject, UpsertDaemon,
     };
     use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
     use std::sync::Mutex;
@@ -242,7 +261,7 @@ mod tests {
             db,
             UpsertDaemon {
                 id: daemon_id.clone(),
-                machine_id: format!("machine-{daemon_id}"),
+                machine_id: crate::embedded_daemon::embedded_machine_id(),
                 hostname: "test-host".to_owned(),
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
@@ -335,6 +354,11 @@ mod tests {
         agent_session_id: Option<String>,
     ) -> db::Execution {
         let now = now_rfc3339();
+        let agent = AgentRepo::get_by_id(db, &agent_id)
+            .await
+            .expect("agent loads")
+            .expect("agent exists");
+        let resolved_daemon_id = agent.daemon_id.clone().expect("agent daemon binding");
         ExecutionRepo::create(
             db,
             CreateExecution {
@@ -360,7 +384,14 @@ mod tests {
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json: Some(
-                    r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                    serde_json::json!({
+                        "agent_id": agent.id,
+                        "agent_daemon_id": agent.daemon_id,
+                        "resolved_daemon_id": resolved_daemon_id,
+                        "executor_type": "shell",
+                        "config": {}
+                    })
+                    .to_string(),
                 ),
                 workspace_id: None,
                 created_at: now.clone(),
@@ -444,6 +475,148 @@ mod tests {
                 .expect("cancelled lock")
                 .as_slice(),
             &[execution.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_remote_execution_on_frozen_daemon_after_agent_rebind() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let agent_id = seed_agent(&db).await;
+        let agent = AgentRepo::get_by_id(&*db, &agent_id)
+            .await
+            .expect("Agent loads")
+            .expect("Agent exists");
+        let daemon_a = agent.daemon_id.clone().expect("daemon A is bound");
+        sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+            .bind("shutdown-frozen-host-a")
+            .bind(&daemon_a)
+            .execute(db.pool())
+            .await
+            .expect("daemon A becomes remote");
+
+        let now = now_rfc3339();
+        let daemon_b = new_uuid_v4();
+        DaemonRepo::upsert_by_machine_id(
+            &*db,
+            UpsertDaemon {
+                id: daemon_b.clone(),
+                machine_id: "shutdown-current-host-b".to_owned(),
+                hostname: "remote-b".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: None,
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: None,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("daemon B creates");
+        let task_id = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task_id, agent_id.clone(), None).await;
+        let current_agent = AgentRepo::get_by_id(&*db, &agent_id)
+            .await
+            .expect("current Agent loads")
+            .expect("current Agent exists");
+        AgentRepo::update(
+            &*db,
+            UpdateAgent {
+                id: current_agent.id,
+                expected_version: current_agent.version,
+                name: None,
+                description: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: None,
+                config_json: None,
+                daemon_id: Some(Some(daemon_b.clone())),
+                max_concurrent_tasks: None,
+                heartbeat_interval_seconds: None,
+                max_missed_heartbeats: None,
+                status: None,
+                last_heartbeat_at: None,
+                is_default: None,
+                paused: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("current Agent rebinds to daemon B");
+
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection_a, mut outbound_a) =
+            crate::daemon_transport::DaemonConnection::new(daemon_a.clone());
+        registry.register(daemon_a.clone(), connection_a);
+        let (connection_b, mut outbound_b) =
+            crate::daemon_transport::DaemonConnection::new(daemon_b.clone());
+        registry.register(daemon_b.clone(), connection_b);
+        let dispatcher_a = Arc::clone(&registry);
+        let execution_id = execution.id.clone();
+        let responder_a = tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, params } = outbound_a
+                .recv()
+                .await
+                .expect("daemon A gets shutdown cancel")
+            else {
+                panic!("expected cancel request");
+            };
+            assert_eq!(method, api_types::METHOD_EXECUTION_CANCEL);
+            assert_eq!(params["execution_id"], execution_id);
+            dispatcher_a.dispatch_incoming(
+                &daemon_a,
+                api_types::DaemonFrame::Response {
+                    id,
+                    result: serde_json::json!({
+                        "execution_id": execution_id,
+                        "cancelled": true
+                    }),
+                },
+            );
+        });
+        let responder_b = tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_millis(150), outbound_b.recv()).await {
+                Err(_) => {}
+                Ok(None) => {}
+                Ok(Some(frame)) => panic!("mutable daemon B received a frame: {frame:?}"),
+            }
+        });
+        let local_executor = Arc::new(RecordingCancelExecutor::default());
+        let task_service = Arc::new(
+            crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+                .with_daemon_connections(registry),
+        );
+
+        GracefulShutdown::new(Arc::clone(&db), event_bus)
+            .with_task_executor(local_executor.clone())
+            .with_task_service(task_service)
+            .shutdown()
+            .await
+            .expect("shutdown succeeds");
+        responder_a.await.expect("daemon A responder joins");
+        responder_b.await.expect("daemon B observer joins");
+        assert!(
+            local_executor
+                .cancelled
+                .lock()
+                .expect("local cancellation log lock")
+                .is_empty(),
+            "remote Execution is not cancelled through the local executor"
         );
     }
 

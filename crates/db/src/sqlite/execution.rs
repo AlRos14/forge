@@ -699,9 +699,11 @@ impl ExecutionRepo for SqliteDb {
         let rows = if exclude_ids.is_empty() {
             sqlx::query(
                 "SELECT e.* FROM execution e
-                 INNER JOIN agent_current a ON a.id = e.agent_id
                  WHERE e.status = 'running'
-                   AND a.daemon_id = ?
+                   AND CASE
+                         WHEN json_valid(e.executor_config_snapshot_json)
+                         THEN json_extract(e.executor_config_snapshot_json, '$.resolved_daemon_id')
+                       END = ?
                    AND e.created_at < ?
                  ORDER BY e.created_at ASC, e.id ASC",
             )
@@ -717,9 +719,11 @@ impl ExecutionRepo for SqliteDb {
                 .join(", ");
             let query = format!(
                 "SELECT e.* FROM execution e
-                 INNER JOIN agent_current a ON a.id = e.agent_id
                  WHERE e.status = 'running'
-                   AND a.daemon_id = ?
+                   AND CASE
+                         WHEN json_valid(e.executor_config_snapshot_json)
+                         THEN json_extract(e.executor_config_snapshot_json, '$.resolved_daemon_id')
+                       END = ?
                    AND e.created_at < ?
                    AND e.id NOT IN ({placeholders})
                  ORDER BY e.created_at ASC, e.id ASC"

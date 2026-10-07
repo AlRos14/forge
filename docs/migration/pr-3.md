@@ -219,6 +219,14 @@ evidence and is rechecked by the current adapter at invocation time. Unknown
 or unsupported historical evidence fails closed except for the narrow PR2
 compatibility case above.
 
+Plan PR10 freezes transport host identity at Execution admission. The
+snapshot's `resolved_daemon_id` selects the host for later Start, Resume,
+Cancel, graceful shutdown, and same-attempt recovery. Current Agent daemon
+bindings and availability order cannot select a replacement. Missing or
+malformed host identity fails closed. A connection-generation change for the same daemon is
+still handled by the existing PR3 transport fence and does not change the
+Execution's selected host.
+
 The same generic invocation and resolved candidate/capability data cross
 `ExecutionStartParams` to the daemon. Every remote execution negotiates
 `generic_harness_invocation_v1` through `daemon.protocol_capabilities` before

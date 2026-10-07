@@ -179,14 +179,6 @@ impl TaskService {
             return Err(error);
         }
         let result = async {
-            let agent = match execution.agent_id.as_deref() {
-                Some(agent_id) => Some(
-                    AgentRepo::get_by_id(&*self.db, agent_id)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
-                ),
-                None => None,
-            };
             if execution.role == crate::workflow::default_roles::REVIEWER
                 && execution.purpose == Some(ExecutionPurpose::Review)
             {
@@ -194,9 +186,7 @@ impl TaskService {
                     .await?;
             }
             let execution = self.freeze_review_subject_and_inputs(execution).await?;
-            let provider = self
-                .execution_provider_for_agent(agent.as_ref(), &execution.id)
-                .await?;
+            let provider = self.execution_provider_for_execution(&execution).await?;
             let params = self.execution_start_params(&execution).await?;
             if snapshot_credential_ref(&params.executor_config)?.is_some() {
                 ensure_snapshot_credential_transport(provider.as_ref(), &params.executor_config)?;
@@ -1222,22 +1212,12 @@ impl TaskService {
 }
 
 impl TaskService {
-    pub(in crate::task_service) async fn cancel_execution_with_provider(
+    pub(crate) async fn cancel_execution_with_provider(
         &self,
         execution: &Execution,
         reason: &str,
     ) -> Result<()> {
-        let agent = match execution.agent_id.as_deref() {
-            Some(agent_id) => Some(
-                AgentRepo::get_by_id(&*self.db, agent_id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
-            ),
-            None => None,
-        };
-        let provider = self
-            .execution_provider_for_agent(agent.as_ref(), &execution.id)
-            .await?;
+        let provider = self.execution_provider_for_execution(execution).await?;
         provider
             .cancel(api_types::ExecutionCancelParams {
                 execution_id: execution.id.clone(),
@@ -1247,27 +1227,37 @@ impl TaskService {
         Ok(())
     }
 
-    async fn execution_provider_for_agent(
+    async fn execution_provider_for_execution(
         &self,
-        agent: Option<&Agent>,
-        execution_id: &str,
+        execution: &Execution,
     ) -> Result<Arc<dyn crate::daemon_transport::ExecutionProvider>> {
-        let daemon_id = agent.and_then(|agent| agent.daemon_id.as_deref());
+        let daemon_id =
+            crate::daemon_transport::router::resolved_daemon_id_for_execution(execution)?;
         if let Some(registry) = self.daemon_connections.as_ref() {
             return crate::daemon_transport::select_execution_provider(
-                daemon_id, &self.db, registry,
+                Some(&daemon_id),
+                &self.db,
+                registry,
             )
             .await
             .inspect_err(|error| {
                 if let ServiceError::DaemonUnavailable { daemon_id } = error {
                     tracing::warn!(
-                        execution_id = %execution_id,
+                        execution_id = %execution.id,
                         daemon_id = %daemon_id,
-                        agent_id = ?agent.map(|agent| agent.id.as_str()),
                         "remote daemon unavailable for execution dispatch"
                     );
                 }
             });
+        }
+
+        let daemon = db::DaemonRepo::get_by_id(&*self.db, &daemon_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.clone()))?;
+        if daemon.status != db::DaemonStatus::Online
+            || !crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
+        {
+            return Err(ServiceError::DaemonUnavailable { daemon_id });
         }
 
         let task_executor = self.task_executor.clone().ok_or_else(|| {

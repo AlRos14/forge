@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use db::{DaemonRepo, SqliteDb};
+use db::{DaemonRepo, Execution, SqliteDb};
+use serde_json::Value;
 
 use crate::daemon_transport::providers::{ExecutionProvider, FilesystemProvider};
 use crate::daemon_transport::{
@@ -8,6 +9,35 @@ use crate::daemon_transport::{
     RemoteFilesystemProvider,
 };
 use crate::ServiceError;
+
+/// Read the daemon identity selected when an Execution was admitted. Existing
+/// Executions never fall back to the Agent's mutable daemon binding because
+/// that can route an attempt to another host or native account.
+pub(crate) fn resolved_daemon_id_for_execution(
+    execution: &Execution,
+) -> Result<String, ServiceError> {
+    let snapshot = execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("execution has no frozen daemon routing snapshot")
+        })?;
+    let snapshot = serde_json::from_str::<Value>(snapshot).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "execution daemon routing snapshot is invalid: {error}"
+        ))
+    })?;
+    snapshot
+        .get("resolved_daemon_id")
+        .and_then(Value::as_str)
+        .filter(|daemon_id| !daemon_id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "execution snapshot has no valid resolved_daemon_id; refusing to select a replacement host",
+            )
+        })
+}
 
 pub async fn select_filesystem_provider(
     daemon_id: &str,

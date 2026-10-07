@@ -299,7 +299,8 @@ async fn main() {
     // 6. Install graceful shutdown
     let shutdown = Arc::new(
         services::GracefulShutdown::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
-            .with_task_executor(Arc::clone(&state.task_executor)),
+            .with_task_executor(Arc::clone(&state.task_executor))
+            .with_task_service(Arc::clone(&state.task_service)),
     );
     let server_shutdown_signal = state.shutdown_signal.clone();
     let shutdown_clone = Arc::clone(&shutdown);

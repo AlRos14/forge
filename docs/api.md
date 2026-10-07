@@ -779,26 +779,35 @@ message with a non-success turn is never rendered as a completed exchange.
 Cancellation is allowed only for an authorized non-terminal turn and requires
 its current optimistic version plus an idempotency key; stale or terminal
 requests return a conflict instead of rewriting the durable outcome.
-CLI-backed assistant output is bounded to 500 Unicode characters before it is
-admitted to the immutable message, semantic-memory, FTS, and subsequent prompt
-history surfaces.
+Assistant output is bounded to 500 Unicode characters before admission to the
+immutable message, semantic-memory, FTS, and subsequent prompt-history
+surfaces.
 
-Main Agent tools are limited to discovery, configured web search, Project
+**Plan PR10 transition:** message admission, immutable history, durable turn
+jobs, profile/binding provenance, retry state, and historical reads remain.
+The current production HarnessAdapter registry cannot prove a no-filesystem
+boundary, so Main and Project Agent Chat jobs fail closed before model
+invocation. The role-scoped Main/Project operations described below are not
+available through these Chat turns during this transition. Task Workers and
+reviewers continue through the existing Task assignment, workflow, Workspace,
+validation, review, and delivery path. PR11 owns Main/Project vertical
+retirement or migration.
+
+The Main Agent's intended scope is discovery, configured web search, Project
 lifecycle/organization, bounded portfolio summaries, and explicit handoff. A
-Project Agent may create and manage Tasks only in its bound Project through
-`TaskService`; neither Main nor Project Agent Chat receives repository access.
-Task Workers and reviewers continue through the existing Task assignment,
-workflow, Workspace, validation, review, and delivery path.
+Project Agent's intended scope is Task management only in its bound Project
+through `TaskService`. Neither role grants repository access through Chat.
+Under PR10 these role descriptions do not imply an operational Agent Chat
+model or Forge tool channel.
 
-When configured, both Main and Project Agent native Chat sessions receive the
-read-only `forge_public_web_search` tool. It is scope-derived (Main account or
-the authenticated Project binding), accepts only a bounded query and result
-limit, and returns at most ten `{url,title,snippet,retrieved_at}` records plus
-untrusted-content metadata. The endpoint is public HTTPS and unauthenticated;
-Forge sends no cookies or credentials. Search results do not create an
-`AgentAction`, persist a decision, or imply user approval. The tool is absent
-when `public_search.endpoint` is not configured, and `web.search` is rejected
-as a proposal operation.
+The public search endpoint remains unauthenticated HTTPS and sends no cookies
+or credentials. Its bounded result contract returns at most ten
+`{url,title,snippet,retrieved_at}` records plus untrusted-content metadata.
+It is not connected to the current Main or Project Agent Chat turn worker:
+those jobs fail closed before model invocation, and no native typed Chat tool
+catalog is available under PR10. Search results do not create an `AgentAction`,
+persist a decision, or imply user approval. PR11 owns migration of the
+vertical Chat tool surfaces.
 
 ### Main-to-Project handoff
 
