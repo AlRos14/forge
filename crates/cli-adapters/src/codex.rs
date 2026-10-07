@@ -530,12 +530,12 @@ impl HarnessAdapter for CodexAdapter {
             )
             .await;
 
-        self.remove_process(&ctx.execution_id)?;
         {
             let mut guard = child.lock().await;
             cleanup_child(&mut guard).await;
         }
         cleanup_guard.disarm();
+        self.remove_process(&ctx.execution_id)?;
 
         result
     }
