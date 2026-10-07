@@ -2837,7 +2837,7 @@ fn build_cli_prompt(
         ));
     }
     sections.push(
-        "This is an Agent Chat turn with no Task Workspace authority. Do not read or modify repositories or files. Planning and scope-authorized typed proposals are not Workspace access: a Project Agent may still propose Tasks for its own Project when that scoped tool is available, while a Main Agent may not. Never claim a mutation occurred unless a tool result confirms it."
+        "This external Agent Chat turn has no Forge typed tool channel. It cannot create or change Forge records or advance Main or Project workflows. Never claim those actions occurred; if the user requests one, explain that the action is unavailable in this turn and direct them to the supported Forge UI/API flow. This turn also has no Task Workspace authority: do not read or modify repositories or files."
             .to_owned(),
     );
     sections.push("Authorized Agent Chat history:".to_owned());
@@ -3942,6 +3942,8 @@ mod tests {
             "continue discovery",
         );
         assert!(prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
+        assert!(prompt.contains("no Forge typed tool channel"));
+        assert!(prompt.contains("cannot create or change Forge records"));
         assert!(prompt.contains("continue discovery"));
     }
 
@@ -3949,6 +3951,7 @@ mod tests {
     fn terminal_genesis_has_no_instruction_overlay() {
         let prompt = build_cli_prompt(None, None, &[], "ordinary Main message");
         assert!(!prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
+        assert!(prompt.contains("no Forge typed tool channel"));
     }
 
     #[test]
