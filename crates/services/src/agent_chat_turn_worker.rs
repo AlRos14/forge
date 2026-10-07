@@ -38,6 +38,7 @@ use crate::{
     },
     agent_chat_turn_policy::failure_after_claim,
     context_manifest::{ContextManifestInput, ContextManifestService, ContextSourceInput},
+    credential_service::CredentialService,
     operating_skills::{
         canonical_main_operating_skill_body, canonical_project_operating_skill_body,
         render_main_baseline_operating_skill, render_project_operating_skill,
@@ -387,9 +388,9 @@ pub trait AgentChatTurnRunner: Send + Sync {
     ) -> Result<CompletedAgentChatTurn>;
 }
 
-/// Narrow legacy CLI adapter for migrated Agent Chats. It deliberately uses a
-/// disposable empty directory and advertises denied workspace authority; a
-/// Task execution path is not routed through this type.
+/// Narrow CLI adapter for Agent Chat. The server-owned denied-workspace marker
+/// is checked by AdapterExecutor before launch; a Task execution path is not
+/// routed through this type.
 #[derive(Clone)]
 pub struct CliAgentChatSessionBackend {
     executor: Arc<dyn TaskExecutor>,
@@ -413,21 +414,25 @@ impl CliAgentChatSessionBackend {
         &self,
         job_id: &str,
         chat_id: &str,
-        executor_type: &str,
-        agent_config: Value,
+        mut executor_snapshot: Value,
         prompt: String,
         cancellation: CancellationToken,
     ) -> Result<(ExecutionResult, i64)> {
+        let executor_type = executor_snapshot
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Agent Chat snapshot has no executor type")
+            })?;
         let kind = executor_type
             .parse::<ExecutorKind>()
             .map_err(ServiceError::invalid_operation)?;
-        let executor_type = kind.to_string();
         if kind == ExecutorKind::Shell {
             return Err(ServiceError::invalid_operation(
                 "selected executor cannot run a legacy CLI Agent Chat turn",
             ));
         }
-        let executor_snapshot = cli_executor_snapshot(&executor_type, agent_config);
+        executors::mark_workspace_access_denied(&mut executor_snapshot);
 
         let sandbox = chat_sandbox_path(job_id);
         let logs_path = chat_log_path(job_id);
@@ -467,7 +472,14 @@ impl CliAgentChatSessionBackend {
                 let _ = std::fs::remove_dir_all(&sandbox);
                 return Err(ServiceError::invalid_operation("Agent Chat CLI turn was cancelled"));
             }
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&sandbox);
+                return Err(error.into());
+            }
+        };
         let _ = std::fs::remove_dir_all(&sandbox);
         Ok((result, started.elapsed().as_millis() as i64))
     }
@@ -477,6 +489,7 @@ impl CliAgentChatSessionBackend {
 pub struct FederatedAgentChatTurnRunner {
     db: Arc<SqliteDb>,
     cli_backend: CliAgentChatSessionBackend,
+    credential_env: Option<Arc<CredentialService>>,
 }
 
 impl fmt::Debug for FederatedAgentChatTurnRunner {
@@ -488,10 +501,15 @@ impl fmt::Debug for FederatedAgentChatTurnRunner {
 }
 
 impl FederatedAgentChatTurnRunner {
-    pub fn new(db: Arc<SqliteDb>, cli_executor: Arc<dyn TaskExecutor>) -> Self {
+    pub fn new(
+        db: Arc<SqliteDb>,
+        cli_executor: Arc<dyn TaskExecutor>,
+        credential_env: Option<Arc<CredentialService>>,
+    ) -> Self {
         Self {
             db,
             cli_backend: CliAgentChatSessionBackend::new(cli_executor),
+            credential_env,
         }
     }
 
@@ -2396,15 +2414,59 @@ impl FederatedAgentChatTurnRunner {
             &history,
             &input.content,
         );
-        let config: Value = serde_json::from_str(&profile.config_json)
+        let mut config: Value = serde_json::from_str(&profile.config_json)
             .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
+        let config_object = config.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent profile config must be a JSON object")
+        })?;
+        if let Some(permission_policy) = profile.permission_policy.as_deref() {
+            config_object.insert(
+                "permission_policy".to_owned(),
+                Value::String(permission_policy.to_owned()),
+            );
+        }
+        let mut executor_snapshot = cli_executor_snapshot(&profile.executor_type, config);
+        let snapshot_object = executor_snapshot.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat executor snapshot is invalid")
+        })?;
+        snapshot_object.insert("agent_id".to_owned(), Value::String(agent.id.clone()));
+        snapshot_object.insert("profile_id".to_owned(), Value::String(profile.id.clone()));
+        snapshot_object.insert(
+            "credential_ref".to_owned(),
+            profile
+                .credential_ref
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        snapshot_object.insert(
+            "provider".to_owned(),
+            profile
+                .provider
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        if executor_snapshot
+            .get("credential_ref")
+            .is_some_and(|credential_ref| !credential_ref.is_null())
+        {
+            self.credential_env
+                .as_ref()
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Agent Chat snapshot credential cannot be resolved by this server",
+                    )
+                })?
+                .inject_snapshot_credential_env(&mut executor_snapshot)
+                .await?;
+        }
         let (result, duration_ms) = self
             .cli_backend
             .run_turn(
                 &job.id,
                 &job.chat_id,
-                &profile.executor_type,
-                config,
+                executor_snapshot,
                 prompt,
                 cancellation,
             )
@@ -2477,10 +2539,12 @@ impl AgentChatTurnWorker {
         db: Arc<SqliteDb>,
         cli_executor: Arc<dyn TaskExecutor>,
         event_bus: Arc<EventBus>,
+        credential_env: Option<Arc<CredentialService>>,
     ) -> Self {
         let runner = Arc::new(FederatedAgentChatTurnRunner::new(
             Arc::clone(&db),
             cli_executor,
+            credential_env,
         ));
         Self::with_runner(db, runner, event_bus)
     }
@@ -3637,6 +3701,27 @@ mod tests {
             self.kind.clone()
         }
 
+        fn interpret_execution_policy(
+            &self,
+            config: &Value,
+        ) -> executors::HarnessPolicyInterpretation {
+            if config.get("permission_policy").and_then(Value::as_str) == Some("deny")
+                && config.get("sandbox").and_then(Value::as_str) == Some("no-filesystem")
+            {
+                return executors::HarnessPolicyInterpretation {
+                    permission_policy: "deny".to_owned(),
+                    isolation_posture: "no-filesystem".to_owned(),
+                };
+            }
+            cli_adapters::default_registry()
+                .get(&self.kind)
+                .map(|adapter| adapter.interpret_execution_policy(config))
+                .unwrap_or(executors::HarnessPolicyInterpretation {
+                    permission_policy: "unknown".to_owned(),
+                    isolation_posture: "not_applicable".to_owned(),
+                })
+        }
+
         async fn discover_options(
             &self,
             _ctx: executors::DiscoverContext,
@@ -3674,6 +3759,8 @@ mod tests {
     async fn setup_main_chat(
         backend_kind: &str,
         executor_type: &str,
+        credential_secret: Option<&str>,
+        policy_override: Option<(&str, &str)>,
     ) -> (
         Arc<SqliteDb>,
         Arc<EventBus>,
@@ -3701,6 +3788,29 @@ mod tests {
         )
         .await
         .expect("owner seeded");
+        let credential_ref = if let Some(secret) = credential_secret {
+            Some(
+                CredentialService::new(Arc::clone(&db), b"agent-chat-credential-test-key")
+                    .connect_api_key_credential(
+                        crate::credential_service::ConnectApiKeyCredential {
+                            owner_user_id: "chat-owner".to_owned(),
+                            provider: "openai".to_owned(),
+                            label: "job profile credential".to_owned(),
+                            credential: crate::credential_service::Secret::new(secret.to_owned()),
+                            base_url: Some("https://8.8.8.8/v1".to_owned()),
+                        },
+                    )
+                    .await
+                    .expect("profile credential stores")
+                    .id,
+            )
+        } else {
+            None
+        };
+        let (permission_policy, config_json) = policy_override.unwrap_or((
+            "deny",
+            r#"{"model":"profile-model","sandbox":"no-filesystem"}"#,
+        ));
         let identity_id = db::new_uuid_v4();
         let profile_id = db::new_uuid_v4();
         db::AgentRepo::create_identity_with_profile(
@@ -3727,15 +3837,15 @@ mod tests {
                 identity_id: identity_id.clone(),
                 backend_kind: backend_kind.to_owned(),
                 executor_type: executor_type.to_owned(),
-                provider: Some("test-provider".to_owned()),
+                provider: Some("openai".to_owned()),
                 model: Some("test-model".to_owned()),
                 reasoning_effort: None,
-                permission_policy: None,
+                permission_policy: Some(permission_policy.to_owned()),
                 prompt_template: Some("profile instruction".to_owned()),
                 capabilities_json: "{}".to_owned(),
                 tool_policy_json: "{}".to_owned(),
-                config_json: r#"{"model":"profile-model"}"#.to_owned(),
-                credential_ref: None,
+                config_json: config_json.to_owned(),
+                credential_ref,
                 daemon_id: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -4620,7 +4730,7 @@ mod tests {
     #[tokio::test]
     async fn main_chat_turn_uses_the_profile_harness_and_no_agent_session() {
         let (db, event_bus, admitted, identity_id, profile_id) =
-            setup_main_chat("cli", "codex").await;
+            setup_main_chat("cli", "codex", None, None).await;
         let executions = Arc::new(Mutex::new(Vec::new()));
         let alternate_executions = Arc::new(Mutex::new(Vec::new()));
         let cancellations = Arc::new(Mutex::new(Vec::new()));
@@ -4637,7 +4747,7 @@ mod tests {
         }));
         let task_executor: Arc<dyn TaskExecutor> =
             Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
-        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus);
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
 
         assert_eq!(worker.run_once().await.expect("worker runs once"), 1);
         let completed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
@@ -4690,6 +4800,8 @@ mod tests {
             executors::HarnessInvocation::Start
         );
         assert_eq!(executions[0].agent_config["model"], "profile-model");
+        assert_eq!(executions[0].agent_config["permission_policy"], "deny");
+        assert_eq!(executions[0].agent_config["sandbox"], "no-filesystem");
         assert!(executions[0]
             .description
             .contains("SERVER-OWNED OPERATING INSTRUCTION"));
@@ -4700,9 +4812,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_chat_rejects_write_capable_profile_before_adapter_invocation() {
+        let (db, event_bus, admitted, _, _) = setup_main_chat(
+            "cli",
+            "codex",
+            None,
+            Some((
+                "auto",
+                r#"{"model":"profile-model","sandbox":"workspace-write"}"#,
+            )),
+        )
+        .await;
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert!(failed
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("no-Workspace")));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_chat_rejects_read_only_profile_that_can_still_read_repository_files() {
+        let (db, event_bus, admitted, _, _) = setup_main_chat(
+            "cli",
+            "codex",
+            None,
+            Some(("plan", r#"{"model":"profile-model","sandbox":"read-only"}"#)),
+        )
+        .await;
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert!(failed
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("no-Workspace")));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_chat_uses_the_job_profile_credential_after_current_profile_changes() {
+        let secret_a = "durable-profile-credential-a";
+        let (db, event_bus, admitted, identity_id, profile_a_id) =
+            setup_main_chat("cli", "codex", Some(secret_a), None).await;
+        let credentials = Arc::new(CredentialService::new(
+            Arc::clone(&db),
+            b"agent-chat-credential-test-key",
+        ));
+        let profile_a = db::AgentProfileRepo::get_profile(&*db, &profile_a_id)
+            .await
+            .expect("job profile loads")
+            .expect("job profile exists");
+        let credential_a_ref = profile_a
+            .credential_ref
+            .clone()
+            .expect("job profile freezes its credential reference");
+        assert_eq!(
+            profile_a.credential_ref.as_deref(),
+            Some(credential_a_ref.as_str())
+        );
+
+        let credential_b = credentials
+            .connect_api_key_credential(crate::credential_service::ConnectApiKeyCredential {
+                owner_user_id: "chat-owner".to_owned(),
+                provider: "openai".to_owned(),
+                label: "replacement profile credential".to_owned(),
+                credential: crate::credential_service::Secret::new(
+                    "current-profile-credential-b".to_owned(),
+                ),
+                base_url: Some("https://8.8.8.8/v1".to_owned()),
+            })
+            .await
+            .expect("replacement profile credential stores");
+        assert_ne!(credential_a_ref, credential_b.id);
+        let profile_b_id = db::new_uuid_v4();
+        db::AgentProfileRepo::create_profile(
+            &*db,
+            db::CreateAgentProfile {
+                id: profile_b_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: Some("openai".to_owned()),
+                model: Some("replacement-model".to_owned()),
+                reasoning_effort: None,
+                permission_policy: Some("plan".to_owned()),
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: r#"{"model":"replacement-model","sandbox":"read-only"}"#.to_owned(),
+                credential_ref: Some(credential_b.id.clone()),
+                daemon_id: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("replacement profile creates");
+        let current_agent = AgentRepo::get_by_id(&*db, &identity_id)
+            .await
+            .expect("current Agent loads")
+            .expect("current Agent exists");
+        db::AgentProfileRepo::select_profile(
+            &*db,
+            db::SelectAgentProfile {
+                identity_id: identity_id.clone(),
+                profile_id: profile_b_id,
+                expected_version: current_agent.version,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("current Agent profile changes after job admission");
+        credentials
+            .revoke_credential_at_version(
+                &credential_b.id,
+                "chat-owner",
+                credential_b.version,
+                &now_rfc3339(),
+            )
+            .await
+            .expect("replacement profile credential revokes");
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(
+            Arc::clone(&db),
+            task_executor,
+            event_bus,
+            Some(Arc::clone(&credentials)),
+        );
+
+        assert_eq!(worker.run_once().await.expect("worker runs once"), 1);
+        let completed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(completed.status, db::AgentChatTurnState::Succeeded);
+        assert_eq!(completed.profile_id.as_deref(), Some(profile_a_id.as_str()));
+        let executions = executions.lock().expect("execution log lock");
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].agent_config["env"]["OPENAI_API_KEY"],
+            secret_a
+        );
+        assert!(!executions[0].description.contains(secret_a));
+        assert!(!executions[0]
+            .agent_config
+            .to_string()
+            .contains("current-profile-credential-b"));
+    }
+
+    #[tokio::test]
+    async fn revoked_agent_chat_profile_credential_fails_before_adapter_invocation() {
+        let (db, event_bus, admitted, _, profile_id) =
+            setup_main_chat("cli", "codex", Some("revoked-profile-secret"), None).await;
+        let credentials = Arc::new(CredentialService::new(
+            Arc::clone(&db),
+            b"agent-chat-credential-test-key",
+        ));
+        let profile = db::AgentProfileRepo::get_profile(&*db, &profile_id)
+            .await
+            .expect("job profile loads")
+            .expect("job profile exists");
+        let credential_ref = profile
+            .credential_ref
+            .expect("job profile freezes its credential reference");
+        let credential = db::CredentialHandleRepo::get_credential_handle(&*db, &credential_ref)
+            .await
+            .expect("credential handle loads")
+            .expect("credential handle exists");
+        credentials
+            .revoke_credential_at_version(
+                &credential.id,
+                "chat-owner",
+                credential.version,
+                &now_rfc3339(),
+            )
+            .await
+            .expect("profile credential revokes");
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker =
+            AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, Some(credentials));
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert_eq!(failed.error_code.as_deref(), Some("credential_unavailable"));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn historical_embedded_chat_binding_fails_durably_without_fallback() {
         let (db, event_bus, admitted, identity_id, profile_id) =
-            setup_main_chat("native", "embedded").await;
+            setup_main_chat("native", "embedded", None, None).await;
         let executions = Arc::new(Mutex::new(Vec::new()));
         let cancellations = Arc::new(Mutex::new(Vec::new()));
         let mut registry = executors::HarnessAdapterRegistry::new();
@@ -4713,7 +5067,7 @@ mod tests {
         }));
         let task_executor: Arc<dyn TaskExecutor> =
             Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
-        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus);
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
 
         assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
         let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)

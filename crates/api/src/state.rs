@@ -286,6 +286,7 @@ impl AppState {
             Arc::clone(&db),
             Arc::clone(&task_executor),
             Arc::clone(&event_bus),
+            Some(Arc::clone(&credential_service)),
         ));
         let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
         let oauth_service = Arc::new(services::OAuthService::new(

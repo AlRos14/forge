@@ -72,6 +72,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   native/embedded Agent execution is retired. Historical native profiles and
   session rows remain readable, but starting them fails closed and never
   switches to another Agent, HarnessAdapter, account, or credential.
+- Credential-backed Task Executions now resolve only the `credential_ref` in
+  their immutable Execution snapshot. Local dispatch injects that exact
+  credential into the in-memory harness invocation; remote daemon dispatch
+  fails before Start until the daemon protocol can prove the same credential
+  identity. Agent Chat pins its durable job profile and fails before launch
+  unless its HarnessAdapter proves a `deny` / `no-filesystem` posture. Current
+  CLI adapters do not expose that posture, so those Agent Chat jobs fail
+  closed rather than receiving read-only filesystem access.
 - Remote execution dispatch now requires a daemon that advertises the generic
   HarnessInvocation protocol. Older daemons are rejected before Start or Resume
   dispatch because they cannot guarantee fresh-start and exact-resume semantics.

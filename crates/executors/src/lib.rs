@@ -32,6 +32,32 @@ pub use shell::{is_pid_alive, ShellExecutor};
 use async_trait::async_trait;
 
 const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
+pub const WORKSPACE_ACCESS_REQUIREMENT_KEY: &str = "_forge_workspace_access";
+
+/// Mark a server-built invocation snapshot as having no Workspace authority.
+/// Harness execution layers check this against HarnessAdapter policy before
+/// they start a model invocation.
+pub fn mark_workspace_access_denied(snapshot: &mut serde_json::Value) {
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert(
+            WORKSPACE_ACCESS_REQUIREMENT_KEY.to_owned(),
+            serde_json::Value::String("deny".to_owned()),
+        );
+    }
+}
+
+/// Read the server-derived Workspace requirement from an invocation snapshot.
+pub fn workspace_access_denied_required(
+    snapshot: &serde_json::Value,
+) -> Result<bool, ExecutorError> {
+    match snapshot.get(WORKSPACE_ACCESS_REQUIREMENT_KEY) {
+        None => Ok(false),
+        Some(serde_json::Value::String(value)) if value == "deny" => Ok(true),
+        Some(_) => Err(ExecutorError::Other(
+            "unsupported Workspace access requirement in executor snapshot".to_owned(),
+        )),
+    }
+}
 
 /// Mark an executor config so the runtime restores the worktree after execution.
 pub fn mark_worktree_read_only(config: &mut serde_json::Value) {

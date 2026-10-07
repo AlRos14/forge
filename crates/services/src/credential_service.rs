@@ -843,8 +843,12 @@ impl CredentialService {
         Ok(handle)
     }
 
-    pub async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()> {
-        let executor_type = agent_config
+    /// Resolve the credential identity frozen into an Execution or Agent Chat
+    /// invocation snapshot and add its secret to the in-memory runtime env.
+    /// The current Agent is consulted only as an ownership fence; its selected
+    /// profile and credential are never used to choose the handle.
+    pub async fn inject_snapshot_credential_env(&self, snapshot: &mut Value) -> Result<()> {
+        let executor_type = snapshot
             .get("executor_type")
             .and_then(Value::as_str)
             .ok_or_else(|| {
@@ -852,37 +856,69 @@ impl CredentialService {
                     "executor config snapshot has no external HarnessAdapter type",
                 )
             })?;
-        executor_type
+        let executor_kind = executor_type
             .parse::<executors::ExecutorKind>()
             .map_err(ServiceError::invalid_operation)?;
-        let Some(agent_id) = agent_config
+        let credential_ref = match snapshot.get("credential_ref") {
+            None | Some(Value::Null) => return Ok(()),
+            Some(Value::String(reference)) if !reference.trim().is_empty() => reference.clone(),
+            Some(_) => {
+                return Err(ServiceError::invalid_operation(
+                    "snapshot credential reference is invalid",
+                ));
+            }
+        };
+        let agent_id = snapshot
             .get("agent_id")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            return Ok(());
-        };
-        let Some(agent) = db::AgentRepo::get_by_id(&*self.db, &agent_id).await? else {
-            return Ok(());
-        };
-        let Some(credential_ref) = agent.credential_ref.as_deref() else {
-            return Ok(());
-        };
-        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, credential_ref)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "credential-backed invocation snapshot has no Agent identity",
+                )
+            })?;
+        let agent = db::AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_identity", agent_id.to_owned()))?;
+        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, &credential_ref)
             .await?
             .ok_or_else(|| {
-                ServiceError::invalid_operation("referenced provider entry is unavailable")
+                ServiceError::invalid_operation("snapshot credential entry is unavailable")
             })?;
+        if agent.owner_id.as_deref() != Some(handle.owner_user_id.as_str()) {
+            return Err(ServiceError::invalid_operation(
+                "snapshot credential entry is not owned by the Agent account",
+            ));
+        }
         if handle.status != "configured" {
             return Err(ServiceError::invalid_operation(
-                "referenced provider entry is disconnected",
+                "snapshot credential entry is disconnected",
             ));
         }
         if handle.credential_method != "api_key" {
             return Err(ServiceError::invalid_operation(
-                "referenced provider entry cannot drive a CLI harness",
+                "snapshot credential cannot drive a CLI harness",
             ));
         }
+        let snapshot_provider = snapshot
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "credential-backed invocation snapshot has no provider identity",
+                )
+            })?;
+        if snapshot_provider != handle.provider {
+            return Err(ServiceError::invalid_operation(
+                "snapshot credential provider does not match the frozen provider identity",
+            ));
+        }
+        crate::provider_authorization::runtime_supported(
+            &handle.provider,
+            &handle.credential_method,
+            &executor_kind.to_string(),
+        )
+        .map_err(ServiceError::invalid_operation)?;
         let variable = provider_env_variable(&handle.provider).ok_or_else(|| {
             ServiceError::invalid_operation("provider has no harness environment contract")
         })?;
@@ -891,7 +927,7 @@ impl CredentialService {
             .acquire(&handle.owner_user_id, &handle.id, 60_000)
             .await
             .map_err(credential_error_to_service)?;
-        let env = agent_config
+        let env = snapshot
             .as_object_mut()
             .map(|snapshot| snapshot.entry("runtime_env").or_insert_with(|| json!({})))
             .and_then(Value::as_object_mut)
@@ -1362,7 +1398,7 @@ mod tests {
     use super::*;
     use db::{
         create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
-        CreateAgentProfile,
+        CreateAgentProfile, SelectAgentProfile,
     };
     use serde_json::json;
 
@@ -1407,7 +1443,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&ciphertext).contains(secret));
 
         let identity_id = "credential-harness-agent".to_owned();
-        let profile_id = "credential-harness-profile".to_owned();
+        let profile_id = "credential-harness-profile-a".to_owned();
         AgentRepo::create_identity_with_profile(
             &*db,
             CreateAgentIdentity {
@@ -1428,7 +1464,7 @@ mod tests {
                 updated_at: now.clone(),
             },
             CreateAgentProfile {
-                id: profile_id,
+                id: profile_id.clone(),
                 identity_id: identity_id.clone(),
                 backend_kind: "cli".to_owned(),
                 executor_type: "codex".to_owned(),
@@ -1440,36 +1476,192 @@ mod tests {
                 capabilities_json: "[]".to_owned(),
                 tool_policy_json: "{}".to_owned(),
                 config_json: "{}".to_owned(),
-                credential_ref: Some(handle.id),
+                credential_ref: Some(handle.id.clone()),
                 daemon_id: None,
                 created_at: now.clone(),
-                updated_at: now,
+                updated_at: now.clone(),
             },
         )
         .await
         .expect("external profile creates");
 
+        let current_handle = credentials
+            .connect_api_key_credential(ConnectApiKeyCredential {
+                owner_user_id: "credential-owner".to_owned(),
+                provider: "openai".to_owned(),
+                label: "replacement account".to_owned(),
+                credential: Secret::new("replacement-profile-secret".to_owned()),
+                base_url: Some("https://8.8.8.8/v1".to_owned()),
+            })
+            .await
+            .expect("replacement credential stores");
+        let profile_b_id = "credential-harness-profile-b".to_owned();
+        db::AgentProfileRepo::create_profile(
+            &*db,
+            CreateAgentProfile {
+                id: profile_b_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: Some("openai".to_owned()),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: Some(current_handle.id.clone()),
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("replacement profile creates");
+        let current_agent = AgentRepo::get_by_id(&*db, &identity_id)
+            .await
+            .expect("current Agent loads")
+            .expect("current Agent exists");
+        db::AgentProfileRepo::select_profile(
+            &*db,
+            SelectAgentProfile {
+                identity_id: identity_id.clone(),
+                profile_id: profile_b_id,
+                expected_version: current_agent.version,
+                updated_at: db::now_rfc3339(),
+            },
+        )
+        .await
+        .expect("current Agent profile changes");
+        credentials
+            .revoke_credential_at_version(
+                &current_handle.id,
+                "credential-owner",
+                current_handle.version,
+                &db::now_rfc3339(),
+            )
+            .await
+            .expect("current profile credential revokes");
+
         let mut adapter_snapshot = json!({
             "executor_type": "codex",
-            "agent_id": identity_id,
+            "agent_id": identity_id.clone(),
+            "profile_id": profile_id.clone(),
+            "credential_ref": handle.id.clone(),
+            "provider": "openai",
             "config": {}
         });
         credentials
-            .inject_provider_env(&mut adapter_snapshot)
+            .inject_snapshot_credential_env(&mut adapter_snapshot)
             .await
             .expect("credential injects into adapter snapshot");
         assert_eq!(
             adapter_snapshot["runtime_env"]["OPENAI_API_KEY"],
             json!(secret)
         );
+        assert!(!adapter_snapshot
+            .to_string()
+            .contains("replacement-profile-secret"));
+
+        let profile_c_id = "credential-harness-profile-c".to_owned();
+        db::AgentProfileRepo::create_profile(
+            &*db,
+            CreateAgentProfile {
+                id: profile_c_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("uncredentialed profile creates");
+        let current_agent = AgentRepo::get_by_id(&*db, &identity_id)
+            .await
+            .expect("current Agent reloads")
+            .expect("current Agent exists");
+        db::AgentProfileRepo::select_profile(
+            &*db,
+            SelectAgentProfile {
+                identity_id: identity_id.clone(),
+                profile_id: profile_c_id,
+                expected_version: current_agent.version,
+                updated_at: db::now_rfc3339(),
+            },
+        )
+        .await
+        .expect("current profile becomes uncredentialed");
+        let mut snapshot_a = json!({
+            "executor_type": "codex",
+            "agent_id": identity_id.clone(),
+            "profile_id": profile_id.clone(),
+            "credential_ref": handle.id.clone(),
+            "provider": "openai",
+            "config": {}
+        });
+        credentials
+            .inject_snapshot_credential_env(&mut snapshot_a)
+            .await
+            .expect("snapshot credential survives an uncredentialed current profile");
+        assert_eq!(snapshot_a["runtime_env"]["OPENAI_API_KEY"], json!(secret));
+
+        let mut ambient_snapshot = json!({
+            "executor_type": "codex",
+            "agent_id": identity_id.clone(),
+            "credential_ref": null,
+            "provider": "openai",
+            "config": {}
+        });
+        credentials
+            .inject_snapshot_credential_env(&mut ambient_snapshot)
+            .await
+            .expect("no explicit credential retains ambient semantics");
+        assert!(ambient_snapshot.get("runtime_env").is_none());
+
+        credentials
+            .revoke_credential_at_version(
+                &handle.id,
+                "credential-owner",
+                handle.version,
+                &db::now_rfc3339(),
+            )
+            .await
+            .expect("frozen credential revokes");
+        let mut revoked_snapshot = json!({
+            "executor_type": "codex",
+            "agent_id": identity_id.clone(),
+            "credential_ref": handle.id.clone(),
+            "provider": "openai",
+            "config": {}
+        });
+        let error = credentials
+            .inject_snapshot_credential_env(&mut revoked_snapshot)
+            .await
+            .expect_err("revoked snapshot credential fails before invocation");
+        assert!(error.to_string().contains("disconnected"));
+        assert!(revoked_snapshot.get("runtime_env").is_none());
 
         let mut retired_snapshot = json!({
             "executor_type": "embedded",
             "agent_id": identity_id,
+            "credential_ref": handle.id,
+            "provider": "openai",
             "config": {}
         });
         let error = credentials
-            .inject_provider_env(&mut retired_snapshot)
+            .inject_snapshot_credential_env(&mut retired_snapshot)
             .await
             .expect_err("retired snapshots cannot receive provider credentials");
         assert!(error.to_string().contains("retired"));

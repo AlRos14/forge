@@ -198,6 +198,14 @@ impl TaskService {
                 .execution_provider_for_agent(agent.as_ref(), &execution.id)
                 .await?;
             let params = self.execution_start_params(&execution).await?;
+            if snapshot_credential_ref(&params.executor_config)?.is_some() {
+                ensure_snapshot_credential_transport(provider.as_ref(), &params.executor_config)?;
+                if self.credential_env.is_none() {
+                    return Err(ServiceError::invalid_operation(
+                        "snapshot credential cannot be resolved by this execution host",
+                    ));
+                }
+            }
             provider.start(params).await
         }
         .await;
@@ -314,11 +322,17 @@ impl TaskService {
         {
             executors::mark_worktree_read_only(&mut agent_config);
         }
-        // Provider-entry-backed harness agents get their API key injected into
-        // the in-memory snapshot only; the stored snapshot never holds it.
-        if let Some(credential_env) = self.credential_env.as_ref() {
-            credential_env
-                .inject_provider_env(&mut agent_config)
+        // The immutable Execution snapshot selects the provider entry. Never
+        // let the Agent's currently selected profile redirect this invocation.
+        if snapshot_credential_ref(&agent_config)?.is_some() {
+            self.credential_env
+                .as_ref()
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "snapshot credential cannot be resolved by this execution host",
+                    )
+                })?
+                .inject_snapshot_credential_env(&mut agent_config)
                 .await?;
         }
         let max_turns = self.resolve_max_turns(&task).await?;
@@ -1351,6 +1365,30 @@ fn execution_description(execution: &Execution, task: &Task) -> String {
         .unwrap_or_else(|| task.title.clone())
 }
 
+fn snapshot_credential_ref(snapshot: &Value) -> Result<Option<&str>> {
+    match snapshot.get("credential_ref") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(reference)) if !reference.trim().is_empty() => Ok(Some(reference)),
+        Some(_) => Err(ServiceError::invalid_operation(
+            "snapshot credential reference is invalid",
+        )),
+    }
+}
+
+fn ensure_snapshot_credential_transport(
+    provider: &dyn crate::daemon_transport::ExecutionProvider,
+    executor_config: &Value,
+) -> Result<()> {
+    if snapshot_credential_ref(executor_config)?.is_some()
+        && !provider.accepts_snapshot_credentials()
+    {
+        return Err(ServiceError::invalid_operation(
+            "credential-backed Agent Execution cannot run on this remote daemon until it supports the exact snapshot credential identity",
+        ));
+    }
+    Ok(())
+}
+
 fn usage_model_fallback(agent_config: &Value) -> Option<String> {
     agent_config
         .get("config")
@@ -1543,5 +1581,30 @@ mod usage_tests {
         });
 
         assert_eq!(super::usage_provider_from_agent_config(&snapshot), "cursor");
+    }
+
+    #[test]
+    fn remote_provider_rejects_snapshot_credentials_before_any_daemon_request() {
+        let registry = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
+        let (connection, mut outbound) =
+            crate::daemon_transport::DaemonConnection::new("remote-daemon".to_owned());
+        registry.register("remote-daemon".to_owned(), connection);
+        let provider = crate::daemon_transport::RemoteExecutionProvider::new(
+            std::sync::Arc::new(registry),
+            "remote-daemon".to_owned(),
+        );
+
+        let config = json!({"credential_ref": "credential-a"});
+        let error = ensure_snapshot_credential_transport(&provider, &config)
+            .expect_err("remote transport cannot resolve a host-only credential");
+        assert!(error
+            .to_string()
+            .contains("exact snapshot credential identity"));
+        assert!(outbound.try_recv().is_err());
+
+        let uncredentialed = json!({"credential_ref": null});
+        ensure_snapshot_credential_transport(&provider, &uncredentialed)
+            .expect("uncredentialed remote execution retains existing transport");
+        assert!(outbound.try_recv().is_err());
     }
 }

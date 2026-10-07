@@ -303,6 +303,14 @@ impl TaskExecutor for AdapterExecutor {
             None,
             &config,
         );
+        if crate::workspace_access_denied_required(&ctx.agent_config)? {
+            crate::effective_policy::validate_agent_chat_no_workspace_policy(
+                &kind,
+                &effective_policy,
+                &config,
+            )
+            .map_err(ExecutorError::Other)?;
+        }
         let candidate_key = crate::config::candidate_key(&kind, &config);
         let execution_config = config.clone();
         ctx.agent_config = invocation_config;
@@ -562,6 +570,16 @@ impl TaskExecutor for FallbackExecutor {
                 }
         );
         let candidates = self.route(&ctx, !is_resume)?;
+        if crate::workspace_access_denied_required(&ctx.agent_config)? {
+            for candidate in &candidates {
+                crate::effective_policy::validate_agent_chat_no_workspace_policy(
+                    &candidate.kind,
+                    &candidate.effective_policy,
+                    &candidate.config,
+                )
+                .map_err(ExecutorError::Other)?;
+            }
+        }
         let cancelled = self.cancellation_flag(&ctx.execution_id);
         let single_candidate = candidates.len() == 1;
 

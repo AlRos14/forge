@@ -4218,14 +4218,43 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct Pr6RecordingExecutor {
+    struct Pr6RecordingHarnessAdapter {
         response: String,
         observed:
             Arc<std::sync::Mutex<Vec<(api_types::HarnessInvocation, Option<String>, String)>>>,
     }
 
     #[async_trait::async_trait]
-    impl executors::TaskExecutor for Pr6RecordingExecutor {
+    impl executors::HarnessAdapter for Pr6RecordingHarnessAdapter {
+        fn kind(&self) -> executors::ExecutorKind {
+            executors::ExecutorKind::Codex
+        }
+
+        fn interpret_execution_policy(
+            &self,
+            config: &Value,
+        ) -> executors::HarnessPolicyInterpretation {
+            executors::HarnessPolicyInterpretation {
+                permission_policy: config
+                    .get("permission_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                isolation_posture: config
+                    .get("sandbox")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            }
+        }
+
+        async fn discover_options(
+            &self,
+            _context: executors::DiscoverContext,
+        ) -> std::result::Result<executors::DiscoveredOptions, executors::ExecutorError> {
+            Ok(executors::DiscoveredOptions::default())
+        }
+
         async fn execute(
             &self,
             context: executors::ExecutionContext,
@@ -4234,8 +4263,7 @@ mod tests {
                 context.invocation,
                 context
                     .agent_config
-                    .get("config")
-                    .and_then(|config| config.get("sandbox"))
+                    .get("sandbox")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 context.role,
@@ -4524,10 +4552,14 @@ mod tests {
         let workspace_root = tempfile::tempdir().expect("workspace root creates");
         let task_service = Arc::new(
             TaskService::new(Arc::clone(&database), Arc::clone(&event_bus))
-                .with_task_executor(Arc::new(Pr6RecordingExecutor {
-                    response: action_response,
-                    observed: Arc::clone(&observed),
-                }))
+                .with_task_executor(Arc::new(executors::AdapterExecutor::new({
+                    let mut registry = executors::HarnessAdapterRegistry::new();
+                    registry.register(Box::new(Pr6RecordingHarnessAdapter {
+                        response: action_response,
+                        observed: Arc::clone(&observed),
+                    }));
+                    Arc::new(registry)
+                })))
                 .with_adapter_registry(Arc::new(cli_adapters::default_registry()))
                 .with_workspace_root(workspace_root.path().to_path_buf()),
         );

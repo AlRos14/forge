@@ -49,20 +49,6 @@ cargo run -p forge-cli         # plain start, data in ~/.forge/
 cargo run -p forge-cli -- --demo  # seed labelled demo data (idempotent)
 ```
 
-The embedded host pins Agent Runtime revision
-`a7075b1d2dd1cee05db63bc480ff46b0f97ec239` and requires Rust 1.86 or newer.
-Cargo fetches that revision normally. Contributors developing both repositories
-side by side may add this gitignored local override to `.cargo/config.toml`:
-
-```toml
-[patch."https://github.com/ForgeAILab/agent-runtime.git"]
-agent-runtime = { path = "../agent-runtime/crates/agent-runtime" }
-agent-runtime-core = { path = "../agent-runtime/crates/agent-runtime-core" }
-agent-runtime-lcm = { path = "../agent-runtime/crates/agent-runtime-lcm" }
-```
-
-Do not commit the local patch or replace the immutable dependency revision.
-
 ### Docker
 
 ```bash
