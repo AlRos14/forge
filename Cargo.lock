@@ -505,7 +505,6 @@ name = "cli-adapters"
 version = "0.8.0"
 dependencies = [
  "async-trait",
- "command-group",
  "dirs",
  "executors",
  "futures-util",
@@ -908,9 +907,10 @@ version = "0.8.0"
 dependencies = [
  "api-types",
  "async-trait",
- "command-group",
  "chrono",
+ "command-group",
  "flate2",
+ "nix 0.27.1",
  "schemars",
  "serde",
  "serde_json",

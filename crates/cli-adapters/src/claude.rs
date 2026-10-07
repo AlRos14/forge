@@ -1,11 +1,10 @@
 mod normalize;
 
 use async_trait::async_trait;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use executors::{
     AvailabilityInfo, AvailabilityStatus, ClaudeCodeConfig, DiscoverContext, DiscoveredOptions,
     ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
-    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
 };
 use normalize::NormalizedEntry;
 use serde_json::Value;
@@ -34,7 +33,7 @@ pub struct ClaudeCodeAdapter {
 }
 
 struct RunningProcess {
-    child: AsyncGroupChild,
+    child: ProcessGroupChild,
     cancel: CancellationToken,
 }
 
@@ -61,7 +60,7 @@ impl Drop for ProcessGroupKillOnDrop {
         if self.armed
             && let Ok(mut process) = self.process.try_lock()
         {
-            signal_child_group(&mut process.child);
+            let _ = process.child.start_kill();
         }
     }
 }
@@ -311,32 +310,47 @@ impl ClaudeCodeAdapter {
 
         let hook_path = install_stop_hook(Path::new(&ctx.worktree_path)).await?;
 
-        let mut child = cmd.group_spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut cmd)?;
         let stdin = match child.inner().stdin.take() {
             Some(stdin) => stdin,
             None => {
-                kill_unstarted_child(child).await;
-                return Err(ExecutorError::Other(
-                    "failed to capture claude stdin".to_owned(),
-                ));
+                let cleanup = kill_unstarted_child(child).await;
+                return Err(ExecutorError::Other(cleanup.map_or_else(
+                    |error| {
+                        format!(
+                            "failed to capture claude stdin; process-group cleanup failed: {error}"
+                        )
+                    },
+                    |_| "failed to capture claude stdin".to_owned(),
+                )));
             }
         };
         let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
             None => {
-                kill_unstarted_child(child).await;
-                return Err(ExecutorError::Other(
-                    "failed to capture claude stdout".to_owned(),
-                ));
+                let cleanup = kill_unstarted_child(child).await;
+                return Err(ExecutorError::Other(cleanup.map_or_else(
+                    |error| {
+                        format!(
+                            "failed to capture claude stdout; process-group cleanup failed: {error}"
+                        )
+                    },
+                    |_| "failed to capture claude stdout".to_owned(),
+                )));
             }
         };
         let stderr = match child.inner().stderr.take() {
             Some(stderr) => stderr,
             None => {
-                kill_unstarted_child(child).await;
-                return Err(ExecutorError::Other(
-                    "failed to capture claude stderr".to_owned(),
-                ));
+                let cleanup = kill_unstarted_child(child).await;
+                return Err(ExecutorError::Other(cleanup.map_or_else(
+                    |error| {
+                        format!(
+                            "failed to capture claude stderr; process-group cleanup failed: {error}"
+                        )
+                    },
+                    |_| "failed to capture claude stderr".to_owned(),
+                )));
             }
         };
 
@@ -366,7 +380,9 @@ impl ClaudeCodeAdapter {
         if status_result.is_ok() {
             group_kill_guard.disarm();
         }
-        self.remove_process(&ctx.execution_id)?;
+        if status_result.is_ok() {
+            self.remove_process(&ctx.execution_id)?;
+        }
         uninstall_stop_hook(hook_path).await;
 
         let stream = stream_result?;
@@ -909,27 +925,13 @@ async fn wait_and_kill(
     process: Arc<AsyncMutex<RunningProcess>>,
 ) -> Result<ExitStatus, ExecutorError> {
     let mut process = process.lock().await;
-    signal_child_group(&mut process.child);
-    Ok(process.child.wait().await?)
+    crate::command::kill_group_and_wait(&mut process.child)
+        .await
+        .map_err(ExecutorError::Io)
 }
 
-async fn kill_unstarted_child(mut child: AsyncGroupChild) {
-    signal_child_group(&mut child);
-    let _ = child.wait().await;
-}
-
-fn signal_child_group(child: &mut AsyncGroupChild) {
-    #[cfg(unix)]
-    {
-        use command_group::{Signal, UnixChildExt};
-
-        let _ = child.signal(Signal::SIGKILL);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = child.start_kill();
-    }
+async fn kill_unstarted_child(mut child: ProcessGroupChild) -> std::io::Result<ExitStatus> {
+    crate::command::kill_group_and_wait(&mut child).await
 }
 
 // ---------------------------------------------------------------------------

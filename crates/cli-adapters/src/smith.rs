@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
     ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
-    LogStream, LogWriter, PermissionPolicy, SmithConfig, TokenUsage,
+    LogStream, LogWriter, PermissionPolicy, ProcessGroupChild, SmithConfig, TokenUsage,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
@@ -39,7 +38,7 @@ const SMITH_AUTH_ERROR_KINDS: &[&str] = &[
 ];
 
 struct RunningExecution {
-    child: Arc<AsyncMutex<Child>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -237,18 +236,37 @@ impl HarnessAdapter for SmithAdapter {
         let mut cmd = Self::build_command(&config, &prompt);
         cmd.current_dir(&ctx.worktree_path);
 
-        let mut child = cmd.spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut cmd)?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture smith stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture smith stderr".into()))?;
+        let stdout = match child.inner().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture smith stdout{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture smith stderr{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
 
         let child_arc = Arc::new(AsyncMutex::new(child));
+        let mut group_kill_guard = crate::command::GroupKillOnDrop::new(child_arc.clone());
         let cancelled = Arc::new(AtomicBool::new(false));
 
         // Record the child before logging yields so generation cancellation
@@ -262,13 +280,14 @@ impl HarnessAdapter for SmithAdapter {
         ) {
             let cleanup_result = {
                 let mut child = child_arc.lock().await;
-                crate::command::kill_child_and_wait(&mut child).await
+                crate::command::kill_group_and_wait(&mut child).await
             };
             if let Err(cleanup_error) = cleanup_result {
                 return Err(ExecutorError::Other(format!(
                     "Smith process registration failed ({registration_error}); child termination failed ({cleanup_error})"
                 )));
             }
+            group_kill_guard.disarm();
             return Err(registration_error);
         }
 
@@ -294,10 +313,16 @@ impl HarnessAdapter for SmithAdapter {
             .await?;
 
         let stream_result = stream_run_output(stdout, stderr, &mut writer).await;
-        let status = {
+        let status_result = {
             let mut child = child_arc.lock().await;
-            child.wait().await?
+            crate::command::kill_group_and_wait(&mut child).await
         };
+        let status = status_result.map_err(|error| {
+            ExecutorError::Other(format!(
+                "Smith process-group termination could not be verified: {error}"
+            ))
+        })?;
+        group_kill_guard.disarm();
         self.remove_execution(&ctx.execution_id)?;
 
         let stream = stream_result?;
@@ -419,7 +444,7 @@ impl HarnessAdapter for SmithAdapter {
         if let Some(running) = running {
             running.cancelled.store(true, Ordering::SeqCst);
             let mut child = running.child.lock().await;
-            crate::command::kill_child_and_wait(&mut child).await?;
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
         Ok(())
     }

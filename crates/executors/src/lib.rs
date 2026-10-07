@@ -8,6 +8,7 @@ pub mod log_reader;
 pub mod log_schema;
 mod log_storage;
 pub mod log_writer;
+pub mod process_group;
 pub mod shell;
 
 pub use adapter::{
@@ -27,6 +28,7 @@ pub use config::{
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
 pub use log_writer::LogWriter;
+pub use process_group::ProcessGroupChild;
 pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;

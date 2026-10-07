@@ -1,11 +1,8 @@
 use async_trait::async_trait;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
-#[cfg(unix)]
-use command_group::{Signal, UnixChildExt};
 use executors::{
     AvailabilityInfo, AvailabilityStatus, CursorConfig, DiscoverContext, DiscoveredOptions,
     ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
-    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -111,7 +108,7 @@ impl RuntimePromptFile {
 
 #[derive(Clone)]
 struct RunningProcess {
-    child: Arc<AsyncMutex<AsyncGroupChild>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     cancel: CancellationToken,
 }
 
@@ -471,26 +468,32 @@ impl HarnessAdapter for CursorAdapter {
                 .unwrap_or_else(|| prompt.clone()),
         );
         command.current_dir(&ctx.worktree_path);
-        let mut child = command.group_spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut command)?;
 
         let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
             None => {
-                signal_child(&mut child);
-                let _ = child.wait().await;
-                return Err(ExecutorError::Other(
-                    "failed to capture cursor stdout".to_owned(),
-                ));
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture cursor stdout{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
             }
         };
         let stderr = match child.inner().stderr.take() {
             Some(stderr) => stderr,
             None => {
-                signal_child(&mut child);
-                let _ = child.wait().await;
-                return Err(ExecutorError::Other(
-                    "failed to capture cursor stderr".to_owned(),
-                ));
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture cursor stderr{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
             }
         };
 
@@ -540,13 +543,9 @@ impl HarnessAdapter for CursorAdapter {
             .await?;
 
         let stream_result = stream_child_output(stdout, stderr, &mut writer, cancel.clone()).await;
-        let stream_failed = stream_result.is_err();
         let status = {
             let mut child = child.lock().await;
-            if stream_failed {
-                signal_child(&mut child);
-            }
-            child.wait().await?
+            crate::command::kill_group_and_wait(&mut child).await?
         };
         group_kill_guard.disarm();
         self.remove_process(&ctx.execution_id)?;
@@ -1314,17 +1313,6 @@ fn command_output_timeout(mut command: std::process::Command, timeout: Duration)
 
 fn executable_in_path(name: &str) -> bool {
     which::which(name).is_ok()
-}
-
-fn signal_child(child: &mut AsyncGroupChild) {
-    #[cfg(unix)]
-    {
-        let _ = child.signal(Signal::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.start_kill();
-    }
 }
 
 #[cfg(test)]

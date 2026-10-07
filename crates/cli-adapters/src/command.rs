@@ -1,25 +1,21 @@
-use command_group::AsyncGroupChild;
-use executors::CommandOverrides;
+use executors::{CommandOverrides, ProcessGroupChild};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::{
-    process::{Child, Command},
-    sync::Mutex,
-};
+use tokio::{process::Command, sync::Mutex};
 
 /// Last-resort group termination when an adapter execution future is dropped.
 /// Normal cancellation still waits for the process group to exit.
 pub(crate) struct GroupKillOnDrop {
-    child: Arc<Mutex<AsyncGroupChild>>,
+    child: Arc<Mutex<ProcessGroupChild>>,
     armed: bool,
 }
 
 impl GroupKillOnDrop {
-    pub(crate) fn new(child: Arc<Mutex<AsyncGroupChild>>) -> Self {
+    pub(crate) fn new(child: Arc<Mutex<ProcessGroupChild>>) -> Self {
         Self { child, armed: true }
     }
 
@@ -38,34 +34,9 @@ impl Drop for GroupKillOnDrop {
     }
 }
 
-/// Kill and reap a direct CLI child. Callers use this while holding the same
-/// process handle registered for the Execution, so a successful return proves
-/// the child can no longer run.
-pub(crate) async fn kill_child_and_wait(child: &mut Child) -> io::Result<ExitStatus> {
-    if let Some(status) = child.try_wait()? {
-        return Ok(status);
-    }
-    if let Err(kill_error) = child.start_kill() {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        return Err(kill_error);
-    }
-    child.wait().await
-}
-
-/// Kill and reap a process group, including descendants started by the CLI.
-pub(crate) async fn kill_group_and_wait(child: &mut AsyncGroupChild) -> io::Result<ExitStatus> {
-    if let Some(status) = child.try_wait()? {
-        return Ok(status);
-    }
-    if let Err(kill_error) = child.start_kill() {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        return Err(kill_error);
-    }
-    child.wait().await
+/// Terminate and verify the complete process boundary for an Execution.
+pub(crate) async fn kill_group_and_wait(child: &mut ProcessGroupChild) -> io::Result<ExitStatus> {
+    child.kill_and_wait().await
 }
 
 /// Run a discovery command without letting a stalled CLI pin an async worker
@@ -223,6 +194,8 @@ pub(crate) fn clear_session_arguments(
 mod tests {
     use super::*;
     use executors::CommandOverrides;
+    use executors::ProcessGroupChild;
+    use std::time::Duration;
 
     #[test]
     fn default_command_no_overrides() {
@@ -298,5 +271,65 @@ mod tests {
             overrides.additional_params,
             Some(vec!["--verbose".into(), "--model".into(), "model-a".into()])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn group_kill_terminates_descendant_after_leader_was_reaped() {
+        let dir = tempfile::tempdir().expect("temp directory creates");
+        let pid_file = dir.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 60 & echo $! > '{}' ; exit 0", pid_file.display()),
+        ]);
+        let mut child = ProcessGroupChild::spawn(&mut command).expect("group spawns");
+        let leader_pid = child.id().expect("leader PID exists");
+
+        let descendant_pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(&pid_file).await {
+                    if let Ok(pid) = value.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant writes its PID");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pid_is_executable(leader_pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader exits before group termination");
+        assert!(pid_is_executable(descendant_pid));
+        assert!(
+            child
+                .try_wait_leader()
+                .expect("leader status can be collected")
+                .is_some(),
+            "leader status is cached before group termination"
+        );
+
+        kill_group_and_wait(&mut child)
+            .await
+            .expect("group termination is verified");
+        assert!(!pid_is_executable(descendant_pid));
+        assert!(!child.group_is_alive().expect("group status is readable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pid_is_executable(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(end_of_command) = stat.rfind(')') else {
+            return false;
+        };
+        !matches!(stat[end_of_command + 2..].chars().next(), Some('Z' | 'X'))
     }
 }

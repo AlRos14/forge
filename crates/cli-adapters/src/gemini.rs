@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
     ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, GeminiConfig, HarnessAdapter,
-    LogKind, LogStream, LogWriter, PermissionPolicy,
+    LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,6 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
@@ -19,7 +18,7 @@ const FIRST_OUTPUT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_SUMMARY_CHARS: usize = 500;
 
 pub struct GeminiAdapter {
-    processes: Arc<Mutex<HashMap<String, Arc<AsyncMutex<Child>>>>>,
+    processes: Arc<Mutex<HashMap<String, Arc<AsyncMutex<ProcessGroupChild>>>>>,
 }
 
 impl GeminiAdapter {
@@ -85,7 +84,7 @@ impl GeminiAdapter {
     fn insert_process(
         &self,
         execution_id: String,
-        child: Arc<AsyncMutex<Child>>,
+        child: Arc<AsyncMutex<ProcessGroupChild>>,
     ) -> Result<(), ExecutorError> {
         self.processes
             .lock()
@@ -200,34 +199,63 @@ impl HarnessAdapter for GeminiAdapter {
         let mut cmd = Self::build_command(&config);
         cmd.current_dir(&ctx.worktree_path);
 
-        let mut child = cmd.spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut cmd)?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture gemini stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture gemini stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture gemini stderr".into()))?;
+        let stdin = match child.inner().stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture gemini stdin{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
+        let stdout = match child.inner().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture gemini stdout{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture gemini stderr{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
 
         let child_arc = Arc::new(AsyncMutex::new(child));
+        let mut group_kill_guard = crate::command::GroupKillOnDrop::new(child_arc.clone());
         if let Err(registration_error) =
             self.insert_process(ctx.execution_id.clone(), child_arc.clone())
         {
             let cleanup_result = {
                 let mut child = child_arc.lock().await;
-                crate::command::kill_child_and_wait(&mut child).await
+                crate::command::kill_group_and_wait(&mut child).await
             };
             if let Err(cleanup_error) = cleanup_result {
                 return Err(ExecutorError::Other(format!(
                     "Gemini process registration failed ({registration_error}); child termination failed ({cleanup_error})"
                 )));
             }
+            group_kill_guard.disarm();
             return Err(registration_error);
         }
 
@@ -261,11 +289,16 @@ impl HarnessAdapter for GeminiAdapter {
         let stream_result =
             stream_child_output(&ctx, stdin, stdout, stderr, &prompt, &mut writer).await;
 
-        let status = {
+        let status_result = {
             let mut child = child_arc.lock().await;
-            let _ = child.start_kill();
-            child.wait().await?
+            crate::command::kill_group_and_wait(&mut child).await
         };
+        let status = status_result.map_err(|error| {
+            ExecutorError::Other(format!(
+                "Gemini process-group termination could not be verified: {error}"
+            ))
+        })?;
+        group_kill_guard.disarm();
         self.remove_process(&ctx.execution_id)?;
 
         let stream = stream_result?;
@@ -326,7 +359,7 @@ impl HarnessAdapter for GeminiAdapter {
 
         if let Some(child_arc) = process {
             let mut child = child_arc.lock().await;
-            crate::command::kill_child_and_wait(&mut child).await?;
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
 
         Ok(())

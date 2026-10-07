@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
     ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
-    LogStream, LogWriter, OpencodeConfig, PermissionPolicy,
+    LogStream, LogWriter, OpencodeConfig, PermissionPolicy, ProcessGroupChild,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
@@ -24,7 +23,7 @@ pub struct OpencodeAdapter {
 
 #[derive(Clone)]
 struct RunningExecution {
-    child: Arc<AsyncMutex<Child>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -182,18 +181,37 @@ impl HarnessAdapter for OpencodeAdapter {
         let mut cmd = Self::build_command(&config, &prompt);
         cmd.current_dir(&ctx.worktree_path);
 
-        let mut child = cmd.spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut cmd)?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture opencode stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture opencode stderr".into()))?;
+        let stdout = match child.inner().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture opencode stdout{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture opencode stderr{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
 
         let child_arc = Arc::new(AsyncMutex::new(child));
+        let mut group_kill_guard = crate::command::GroupKillOnDrop::new(child_arc.clone());
         let cancelled = Arc::new(AtomicBool::new(false));
 
         // Record the process before the first await. If generation retirement
@@ -207,13 +225,14 @@ impl HarnessAdapter for OpencodeAdapter {
         ) {
             let cleanup_result = {
                 let mut child = child_arc.lock().await;
-                crate::command::kill_child_and_wait(&mut child).await
+                crate::command::kill_group_and_wait(&mut child).await
             };
             if let Err(cleanup_error) = cleanup_result {
                 return Err(ExecutorError::Other(format!(
                     "OpenCode process registration failed ({registration_error}); child termination failed ({cleanup_error})"
                 )));
             }
+            group_kill_guard.disarm();
             return Err(registration_error);
         }
 
@@ -239,10 +258,16 @@ impl HarnessAdapter for OpencodeAdapter {
             .await?;
 
         let stream_result = stream_run_output(stdout, stderr, &mut writer).await;
-        let status = {
+        let status_result = {
             let mut child = child_arc.lock().await;
-            child.wait().await?
+            crate::command::kill_group_and_wait(&mut child).await
         };
+        let status = status_result.map_err(|error| {
+            ExecutorError::Other(format!(
+                "OpenCode process-group termination could not be verified: {error}"
+            ))
+        })?;
+        group_kill_guard.disarm();
         self.remove_execution(&ctx.execution_id)?;
 
         let stream = stream_result?;
@@ -368,7 +393,7 @@ impl HarnessAdapter for OpencodeAdapter {
         if let Some(exec) = execution {
             exec.cancelled.store(true, Ordering::SeqCst);
             let mut child = exec.child.lock().await;
-            crate::command::kill_child_and_wait(&mut child).await?;
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
 
         Ok(())
@@ -1042,19 +1067,21 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         assert_eq!(result.summary, Some("forge fake ok".to_owned()));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn opencode_child_is_killed_when_dropped_before_registration() {
+    async fn opencode_process_group_is_killed_when_dropped_before_registration() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("opencode-child.pid");
+        let leader_pid_file = dir.path().join("opencode-leader.pid");
+        let descendant_pid_file = dir.path().join("opencode-descendant.pid");
         let fake_opencode = dir.path().join("fake-opencode");
         std::fs::write(
             &fake_opencode,
             format!(
-                "#!/bin/sh\necho $$ > {}\nexec sleep 60\n",
-                pid_file.display()
+                "#!/bin/sh\necho $$ > '{}'\nsleep 60 &\necho $! > '{}'\nexec sleep 60\n",
+                leader_pid_file.display(),
+                descendant_pid_file.display(),
             ),
         )
         .unwrap();
@@ -1068,13 +1095,107 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         .expect("OpenCode config parses");
         let mut command = OpencodeAdapter::build_command(&config, "test prompt");
         command.current_dir(dir.path());
-        let child = command.spawn().expect("fake OpenCode child spawns");
-        let pid = child.id().expect("child has pid");
+        let child = ProcessGroupChild::spawn(&mut command).expect("fake OpenCode group spawns");
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(value) = tokio::fs::read_to_string(&pid_file).await {
-                    if value.trim() == pid.to_string() {
+                if tokio::fs::try_exists(&leader_pid_file)
+                    .await
+                    .unwrap_or(false)
+                    && tokio::fs::try_exists(&descendant_pid_file)
+                        .await
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader and descendant reach the pre-registration barrier");
+        let leader_pid = std::fs::read_to_string(&leader_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(pid_is_executable(leader_pid));
+        assert!(pid_is_executable(descendant_pid));
+
+        drop(child);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while pid_is_executable(leader_pid) || pid_is_executable(descendant_pid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drop kill signal terminates the unregistered OpenCode group");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancel_terminates_opencode_descendant_after_leader_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let leader_pid_file = dir.path().join("opencode-leader.pid");
+        let descendant_pid_file = dir.path().join("opencode-descendant.pid");
+        let fake_opencode = dir.path().join("fake-opencode-tree");
+        std::fs::write(
+            &fake_opencode,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nsleep 60 &\necho $! > '{}'\nprintf '%s\\n' '{{\"type\":\"text\",\"sessionID\":\"ses_tree\",\"part\":{{\"type\":\"text\",\"text\":\"tree output\"}}}}'\nexit 0\n",
+                leader_pid_file.display(),
+                descendant_pid_file.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_opencode, permissions).unwrap();
+
+        let adapter = Arc::new(OpencodeAdapter::new());
+        let context = ExecutionContext {
+            invocation: executors::HarnessInvocation::Start,
+            task_id: "task-tree".to_owned(),
+            execution_id: "execution-tree".to_owned(),
+            role: "coder".to_owned(),
+            worktree_path: dir.path().to_string_lossy().to_string(),
+            description: "tree test".to_owned(),
+            agent_config: serde_json::json!({
+                "base_command_override": fake_opencode.to_string_lossy(),
+            }),
+            logs_path: dir
+                .path()
+                .join("opencode-tree.jsonl")
+                .to_string_lossy()
+                .to_string(),
+            heartbeat_interval_seconds: 1,
+            max_turns: None,
+            log_sender: None,
+        };
+        let execution_adapter = Arc::clone(&adapter);
+        let execution = tokio::spawn(async move { execution_adapter.execute(context).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::fs::try_exists(&leader_pid_file)
+                    .await
+                    .unwrap_or(false)
+                    && tokio::fs::try_exists(&descendant_pid_file)
+                        .await
+                        .unwrap_or(false)
+                {
+                    let leader_pid = std::fs::read_to_string(&leader_pid_file)
+                        .unwrap()
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap();
+                    if !pid_is_executable(leader_pid) {
                         break;
                     }
                 }
@@ -1082,17 +1203,41 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
             }
         })
         .await
-        .expect("child reaches the pre-registration barrier");
-        assert!(executors::is_pid_alive(pid));
+        .expect("OpenCode leader exits while its descendant holds output open");
+        let leader_pid = std::fs::read_to_string(&leader_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(!pid_is_executable(leader_pid));
+        assert!(pid_is_executable(descendant_pid));
 
-        drop(child);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while executors::is_pid_alive(pid) {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("kill_on_drop terminates the unregistered OpenCode child");
+        adapter
+            .cancel("execution-tree")
+            .await
+            .expect("adapter cancellation verifies the full process group");
+        tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+            .await
+            .expect("adapter execution finishes after group termination")
+            .expect("adapter task joins")
+            .expect("adapter returns its execution result");
+        assert!(!pid_is_executable(descendant_pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pid_is_executable(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(end_of_command) = stat.rfind(')') else {
+            return false;
+        };
+        !matches!(stat[end_of_command + 2..].chars().next(), Some('Z' | 'X'))
     }
 
     #[tokio::test]

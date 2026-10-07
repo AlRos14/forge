@@ -611,12 +611,19 @@ launched through its `DaemonRuntime`, `FallbackExecutor`, and adapter process
 maps. When dispatch ends because the socket is lost or the daemon is shutting
 down, that runtime closes Start admission, cancels its active tasks through
 the same executor and adapters, and waits for bounded task termination before
-reconnect. Successful generation retirement also verifies the retained
-adapter process handles after task join; adapters wait for their direct child
-or process group to exit before reporting cancellation complete. Therefore a
-successful retirement proves that its execution processes cannot outlive the
-generation. If a task must be aborted, or process termination cannot be
-verified, retirement fails closed. The connect loop returns that failure to
+reconnect. On Unix, each remote harness Execution starts in a dedicated
+process group whose ID is retained only by that generation's in-memory adapter
+handle. Successful adapter cancellation sends SIGKILL to that group, reaps the
+leader, and waits until the group no longer exists; a cached leader exit is not
+evidence that descendants have exited. Therefore successful Unix generation
+retirement proves that no process in those Execution groups can continue work.
+Drop guards send a last-resort group signal but do not prove termination. If a
+task must be aborted, or process termination cannot be verified, retirement
+fails closed. On non-Unix hosts the current command-group API creates a Windows
+Job Object but does not expose a reliable active-member check, so remote harness
+launch fails before spawning until Forge can verify that the Job Object is
+empty. No Windows process-tree retirement guarantee is claimed. The connect
+loop returns teardown failure to
 the daemon supervisor, which stops reporting readiness, shuts down the daemon,
 and does not create a replacement generation. A replacement connection for
 the same daemon ID starts with a new runtime and never adopts old process

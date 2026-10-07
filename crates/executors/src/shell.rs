@@ -1,11 +1,8 @@
 use crate::{
     build_shell_command_plan, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    LogKind, LogStream, LogWriter, ShellConfig, TaskExecutor,
+    LogKind, LogStream, LogWriter, ProcessGroupChild, ShellConfig, TaskExecutor,
 };
 use async_trait::async_trait;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
-#[cfg(unix)]
-use command_group::{Signal, UnixChildExt};
 use std::{
     collections::HashMap,
     process::Stdio,
@@ -75,17 +72,17 @@ impl ShellExecutor {
 }
 
 struct RunningProcess {
-    child: Arc<AsyncMutex<AsyncGroupChild>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     cancellation_requested: AtomicBool,
 }
 
 struct GroupKillOnDrop {
-    child: Arc<AsyncMutex<AsyncGroupChild>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     armed: bool,
 }
 
 impl GroupKillOnDrop {
-    fn new(child: Arc<AsyncMutex<AsyncGroupChild>>) -> Self {
+    fn new(child: Arc<AsyncMutex<ProcessGroupChild>>) -> Self {
         Self { child, armed: true }
     }
 
@@ -147,7 +144,7 @@ impl TaskExecutor for ShellExecutor {
         }
         command.kill_on_drop(true);
 
-        let mut child = match command.group_spawn() {
+        let mut child = match ProcessGroupChild::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 return Err(ExecutorError::Io(error));
@@ -194,9 +191,16 @@ impl TaskExecutor for ShellExecutor {
         let result = self
             .supervise_process(&ctx, process.clone(), stdout, stderr, &mut writer)
             .await;
-        if result.is_ok() {
-            group_kill_guard.disarm();
+        let cleanup = {
+            let mut child = process.child.lock().await;
+            terminate_process_group(&mut child).await
+        };
+        if let Err(cleanup_error) = cleanup {
+            return Err(ExecutorError::Other(format!(
+                "shell process-group termination could not be verified: {cleanup_error}"
+            )));
         }
+        group_kill_guard.disarm();
 
         self.remove_process(&ctx.execution_id)?;
 
@@ -214,52 +218,38 @@ impl TaskExecutor for ShellExecutor {
 
         #[cfg(unix)]
         {
-            let child = process.child.lock().await;
-            let _ = child.signal(Signal::SIGTERM);
+            process.child.lock().await.send_sigterm()?;
+            let deadline = time::Instant::now() + self.cancel_grace_period;
+            let process_group_exited = loop {
+                let alive = process.child.lock().await.group_is_alive()?;
+                if !alive {
+                    break true;
+                }
+                if time::Instant::now() >= deadline {
+                    break false;
+                }
+                time::sleep(COMPLETION_POLL_INTERVAL).await;
+            };
+
+            let mut child = process.child.lock().await;
+            if process_group_exited {
+                child.wait_leader().await?;
+            } else {
+                terminate_process_group(&mut child).await?;
+            }
         }
         #[cfg(not(unix))]
         {
             let mut child = process.child.lock().await;
-            let _ = child.start_kill();
-        }
-
-        let deadline = time::Instant::now() + self.cancel_grace_period;
-        let process_group_exited = loop {
-            {
-                let mut child = process.child.lock().await;
-                if child.try_wait()?.is_some() {
-                    break true;
-                }
-            }
-
-            if time::Instant::now() >= deadline {
-                break false;
-            }
-
-            time::sleep(COMPLETION_POLL_INTERVAL).await;
-        };
-
-        // AsyncGroupChild tracks the whole process group. Reap it after the
-        // grace period so descendants cannot keep working after cancellation.
-        if !process_group_exited {
-            let mut child = process.child.lock().await;
             terminate_process_group(&mut child).await?;
         }
-
-        let mut child = process.child.lock().await;
-        child.wait().await?;
 
         Ok(())
     }
 }
 
-async fn terminate_process_group(child: &mut AsyncGroupChild) -> std::io::Result<()> {
-    if let Err(kill_error) = child.start_kill() {
-        if child.try_wait()?.is_none() {
-            return Err(kill_error);
-        }
-    }
-    child.wait().await.map(|_| ())
+async fn terminate_process_group(child: &mut ProcessGroupChild) -> std::io::Result<()> {
+    child.kill_and_wait().await.map(|_| ())
 }
 
 impl ShellExecutor {
@@ -323,7 +313,7 @@ impl ShellExecutor {
                 _ = completion_interval.tick() => {
                     let status = {
                         let mut child = process.child.lock().await;
-                        child.try_wait()?
+                        child.try_wait_leader()?
                     };
 
                     if let Some(status) = status {
@@ -333,7 +323,7 @@ impl ShellExecutor {
                 _ = heartbeat.tick() => {
                     let status = {
                         let mut child = process.child.lock().await;
-                        child.try_wait()?
+                        child.try_wait_leader()?
                     };
 
                     if let Some(status) = status {

@@ -1002,13 +1002,10 @@ mod tests {
     use executors::{
         AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
         ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter,
-        HarnessAdapterRegistry,
+        HarnessAdapterRegistry, ProcessGroupChild,
     };
     use tokio::sync::{mpsc, Notify};
-    use tokio::{
-        io::AsyncReadExt,
-        process::{Child, Command},
-    };
+    use tokio::{io::AsyncReadExt, process::Command};
     use tokio_util::sync::CancellationToken;
 
     struct ResumeRecordingAdapter {
@@ -1126,8 +1123,10 @@ mod tests {
     }
 
     struct ChildProcessState {
-        child: Mutex<Option<Arc<tokio::sync::Mutex<Child>>>>,
+        child: Mutex<Option<Arc<tokio::sync::Mutex<ProcessGroupChild>>>>,
         pid: AtomicU32,
+        descendant_pid: AtomicU32,
+        descendant_pid_file: PathBuf,
         spawned: Notify,
         hold_before_registration: bool,
     }
@@ -1160,21 +1159,44 @@ mod tests {
         async fn execute(&self, _ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
             let mut command = Command::new("sh");
             command
-                .args(["-c", "exec sleep 60"])
-                .kill_on_drop(true)
+                .args([
+                    "-c",
+                    &format!(
+                        "sleep 60 & echo $! > '{}' ; exec sleep 60",
+                        self.state.descendant_pid_file.display()
+                    ),
+                ])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null());
-            let mut child = command.spawn()?;
+            let mut child = ProcessGroupChild::spawn(&mut command)?;
             self.state
                 .pid
-                .store(child.id().expect("child has pid"), Ordering::SeqCst);
+                .store(child.id().expect("leader has pid"), Ordering::SeqCst);
+
+            let descendant_pid = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(value) =
+                        tokio::fs::read_to_string(&self.state.descendant_pid_file).await
+                    {
+                        if let Ok(pid) = value.trim().parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| ExecutorError::Other("descendant did not write its PID".to_owned()))?;
+            self.state
+                .descendant_pid
+                .store(descendant_pid, Ordering::SeqCst);
 
             if self.state.hold_before_registration {
                 self.state.spawned.notify_one();
                 std::future::pending::<()>().await;
             }
 
-            let stdout = child.stdout.take().expect("child stdout is piped");
+            let stdout = child.inner().stdout.take().expect("child stdout is piped");
             let child = Arc::new(tokio::sync::Mutex::new(child));
             *self.state.child.lock().expect("child process lock") = Some(child.clone());
             self.state.spawned.notify_one();
@@ -1182,7 +1204,7 @@ mod tests {
             let mut output = Vec::new();
             let mut stdout = stdout;
             stdout.read_to_end(&mut output).await?;
-            let status = child.lock().await.wait().await?;
+            let status = child.lock().await.kill_and_wait().await?;
             self.state.child.lock().expect("child process lock").take();
             Ok(ExecutionResult {
                 status: if status.success() {
@@ -1198,12 +1220,7 @@ mod tests {
             let child = self.state.child.lock().expect("child process lock").clone();
             if let Some(child) = child {
                 let mut child = child.lock().await;
-                if let Err(kill_error) = child.start_kill() {
-                    if child.try_wait()?.is_none() {
-                        return Err(ExecutorError::Io(kill_error));
-                    }
-                }
-                child.wait().await?;
+                child.kill_and_wait().await?;
             }
             Ok(())
         }
@@ -1637,12 +1654,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn successful_generation_retirement_proves_real_child_is_dead() {
+    async fn successful_generation_retirement_proves_real_process_tree_dead_before_a2() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, _rx) = mpsc::unbounded_channel();
         let state = Arc::new(ChildProcessState {
             child: Mutex::new(None),
             pid: AtomicU32::new(0),
+            descendant_pid: AtomicU32::new(0),
+            descendant_pid_file: dir.path().join("a1-descendant.pid"),
             spawned: Notify::new(),
             hold_before_registration: false,
         });
@@ -1656,20 +1675,48 @@ mod tests {
             .await
             .expect("real child starts");
         let pid = state.pid.load(Ordering::SeqCst);
+        let descendant_pid = state.descendant_pid.load(Ordering::SeqCst);
         assert_ne!(pid, 0);
+        assert_ne!(descendant_pid, 0);
         assert!(
-            executors::is_pid_alive(pid),
-            "child is alive before retirement"
+            process_is_executable(pid),
+            "A1 leader is live before retirement"
+        );
+        assert!(
+            process_is_executable(descendant_pid),
+            "A1 descendant is live before retirement"
         );
 
         runtime
             .retire()
             .await
-            .expect("successful retirement proves child termination");
+            .expect("successful retirement proves process-tree termination");
         assert!(
-            !executors::is_pid_alive(pid),
-            "child PID must be gone when retirement returns Ok"
+            !process_is_executable(pid),
+            "A1 leader is dead on retirement"
         );
+        assert!(
+            !process_is_executable(descendant_pid),
+            "A1 descendant is dead on retirement"
+        );
+
+        let (a2_tx, _a2_rx) = mpsc::unbounded_channel();
+        let a2_state = Arc::new(ChildProcessState {
+            child: Mutex::new(None),
+            pid: AtomicU32::new(0),
+            descendant_pid: AtomicU32::new(0),
+            descendant_pid_file: dir.path().join("a2-descendant.pid"),
+            spawned: Notify::new(),
+            hold_before_registration: false,
+        });
+        let a2 = child_process_runtime(dir.path(), Arc::clone(&a2_state), a2_tx);
+        a2.start(controlled_start_params(dir.path(), "exec-real-child-a2"))
+            .await
+            .expect("A2 starts only after A1 tree retirement succeeds");
+        tokio::time::timeout(Duration::from_secs(2), a2_state.spawned.notified())
+            .await
+            .expect("A2 process tree starts");
+        a2.retire().await.expect("A2 process tree retires");
     }
 
     #[cfg(unix)]
@@ -1680,6 +1727,8 @@ mod tests {
         let state = Arc::new(ChildProcessState {
             child: Mutex::new(None),
             pid: AtomicU32::new(0),
+            descendant_pid: AtomicU32::new(0),
+            descendant_pid_file: dir.path().join("pre-registration-descendant.pid"),
             spawned: Notify::new(),
             hold_before_registration: true,
         });
@@ -1693,11 +1742,17 @@ mod tests {
             .await
             .expect("child reaches the pre-registration barrier");
         let pid = state.pid.load(Ordering::SeqCst);
+        let descendant_pid = state.descendant_pid.load(Ordering::SeqCst);
         assert_ne!(pid, 0);
+        assert_ne!(descendant_pid, 0);
         assert!(state.child.lock().expect("child process lock").is_none());
         assert!(
-            executors::is_pid_alive(pid),
-            "child is alive before retirement"
+            process_is_executable(pid),
+            "leader is live before retirement"
+        );
+        assert!(
+            process_is_executable(descendant_pid),
+            "descendant is live before retirement"
         );
 
         let retirement = tokio::time::timeout(Duration::from_secs(9), runtime.retire())
@@ -1705,12 +1760,30 @@ mod tests {
             .expect("bounded retirement finishes");
         assert!(retirement.is_err(), "aborted task must fail closed");
         tokio::time::timeout(Duration::from_secs(2), async {
-            while executors::is_pid_alive(pid) {
+            while process_is_executable(pid) || process_is_executable(descendant_pid) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("kill_on_drop terminates the pre-registration child");
+        .expect("drop guard kills the pre-registration process group");
+    }
+
+    #[cfg(unix)]
+    fn process_is_executable(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            let Some(end_of_command) = stat.rfind(')') else {
+                return false;
+            };
+            !matches!(stat[end_of_command + 2..].chars().next(), Some('Z' | 'X'))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            executors::is_pid_alive(pid)
+        }
     }
 
     async fn next_execution_log_line(
