@@ -14,7 +14,7 @@ pub async fn run(
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let workspace_root = Arc::new(workspace_root);
-    run_with_reconnect(client, move |stream| {
+    run_with_reconnect(client, shutdown.clone(), move |stream| {
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
         let active_executions = active_executions.clone();
@@ -48,7 +48,11 @@ pub async fn run(
                     }
                 }
             };
-            run_dispatch_loop(stream, handler, shutdown, responses_tx, responses_rx).await
+            forge_client::daemon_runtime::retire_generation_after_dispatch(
+                &daemon_runtime,
+                run_dispatch_loop(stream, handler, shutdown, responses_tx, responses_rx),
+            )
+            .await
         }
     })
     .await

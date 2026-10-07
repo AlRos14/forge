@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use api_types::{
     DaemonErrorPayload, DaemonFrame, DaemonProtocolCapabilities, DaemonProtocolCapabilitiesRequest,
     ExecutionCancelParams, ExecutionCancelResult, ExecutionStartParams, ExecutionStartResult,
@@ -24,7 +25,11 @@ use executors::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -34,6 +39,9 @@ use crate::{
 
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 const EXECUTION_ERROR: &str = "execution_error";
+const GENERATION_CANCEL_TIMEOUT: Duration = Duration::from_secs(12);
+const GENERATION_TASK_TIMEOUT: Duration = Duration::from_secs(5);
+const GENERATION_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A finished execution's terminal notification is only queued for the command
 /// stream when its guard drops, so a report snapshot taken right after could
@@ -128,7 +136,7 @@ pub async fn run_command_stream(
     active_executions: ActiveExecutionTracker,
 ) -> Result<()> {
     let workspace_root = Arc::new(workspace_root);
-    run_with_reconnect(client, move |stream| {
+    run_with_reconnect(client, shutdown.clone(), move |stream| {
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
         let active_executions = active_executions.clone();
@@ -146,10 +154,29 @@ pub async fn run_command_stream(
                     async move { runtime.handle_request(frame).await }
                 }
             };
-            run_dispatch_loop(stream, handler, shutdown, responses_tx, responses_rx).await
+            retire_generation_after_dispatch(
+                &runtime,
+                run_dispatch_loop(stream, handler, shutdown, responses_tx, responses_rx),
+            )
+            .await
         }
     })
     .await
+}
+
+/// Await one command connection's dispatch loop, then retire all executions
+/// owned by that generation on both disconnect and graceful shutdown.
+pub async fn retire_generation_after_dispatch<Fut>(
+    runtime: &DaemonRuntime,
+    dispatch: Fut,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    if let Err(error) = dispatch.await {
+        tracing::warn!(%error, "daemon command dispatch ended");
+    }
+    runtime.retire().await
 }
 
 pub struct DaemonRuntime {
@@ -157,6 +184,15 @@ pub struct DaemonRuntime {
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     executor: Arc<FallbackExecutor>,
     active_executions: ActiveExecutionTracker,
+    generation: Mutex<ExecutionGeneration>,
+}
+
+#[derive(Default)]
+struct ExecutionGeneration {
+    retired: bool,
+    owned_execution_ids: HashSet<String>,
+    running_execution_ids: HashSet<String>,
+    tasks: JoinSet<String>,
 }
 
 impl DaemonRuntime {
@@ -188,6 +224,7 @@ impl DaemonRuntime {
             outbound,
             executor: Arc::new(FallbackExecutor::new(registry)),
             active_executions,
+            generation: Mutex::new(ExecutionGeneration::default()),
         })
     }
 
@@ -302,8 +339,34 @@ impl DaemonRuntime {
         let executor = Arc::clone(&self.executor);
         let outbound = self.outbound.clone();
         let active_executions = self.active_executions.clone();
-        tokio::spawn(async move {
-            run_execution_task(executor, outbound, ctx, active_executions).await;
+        let mut generation = self
+            .generation
+            .lock()
+            .expect("daemon execution generation lock");
+        reap_finished_generation_tasks(&mut generation);
+        if generation.retired {
+            return Err(execution_error(
+                "daemon command connection generation is retiring",
+            ));
+        }
+        if !generation.owned_execution_ids.insert(execution_id.clone()) {
+            return Err(execution_error(format!(
+                "execution {execution_id} was already admitted by this connection generation"
+            )));
+        }
+
+        // Arm the cancellation state before spawning. A disconnect can retire
+        // this generation as soon as Start is accepted, including before the
+        // task reaches FallbackExecutor::execute.
+        self.executor.prepare_execution(&execution_id);
+        generation
+            .running_execution_ids
+            .insert(execution_id.clone());
+        let task_id = execution_id.clone();
+        generation.tasks.spawn(async move {
+            run_execution_task(Arc::clone(&executor), outbound, ctx, active_executions).await;
+            executor.finish_execution(&task_id);
+            task_id
         });
 
         Ok(ExecutionStartResult {
@@ -316,6 +379,24 @@ impl DaemonRuntime {
         &self,
         params: ExecutionCancelParams,
     ) -> CommandResult<ExecutionCancelResult> {
+        let execution_is_owned = {
+            let mut generation = self
+                .generation
+                .lock()
+                .expect("daemon execution generation lock");
+            reap_finished_generation_tasks(&mut generation);
+            !generation.retired
+                && generation
+                    .running_execution_ids
+                    .contains(&params.execution_id)
+        };
+        if !execution_is_owned {
+            return Ok(ExecutionCancelResult {
+                execution_id: params.execution_id,
+                cancelled: false,
+            });
+        }
+
         self.executor
             .cancel(&params.execution_id)
             .await
@@ -324,6 +405,127 @@ impl DaemonRuntime {
             execution_id: params.execution_id,
             cancelled: true,
         })
+    }
+
+    /// Retire this command connection generation and stop every Execution it
+    /// launched through the exact executor and adapter instances that own its
+    /// live process handles. Reconnected runtimes never adopt these tasks.
+    pub async fn retire(&self) -> Result<()> {
+        let (mut tasks, execution_ids) = {
+            let mut generation = self
+                .generation
+                .lock()
+                .expect("daemon execution generation lock");
+            generation.retired = true;
+            reap_finished_generation_tasks(&mut generation);
+            let execution_ids = std::mem::take(&mut generation.running_execution_ids)
+                .into_iter()
+                .collect::<Vec<_>>();
+            (std::mem::take(&mut generation.tasks), execution_ids)
+        };
+
+        if execution_ids.is_empty() {
+            return Ok(());
+        }
+
+        let executor = Arc::clone(&self.executor);
+        let cancellations =
+            futures_util::future::join_all(execution_ids.iter().cloned().map(|execution_id| {
+                let executor = Arc::clone(&executor);
+                async move { (execution_id.clone(), executor.cancel(&execution_id).await) }
+            }));
+        match timeout(GENERATION_CANCEL_TIMEOUT, cancellations).await {
+            Ok(results) => {
+                for (execution_id, result) in results {
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            %execution_id,
+                            %error,
+                            "failed to cancel execution while retiring daemon connection generation"
+                        );
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(
+                execution_count = execution_ids.len(),
+                timeout_secs = GENERATION_CANCEL_TIMEOUT.as_secs(),
+                "timed out cancelling executions while retiring daemon connection generation"
+            ),
+        }
+
+        let joined = timeout(GENERATION_TASK_TIMEOUT, join_generation_tasks(&mut tasks)).await;
+        if joined.is_err() {
+            tracing::warn!(
+                execution_count = execution_ids.len(),
+                timeout_secs = GENERATION_TASK_TIMEOUT.as_secs(),
+                "execution tasks did not finish after daemon generation cancellation; aborting remaining tasks"
+            );
+            tasks.abort_all();
+            let aborted =
+                timeout(GENERATION_ABORT_TIMEOUT, join_generation_tasks(&mut tasks)).await;
+            if aborted.is_err() {
+                return Err(anyhow!(
+                    "execution tasks did not stop after daemon connection generation was retired"
+                ));
+            }
+
+            // Aborting an adapter future releases locks held by its process
+            // supervisor. Retry cancellation through the same adapter registry
+            // so retained process handles receive their final termination.
+            let executor = Arc::clone(&self.executor);
+            let pending_execution_ids = execution_ids
+                .iter()
+                .filter(|execution_id| self.executor.owns_execution(execution_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let cancellations = futures_util::future::join_all(
+                pending_execution_ids.into_iter().map(|execution_id| {
+                    let executor = Arc::clone(&executor);
+                    async move { (execution_id.clone(), executor.cancel(&execution_id).await) }
+                }),
+            );
+            match timeout(GENERATION_CANCEL_TIMEOUT, cancellations).await {
+                Ok(results) => {
+                    let failures = results
+                        .into_iter()
+                        .filter_map(|(execution_id, result)| {
+                            result.err().map(|error| format!("{execution_id}: {error}"))
+                        })
+                        .collect::<Vec<_>>();
+                    if !failures.is_empty() {
+                        return Err(anyhow!(
+                            "failed to terminate daemon generation executions: {}",
+                            failures.join(", ")
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "timed out terminating daemon generation executions after task abort"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn reap_finished_generation_tasks(generation: &mut ExecutionGeneration) {
+    while let Some(result) = generation.tasks.try_join_next() {
+        if let Ok(execution_id) = result {
+            generation.running_execution_ids.remove(&execution_id);
+        }
+    }
+}
+
+async fn join_generation_tasks(tasks: &mut JoinSet<String>) {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                tracing::warn!(%error, "daemon execution task failed while joining its generation");
+            }
+        }
     }
 }
 
@@ -736,7 +938,10 @@ fn rfc3339_now() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use super::*;
     use api_types::{
@@ -750,7 +955,8 @@ mod tests {
         ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter,
         HarnessAdapterRegistry,
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
+    use tokio_util::sync::CancellationToken;
 
     struct ResumeRecordingAdapter {
         invocations: Arc<Mutex<Vec<executors::HarnessInvocation>>>,
@@ -795,6 +1001,118 @@ mod tests {
         async fn cancel(&self, _execution_id: &str) -> Result<(), ExecutorError> {
             Ok(())
         }
+    }
+
+    struct ControlledExecution {
+        started: AtomicBool,
+        running: AtomicBool,
+        cancellations: AtomicUsize,
+        started_notify: Notify,
+        cancel: CancellationToken,
+        complete: CancellationToken,
+    }
+
+    impl ControlledExecution {
+        fn new() -> Self {
+            Self {
+                started: AtomicBool::new(false),
+                running: AtomicBool::new(false),
+                cancellations: AtomicUsize::new(0),
+                started_notify: Notify::new(),
+                cancel: CancellationToken::new(),
+                complete: CancellationToken::new(),
+            }
+        }
+    }
+
+    struct ControlledAdapter {
+        execution: Arc<ControlledExecution>,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for ControlledAdapter {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Codex
+        }
+
+        fn check_availability(&self) -> AvailabilityInfo {
+            AvailabilityInfo {
+                status: AvailabilityStatus::Authenticated,
+                authenticated_at: None,
+                config_path: None,
+            }
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: DiscoverContext,
+        ) -> Result<DiscoveredOptions, ExecutorError> {
+            Ok(DiscoveredOptions::default())
+        }
+
+        async fn execute(&self, _ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+            self.execution.running.store(true, Ordering::SeqCst);
+            self.execution.started.store(true, Ordering::SeqCst);
+            self.execution.started_notify.notify_one();
+            let status = tokio::select! {
+                () = self.execution.cancel.cancelled() => ExecutionOutcome::Cancelled,
+                () = self.execution.complete.cancelled() => ExecutionOutcome::Completed,
+            };
+            self.execution.running.store(false, Ordering::SeqCst);
+            Ok(ExecutionResult {
+                status,
+                ..Default::default()
+            })
+        }
+
+        async fn cancel(&self, _execution_id: &str) -> Result<(), ExecutorError> {
+            self.execution.cancellations.fetch_add(1, Ordering::SeqCst);
+            self.execution.cancel.cancel();
+            Ok(())
+        }
+    }
+
+    fn controlled_runtime(
+        workspace_root: &Path,
+        execution: Arc<ControlledExecution>,
+        tracker: ActiveExecutionTracker,
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+    ) -> Arc<DaemonRuntime> {
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(ControlledAdapter { execution }));
+        DaemonRuntime::new_with_registry_and_tracker(
+            outbound,
+            workspace_root.to_path_buf(),
+            Arc::new(registry),
+            tracker,
+        )
+    }
+
+    fn controlled_start_params(workspace_root: &Path, execution_id: &str) -> ExecutionStartParams {
+        ExecutionStartParams {
+            task_id: "task-generation".to_owned(),
+            execution_id: execution_id.to_owned(),
+            role: "coder".to_owned(),
+            workspace_path: workspace_root.to_string_lossy().into_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: serde_json::json!({
+                "executor_type": "codex",
+                "config": {}
+            }),
+            prompt: serde_json::json!({ "description": "controlled execution" }),
+            invocation: executors::HarnessInvocation::Start,
+            max_turns: None,
+        }
+    }
+
+    async fn wait_until_started(execution: &ControlledExecution) {
+        if execution.started.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(2), execution.started_notify.notified())
+            .await
+            .expect("controlled execution starts");
+        assert!(execution.started.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1030,6 +1348,139 @@ mod tests {
 
         let notification = next_terminal_notification(&mut rx, &execution_id).await;
         assert_eq!(notification.status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn lost_connection_generation_cancels_and_joins_its_running_execution() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let execution = Arc::new(ControlledExecution::new());
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let runtime = controlled_runtime(dir.path(), Arc::clone(&execution), tracker.clone(), tx);
+
+        runtime
+            .start(controlled_start_params(dir.path(), "exec-generation-e"))
+            .await
+            .expect("execution starts on generation A1");
+        wait_until_started(&execution).await;
+        assert!(execution.running.load(Ordering::SeqCst));
+        assert_eq!(runtime.active_execution_ids(), ["exec-generation-e"]);
+
+        retire_generation_after_dispatch(&runtime, async {
+            Err(anyhow::anyhow!("command socket dropped"))
+        })
+        .await
+        .expect("generation retires its execution after disconnect");
+
+        assert_eq!(execution.cancellations.load(Ordering::SeqCst), 1);
+        assert!(!execution.running.load(Ordering::SeqCst));
+        assert!(runtime.active_execution_ids().is_empty());
+        assert!(tracker.active_ids().is_empty());
+        let terminal = next_terminal_notification(&mut rx, "exec-generation-e").await;
+        assert_eq!(terminal.status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_start_accepted_before_its_adapter_begins() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let execution = Arc::new(ControlledExecution::new());
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let runtime = controlled_runtime(dir.path(), Arc::clone(&execution), tracker.clone(), tx);
+
+        runtime
+            .start(controlled_start_params(dir.path(), "exec-pending-start"))
+            .await
+            .expect("Start is admitted before disconnect");
+        retire_generation_after_dispatch(&runtime, async {
+            Err(anyhow::anyhow!("connection dropped before adapter start"))
+        })
+        .await
+        .expect("pending Start is retired with its generation");
+
+        assert_eq!(execution.cancellations.load(Ordering::SeqCst), 1);
+        assert!(!execution.running.load(Ordering::SeqCst));
+        assert!(tracker.active_ids().is_empty());
+        let terminal = next_terminal_notification(&mut rx, "exec-pending-start").await;
+        assert_eq!(terminal.status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn new_connection_generation_does_not_adopt_old_execution_and_runs_new_work() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let (a1_tx, mut a1_rx) = mpsc::unbounded_channel();
+        let a1_execution = Arc::new(ControlledExecution::new());
+        let a1 = controlled_runtime(
+            dir.path(),
+            Arc::clone(&a1_execution),
+            tracker.clone(),
+            a1_tx,
+        );
+        a1.start(controlled_start_params(dir.path(), "exec-old-generation"))
+            .await
+            .expect("A1 starts E");
+        wait_until_started(&a1_execution).await;
+        retire_generation_after_dispatch(&a1, async { Err(anyhow::anyhow!("A1 disconnected")) })
+            .await
+            .expect("A1 terminates E before retirement");
+        let terminal = next_terminal_notification(&mut a1_rx, "exec-old-generation").await;
+        assert_eq!(terminal.status.as_deref(), Some("cancelled"));
+        assert!(!a1_execution.running.load(Ordering::SeqCst));
+
+        // The logical daemon identity is unchanged across this replacement;
+        // only its in-memory command generation and runtime are new.
+        let (a2_tx, mut a2_rx) = mpsc::unbounded_channel();
+        let a2_execution = Arc::new(ControlledExecution::new());
+        let a2 = controlled_runtime(
+            dir.path(),
+            Arc::clone(&a2_execution),
+            tracker.clone(),
+            a2_tx,
+        );
+        let old_cancel = a2
+            .cancel(ExecutionCancelParams {
+                execution_id: "exec-old-generation".to_owned(),
+                reason: Some("recovery".to_owned()),
+            })
+            .await
+            .expect("A2 rejects control over E from A1");
+        assert!(!old_cancel.cancelled);
+        assert_eq!(a2_execution.cancellations.load(Ordering::SeqCst), 0);
+
+        a2.start(controlled_start_params(dir.path(), "exec-new-generation"))
+            .await
+            .expect("A2 starts F normally");
+        wait_until_started(&a2_execution).await;
+        a2_execution.complete.cancel();
+        let terminal = next_terminal_notification(&mut a2_rx, "exec-new-generation").await;
+        assert_eq!(terminal.status.as_deref(), Some("completed"));
+        assert!(!a2_execution.running.load(Ordering::SeqCst));
+        a2.retire().await.expect("A2 retires cleanly");
+    }
+
+    #[tokio::test]
+    async fn graceful_daemon_shutdown_retires_running_generation_execution() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let execution = Arc::new(ControlledExecution::new());
+        let tracker = ActiveExecutionTracker::with_finished_linger(Duration::ZERO);
+        let runtime = controlled_runtime(dir.path(), Arc::clone(&execution), tracker.clone(), tx);
+
+        runtime
+            .start(controlled_start_params(dir.path(), "exec-daemon-shutdown"))
+            .await
+            .expect("execution starts before shutdown");
+        wait_until_started(&execution).await;
+        retire_generation_after_dispatch(&runtime, async { Ok(()) })
+            .await
+            .expect("graceful dispatch exit retires its execution");
+
+        assert_eq!(execution.cancellations.load(Ordering::SeqCst), 1);
+        assert!(!execution.running.load(Ordering::SeqCst));
+        assert!(tracker.active_ids().is_empty());
+        let terminal = next_terminal_notification(&mut rx, "exec-daemon-shutdown").await;
+        assert_eq!(terminal.status.as_deref(), Some("cancelled"));
     }
 
     async fn next_execution_log_line(

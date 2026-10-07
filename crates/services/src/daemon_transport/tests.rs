@@ -334,6 +334,89 @@ async fn remote_resume_requires_protocol_feature_and_dispatches_exact_session() 
 }
 
 #[tokio::test]
+async fn execution_start_after_same_daemon_reconnect_uses_current_generation() {
+    let registry = make_registry();
+    let (connection_a, mut outbound_a) = DaemonConnection::new("daemon-1".to_owned());
+    let connection_a_id = connection_a.id();
+    registry.register("daemon-1".to_owned(), connection_a);
+
+    // Execution admission has frozen daemon-1. Its socket reconnects before
+    // Start, so the request must use the current generation of that same host.
+    let (connection_b, mut outbound_b) = DaemonConnection::new("daemon-1".to_owned());
+    assert_ne!(connection_a_id, connection_b.id());
+    registry.register("daemon-1".to_owned(), connection_b);
+
+    let dispatcher = registry.clone();
+    let responder = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request {
+            id: capabilities_id,
+            method,
+            ..
+        } = outbound_b
+            .recv()
+            .await
+            .expect("replacement receives protocol negotiation")
+        else {
+            panic!("expected protocol request on current generation");
+        };
+        assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+        dispatcher.dispatch_incoming(
+            "daemon-1",
+            api_types::DaemonFrame::Response {
+                id: capabilities_id,
+                result: json!({
+                    "schema_version": 1,
+                    "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+                }),
+            },
+        );
+
+        let api_types::DaemonFrame::Request {
+            id: start_id,
+            method,
+            params,
+        } = outbound_b
+            .recv()
+            .await
+            .expect("replacement receives Execution Start")
+        else {
+            panic!("expected Start request on current generation");
+        };
+        assert_eq!(method, api_types::METHOD_EXECUTION_START);
+        assert_eq!(params["execution_id"], "execution-after-reconnect");
+        dispatcher.dispatch_incoming(
+            "daemon-1",
+            api_types::DaemonFrame::Response {
+                id: start_id,
+                result: json!({"execution_id":"execution-after-reconnect", "accepted":true}),
+            },
+        );
+    });
+
+    let provider = super::RemoteExecutionProvider::new(registry, "daemon-1".to_owned());
+    let result = provider
+        .start(api_types::ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-after-reconnect".to_owned(),
+            role: "worker".to_owned(),
+            workspace_path: "/work".to_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: json!({"executor_type":"codex","config":{}}),
+            prompt: json!({"description":"start after same-host reconnect"}),
+            invocation: api_types::HarnessInvocation::Start,
+            max_turns: None,
+        })
+        .await
+        .expect("Start reaches the current generation for frozen daemon-1");
+    assert!(result.accepted);
+    assert!(
+        outbound_a.try_recv().is_err(),
+        "old generation stays unused"
+    );
+    responder.await.expect("replacement responder joins");
+}
+
+#[tokio::test]
 async fn remote_dispatch_does_not_cross_daemon_connection_generation() {
     let registry = make_registry();
     let (connection_a, mut outbound_a) = DaemonConnection::new("daemon-1".to_owned());

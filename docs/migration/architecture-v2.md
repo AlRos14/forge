@@ -606,6 +606,17 @@ a closed failure. Reconnecting the same logical daemon remains valid under
 PR3's connection-generation checks. The daemon ID identifies the host chosen
 for an Execution; it is separate from a socket connection generation.
 
+On the daemon, each command connection generation owns the Execution tasks
+launched through its `DaemonRuntime`, `FallbackExecutor`, and adapter process
+maps. When dispatch ends because the socket is lost or the daemon is shutting
+down, that runtime closes Start admission, cancels its active tasks through
+the same executor and adapters, and waits for bounded task termination before
+reconnect. A replacement connection for the same daemon ID starts with a new
+runtime and never adopts old process handles. If the old socket is already
+gone, its final log or terminal notification may be lost; daemon reports and
+the existing recovery path reconcile durable Execution state. Failed bounded
+teardown stops reconnect so a later generation cannot overlap the old work.
+
 An Execution's `credential_ref` is immutable invocation identity. Credential
 resolution may verify current Agent ownership and credential status, but it
 never reads the Agent's current credential to choose a replacement. Secret

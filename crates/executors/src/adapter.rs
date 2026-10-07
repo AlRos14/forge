@@ -387,6 +387,29 @@ impl FallbackExecutor {
         }
     }
 
+    /// Reserve cancellation state before a daemon runtime spawns the execution
+    /// task. This lets a generation retirement cancel a Start that has been
+    /// accepted but has not entered `execute` yet.
+    pub fn prepare_execution(&self, execution_id: &str) {
+        let _ = self.cancellation_flag(execution_id);
+    }
+
+    /// Release the reservation after the daemon execution task has completed,
+    /// including failures that happen before `execute` is entered.
+    pub fn finish_execution(&self, execution_id: &str) {
+        self.clear_cancellation(execution_id);
+    }
+
+    /// Whether this executor instance still owns cancellation state for an
+    /// admitted execution. A replacement runtime uses this to avoid claiming
+    /// control over an id from an older connection generation.
+    pub fn owns_execution(&self, execution_id: &str) -> bool {
+        self.cancellations
+            .lock()
+            .expect("cancellation lock poisoned")
+            .contains_key(execution_id)
+    }
+
     /// The preferred candidate is the snapshot's top-level pair (the launch
     /// path points it at the sticky winner); remaining route candidates
     /// follow in configured order.
@@ -1506,6 +1529,32 @@ mod tests {
         let result = run.await.expect("join").expect("terminal result");
         assert_eq!(result.status, ExecutionOutcome::Cancelled);
         assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
+    }
+
+    #[tokio::test]
+    async fn prepared_execution_cancelled_before_execute_never_starts_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[(
+            "model-a",
+            ScriptedBehavior::Complete {
+                usage_output_tokens: 1,
+            },
+        )]);
+
+        executor.prepare_execution("pre-cancelled");
+        assert!(executor.owns_execution("pre-cancelled"));
+        executor
+            .cancel("pre-cancelled")
+            .await
+            .expect("reserved execution can be cancelled before its task starts");
+
+        let result = executor
+            .execute(routed_ctx("pre-cancelled", dir.path()))
+            .await
+            .expect("pre-cancelled execution returns a terminal outcome");
+        assert_eq!(result.status, ExecutionOutcome::Cancelled);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!executor.owns_execution("pre-cancelled"));
     }
 
     #[tokio::test]

@@ -350,7 +350,11 @@ where
     }
 }
 
-pub async fn run_with_reconnect<F, Fut>(client: Arc<DaemonClient>, on_stream: F) -> !
+pub async fn run_with_reconnect<F, Fut>(
+    client: Arc<DaemonClient>,
+    mut shutdown: watch::Receiver<bool>,
+    on_stream: F,
+) -> Result<()>
 where
     F: Fn(DaemonCommandStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>>,
@@ -359,43 +363,36 @@ where
     let mut reconnect_attempt: u64 = 0;
 
     loop {
-        match client.connect_command_stream().await {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+
+        let connection = tokio::select! {
+            result = client.connect_command_stream() => result,
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
+        match connection {
             Ok(stream) => {
                 tracing::info!(
                     daemon_id = ?client.daemon_id,
                     "daemon command stream connected"
                 );
                 backoff = Duration::from_secs(DAEMON_RETRY_INITIAL_BACKOFF_SECS);
-
-                let heartbeat_sender = Arc::clone(&stream.sender);
-                let mut heartbeat =
-                    tokio::spawn(async move { heartbeat_loop(heartbeat_sender).await });
-                let stream_future = on_stream(stream);
-                tokio::pin!(stream_future);
-
-                let result = tokio::select! {
-                    result = &mut stream_future => {
-                        heartbeat.abort();
-                        let _ = heartbeat.await;
-                        result
-                    }
-                    result = &mut heartbeat => {
-                        match result {
-                            Ok(Ok(())) => Ok(()),
-                            Ok(Err(error)) => Err(error).context("daemon heartbeat failed"),
-                            Err(error) => Err(error).context("daemon heartbeat task failed"),
-                        }
-                    }
-                };
-
-                if let Err(error) = result {
-                    tracing::warn!(
-                        error = %error,
-                        "daemon command stream ended with error; reconnecting"
+                if let Err(error) = on_stream(stream).await {
+                    return Err(error).context(
+                        "daemon command generation failed to retire its owned executions",
                     );
-                } else {
-                    tracing::warn!("daemon command stream closed; reconnecting");
                 }
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                tracing::warn!("daemon command stream closed; reconnecting");
             }
             Err(error) => {
                 tracing::warn!(
@@ -411,7 +408,14 @@ where
             backoff_secs = backoff.as_secs(),
             "daemon command stream reconnect scheduled"
         );
-        sleep(backoff).await;
+        tokio::select! {
+            () = sleep(backoff) => {}
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
         backoff = next_backoff(backoff);
     }
 }
@@ -466,18 +470,6 @@ pub async fn report_with_retry(
             }
             Err(error) => return Err(error),
         }
-    }
-}
-
-async fn heartbeat_loop(sender: SharedCommandSender) -> Result<()> {
-    let mut ticker = tokio::time::interval(Duration::from_secs(DAEMON_HEARTBEAT_INTERVAL_SECS));
-    ticker.tick().await;
-    let mut seq = 0;
-
-    loop {
-        ticker.tick().await;
-        seq += 1;
-        send_frame(&sender, &api_types::DaemonFrame::Heartbeat { seq }).await?;
     }
 }
 

@@ -122,17 +122,12 @@ async fn main() -> Result<()> {
     wait_for_shutdown(shutdown_rx.clone()).await;
     tracing::info!("forge-daemon shutting down");
 
-    if let Err(error) = reporter_handle.await.context("join daemon reporter task")? {
+    let (reporter_result, connect_result) = tokio::join!(reporter_handle, connect_handle);
+    if let Err(error) = reporter_result.context("join daemon reporter task")? {
         tracing::warn!(error = %error, "daemon reporter stopped with error");
     }
 
-    connect_handle.abort();
-    match connect_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(error = %error, "daemon command loop stopped with error"),
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => tracing::warn!(error = %error, "daemon command loop task failed"),
-    }
+    connect_result.context("join daemon command loop task")??;
 
     Ok(())
 }

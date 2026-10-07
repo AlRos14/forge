@@ -154,6 +154,18 @@ OS; PR10 adds no sandbox, process-isolation, or cognition infrastructure.
 
 ## Implementation and verification result
 
+Remote command work is owned by the daemon command connection generation
+whose `DaemonRuntime` launched it. Disconnect and graceful shutdown close that
+runtime to new Starts, cancel its active Executions through the same
+`FallbackExecutor` and adapter instances, then wait for bounded task
+termination before a reconnect can create a new runtime. A new generation for
+the same logical daemon never adopts old process handles. Logs or a terminal
+notification sent after the socket disappears may be lost; the existing daemon
+report and recovery paths reconcile durable Execution state. If bounded
+teardown cannot complete, the daemon stops instead of reconnecting alongside
+work it can no longer control. This ephemeral control lifetime does not change
+the Execution's frozen `resolved_daemon_id` or HarnessSession authority.
+
 No database migration was required. Retired runtime and protected payload rows
 remain historical; `execution.agent_session_id` remains readable but is no
 longer consulted to resume or materialized into `HarnessSession`. The
