@@ -45,5 +45,6 @@ external session cannot resume, the adapter reports unsupported or unavailable
 and policy chooses queue, stop/resume, or a new explicit Execution.
 
 No role-name lookup or latest-thread heuristic is a fundamental identity
-mechanism. Any temporary compatibility reader is bounded to the owning Plan PR
-that removes it.
+mechanism. Plan PR10 removed the legacy `execution.agent_session_id` resume
+reader: only an explicit reusable `HarnessSession` authorizes Resume. The
+legacy field remains a historical projection for audit and responses.

@@ -71,10 +71,13 @@ Role, Task, model, or latest Execution, and a session scoped to one workspace
 is not silently reused in another. Human Executions have no HarnessSession.
 
 The existing `agent_session` table and `AgentSession` model are deliberately
-different. They belong to the embedded Agent Runtime/Agent Host, together
-with `agent_context_scope`, protected runtime state, and context manifests.
-They remain legacy embedded-runtime infrastructure until the named later
-cleanup; they are not the generic Execution continuity authority.
+different. They preserve history from the retired embedded Agent Runtime and
+remain readable for audit and connection-health projections. No new embedded
+execution may create or resume one, and it is never the generic Execution
+continuity authority. `agent_context_scope` remains the foreign-key scope for
+server-owned Chat context manifests; those deny-workspace rows do not authorize
+runtime tools. Protected runtime state, LCM state, and runtime context manifests
+have no post-PR10 cognition consumer and remain historical until Plan PR13.
 
 The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of
 representation, each Execution snapshots the exact effective profile,

@@ -4,8 +4,8 @@ mod common;
 
 use api_types::{
     AgentChatMessageListResponse, AgentChatSwitcherResponse, AgentChatTurnJobResponse,
-    AgentChatTurnStatus, ConnectedEmbeddedAgentResponse, ErrorResponse, MainAgentBindingResponse,
-    ProjectAgentBindingResponse, ProjectResponse, SendAgentChatMessageResponse,
+    AgentChatTurnStatus, ErrorResponse, MainAgentBindingResponse, ProjectAgentBindingResponse,
+    ProjectResponse, SendAgentChatMessageResponse,
 };
 use axum::{
     body::Body,
@@ -77,16 +77,7 @@ async fn project_creation_records_chat_binding_events_and_stale_binding_replacem
     let workspace = common::TestDir::new("agent-chat-project-events");
     let harness = common::test_app(workspace.path(), "agent-chat-project-events").await;
     let token = common::test_jwt();
-    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
-        &harness.app,
-        &token,
-        "project-event-agent",
-        "project-event",
-        "project-event-secret",
-        json!({"permissions": ["read_agent_chat", "propose_message"]}),
-        json!({"allowed": ["read_agent_chat", "propose_message"]}),
-    )
-    .await;
+    let connected = common::create_harness_agent(&harness.app, &token, "project-event-agent").await;
 
     let initial_main: MainAgentBindingResponse = common::json_request_with_bearer(
         &harness.app,
@@ -214,16 +205,7 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     let workspace = common::TestDir::new("agent-chat-turn-cancel");
     let harness = common::test_app(workspace.path(), "agent-chat-turn-cancel").await;
     let token = common::test_jwt();
-    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
-        &harness.app,
-        &token,
-        "turn-cancel-agent",
-        "turn-cancel",
-        "turn-cancel-secret",
-        json!({"permissions": ["read_agent_chat", "propose_message"]}),
-        json!({"allowed": ["read_agent_chat", "propose_message"]}),
-    )
-    .await;
+    let connected = common::create_harness_agent(&harness.app, &token, "turn-cancel-agent").await;
     let binding: MainAgentBindingResponse = common::json_request_with_bearer(
         &harness.app,
         Method::PUT,

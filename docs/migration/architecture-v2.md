@@ -533,11 +533,11 @@ must repeat the search at its own HEAD.
 | --- | --- | --- |
 | Singular Task role assignment | V009 task_role_assignment; db TaskRoleAssignmentRepo and sqlite workflow adapter; services TaskService/workflow; API request/response role_assignments; MCP and web task role controls | Plan PR1 adds TaskRole and RoleMembership, makes the membership set authoritative, then Plan PR13 removes singular writes/readers |
 | Agent identity/profile and Main/Project bindings | V059 agent_identity, agent_profile, project/account binding records; services agent and chat services; API, MCP, CLI, and web federation surfaces | Plan PR1 introduces ActorRef and harness-bound Agent semantics; Plan PR11 retires Main/Project verticals after consumer migration |
-| Execution session continuity | execution.agent_session_id and executor snapshots; cli-adapters emit external session IDs; services launch, cascade, recovery, follow-up, context manifests, and embedded execution consume them | Plan PR2 adds HarnessSession and explicit references; compatibility backfill/read ends in Plan PR13 |
-| Permission and planning mode | executor configuration, CLI adapter settings, embedded execution policy, workflow/prompt dispatch, and plan-related task paths | Plan PR2 separates Purpose; Plan PR3 maps capabilities and native plan modes; Plan PR7 removes plan permission semantics |
+| Execution session continuity | `execution.harness_session_id` references the explicit HarnessSession; `execution.agent_session_id` remains a readable projection only | Plan PR2 adds explicit references; Plan PR10 removes projection-based Resume; Plan PR13 owns physical cleanup |
+| Permission and planning mode | executor configuration, CLI adapter settings, historical embedded policy snapshots, workflow/prompt dispatch, and plan-related task paths | Plan PR2 separates Purpose; Plan PR3 maps capabilities and native plan modes; Plan PR7 removes plan permission semantics; PR10 rejects embedded profiles |
 | Workflow state machine | V009 workflow_definition/task_state_config; services workflow engine, TaskService transitions, hooks, dispatch loader, recovery, and default workflow; API/UI state controls | Plan PR9 reduces state to aggregate lifecycle and Gates; Plan PR13 removes old workflow persistence after all readers/writers move |
 | Special review runtime | review table from V006; crates/review runner/auditor/follow_up; service error and orchestration paths; API/UI review actions; review evidence V084 | Plan PR8 emits validation Evidence and review Executions/Artifacts; Plan PR13 drops special review persistence/runtime |
-| Forge-owned cognition | forge-agent-host crate, agent-runtime dependency, embedded_agent_service, embedded_task_executor, native/typed tools, startup wiring in forge-cli/api/services | Plan PR10 extracts legitimate credential/process infrastructure, migrates adapters, then removes agent-host |
+| Forge-owned cognition | Removed by Plan PR10: no `forge-agent-host` crate, `agent-runtime` dependency, embedded task executor, native tool catalog, or runtime startup wiring. Credential ownership now lives in `CredentialService`; API history readers remain fail-closed. | Complete; protected runtime/session storage remains historical until Plan PR13 |
 | Main Agent/Project Agent/Project OS | V061–V075 rooms, chats, bindings, genesis, memory, commitments, attention, project charter/baseline, and related services/routes/MCP/UI | Plan PR11 moves useful durable behavior onto generic actors/collaboration/artifacts, then Plan PR12 removes obsolete surfaces |
 | Bespoke plan persistence | V081 task_plan_revision/task_plan_approval remain preserved; PR7 stops runtime authority and records V098 provenance migration audit | Plan PR13 owns physical V081 table/column cleanup after all consumers move |
 | Project documents and milestone governance | V076 project charter/document/decision/baseline/milestone/release records and orchestration services | Preserve only generic Artifact/Evidence/Gate value; reconcile with the new Task-scoped model during Plan PRs 4, 8, 9, and 11 |
@@ -575,7 +575,7 @@ fallback is authorized by Plan PR0.
 | Plan PR0 | Documentation, invariants, ADRs, audit | All current paths | Plan PR0A may begin after Plan PR0 is reviewed and merged; Plan PR1 waits for both Plan PR0 and Plan PR0A |
 | Plan PR0A | Operational reconciliation: execution log rotation/storage, Cursor large-prompt transport, explicit launch/env configuration, usage/quota observations, WorkspaceLease revision independence, and salvage classification for legacy Repo PR #2 and local commits | Existing singular sessions, workflow cognition, special planning/review paths | Plan PR1 waits until Plan PR0 and Plan PR0A are reviewed and merged; explicit sessions and role migration remain in Plan PRs 1/2 |
 | Plan PR1 | ActorRef, TaskRole, RoleMembership, coordination mode | Singular task_role_assignment | New membership authority; remove old role path in Plan PR13 |
-| Plan PR2 | ExecutionPurpose and HarnessSession | execution.agent_session_id and inferred resume paths | Explicit session authority; remove compatibility in Plan PR13 |
+| Plan PR2 | ExecutionPurpose and HarnessSession | execution.agent_session_id projection | Explicit session authority; Plan PR10 removes projection-based Resume and Plan PR13 removes the stored projection |
 | Plan PR3 | HarnessAdapter and dimensional capabilities | TaskExecutor supervisor/routing facade; no CodingExecutorAdapter production authority | All harness calls route through adapter; remove the transitional TaskExecutor facade when its remaining generic supervisor consumers migrate |
 | Plan PR4 | Artifact, Message, Handoff, Proposal, Decision | Plan/review/chat-specific outputs | Generic records authoritative; remove duplicate outputs in Plan PRs 7, 8, 11 |
 | Plan PR5 | WorkUnit DAG and isolated integration | One-task workspace assumptions | WorkUnit isolation authoritative; remove shared assumptions in Plan PR13 |
@@ -583,7 +583,7 @@ fallback is authorized by Plan PR0.
 | Plan PR7 | Plan Execution and plan Artifact | Canonical plan revisions, planner retry/prompt machinery | Artifact authoritative; remove old plan APIs/persistence in Plan PR13 |
 | Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence | ReviewRunner, special review rows, FORGE_RESULT-centric flow | Generic review/validation authoritative; remove special runtime in Plan PR13 |
 | Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | New lifecycle authoritative; remove workflow tables/branches in Plan PR13 |
-| Plan PR10 | External harness cognition only | agent-host and embedded runtime | Remove crate/dependency/startup consumers |
+| Plan PR10 | External harness cognition only | agent-host, embedded runtime, and Forge-owned model/tool loop | Complete: crate and dependency removed, new embedded admission rejected, historical profiles fail closed |
 | Plan PR11 | Project/Repo/Task plus generic collaboration | Main/Project Agent and Project OS verticals | Remove old services/tables after migration fixtures |
 | Plan PR12 | Public surfaces over target domain | Old API/MCP/CLI/UI endpoints | Remove obsolete endpoints and UI |
 | Plan PR13 | Destructive persistence cleanup | None if preconditions hold | Drop old schema and compatibility code |
@@ -636,14 +636,17 @@ Important files added or changed:
 
 Schema changes: none.
 
-Compatibility shims remaining: all pre-existing runtime paths remain in place;
-Plan PR0 introduces none.
+Compatibility storage remaining: the read-only historical
+`execution.agent_session_id` projection, native profile/session history, and
+the other named pre-PR13 records remain. Plan PR10 removed embedded execution,
+runtime startup, and legacy projection-based Resume; Plan PR0 introduced no
+compatibility shims.
 
-Deprecated concepts still alive: singular role assignments, inferred execution
-session continuity, workflow-as-cognition, special review runtime,
-Forge-owned/embedded cognition, Main/Project Agent verticals, and associated
-legacy persistence. Their current readers/writers and removal Plan PRs are listed
-above.
+Deprecated concepts still alive: singular role assignments,
+workflow-as-cognition, special review runtime, Main/Project Agent verticals,
+and associated legacy persistence. Forge-owned/embedded cognition was retired
+in Plan PR10; native profiles and runtime records remain historical, and Plan
+PR13 owns their physical cleanup.
 
 Validation: documentation consistency and diff checks are run for this
 documentation-only Repo PR. Rust, web, migration, live server, and browser tests

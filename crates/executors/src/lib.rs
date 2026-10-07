@@ -20,10 +20,9 @@ pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     account_key, account_key_for_context, candidate_key, merge_overrides, normalize_harness_config,
     validate_ordered_fallback_routing, validate_same_agent_candidate, ClaudeCodeConfig,
-    CodexConfig, CommandOverrides, CursorConfig, EmbeddedConfig, ExecutorCandidate,
-    ExecutorRouting, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt,
-    RouteAttemptOutcome, ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY,
-    ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
+    CodexConfig, CommandOverrides, CursorConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig,
+    NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig,
+    SmithConfig, FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};

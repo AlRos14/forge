@@ -1292,6 +1292,7 @@ fn parse_json(value: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api_types::PROJECT_DOCUMENT_OPERATION;
 
     #[test]
     fn action_materialized_is_false_until_typed_outcome_is_persisted() {
@@ -1331,14 +1332,14 @@ mod tests {
             Some(r#"{"task_id":"task-1"}"#),
         ));
         assert!(action_materialized(
-            forge_agent_host::PROJECT_DOCUMENT_OPERATION,
+            PROJECT_DOCUMENT_OPERATION,
             &AgentActionStatus::Executed,
             Some("project"),
             Some("project-1"),
             Some(r#"{"operation":"project.document","domain_committed":true}"#),
         ));
         assert!(!action_materialized(
-            forge_agent_host::PROJECT_DOCUMENT_OPERATION,
+            PROJECT_DOCUMENT_OPERATION,
             &AgentActionStatus::Executed,
             Some("project"),
             Some("project-1"),

@@ -65,6 +65,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   by the existing `harness_session_id` relation and a runtime-only generic
   Start/Resume invocation. The HarnessSession relation remains the durable
   continuity authority; typed `harness_capabilities` records support evidence.
+- Agent Resume now requires an explicit reusable `Execution.harness_session_id`
+  relation. Historical `execution.agent_session_id` values remain readable as
+  projections but cannot authorize Resume or be materialized into a new
+  HarnessSession; re-execution starts a fresh adapter session. Forge-owned
+  native/embedded Agent execution is retired. Historical native profiles and
+  session rows remain readable, but starting them fails closed and never
+  switches to another Agent, HarnessAdapter, account, or credential.
 - Remote execution dispatch now requires a daemon that advertises the generic
   HarnessInvocation protocol. Older daemons are rejected before Start or Resume
   dispatch because they cannot guarantee fresh-start and exact-resume semantics.

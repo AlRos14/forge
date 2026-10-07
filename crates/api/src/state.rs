@@ -6,7 +6,7 @@ use events::EventBus;
 use executors::{FallbackExecutor, HarnessAdapterRegistry, TaskExecutor};
 use services::{
     AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
-    CommitmentService, DaemonService, EmbeddedAgentService, MemoryService, MergeService,
+    CommitmentService, CredentialService, DaemonService, MemoryService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
     ProviderAuthorizationService, TaskService, TerminalActivityTracker, TerminalService,
     WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
@@ -64,7 +64,7 @@ pub struct AppState {
     pub db: Arc<SqliteDb>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
-    pub embedded_agent_service: Arc<EmbeddedAgentService>,
+    pub credential_service: Arc<CredentialService>,
     pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
     pub commitment_service: Arc<CommitmentService>,
@@ -180,8 +180,7 @@ impl AppState {
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
-        let embedded_agent_service =
-            Arc::new(EmbeddedAgentService::new(Arc::clone(&db), &jwt_secret));
+        let credential_service = Arc::new(CredentialService::new(Arc::clone(&db), &jwt_secret));
         let agent_chat_service = Arc::new(services::AgentChatService::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -195,14 +194,7 @@ impl AppState {
         ));
         let cli_task_executor: Arc<dyn TaskExecutor> =
             Arc::new(FallbackExecutor::new(Arc::clone(&adapter_registry)));
-        let embedded_task_executor = Arc::new(services::EmbeddedTaskExecutor::new(
-            Arc::clone(&db),
-            Arc::clone(&embedded_agent_service),
-        ));
-        let task_executor: Arc<dyn TaskExecutor> = Arc::new(services::TaskExecutorRouter::new(
-            cli_task_executor,
-            embedded_task_executor,
-        ));
+        let task_executor = cli_task_executor;
         let workspace_exec_locks = merge_service.workspace_exec_locks();
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         merge_service.set_cleanup_scheduler(Arc::clone(&cleanup_scheduler));
@@ -255,7 +247,7 @@ impl AppState {
                 .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
                 .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
                 .with_memory_service(Arc::clone(&memory_service))
-                .with_provider_credential_env(Arc::clone(&embedded_agent_service))
+                .with_provider_credential_env(Arc::clone(&credential_service))
                 .with_workspace_root(workspace_root.clone()),
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
@@ -292,7 +284,6 @@ impl AppState {
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
         let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
             Arc::clone(&db),
-            Arc::clone(&embedded_agent_service),
             Arc::clone(&task_executor),
             Arc::clone(&event_bus),
         ));
@@ -304,7 +295,7 @@ impl AppState {
         ));
         let provider_authorization_service = Arc::new(ProviderAuthorizationService::new(
             Arc::clone(&db),
-            Arc::clone(&embedded_agent_service),
+            Arc::clone(&credential_service),
             effective_config.trusted_web_origins(),
         ));
 
@@ -312,7 +303,7 @@ impl AppState {
             db,
             task_service,
             agent_service,
-            embedded_agent_service,
+            credential_service,
             agent_chat_service,
             agent_chat_turn_worker,
             commitment_service,
@@ -354,8 +345,6 @@ impl AppState {
     }
 
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
-        self.embedded_agent_service
-            .set_public_search_config(Some(config.public_search.clone()));
         self.oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.auth_service),

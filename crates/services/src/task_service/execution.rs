@@ -84,9 +84,9 @@ pub(crate) fn execution_purpose_for_workflow_state(
     }
 }
 
-/// Resolve explicit generic continuity. A referenced HarnessSession is the
-/// authority for new rows; the legacy execution.agent_session_id fallback is
-/// only available to historical rows that have not yet been materialized.
+/// Resolve generic continuity only through the Execution's explicit
+/// HarnessSession reference. The legacy `agent_session_id` field is a
+/// projection for history and never authorizes Resume.
 pub async fn resumable_external_session(
     db: &SqliteDb,
     execution: &Execution,
@@ -101,123 +101,70 @@ pub async fn resumable_external_session(
         return Ok(None);
     }
 
-    if let Some(harness_session_id) = execution.harness_session_id.as_deref() {
-        let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
-            return Ok(None);
-        };
-        let Some(agent) = AgentRepo::get_by_id(db, &session.agent_id).await? else {
-            return Ok(None);
-        };
-        if !harness_session_identity_matches_snapshot(
-            &agent.executor_type,
-            &agent.config_json,
-            agent.credential_ref.as_deref(),
-            &session.harness_kind,
-            &session.profile_snapshot_json,
-        ) || !harness_identity_matches_snapshot(
-            &agent.executor_type,
-            &agent.config_json,
-            agent.credential_ref.as_deref(),
-            execution.executor_config_snapshot_json.as_deref(),
-        ) {
-            // Historical PR2 fallbacks could have written a session under an
-            // Agent whose primary harness/account identity did not match the
-            // actual candidate. Keep that history, but do not advertise or
-            // resume it as continuity for the current Agent identity.
-            return Ok(None);
-        }
-        let execution_harness_kind = execution
-            .executor_config_snapshot_json
-            .as_deref()
-            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
-            .and_then(|snapshot| {
-                snapshot
-                    .get("executor_type")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-            });
-        if !matches!(&session.status, HarnessSessionStatus::Active)
-            || !session
-                .external_session_id
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || !matches!(
-                execution.actor_ref(),
-                Some(db::ActorRef::Agent(ref agent_id)) if agent_id == &session.agent_id
-            )
-            || expected_agent_id.is_some_and(|agent_id| session.agent_id != agent_id)
-            || execution_harness_kind
-                .as_deref()
-                .is_some_and(|harness_kind| harness_kind != session.harness_kind)
-            || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
-            || execution
-                .agent_session_id
-                .as_deref()
-                .is_some_and(|legacy_id| Some(legacy_id) != session.external_session_id.as_deref())
-        {
-            return Ok(None);
-        }
-        if !harness_session_resume_is_available(&session) {
-            return Ok(None);
-        }
-        return Ok(session.external_session_id);
-    }
-
-    // Bounded PR13 cleanup fallback: old rows have no generic reference, so
-    // their legacy external identity is usable only when the persisted Agent
-    // still matches the caller. Never use this path when a generic reference
-    // exists, even if the compatibility projection is populated.
-    let Some(db::ActorRef::Agent(actor_id)) = execution.actor_ref() else {
+    let Some(harness_session_id) = execution.harness_session_id.as_deref() else {
         return Ok(None);
     };
-    if execution.agent_id.as_deref() == Some(actor_id.as_str())
-        && !actor_id.eq_ignore_ascii_case("human")
-        && execution
-            .agent_session_id
+    let Some(session) = HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
+        return Ok(None);
+    };
+    let Some(agent) = AgentRepo::get_by_id(db, &session.agent_id).await? else {
+        return Ok(None);
+    };
+    if !harness_session_identity_matches_snapshot(
+        &agent.executor_type,
+        &agent.config_json,
+        agent.credential_ref.as_deref(),
+        &session.harness_kind,
+        &session.profile_snapshot_json,
+    ) || !harness_identity_matches_snapshot(
+        &agent.executor_type,
+        &agent.config_json,
+        agent.credential_ref.as_deref(),
+        execution.executor_config_snapshot_json.as_deref(),
+    ) {
+        // Historical fallback winners may have written a session under an
+        // Agent whose primary harness/account identity did not match the
+        // actual candidate. Keep that history, but do not resume it under the
+        // current Agent identity.
+        return Ok(None);
+    }
+    let execution_harness_kind = execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
+        .and_then(|snapshot| {
+            snapshot
+                .get("executor_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+    if !matches!(&session.status, HarnessSessionStatus::Active)
+        || !session
+            .external_session_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
-        && (execution.workspace_id.is_none() || execution.workspace_id.as_deref() == workspace_id)
-        && expected_agent_id.is_none_or(|agent_id| actor_id == agent_id)
-    {
-        let Some(snapshot_value) = execution
-            .executor_config_snapshot_json
+        || !matches!(
+            execution.actor_ref(),
+            Some(db::ActorRef::Agent(ref agent_id)) if agent_id == &session.agent_id
+        )
+        || expected_agent_id.is_some_and(|agent_id| session.agent_id != agent_id)
+        || execution_harness_kind
             .as_deref()
-            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
-        else {
-            return Ok(None);
-        };
-        let Some(snapshot_kind) = snapshot_value
-            .get("executor_type")
-            .and_then(Value::as_str)
-            .filter(|kind| is_known_pr2_resume_harness(kind))
-        else {
-            return Ok(None);
-        };
-        if snapshot_value
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .is_some_and(|snapshot_agent_id| snapshot_agent_id != actor_id)
-        {
-            return Ok(None);
-        }
-        let Some(agent) = AgentRepo::get_by_id(db, &actor_id).await? else {
-            return Ok(None);
-        };
-        if !agent.executor_type.eq_ignore_ascii_case(snapshot_kind)
-            || !harness_identity_matches_value(
-                &agent.executor_type,
-                &agent.config_json,
-                agent.credential_ref.as_deref(),
-                &snapshot_value,
-            )
-        {
-            return Ok(None);
-        }
-        return Ok(execution.agent_session_id.clone());
+            .is_some_and(|harness_kind| harness_kind != session.harness_kind)
+        || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
+        || execution
+            .agent_session_id
+            .as_deref()
+            .is_some_and(|legacy_id| Some(legacy_id) != session.external_session_id.as_deref())
+    {
+        return Ok(None);
     }
-    Ok(None)
+    if !harness_session_resume_is_available(&session) {
+        return Ok(None);
+    }
+    Ok(session.external_session_id)
 }
 
 fn harness_session_identity_matches_snapshot(
@@ -474,38 +421,6 @@ fn is_known_pr2_resume_harness(harness_kind: &str) -> bool {
         harness_kind,
         "codex" | "claude_code" | "cursor" | "opencode" | "smith"
     )
-}
-
-/// Reconcile a pre-PR2 Execution's exact legacy external identity into the
-/// generic authority before a new resume child is created. This is only for
-/// historical rows that were backfilled to an Agent ActorRef; an unresolved
-/// agentless row must fail closed instead of minting continuity.
-pub(crate) async fn materialize_historical_harness_session(
-    db: &SqliteDb,
-    execution: &Execution,
-    external_session_id: &str,
-) -> Result<Option<Execution>> {
-    if execution.harness_session_id.is_some() {
-        return Ok(Some(execution.clone()));
-    }
-    let Some(db::ActorRef::Agent(actor_id)) = execution.actor_ref() else {
-        return Ok(None);
-    };
-    if execution.agent_id.as_deref() != Some(actor_id.as_str()) {
-        return Ok(None);
-    }
-    let reconciled = ExecutionRepo::record_harness_session_result(
-        db,
-        &execution.id,
-        external_session_id,
-        &db::now_rfc3339(),
-    )
-    .await?;
-    if reconciled.harness_session_id.is_some() {
-        Ok(Some(reconciled))
-    } else {
-        Ok(None)
-    }
 }
 
 #[cfg(test)]

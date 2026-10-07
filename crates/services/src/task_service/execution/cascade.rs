@@ -161,7 +161,7 @@ impl TaskService {
                 Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &agent_id
             );
             let (harness_session_id, updated_snapshot) = if parent_actor_matches {
-                let agent_session_id = resumable_external_session(
+                let _external_session_id = resumable_external_session(
                     &self.db,
                     execution,
                     Some(&agent_id),
@@ -170,22 +170,10 @@ impl TaskService {
                 .await?
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
-                        "execution {} has no reusable HarnessSession",
+                        "execution {} has no reusable explicit HarnessSession",
                         execution.id
                     ))
                 })?;
-                let continuity_execution = if execution.harness_session_id.is_none() {
-                    materialize_historical_harness_session(&self.db, execution, &agent_session_id)
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::invalid_operation(format!(
-                                "execution {} has unresolved legacy session authority",
-                                execution.id
-                            ))
-                        })?
-                } else {
-                    execution.clone()
-                };
                 let snapshot_json = execution
                     .executor_config_snapshot_json
                     .as_deref()
@@ -196,7 +184,7 @@ impl TaskService {
                         ))
                     })?;
                 (
-                    continuity_execution.harness_session_id,
+                    execution.harness_session_id.clone(),
                     Some(executor_snapshot_for_harness_resume(snapshot_json)?),
                 )
             } else {

@@ -241,18 +241,12 @@ pub(super) async fn build_executor_config_snapshot(
     overrides: Option<ExecutionOverrides>,
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
 ) -> Result<Option<String>> {
-    // Native profiles are hosted by Forge itself and deliberately have no
-    // daemon authority.  CLI profiles retain the existing daemon resolution
-    // and snapshot provenance.
-    let resolved_daemon_id = if agent.backend_kind == "native" {
-        None
-    } else {
-        Some(
-            crate::agent_service::resolve_daemon_for_agent(db, agent)
-                .await?
-                .id,
-        )
-    };
+    ensure_harness_adapter_profile(&agent.backend_kind, &agent.executor_type)?;
+    let resolved_daemon_id = Some(
+        crate::agent_service::resolve_daemon_for_agent(db, agent)
+            .await?
+            .id,
+    );
     let mut base_config = parse_json_value("agent config_json", &agent.config_json)?;
     // Extract before normalization: the typed config round-trip drops
     // unknown fields, which would silently delete the chain.
@@ -277,10 +271,8 @@ pub(super) async fn build_executor_config_snapshot(
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     let mut snapshot = json!({
         "agent_id": agent.id,
-        // Native execution consumes this immutable profile reference from the
-        // Task snapshot.  Provider credentials remain behind the protected
-        // profile/store boundary and are never copied into public execution
-        // snapshot JSON.
+        // Provider credentials remain behind the credential boundary and are
+        // never copied into public execution snapshot JSON.
         "profile_id": agent.profile_id,
         // This opaque durable reference is not a credential. It allows usage
         // accounting to prove that host-local observations share a logical
@@ -543,11 +535,6 @@ fn routing_snapshot_value(
     if fallbacks.is_empty() {
         return Ok(None);
     }
-    if kind == ExecutorKind::Embedded {
-        return Err(ServiceError::invalid_operation(
-            "embedded executor cannot use CLI fallback routing",
-        ));
-    }
     let mut candidates = vec![executors::ExecutorCandidate {
         executor_type: kind,
         config: normalized_primary.clone(),
@@ -567,11 +554,6 @@ fn routing_snapshot_value(
         let candidate_kind = executor_type.parse::<ExecutorKind>().map_err(|_| {
             ServiceError::invalid_operation(format!("fallbacks[{index}] has unknown executor_type"))
         })?;
-        if candidate_kind == ExecutorKind::Embedded {
-            return Err(ServiceError::invalid_operation(
-                "embedded executor cannot be a CLI fallback candidate",
-            ));
-        }
         let raw_config = object.get("config").cloned().unwrap_or_else(|| json!({}));
         if !raw_config.is_object() {
             return Err(ServiceError::invalid_operation(format!(
@@ -628,13 +610,6 @@ fn normalize_candidate_config(
     config: &Value,
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
 ) -> std::result::Result<Value, executors::ExecutorError> {
-    if kind == &ExecutorKind::Embedded {
-        return executors::normalize_harness_config::<executors::EmbeddedConfig>(
-            kind.clone(),
-            config,
-            &ExecutionOverrides::default(),
-        );
-    }
     let normalize = |registry: &executors::HarnessAdapterRegistry| {
         let adapter = registry.get(kind).ok_or_else(|| {
             executors::ExecutorError::Other(format!("No HarnessAdapter registered for {kind}"))
@@ -652,12 +627,6 @@ fn effective_harness_capabilities(
     normalized_config: &Value,
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
 ) -> std::result::Result<api_types::HarnessCapabilities, executors::ExecutorError> {
-    if kind == &ExecutorKind::Embedded {
-        // Embedded cognition remains the bounded PR10 Agent Host exception.
-        // Keep its capability evidence Unknown instead of inventing harness
-        // features for the runtime that PR10 removes.
-        return Ok(api_types::HarnessCapabilities::unknown());
-    }
     let capabilities_for = |registry: &executors::HarnessAdapterRegistry| {
         registry
             .get(kind)
@@ -677,10 +646,6 @@ fn effective_harness_policy(
     normalized_config: &Value,
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
 ) -> std::result::Result<Option<api_types::EffectiveExecutionPolicy>, executors::ExecutorError> {
-    if kind == &ExecutorKind::Embedded {
-        // Embedded policy interpretation remains bounded Agent Host/PR10 debt.
-        return Ok(None);
-    }
     let policy_for = |registry: &executors::HarnessAdapterRegistry| {
         let adapter = registry.get(kind).ok_or_else(|| {
             executors::ExecutorError::Other(format!("No HarnessAdapter registered for {kind}"))
@@ -707,9 +672,6 @@ pub(crate) fn recompute_effective_policy_for_route_winner(
     effective_cwd: Option<&str>,
 ) -> Option<Value> {
     let kind = executor_type.parse::<ExecutorKind>().ok()?;
-    if kind == ExecutorKind::Embedded {
-        return None;
-    }
     let default_registry;
     let registry = match adapter_registry {
         Some(registry) => registry,
@@ -927,9 +889,34 @@ fn merge_override_layer(
     }
 }
 
+fn ensure_harness_adapter_profile(backend_kind: &str, executor_type: &str) -> Result<()> {
+    if backend_kind.eq_ignore_ascii_case("native")
+        || executor_type.trim().eq_ignore_ascii_case("embedded")
+    {
+        return Err(ServiceError::invalid_operation(
+            "native/embedded Agent profile is retired; create a new Agent bound to an available HarnessAdapter",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_native_and_embedded_profiles_fail_task_admission() {
+        assert!(ensure_harness_adapter_profile("native", "codex")
+            .expect_err("native profile is retired")
+            .to_string()
+            .contains("retired"));
+        assert!(ensure_harness_adapter_profile("cli", "embedded")
+            .expect_err("embedded executor value is retired")
+            .to_string()
+            .contains("retired"));
+        ensure_harness_adapter_profile("cli", "codex")
+            .expect("external harness profile remains admissible");
+    }
 
     #[test]
     fn extract_fallbacks_removes_key_and_returns_entries() {
@@ -1142,12 +1129,6 @@ mod tests {
         .expect("external harness policy is captured");
         assert_eq!(policy.isolation_posture, "danger-full-access");
         assert!(policy.is_high_risk);
-
-        assert!(
-            effective_harness_policy(&ExecutorKind::Embedded, &json!({}), Some(&registry),)
-                .expect("embedded remains on the legacy path")
-                .is_none()
-        );
     }
 
     #[test]

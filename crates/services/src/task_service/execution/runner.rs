@@ -314,9 +314,6 @@ impl TaskService {
         {
             executors::mark_worktree_read_only(&mut agent_config);
         }
-        if agent_config.get("executor_type").and_then(Value::as_str) == Some("embedded") {
-            crate::embedded_task_executor::set_task_role_marker(&mut agent_config, &execution.role);
-        }
         // Provider-entry-backed harness agents get their API key injected into
         // the in-memory snapshot only; the stored snapshot never holds it.
         if let Some(credential_env) = self.credential_env.as_ref() {

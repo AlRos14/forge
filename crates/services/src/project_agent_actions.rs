@@ -1,6 +1,6 @@
 //! Typed materialization for Project Agent orchestration proposals.
 //!
-//! Project native tools persist an `AgentAction` first.  This module is the
+//! Project Agent actions persist an `AgentAction` first. This module is the
 //! only path which may turn the safe Project-local proposal operations into
 //! Charter/Document/Decision/Milestone/media domain records.  The generic
 //! action executor deliberately rejects these operations, so an arbitrary
@@ -12,7 +12,9 @@ use api_types::{
     canonical_digest_with_schema, canonical_json, AdaptiveEnvelope, ArtifactRef,
     AuthorizationProvenance, ExecutionBaselineContent, MilestoneDefinitionContent, PrincipalKind,
     PrincipalRef, ProjectCharterContent, ProjectDocumentContent, ProjectDocumentKind,
-    RevisionProvenance,
+    RevisionProvenance, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION,
+    PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
@@ -22,11 +24,6 @@ use db::{
     CreateProjectDecisionCandidate, CreateProjectDocumentRevision, CreateProjectMediaAttachment,
     CreateProjectMilestone, CreateProjectMilestoneRevision, DomainEventRepo,
     ProjectOrchestrationRepo, SharedMediaRepo, SqliteDb,
-};
-use forge_agent_host::{
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
 };
 use serde_json::{json, Value};
 use sqlx::Row;

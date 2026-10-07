@@ -7,15 +7,18 @@
 
 mod common;
 
-use api_types::ProjectCharterContent;
+use api_types::{ProjectCharterContent, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION};
 use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
     Router,
 };
 use chrono::{Duration, Utc};
-use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
 use serde_json::{json, Value};
+use services::{
+    AgentActionService, ExecuteProjectOrchestrationActionInput, ProjectOrchestrationActionService,
+    ProposeActionInput,
+};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tower::ServiceExt;
@@ -605,35 +608,33 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     )
     .await;
     let document_id = required_string(&document, &["id"]);
-    let provider = services::CoordinationToolProvider::new(harness.state.db.clone());
-    let scope = CanonicalScope {
-        scope_type: CanonicalScopeType::Project,
-        scope_id: fixture.project_id.clone(),
-        workspace_access: WorkspaceAccess::Deny,
-    };
-    let document_proposal = provider
-        .propose(
-            &fixture.project_identity_id,
-            &scope,
-            forge_agent_host::PROJECT_DOCUMENT_OPERATION,
-            json!({
-                "payload": {
-                    "action": "draft_revision",
-                    "document_id": document_id,
-                    "kind": "delivery_brief",
-                    "title": "V076 delivery brief",
-                    "base_revision_id": null,
-                    "expected_document_version": document["version"],
-                    "content": {}
-                },
-                "dedupe_key": "v076-document-proposal",
-                "correlation_id": "v076-document-proposal-correlation"
-            }),
-        )
-        .await
-        .expect("typed Project Document proposal is admitted");
-    assert_eq!(document_proposal["materialized"], json!(true));
-    assert_eq!(document_proposal["domain_committed"], json!(true));
+    let document_execution = propose_project_action(
+        &harness.state.db,
+        &fixture.project_id,
+        &fixture.project_chat_id,
+        &fixture.project_identity_id,
+        PROJECT_DOCUMENT_OPERATION,
+        json!({
+            "action": "draft_revision",
+            "document_id": document_id,
+            "kind": "delivery_brief",
+            "title": "V076 delivery brief",
+            "base_revision_id": null,
+            "expected_document_version": document["version"],
+            "content": {}
+        }),
+        "v076-document-proposal",
+        "v076-document-proposal-correlation",
+    )
+    .await;
+    let document_result: Value = serde_json::from_str(
+        document_execution
+            .result_json
+            .as_deref()
+            .expect("document action result"),
+    )
+    .expect("document action result parses");
+    assert_eq!(document_result["domain_committed"], json!(true));
     let document_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM project_document_revision
          WHERE document_id = ? AND author_type = 'agent'",
@@ -757,34 +758,38 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         &[StatusCode::OK],
     )
     .await;
-    let decision_proposal = provider
-        .propose(
-            &fixture.project_identity_id,
-            &scope,
-            forge_agent_host::PROJECT_DECISION_OPERATION,
-            json!({
-                "payload": {
-                    "action": "record_candidate",
-                    "question": "Should the V076 typed flow be accepted?",
-                    "options": ["yes", "no"],
-                    "selected_outcome": "yes",
-                    "rationale": "The acceptance suite covers the approved path.",
-                    "decision_class": "project_implementation",
-                    "baseline_id": baseline.baseline_id,
-                    "baseline_revision_id": baseline.baseline_revision_id,
-                    "expected_project_version": project_after_baseline["version"],
-                    "affected_artifact_refs": [],
-                    "affected_task_ids": [],
-                    "affected_milestone_ids": []
-                },
-                "dedupe_key": "v076-decision-proposal",
-                "correlation_id": "v076-decision-proposal-correlation"
-            }),
-        )
-        .await
-        .expect("typed Project Decision proposal is admitted");
-    assert_eq!(decision_proposal["materialized"], json!(true));
-    assert_eq!(decision_proposal["domain_committed"], json!(true));
+    let decision_execution = propose_project_action(
+        &harness.state.db,
+        &fixture.project_id,
+        &fixture.project_chat_id,
+        &fixture.project_identity_id,
+        PROJECT_DECISION_OPERATION,
+        json!({
+            "action": "record_candidate",
+            "question": "Should the V076 typed flow be accepted?",
+            "options": ["yes", "no"],
+            "selected_outcome": "yes",
+            "rationale": "The acceptance suite covers the approved path.",
+            "decision_class": "project_implementation",
+            "baseline_id": baseline.baseline_id,
+            "baseline_revision_id": baseline.baseline_revision_id,
+            "expected_project_version": project_after_baseline["version"],
+            "affected_artifact_refs": [],
+            "affected_task_ids": [],
+            "affected_milestone_ids": []
+        }),
+        "v076-decision-proposal",
+        "v076-decision-proposal-correlation",
+    )
+    .await;
+    let decision_result: Value = serde_json::from_str(
+        decision_execution
+            .result_json
+            .as_deref()
+            .expect("decision action result"),
+    )
+    .expect("decision action result parses");
+    assert_eq!(decision_result["domain_committed"], json!(true));
     let decision_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM project_decision_candidate WHERE project_id = ?")
             .bind(&fixture.project_id)
@@ -3390,6 +3395,54 @@ fn user_provenance(summary: &str) -> Value {
         "source_refs": [],
         "change_summary": summary
     })
+}
+
+async fn propose_project_action(
+    db: &std::sync::Arc<db::SqliteDb>,
+    project_id: &str,
+    chat_id: &str,
+    actor_identity_id: &str,
+    operation: &str,
+    payload: Value,
+    dedupe_key: &str,
+    correlation_id: &str,
+) -> db::AgentActionExecution {
+    let action = AgentActionService::new(db.clone())
+        .propose(ProposeActionInput {
+            id: None,
+            actor_identity_id: actor_identity_id.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat_id.to_owned(),
+            operation: operation.to_owned(),
+            payload_json: payload.to_string(),
+            dedupe_key: dedupe_key.to_owned(),
+            correlation_id: correlation_id.to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            requested_permission: "propose_project".to_owned(),
+            policy_reason: None,
+            target_type: Some("project".to_owned()),
+            target_id: Some(project_id.to_owned()),
+        })
+        .await
+        .expect("typed Project proposal passes deterministic policy");
+    assert_eq!(action.policy_result, db::AgentActionPolicyResult::Allowed);
+    assert_eq!(action.status, db::AgentActionStatus::Proposed);
+    assert_eq!(action.target_type.as_deref(), Some("project"));
+    assert_eq!(action.target_id.as_deref(), Some(project_id));
+
+    let execution = ProjectOrchestrationActionService::new(db.clone())
+        .execute(ExecuteProjectOrchestrationActionInput {
+            action_id: action.id,
+            expected_version: action.version,
+            executed_by_type: "agent".to_owned(),
+            executed_by_id: actor_identity_id.to_owned(),
+            idempotency_key: dedupe_key.to_owned(),
+        })
+        .await
+        .expect("typed Project proposal materializes through its domain service");
+    assert_eq!(execution.status, db::AgentActionExecutionStatus::Succeeded);
+    execution
 }
 
 fn project_policy_digest(policy: &Value) -> String {

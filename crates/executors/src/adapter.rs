@@ -8,13 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Registry of known CLI executor families.
+/// Registry of known external harness integrations.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
-    /// Forge-hosted Agent Runtime profile.  This is intentionally not a CLI
-    /// adapter; services route it to the Forge-owned native task backend.
-    Embedded,
     Shell,
     Codex,
     ClaudeCode,
@@ -28,7 +25,6 @@ pub enum ExecutorKind {
 impl std::fmt::Display for ExecutorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Embedded => write!(f, "embedded"),
             Self::Shell => write!(f, "shell"),
             Self::Codex => write!(f, "codex"),
             Self::ClaudeCode => write!(f, "claude_code"),
@@ -45,7 +41,10 @@ impl std::str::FromStr for ExecutorKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "embedded" => Ok(Self::Embedded),
+            "embedded" => Err(
+                "executor type `embedded` is retired; create a new Agent bound to an available HarnessAdapter"
+                    .to_owned(),
+            ),
             "shell" => Ok(Self::Shell),
             "codex" => Ok(Self::Codex),
             "claude_code" => Ok(Self::ClaudeCode),
@@ -850,11 +849,9 @@ fn executor_config_pair(
         .ok_or_else(|| {
             ExecutorError::Other("executor config snapshot missing executor_type".to_owned())
         })?;
-    let kind = executor_type.parse::<ExecutorKind>().map_err(|_| {
-        ExecutorError::Other(format!(
-            "No adapter registered for executor type: {executor_type}"
-        ))
-    })?;
+    let kind = executor_type
+        .parse::<ExecutorKind>()
+        .map_err(ExecutorError::Other)?;
     let config = object.get("config").unwrap_or(agent_config).clone();
     Ok((kind, config))
 }
@@ -1302,6 +1299,36 @@ mod tests {
         let mut registry = HarnessAdapterRegistry::new();
         registry.register(Box::new(adapter));
         (FallbackExecutor::new(Arc::new(registry)), calls)
+    }
+
+    #[tokio::test]
+    async fn retired_embedded_snapshot_fails_before_any_route_candidate_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[(
+            "model-a",
+            ScriptedBehavior::Complete {
+                usage_output_tokens: 1,
+            },
+        )]);
+        let mut ctx = routed_ctx("retired-embedded", dir.path());
+        ctx.agent_config = serde_json::json!({
+            "executor_type": "embedded",
+            "config": {"profile_id": "historical-profile"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "embedded", "config": {"profile_id": "historical-profile"}},
+                    {"executor_type": "smith", "config": {"profile": "other-account", "model": "model-a"}}
+                ]
+            }
+        });
+
+        let error = executor
+            .execute(ctx)
+            .await
+            .expect_err("retired profile must not dispatch or fall back");
+        assert!(error.to_string().contains("retired"));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

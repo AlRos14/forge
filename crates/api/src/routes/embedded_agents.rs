@@ -1,27 +1,21 @@
+//! Transitional routes for historical embedded Agent records.
+//!
+//! Runtime operations fail closed until the broad public-surface retirement
+//! in PR12. Profile and session history remain readable for audit.
+
 use api_types::{
-    AgentConnectionHealthResponse, AgentProfileResponse, AgentSessionResponse,
-    CanonicalScopeRequest, ConnectEmbeddedProfileRequest, ConnectedEmbeddedAgentResponse,
-    ConnectedEmbeddedProfileResponse, CreateAgentSessionRequest, CreateEmbeddedAgentRequest,
-    CredentialHandleResponse, EffectivePermissionsResponse, ProtectedInteractionAnswerRequest,
-    ProtectedInteractionAnswerValue, ProtectedInteractionCancelRequest,
-    ProtectedInteractionSummaryResponse, SessionVersionRequest, SteerAgentSessionRequest,
+    AgentProfileResponse, AgentSessionResponse, ConnectEmbeddedProfileRequest,
+    CreateAgentSessionRequest, CreateEmbeddedAgentRequest, SessionVersionRequest,
 };
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
     Json,
 };
 use db::{
-    now_rfc3339, Agent, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession, CredentialHandle,
+    Agent, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo,
     ExecutionRepo, SelectAgentProfile,
 };
-use forge_agent_host::{AgentHostError, InteractionAnswer, InteractionAnswerValue};
-use services::{
-    agent_service::compute_effective_status,
-    embedded_agent_service::{
-        ConnectEmbeddedProfile, CreateEmbeddedAgent, CreateScopedSession, RequestedCanonicalScope,
-    },
-};
+use services::agent_service::compute_effective_status;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -30,70 +24,20 @@ use crate::{
 };
 
 pub async fn create_embedded_agent(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Json(request): Json<CreateEmbeddedAgentRequest>,
-) -> ApiResult<Json<ConnectedEmbeddedAgentResponse>> {
-    let connected = state
-        .embedded_agent_service
-        .create_agent_from_entry(CreateEmbeddedAgent {
-            owner_user_id: user.user_id.clone(),
-            name: request.name,
-            description: request.description,
-            credential_id: request.credential_id,
-            model: request.model,
-            system_prompt: request.system_prompt,
-            account_permission_ceiling: request
-                .account_permission_ceiling
-                .unwrap_or_else(default_account_permissions),
-            tool_policy: request
-                .tool_policy
-                .unwrap_or_else(default_profile_tool_policy),
-            context_tokens: request.context_tokens,
-            max_input_tokens: request.max_input_tokens,
-            max_output_tokens: request.max_output_tokens,
-        })
-        .await?;
-    let agent = response_for_agent(&state, connected.agent).await?;
-    Ok(Json(ConnectedEmbeddedAgentResponse {
-        agent,
-        credential_handle: credential_response(connected.credential_handle),
-        profile: profile_response(connected.profile),
-        health: health_response(connected.health),
-        session: session_response(connected.session),
-    }))
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Json(_request): Json<CreateEmbeddedAgentRequest>,
+) -> ApiResult<Json<api_types::ConnectedEmbeddedAgentResponse>> {
+    Err(retired_runtime_error())
 }
 
 pub async fn connect_embedded_profile(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(identity_id): Path<String>,
-    Json(request): Json<ConnectEmbeddedProfileRequest>,
-) -> ApiResult<Json<ConnectedEmbeddedProfileResponse>> {
-    let (agent, credential, profile, health) = state
-        .embedded_agent_service
-        .connect_profile(ConnectEmbeddedProfile {
-            owner_user_id: user.user_id,
-            identity_id,
-            expected_identity_version: request.version,
-            credential_id: request.credential_id,
-            model: request.model,
-            system_prompt: request.system_prompt,
-            permission_policy: request.permission_policy,
-            tool_policy: request
-                .tool_policy
-                .unwrap_or_else(default_profile_tool_policy),
-            context_tokens: request.context_tokens,
-            max_input_tokens: request.max_input_tokens,
-            max_output_tokens: request.max_output_tokens,
-        })
-        .await?;
-    Ok(Json(ConnectedEmbeddedProfileResponse {
-        agent: response_for_agent(&state, agent).await?,
-        profile: profile_response(profile),
-        credential_handle: credential_response(credential),
-        health: health_response(health),
-    }))
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_identity_id): Path<String>,
+    Json(_request): Json<ConnectEmbeddedProfileRequest>,
+) -> ApiResult<Json<api_types::ConnectedEmbeddedProfileResponse>> {
+    Err(retired_runtime_error())
 }
 
 pub async fn list_profiles(
@@ -113,13 +57,20 @@ pub async fn select_profile(
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<api_types::AgentResponse>> {
     require_owned_identity(&state, &identity_id, &user.user_id).await?;
+    let profile = AgentProfileRepo::get_profile(&*state.db, &profile_id)
+        .await?
+        .filter(|profile| profile.identity_id == identity_id)
+        .ok_or_else(|| ApiError::not_found("agent_profile", profile_id.clone()))?;
+    if is_retired_profile(&profile) {
+        return Err(retired_runtime_error());
+    }
     let agent = AgentProfileRepo::select_profile(
         &*state.db,
         SelectAgentProfile {
             identity_id,
             profile_id,
             expected_version: request.version,
-            updated_at: now_rfc3339(),
+            updated_at: db::now_rfc3339(),
         },
     )
     .await?;
@@ -127,21 +78,12 @@ pub async fn select_profile(
 }
 
 pub async fn create_session(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(identity_id): Path<String>,
-    Json(request): Json<CreateAgentSessionRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_identity_id): Path<String>,
+    Json(_request): Json<CreateAgentSessionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
-    let session = state
-        .embedded_agent_service
-        .create_or_resume_session(CreateScopedSession {
-            actor_user_id: user.user_id,
-            identity_id,
-            profile_id: request.profile_id,
-            scope: requested_scope(request.scope),
-        })
-        .await?;
-    Ok(Json(session_response(session)))
+    Err(retired_runtime_error())
 }
 
 pub async fn list_sessions(
@@ -149,164 +91,110 @@ pub async fn list_sessions(
     user: AuthenticatedUser,
     Path(identity_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentSessionResponse>>> {
-    let sessions = state
-        .embedded_agent_service
-        .list_sessions(&user.user_id, &identity_id)
-        .await?;
+    require_owned_identity(&state, &identity_id, &user.user_id).await?;
+    let sessions = AgentSessionRepo::list_agent_sessions(&*state.db, &identity_id).await?;
     Ok(Json(sessions.into_iter().map(session_response).collect()))
 }
 
-/// List only redaction-safe pending interactions for an authenticated
-/// owner's session.  The broker performs the owner/session join; no owner or
-/// identity authority is accepted from the request body or query string.
 pub async fn list_session_interactions(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-) -> ApiResult<Json<Vec<ProtectedInteractionSummaryResponse>>> {
-    let summaries = state
-        .embedded_agent_service
-        .interaction_broker()
-        .list_pending_for_owner(&user.user_id, &session_id)
-        .await
-        .map_err(protected_interaction_error)?;
-    Ok(Json(
-        summaries
-            .into_iter()
-            .map(protected_interaction_response)
-            .collect(),
-    ))
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_session_id): Path<String>,
+) -> ApiResult<Json<Vec<api_types::ProtectedInteractionSummaryResponse>>> {
+    Err(retired_runtime_error())
 }
 
 pub async fn answer_session_interaction(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((session_id, interaction_id)): Path<(String, String)>,
-    Json(request): Json<ProtectedInteractionAnswerRequest>,
-) -> ApiResult<Json<ProtectedInteractionSummaryResponse>> {
-    let answer = InteractionAnswer::new(
-        interaction_id,
-        request.expected_version,
-        request
-            .values
-            .into_iter()
-            .map(runtime_interaction_answer)
-            .collect(),
-    );
-    let summary = state
-        .embedded_agent_service
-        .interaction_broker()
-        .answer_for_session(&user.user_id, &session_id, answer)
-        .await
-        .map_err(protected_interaction_error)?;
-    Ok(Json(protected_interaction_response(summary)))
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((_session_id, _interaction_id)): Path<(String, String)>,
+    Json(_request): Json<api_types::ProtectedInteractionAnswerRequest>,
+) -> ApiResult<Json<api_types::ProtectedInteractionSummaryResponse>> {
+    Err(retired_runtime_error())
 }
 
 pub async fn cancel_session_interaction(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((session_id, interaction_id)): Path<(String, String)>,
-    Json(request): Json<ProtectedInteractionCancelRequest>,
-) -> ApiResult<Json<ProtectedInteractionSummaryResponse>> {
-    let summary = state
-        .embedded_agent_service
-        .interaction_broker()
-        .cancel_for_session(
-            &user.user_id,
-            &session_id,
-            &interaction_id,
-            request.expected_version,
-        )
-        .await
-        .map_err(protected_interaction_error)?;
-    Ok(Json(protected_interaction_response(summary)))
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((_session_id, _interaction_id)): Path<(String, String)>,
+    Json(_request): Json<api_types::ProtectedInteractionCancelRequest>,
+) -> ApiResult<Json<api_types::ProtectedInteractionSummaryResponse>> {
+    Err(retired_runtime_error())
 }
 
 pub async fn rotate_session(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-    Json(request): Json<SessionVersionRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_session_id): Path<String>,
+    Json(_request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
-    let session = state
-        .embedded_agent_service
-        .rotate_session(&user.user_id, &session_id, request.version)
-        .await?;
-    Ok(Json(session_response(session)))
+    Err(retired_runtime_error())
 }
 
 pub async fn suspend_session(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-    Json(request): Json<SessionVersionRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_session_id): Path<String>,
+    Json(_request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
-    set_session_status(state, user, session_id, request.version, "suspended").await
+    Err(retired_runtime_error())
 }
 
 pub async fn resume_session(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-    Json(request): Json<SessionVersionRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_session_id): Path<String>,
+    Json(_request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
-    set_session_status(state, user, session_id, request.version, "ready").await
+    Err(retired_runtime_error())
 }
 
 pub async fn cancel_session_turn(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-) -> ApiResult<StatusCode> {
-    state
-        .embedded_agent_service
-        .cancel_session_turn(&user.user_id, &session_id)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_session_id): Path<String>,
+) -> ApiResult<axum::http::StatusCode> {
+    Err(retired_runtime_error())
 }
 
 pub async fn steer_session_turn(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(session_id): Path<String>,
-    Json(request): Json<SteerAgentSessionRequest>,
-) -> ApiResult<StatusCode> {
-    state
-        .embedded_agent_service
-        .steer_session_turn(&user.user_id, &session_id, request.content)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_session_id): Path<String>,
+    Json(_request): Json<api_types::SteerAgentSessionRequest>,
+) -> ApiResult<axum::http::StatusCode> {
+    Err(retired_runtime_error())
 }
 
 pub async fn effective_permissions(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(identity_id): Path<String>,
-    Json(scope): Json<CanonicalScopeRequest>,
-) -> ApiResult<Json<EffectivePermissionsResponse>> {
-    let permissions = state
-        .embedded_agent_service
-        .effective_permissions(&user.user_id, &identity_id, &requested_scope(scope))
-        .await?;
-    Ok(Json(EffectivePermissionsResponse {
-        allowed: permissions.allowed.into_iter().collect(),
-        denied: permissions.denied.into_iter().collect(),
-        requires_approval: permissions.requires_approval.into_iter().collect(),
-    }))
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_identity_id): Path<String>,
+    Json(_scope): Json<api_types::CanonicalScopeRequest>,
+) -> ApiResult<Json<api_types::EffectivePermissionsResponse>> {
+    Err(retired_runtime_error())
 }
 
-async fn set_session_status(
-    state: AppState,
-    user: AuthenticatedUser,
-    session_id: String,
-    version: i64,
-    status: &'static str,
-) -> ApiResult<Json<AgentSessionResponse>> {
-    let session = state
-        .embedded_agent_service
-        .set_session_status(&user.user_id, &session_id, version, status)
-        .await?;
-    Ok(Json(session_response(session)))
+async fn require_owned_identity(
+    state: &AppState,
+    identity_id: &str,
+    user_id: &str,
+) -> ApiResult<Agent> {
+    AgentRepo::get_by_id(&*state.db, identity_id)
+        .await?
+        .filter(|agent| agent.owner_id.as_deref() == Some(user_id))
+        .ok_or_else(|| ApiError::not_found("agent", identity_id.to_owned()))
+}
+
+fn is_retired_profile(profile: &AgentProfile) -> bool {
+    profile.backend_kind == "native" || profile.executor_type == "embedded"
+}
+
+fn retired_runtime_error() -> ApiError {
+    ApiError::bad_request_with_code(
+        "agent_runtime.retired",
+        "embedded Agent execution is retired; bind a new Agent to an available HarnessAdapter",
+    )
 }
 
 async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_types::AgentResponse> {
@@ -322,112 +210,6 @@ async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_typ
         Some(effective_status),
         stats,
     ))
-}
-
-async fn require_owned_identity(
-    state: &AppState,
-    identity_id: &str,
-    user_id: &str,
-) -> ApiResult<Agent> {
-    AgentRepo::get_by_id(&*state.db, identity_id)
-        .await?
-        .filter(|agent| agent.owner_id.as_deref() == Some(user_id))
-        .ok_or_else(|| ApiError::not_found("agent", identity_id.to_owned()))
-}
-
-fn requested_scope(scope: CanonicalScopeRequest) -> RequestedCanonicalScope {
-    match scope {
-        CanonicalScopeRequest::Account => RequestedCanonicalScope::Account,
-        CanonicalScopeRequest::Project { project_id } => {
-            RequestedCanonicalScope::Project { project_id }
-        }
-        CanonicalScopeRequest::AgentChat { chat_id } => {
-            RequestedCanonicalScope::AgentChat { chat_id }
-        }
-        CanonicalScopeRequest::Task { task_id, role } => {
-            RequestedCanonicalScope::Task { task_id, role }
-        }
-    }
-}
-
-pub(crate) fn credential_response(handle: CredentialHandle) -> CredentialHandleResponse {
-    CredentialHandleResponse {
-        id: handle.id,
-        provider: handle.provider,
-        label: handle.label,
-        credential_method: handle.credential_method,
-        status: handle.status,
-        version: handle.version,
-        created_at: handle.created_at,
-        updated_at: handle.updated_at,
-    }
-}
-
-fn protected_interaction_response(
-    summary: forge_agent_host::ProtectedInteractionSummary,
-) -> ProtectedInteractionSummaryResponse {
-    ProtectedInteractionSummaryResponse {
-        id: summary.id,
-        session_id: summary.session_id,
-        interaction_kind: summary.interaction_kind,
-        prompt_redacted: summary.prompt_redacted,
-        status: summary.status,
-        expires_at: summary.expires_at,
-        version: summary.version,
-        created_at: summary.created_at,
-        updated_at: summary.updated_at,
-    }
-}
-
-fn runtime_interaction_answer(value: ProtectedInteractionAnswerValue) -> InteractionAnswerValue {
-    match value {
-        ProtectedInteractionAnswerValue::Choice {
-            question_id,
-            choice_id,
-        } => InteractionAnswerValue::Choice {
-            question_id,
-            choice_id,
-        },
-        ProtectedInteractionAnswerValue::FreeForm { question_id, value } => {
-            InteractionAnswerValue::FreeForm { question_id, value }
-        }
-    }
-}
-
-fn protected_interaction_error(error: AgentHostError) -> ApiError {
-    match error {
-        AgentHostError::SessionNotFound => ApiError::not_found_with_code(
-            "protected_interaction.not_found",
-            "agent_session",
-            "unavailable",
-        ),
-        AgentHostError::Authority(message) if message.contains("answer is invalid") => {
-            ApiError::bad_request_with_code(
-                "protected_interaction.invalid",
-                "protected interaction answer is invalid",
-            )
-        }
-        AgentHostError::Authority(_) => ApiError::conflict_with_code(
-            "protected_interaction.version_conflict",
-            "protected interaction is no longer pending or its version changed",
-        ),
-        AgentHostError::VersionConflict => ApiError::conflict_with_code(
-            "protected_interaction.version_conflict",
-            "protected interaction is no longer pending or its version changed",
-        ),
-        AgentHostError::ProtectedPersistence => {
-            ApiError::internal("protected interaction persistence failed")
-        }
-        AgentHostError::Configuration(_) | AgentHostError::Unsupported(_) => {
-            ApiError::bad_request_with_code(
-                "protected_interaction.unavailable",
-                "protected interaction is unavailable",
-            )
-        }
-        AgentHostError::CredentialNotFound | AgentHostError::Runtime(_) => {
-            ApiError::internal("protected interaction is unavailable")
-        }
-    }
 }
 
 fn profile_response(profile: AgentProfile) -> AgentProfileResponse {
@@ -522,17 +304,6 @@ fn contains_protected_runtime_marker(value: &str) -> bool {
         || has_pem_marker
 }
 
-fn health_response(health: db::AgentConnectionHealth) -> AgentConnectionHealthResponse {
-    AgentConnectionHealthResponse {
-        profile_id: health.profile_id,
-        status: health.status,
-        capabilities: parse_json(&health.capability_status_json),
-        checked_at: health.checked_at,
-        error_code: health.error_code,
-        updated_at: health.updated_at,
-    }
-}
-
 fn session_response(session: AgentSession) -> AgentSessionResponse {
     AgentSessionResponse {
         id: session.id,
@@ -554,36 +325,4 @@ fn session_response(session: AgentSession) -> AgentSessionResponse {
 
 fn parse_json(value: &str) -> serde_json::Value {
     serde_json::from_str(value).unwrap_or(serde_json::Value::Null)
-}
-
-fn default_account_permissions() -> serde_json::Value {
-    default_profile_tool_policy()
-}
-
-fn default_profile_tool_policy() -> serde_json::Value {
-    // A profile is a capability ceiling, not a scope grant. Keep the reusable
-    // profile broad enough for later Project/Agent Chat/Task admission; the account
-    // ceiling, membership/participation, workflow admission, and canonical
-    // scope are still intersected server-side and therefore remain decisive.
-    serde_json::json!({
-        "allowed": [
-            "read_account",
-            "read_project",
-            "read_agent_chat",
-            "read_task",
-            "read_memory",
-            "propose_task",
-            "propose_discovery",
-            "propose_project",
-            "propose_handoff",
-            "propose_message",
-            "propose_review",
-            "propose_commitment",
-            "propose_memory",
-            "propose_decision",
-            "propose_session",
-            "task_read",
-            "task_write"
-        ]
-    })
 }

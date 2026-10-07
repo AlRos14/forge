@@ -11,7 +11,6 @@ use db::{
     new_uuid_v4, now_rfc3339, CreateProviderAuthorizationOperation, ProviderAuthorizationOperation,
     ProviderAuthorizationRepo, SqliteDb, UpdateProviderAuthorizationOperation,
 };
-use forge_agent_host::{OAuthCredentialBundle, SqliteProtectedRuntimeStore};
 use rand::{rngs::OsRng, RngCore};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -24,7 +23,10 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{embedded_agent_service::ConnectOAuthCredential, Result, ServiceError};
+use crate::{
+    credential_service::{ConnectOAuthCredential, CredentialService, OAuthCredentialBundle},
+    Result, ServiceError,
+};
 
 const OPENAI_ISSUER: &str = "https://auth.openai.com";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -48,8 +50,7 @@ const LOOPBACK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone)]
 pub struct ProviderAuthorizationService {
     db: Arc<SqliteDb>,
-    embedded_agents: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
-    protected_store: Arc<SqliteProtectedRuntimeStore>,
+    credentials: Arc<CredentialService>,
     trusted_origins: Arc<RwLock<Vec<String>>>,
     client: reqwest::Client,
 }
@@ -118,13 +119,12 @@ struct OidcDiscovery {
 impl ProviderAuthorizationService {
     pub fn new(
         db: Arc<SqliteDb>,
-        embedded_agents: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
+        credentials: Arc<CredentialService>,
         trusted_origins: Vec<String>,
     ) -> Self {
         Self {
-            protected_store: embedded_agents.protected_store(),
             db,
-            embedded_agents,
+            credentials,
             trusted_origins: Arc::new(RwLock::new(trusted_origins)),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -306,16 +306,15 @@ impl ProviderAuthorizationService {
                     },
                 )
                 .await?;
-                self.protected_store
-                    .seal_provider_authorization_state(
+                self.credentials
+                    .seal_authorization_state(
                         &id,
                         &serde_json::to_vec(&secret).map_err(|_| {
                             ServiceError::invalid_operation("authorization state is invalid")
                         })?,
                         &created.updated_at,
                     )
-                    .await
-                    .map_err(redacted_host_error)?;
+                    .await?;
                 // The sealed state has to exist before the browser can come
                 // back, so the listener only starts once the row is durable.
                 if let Some(listener) = listener {
@@ -361,8 +360,8 @@ impl ProviderAuthorizationService {
                         .bind(&id)
                         .execute(self.db.pool())
                         .await?;
-                        self.protected_store
-                            .seal_provider_authorization_state(
+                        self.credentials
+                            .seal_authorization_state(
                                 &id,
                                 &serde_json::to_vec(&secret).map_err(|_| {
                                     ServiceError::invalid_operation(
@@ -371,8 +370,7 @@ impl ProviderAuthorizationService {
                                 })?,
                                 &now_rfc3339(),
                             )
-                            .await
-                            .map_err(redacted_host_error)?;
+                            .await?;
                         let operation = ProviderAuthorizationRepo::update_provider_authorization(
                             &*self.db,
                             UpdateProviderAuthorizationOperation {
@@ -445,10 +443,7 @@ impl ProviderAuthorizationService {
             },
         )
         .await?;
-        self.protected_store
-            .delete_provider_authorization_state(id)
-            .await
-            .map_err(redacted_host_error)?;
+        self.credentials.delete_authorization_state(id).await?;
         Ok(updated)
     }
 
@@ -847,7 +842,7 @@ impl ProviderAuthorizationService {
             provider_account_id: account,
         };
         let credential = self
-            .embedded_agents
+            .credentials
             .connect_oauth_credential(ConnectOAuthCredential {
                 owner_user_id: publishing.owner_user_id.clone(),
                 provider: publishing.provider.clone(),
@@ -874,10 +869,9 @@ impl ProviderAuthorizationService {
             },
         )
         .await?;
-        self.protected_store
-            .delete_provider_authorization_state(&completed.id)
-            .await
-            .map_err(redacted_host_error)?;
+        self.credentials
+            .delete_authorization_state(&completed.id)
+            .await?;
         Ok(completed)
     }
 
@@ -937,11 +931,7 @@ impl ProviderAuthorizationService {
     }
 
     async fn protected_state(&self, id: &str) -> Result<ProtectedAuthorizationState> {
-        let plaintext = self
-            .protected_store
-            .open_provider_authorization_state(id)
-            .await
-            .map_err(redacted_host_error)?;
+        let plaintext = self.credentials.open_authorization_state(id).await?;
         serde_json::from_slice(&plaintext).map_err(|_| {
             ServiceError::invalid_operation("protected authorization state is invalid")
         })
@@ -1005,8 +995,8 @@ impl ProviderAuthorizationService {
         )
         .await?;
         let _ = self
-            .protected_store
-            .delete_provider_authorization_state(&updated.id)
+            .credentials
+            .delete_authorization_state(&updated.id)
             .await;
         Ok(updated)
     }
@@ -1643,10 +1633,6 @@ fn bounded_error(message: &str) -> String {
     safe.to_owned()
 }
 
-fn redacted_host_error(_: forge_agent_host::AgentHostError) -> ServiceError {
-    ServiceError::invalid_operation("protected provider authorization persistence failed")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,14 +1660,14 @@ mod tests {
         )
         .await
         .expect("owner creates");
-        let embedded = Arc::new(crate::embedded_agent_service::EmbeddedAgentService::new(
+        let credentials = Arc::new(CredentialService::new(
             Arc::clone(&db),
             b"provider-auth-test-key",
         ));
         (
             ProviderAuthorizationService::new(
                 db,
-                embedded,
+                credentials,
                 vec!["http://localhost:5173".to_owned()],
             ),
             owner,
@@ -1721,13 +1707,13 @@ mod tests {
             .expect("pool creates");
         db::run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
-        let embedded = Arc::new(crate::embedded_agent_service::EmbeddedAgentService::new(
+        let credentials = Arc::new(CredentialService::new(
             Arc::clone(&db),
             b"provider-auth-test-key",
         ));
         let service = ProviderAuthorizationService::new(
             db,
-            embedded,
+            credentials,
             vec!["http://localhost:5173".to_owned()],
         );
         let registry = service.capabilities();
@@ -1995,8 +1981,8 @@ mod tests {
         );
         assert!(!failed.error_message.unwrap().contains("access-secret"));
         assert!(service
-            .protected_store
-            .open_provider_authorization_state(&operation.id)
+            .credentials
+            .open_authorization_state(&operation.id)
             .await
             .is_err());
     }

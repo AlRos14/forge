@@ -13,12 +13,12 @@ cli-adapters = { path = "../cli-adapters" }
 db = { path = "../db" }
 events = { path = "../events" }
 executors = { path = "../executors" }
-forge-agent-host = { path = "../agent-host" }
 git = { path = "../git" }
 review = { path = "../review" }
 workspace = { path = "../workspace" }
 async-trait = "0.1"
 base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bcrypt = "0.17"
 config = { path = "../config" }

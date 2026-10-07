@@ -1,6 +1,7 @@
 use super::super::*;
 use api_types::ActorRef;
 use db::{CollaborationRepo, CoordinationMode, ProjectMemberRepo, TaskLifecycleRepo, TaskRoleRepo};
+use serde_json::Value;
 
 async fn add_human_reviewer(
     db: &db::SqliteDb,
@@ -1746,7 +1747,7 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     .await;
 
     let registry = Arc::new(cli_adapters::default_registry());
-    let executor = executors::AdapterExecutor::new(registry);
+    let executor = executors::FallbackExecutor::new(registry);
     let execution = service
         .run_execution(execution.id, &executor)
         .await
@@ -1756,6 +1757,18 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
         execution.status,
         ExecutionStatus::Completed,
         "{execution:#?}"
+    );
+    let snapshot: Value = serde_json::from_str(
+        execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("execution retains its immutable harness snapshot"),
+    )
+    .expect("harness snapshot is valid JSON");
+    assert_eq!(snapshot["executor_type"], "shell");
+    assert_eq!(
+        snapshot["routing"]["selected_candidate_key"],
+        executors::candidate_key(&executors::ExecutorKind::Shell, &snapshot["config"])
     );
     let logs_path = execution.logs_path.expect("logs path recorded");
     assert!(
@@ -3390,7 +3403,7 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
 }
 
 #[tokio::test]
-async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
+async fn legacy_execution_session_id_never_authorizes_resume_or_actions() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
@@ -3440,41 +3453,11 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
         .expect("execution loads")
         .expect("execution exists");
 
-    let unambiguous =
+    let legacy_only =
         crate::task_service::resumable_external_session(&db, &historical, Some(&agent_id), None)
             .await
-            .expect("bounded historical lookup succeeds");
-    assert_eq!(unambiguous.as_deref(), Some("legacy-thread"));
-
-    let mut unsupported_legacy_harness = historical.clone();
-    unsupported_legacy_harness.executor_config_snapshot_json = Some(
-        serde_json::json!({"agent_id":agent_id.clone(),"executor_type":"shell","config":{}})
-            .to_string(),
-    );
-    let unsupported = crate::task_service::resumable_external_session(
-        &db,
-        &unsupported_legacy_harness,
-        Some(&agent_id),
-        None,
-    )
-    .await
-    .expect("unsupported legacy evidence fails closed without an error");
-    assert_eq!(unsupported, None);
-
-    let mut mismatched_legacy_agent = historical.clone();
-    mismatched_legacy_agent.executor_config_snapshot_json = Some(
-        serde_json::json!({"agent_id":"another-agent","executor_type":"codex","config":{}})
-            .to_string(),
-    );
-    let mismatched = crate::task_service::resumable_external_session(
-        &db,
-        &mismatched_legacy_agent,
-        Some(&agent_id),
-        None,
-    )
-    .await
-    .expect("contradictory legacy evidence fails closed without an error");
-    assert_eq!(mismatched, None);
+            .expect("legacy projection lookup succeeds without becoming authority");
+    assert_eq!(legacy_only, None);
 
     sqlx::query(
         "INSERT INTO execution_session_migration_issue
@@ -3493,14 +3476,6 @@ async fn ambiguous_historical_session_fails_closed_for_resume_and_actions() {
             .await
             .expect("ambiguous lookup fails closed without error");
     assert_eq!(ambiguous, None);
-    let materialized = crate::task_service::execution::materialize_historical_harness_session(
-        &db,
-        &historical,
-        "legacy-thread",
-    )
-    .await
-    .expect("ambiguous history remains on the legacy projection");
-    assert!(materialized.is_none());
 
     let workflow = crate::workflow::default_workflow::default_workflow();
     let annotation = api_types::TaskBlockingAnnotation {
@@ -4131,7 +4106,7 @@ async fn follow_up_on_cancelled_execution_without_session_starts_new_execution()
 }
 
 #[tokio::test]
-async fn follow_up_execution_without_session_starts_new_execution() {
+async fn follow_up_execution_with_legacy_projection_starts_fresh_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -4173,6 +4148,11 @@ async fn follow_up_execution_without_session_starts_new_execution() {
     )
     .await
     .expect("parent execution creates");
+    sqlx::query("UPDATE execution SET agent_session_id = 'legacy-thread' WHERE id = ?")
+        .bind(&parent_execution.id)
+        .execute(db.pool())
+        .await
+        .expect("legacy projection is added to the historical execution");
 
     let parent_id = parent_execution.id.clone();
     let result = service
@@ -4186,6 +4166,16 @@ async fn follow_up_execution_without_session_starts_new_execution() {
     );
     assert!(child.execution.harness_session_id.is_none());
     assert!(child.execution.agent_session_id.is_none());
+    assert_eq!(
+        crate::task_service::execution::harness_invocation_for_execution(
+            &db,
+            &child.execution,
+            None,
+        )
+        .await
+        .expect("legacy projection does not change Start into Resume"),
+        api_types::HarnessInvocation::Start
+    );
 }
 
 #[tokio::test]
