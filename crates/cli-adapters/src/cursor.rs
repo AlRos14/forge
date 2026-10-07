@@ -495,14 +495,27 @@ impl HarnessAdapter for CursorAdapter {
         };
 
         let child = Arc::new(AsyncMutex::new(child));
+        let mut group_kill_guard = crate::command::GroupKillOnDrop::new(child.clone());
         let cancel = CancellationToken::new();
-        self.insert_process(
+        if let Err(registration_error) = self.insert_process(
             ctx.execution_id.clone(),
             RunningProcess {
                 child: child.clone(),
                 cancel: cancel.clone(),
             },
-        )?;
+        ) {
+            let cleanup_result = {
+                let mut child = child.lock().await;
+                crate::command::kill_group_and_wait(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Cursor process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            group_kill_guard.disarm();
+            return Err(registration_error);
+        }
 
         let mut writer = LogWriter::new(
             &ctx.logs_path,
@@ -535,6 +548,7 @@ impl HarnessAdapter for CursorAdapter {
             }
             child.wait().await?
         };
+        group_kill_guard.disarm();
         self.remove_process(&ctx.execution_id)?;
 
         let stream = stream_result?;
@@ -622,7 +636,7 @@ impl HarnessAdapter for CursorAdapter {
         if let Some(running) = running {
             running.cancel.cancel();
             let mut child = running.child.lock().await;
-            signal_child(&mut child);
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
 
         Ok(())

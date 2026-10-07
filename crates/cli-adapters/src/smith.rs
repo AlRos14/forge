@@ -251,6 +251,27 @@ impl HarnessAdapter for SmithAdapter {
         let child_arc = Arc::new(AsyncMutex::new(child));
         let cancelled = Arc::new(AtomicBool::new(false));
 
+        // Record the child before logging yields so generation cancellation
+        // cannot miss a process that has already been spawned.
+        if let Err(registration_error) = self.insert_execution(
+            ctx.execution_id.clone(),
+            RunningExecution {
+                child: child_arc.clone(),
+                cancelled: cancelled.clone(),
+            },
+        ) {
+            let cleanup_result = {
+                let mut child = child_arc.lock().await;
+                crate::command::kill_child_and_wait(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Smith process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            return Err(registration_error);
+        }
+
         let mut writer = LogWriter::new(
             &ctx.logs_path,
             ctx.execution_id.clone(),
@@ -271,14 +292,6 @@ impl HarnessAdapter for SmithAdapter {
                 }),
             )
             .await?;
-
-        self.insert_execution(
-            ctx.execution_id.clone(),
-            RunningExecution {
-                child: child_arc.clone(),
-                cancelled: cancelled.clone(),
-            },
-        )?;
 
         let stream_result = stream_run_output(stdout, stderr, &mut writer).await;
         let status = {
@@ -406,7 +419,7 @@ impl HarnessAdapter for SmithAdapter {
         if let Some(running) = running {
             running.cancelled.store(true, Ordering::SeqCst);
             let mut child = running.child.lock().await;
-            child.start_kill()?;
+            crate::command::kill_child_and_wait(&mut child).await?;
         }
         Ok(())
     }

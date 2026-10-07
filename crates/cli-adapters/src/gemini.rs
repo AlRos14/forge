@@ -216,7 +216,20 @@ impl HarnessAdapter for GeminiAdapter {
             .ok_or_else(|| ExecutorError::Other("failed to capture gemini stderr".into()))?;
 
         let child_arc = Arc::new(AsyncMutex::new(child));
-        self.insert_process(ctx.execution_id.clone(), child_arc.clone())?;
+        if let Err(registration_error) =
+            self.insert_process(ctx.execution_id.clone(), child_arc.clone())
+        {
+            let cleanup_result = {
+                let mut child = child_arc.lock().await;
+                crate::command::kill_child_and_wait(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Gemini process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            return Err(registration_error);
+        }
 
         let mut writer = LogWriter::new(
             &ctx.logs_path,
@@ -313,7 +326,7 @@ impl HarnessAdapter for GeminiAdapter {
 
         if let Some(child_arc) = process {
             let mut child = child_arc.lock().await;
-            child.start_kill()?;
+            crate::command::kill_child_and_wait(&mut child).await?;
         }
 
         Ok(())

@@ -1,8 +1,72 @@
+use command_group::AsyncGroupChild;
 use executors::CommandOverrides;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io;
+use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
+use tokio::{
+    process::{Child, Command},
+    sync::Mutex,
+};
+
+/// Last-resort group termination when an adapter execution future is dropped.
+/// Normal cancellation still waits for the process group to exit.
+pub(crate) struct GroupKillOnDrop {
+    child: Arc<Mutex<AsyncGroupChild>>,
+    armed: bool,
+}
+
+impl GroupKillOnDrop {
+    pub(crate) fn new(child: Arc<Mutex<AsyncGroupChild>>) -> Self {
+        Self { child, armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut child) = self.child.try_lock()
+        {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+/// Kill and reap a direct CLI child. Callers use this while holding the same
+/// process handle registered for the Execution, so a successful return proves
+/// the child can no longer run.
+pub(crate) async fn kill_child_and_wait(child: &mut Child) -> io::Result<ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    if let Err(kill_error) = child.start_kill() {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        return Err(kill_error);
+    }
+    child.wait().await
+}
+
+/// Kill and reap a process group, including descendants started by the CLI.
+pub(crate) async fn kill_group_and_wait(child: &mut AsyncGroupChild) -> io::Result<ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    if let Err(kill_error) = child.start_kill() {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        return Err(kill_error);
+    }
+    child.wait().await
+}
 
 /// Run a discovery command without letting a stalled CLI pin an async worker
 /// or survive after the timeout expires.

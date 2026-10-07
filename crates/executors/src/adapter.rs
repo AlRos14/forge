@@ -179,6 +179,8 @@ pub trait HarnessAdapter: Send + Sync {
         self.execute(ctx).await
     }
 
+    /// Stop all processes tracked for this execution. Returning `Ok(())` means
+    /// the adapter has waited for its direct child or process group to exit.
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
 
     /// Optional account/quota observation, separate from per-execution token
@@ -338,12 +340,22 @@ impl TaskExecutor for AdapterExecutor {
     }
 
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
+        let mut failures = Vec::new();
         for kind in self.registry.kinds() {
             if let Some(adapter) = self.registry.get(&kind) {
-                adapter.cancel(execution_id).await?;
+                if let Err(error) = adapter.cancel(execution_id).await {
+                    failures.push(format!("{kind}: {error}"));
+                }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutorError::Other(format!(
+                "adapter cancellation failed: {}",
+                failures.join(", ")
+            )))
+        }
     }
 
     async fn observe_usage(
@@ -400,9 +412,9 @@ impl FallbackExecutor {
         self.clear_cancellation(execution_id);
     }
 
-    /// Whether this executor instance still owns cancellation state for an
-    /// admitted execution. A replacement runtime uses this to avoid claiming
-    /// control over an id from an older connection generation.
+    /// Whether this executor instance still owns cancellation bookkeeping for
+    /// an admitted execution. This does not report whether a child process is
+    /// alive.
     pub fn owns_execution(&self, execution_id: &str) -> bool {
         self.cancellations
             .lock()
@@ -840,12 +852,22 @@ impl TaskExecutor for FallbackExecutor {
         {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        let mut failures = Vec::new();
         for kind in self.registry.kinds() {
             if let Some(adapter) = self.registry.get(&kind) {
-                adapter.cancel(execution_id).await?;
+                if let Err(error) = adapter.cancel(execution_id).await {
+                    failures.push(format!("{kind}: {error}"));
+                }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutorError::Other(format!(
+                "adapter cancellation failed: {}",
+                failures.join(", ")
+            )))
+        }
     }
 
     async fn observe_usage(

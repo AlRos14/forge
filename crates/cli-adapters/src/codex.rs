@@ -484,13 +484,25 @@ impl HarnessAdapter for CodexAdapter {
         let cancel = CancellationToken::new();
         let child = Arc::new(AsyncMutex::new(child));
         let mut cleanup_guard = CleanupSignalGuard::new(child.clone());
-        self.insert_process(
+        if let Err(registration_error) = self.insert_process(
             ctx.execution_id.clone(),
             RunningProcess {
                 child: child.clone(),
                 cancel: cancel.clone(),
             },
-        )?;
+        ) {
+            let cleanup_result = {
+                let mut child = child.lock().await;
+                crate::command::kill_group_and_wait(&mut child).await
+            };
+            cleanup_guard.disarm();
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Codex process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            return Err(registration_error);
+        }
 
         let writer = Arc::new(AsyncMutex::new(LogWriter::new(
             &ctx.logs_path,
@@ -539,7 +551,7 @@ impl HarnessAdapter for CodexAdapter {
         if let Some(running) = running {
             running.cancel.cancel();
             let mut child = running.child.lock().await;
-            signal_child(&mut child);
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
 
         Ok(())

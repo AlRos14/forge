@@ -38,6 +38,34 @@ struct RunningProcess {
     cancel: CancellationToken,
 }
 
+struct ProcessGroupKillOnDrop {
+    process: Arc<AsyncMutex<RunningProcess>>,
+    armed: bool,
+}
+
+impl ProcessGroupKillOnDrop {
+    fn new(process: Arc<AsyncMutex<RunningProcess>>) -> Self {
+        Self {
+            process,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupKillOnDrop {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut process) = self.process.try_lock()
+        {
+            signal_child_group(&mut process.child);
+        }
+    }
+}
+
 struct StreamResult {
     cancelled: bool,
     agent_session_id: Option<String>,
@@ -316,10 +344,28 @@ impl ClaudeCodeAdapter {
             child,
             cancel: cancel.clone(),
         }));
-        self.insert_process(ctx.execution_id.clone(), process.clone())?;
+        let mut group_kill_guard = ProcessGroupKillOnDrop::new(process.clone());
+        if let Err(registration_error) =
+            self.insert_process(ctx.execution_id.clone(), process.clone())
+        {
+            let cleanup_result = {
+                let mut process = process.lock().await;
+                crate::command::kill_group_and_wait(&mut process.child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Claude process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            group_kill_guard.disarm();
+            return Err(registration_error);
+        }
 
         let stream_result = stream_child_output(&ctx, stdin, stdout, stderr, cancel).await;
         let status_result = wait_and_kill(process).await;
+        if status_result.is_ok() {
+            group_kill_guard.disarm();
+        }
         self.remove_process(&ctx.execution_id)?;
         uninstall_stop_hook(hook_path).await;
 
@@ -547,7 +593,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         if let Some(process) = process {
             let mut process = process.lock().await;
             process.cancel.cancel();
-            signal_child_group(&mut process.child);
+            crate::command::kill_group_and_wait(&mut process.child).await?;
         }
 
         Ok(())

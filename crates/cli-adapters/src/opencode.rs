@@ -83,7 +83,9 @@ impl OpencodeAdapter {
 
         let mut cmd = builder.build();
         cmd.arg(prompt);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd
     }
 
@@ -194,6 +196,27 @@ impl HarnessAdapter for OpencodeAdapter {
         let child_arc = Arc::new(AsyncMutex::new(child));
         let cancelled = Arc::new(AtomicBool::new(false));
 
+        // Record the process before the first await. If generation retirement
+        // races this setup, its cancellation reaches the child handle directly.
+        if let Err(registration_error) = self.insert_execution(
+            ctx.execution_id.clone(),
+            RunningExecution {
+                child: child_arc.clone(),
+                cancelled: cancelled.clone(),
+            },
+        ) {
+            let cleanup_result = {
+                let mut child = child_arc.lock().await;
+                crate::command::kill_child_and_wait(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "OpenCode process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            return Err(registration_error);
+        }
+
         let mut writer = LogWriter::new(
             &ctx.logs_path,
             ctx.execution_id.clone(),
@@ -214,14 +237,6 @@ impl HarnessAdapter for OpencodeAdapter {
                 }),
             )
             .await?;
-
-        self.insert_execution(
-            ctx.execution_id.clone(),
-            RunningExecution {
-                child: child_arc.clone(),
-                cancelled: cancelled.clone(),
-            },
-        )?;
 
         let stream_result = stream_run_output(stdout, stderr, &mut writer).await;
         let status = {
@@ -353,7 +368,7 @@ impl HarnessAdapter for OpencodeAdapter {
         if let Some(exec) = execution {
             exec.cancelled.store(true, Ordering::SeqCst);
             let mut child = exec.child.lock().await;
-            child.start_kill()?;
+            crate::command::kill_child_and_wait(&mut child).await?;
         }
 
         Ok(())
@@ -1025,6 +1040,59 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         assert_eq!(result.status, ExecutionOutcome::Completed);
         assert_eq!(result.agent_session_id, Some("ses_test".to_owned()));
         assert_eq!(result.summary, Some("forge fake ok".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_child_is_killed_when_dropped_before_registration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("opencode-child.pid");
+        let fake_opencode = dir.path().join("fake-opencode");
+        std::fs::write(
+            &fake_opencode,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_opencode, permissions).unwrap();
+
+        let config = serde_json::from_value(serde_json::json!({
+            "base_command_override": fake_opencode.to_string_lossy(),
+        }))
+        .expect("OpenCode config parses");
+        let mut command = OpencodeAdapter::build_command(&config, "test prompt");
+        command.current_dir(dir.path());
+        let child = command.spawn().expect("fake OpenCode child spawns");
+        let pid = child.id().expect("child has pid");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(&pid_file).await {
+                    if value.trim() == pid.to_string() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child reaches the pre-registration barrier");
+        assert!(executors::is_pid_alive(pid));
+
+        drop(child);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executors::is_pid_alive(pid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("kill_on_drop terminates the unregistered OpenCode child");
     }
 
     #[tokio::test]

@@ -908,6 +908,7 @@ version = "0.8.0"
 dependencies = [
  "api-types",
  "async-trait",
+ "command-group",
  "chrono",
  "flate2",
  "schemars",

@@ -611,11 +611,18 @@ launched through its `DaemonRuntime`, `FallbackExecutor`, and adapter process
 maps. When dispatch ends because the socket is lost or the daemon is shutting
 down, that runtime closes Start admission, cancels its active tasks through
 the same executor and adapters, and waits for bounded task termination before
-reconnect. A replacement connection for the same daemon ID starts with a new
-runtime and never adopts old process handles. If the old socket is already
-gone, its final log or terminal notification may be lost; daemon reports and
-the existing recovery path reconcile durable Execution state. Failed bounded
-teardown stops reconnect so a later generation cannot overlap the old work.
+reconnect. Successful generation retirement also verifies the retained
+adapter process handles after task join; adapters wait for their direct child
+or process group to exit before reporting cancellation complete. Therefore a
+successful retirement proves that its execution processes cannot outlive the
+generation. If a task must be aborted, or process termination cannot be
+verified, retirement fails closed. The connect loop returns that failure to
+the daemon supervisor, which stops reporting readiness, shuts down the daemon,
+and does not create a replacement generation. A replacement connection for
+the same daemon ID starts with a new runtime and never adopts old process
+handles. If the old socket is already gone, its final log or terminal
+notification may be lost; daemon reports and the existing recovery path
+reconcile durable Execution state.
 
 An Execution's `credential_ref` is immutable invocation identity. Credential
 resolution may verify current Agent ownership and credential status, but it

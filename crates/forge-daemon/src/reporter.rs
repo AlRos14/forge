@@ -27,20 +27,30 @@ pub async fn run(
                 }
             }
             _ = ticker.tick() => {
-                match report_once(&client, &workspace_root, &labels, &active_executions).await {
-                    Ok(daemon) => {
-                        tracing::info!(
-                            daemon_id = %daemon.id,
-                            workspace_root = %workspace_root.display(),
-                            "daemon report submitted"
-                        );
+                tokio::select! {
+                    result = report_once(&client, &workspace_root, &labels, &active_executions) => {
+                        match result {
+                            Ok(daemon) => {
+                                tracing::info!(
+                                    daemon_id = %daemon.id,
+                                    workspace_root = %workspace_root.display(),
+                                    "daemon report submitted"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    workspace_root = %workspace_root.display(),
+                                    "daemon report failed"
+                                );
+                            }
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            workspace_root = %workspace_root.display(),
-                            "daemon report failed"
-                        );
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() {
+                            tracing::info!("daemon reporter stopped during report");
+                            return Ok(());
+                        }
                     }
                 }
             }

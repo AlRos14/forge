@@ -3,6 +3,9 @@ use crate::{
     LogKind, LogStream, LogWriter, ShellConfig, TaskExecutor,
 };
 use async_trait::async_trait;
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
+#[cfg(unix)]
+use command_group::{Signal, UnixChildExt};
 use std::{
     collections::HashMap,
     process::Stdio,
@@ -14,7 +17,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
-    process::{Child, Command},
+    process::Command,
     sync::{mpsc, Mutex as AsyncMutex},
     time::{self, MissedTickBehavior},
 };
@@ -72,8 +75,33 @@ impl ShellExecutor {
 }
 
 struct RunningProcess {
-    child: AsyncMutex<Child>,
+    child: Arc<AsyncMutex<AsyncGroupChild>>,
     cancellation_requested: AtomicBool,
+}
+
+struct GroupKillOnDrop {
+    child: Arc<AsyncMutex<AsyncGroupChild>>,
+    armed: bool,
+}
+
+impl GroupKillOnDrop {
+    fn new(child: Arc<AsyncMutex<AsyncGroupChild>>) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut child) = self.child.try_lock() {
+                let _ = child.start_kill();
+            }
+        }
+    }
 }
 
 enum OutputEvent {
@@ -117,34 +145,58 @@ impl TaskExecutor for ShellExecutor {
         for (key, value) in &plan.env_set {
             command.env(key, value);
         }
-        configure_process_group(&mut command);
+        command.kill_on_drop(true);
 
-        let mut child = match command.spawn() {
+        let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(error) => {
                 return Err(ExecutorError::Io(error));
             }
         };
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture child stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutorError::Other("failed to capture child stderr".to_string()))?;
+        let Some(stdout) = child.inner().stdout.take() else {
+            let cleanup = terminate_process_group(&mut child).await;
+            return Err(cleanup.err().map_or_else(
+                || ExecutorError::Other("failed to capture child stdout".to_string()),
+                ExecutorError::Io,
+            ));
+        };
+        let Some(stderr) = child.inner().stderr.take() else {
+            let cleanup = terminate_process_group(&mut child).await;
+            return Err(cleanup.err().map_or_else(
+                || ExecutorError::Other("failed to capture child stderr".to_string()),
+                ExecutorError::Io,
+            ));
+        };
 
         let process = Arc::new(RunningProcess {
-            child: AsyncMutex::new(child),
+            child: Arc::new(AsyncMutex::new(child)),
             cancellation_requested: AtomicBool::new(false),
         });
+        let mut group_kill_guard = GroupKillOnDrop::new(Arc::clone(&process.child));
 
-        self.insert_process(ctx.execution_id.clone(), process.clone())?;
+        if let Err(registration_error) =
+            self.insert_process(ctx.execution_id.clone(), process.clone())
+        {
+            let cleanup = {
+                let mut child = process.child.lock().await;
+                terminate_process_group(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup {
+                return Err(ExecutorError::Other(format!(
+                    "shell process registration failed ({registration_error}); process group termination failed ({cleanup_error})"
+                )));
+            }
+            group_kill_guard.disarm();
+            return Err(registration_error);
+        }
 
         let result = self
             .supervise_process(&ctx, process.clone(), stdout, stderr, &mut writer)
             .await;
+        if result.is_ok() {
+            group_kill_guard.disarm();
+        }
 
         self.remove_process(&ctx.execution_id)?;
 
@@ -160,17 +212,19 @@ impl TaskExecutor for ShellExecutor {
 
         process.cancellation_requested.store(true, Ordering::SeqCst);
 
-        let child_id = {
+        #[cfg(unix)]
+        {
             let child = process.child.lock().await;
-            child.id()
-        };
-
-        if let Some(child_id) = child_id {
-            let _ = send_sigterm(child_id).await;
+            let _ = child.signal(Signal::SIGTERM);
+        }
+        #[cfg(not(unix))]
+        {
+            let mut child = process.child.lock().await;
+            let _ = child.start_kill();
         }
 
         let deadline = time::Instant::now() + self.cancel_grace_period;
-        let direct_child_exited = loop {
+        let process_group_exited = loop {
             {
                 let mut child = process.child.lock().await;
                 if child.try_wait()?.is_some() {
@@ -185,32 +239,28 @@ impl TaskExecutor for ShellExecutor {
             time::sleep(COMPLETION_POLL_INTERVAL).await;
         };
 
-        // Always SIGKILL the process group, even when the direct child exited
-        // during the grace period: TERM-ignoring descendants in the group can
-        // outlive it and keep the output pipes open, which would stall the
-        // supervisor's drain loop until they exit on their own. Signalling an
-        // already-dead group is a no-op (ESRCH).
-        if let Some(child_id) = child_id {
-            let _ = send_sigkill(child_id).await;
-        }
-        if !direct_child_exited {
-            // Tolerate the child exiting between the deadline check and here;
-            // start_kill errors on an already-reaped process.
+        // AsyncGroupChild tracks the whole process group. Reap it after the
+        // grace period so descendants cannot keep working after cancellation.
+        if !process_group_exited {
             let mut child = process.child.lock().await;
-            let _ = child.start_kill();
+            terminate_process_group(&mut child).await?;
         }
+
+        let mut child = process.child.lock().await;
+        child.wait().await?;
 
         Ok(())
     }
 }
 
-#[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
-    command.process_group(0);
+async fn terminate_process_group(child: &mut AsyncGroupChild) -> std::io::Result<()> {
+    if let Err(kill_error) = child.start_kill() {
+        if child.try_wait()?.is_none() {
+            return Err(kill_error);
+        }
+    }
+    child.wait().await.map(|_| ())
 }
-
-#[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
 
 impl ShellExecutor {
     fn insert_process(
@@ -408,35 +458,6 @@ async fn write_output_event(
     }
 
     Ok(())
-}
-
-async fn send_sigterm(pid: u32) -> std::io::Result<()> {
-    send_signal(pid, "TERM").await
-}
-
-async fn send_sigkill(pid: u32) -> std::io::Result<()> {
-    send_signal(pid, "KILL").await
-}
-
-#[cfg(unix)]
-async fn send_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .status()
-        .await
-        .map(|_| ())
-}
-
-#[cfg(not(unix))]
-async fn send_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(pid.to_string())
-        .status()
-        .await
-        .map(|_| ())
 }
 
 #[cfg(unix)]

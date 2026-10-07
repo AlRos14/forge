@@ -352,11 +352,54 @@ where
 
 pub async fn run_with_reconnect<F, Fut>(
     client: Arc<DaemonClient>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     on_stream: F,
 ) -> Result<()>
 where
     F: Fn(DaemonCommandStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>>,
+{
+    let daemon_id = client.daemon_id.clone();
+    let connect_client = Arc::clone(&client);
+    let on_stream = Arc::new(on_stream);
+    run_with_reconnect_loop(
+        daemon_id,
+        shutdown,
+        move || {
+            let client = Arc::clone(&connect_client);
+            async move {
+                client
+                    .connect_command_stream()
+                    .await
+                    .map(DispatchCommandStream::Live)
+            }
+        },
+        move |stream| {
+            let on_stream = Arc::clone(&on_stream);
+            async move {
+                match stream {
+                    DispatchCommandStream::Live(stream) => on_stream(stream).await,
+                    #[cfg(test)]
+                    DispatchCommandStream::Test(_) => {
+                        unreachable!("test command stream cannot enter the public callback")
+                    }
+                }
+            }
+        },
+    )
+    .await
+}
+
+async fn run_with_reconnect_loop<C, CFut, F, Fut>(
+    daemon_id: Option<String>,
+    mut shutdown: watch::Receiver<bool>,
+    connect_stream: C,
+    on_stream: F,
+) -> Result<()>
+where
+    C: Fn() -> CFut + Send + Sync + 'static,
+    CFut: Future<Output = Result<DispatchCommandStream>>,
+    F: Fn(DispatchCommandStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>>,
 {
     let mut backoff = Duration::from_secs(DAEMON_RETRY_INITIAL_BACKOFF_SECS);
@@ -368,7 +411,7 @@ where
         }
 
         let connection = tokio::select! {
-            result = client.connect_command_stream() => result,
+            result = connect_stream() => result,
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() {
                     return Ok(());
@@ -380,7 +423,7 @@ where
         match connection {
             Ok(stream) => {
                 tracing::info!(
-                    daemon_id = ?client.daemon_id,
+                    daemon_id = ?daemon_id,
                     "daemon command stream connected"
                 );
                 backoff = Duration::from_secs(DAEMON_RETRY_INITIAL_BACKOFF_SECS);
@@ -627,6 +670,10 @@ impl TestCommandStream {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::Duration;
 
     use super::*;
@@ -716,6 +763,80 @@ mod tests {
         // Kept alive until the loop exits so the recv branch never observes a
         // closed stream and races the shutdown branch in select!.
         drop(in_tx);
+    }
+
+    #[tokio::test]
+    async fn failed_generation_retirement_never_attempts_a2() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connect_attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = Arc::new(AtomicUsize::new(0));
+        let connector_count = Arc::clone(&connect_attempts);
+        let connector = move || {
+            connector_count.fetch_add(1, Ordering::SeqCst);
+            let (_incoming_tx, stream, _outgoing_rx) = TestCommandStream::pair();
+            async move {
+                drop(_incoming_tx);
+                drop(_outgoing_rx);
+                Ok(DispatchCommandStream::Test(stream))
+            }
+        };
+        let callback_count = Arc::clone(&callback_attempts);
+        let on_stream = move |_stream| {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow!("A1 retirement failed")) }
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_with_reconnect_loop(None, shutdown_rx, connector, on_stream),
+        )
+        .await
+        .expect("failed teardown returns without reconnect delay");
+
+        assert!(result.is_err());
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(callback_attempts.load(Ordering::SeqCst), 1);
+        drop(shutdown_tx);
+    }
+
+    #[tokio::test]
+    async fn successful_generation_retirement_allows_reconnect() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connect_attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = Arc::new(AtomicUsize::new(0));
+        let connector_count = Arc::clone(&connect_attempts);
+        let connector = move || {
+            connector_count.fetch_add(1, Ordering::SeqCst);
+            let (_incoming_tx, stream, _outgoing_rx) = TestCommandStream::pair();
+            async move {
+                drop(_incoming_tx);
+                drop(_outgoing_rx);
+                Ok(DispatchCommandStream::Test(stream))
+            }
+        };
+        let callback_count = Arc::clone(&callback_attempts);
+        let callback_shutdown = shutdown_tx.clone();
+        let on_stream = move |_stream| {
+            let attempt = callback_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let shutdown = callback_shutdown.clone();
+            async move {
+                if attempt == 2 {
+                    let _ = shutdown.send(true);
+                }
+                Ok(())
+            }
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            run_with_reconnect_loop(None, shutdown_rx, connector, on_stream),
+        )
+        .await
+        .expect("successful retirement reconnects")
+        .expect("reconnect loop exits on shutdown");
+
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(callback_attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

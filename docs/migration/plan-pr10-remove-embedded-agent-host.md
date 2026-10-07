@@ -158,13 +158,19 @@ Remote command work is owned by the daemon command connection generation
 whose `DaemonRuntime` launched it. Disconnect and graceful shutdown close that
 runtime to new Starts, cancel its active Executions through the same
 `FallbackExecutor` and adapter instances, then wait for bounded task
-termination before a reconnect can create a new runtime. A new generation for
-the same logical daemon never adopts old process handles. Logs or a terminal
-notification sent after the socket disappears may be lost; the existing daemon
-report and recovery paths reconcile durable Execution state. If bounded
-teardown cannot complete, the daemon stops instead of reconnecting alongside
-work it can no longer control. This ephemeral control lifetime does not change
-the Execution's frozen `resolved_daemon_id` or HarnessSession authority.
+termination before a reconnect can create a new runtime. Retirement also
+verifies every Execution ID admitted by that generation after task join,
+including tasks that already returned. Adapter cancellation waits for its
+direct child or process group to exit. Successful retirement therefore proves
+that its execution processes cannot outlive the generation. If a task must be
+aborted or termination cannot be verified, retirement returns an error; the
+connect loop creates no replacement generation and the daemon supervisor
+stops the reporter and daemon process. A new generation for the same logical
+daemon never adopts old process handles. Logs or a terminal notification sent
+after the socket disappears may be lost; the existing daemon report and
+recovery paths reconcile durable Execution state. This ephemeral control
+lifetime does not change the Execution's frozen `resolved_daemon_id` or
+HarnessSession authority.
 
 No database migration was required. Retired runtime and protected payload rows
 remain historical; `execution.agent_session_id` remains readable but is no
@@ -219,3 +225,46 @@ Static searches found no executable production references to
 No migration, workspace-wide test/build/clippy, or target cleanup was run.
 The shared target measured 13 GB before focused compilation and 14 GB after;
 free disk moved from 98 GB to 97 GB.
+
+## Generation teardown hardening follow-up (2026-10-07)
+
+The daemon now supervises command-loop completion alongside OS shutdown. A
+definitive command-loop error signals shared shutdown, stops the reporter, and
+returns the original failure. Reporter requests are cancellable while in
+flight. Normal socket loss still passes through `run_with_reconnect`; only a
+failed generation retirement terminates daemon supervision.
+
+`DaemonRuntime::retire()` now checks every Execution admitted by the retiring
+generation, including tasks that already returned. It waits for tasks, then
+asks the same adapter registry to terminate any retained child/process-group
+handles. `Ok(())` is returned only when all tasks joined without abort and the
+post-join adapter termination pass succeeded. If a task had to be aborted,
+retirement returns `Err` regardless of a later cancel result because the
+aborted task itself cannot prove process termination. That error prevents A2
+and makes daemon-level supervision stop.
+
+Production adapters now wait for direct-child or process-group exit from their
+explicit cancel path. OpenCode kills on child drop and records the child before
+its first await; Smith now records its already-drop-safe child before logging
+yields. Claude, Cursor, and Shell signal their process groups if an execution
+future is dropped; successful cancellation still waits for group exit. No process
+adoption, daemon identity, `resolved_daemon_id`, HarnessSession, credential,
+or Agent Chat contract changed.
+
+Passing focused checks for this follow-up:
+
+```text
+cargo check -p executors -p cli-adapters --locked --offline
+cargo test -p cli-adapters --lib opencode_child_is_killed_when_dropped_before_registration --locked --offline -- --test-threads=1
+cargo test -p executors --test shell_executor shell_executor_drop_kills_process_group_descendants --locked --offline -- --test-threads=1
+cargo test -p executors --test shell_executor shell_executor_cancel --locked --offline -- --test-threads=1
+cargo test -p services --lib execution_start_after_same_daemon_reconnect_uses_current_generation --locked --offline -- --test-threads=1
+```
+
+The focused client/daemon build and the new runtime/supervisor tests were not
+run: Cargo offline resolution stopped because `crossterm v0.29.0` is absent
+from the local cache. Those tests cover successful retirement with a real
+child PID, the pre-registration abort/drop race, no A2 after failed
+retirement, fatal connect shutdown, and normal shutdown. They remain pending
+local verification; this follow-up is not PR10 acceptance evidence until
+those scenarios pass.
