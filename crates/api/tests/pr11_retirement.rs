@@ -114,6 +114,31 @@ async fn retired_rest_mutations_return_stable_gone_errors() {
         ),
         (
             Method::POST,
+            format!(
+                "/api/v1/projects/{}/milestones/legacy-milestone/readiness",
+                project.id
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/projects/{}/milestones/legacy-milestone/transition",
+                project.id
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/projects/{}/milestones/legacy-milestone/release",
+                project.id
+            ),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/milestones/primary", project.id),
+        ),
+        (
+            Method::POST,
             format!("/api/v1/projects/{}/agent-handoffs", project.id),
         ),
         (Method::POST, "/api/v1/agents/agent/actions".to_owned()),
