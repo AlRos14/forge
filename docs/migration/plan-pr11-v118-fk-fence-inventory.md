@@ -177,7 +177,7 @@ For `SET NULL` rows, a `N` parent operation means the exception is not reached b
 
 ## Focal evidence
 
-- `crates/db/tests/pr11_retirement.rs::v119_allows_only_exact_task_and_binding_fk_cleanup` reconstructs a V117 historical Project, verifies the V118 `ProjectRepo::delete` failure, applies V119, and verifies productive teardown, `Task`/`Execution` reference cleanup, surviving history, Project governance cleanup, and self-referential binding `SET NULL` while preserving the surviving row.
+- `crates/db/tests/pr11_retirement.rs::v119_allows_only_exact_task_and_binding_fk_cleanup` reconstructs a V117 historical Project, verifies the V118 `ProjectRepo::delete` failure, applies V119, and verifies productive teardown, `Task`/`Execution` reference cleanup, a surviving Charter approval's `consumed_project_id`, Project governance cleanup, and self-referential binding `SET NULL` while preserving each surviving row.
 - The same test rejects direct FK nulling while the parent exists, semantic updates, and mixed FK-plus-semantic updates, including while a deletion guard exists.
 - `crates/services/src/project_deletion.rs::delete_project_preserves_pr11_history_and_clears_only_fk_references` covers Genesis/Charter provenance, Project Agent binding provenance, commitment/memory history, guarded Chat/handoff cleanup, domain-event preservation, no guard residue, and `PRAGMA foreign_key_check`.
 - `crates/db/src/tests.rs::project_delete_tears_down_charter_and_immutable_milestone_rows` verifies Project teardown with historical Charter and milestone rows; `project_deletion_reconciles_stale_task_integration_operations` verifies deletion without PR11 history.

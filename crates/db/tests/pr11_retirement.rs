@@ -971,6 +971,49 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     .await
     .expect("historical Project Charter");
     sqlx::query(
+        "INSERT INTO project_charter
+         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
+         VALUES ('fk-keep-charter', 'fk-owner', 'fk-keep-project', 'standard', 'mvp', 'attached', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("surviving Project Charter");
+    sqlx::query(
+        "INSERT INTO project_charter_revision
+         (id, charter_id, revision, lifecycle, schema_version, render_version,
+          content_json, rendered_view, author_type, author_id, content_digest,
+          rendered_digest, created_at)
+         VALUES ('fk-keep-charter-r1', 'fk-keep-charter', 1, 'approved', 'test', 'test',
+                 '{}', 'historical approval target', 'user', 'fk-owner',
+                 'keep-charter-digest', 'keep-charter-render-digest', ?)",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("surviving Charter revision");
+    sqlx::query(
+        "INSERT INTO project_charter_approval
+         (id, approval_type, charter_id, revision_id, content_digest, rendered_digest,
+          expected_charter_version, approving_principal_type, approving_principal_id,
+          authorization_basis, authorization_action, explicit_event,
+          authorization_occurred_at, source_action, lifecycle, idempotency_key,
+          consumed_project_id, consumed_at, created_at, updated_at)
+         VALUES ('fk-consumed-approval', 'project_creation', 'fk-keep-charter',
+                 'fk-keep-charter-r1', 'keep-charter-digest', 'keep-charter-render-digest',
+                 1, 'user', 'fk-owner', 'historical approval', 'project.create',
+                 'historical consumed approval', ?, 'fixture', 'consumed',
+                 'fk-consumed-approval-key', 'fk-project', ?, ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical approval consumed by the deleting Project");
+    sqlx::query(
         "INSERT INTO project_execution_baseline
          (id, project_id, lifecycle, created_at, updated_at)
          VALUES ('fk-baseline', 'fk-project', 'draft', ?, ?)",
@@ -1197,6 +1240,19 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
         )
         .execute(&pool)
         .await,
+        sqlx::query(
+            "UPDATE project_charter_approval SET consumed_project_id = NULL
+             WHERE id = 'fk-consumed-approval'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query(
+            "UPDATE project_charter_approval
+             SET consumed_project_id = NULL, lifecycle = 'revoked'
+             WHERE id = 'fk-consumed-approval'",
+        )
+        .execute(&pool)
+        .await,
     ];
     for (index, result) in denied_writes.into_iter().enumerate() {
         assert!(result.is_err(), "retired or mixed update {index} must fail");
@@ -1242,6 +1298,30 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     .await
     .expect("historical governance survives target Task deletion");
     assert_eq!(governance, ("fk-task-keep".to_owned(), None, 0));
+
+    let approval: (String, Option<String>, Option<String>, String) = sqlx::query_as(
+        "SELECT lifecycle, consumed_project_id, consumed_at, updated_at
+         FROM project_charter_approval WHERE id = 'fk-consumed-approval'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("surviving Project OS approval remains historical");
+    assert_eq!(
+        approval,
+        ("consumed".to_owned(), None, Some(now.clone()), now.clone(),),
+        "only the consumed Project FK is cleared"
+    );
+    let mixed_approval_update = sqlx::query(
+        "UPDATE project_charter_approval
+         SET consumed_project_id = NULL, lifecycle = 'revoked'
+         WHERE id = 'fk-consumed-approval'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        mixed_approval_update.is_err(),
+        "FK cleanup cannot authorize a Charter approval lifecycle change"
+    );
 
     let binding: (
         String,
