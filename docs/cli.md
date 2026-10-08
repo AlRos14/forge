@@ -147,171 +147,56 @@ Supported agents are `claude`, `codex`, and `cursor`. Supported config scopes
 are `project`, `local`, and `user`; the optional `--project-id` scopes MCP tool
 calls to one Forge project.
 
-### Direct embedded agents, bindings, and Agent Chats
+### Agent identities and Task sessions
 
-`forge-ctl embedded` manages account-owned provider entries, embedded agents,
-and their scope-bound native sessions. Adding a provider stores its credential
-as an entry and never creates an agent; creating an agent references an entry;
-neither creates Main or Project authority — select that explicitly through a
-singular binding. Provider credentials are accepted only through a hidden
-terminal prompt or `--credential-stdin` and are never printed by the CLI.
+`forge-ctl embedded` retains provider entries, Agent identities, profile
+revisions, and explicit Task-scoped HarnessSessions. Main/Project bindings,
+Main/Project Chat, Genesis, vertical handoffs, and bespoke commitments are
+retired. Their historical reads may remain available during the PR12 public
+surface transition, but requests that mutate those records return the stable
+`operation_retired` error. An old binding or approved action cannot authorize a
+Task or Execution.
+
+Provider credentials are accepted only through a hidden terminal prompt or
+`--credential-stdin` and are never printed by the CLI.
 
 ```bash
-# Add an API-key provider entry (the credential is prompted for)
 forge-ctl embedded provider add --provider openai --label "primary"
-
-# Pipe a credential without putting it in shell history or process arguments
-printf '%s\n' "$OPENAI_API_KEY" | forge-ctl embedded provider add \
-  --provider openai --label "primary" --credential-stdin
-
-# Sign in with OAuth from this machine (see "OAuth logins" below)
 forge-ctl embedded provider login --provider openai --label "chatgpt"
-forge-ctl embedded provider login --provider openai --method device
-
 forge-ctl embedded provider list
 forge-ctl embedded provider rename <ENTRY_ID> --label "work" --version <VERSION>
 forge-ctl embedded provider remove <ENTRY_ID> --version <VERSION>
 
-# Create a direct agent on an entry
-forge-ctl embedded create \
-  --name "Forge Assistant" \
-  --credential-id <ENTRY_ID> \
-  --model gpt-5.6
-
+forge-ctl embedded create --name "Forge Assistant" \
+  --credential-id <ENTRY_ID> --model gpt-5.6
 forge-ctl embedded profile list <IDENTITY_ID>
 forge-ctl embedded profile connect <IDENTITY_ID> --version <VERSION> \
   --credential-id <ENTRY_ID> --model gpt-5.6
-forge-ctl embedded profile select <IDENTITY_ID> <PROFILE_ID> --version <VERSION>
 
-# Every session names one canonical scope; only Task scopes can receive a workspace.
-forge-ctl embedded session create <IDENTITY_ID> --scope main \
-  --chat-id <MAIN_CHAT_ID>
-forge-ctl embedded session create <IDENTITY_ID> --scope project \
-  --chat-id <PROJECT_CHAT_ID>
 forge-ctl embedded session create <IDENTITY_ID> --scope task \
-  --task-id <TASK_ID> --role worker
+  --task-id <TASK_ID> --role implementer
 forge-ctl embedded session list <IDENTITY_ID>
-forge-ctl embedded session rotate <SESSION_ID> --version <VERSION>
-forge-ctl embedded session suspend <SESSION_ID> --version <VERSION>
-forge-ctl embedded session resume <SESSION_ID> --version <VERSION>
 forge-ctl embedded session cancel <SESSION_ID>
-forge-ctl embedded session steer <SESSION_ID> "Use the latest accepted requirement"
-forge-ctl embedded session effective-permissions \
-  --identity-id <IDENTITY_ID> --scope project --chat-id <PROJECT_CHAT_ID>
 ```
 
-#### OAuth logins
+Only a Task with explicit TaskRole membership and ordinary Execution authority
+can use a Task HarnessSession. Main and Project chat scopes are retired.
+Provider entry removal and profile changes use optimistic concurrency; pass the
+current `--version` to avoid overwriting a concurrent update.
 
-Some providers' OAuth clients whitelist only a `localhost` callback — OpenAI's
-Codex client accepts `http://localhost:1455/auth/callback` (or `:1457`) and
-nothing else. The listener therefore has to run on the machine the browser runs
-on:
+For OAuth login, the CLI binds the provider callback on the machine running the
+browser flow and relays the authorization code to the server. When Forge and the
+browser are on the same machine, the web UI's **Continue with ChatGPT** flow can
+bind the callback locally. Use `--method device` when no browser is available.
 
-| Where Forge runs | What to use |
-| --- | --- |
-| Same machine as the browser | The web UI's **Continue with ChatGPT**. Forge binds the callback port for the duration of the ceremony. |
-| Another host | `forge-ctl embedded provider login`. The CLI binds the port locally and relays only the authorization code to the server. |
-| No browser available | `--method device`, which prints a code to enter elsewhere. |
+The old `embedded main`, `embedded project`, `embedded chat`, `embedded handoff`,
+and `embedded commitment` commands are retained only as compatibility surfaces
+until PR12; writes fail with `operation_retired`. Task communication uses
+Task-scoped Message and Handoff records through the generic Task APIs.
 
-`login` never sees the PKCE verifier or the resulting tokens: the server keeps
-both and performs the exchange, exactly as it does for the web flow. Browser
-login from a remote origin is rejected with an error pointing here, because no
-listener could answer the callback.
-
-Main and Project bindings are singular, versioned resources. Replacing a
-binding preserves the existing Agent Chat and historical attribution. A
-missing binding leaves the chat available for setup but admits no model turn
-until a new binding is selected.
-
-```bash
-forge-ctl embedded main get
-forge-ctl embedded main set <IDENTITY_ID> --profile-id <PROFILE_ID> \
-  --version <VERSION>
-
-forge-ctl embedded project get <PROJECT_ID>
-forge-ctl embedded project set <PROJECT_ID> <IDENTITY_ID> \
-  --profile-id <PROFILE_ID> --version <VERSION>
-```
-
-Agent Chats are singular timelines: one global Main Chat and one Project Agent
-Chat per authorized Project. Chat reads expose bounded provenance and finite
-turn state. Sending a message admits the responder from the server-side binding;
-the CLI never supplies an authority identity.
-
-```bash
-forge-ctl embedded chat list --limit 50
-forge-ctl embedded chat get <CHAT_ID>
-forge-ctl embedded chat messages <CHAT_ID> --limit 50
-forge-ctl embedded chat messages <CHAT_ID> \
-  --before-sequence <SEQUENCE> --limit 50
-forge-ctl embedded chat send <CHAT_ID> "Summarize the accepted requirements" \
-  --dedupe-key <DEDUPE_KEY>
-```
-
-Main-to-Project handoffs are explicit, immutable, bounded publications. The
-server guards source references, records provenance, and schedules at most one
-Project Agent turn. A repeated dedupe key returns the original outcome.
-
-```bash
-forge-ctl embedded handoff list <PROJECT_ID> --limit 50
-forge-ctl embedded handoff get <PROJECT_ID> <HANDOFF_ID>
-forge-ctl embedded handoff create <PROJECT_ID> \
-  --content "Approved brief and next steps" \
-  --source-message-id <MESSAGE_ID> \
-  --source-turn-job-id <TURN_JOB_ID> \
-  --dedupe-key <DEDUPE_KEY>
-```
-
-Context inspection is metadata-only. The server returns source IDs, revisions,
-selection reasons, dispositions, and fingerprints; it does not return source
-fragments, protected checkpoints, secrets, or inaccessible memory bodies.
-
-```bash
-forge-ctl embedded context list <IDENTITY_ID> --limit 20
-forge-ctl embedded context list <IDENTITY_ID> \
-  --context-scope-id <CONTEXT_SCOPE_ID>
-forge-ctl embedded context get <MANIFEST_ID> \
-  --identity-id <IDENTITY_ID> --context-scope-id <CONTEXT_SCOPE_ID>
-```
-
-Provider entry disconnect (`embedded provider remove`) uses optimistic
-concurrency. Pass the entry `version` returned by `provider list`; a stale
-version is rejected instead of revoking a connection changed by another
-session. Removal reports the agents that referenced the entry — they become
-visibly unhealthy and are never silently rebound.
-
-Commitments are durable identity-owned obligations. Create/list operations use
-the identity path and an explicitly authorized canonical scope; lifecycle
-mutations require the optimistic `--version` returned by the previous response.
-Completion requires evidence, and transfer/cancellation require a reason.
-
-```bash
-forge-ctl embedded commitment list <IDENTITY_ID> \
-  --scope-type project --scope-id <PROJECT_ID> --limit 50
-forge-ctl embedded commitment create <IDENTITY_ID> \
-  --scope-type project --scope-id <PROJECT_ID> \
-  --title "Deliver the accepted plan" --correlation-id <CORRELATION_ID>
-forge-ctl embedded commitment get <COMMITMENT_ID>
-forge-ctl embedded commitment update <COMMITMENT_ID> \
-  --version <VERSION> --status blocked \
-  --blocked-reason "Waiting for review" --reason "Dependency" \
-  --dedupe-key <DEDUPE_KEY>
-forge-ctl embedded commitment complete <COMMITMENT_ID> \
-  --version <VERSION> --evidence-type task-delivery \
-  --evidence-id <EVIDENCE_ID> --dedupe-key <DEDUPE_KEY>
-forge-ctl embedded commitment transfer <COMMITMENT_ID> \
-  --version <VERSION> --to-identity-id <IDENTITY_ID> \
-  --reason "Reassigning ownership" --dedupe-key <DEDUPE_KEY>
-forge-ctl embedded commitment cancel <COMMITMENT_ID> \
-  --version <VERSION> --reason "No longer required" \
-  --dedupe-key <DEDUPE_KEY>
-forge-ctl embedded commitment evidence <COMMITMENT_ID>
-```
-
-Use `--output json` for machine-readable responses. Nested profile, session,
-binding, chat, handoff, context-manifest, and commitment resources are emitted as JSON
-even with the default table output so provenance, lifecycle, and capability
-fields are not lost.
+Use `--output json` for machine-readable responses. Agent identity, profile,
+provider, and Task session resources are emitted as JSON even with the default
+table output so their provenance and lifecycle fields are not lost.
 
 ### JSON output for scripting
 

@@ -268,19 +268,6 @@ async fn main() {
     ));
     let _external_sync_handle = Arc::clone(&external_sync).start();
     let state = state.with_task_dispatcher(Arc::clone(&task_dispatcher));
-    let mut agent_chat_turn_worker_handle =
-        Arc::clone(&state.agent_chat_turn_worker).start(state.shutdown_signal.subscribe());
-    let memory_consumer = Arc::new(services::AgentChatMemoryConsumer::new(
-        Arc::clone(&state.db),
-        services::memory_consumer_lease_owner(),
-    ));
-    let mut memory_consumer_handle = memory_consumer.start(state.shutdown_signal.subscribe());
-    let coordination_consumer = Arc::new(services::CoordinationOutcomeConsumer::new(
-        Arc::clone(&state.db),
-        services::coordination_consumer_lease_owner(),
-    ));
-    let mut coordination_consumer_handle =
-        coordination_consumer.start(state.shutdown_signal.subscribe());
     let orchestrator_runtime = Arc::new(services::OrchestratorRuntime::new(
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),
@@ -288,9 +275,6 @@ async fn main() {
     ));
     let mut orchestrator_runtime_handle =
         Arc::clone(&orchestrator_runtime).start(state.shutdown_signal.subscribe());
-    let attention_projection = Arc::new(services::AttentionService::new(Arc::clone(&state.db)));
-    let mut attention_projection_handle =
-        attention_projection.start(state.shutdown_signal.subscribe());
 
     if let Err(error) = state.workflow_template_service.initialize().await {
         warn!(%error, "workflow template initialization failed");
@@ -409,33 +393,6 @@ async fn main() {
         Err(_) => warn!("task dispatcher did not stop before shutdown timeout"),
     }
     project_hook_service_handle.abort();
-    match tokio::time::timeout(Duration::from_secs(5), &mut agent_chat_turn_worker_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Agent Chat turn worker failed during shutdown"),
-        Err(_) => {
-            warn!("Agent Chat turn worker did not stop before shutdown timeout");
-            agent_chat_turn_worker_handle.abort();
-            let _ = agent_chat_turn_worker_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut memory_consumer_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Agent Chat memory consumer failed during shutdown"),
-        Err(_) => {
-            warn!("Agent Chat memory consumer did not stop before shutdown timeout");
-            memory_consumer_handle.abort();
-            let _ = memory_consumer_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut coordination_consumer_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Task coordination consumer failed during shutdown"),
-        Err(_) => {
-            warn!("Task coordination consumer did not stop before shutdown timeout");
-            coordination_consumer_handle.abort();
-            let _ = coordination_consumer_handle.await;
-        }
-    }
     match tokio::time::timeout(Duration::from_secs(5), &mut orchestrator_runtime_handle).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(%error, "orchestrator runtime failed during shutdown"),
@@ -443,15 +400,6 @@ async fn main() {
             warn!("orchestrator runtime did not stop before shutdown timeout");
             orchestrator_runtime_handle.abort();
             let _ = orchestrator_runtime_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut attention_projection_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Attention projection worker failed during shutdown"),
-        Err(_) => {
-            warn!("Attention projection worker did not stop before shutdown timeout");
-            attention_projection_handle.abort();
-            let _ = attention_projection_handle.await;
         }
     }
 }

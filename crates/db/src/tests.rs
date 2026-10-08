@@ -5,16 +5,15 @@ use crate::{
     ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CoordinationMode, CreateAgent,
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
     CreateDomainEvent, CreateEvidence, CreateExecution, CreateOrchestratorWake, CreateProject,
-    CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
-    CreateProjectCharterRevisionAtomically, CreateProjectMember,
-    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateRoleMembership,
-    CreateSkill, CreateTask, CreateTaskRole, CreateTaskRoleAssignment, CreateTerminalSession,
-    CreateValidationRun, CreateValidationRunArtifact, CreateWorkspace, CreateWorkspaceLease,
-    CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo,
-    ExecutionStatus, FinishValidationRun, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery,
-    MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity,
-    MoveTaskPersistence, NotificationListQuery, NotificationRepo, OrchestratorWakeRepo,
-    PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
+    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
+    CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
+    CreateRoleMembership, CreateSkill, CreateTask, CreateTaskRole, CreateTaskRoleAssignment,
+    CreateTerminalSession, CreateValidationRun, CreateValidationRunArtifact, CreateWorkspace,
+    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
+    ExecutionRepo, ExecutionStatus, FinishValidationRun, MemoryAccessQuery, MemoryConfidence,
+    MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType,
+    MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery, NotificationRepo,
+    OrchestratorWakeRepo, PageRequest, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
     ProviderAuthorizationRepo, RepoRepo, ReserveOrchestratorAction, ReviewRepo, ReviewStatus,
     RoleMembershipRepo, RoleMembershipStatus, RotateAgentSession, ScopedMemoryRepository,
     SelectAgentProfile, SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo,
@@ -1228,7 +1227,7 @@ async fn test_agent_session_rotation_is_atomic_and_preserves_lineage() {
 }
 
 #[tokio::test]
-async fn test_list_agents_usable_in_project() {
+async fn test_list_agents_eligible_for_project_uses_generic_identity_rules() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
     let u1_id = seed_user(&db).await;
@@ -1265,63 +1264,21 @@ async fn test_list_agents_usable_in_project() {
     .await
     .expect("u2 project member creates");
 
-    let usable = SqliteDb::list_agents_usable_in_project(&db, &project_id, &u1_id)
+    let usable = SqliteDb::list_agents_eligible_for_project(&db, &project_id)
         .await
-        .expect("usable agents list");
+        .expect("eligible agents list");
     assert!(usable
         .iter()
         .any(|agent| agent.id.as_str() == global_agent_id.as_str()));
     assert!(usable
         .iter()
         .any(|agent| agent.id.as_str() == u1_agent_id.as_str()));
-    assert!(!usable
-        .iter()
-        .any(|agent| agent.id.as_str() == u2_agent_id.as_str()));
-
-    let setup_binding = ProjectAgentBindingRepo::get_active_project_binding(&db, &project_id)
-        .await
-        .expect("project setup binding loads")
-        .expect("project setup binding exists");
-    let u2_agent = AgentRepo::get_by_id(&db, &u2_agent_id)
-        .await
-        .expect("u2 agent loads")
-        .expect("u2 agent exists");
-    ProjectAgentBindingRepo::replace_project_binding(
-        &db,
-        crate::ReplaceProjectAgentBinding {
-            project_id: project_id.clone(),
-            expected_version: setup_binding.version,
-            replacement: CreateProjectAgentBinding {
-                id: new_uuid_v4(),
-                project_id: project_id.clone(),
-                identity_id: Some(u2_agent.id),
-                profile_id: Some(u2_agent.profile_id),
-                state: "active".to_owned(),
-                autonomy_policy_json: "{}".to_owned(),
-                permission_ceiling_json: "{}".to_owned(),
-                subscriptions_json: "[]".to_owned(),
-                wake_budget: 0,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-            replacement_reason: Some("test project agent selection".to_owned()),
-        },
-    )
-    .await
-    .expect("project agent binding creates");
-
-    let usable = SqliteDb::list_agents_usable_in_project(&db, &project_id, &u1_id)
-        .await
-        .expect("usable agents list after link");
-    assert!(usable
-        .iter()
-        .any(|agent| agent.id.as_str() == global_agent_id.as_str()));
-    assert!(usable
-        .iter()
-        .any(|agent| agent.id.as_str() == u1_agent_id.as_str()));
-    assert!(usable
-        .iter()
-        .any(|agent| agent.id.as_str() == u2_agent_id.as_str()));
+    assert!(
+        usable
+            .iter()
+            .any(|agent| agent.id.as_str() == u2_agent_id.as_str()),
+        "an Agent owned by a Project member is eligible without a Project Agent binding"
+    );
 }
 
 async fn seed_task(

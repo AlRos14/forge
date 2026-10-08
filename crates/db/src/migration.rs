@@ -34,7 +34,8 @@ use std::{
 // the exact historical wrong-head retry that still owns the current lifecycle;
 // V116 snapshots terminal modern PR history before reusing its current projection;
 // V117 repairs V115 false-negatives only while the exact wrong rework transition
-// remains current, regardless of unrelated later Task-scoped events.
+// remains current, regardless of unrelated later Task-scoped events. V118
+// retires Main/Project Agent and Project OS authority without dropping history.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

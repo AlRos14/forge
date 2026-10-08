@@ -1,16 +1,18 @@
+mod support;
+
 use db::{
-    create_sqlite_pool, run_migrations, AccountMainAgentBindingRepo, AgentActionPolicyResult,
-    AgentActionRepo, AgentActionStatus, AgentChatRepo, AgentContextScopeRepo, AgentLcmEntryRecord,
-    AgentLcmRepo, AgentRepo, AgentSessionRepo, CreateAccountMainAgentBinding, CreateAgent,
-    CreateAgentAction, CreateAgentContextScope, CreateAgentIdentity, CreateAgentLcmTimeline,
-    CreateAgentProfile, CreateAgentSession, CreateContextManifest, CreateContextManifestSource,
-    CreateDomainEvent, CreateForgeMemorySourceBinding, DomainEventRepo, MemoryItem,
-    ReplaceAccountMainAgentBinding, ScopedMemoryRepository, SqliteDb, User, UserRepo,
+    create_sqlite_pool, AccountMainAgentBindingRepo, AgentActionPolicyResult, AgentActionRepo,
+    AgentActionStatus, AgentChatRepo, AgentContextScopeRepo, AgentLcmEntryRecord, AgentLcmRepo,
+    AgentRepo, AgentSessionRepo, CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction,
+    CreateAgentContextScope, CreateAgentIdentity, CreateAgentLcmTimeline, CreateAgentProfile,
+    CreateAgentSession, CreateContextManifest, CreateContextManifestSource, CreateDomainEvent,
+    CreateForgeMemorySourceBinding, DomainEventRepo, MemoryItem, ReplaceAccountMainAgentBinding,
+    ScopedMemoryRepository, SqliteDb, User, UserRepo,
 };
 
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-    run_migrations(&pool).await.expect("migrations");
+    support::migrate_through(&pool, 117).await;
     SqliteDb::new(pool)
 }
 

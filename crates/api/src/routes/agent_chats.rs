@@ -5,6 +5,11 @@
 //! user.  The repository layer owns persistence and optimistic concurrency;
 //! this module only translates the public API shapes.
 
+use crate::{
+    errors::{ApiError, ApiResult},
+    routes::auth::AuthenticatedUser,
+    state::AppState,
+};
 use api_types::{
     AgentBindingState, AgentChatDetailResponse, AgentChatKind, AgentChatMessageAuthorType,
     AgentChatMessageListResponse, AgentChatMessageResponse, AgentChatMessageStatus,
@@ -28,16 +33,6 @@ use db::{
     ProjectRepo, SortBy, SortOrder,
 };
 use serde_json::{json, Value};
-use services::{
-    CancelAgentChatTurnInput, CreateAgentHandoffInput, ProductGenesisService,
-    SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
-};
-
-use crate::{
-    errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
-    state::AppState,
-};
 
 pub async fn get_main_agent(
     State(state): State<AppState>,
@@ -50,24 +45,14 @@ pub async fn get_main_agent(
 }
 
 pub async fn set_main_agent(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Json(request): Json<SetMainAgentBindingRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Json(_request): Json<SetMainAgentBindingRequest>,
 ) -> ApiResult<Json<MainAgentBindingResponse>> {
-    let binding = state
-        .agent_chat_service
-        .set_main_binding(SetMainAgentBindingInput {
-            actor_user_id: user.user_id.clone(),
-            account_id: user.user_id,
-            identity_id: request.identity_id,
-            profile_id: request.profile_id,
-            autonomy_policy_json: request.autonomy_policy.to_string(),
-            tool_policy_revision: "default".to_owned(),
-            expected_version: (request.expected_version > 0).then_some(request.expected_version),
-            replacement_reason: Some("api_replace".to_owned()),
-        })
-        .await?;
-    Ok(Json(main_binding_response(&state, binding).await?))
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Main Agent bindings were retired in Plan PR11",
+    ))
 }
 
 pub async fn get_project_agent(
@@ -83,34 +68,15 @@ pub async fn get_project_agent(
 }
 
 pub async fn set_project_agent(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(project_id): Path<String>,
-    Json(request): Json<SetProjectAgentBindingRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_project_id): Path<String>,
+    Json(_request): Json<SetProjectAgentBindingRequest>,
 ) -> ApiResult<Json<ProjectAgentBindingResponse>> {
-    require_project_admin(&state, &project_id, &user.user_id).await?;
-    if request.wake_budget < 0 {
-        return Err(ApiError::bad_request("wake_budget must be non-negative"));
-    }
-    let subscriptions_json = serde_json::to_string(&request.subscriptions)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let binding = state
-        .agent_chat_service
-        .set_project_binding(SetProjectAgentBindingInput {
-            actor_user_id: user.user_id,
-            project_id,
-            identity_id: Some(request.identity_id),
-            profile_id: Some(request.profile_id),
-            state: "active".to_owned(),
-            autonomy_policy_json: request.autonomy_policy.to_string(),
-            permission_ceiling_json: request.permission_ceiling.to_string(),
-            subscriptions_json,
-            wake_budget: request.wake_budget,
-            expected_version: (request.expected_version > 0).then_some(request.expected_version),
-            replacement_reason: Some("api_replace".to_owned()),
-        })
-        .await?;
-    Ok(Json(project_binding_response(&state, binding).await?))
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Project Agent bindings were retired in Plan PR11; use explicit TaskRole membership",
+    ))
 }
 
 pub async fn list_agent_chats(
@@ -119,7 +85,7 @@ pub async fn list_agent_chats(
     Query(_query): Query<api_types::AgentChatListQuery>,
 ) -> ApiResult<Json<AgentChatSwitcherResponse>> {
     let chats = state
-        .agent_chat_service
+        .agent_chat_history
         .list_authorized_chats(&user.user_id)
         .await?;
     let mut items = Vec::with_capacity(chats.len());
@@ -139,7 +105,7 @@ pub async fn get_agent_chat(
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<AgentChatDetailResponse>> {
     let chat = state
-        .agent_chat_service
+        .agent_chat_history
         .get_authorized_chat(&user.user_id, &chat_id)
         .await?;
     let pending_turn_count = pending_turn_count(&state, &chat.id).await?;
@@ -177,7 +143,7 @@ pub async fn list_agent_chat_messages(
     Query(query): Query<AgentChatMessagesQuery>,
 ) -> ApiResult<Json<AgentChatMessageListResponse>> {
     state
-        .agent_chat_service
+        .agent_chat_history
         .get_authorized_chat(&user.user_id, &chat_id)
         .await?;
     let page = AgentChatMessageRepo::list_agent_chat_messages(
@@ -203,47 +169,14 @@ pub async fn list_agent_chat_messages(
 }
 
 pub async fn send_agent_chat_message(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(chat_id): Path<String>,
-    Json(request): Json<SendAgentChatMessageRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_chat_id): Path<String>,
+    Json(_request): Json<SendAgentChatMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<SendAgentChatMessageResponse>)> {
-    let actor_user_id = user.user_id;
-    let source_chat_id = chat_id.clone();
-    let admitted = state
-        .agent_chat_service
-        .send_message(SendAgentChatMessageInput {
-            actor_user_id: actor_user_id.clone(),
-            chat_id,
-            content: request.content,
-            dedupe_key: request.dedupe_key,
-        })
-        .await?;
-    // Genesis source references follow the existing Main Chat timeline.  A
-    // normal message after the initial discovery admission is still part of
-    // the same typed session and may be the source selected for handoff.
-    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
-    if let Some(session) = genesis.active(&actor_user_id).await? {
-        if session.main_chat_id == source_chat_id {
-            if let Err(error) = genesis
-                .record_source_message(&session.id, session.version, &admitted.message.id)
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session.id,
-                    message_id = %admitted.message.id,
-                    %error,
-                    "Genesis source reference could not be recorded after Main Chat admission"
-                );
-            }
-        }
-    }
-    Ok((
-        StatusCode::CREATED,
-        Json(SendAgentChatMessageResponse {
-            message: message_response(admitted.message),
-            turn_job: Some(turn_response(admitted.turn_job)),
-        }),
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Agent Chat cognition was retired in Plan PR11; use Task Message and Handoff",
     ))
 }
 
@@ -253,7 +186,7 @@ pub async fn list_agent_chat_turns(
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentChatTurnJobResponse>>> {
     state
-        .agent_chat_service
+        .agent_chat_history
         .get_authorized_chat(&user.user_id, &chat_id)
         .await?;
     let jobs = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &chat_id).await?;
@@ -261,22 +194,15 @@ pub async fn list_agent_chat_turns(
 }
 
 pub async fn cancel_agent_chat_turn(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((chat_id, turn_id)): Path<(String, String)>,
-    Json(request): Json<CancelAgentChatTurnRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((_chat_id, _turn_id)): Path<(String, String)>,
+    Json(_request): Json<CancelAgentChatTurnRequest>,
 ) -> ApiResult<Json<AgentChatTurnJobResponse>> {
-    let job = state
-        .agent_chat_service
-        .cancel_turn(CancelAgentChatTurnInput {
-            actor_user_id: user.user_id,
-            chat_id,
-            turn_job_id: turn_id,
-            expected_version: request.expected_version,
-            idempotency_key: request.idempotency_key,
-        })
-        .await?;
-    Ok(Json(turn_response(job)))
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Agent Chat turns cannot be resumed or cancelled after the PR11 cutover",
+    ))
 }
 
 pub async fn list_agent_handoffs(
@@ -305,7 +231,7 @@ pub async fn get_agent_handoff(
         .await?
         .ok_or_else(|| ApiError::not_found("agent_handoff", handoff_id.clone()))?;
     let target = state
-        .agent_chat_service
+        .agent_chat_history
         .get_authorized_chat(&user.user_id, &handoff.target_chat_id)
         .await?;
     if target.project_id.as_deref() != Some(_project_id.as_str()) {
@@ -315,35 +241,14 @@ pub async fn get_agent_handoff(
 }
 
 pub async fn create_agent_handoff(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(project_id): Path<String>,
-    Json(request): Json<CreateAgentHandoffRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_project_id): Path<String>,
+    Json(_request): Json<CreateAgentHandoffRequest>,
 ) -> ApiResult<(StatusCode, Json<AgentHandoffResponse>)> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
-    let source = state
-        .agent_chat_service
-        .ensure_main_chat(&user.user_id)
-        .await?;
-    // Genesis creation performs its first handoff inside
-    // CreateProjectFromCharterApproval. This endpoint remains available for
-    // later explicit, bounded Main-to-Project publications only.
-    let outcome = state
-        .agent_chat_service
-        .create_handoff(CreateAgentHandoffInput {
-            actor_user_id: user.user_id.clone(),
-            source_chat_id: source.id,
-            source_message_id: request.source_message_id,
-            source_turn_job_id: request.source_turn_job_id,
-            target_project_id: project_id.clone(),
-            content: request.content,
-            source_revisions_json: "[]".to_owned(),
-            dedupe_key: request.dedupe_key,
-        })
-        .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(handoff_response(&state, outcome.handoff).await?),
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Main-to-Project Agent handoffs were retired; use Task-scoped Handoff",
     ))
 }
 
@@ -355,19 +260,6 @@ async fn require_project_member(
     ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    Ok(())
-}
-
-async fn require_project_admin(state: &AppState, project_id: &str, user_id: &str) -> ApiResult<()> {
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(ApiError::forbidden_with_code(
-            "insufficient_role",
-            "project owner or admin role is required",
-        ));
-    }
     Ok(())
 }
 

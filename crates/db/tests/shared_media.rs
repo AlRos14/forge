@@ -6,9 +6,21 @@ use db::{
 };
 use sqlx::SqlitePool;
 
+mod support;
+
 async fn fixture() -> (SqliteDb, String, String) {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
+    fixture_rows(pool).await
+}
+
+async fn fixture_before_pr11() -> (SqliteDb, String, String) {
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    support::migrate_through(&pool, 117).await;
+    fixture_rows(pool).await
+}
+
+async fn fixture_rows(pool: SqlitePool) -> (SqliteDb, String, String) {
     let db = SqliteDb::new(pool);
     let project_id = "project-media".to_owned();
     let task_id = "task-media".to_owned();
@@ -369,7 +381,7 @@ async fn active_project_evidence_blocks_task_media_gc_until_removed() {
 
 #[tokio::test]
 async fn immutable_release_pin_keeps_asset_referenced_after_task_cleanup() {
-    let (db, project_id, task_id) = fixture().await;
+    let (db, project_id, task_id) = fixture_before_pr11().await;
     create_release(&db, &project_id).await;
     let media = upload(&db, &task_id, "asset-pinned").await;
     let now = now_rfc3339();
@@ -743,7 +755,7 @@ async fn project_media_tombstone_replay_compares_complete_user_receipt() {
 
 #[tokio::test]
 async fn project_evidence_composite_rejects_cross_project_asset() {
-    let (db, project_id, task_id) = fixture().await;
+    let (db, project_id, task_id) = fixture_before_pr11().await;
     let media = upload(&db, &task_id, "asset-cross-project").await;
     let now = now_rfc3339();
     sqlx::query(
@@ -819,7 +831,7 @@ async fn project_evidence_composite_rejects_cross_project_asset() {
 
 #[tokio::test]
 async fn queued_gc_is_restartable_and_rejects_new_typed_references() {
-    let (db, project_id, task_id) = fixture().await;
+    let (db, project_id, task_id) = fixture_before_pr11().await;
     create_release(&db, &project_id).await;
     let media = upload(&db, &task_id, "asset-restart").await;
     let now = now_rfc3339();

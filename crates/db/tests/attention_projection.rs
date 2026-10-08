@@ -1,12 +1,14 @@
+mod support;
+
 use db::{
-    create_sqlite_pool, now_rfc3339, run_migrations, AttentionListQuery, AttentionRepo,
-    CreateAttentionProjection, CreateDomainEvent, CreateProject, DomainEventRepo, PageRequest,
-    ProjectRepo, SortBy, SortOrder, UpdateAttentionLifecycle, UpsertAttentionConsumerHealth,
+    create_sqlite_pool, now_rfc3339, AttentionListQuery, AttentionRepo, CreateAttentionProjection,
+    CreateDomainEvent, CreateProject, DomainEventRepo, PageRequest, ProjectRepo, SortBy, SortOrder,
+    UpdateAttentionLifecycle, UpsertAttentionConsumerHealth,
 };
 
 async fn database() -> db::SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
-    run_migrations(&pool).await.unwrap();
+    support::migrate_through(&pool, 117).await;
     db::SqliteDb::new(pool)
 }
 

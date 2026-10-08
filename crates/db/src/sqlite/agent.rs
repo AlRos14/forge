@@ -470,15 +470,8 @@ impl AgentRepo for SqliteDb {
                     )
                       AND task.deleted_at IS NULL
                       AND lifecycle.state = 'active'
-                ) +
-                (
-                    SELECT COUNT(*)
-                    FROM agent_chat_turn_job
-                    WHERE responder_identity_id = ?
-                      AND status IN ('leased', 'running')
                 )",
         )
-        .bind(agent_id)
         .bind(agent_id)
         .bind(agent_id)
         .fetch_one(&self.pool)
@@ -603,23 +596,22 @@ impl AgentProfileRepo for SqliteDb {
 }
 
 impl SqliteDb {
-    pub async fn list_agents_usable_in_project(
-        &self,
-        project_id: &str,
-        user_id: &str,
-    ) -> Result<Vec<Agent>> {
+    pub async fn list_agents_eligible_for_project(&self, project_id: &str) -> Result<Vec<Agent>> {
         let rows = sqlx::query(
             "SELECT DISTINCT agent.*
              FROM agent_current AS agent
-             LEFT JOIN project_agent_binding AS binding
-               ON binding.identity_id = agent.id
-              AND binding.state = 'active'
+             JOIN project AS p ON p.id = ?
              WHERE agent.visibility = 'global'
-                OR (agent.visibility = 'account' AND agent.owner_id = ?)
-                OR (binding.project_id = ?)
+                OR (agent.visibility = 'account'
+                    AND agent.owner_id IS NOT NULL
+                    AND (agent.owner_id = p.owner_id
+                         OR EXISTS (
+                             SELECT 1 FROM project_member pm
+                             WHERE pm.project_id = p.id
+                               AND pm.user_id = agent.owner_id
+                         )))
              ORDER BY agent.created_at ASC, agent.id ASC",
         )
-        .bind(user_id)
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?;

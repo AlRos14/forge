@@ -22,9 +22,6 @@ impl TaskService {
             },
         )
         .await?;
-        if let Err(error) = self.index_task_comment_memory(task_id, &comment).await {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-        }
         self.publish(ForgeEvent {
             event_type: "comment.created".to_owned(),
             entity_id: comment.id.clone(),
@@ -55,9 +52,6 @@ impl TaskService {
             },
         )
         .await?;
-        if let Err(error) = self.index_task_comment_memory(task_id, &comment).await {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-        }
         self.publish(ForgeEvent {
             event_type: "comment.created".to_owned(),
             entity_id: comment.id.clone(),
@@ -98,9 +92,6 @@ impl TaskService {
             },
         )
         .await?;
-        if let Err(error) = self.index_task_comment_memory(task_id, &comment).await {
-            tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-        }
         self.publish(ForgeEvent {
             event_type: "comment.created".to_owned(),
             entity_id: comment.id.clone(),
@@ -112,16 +103,6 @@ impl TaskService {
                 author_name: agent.name,
             },
         });
-        Ok(())
-    }
-
-    async fn index_task_comment_memory(&self, task_id: &str, comment: &TaskComment) -> Result<()> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, true)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        self.memory_service
-            .record_task_comment(&task.project_id, comment)
-            .await?;
         Ok(())
     }
 

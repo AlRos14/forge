@@ -4,8 +4,8 @@ use api_types::{parse_project_hooks_json, ProjectHookAction, ProjectHookRule, Pr
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateProjectHookRun, CreateTask, DaemonRepo, DaemonStatus,
-    ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, SqliteDb, Task,
-    TaskRepo, UpdateDaemonReport, UpsertDaemon,
+    ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, RoleMembershipRepo,
+    SqliteDb, Task, TaskRepo, UpdateDaemonReport, UpsertDaemon,
 };
 use events::EventBus;
 use serde_json::json;
@@ -182,6 +182,19 @@ async fn dispatch_agent_launch_failure_links_created_automation_task() {
         .expect("automation task loads")
         .expect("automation task exists");
     assert!(automation_task.is_automation);
+    let roles = db::TaskRoleRepo::list_by_task(&*db, automation_task_id)
+        .await
+        .expect("automation TaskRoles load");
+    assert!(roles.iter().any(|role| role.role == "implementer"));
+    let memberships = RoleMembershipRepo::list_by_task(&*db, automation_task_id, false)
+        .await
+        .expect("automation RoleMemberships load");
+    assert!(memberships.iter().any(|(role, membership)| {
+        role.role == "implementer"
+            && membership.actor_kind == db::ActorKind::Agent
+            && membership.actor_id == agent_id
+            && membership.status == db::RoleMembershipStatus::Active
+    }));
 }
 
 #[tokio::test]

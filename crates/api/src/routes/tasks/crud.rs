@@ -6,6 +6,12 @@ pub async fn create_task(
     Json(body): Json<Value>,
 ) -> ApiResult<Json<TaskResponse>> {
     let request: CreateTaskRequest = serde_json::from_value(body)?;
+    if request.governance.is_some() {
+        return Err(ApiError::gone_with_code(
+            "operation_retired",
+            "Project Task Governance was retired in Plan PR11; create an ordinary Task",
+        ));
+    }
     let review_config = match request.review_config {
         Some(review_config) => Some(review_config),
         None => project_default_review_config(&state.db, &project_id).await?,
@@ -25,7 +31,7 @@ pub async fn create_task(
     });
     let task = state
         .task_service
-        .create_task_with_governance(
+        .create_task(
             project_id,
             request.title,
             request.description,
@@ -35,7 +41,6 @@ pub async fn create_task(
             review_config,
             request.merge_config,
             request.role_assignments,
-            request.governance,
         )
         .await?;
     Ok(Json(task_response(&state.db, task).await?))

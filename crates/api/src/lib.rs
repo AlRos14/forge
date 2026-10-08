@@ -1138,6 +1138,7 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/config/mcp",
             get(routes::mcp_config::get_mcp_config).post(routes::mcp_config::update_mcp_config),
         )
+        .layer(from_fn(retired_vertical_write_middleware))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,
@@ -1178,6 +1179,143 @@ pub fn api_router(state: AppState) -> Router {
             })
             .on_response(DefaultOnResponse::new().level(Level::INFO)),
     )
+}
+
+async fn retired_vertical_write_middleware(
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    if !is_retired_vertical_mutation(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let request_id = request
+        .headers()
+        .get(&middleware::REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let mut response = (
+        StatusCode::GONE,
+        axum::Json(api_types::ErrorResponse {
+            code: "operation_retired".to_owned(),
+            message:
+                "This Main Agent, Project Agent, or Project OS operation was retired in Plan PR11"
+                    .to_owned(),
+            details: None,
+            request_id,
+        }),
+    )
+        .into_response();
+    if let Some(request_id) = request
+        .headers()
+        .get(&middleware::REQUEST_ID_HEADER)
+        .cloned()
+    {
+        response
+            .headers_mut()
+            .insert(middleware::REQUEST_ID_HEADER.clone(), request_id);
+    }
+    response
+}
+
+fn is_retired_vertical_mutation(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+
+    let path = path.trim_end_matches('/');
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.len() >= 6
+        && segments[1..3] == ["api", "v1"]
+        && segments[3] == "projects"
+        && segments[5] == "memory"
+        && segments.get(6) == Some(&"search")
+    {
+        // This search feeds retrieved semantic memory into cognition. PR11
+        // keeps point reads for historical inspection but retires retrieval.
+        return true;
+    }
+
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+
+    if path == "/api/v1/account/main-agent"
+        || path.starts_with("/api/v1/account/main-agent/product-genesis")
+        || path.starts_with("/api/v1/agent-chats/")
+        || path.starts_with("/api/v1/actions/")
+        || path.starts_with("/api/v1/commitments/")
+        || path.starts_with("/api/v1/inbox/")
+        || path.starts_with("/api/v1/questions/")
+        || path == "/api/v1/memory/backfill"
+        || path.starts_with("/api/v1/memory/")
+            && (path.ends_with("/publish") || path.ends_with("/lifecycle"))
+        || path.starts_with("/api/v1/mission-control/attention/")
+    {
+        return true;
+    }
+    if segments.len() >= 5 && segments[1..3] == ["api", "v1"] {
+        let project_area = segments[3] == "projects";
+        if project_area {
+            return matches!(
+                segments.get(5).copied(),
+                Some(
+                    "project-agent"
+                        | "execution-baseline"
+                        | "charter"
+                        | "documents"
+                        | "milestones"
+                        | "agent-handoffs"
+                )
+            ) || (segments.get(5) == Some(&"decisions")
+                && segments.get(6) == Some(&"candidates"));
+        }
+        if segments[3] == "agents" {
+            return matches!(
+                segments.get(5).copied(),
+                Some("commitments" | "questions" | "actions" | "task-proposals")
+            );
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod retired_vertical_route_tests {
+    use super::is_retired_vertical_mutation;
+    use axum::http::Method;
+
+    #[test]
+    fn retired_mutations_fail_closed_while_history_reads_remain_available() {
+        assert!(is_retired_vertical_mutation(
+            &Method::POST,
+            "/api/v1/account/main-agent/product-genesis"
+        ));
+        assert!(is_retired_vertical_mutation(
+            &Method::POST,
+            "/api/v1/projects/p1/milestones/m1/release"
+        ));
+        assert!(is_retired_vertical_mutation(
+            &Method::POST,
+            "/api/v1/actions/a1/execute"
+        ));
+        assert!(is_retired_vertical_mutation(
+            &Method::GET,
+            "/api/v1/projects/p1/memory/search"
+        ));
+        assert!(!is_retired_vertical_mutation(
+            &Method::GET,
+            "/api/v1/projects/p1/milestones/m1"
+        ));
+        assert!(!is_retired_vertical_mutation(
+            &Method::POST,
+            "/api/v1/projects"
+        ));
+        assert!(!is_retired_vertical_mutation(
+            &Method::POST,
+            "/api/v1/projects/p1/tasks"
+        ));
+    }
 }
 
 pub async fn serve(

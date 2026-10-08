@@ -27,7 +27,7 @@ use db::{
 use services::{
     evaluate_project_charter_readiness, render_and_digest_charter, semantic_revision_diff,
     validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
-    PROJECT_CHARTER_RENDER_VERSION, PROJECT_OPERATING_SKILL_KEY,
+    PROJECT_CHARTER_RENDER_VERSION,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -40,6 +40,7 @@ use crate::{
 
 const CHARTER_SCHEMA_VERSION: &str = "forge.project-charter/v1";
 const PROJECT_AGENT_POLICY_REVISION: &str = "forge.project-agent-policy/v1";
+const LEGACY_PROJECT_OPERATING_SKILL_KEY: &str = "forge.project.orchestration/v1";
 const REVISION_SAVE_ACTION: &str = "project_charter.revision.save";
 const APPROVAL_ACTION: &str = "project_charter.approval";
 const MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS: i64 = 48 * 60 * 60;
@@ -882,8 +883,8 @@ async fn approve_existing_project_charter(
     .bind(profile_id)
     .bind(identity_id)
     .bind(account_id)
-    .bind(PROJECT_OPERATING_SKILL_KEY)
-    .bind(PROJECT_OPERATING_SKILL_KEY)
+    .bind(LEGACY_PROJECT_OPERATING_SKILL_KEY)
+    .bind(LEGACY_PROJECT_OPERATING_SKILL_KEY)
     .fetch_optional(&mut *tx)
     .await?;
     if selected_ok.is_none() {
@@ -1803,7 +1804,7 @@ async fn current_project_agent_operating_skill_revision(state: &AppState) -> Api
            AND skill.current_revision_id IS NOT NULL
          LIMIT 1",
     )
-    .bind(PROJECT_OPERATING_SKILL_KEY)
+    .bind(LEGACY_PROJECT_OPERATING_SKILL_KEY)
     .fetch_optional(state.db.pool())
     .await?
     .ok_or_else(|| {

@@ -7,9 +7,11 @@ continuous reviewer.
 PR4's generic Message, Handoff, Proposal, and Decision records provide the
 initial durable collaboration surface. Their events use the existing
 `domain_event` ledger. A Handoff to a Role does not assign a member, and a
-Proposal or Decision does not execute the proposed action. Legacy Agent Host
-and Project OS records remain authoritative for their own data until PR11;
-PR4 does not dual-write them.
+Proposal or Decision does not execute the proposed action. PR11 retires
+Main/Project Agent and Project OS write and authority paths without
+dual-writing generic records. Their historical rows remain readable for
+compatibility, while current orchestration uses Task-scoped collaboration,
+Roles, Executions, and durable events.
 
 ## Implemented subset: PR6
 

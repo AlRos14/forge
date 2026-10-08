@@ -5,25 +5,24 @@ use api_types::{
     AgentBindingState, AgentChatDetailResponse, AgentChatKind, AgentChatListResponse,
     AgentChatMessageAuthorType, AgentChatMessageListResponse, AgentChatMessageResponse,
     AgentChatMessageStatus, AgentChatResponse as ApiAgentChatResponse, AgentChatStatus,
-    AgentChatTurnJobResponse, AgentChatTurnStatus, AgentHandoffResponse, AgentHandoffStatus,
-    MainAgentBindingResponse, ProjectAgentBindingResponse,
+    AgentHandoffResponse, AgentHandoffStatus, MainAgentBindingResponse,
+    ProjectAgentBindingResponse,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBinding, AccountMainAgentBindingRepo, AgentChat,
     AgentChatMessage, AgentChatMessageAuthorType as DbMessageAuthorType, AgentChatMessageListQuery,
-    AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo,
-    AgentChatTurnJob, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
-    AgentHandoffStatus as DbHandoffStatus, AgentListQuery, AgentProfileRepo, AgentRepo,
-    AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
-    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectRepo, ReplaceAccountMainAgentBinding, SortBy, SortOrder, Task, TaskDependencyRepo,
-    TaskListQuery, TaskRepo, UpdateProject, UpdateTask, WorkspaceRepo,
+    AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo, AgentHandoff,
+    AgentHandoffRepo, AgentHandoffStatus as DbHandoffStatus, AgentListQuery, AgentProfileRepo,
+    AgentRepo, AgentSessionRepo, CreateProject, ExecutionRepo, MemoryScopeGrant, PageRequest,
+    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, SortBy,
+    SortOrder, Task, TaskDependencyRepo, TaskListQuery, TaskRepo, UpdateProject, UpdateTask,
+    WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
 use services::{
     workflow::engine::WorkflowEngine, Assignee, DiffService, MemoryAccessContext,
-    MemorySearchResult, SetProjectAgentBindingInput,
+    MemorySearchResult,
 };
 use uuid::Uuid;
 
@@ -31,15 +30,14 @@ use crate::{
     error::McpToolError,
     params::{
         page_request, parse_params, task_page_request, AddTaskDependencyParams, AssignAgentParams,
-        BindMainAgentParams, BindProjectAgentParams, CreateAgentHandoffParams, CreateProjectParams,
-        CreateSubTasksParams, CreateTaskParams, GetAgentChatParams, GetAgentHandoffParams,
-        GetAgentSessionParams, GetProjectAgentParams, GetProjectParams, GetTaskParams,
-        ListAgentChatMessagesParams, ListAgentChatsParams, ListAgentHandoffsParams,
+        CreateProjectParams, CreateSubTasksParams, CreateTaskParams, GetAgentChatParams,
+        GetAgentHandoffParams, GetAgentSessionParams, GetProjectAgentParams, GetProjectParams,
+        GetTaskParams, ListAgentChatMessagesParams, ListAgentChatsParams, ListAgentHandoffsParams,
         ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams, ListExecutionsParams,
         ListProjectsParams, ListTaskDependenciesParams, ListTasksParams, MemoryGetParams,
         MemorySearchParams, PreviewPromptParams, RegisterAgentParams, RemoveTaskDependencyParams,
-        SendAgentChatMessageParams, TransitionTaskParams, UpdateProjectLifecycleHooksParams,
-        UpdateProjectParams, UpdateTaskParams,
+        TransitionTaskParams, UpdateProjectLifecycleHooksParams, UpdateProjectParams,
+        UpdateTaskParams,
     },
     protocol::McpContext,
     state::AppState,
@@ -470,7 +468,7 @@ pub(super) async fn forge_memory_search(
         ));
     }
     let layer = response_layer(params.layer, params.token_budget)?;
-    let memory_service = services::MemoryService::new(Arc::clone(&state.db));
+    let memory_service = services::HistoricalMemoryReader::new(Arc::clone(&state.db));
     let access = MemoryAccessContext {
         identity_id: None,
         grants: vec![MemoryScopeGrant {
@@ -527,7 +525,7 @@ pub(super) async fn forge_memory_get(
             "memory get requires the admitted MCP project scope",
         ));
     };
-    let memory_service = services::MemoryService::new(Arc::clone(&state.db));
+    let memory_service = services::HistoricalMemoryReader::new(Arc::clone(&state.db));
     let result = memory_service
         .get_scoped(
             &MemoryAccessContext {
@@ -1182,54 +1180,11 @@ pub(super) async fn forge_get_main_agent(
 }
 
 pub(super) async fn forge_set_main_agent(
-    state: &AppState,
-    params: Value,
-    context: &McpContext,
+    _state: &AppState,
+    _params: Value,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
-    let user_id = authenticated_user(context)?;
-    let params: BindMainAgentParams = parse_params(params)?;
-    require_owned_profile(state, user_id, &params.identity_id, &params.profile_id).await?;
-    let now = now_rfc3339();
-    let replacement = CreateAccountMainAgentBinding {
-        id: new_uuid_v4(),
-        account_id: user_id.to_owned(),
-        identity_id: params.identity_id,
-        profile_id: params.profile_id,
-        autonomy_policy_json: policy_json(params.autonomy_policy),
-        tool_policy_revision: "default".to_owned(),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let binding =
-        match AccountMainAgentBindingRepo::get_active_main_binding(&*state.db, user_id).await? {
-            Some(_) => {
-                AccountMainAgentBindingRepo::replace_main_binding(
-                    &*state.db,
-                    ReplaceAccountMainAgentBinding {
-                        account_id: user_id.to_owned(),
-                        expected_version: params.expected_version,
-                        replacement,
-                        replacement_reason: Some("mcp_replace".to_owned()),
-                    },
-                )
-                .await?
-            }
-            None if params.expected_version == 0 => {
-                AccountMainAgentBindingRepo::create_main_binding(&*state.db, replacement).await?
-            }
-            None => {
-                return Err(McpToolError::new(
-                    -32009,
-                    "main agent binding does not exist; expected_version must be 0",
-                ));
-            }
-        };
-    let chat_id = AgentChatRepo::get_main_chat(&*state.db, user_id)
-        .await?
-        .map(|chat| chat.id)
-        .unwrap_or_default();
-    Ok(serialize_public(main_binding_response(binding, chat_id)))
+    Err(McpToolError::new(-32040, "operation retired"))
 }
 
 pub(super) async fn forge_get_project_agent(
@@ -1254,44 +1209,11 @@ pub(super) async fn forge_get_project_agent(
 }
 
 pub(super) async fn forge_set_project_agent(
-    state: &AppState,
-    params: Value,
-    context: &McpContext,
+    _state: &AppState,
+    _params: Value,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: BindProjectAgentParams = parse_params(params)?;
-    require_project_admin(state, &params.project_id, user_id).await?;
-    if params.wake_budget < 0 {
-        return Err(invalid_field_error(
-            "wake_budget",
-            "must be non-negative",
-            Some(json!({ "type": "integer", "minimum": 0 })),
-        ));
-    }
-    let binding = state
-        .agent_chat_service
-        .set_project_binding(SetProjectAgentBindingInput {
-            actor_user_id: user_id.to_owned(),
-            project_id: params.project_id.clone(),
-            identity_id: Some(params.identity_id),
-            profile_id: Some(params.profile_id),
-            state: "active".to_owned(),
-            autonomy_policy_json: policy_json(params.autonomy_policy),
-            permission_ceiling_json: policy_json(params.permission_ceiling),
-            subscriptions_json: serde_json::to_string(&params.subscriptions)
-                .map_err(|error| McpToolError::new(-32603, error.to_string()))?,
-            wake_budget: params.wake_budget,
-            expected_version: (params.expected_version > 0).then_some(params.expected_version),
-            replacement_reason: Some("mcp_replace".to_owned()),
-        })
-        .await?;
-    let chat_id = AgentChatRepo::get_project_chat(&*state.db, &params.project_id)
-        .await?
-        .map(|chat| chat.id)
-        .unwrap_or_default();
-    Ok(serialize_public(project_binding_response(
-        binding, chat_id,
-    )?))
+    Err(McpToolError::new(-32040, "operation retired"))
 }
 
 pub(super) async fn forge_list_agent_chats(
@@ -1326,7 +1248,7 @@ pub(super) async fn forge_get_agent_chat(
     let user_id = authenticated_user(context)?;
     let params: GetAgentChatParams = parse_params(params)?;
     let chat = state
-        .agent_chat_service
+        .agent_chat_history
         .get_authorized_chat(user_id, &params.chat_id)
         .await?;
     ensure_chat_scope(context, &chat)?;
@@ -1361,7 +1283,7 @@ pub(super) async fn forge_list_agent_chat_messages(
     let user_id = authenticated_user(context)?;
     let params: ListAgentChatMessagesParams = parse_params(params)?;
     let chat = state
-        .agent_chat_service
+        .agent_chat_history
         .get_authorized_chat(user_id, &params.chat_id)
         .await?;
     ensure_chat_scope(context, &chat)?;
@@ -1388,41 +1310,11 @@ pub(super) async fn forge_list_agent_chat_messages(
 }
 
 pub(super) async fn forge_send_agent_chat_message(
-    state: &AppState,
-    params: Value,
-    context: &McpContext,
+    _state: &AppState,
+    _params: Value,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: SendAgentChatMessageParams = parse_params(params)?;
-    if params
-        .dedupe_key
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        return Err(invalid_field_error(
-            "dedupe_key",
-            "must be non-empty when provided",
-            Some(json!({ "type": "string", "non_empty": true })),
-        ));
-    }
-    let chat = state
-        .agent_chat_service
-        .get_authorized_chat(user_id, &params.chat_id)
-        .await?;
-    ensure_chat_scope(context, &chat)?;
-    let admitted = state
-        .agent_chat_service
-        .send_message(services::SendAgentChatMessageInput {
-            actor_user_id: user_id.to_owned(),
-            chat_id: params.chat_id,
-            content: params.content,
-            dedupe_key: params.dedupe_key,
-        })
-        .await?;
-    Ok(serialize_public(api_types::SendAgentChatMessageResponse {
-        message: message_response(admitted.message),
-        turn_job: Some(turn_response(admitted.turn_job)),
-    }))
+    Err(McpToolError::new(-32040, "operation retired"))
 }
 
 pub(super) async fn forge_list_agent_handoffs(
@@ -1468,39 +1360,11 @@ pub(super) async fn forge_get_agent_handoff(
 }
 
 pub(super) async fn forge_create_agent_handoff(
-    state: &AppState,
-    params: Value,
-    context: &McpContext,
+    _state: &AppState,
+    _params: Value,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: CreateAgentHandoffParams = parse_params(params)?;
-    let project_id = params.project_id.clone();
-    if params.dedupe_key.trim().is_empty() {
-        return Err(invalid_field_error(
-            "dedupe_key",
-            "must be a non-empty string",
-            Some(json!({ "type": "string", "non_empty": true })),
-        ));
-    }
-    require_project_member(state, &project_id, user_id).await?;
-    let source = state.agent_chat_service.ensure_main_chat(user_id).await?;
-    let outcome = state
-        .agent_chat_service
-        .create_handoff(services::CreateAgentHandoffInput {
-            actor_user_id: user_id.to_owned(),
-            source_chat_id: source.id,
-            source_message_id: params.source_message_id,
-            source_turn_job_id: params.source_turn_job_id,
-            target_project_id: project_id.clone(),
-            content: params.content,
-            source_revisions_json: "[]".to_owned(),
-            dedupe_key: params.dedupe_key,
-        })
-        .await?;
-    Ok(serialize_public(handoff_response(
-        outcome.handoff,
-        project_id,
-    )))
+    Err(McpToolError::new(-32040, "operation retired"))
 }
 
 fn authenticated_user(context: &McpContext) -> Result<&str, McpToolError> {
@@ -1528,33 +1392,6 @@ async fn require_owned_identity(
         ));
     }
     Ok(identity)
-}
-
-async fn require_owned_profile(
-    state: &AppState,
-    user_id: &str,
-    identity_id: &str,
-    profile_id: &str,
-) -> Result<(), McpToolError> {
-    require_owned_identity(
-        state,
-        &McpContext {
-            project_id: None,
-            user_id: Some(user_id.to_owned()),
-        },
-        identity_id,
-    )
-    .await?;
-    let profile = AgentProfileRepo::get_profile(&*state.db, profile_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent_profile", profile_id.to_owned()))?;
-    if profile.identity_id != identity_id {
-        return Err(McpToolError::not_found(
-            "agent_profile",
-            profile_id.to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn require_account_scope(context: &McpContext) -> Result<(), McpToolError> {
@@ -1600,29 +1437,6 @@ async fn require_project_member(
     Err(McpToolError::new(-32001, "project not accessible"))
 }
 
-async fn require_project_admin(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> Result<(), McpToolError> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| McpToolError::new(-32001, "project not accessible"))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(McpToolError::new(
-            -32001,
-            "project owner or admin role is required",
-        ));
-    }
-    Ok(())
-}
-
 async fn authorized_chat(
     state: &AppState,
     user_id: &str,
@@ -1647,14 +1461,6 @@ async fn authorized_chat(
 
 fn setup_required(message: &str) -> McpToolError {
     McpToolError::new(-32004, message).with_data(json!({ "code": "agent_setup_required" }))
-}
-
-fn policy_json(value: Value) -> String {
-    if value.is_null() {
-        "{}".to_owned()
-    } else {
-        value.to_string()
-    }
 }
 
 fn serialize_public<T: serde::Serialize>(value: T) -> Value {
@@ -1760,34 +1566,6 @@ fn message_response(message: AgentChatMessage) -> AgentChatMessageResponse {
         source_message_id: message.source_message_id,
         sequence: message.sequence,
         created_at: message.created_at,
-    }
-}
-
-fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
-    AgentChatTurnJobResponse {
-        id: job.id,
-        chat_id: job.chat_id,
-        input_message_id: job.triggering_message_id,
-        responder_identity_id: job.responder_identity_id,
-        responder_profile_id: job.profile_id,
-        status: match job.status {
-            AgentChatTurnState::Queued => AgentChatTurnStatus::Queued,
-            AgentChatTurnState::Leased => AgentChatTurnStatus::Leased,
-            AgentChatTurnState::RetryWait => AgentChatTurnStatus::RetryWait,
-            AgentChatTurnState::Succeeded => AgentChatTurnStatus::Succeeded,
-            AgentChatTurnState::Failed => AgentChatTurnStatus::Failed,
-            AgentChatTurnState::Cancelled => AgentChatTurnStatus::Cancelled,
-        },
-        attempt_count: job.attempt_count,
-        max_attempts: job.max_attempts,
-        lease_expires_at: job.leased_until,
-        next_attempt_at: job.next_attempt_at,
-        response_message_id: job.response_message_id,
-        error: job.error_message.or(job.error_code),
-        correlation_id: job.correlation_id,
-        version: job.version,
-        created_at: job.created_at,
-        updated_at: job.updated_at,
     }
 }
 

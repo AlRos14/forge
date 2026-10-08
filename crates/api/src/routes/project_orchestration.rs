@@ -26,7 +26,7 @@ use db::{
 use services::{
     evaluate_project_charter_readiness, render_and_digest_charter, semantic_revision_diff,
     validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
-    PROJECT_CHARTER_RENDER_VERSION, PROJECT_OPERATING_SKILL_KEY,
+    PROJECT_CHARTER_RENDER_VERSION,
 };
 
 use crate::{
@@ -37,6 +37,7 @@ use crate::{
 
 const CHARTER_SCHEMA_VERSION: &str = "forge.project-charter/v1";
 const PROJECT_AGENT_POLICY_REVISION: &str = "forge.project-agent-policy/v1";
+const LEGACY_PROJECT_OPERATING_SKILL_KEY: &str = "forge.project.orchestration/v1";
 const MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS: i64 = 48 * 60 * 60;
 
 pub async fn get_genesis_charter(
@@ -533,9 +534,7 @@ async fn authorized_genesis(
     user_id: &str,
     session_id: &str,
 ) -> ApiResult<api_types::ProductGenesisSession> {
-    let session = services::ProductGenesisService::for_sqlite(state.db.clone())
-        .get(session_id)
-        .await?;
+    let session = state.product_genesis_history.get(session_id).await?;
     if session.account_id != user_id {
         return Err(ApiError::not_found(
             "product_genesis_session",
@@ -942,7 +941,7 @@ async fn current_project_agent_operating_skill_revision(state: &AppState) -> Api
            AND skill.current_revision_id IS NOT NULL
          LIMIT 1",
     )
-    .bind(PROJECT_OPERATING_SKILL_KEY)
+    .bind(LEGACY_PROJECT_OPERATING_SKILL_KEY)
     .fetch_optional(state.db.pool())
     .await?
     .ok_or_else(|| {

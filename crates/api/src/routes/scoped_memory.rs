@@ -18,9 +18,7 @@ use db::{
     AgentContextScopeRepo, AgentRepo, MemoryGetQuery, MemoryItem, MemoryLifecycleAssertion,
     MemoryScopeGrant, ProjectMemberRepo, ProjectRepo, ScopedMemoryRepository, TaskRepo,
 };
-use services::{
-    ContextManifestService, MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput,
-};
+use services::HistoricalContextManifestReader;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -37,99 +35,29 @@ const MAX_MANIFEST_SOURCES: usize = 500;
 /// scope. The response is provenance-only so a publication endpoint cannot be
 /// used as a content exfiltration surface.
 pub async fn publish_memory(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(memory_id): Path<String>,
-    Json(request): Json<MemoryPublicationRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_memory_id): Path<String>,
+    Json(_request): Json<MemoryPublicationRequest>,
 ) -> ApiResult<(StatusCode, Json<MemoryProvenanceResponse>)> {
-    let source_id = parse_uuid(&memory_id, "memory_id")?;
-    require_owned_identity(&state, &user, &request.actor_identity_id).await?;
-    let source_grant = authorized_scope_grant(
-        &state,
-        &user,
-        &request.source_scope_type,
-        &request.source_scope_id,
-    )
-    .await?;
-    let target_grant = authorized_scope_grant(
-        &state,
-        &user,
-        &request.target_scope_type,
-        &request.target_scope_id,
-    )
-    .await?;
-    validate_target_visibility(&request.target_scope_type, &request.target_visibility)?;
-    validate_target_linkage(&request)?;
-
-    let access = MemoryAccessContext {
-        identity_id: Some(request.actor_identity_id.clone()),
-        grants: vec![source_grant, target_grant],
-    };
-    let published = state
-        .memory_service
-        .publish(
-            &access,
-            MemoryPublicationInput {
-                source_id,
-                source_scope_type: request.source_scope_type,
-                source_scope_id: request.source_scope_id,
-                target_scope_type: request.target_scope_type,
-                target_scope_id: request.target_scope_id,
-                target_project_id: request.target_project_id,
-                target_task_id: request.target_task_id,
-                target_visibility: request.target_visibility,
-                target_authority: request.target_authority,
-                actor_identity_id: request.actor_identity_id,
-                reason: request.reason,
-                evidence_json: request.evidence_json,
-            },
-        )
-        .await?;
-    let lifecycle = state
-        .db
-        .list_memory_lifecycle_assertions(&published.id)
-        .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(provenance_response(published, lifecycle)?),
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Agent semantic memory publication was retired in Plan PR11",
     ))
 }
 
 /// Append an immutable lifecycle assertion. Destructive assertions are
 /// owner-only in the service; shared actors may add disputed/evidence records.
 pub async fn assert_memory_lifecycle(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(memory_id): Path<String>,
-    Json(request): Json<MemoryLifecycleRequest>,
+    State(_state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(_memory_id): Path<String>,
+    Json(_request): Json<MemoryLifecycleRequest>,
 ) -> ApiResult<Json<MemoryLifecycleResponse>> {
-    let memory_id = parse_uuid(&memory_id, "memory_id")?;
-    require_owned_identity(&state, &user, &request.actor_identity_id).await?;
-    let grant =
-        authorized_scope_grant(&state, &user, &request.scope_type, &request.scope_id).await?;
-    let related_memory_id = request
-        .related_memory_id
-        .as_deref()
-        .map(|value| parse_uuid(value, "related_memory_id"))
-        .transpose()?;
-    let assertion = state
-        .memory_service
-        .assert_lifecycle(
-            &MemoryAccessContext {
-                identity_id: Some(request.actor_identity_id.clone()),
-                grants: vec![grant],
-            },
-            MemoryLifecycleInput {
-                memory_id,
-                assertion_type: request.assertion_type,
-                related_memory_id,
-                reason: request.reason,
-                evidence_json: request.evidence_json,
-                actor_identity_id: request.actor_identity_id,
-            },
-        )
-        .await?;
-    Ok(Json(lifecycle_response(assertion)))
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Agent semantic memory lifecycle mutations were retired in Plan PR11",
+    ))
 }
 
 /// Return metadata-only provenance after canonical scope authorization. The
@@ -238,7 +166,7 @@ pub async fn get_context_manifest(
     )
     .await?;
 
-    let service = ContextManifestService::new(Arc::clone(&state.db));
+    let service = HistoricalContextManifestReader::new(Arc::clone(&state.db));
     let manifest = service
         .get_authorized(manifest_id, identity_id, context_scope_id)
         .await?
@@ -286,7 +214,7 @@ pub async fn list_context_manifests(
             .ok_or_else(|| ApiError::not_found("context_scope", scope_id.to_string()))?;
         authorized_scope_grant(&state, &user, &scope.scope_type, &scope.scope_id).await?;
     }
-    let service = ContextManifestService::new(Arc::clone(&state.db));
+    let service = HistoricalContextManifestReader::new(Arc::clone(&state.db));
     let manifests = service
         .list_authorized(
             identity,
@@ -393,7 +321,7 @@ async fn authorized_scope_grant(
         }
         "agent_chat" => {
             let chat = state
-                .agent_chat_service
+                .agent_chat_history
                 .get_authorized_chat(&user.user_id, scope_id)
                 .await?;
             if !matches!(chat.kind.as_str(), "account_main" | "project") {
@@ -420,73 +348,6 @@ async fn authorized_scope_grant(
         visibility,
         identity_id: None,
     })
-}
-
-fn validate_target_visibility(scope_type: &str, visibility: &str) -> ApiResult<()> {
-    let allowed = match scope_type {
-        "account" => ["account"].as_slice(),
-        "project" | "task" => ["project"].as_slice(),
-        "agent_chat" => ["chat"].as_slice(),
-        _ => return Err(ApiError::bad_request("invalid target scope type")),
-    };
-    if allowed.contains(&visibility) {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(
-            "target_visibility is not valid for the target scope",
-        ))
-    }
-}
-
-fn validate_target_linkage(request: &MemoryPublicationRequest) -> ApiResult<()> {
-    if request.target_scope_type == "account"
-        && (request.target_project_id.is_some()
-            || request.target_task_id.is_some()
-            || request.target_chat_id.is_some())
-    {
-        return Err(ApiError::bad_request(
-            "account target scopes cannot carry project, task, or Agent Chat linkage",
-        ));
-    }
-    if request.target_scope_type == "project"
-        && request.target_project_id.as_deref() != Some(request.target_scope_id.as_str())
-    {
-        return Err(ApiError::bad_request(
-            "target_project_id must match a project target scope",
-        ));
-    }
-    if request.target_scope_type == "project"
-        && (request.target_task_id.is_some() || request.target_chat_id.is_some())
-    {
-        return Err(ApiError::bad_request(
-            "project target scopes cannot carry task or Agent Chat linkage",
-        ));
-    }
-    if request.target_scope_type == "agent_chat"
-        && request.target_chat_id.as_deref() != Some(request.target_scope_id.as_str())
-    {
-        return Err(ApiError::bad_request(
-            "target_chat_id must match an Agent Chat target scope",
-        ));
-    }
-    if request.target_scope_type == "agent_chat" && request.target_task_id.is_some() {
-        return Err(ApiError::bad_request(
-            "Agent Chat target scopes cannot carry task linkage",
-        ));
-    }
-    if request.target_scope_type == "task"
-        && request.target_task_id.as_deref() != Some(request.target_scope_id.as_str())
-    {
-        return Err(ApiError::bad_request(
-            "target_task_id must match a task target scope",
-        ));
-    }
-    if request.target_scope_type == "task" && request.target_chat_id.is_some() {
-        return Err(ApiError::bad_request(
-            "task target scopes cannot carry Agent Chat linkage",
-        ));
-    }
-    Ok(())
 }
 
 async fn require_project_visible(
@@ -805,41 +666,7 @@ fn safe_metadata_value(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn publication(target_scope_type: &str, target_scope_id: &str) -> MemoryPublicationRequest {
-        MemoryPublicationRequest {
-            source_scope_type: "account".to_owned(),
-            source_scope_id: "source".to_owned(),
-            target_scope_type: target_scope_type.to_owned(),
-            target_scope_id: target_scope_id.to_owned(),
-            target_project_id: None,
-            target_task_id: None,
-            target_chat_id: None,
-            target_visibility: "project".to_owned(),
-            target_authority: "observation".to_owned(),
-            actor_identity_id: "identity".to_owned(),
-            reason: "explicit publication".to_owned(),
-            evidence_json: "{}".to_owned(),
-        }
-    }
-
     #[test]
-    fn publication_linkage_rejects_scope_confusion() {
-        let request = publication("project", "project-1");
-        assert!(validate_target_linkage(&request).is_err());
-    }
-
-    #[test]
-    fn publication_linkage_requires_canonical_target_ids() {
-        let mut request = publication("project", "project-1");
-        request.target_project_id = Some("project-1".to_owned());
-        assert!(validate_target_linkage(&request).is_ok());
-        assert!(validate_target_visibility("project", "participants").is_err());
-        assert!(validate_target_visibility("project", "project").is_ok());
-        assert!(validate_target_visibility("agent_chat", "participants").is_err());
-        assert!(validate_target_visibility("agent_chat", "chat").is_ok());
-        assert!(validate_target_visibility("room", "participants").is_err());
-    }
-
     #[test]
     fn project_context_sources_report_live_and_missing_canonical_pointers() {
         let source = db::ContextManifestSource {

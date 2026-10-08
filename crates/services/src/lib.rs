@@ -2,18 +2,10 @@
 
 pub mod account_usage;
 pub(crate) mod agent_capacity;
-pub mod agent_chat_memory_consumer;
-pub mod agent_chat_policy;
-pub mod agent_chat_service;
-pub mod agent_chat_turn_policy;
-pub mod agent_chat_turn_worker;
 pub mod agent_service;
-pub mod attention_service;
 pub mod auth_service;
 pub mod collaboration_service;
 pub mod context_manifest;
-pub mod coordination_consumer;
-pub mod coordination_service;
 pub mod credential_service;
 pub mod daemon_monitor;
 pub mod daemon_service;
@@ -28,17 +20,15 @@ pub mod execution_baseline;
 pub mod external_api;
 pub mod external_sync;
 pub mod gate_engine;
+mod historical_agent_chat;
+mod historical_memory;
 pub mod integration_service;
 pub mod lifecycle;
-pub mod main_orchestration_actions;
-pub mod memory;
-pub mod memory_source;
 pub mod merge_service;
 pub mod milestone_orchestration;
 pub mod milestone_runtime;
 pub mod notification_service;
 pub mod oauth_service;
-pub mod operating_skills;
 pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod orchestrator_runtime;
@@ -46,14 +36,11 @@ pub mod plan_artifact;
 pub mod pr_service;
 pub mod product_genesis;
 pub(crate) mod project_actor_scope;
-pub mod project_agent_actions;
-pub mod project_creation;
 pub mod project_deletion;
 pub mod project_documents;
 pub mod project_hooks;
 pub mod project_member_service;
 pub mod project_orchestration;
-pub mod project_runtime;
 pub mod prompt_preview;
 pub mod provider_authorization;
 pub mod recovery;
@@ -73,48 +60,13 @@ pub mod workflow;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
 
-pub use agent_chat_memory_consumer::{
-    memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
-};
-pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
-pub use agent_chat_service::{
-    AdmittedAgentChatMessage, AgentChatHandoffOutcome, AgentChatService, CancelAgentChatTurnInput,
-    CommittedAgentChatResponse, CreateAgentHandoffInput, SendAgentChatMessageInput,
-    SetMainAgentBindingInput, SetProjectAgentBindingInput,
-};
-pub use agent_chat_turn_policy::{
-    bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
-    failure as fail_agent_chat_turn, failure_after_claim as fail_agent_chat_turn_after_claim,
-    recover_expired as recover_expired_agent_chat_turn,
-    FailureDecision as AgentChatFailureDecision, LeaseDecision as AgentChatLeaseDecision,
-};
-pub use agent_chat_turn_worker::{
-    AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend, CompletedAgentChatTurn,
-    FederatedAgentChatTurnRunner,
-};
 pub use agent_service::AgentService;
-pub use attention_service::{
-    AttentionProjectionRun, AttentionService, WakeAdmissionRequest, WakeAdmissionResult,
-    WakeSuppressionReason,
-};
 pub use auth_service::AuthService;
 pub use collaboration_service::{
     CollaborationActorSource, CollaborationService, CreateArtifactInput, CreateDecisionInput,
     CreateHandoffInput, CreateMessageInput, CreateProposalInput,
 };
-pub use context_manifest::{
-    fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
-};
-pub use coordination_consumer::{
-    coordination_consumer_lease_owner, coordination_consumer_name, CoordinationOutcomeConsumer,
-    CoordinationOutcomeRun,
-};
-pub use coordination_service::{
-    AgentActionService, AgentInboxService, ApproveActionInput, AskQuestionInput,
-    CommitmentEvidenceInput, CommitmentService, CompleteCommitmentInput, CreateCommitmentInput,
-    DeliverInboxInput, ExecuteActionInput, ExecuteTaskProposalInput, ExecutedTaskProposal,
-    ProposeActionInput, TaskProposalPayload, TransferCommitmentInput, UpdateCommitmentInput,
-};
+pub use context_manifest::HistoricalContextManifestReader;
 pub use credential_service::{
     ConnectApiKeyCredential, ConnectOAuthCredential, CredentialError, CredentialRevocationOutcome,
     CredentialService, OAuthCredentialBundle, ProviderEntryTestOutcome, ProviderUsageOutcome,
@@ -140,20 +92,12 @@ pub use execution_baseline::{
     EXECUTION_BASELINE_RENDER_VERSION, EXECUTION_BASELINE_SCHEMA_VERSION,
 };
 pub use external_sync::ExternalSyncService;
+pub use historical_agent_chat::HistoricalAgentChatReader;
+pub use historical_memory::{
+    HistoricalMemoryReader, MemoryAccessContext, MemoryCreator, MemoryReferences,
+    MemorySearchResult,
+};
 pub use integration_service::IntegrationService;
-pub use main_orchestration_actions::{
-    is_main_orchestration_operation, ExecuteMainOrchestrationActionInput,
-    MainOrchestrationActionService,
-};
-pub use memory::{
-    BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
-    MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
-    MemoryService,
-};
-pub use memory_source::{
-    ForgeMemoryQuery, ForgeMemoryRecord, ForgeMemorySearch, ForgeMemorySource,
-    MemorySourceBindingInput,
-};
 pub use merge_service::{MergeOutcome, MergeService};
 pub use milestone_orchestration::{
     evaluate_readiness, milestone_identity, principals_equal, recompute_readiness_digest,
@@ -167,38 +111,10 @@ pub use milestone_orchestration::{
 pub use milestone_runtime::{validate_release_policy, MilestoneRuntime};
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
-pub use operating_skills::{
-    canonical_main_baseline_operating_skill_body, canonical_main_operating_skill_body,
-    canonical_project_operating_skill_body, main_operating_skill_active,
-    render_main_baseline_operating_skill, render_main_operating_skill,
-    render_project_operating_skill, EffectiveProjectStateContext, MainBaselineSkillContext,
-    MainOperatingSkillContext, ProjectOperatingSkillContext,
-    MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST, MAIN_BASELINE_OPERATING_SKILL_KEY,
-    MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_CONTENT_DIGEST,
-    MAIN_OPERATING_SKILL_KEY, MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
-    MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
-    MAIN_OPERATING_SKILL_VERSION, PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
-    PROJECT_OPERATING_SKILL_KEY, PROJECT_OPERATING_SKILL_POLICY_DIGEST,
-    PROJECT_OPERATING_SKILL_POLICY_JSON, PROJECT_OPERATING_SKILL_RENDER_VERSION,
-    PROJECT_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_VERSION,
-};
 pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
 pub use orchestrator_runtime::{OrchestratorRun, OrchestratorRuntime};
-pub use product_genesis::{
-    render_product_genesis_prompt, validate_genesis_transition, GenesisLifecycleError,
-    GenesisPromptContext, NewProductGenesisSession, ProductGenesisService, ProductGenesisStart,
-    ProductGenesisStore, SqliteProductGenesisStore, TransitionProductGenesis,
-    PRODUCT_GENESIS_PROMPT_VERSION,
-};
-pub use project_agent_actions::{
-    is_project_orchestration_operation, ExecuteProjectOrchestrationActionInput,
-    ProjectOrchestrationActionService,
-};
-pub use project_creation::{
-    create_project_from_charter_approval, CreateProjectAuthorization,
-    CreateProjectFromCharterApprovalInput,
-};
+pub use product_genesis::HistoricalProductGenesisReader;
 pub use project_documents::{
     diff_project_document_views, document_content_digest, document_kind_name,
     document_render_digest, parse_document_kind, parse_document_revision_lifecycle,
@@ -215,10 +131,6 @@ pub use project_orchestration::{
     try_charter_render_digest, validate_approval_candidate, validate_charter_approval_candidate,
     CharterApprovalValidationError, CharterFieldChange, CharterRender, CharterRevisionDiff,
     CHARTER_DIFF_VERSION, CHARTER_READINESS_POLICY_VERSION, PROJECT_CHARTER_RENDER_VERSION,
-};
-pub use project_runtime::{
-    load_effective_project_state, ProjectCommitmentProjection, ProjectCurrentStateResponse,
-    ProjectEffectiveStateProjection, ProjectInboxProjection,
 };
 pub use prompt_preview::preview_effective_prompt;
 pub use provider_authorization::ProviderAuthorizationService;

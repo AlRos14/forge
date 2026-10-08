@@ -246,14 +246,7 @@ impl OperatorStatusService {
                     FROM execution e
                     JOIN agent_current a ON a.id = e.agent_id
                     WHERE a.daemon_id = d.id AND e.status = 'running'
-                ) AS running_executions,
-                (
-                    SELECT COUNT(*)
-                    FROM agent_chat_turn_job turn_job
-                    JOIN agent_current a ON a.id = turn_job.responder_identity_id
-                    WHERE a.daemon_id = d.id
-                      AND turn_job.status = 'leased'
-                ) AS active_agent_chat_turns
+                ) AS running_executions
              FROM daemon d
              ORDER BY d.updated_at DESC, d.id ASC",
         )
@@ -263,10 +256,7 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let running_executions: i64 = row.try_get("running_executions")?;
-            let active_agent_chat_turns: i64 = row.try_get("active_agent_chat_turns")?;
-            let active_sessions = running_executions
-                .saturating_add(active_agent_chat_turns)
-                .max(0) as u32;
+            let active_sessions = running_executions.max(0) as u32;
             let labels_json: String = row.try_get("labels_json")?;
             let max_sessions = daemon_session_cap_from_labels(&labels_json)
                 .and_then(|value| u32::try_from(value).ok());
@@ -296,13 +286,7 @@ impl OperatorStatusService {
                     SELECT COUNT(*)
                     FROM execution e
                     WHERE e.agent_id = a.id AND e.status = 'running'
-                ) AS running_executions,
-                (
-                    SELECT COUNT(*)
-                    FROM agent_chat_turn_job turn_job
-                    WHERE turn_job.responder_identity_id = a.id
-                      AND turn_job.status = 'leased'
-                ) AS active_agent_chat_turns
+                ) AS running_executions
              FROM agent_current a
              ORDER BY a.name ASC, a.id ASC",
         )
@@ -312,10 +296,7 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let running_executions: i64 = row.try_get("running_executions")?;
-            let active_agent_chat_turns: i64 = row.try_get("active_agent_chat_turns")?;
-            let active_sessions = running_executions
-                .saturating_add(active_agent_chat_turns)
-                .max(0) as u32;
+            let active_sessions = running_executions.max(0) as u32;
             let max_sessions = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
             let at_capacity = max_sessions > 0 && active_sessions >= max_sessions;
             if active_sessions == 0 && !at_capacity {

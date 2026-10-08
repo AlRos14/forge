@@ -651,7 +651,7 @@ impl OrchestratorRuntime {
                     target: WakeTarget::Task,
                 }
             }
-            "task.transitioned" | "task.status_changed" => {
+            "task.transitioned" | "task.status_changed" | "task.updated" => {
                 if event.entity_type != "task" || event.entity_id != task.id {
                     return Ok(None);
                 }
@@ -4306,8 +4306,8 @@ mod tests {
             &*database,
             UpsertDaemon {
                 id: daemon_id.clone(),
-                machine_id: format!("pr6-{daemon_id}"),
-                hostname: "pr6-test".to_owned(),
+                machine_id: crate::embedded_daemon::embedded_machine_id(),
+                hostname: "pr6-embedded-test".to_owned(),
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 agent_version: None,
@@ -4321,7 +4321,7 @@ mod tests {
             },
         )
         .await
-        .expect("online daemon creates");
+        .expect("embedded daemon creates");
         DaemonRepo::update_report(
             &*database,
             UpdateDaemonReport {
@@ -4336,6 +4336,7 @@ mod tests {
         )
         .await
         .expect("Codex capability is advertised");
+
         let agent_id = new_uuid_v4();
         AgentRepo::create(
             &*database,

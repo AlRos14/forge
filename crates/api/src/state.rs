@@ -5,11 +5,11 @@ use db::SqliteDb;
 use events::EventBus;
 use executors::{FallbackExecutor, HarnessAdapterRegistry, TaskExecutor};
 use services::{
-    AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
-    CommitmentService, CredentialService, DaemonService, MemoryService, MergeService,
-    NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
-    ProviderAuthorizationService, TaskService, TerminalActivityTracker, TerminalService,
-    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
+    AgentService, AuthService, CredentialService, DaemonService, HistoricalAgentChatReader,
+    HistoricalMemoryReader, HistoricalProductGenesisReader, MergeService, NotificationService,
+    OperatorStatusEmitter, OperatorStatusService, ProjectHookService, ProviderAuthorizationService,
+    TaskService, TerminalActivityTracker, TerminalService, WorkspaceCleanupScheduler,
+    WorkspaceExecutionLockManager,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -65,18 +65,15 @@ pub struct AppState {
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub credential_service: Arc<CredentialService>,
-    pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
-    pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
-    pub commitment_service: Arc<CommitmentService>,
-    pub agent_inbox_service: Arc<AgentInboxService>,
-    pub agent_action_service: Arc<AgentActionService>,
+    pub agent_chat_history: Arc<HistoricalAgentChatReader<SqliteDb>>,
+    pub product_genesis_history: Arc<HistoricalProductGenesisReader>,
     pub collaboration_service: Arc<services::CollaborationService>,
     pub work_unit_service: Arc<services::WorkUnitService>,
     pub daemon_service: Arc<DaemonService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
     pub workflow_template_service:
         Arc<services::workflow::template_service::WorkflowTemplateService>,
-    pub memory_service: Arc<MemoryService>,
+    pub memory_history: Arc<HistoricalMemoryReader>,
     pub merge_service: Arc<MergeService>,
     pub notification_service: Arc<NotificationService>,
     pub project_hook_service: Arc<ProjectHookService>,
@@ -181,13 +178,9 @@ impl AppState {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
         let credential_service = Arc::new(CredentialService::new(Arc::clone(&db), &jwt_secret));
-        let agent_chat_service = Arc::new(services::AgentChatService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-        ));
-        let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
-        let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
-        let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
+        let agent_chat_history = Arc::new(HistoricalAgentChatReader::new(Arc::clone(&db)));
+        let product_genesis_history =
+            Arc::new(HistoricalProductGenesisReader::new(Arc::clone(&db)));
         let collaboration_service = Arc::new(services::CollaborationService::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -208,7 +201,7 @@ impl AppState {
             Arc::clone(&workspace_exec_locks),
         ));
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
-        let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
+        let memory_history = Arc::new(HistoricalMemoryReader::new(Arc::clone(&db)));
         let workflow_template_service = Arc::new(
             services::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
         );
@@ -246,7 +239,6 @@ impl AppState {
                 .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
                 .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
                 .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
-                .with_memory_service(Arc::clone(&memory_service))
                 .with_provider_credential_env(Arc::clone(&credential_service))
                 .with_workspace_root(workspace_root.clone()),
         );
@@ -282,12 +274,6 @@ impl AppState {
         let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
-        let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
-            Arc::clone(&db),
-            Arc::clone(&task_executor),
-            Arc::clone(&event_bus),
-            Some(Arc::clone(&credential_service)),
-        ));
         let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
         let oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&db),
@@ -305,17 +291,14 @@ impl AppState {
             task_service,
             agent_service,
             credential_service,
-            agent_chat_service,
-            agent_chat_turn_worker,
-            commitment_service,
-            agent_inbox_service,
-            agent_action_service,
+            agent_chat_history,
+            product_genesis_history,
             collaboration_service,
             work_unit_service,
             daemon_service,
             daemon_connections,
             workflow_template_service,
-            memory_service,
+            memory_history,
             merge_service,
             notification_service,
             project_hook_service,

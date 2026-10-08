@@ -373,13 +373,6 @@ pub(super) async fn create_system_comment(ctx: &HookContext, content: String) ->
         },
     )
     .await?;
-    let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
-    if let Err(error) = memory_service
-        .record_task_comment(&ctx.project_id, &comment)
-        .await
-    {
-        tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-    }
     ctx.event_bus.publish(ForgeEvent {
         event_type: "comment.created".to_string(),
         entity_id: comment.id.clone(),

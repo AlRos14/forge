@@ -538,7 +538,7 @@ must repeat the search at its own HEAD.
 | Workflow state machine | V009 workflow_definition/task_state_config; services workflow engine, TaskService transitions, hooks, dispatch loader, recovery, and default workflow; API/UI state controls | Plan PR9 reduces state to aggregate lifecycle and Gates; Plan PR13 removes old workflow persistence after all readers/writers move |
 | Special review runtime | review table from V006; crates/review runner/auditor/follow_up; service error and orchestration paths; API/UI review actions; review evidence V084 | Plan PR8 emits validation Evidence and review Executions/Artifacts; Plan PR13 drops special review persistence/runtime |
 | Forge-owned cognition | Removed by Plan PR10: no `forge-agent-host` crate, `agent-runtime` dependency, embedded task executor, native tool catalog, or runtime startup wiring. Credential ownership now lives in `CredentialService`; API history readers remain fail-closed. | Complete; protected runtime/session storage remains historical until Plan PR13 |
-| Main Agent/Project Agent/Project OS | V061–V075 rooms, chats, bindings, genesis, memory, commitments, attention, project charter/baseline, and related services/routes/MCP/UI | Plan PR11 moves useful durable behavior onto generic actors/collaboration/artifacts, then Plan PR12 removes obsolete surfaces |
+| Main Agent/Project Agent/Project OS | V061–V076 rooms, chats, bindings, genesis, memory, commitments, attention, charter/baseline, milestones/releases, and related readers/writers | Plan PR11 V118 retires writers, workers, and authority while preserving rows; PR12 removes public surfaces; PR13 drops unused storage |
 | Bespoke plan persistence | V081 task_plan_revision/task_plan_approval remain preserved; PR7 stops runtime authority and records V098 provenance migration audit | Plan PR13 owns physical V081 table/column cleanup after all consumers move |
 | Project documents and milestone governance | V076 project charter/document/decision/baseline/milestone/release records and orchestration services | Preserve only generic Artifact/Evidence/Gate value; reconcile with the new Task-scoped model during Plan PRs 4, 8, 9, and 11 |
 | Workspace and Git isolation | workspace, git, daemon, workspace lease records, execution launch/recovery, and integration paths | Preserve and extend in Plan PR5; no replacement that permits shared writable trees |
@@ -549,6 +549,17 @@ authority-aware workspace-lease renewal and V087 for the additive
 `cursor_poll` usage source; it edits no historical migration. The table above
 is an audit record, not permission to drop any listed table. The Plan PR0A
 reconciliation ledger is in [migration/pr-0a.md](pr-0a.md).
+
+The post-PR11 inventory was rechecked at `origin/main` SHA
+`815d3ce42af300632056633eed8265f08f82081e`, with migration V118. Main and
+Project binding, chat, Project OS, semantic-memory, Attention, and operating
+skill writes are fenced at SQLite and retired REST/MCP mutation boundaries.
+`project_actor_scope` uses only generic Agent visibility/ownership rules;
+Task responsibility and repository leases use TaskRole/RoleMembership and the
+exact Execution. Legacy V071 auto-chat triggers are removed. Historical reads
+remain for PR12, while physical rows and read-only compatibility are assigned
+to PR13. The full writer/reader/authority audit is in
+[Plan PR11](plan-pr11-retire-main-project-agent-project-os.md).
 
 ## Compatibility policy for the migration
 
@@ -584,7 +595,7 @@ fallback is authorized by Plan PR0.
 | Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence | ReviewRunner, special review rows, FORGE_RESULT-centric flow | Generic review/validation authoritative; remove special runtime in Plan PR13 |
 | Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | New lifecycle authoritative; remove workflow tables/branches in Plan PR13 |
 | Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task dispatch and cancellation use the Execution snapshot's exact `resolved_daemon_id`; a missing host fails closed. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat storage and provenance remain readable, but every current production adapter fails closed because none proves `permission_policy=deny` and `isolation_posture=no-filesystem`. Periodic Cursor `/usage` polling is disabled during Executions because its PTY child can leave the wrapper process group; no old snapshot is attached to the current Execution. PR11 owns vertical retirement or migration. |
-| Plan PR11 | Project/Repo/Task plus generic collaboration | Main/Project Agent and Project OS verticals | Remove old services/tables after migration fixtures |
+| Plan PR11 | Project/Repo/Task plus generic collaboration | Retired vertical writes/authority are database-fenced; safe history reads remain | V118; remove vertical workers/materializers and legacy authority; PR12 removes surfaces, PR13 drops storage |
 | Plan PR12 | Public surfaces over target domain | Old API/MCP/CLI/UI endpoints | Remove obsolete endpoints and UI |
 | Plan PR13 | Destructive persistence cleanup | None if preconditions hold | Drop old schema and compatibility code |
 | Plan PR14 | Final product documentation/name | Old public branding where intentionally retained | Rename only with explicit supplied name and data discovery |

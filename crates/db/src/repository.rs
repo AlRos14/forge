@@ -1652,15 +1652,6 @@ pub trait TerminalSessionRepo: Send + Sync {
 #[async_trait]
 pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
-    /// Create a Project together with its singular Agent Chat and binding.
-    /// Passing no identity/profile preserves explicit setup-required state;
-    /// passing both values makes the binding active in the same transaction.
-    async fn create_with_agent_binding(
-        &self,
-        input: CreateProject,
-        identity_id: Option<String>,
-        profile_id: Option<String>,
-    ) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
     async fn update(&self, input: UpdateProject) -> Result<Project>;

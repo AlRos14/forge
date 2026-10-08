@@ -1,6 +1,6 @@
 use api_types::{
-    AdminUserListResponse, AdminUserResponse, MemoryBackfillResponse, MemoryBackfillTypeResponse,
-    SettingListResponse, SettingResponse, UpdateAdminRequest, UpsertSettingRequest,
+    AdminUserListResponse, AdminUserResponse, MemoryBackfillResponse, SettingListResponse,
+    SettingResponse, UpdateAdminRequest, UpsertSettingRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -146,22 +146,12 @@ pub async fn delete_setting(
 
 pub async fn backfill_memory(
     _admin: RequireAdmin,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> ApiResult<Json<MemoryBackfillResponse>> {
-    let summary = state.memory_service.backfill_sources().await?;
-    Ok(Json(MemoryBackfillResponse {
-        indexed: summary.indexed,
-        skipped: summary.skipped,
-        items: summary
-            .items
-            .into_iter()
-            .map(|result| MemoryBackfillTypeResponse {
-                source_type: result.source_type.to_string(),
-                indexed: result.indexed,
-                skipped: result.skipped,
-            })
-            .collect(),
-    }))
+    Err(ApiError::gone_with_code(
+        "operation_retired",
+        "Agent semantic memory backfill was retired in Plan PR11",
+    ))
 }
 
 fn admin_user_response(user: User) -> AdminUserResponse {

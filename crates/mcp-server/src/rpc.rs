@@ -30,6 +30,12 @@ pub(crate) async fn dispatch_with_context(
         "tools/list" => handle_tools_list(context),
         "tools/call" => {
             let params: ToolCallParams = parse_params(params)?;
+            if is_retired_vertical_tool(&params.name) {
+                return Err(McpToolError::new(-32040, "operation retired").with_data(json!({
+                    "code": "operation_retired",
+                    "message": "This Main Agent, Project Agent, or Agent memory operation was retired in Plan PR11"
+                })));
+            }
             let arguments = match params.arguments {
                 Value::Null => json!({}),
                 arguments => arguments,
@@ -40,6 +46,18 @@ pub(crate) async fn dispatch_with_context(
         }
         _ => Err(McpToolError::new(-32601, "method not found")),
     }
+}
+
+fn is_retired_vertical_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "forge_set_main_agent"
+            | "forge_set_project_agent"
+            | "forge_send_agent_chat_message"
+            | "forge_create_agent_handoff"
+            | "forge_memory_search"
+            | "forge_memory_get"
+    )
 }
 
 async fn apply_project_scope(

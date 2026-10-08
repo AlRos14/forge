@@ -103,13 +103,14 @@ pub async fn assign_task_role(
     Path((id, role_name)): Path<(String, String)>,
     Json(request): Json<AssignRoleRequest>,
 ) -> ApiResult<Json<TaskRoleAssignmentResponse>> {
+    ensure_task_role_access(&state.db, &id, &user.user_id).await?;
     let project_id = validate_role_name(&state.db, &id, &role_name).await?;
     let assignee_id = required_body_field(request.assignee_id.clone(), "assignee_id")?;
     match request.assignee_type.as_str() {
         "agent" => {
             let usable_agents = state
                 .db
-                .list_agents_usable_in_project(&project_id, &user.user_id)
+                .list_agents_eligible_for_project(&project_id)
                 .await
                 .map_err(ApiError::from)?;
             let is_usable = usable_agents
@@ -220,9 +221,7 @@ async fn validate_actor_request(
 ) -> ApiResult<()> {
     match actor_ref {
         api_types::ActorRef::Agent(agent_id) => {
-            let usable = db
-                .list_agents_usable_in_project(project_id, _requester_id)
-                .await?;
+            let usable = db.list_agents_eligible_for_project(project_id).await?;
             if usable.into_iter().all(|agent| agent.id != *agent_id) {
                 return Err(ApiError::not_found("agent", agent_id.clone()));
             }

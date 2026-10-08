@@ -70,6 +70,15 @@ impl ApiError {
         }
     }
 
+    pub fn gone_with_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code,
+            message: message.into(),
+            details: None,
+        }
+    }
+
     pub fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         let id = id.into();
         Self {
