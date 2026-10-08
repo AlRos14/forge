@@ -583,7 +583,7 @@ fallback is authorized by Plan PR0.
 | Plan PR7 | Plan Execution and plan Artifact | Canonical plan revisions, planner retry/prompt machinery | Artifact authoritative; remove old plan APIs/persistence in Plan PR13 |
 | Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence | ReviewRunner, special review rows, FORGE_RESULT-centric flow | Generic review/validation authoritative; remove special runtime in Plan PR13 |
 | Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | New lifecycle authoritative; remove workflow tables/branches in Plan PR13 |
-| Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task dispatch and cancellation use the Execution snapshot's exact `resolved_daemon_id`; a missing host fails closed. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat storage and provenance remain readable, but every current production adapter fails closed because none proves `permission_policy=deny` and `isolation_posture=no-filesystem`. PR11 owns vertical retirement or migration. |
+| Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task dispatch and cancellation use the Execution snapshot's exact `resolved_daemon_id`; a missing host fails closed. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat storage and provenance remain readable, but every current production adapter fails closed because none proves `permission_policy=deny` and `isolation_posture=no-filesystem`. Periodic Cursor `/usage` polling is disabled during Executions because its PTY child can leave the wrapper process group; no old snapshot is attached to the current Execution. PR11 owns vertical retirement or migration. |
 | Plan PR11 | Project/Repo/Task plus generic collaboration | Main/Project Agent and Project OS verticals | Remove old services/tables after migration fixtures |
 | Plan PR12 | Public surfaces over target domain | Old API/MCP/CLI/UI endpoints | Remove obsolete endpoints and UI |
 | Plan PR13 | Destructive persistence cleanup | None if preconditions hold | Drop old schema and compatibility code |
@@ -631,6 +631,18 @@ A replacement connection for the same daemon ID starts with a new runtime and
 never adopts old process handles. If the old socket is already gone, its final
 log or terminal notification may be lost; daemon reports and the existing
 recovery path reconcile durable Execution state.
+The local daemon command also waits for its command-stream task to finish this
+retirement after an OS shutdown signal, and propagates retirement failures
+instead of reporting a successful stop. It supervises command-stream completion
+alongside reporting and stops the reporter if the command loop exits or fails.
+
+Cursor's execution route detection resolves the configured executable without
+running `cursor-agent status`. That status command remains part of the separate
+detailed availability operation. Neither the server runner nor the remote
+daemon starts Cursor's interactive quota poll as an Execution helper: the PTY
+child has a separate session/process group that the Execution boundary cannot
+verify. Missing Cursor `account_usage` remains unavailable; a prior account
+snapshot is not copied into a new Execution.
 
 An Execution's `credential_ref` is immutable invocation identity. Credential
 resolution may verify current Agent ownership and credential status, but it

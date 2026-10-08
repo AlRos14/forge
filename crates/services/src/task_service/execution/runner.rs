@@ -728,18 +728,6 @@ impl TaskService {
             )
             .await?
         };
-        let usage_probe = if existing_plan_output.is_some() {
-            None
-        } else {
-            self.task_executor.clone().and_then(|executor| {
-                super::spawn_account_usage_probe(
-                    Arc::clone(&self.db),
-                    execution.executor_config_snapshot_json.clone(),
-                    execution_id.clone(),
-                    executor,
-                )
-            })
-        };
         let prelaunch_review_error = if let Some(subject) = review_subject.as_ref() {
             let current_head =
                 git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
@@ -801,9 +789,6 @@ impl TaskService {
                 })
                 .await
         };
-        if let Some(probe) = usage_probe {
-            probe.stop().await;
-        }
         if let Err(error) = executors::LogWriter::compact(std::path::Path::new(&logs_path)).await {
             tracing::warn!(%execution_id, %error, "failed to compress final execution log segment; plain log retained");
         }

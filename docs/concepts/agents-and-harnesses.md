@@ -132,6 +132,14 @@ quota, cooldown, and failover remain platform infrastructure. Failover may
 select another Agent only when that fact is explicit in Execution history; it
 must not impersonate the original Agent or mutate its identity.
 
+Cursor's interactive `/usage` probe is not started as a periodic child of an
+Execution. Its PTY command can run in a separate process session, outside the
+Execution's verifiable process group. A Cursor Execution without a current
+observation therefore has no `account_usage`; Forge does not substitute an
+older account snapshot. Cursor's side-effect-free execution detection checks
+the configured executable, while the detailed availability check remains a
+separate operation.
+
 ## Frozen Execution host (Plan PR10)
 
 Admission may resolve an Agent's pinned daemon or select an available daemon

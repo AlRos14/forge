@@ -22,7 +22,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   daemon selected at admission for Start, Resume, Cancel, and recovery; a
   missing frozen host fails closed rather than routing through a changed
   Agent binding. Execution credentials remain snapshot-bound, local-only for
-  secret injection, and fail closed for remote credential-backed Start.
+  secret injection, and fail closed for remote credential-backed Start. The
+  daemon CLI now stops reporting if its command stream exits or fails and waits
+  for generation retirement on shutdown.
 
 - Task progress is now owned by the aggregate `task_lifecycle` record. Legacy
   `task.status` is a one-way compatibility projection; old workflow states,
@@ -244,6 +246,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Cursor's periodic `/usage` poll no longer runs inside an active Execution.
+  Its PTY child can leave the wrapper's process group, so Forge cannot prove
+  that it retired with the Execution. New Cursor Executions report no
+  `account_usage` unless they produce a current observation; an older account
+  snapshot is never attached as if it were current. Cursor execution routing
+  now checks the configured executable without running `cursor-agent status`.
 - Run observability no longer treats missing USD cost as `$0.00`. Subscription
   Codex and Cursor runs show account quota instead, and Turns counts harness
   protocol turns rather than `assistant` log rows in the loaded tail.

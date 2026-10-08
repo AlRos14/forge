@@ -714,24 +714,6 @@ pub(crate) async fn persist_account_usage_snapshot_with_host(
     .await
 }
 
-pub(crate) async fn persist_account_usage_snapshot_with_source(
-    db: &SqliteDb,
-    snapshot: Option<&str>,
-    execution_id: &str,
-    account_usage: &Value,
-    source: &str,
-) -> Result<()> {
-    persist_account_usage_snapshot_with_source_and_host(
-        db,
-        snapshot,
-        execution_id,
-        account_usage,
-        source,
-        None,
-    )
-    .await
-}
-
 pub(crate) async fn persist_account_usage_snapshot_with_source_and_host(
     db: &SqliteDb,
     snapshot: Option<&str>,
@@ -777,103 +759,6 @@ pub(crate) async fn persist_account_usage_snapshot_with_source_and_host(
     .execute(db.pool())
     .await?;
     Ok(())
-}
-
-pub(super) struct CursorUsageProbe {
-    cancel: tokio_util::sync::CancellationToken,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl CursorUsageProbe {
-    pub(super) async fn stop(self) {
-        self.cancel.cancel();
-        let _ = self.task.await;
-    }
-}
-
-pub(super) fn spawn_account_usage_probe(
-    db: Arc<SqliteDb>,
-    snapshot: Option<String>,
-    execution_id: String,
-    executor: Arc<dyn executors::TaskExecutor>,
-) -> Option<CursorUsageProbe> {
-    let snapshot = snapshot?;
-    let value = serde_json::from_str::<Value>(&snapshot).ok()?;
-    let kind = value
-        .get("executor_type")
-        .and_then(Value::as_str)?
-        .parse::<executors::ExecutorKind>()
-        .ok()?;
-    // PR0A's periodic account quota poll is Cursor-specific. Other adapters
-    // can expose an explicit observation API without changing that policy.
-    if kind != executors::ExecutorKind::Cursor {
-        return None;
-    }
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            if task_cancel.is_cancelled() {
-                break;
-            }
-            persist_account_usage_probe(
-                &db,
-                &snapshot,
-                kind.clone(),
-                value.get("config").unwrap_or(&Value::Null).clone(),
-                Arc::clone(&executor),
-                &execution_id,
-                task_cancel.clone(),
-            )
-            .await;
-            tokio::select! {
-                _ = task_cancel.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(45)) => {}
-            }
-        }
-    });
-    Some(CursorUsageProbe { cancel, task })
-}
-
-async fn persist_account_usage_probe(
-    db: &SqliteDb,
-    snapshot: &str,
-    kind: executors::ExecutorKind,
-    config: Value,
-    executor: Arc<dyn executors::TaskExecutor>,
-    execution_id: &str,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    match executor.observe_usage(kind, &config, cancel.clone()).await {
-        Ok(Some(observation)) => {
-            if let Err(error) = persist_account_usage_snapshot_with_source(
-                db,
-                Some(snapshot),
-                execution_id,
-                &observation.value,
-                observation
-                    .source
-                    .as_deref()
-                    .unwrap_or("harness_account_usage"),
-            )
-            .await
-            {
-                tracing::warn!(
-                    execution_id = %execution_id,
-                    %error,
-                    "failed to persist harness account usage snapshot"
-                );
-            }
-        }
-        Err(error) if !cancel.is_cancelled() => {
-            tracing::warn!(
-                execution_id = %execution_id,
-                %error,
-                "failed to observe harness account usage"
-            );
-        }
-        Ok(None) | Err(_) => {}
-    }
 }
 
 #[cfg(test)]

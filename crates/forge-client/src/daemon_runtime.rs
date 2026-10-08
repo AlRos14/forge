@@ -30,7 +30,6 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     daemon_fs,
@@ -571,12 +570,6 @@ async fn run_execution_task(
     active_executions: ActiveExecutionTracker,
 ) {
     let _active_guard = active_executions.track(ctx.execution_id.clone());
-    let usage_probe = spawn_account_usage_probe(
-        &ctx.agent_config,
-        &ctx.execution_id,
-        outbound.clone(),
-        Arc::clone(&executor),
-    );
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     ctx.log_sender = Some(log_tx);
     let log_outbound = outbound.clone();
@@ -632,9 +625,6 @@ async fn run_execution_task(
         }
         Err(error) => Err(error),
     };
-    if let Some(probe) = usage_probe {
-        probe.stop().await;
-    }
     // The executor owns the only log sender in ctx, so completion should close the
     // channel and let the forwarder drain. If an executor holds a sender clone or
     // emits a very large trailing burst, the timeout favors terminal notification
@@ -669,98 +659,6 @@ async fn run_execution_task(
         },
     };
     emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification);
-}
-
-struct CursorUsageProbe {
-    cancel: CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl CursorUsageProbe {
-    async fn stop(mut self) {
-        self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
-impl Drop for CursorUsageProbe {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-fn spawn_account_usage_probe(
-    agent_config: &Value,
-    execution_id: &str,
-    outbound: mpsc::UnboundedSender<DaemonFrame>,
-    executor: Arc<FallbackExecutor>,
-) -> Option<CursorUsageProbe> {
-    let kind = agent_config
-        .get("executor_type")
-        .and_then(Value::as_str)?
-        .parse::<executors::ExecutorKind>()
-        .ok()?;
-    // PR0A's periodic account quota observation is Cursor-specific. Other
-    // HarnessAdapters may expose an explicit probe without changing this
-    // scheduling/accounting policy.
-    if kind != executors::ExecutorKind::Cursor {
-        return None;
-    }
-    let config = agent_config.get("config").cloned().unwrap_or(Value::Null);
-    let execution_id = execution_id.to_owned();
-    let cancel = CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            if task_cancel.is_cancelled() {
-                break;
-            }
-            match executor
-                .observe_usage(kind.clone(), &config, task_cancel.clone())
-                .await
-            {
-                Ok(Some(observation)) => emit_execution_log(
-                    &outbound,
-                    LogEntry {
-                        schema_version: 1,
-                        sequence: 0,
-                        timestamp: rfc3339_now(),
-                        execution_id: execution_id.clone(),
-                        kind: executors::LogKind::SessionInfo,
-                        stream: executors::LogStream::Heartbeat,
-                        payload: serde_json::json!({
-                            "method": "forge/cursor/usage",
-                            "params": observation.value,
-                            "source": observation.source.unwrap_or_else(|| "harness_account_usage".to_owned())
-                        }),
-                        truncated: false,
-                    },
-                ),
-                Ok(None) => break,
-                Err(error) if !task_cancel.is_cancelled() => {
-                    tracing::debug!(
-                        execution_id = %execution_id,
-                        %error,
-                        "remote Cursor usage poll did not produce an observation"
-                    );
-                }
-                Err(_) => break,
-            }
-            tokio::select! {
-                _ = task_cancel.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(45)) => {}
-            }
-        }
-    });
-    Some(CursorUsageProbe {
-        cancel,
-        task: Some(task),
-    })
 }
 
 fn terminal_notification_from_result(
@@ -1046,6 +944,57 @@ mod tests {
                 status: ExecutionOutcome::Completed,
                 ..Default::default()
             })
+        }
+
+        async fn cancel(&self, _execution_id: &str) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+    }
+
+    struct CursorExecutionUsageAdapter {
+        executions: Arc<AtomicUsize>,
+        usage_observations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for CursorExecutionUsageAdapter {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Cursor
+        }
+
+        fn check_availability(&self) -> AvailabilityInfo {
+            AvailabilityInfo {
+                status: AvailabilityStatus::Authenticated,
+                authenticated_at: None,
+                config_path: None,
+            }
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: DiscoverContext,
+        ) -> Result<DiscoveredOptions, ExecutorError> {
+            Ok(DiscoveredOptions::default())
+        }
+
+        async fn execute(&self, _ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                ..Default::default()
+            })
+        }
+
+        async fn observe_usage(
+            &self,
+            _config: &serde_json::Value,
+            _cancel: CancellationToken,
+        ) -> Result<Option<executors::UsageObservation>, ExecutorError> {
+            self.usage_observations.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(executors::UsageObservation {
+                value: serde_json::json!({"plan": "fixture"}),
+                source: Some("cursor_poll".to_owned()),
+            }))
         }
 
         async fn cancel(&self, _execution_id: &str) -> Result<(), ExecutorError> {
@@ -1479,6 +1428,57 @@ mod tests {
         };
         assert_eq!(capabilities.resume, api_types::CapabilitySupport::Native);
         assert_eq!(capabilities.cancel, api_types::CapabilitySupport::Emulated);
+    }
+
+    #[tokio::test]
+    async fn cursor_execution_completes_without_periodic_usage_observation() {
+        let dir = tempfile::tempdir().expect("workspace root creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let usage_observations = Arc::new(AtomicUsize::new(0));
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(CursorExecutionUsageAdapter {
+            executions: Arc::clone(&executions),
+            usage_observations: Arc::clone(&usage_observations),
+        }));
+        let runtime = DaemonRuntime::new_with_registry_and_tracker(
+            tx,
+            dir.path().to_path_buf(),
+            Arc::new(registry),
+            ActiveExecutionTracker::default(),
+        );
+
+        runtime
+            .start(ExecutionStartParams {
+                task_id: "task-cursor-usage".to_owned(),
+                execution_id: "exec-cursor-usage".to_owned(),
+                role: "coder".to_owned(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "cursor".to_owned(),
+                executor_config: serde_json::json!({
+                    "executor_type": "cursor",
+                    "config": {}
+                }),
+                prompt: serde_json::json!({"description": "complete Cursor execution"}),
+                invocation: executors::HarnessInvocation::Start,
+                max_turns: None,
+            })
+            .await
+            .expect("Cursor execution is accepted");
+
+        let terminal = next_terminal_notification(&mut rx, "exec-cursor-usage").await;
+
+        assert_eq!(terminal.status.as_deref(), Some("completed"));
+        assert!(
+            terminal.account_usage.is_none(),
+            "no current Cursor observation is reported when polling is disabled"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            usage_observations.load(Ordering::SeqCst),
+            0,
+            "Execution must not launch a Cursor usage helper"
+        );
     }
 
     #[cfg(unix)]

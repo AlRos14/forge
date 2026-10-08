@@ -2218,6 +2218,114 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     }));
 }
 
+#[derive(Default)]
+struct CursorUsageRecordingExecutor {
+    executions: std::sync::atomic::AtomicUsize,
+    usage_observations: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl executors::TaskExecutor for CursorUsageRecordingExecutor {
+    async fn execute(
+        &self,
+        _ctx: ExecutionContext,
+    ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
+        self.executions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(executors::ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(
+        &self,
+        _execution_id: &str,
+    ) -> std::result::Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+
+    async fn observe_usage(
+        &self,
+        _kind: executors::ExecutorKind,
+        _config: &Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<Option<executors::UsageObservation>, executors::ExecutorError> {
+        self.usage_observations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(executors::UsageObservation {
+            value: serde_json::json!({"plan": "fixture"}),
+            source: Some("cursor_poll".to_owned()),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn run_cursor_execution_does_not_poll_or_persist_usage() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let executor = Arc::new(CursorUsageRecordingExecutor::default());
+    let task_executor: Arc<dyn executors::TaskExecutor> = executor.clone();
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_task_executor(task_executor);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "cursor", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Cursor Agent loads")
+        .expect("Cursor Agent exists");
+    let snapshot =
+        crate::task_service::config::build_executor_config_snapshot(&db, &task, &agent, None, None)
+            .await
+            .expect("Cursor snapshot builds");
+    let (execution, _workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("complete Cursor work".to_owned()),
+        snapshot,
+    )
+    .await;
+    let execution_id = execution.id.clone();
+
+    let execution = service
+        .run_execution(execution_id.clone(), executor.as_ref())
+        .await
+        .expect("Cursor execution completes");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        executor
+            .executions
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        executor
+            .usage_observations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the service must not launch an Execution-owned Cursor usage helper"
+    );
+    let usage_snapshots: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM account_usage_snapshot WHERE execution_id = ?")
+            .bind(execution_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("usage snapshot count reads");
+    assert_eq!(
+        usage_snapshots, 0,
+        "no stale or fixture usage is persisted for this Execution"
+    );
+}
+
 #[tokio::test]
 async fn run_execution_emits_terminal_execution_event() {
     let db = Arc::new(sqlite_db().await);

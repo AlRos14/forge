@@ -360,6 +360,44 @@ impl HarnessAdapter for CursorAdapter {
         detect_cursor_availability()
     }
 
+    fn detect(&self, config: &Value) -> AvailabilityInfo {
+        let Ok(config) = serde_json::from_value::<CursorConfig>(config.clone()) else {
+            return AvailabilityInfo {
+                status: AvailabilityStatus::NotFound,
+                authenticated_at: None,
+                config_path: None,
+            };
+        };
+        let command = crate::command::CommandBuilder::new("cursor-agent")
+            .overrides(&config.command_overrides);
+        let Some(executable) = command.resolve_executable() else {
+            return AvailabilityInfo {
+                status: AvailabilityStatus::NotFound,
+                authenticated_at: None,
+                config_path: None,
+            };
+        };
+
+        let configured_api_key = config
+            .command_overrides
+            .env
+            .as_ref()
+            .and_then(|env| env.get("CURSOR_API_KEY"))
+            .is_some_and(|value| !value.trim().is_empty());
+        let ambient_api_key = std::env::var("CURSOR_API_KEY")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        AvailabilityInfo {
+            status: if configured_api_key || ambient_api_key {
+                AvailabilityStatus::Authenticated
+            } else {
+                AvailabilityStatus::Installed
+            },
+            authenticated_at: None,
+            config_path: Some(executable.to_string_lossy().into_owned()),
+        }
+    }
+
     fn normalize_config(
         &self,
         config: &Value,
@@ -664,9 +702,10 @@ fn resolve_usage_program(config: &CursorConfig) -> String {
         })
 }
 
-/// Cancellable form used by the bounded live-usage probe around an active
-/// execution. Every wait has a deadline, and cancellation drops a
-/// `kill_on_drop` child so a probe cannot survive its execution.
+/// Cancellable one-shot query used by explicit account-usage observation. This
+/// query is not scheduled from active Executions because the PTY wrapper can
+/// create a process outside the wrapper's group, which cannot satisfy the
+/// Execution retirement guarantee.
 pub async fn query_account_usage_with_cancel(
     config: &CursorConfig,
     cancel: CancellationToken,
@@ -1382,6 +1421,40 @@ mod tests {
                 "--resume",
                 "session-123",
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_detection_does_not_run_cursor_status_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("fixture directory creates");
+        let executable = dir.path().join("cursor-agent");
+        let marker = dir.path().join("invoked");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+        )
+        .expect("fake Cursor command writes");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("fake Cursor command is executable");
+
+        let availability = CursorAdapter::new().detect(&serde_json::json!({
+            "base_command_override": executable.display().to_string()
+        }));
+
+        assert!(matches!(
+            availability.status,
+            AvailabilityStatus::Authenticated | AvailabilityStatus::Installed
+        ));
+        assert_eq!(
+            availability.config_path.as_deref(),
+            Some(executable.to_str().unwrap())
+        );
+        assert!(
+            !marker.exists(),
+            "Cursor execution detection must inspect the executable without running it"
         );
     }
 
