@@ -260,6 +260,45 @@ impl ProjectRepo for SqliteDb {
             .execute(&mut *tx)
             .await?;
 
+        // A Project Chat deletion cascades through immutable legacy handoff
+        // records. Delete those rows explicitly while the Project-scoped
+        // guard and their chat provenance are still present; the guarded
+        // triggers permit only this bounded teardown path.
+        for statement in [
+            "DELETE FROM agent_handoff_delivery
+             WHERE handoff_id IN (
+                 SELECT h.id FROM agent_handoff h
+                 WHERE EXISTS (
+                     SELECT 1 FROM agent_chat c
+                     WHERE c.project_id = ?
+                       AND (c.id = h.source_chat_id OR c.id = h.target_chat_id)
+                 )
+             )",
+            "DELETE FROM agent_handoff
+             WHERE EXISTS (
+                 SELECT 1 FROM agent_chat c
+                 WHERE c.project_id = ?
+                   AND (c.id = agent_handoff.source_chat_id
+                        OR c.id = agent_handoff.target_chat_id)
+             )",
+        ] {
+            sqlx::query(statement).bind(id).execute(&mut *tx).await?;
+        }
+
+        // Project Chat transcripts and instruction revisions carry immutable
+        // delete guards for direct callers. Remove them under the same exact
+        // Project teardown guard before the Project FK cascade removes chats.
+        for statement in [
+            "DELETE FROM agent_chat_turn_job
+             WHERE chat_id IN (SELECT id FROM agent_chat WHERE project_id = ?)",
+            "DELETE FROM agent_chat_instruction_revision
+             WHERE chat_id IN (SELECT id FROM agent_chat WHERE project_id = ?)",
+            "DELETE FROM agent_chat_message
+             WHERE chat_id IN (SELECT id FROM agent_chat WHERE project_id = ?)",
+        ] {
+            sqlx::query(statement).bind(id).execute(&mut *tx).await?;
+        }
+
         for statement in [
             "DELETE FROM orchestrator_action WHERE execution_id IN
                  (SELECT e.id FROM execution e JOIN task t ON t.id = e.task_id WHERE t.project_id = ?)",

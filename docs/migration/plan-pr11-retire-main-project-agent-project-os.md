@@ -128,6 +128,21 @@ bytes.
 6. Keep `OrchestratorRuntime` on generic Task, RoleMembership, Execution,
    Message, Handoff, Proposal, Decision, and domain-event records.
 7. Keep Project deletion and WorkspaceLease/media lifecycle contracts intact.
+8. V119 narrows V118's update fences for the exact historical FK columns that
+   SQLite maintains with `ON DELETE SET NULL`. It permits only a non-null to
+   NULL transition after the referenced parent is gone, with every other row
+   value unchanged. It also removes the old cross-field Genesis check that
+   made a handed-off history row impossible to retain after its Project and
+   handoff references were cleared. Genesis lifecycle and source content stay
+   unchanged; its INSERT fence remains active.
+9. The existing Project cascade removes handoffs, delivery receipts, messages,
+   instruction revisions, and turns tied to its historical Project Chats.
+   `ProjectRepo` deletes the immutable leaves while the Project-scoped teardown
+   guard and chat provenance still exist; direct leaf deletion remains blocked.
+10. V120 keeps `Execution.role = 'interactive'` as an execution label and maps
+    the WorkspaceLease to the Task's canonical TaskRole (`implementer`,
+    `planner`, `reviewer`, `validator`, or `investigator`). The exact Actor,
+    active RoleMembership, repository, and capability checks remain required.
 
 Every SQL operation is keyed by exact legacy row IDs or exact Task/role/member
 IDs. There is no timestamp, text, latest-record, or current-binding matching.
@@ -136,12 +151,27 @@ recovery deterministic. A crash before commit leaves neither partial
 membership changes nor partial receipts; a crash after commit observes the
 same completed state.
 
+Historical rows are semantically immutable, but mechanical foreign-key
+maintenance required by legitimate V2 teardown remains permitted. The
+exception applies only to a listed FK column changing from a value to `NULL`
+after its parent row is absent; every other column must compare equal. A
+semantic update, a direct FK clear while the parent exists, or a mixed FK and
+semantic update still aborts. `project_deletion_guard` does not grant this
+exception and cannot authorize other legacy writes. Existing `CASCADE`,
+`RESTRICT`, and `NO ACTION` relationships retain their outcomes; ProjectRepo
+uses its guard and explicit leaf ordering for the historical handoff rows
+that otherwise block Project Chat cascades.
+
+The complete V118 fence-to-FK cross-check, with all 152 relations and parent
+teardown classifications, is in the [FK fence inventory](plan-pr11-v118-fk-fence-inventory.md).
+
 ## Compatibility and rollback
 
 Legacy GET/read paths may continue to expose historical records through PR12.
 REST mutations return HTTP 410 `operation_retired`, MCP mutation tools return
 numeric error `-32040` with the same code, and database writes/turn claims abort
-at the last boundary for direct SQL callers. Generic Task creation, role changes, Executions,
+at the last boundary for direct SQL callers, except for the exact mechanical FK
+maintenance described above. Generic Task creation, role changes, Executions,
 collaboration, and Project creation remain available through their existing
 domain authority.
 
@@ -172,7 +202,8 @@ not claim those concepts were migrated.
 
 ## Upgrade fixtures
 
-The automated DB migration fixtures use a real V117 schema, then apply V118.
+The automated DB migration fixtures use a real V117 schema, then apply V118
+and V119.
 The row below names the evidence exercised by the PR11 retirement fixture or
 the focused API/service test:
 
@@ -193,11 +224,14 @@ the focused API/service test:
 | M — Project created after PR11 | API and SQL creation produce no Main/Project Chat, binding, Genesis, Charter, or governance bootstrap. |
 | N — exact Task-scoped old record | A Commitment with an exact `originating_task_id` is recorded as `already_represented`; it does not create or replace a Task. No other old record is converted to generic data. |
 | O — ambiguous old record | A Project Document without proven Task/producer provenance remains readable and is recorded `historical_only`; no generic Artifact is fabricated. |
+| P — Project teardown with historical rows | `delete_project(...)` succeeds with handed-off Genesis, Charter and approval provenance, Project Agent binding history, Task Execution, Commitment, MemoryItem, Baseline, Milestone, and a durable Project event. Exact FK references become `NULL`; lifecycle/body/status and other history stay unchanged; Project OS rows follow the existing delete contract; no deletion guard remains. |
+| Q — exact cleanup and denied writes | V119 permits Task/Execution and self-binding `SET NULL` maintenance, preserves their historical rows, and rejects semantic updates, direct FK clearing while a parent exists, and mixed FK-plus-semantic updates. V120 verifies an interactive Execution uses the Task's canonical TaskRole and active Actor membership. |
 
 Focused tests also verify that legacy REST mutations return 410,
 Project/Task creation uses ordinary domain authority, Project Agent dispatch
 creates explicit TaskRole membership, and V118 media infrastructure remains
-usable. The V118 fixture is transactional and restart-safe; it does not
+usable. The productive Project deletion service also handles real V117 history
+after V119. The V118 fixture is transactional and restart-safe; it does not
 simulate simultaneous Project deletion, concurrent membership edits, or a live
 Execution racing the upgrade. Those remain review checks for the database's
 single-writer migration boundary and immutable Execution snapshots.

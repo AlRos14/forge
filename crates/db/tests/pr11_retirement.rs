@@ -228,6 +228,18 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     .await
     .expect("binding-only Project");
     sqlx::query(
+        "INSERT INTO domain_event
+         (id, event_type, entity_type, entity_id, actor_type, actor_id,
+          scope_type, scope_id, correlation_id, payload_json, created_at)
+         VALUES ('pr11-project-history-event', 'project.created', 'project',
+                 'pr11-fixture-project', 'user', 'pr11-owner', 'project',
+                 'pr11-fixture-project', 'pr11-project-history-correlation', '{}', ?)",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Project domain event");
+    sqlx::query(
         "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at)
          VALUES ('pr11-member-row', 'pr11-fixture-project', 'pr11-member-owner', 'member', ?, ?)",
     )
@@ -538,7 +550,7 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     run_migrations_from(&pool, migration_dir)
         .await
-        .expect("apply V118 to populated V117 database");
+        .expect("apply PR11 migrations through V119 to populated V117 database");
     let issues_before_restart: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM pr11_vertical_migration_issue")
             .fetch_one(&pool)
@@ -830,6 +842,443 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
         governance_write.is_err(),
         "Project Task Governance is frozen"
     );
+
+    let db = db::SqliteDb::new(pool.clone());
+    db::ProjectRepo::delete(&db, "pr11-fixture-project")
+        .await
+        .expect("Project deletion with historical PR11 rows succeeds");
+    let genesis_after_delete: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT lifecycle, project_id, handoff_id, charter_id,
+                charter_revision_id, charter_approval_id
+         FROM product_genesis_session WHERE id = 'pr11-handed-off-genesis'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("handed-off Genesis remains historical");
+    assert_eq!(
+        genesis_after_delete,
+        ("handed_off".to_owned(), None, None, None, None, None),
+        "FK cleanup preserves Genesis lifecycle and clears only deleted references"
+    );
+    let commitment_after_delete: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT title, status, originating_task_id
+         FROM agent_commitment WHERE id = 'pr11-task-commitment'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical Task commitment remains after Project teardown");
+    assert_eq!(
+        commitment_after_delete,
+        ("historical obligation".to_owned(), "open".to_owned(), None)
+    );
+    let remaining_project_os: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM project_charter WHERE project_id = 'pr11-fixture-project')
+              + (SELECT COUNT(*) FROM project_execution_baseline WHERE project_id = 'pr11-fixture-project')
+              + (SELECT COUNT(*) FROM project_milestone WHERE project_id = 'pr11-fixture-project')
+              + (SELECT COUNT(*) FROM project_release WHERE project_id = 'pr11-fixture-project')
+              + (SELECT COUNT(*) FROM project_release_media_pin WHERE project_id = 'pr11-fixture-project')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Project OS teardown count");
+    assert_eq!(
+        remaining_project_os, 0,
+        "deletion follows existing cascade contract"
+    );
+    let guard_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_deletion_guard")
+        .fetch_one(&pool)
+        .await
+        .expect("Project deletion guard cleanup");
+    assert_eq!(guard_rows, 0, "guard is removed before commit");
+    let domain_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE id = 'pr11-project-history-event'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("domain-event history survives Project deletion");
+    assert_eq!(domain_event_count, 1);
+}
+
+#[tokio::test]
+async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let migrations = temp.path().join("migrations");
+    fs::create_dir_all(&migrations).expect("migration dir");
+    copy_migrations_through(117, &migrations);
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("in-memory database");
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("schema through V117");
+
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES ('fk-owner', 'fk-owner@example.test', 'fixture', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture owner");
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, workflow_definition, owner_id, created_at, updated_at)
+         VALUES ('fk-project', 'FK teardown', '{}', '{}', 'fk-owner', ?, ?),
+                ('fk-keep-project', 'FK history survivor', '{}', '{}', 'fk-owner', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Project");
+    let main_chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE kind = 'account_main' AND account_id = 'fk-owner'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account Main Chat");
+    sqlx::query(
+        "INSERT INTO product_genesis_session
+         (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+          lifecycle, project_id, created_at, updated_at)
+         VALUES ('fk-genesis', 'fk-owner', ?, 'v1', 'history', 'mvp',
+                 'discovering', 'fk-project', ?, ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Product Genesis");
+    sqlx::query(
+        "INSERT INTO project_charter
+         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
+         VALUES ('fk-charter', 'fk-owner', 'fk-project', 'standard', 'mvp', 'draft', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Project Charter");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline
+         (id, project_id, lifecycle, created_at, updated_at)
+         VALUES ('fk-baseline', 'fk-project', 'draft', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Execution Baseline");
+    sqlx::query(
+        "INSERT INTO project_milestone
+         (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at)
+         VALUES ('fk-milestone', 'fk-project', 1, 'M001', 'planned', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Project Milestone");
+    for (id, project_id, title) in [
+        (
+            "fk-task-keep",
+            "fk-keep-project",
+            "Task keeps historical governance",
+        ),
+        ("fk-task-delete", "fk-project", "Task removed by teardown"),
+    ] {
+        sqlx::query(
+            "INSERT INTO task
+             (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
+             VALUES (?, ?, NULL, ?, 'implementation', 'todo', ?, ?)",
+        )
+        .bind(id)
+        .bind(project_id)
+        .bind(title)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("fixture Task");
+    }
+    sqlx::query(
+        "INSERT INTO execution (id, task_id, role, status, created_at, updated_at)
+         VALUES ('fk-execution', 'fk-task-delete', 'executor', 'completed', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Execution");
+    sqlx::query(
+        "INSERT INTO agent_identity (id, name, owner_id, visibility, created_at, updated_at)
+         VALUES ('fk-agent', 'FK Agent', 'fk-owner', 'global', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Agent identity");
+    sqlx::query(
+        "INSERT INTO agent_profile
+         (id, identity_id, backend_kind, executor_type, created_at, updated_at)
+         VALUES ('fk-profile', 'fk-agent', 'cli', 'test', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Agent profile");
+    sqlx::query(
+        "UPDATE agent_identity SET selected_profile_id = 'fk-profile' WHERE id = 'fk-agent'",
+    )
+    .execute(&pool)
+    .await
+    .expect("selected Agent profile");
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET state = 'replaced', replacement_reason = 'historical setup row'
+         WHERE project_id = 'fk-project'",
+    )
+    .execute(&pool)
+    .await
+    .expect("retire generated setup binding in historical fixture");
+    sqlx::query(
+        "INSERT INTO project_agent_binding
+         (id, project_id, identity_id, profile_id, state, created_at, updated_at)
+         VALUES ('fk-binding-b', 'fk-project', 'fk-agent', 'fk-profile', 'active', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("replacement target binding");
+    sqlx::query(
+        "INSERT INTO project_agent_binding
+         (id, project_id, identity_id, profile_id, state, replaced_by_binding_id,
+          replacement_reason, created_at, updated_at)
+         VALUES ('fk-binding-a', 'fk-keep-project', 'fk-agent', 'fk-profile', 'replaced',
+                 'fk-binding-b', 'historical replacement chain', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical replacement chain");
+    sqlx::query(
+        "INSERT INTO project_task_governance
+         (task_id, project_id, replacement_of_task_id, created_at, updated_at)
+         VALUES ('fk-task-keep', 'fk-keep-project', 'fk-task-delete', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical replacement governance");
+    sqlx::query(
+        "INSERT INTO agent_commitment
+         (id, owner_identity_id, scope_type, scope_id, title, status,
+          correlation_id, originating_task_id, created_at, updated_at)
+         VALUES ('fk-commitment', 'fk-agent', 'task', 'fk-task-delete',
+                 'historical commitment', 'open', 'fk-commitment-correlation',
+                 'fk-task-delete', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical commitment");
+    sqlx::query(
+        "INSERT INTO memory_item
+         (id, task_id, execution_id, scope_type, scope_id, source_type,
+          kind, title, body, created_at)
+         VALUES ('fk-memory', 'fk-task-delete', 'fk-execution', 'task',
+                 'fk-task-delete', 'fixture', 'observation',
+                 'historical memory', 'body preserved by teardown', ?)",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical memory item");
+
+    copy_migrations_through(118, &migrations);
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("apply V118 to populated V117 schema");
+    let db = db::SqliteDb::new(pool.clone());
+    let blocked_by_v118 = db::ProjectRepo::delete(&db, "fk-project")
+        .await
+        .expect_err("V118 must reproduce the Project teardown fence blocker");
+    assert!(
+        format!("{blocked_by_v118:?}").contains("PR11_OPERATION_RETIRED"),
+        "V118 failure must come from the retired-row fence: {blocked_by_v118:?}"
+    );
+
+    copy_migrations_through(119, &migrations);
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("apply the additive V119 correction to an already V118 database");
+    let fk_errors: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .expect("foreign key check");
+    assert!(
+        fk_errors.is_empty(),
+        "V119 preserves FK integrity: {fk_errors:?}"
+    );
+
+    // A deletion guard alone cannot bypass the row-value fence. This guard
+    // belongs to the surviving Project so it cannot authorize the teardown
+    // below, which targets fk-project.
+    sqlx::query(
+        "INSERT INTO project_deletion_guard (project_id, created_at)
+         VALUES ('fk-keep-project', ?)",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("guard fixture for semantic write denial");
+    let denied_writes = [
+        sqlx::query("UPDATE agent_commitment SET status = 'completed' WHERE id = 'fk-commitment'")
+            .execute(&pool)
+            .await,
+        sqlx::query("UPDATE memory_item SET body = 'mutated' WHERE id = 'fk-memory'")
+            .execute(&pool)
+            .await,
+        sqlx::query(
+            "UPDATE product_genesis_session SET lifecycle = 'cancelled' WHERE id = 'fk-genesis'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query("UPDATE project_agent_binding SET state = 'paused' WHERE id = 'fk-binding-b'")
+            .execute(&pool)
+            .await,
+        sqlx::query("UPDATE project_charter SET lifecycle = 'cancelled' WHERE id = 'fk-charter'")
+            .execute(&pool)
+            .await,
+        sqlx::query(
+            "UPDATE project_execution_baseline SET lifecycle = 'active' WHERE id = 'fk-baseline'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query("UPDATE project_milestone SET lifecycle = 'active' WHERE id = 'fk-milestone'")
+            .execute(&pool)
+            .await,
+        sqlx::query(
+            "UPDATE project_task_governance SET runnable = 1 WHERE task_id = 'fk-task-keep'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query(
+            "UPDATE agent_commitment SET originating_task_id = NULL WHERE id = 'fk-commitment'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query(
+            "UPDATE agent_commitment SET originating_task_id = NULL, status = 'completed'
+             WHERE id = 'fk-commitment'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query(
+            "UPDATE project_agent_binding
+             SET replaced_by_binding_id = NULL, state = 'paused' WHERE id = 'fk-binding-a'",
+        )
+        .execute(&pool)
+        .await,
+    ];
+    for (index, result) in denied_writes.into_iter().enumerate() {
+        assert!(result.is_err(), "retired or mixed update {index} must fail");
+    }
+    sqlx::query("DELETE FROM project_deletion_guard WHERE project_id = 'fk-keep-project'")
+        .execute(&pool)
+        .await
+        .expect("remove test guard");
+
+    db::ProjectRepo::delete(&db, "fk-project")
+        .await
+        .expect("productive Project teardown permits only exact FK cleanup");
+    let commitment: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT title, status, originating_task_id FROM agent_commitment WHERE id = 'fk-commitment'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical Commitment survives Task deletion");
+    assert_eq!(
+        commitment,
+        ("historical commitment".to_owned(), "open".to_owned(), None)
+    );
+    let memory: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT title, body, task_id, execution_id FROM memory_item WHERE id = 'fk-memory'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical MemoryItem survives Task/Execution deletion");
+    assert_eq!(
+        memory,
+        (
+            "historical memory".to_owned(),
+            "body preserved by teardown".to_owned(),
+            None,
+            None,
+        )
+    );
+    let governance: (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT task_id, replacement_of_task_id, runnable
+         FROM project_task_governance WHERE task_id = 'fk-task-keep'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical governance survives target Task deletion");
+    assert_eq!(governance, ("fk-task-keep".to_owned(), None, 0));
+
+    let binding: (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT state, identity_id, profile_id, replaced_by_binding_id, replacement_reason
+             FROM project_agent_binding WHERE id = 'fk-binding-a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("older replacement binding survives");
+    assert_eq!(
+        binding,
+        (
+            "replaced".to_owned(),
+            "fk-agent".to_owned(),
+            Some("fk-profile".to_owned()),
+            None,
+            Some("historical replacement chain".to_owned()),
+        )
+    );
+    let guard_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_deletion_guard")
+        .fetch_one(&pool)
+        .await
+        .expect("Project teardown guard removed");
+    assert_eq!(guard_count, 0);
+    let semantic_write =
+        sqlx::query("UPDATE project_agent_binding SET state = 'paused' WHERE id = 'fk-binding-a'")
+            .execute(&pool)
+            .await;
+    assert!(
+        semantic_write.is_err(),
+        "self-FK cleanup cannot authorize a state change"
+    );
 }
 
 async fn seed_legacy_project_os_and_release(
@@ -924,7 +1373,7 @@ async fn seed_legacy_project_os_and_release(
         "INSERT INTO project_charter
          (id, account_id, genesis_session_id, project_id, project_mode, maturity,
           lifecycle, created_at, updated_at)
-         VALUES ('pr11-charter', 'pr11-owner', 'pr11-active-genesis',
+         VALUES ('pr11-charter', 'pr11-owner', 'pr11-handed-off-genesis',
                  'pr11-fixture-project', 'standard', 'mvp', 'attached', ?, ?)",
     )
     .bind(now)
@@ -945,6 +1394,40 @@ async fn seed_legacy_project_os_and_release(
     .execute(pool)
     .await
     .expect("historical Charter revision");
+    sqlx::query(
+        "INSERT INTO project_charter_approval
+         (id, approval_type, charter_id, revision_id, content_digest, rendered_digest,
+          expected_charter_version, approving_principal_type, approving_principal_id,
+          authorization_basis, authorization_action, explicit_event,
+          authorization_occurred_at, source_action, idempotency_key, created_at, updated_at)
+         VALUES ('pr11-charter-approval', 'project_creation', 'pr11-charter',
+                 'pr11-charter-r1', 'charter-digest', 'charter-render-digest', 1,
+                 'user', 'pr11-owner', 'historical approval', 'project.create',
+                 'approve historical charter', ?, 'fixture', 'pr11-charter-approval-key', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("historical Charter approval");
+    sqlx::query(
+        "UPDATE product_genesis_session
+         SET charter_id = 'pr11-charter', charter_revision_id = 'pr11-charter-r1',
+             charter_approval_id = 'pr11-charter-approval', charter_version = 1
+         WHERE id = 'pr11-handed-off-genesis'",
+    )
+    .execute(pool)
+    .await
+    .expect("Genesis Charter provenance");
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET charter_id = 'pr11-charter', charter_revision_id = 'pr11-charter-r1'
+         WHERE id = 'pr11-project-binding-global'",
+    )
+    .execute(pool)
+    .await
+    .expect("Project Agent binding Charter provenance");
     sqlx::query(
         "UPDATE project_charter
          SET current_approved_revision_id = 'pr11-charter-r1'

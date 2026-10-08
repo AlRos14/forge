@@ -36,6 +36,9 @@ use std::{
 // V117 repairs V115 false-negatives only while the exact wrong rework transition
 // remains current, regardless of unrelated later Task-scoped events. V118
 // retires Main/Project Agent and Project OS authority without dropping history.
+// V119 permits only exact FK ON DELETE SET NULL maintenance on retired rows;
+// every other historical field remains immutable. V120 preserves the
+// task-type-to-TaskRole mapping for interactive WorkspaceLease Executions.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

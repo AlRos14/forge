@@ -321,7 +321,31 @@ async fn atomic_first_charter_revision_rolls_back_new_ownership_on_failure() {
 
 #[tokio::test]
 async fn project_delete_tears_down_charter_and_immutable_milestone_rows() {
-    let db = sqlite_db().await;
+    let migration_dir = tempfile::tempdir().expect("migration directory creates");
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source_dir).expect("migration source reads") {
+        let path = entry.expect("migration entry reads").path();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("migration filename is UTF-8");
+        let version = filename
+            .strip_prefix('V')
+            .and_then(|version| version.split_once("__"))
+            .and_then(|(version, _)| version.parse::<i64>().ok())
+            .expect("migration name has a version");
+        if version <= 117 {
+            std::fs::copy(&path, migration_dir.path().join(filename))
+                .expect("pre-cutover migration copies");
+        }
+    }
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    crate::run_migrations_from(&pool, migration_dir.path())
+        .await
+        .expect("database migrates through V117");
+    let db = SqliteDb::new(pool);
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO user (id, email, password_hash, created_at, updated_at)
@@ -383,6 +407,26 @@ async fn project_delete_tears_down_charter_and_immutable_milestone_rows() {
     .execute(db.pool())
     .await
     .expect("milestone revision fixture");
+
+    for entry in std::fs::read_dir(&source_dir).expect("migration source reads") {
+        let path = entry.expect("migration entry reads").path();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("migration filename is UTF-8");
+        let version = filename
+            .strip_prefix('V')
+            .and_then(|version| version.split_once("__"))
+            .and_then(|(version, _)| version.parse::<i64>().ok())
+            .expect("migration name has a version");
+        if version <= 119 {
+            std::fs::copy(&path, migration_dir.path().join(filename))
+                .expect("cutover migrations copy");
+        }
+    }
+    crate::run_migrations_from(db.pool(), migration_dir.path())
+        .await
+        .expect("historical fixture migrates through V119");
 
     assert!(
         sqlx::query("DELETE FROM project_milestone_revision WHERE id = 'delete-milestone-r1'")
@@ -2756,14 +2800,43 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
         .await
         .expect("task loads")
         .expect("task exists");
+    let role_now = now_rfc3339();
+    let task_role = TaskRoleRepo::create(
+        &db,
+        CreateTaskRole {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role: "implementer".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: role_now.clone(),
+            updated_at: role_now.clone(),
+        },
+    )
+    .await
+    .expect("canonical TaskRole creates");
+    RoleMembershipRepo::add(
+        &db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: task_role.id.clone(),
+            actor_kind: crate::ActorKind::Agent,
+            actor_id: role_agent_id.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: role_now.clone(),
+            updated_at: role_now.clone(),
+        },
+    )
+    .await
+    .expect("canonical TaskRole membership creates");
     let now = chrono::Utc::now();
     let execution = ExecutionRepo::create(
         &db,
         CreateExecution {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
-            agent_id: Some(stale_legacy_agent_id.clone()),
-            actor_ref: Some(crate::ActorRef::Agent(stale_legacy_agent_id.clone())),
+            agent_id: Some(role_agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(role_agent_id.clone())),
             purpose: Some(crate::ExecutionPurpose::General),
             harness_session_id: None,
             role: "interactive".to_owned(),
@@ -2807,7 +2880,7 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
         role: "worker".to_owned(),
         capabilities_json: r#"["repository_write"]"#.to_owned(),
         assigned_principal_type: "agent".to_owned(),
-        assigned_principal_id: stale_legacy_agent_id.clone(),
+        assigned_principal_id: role_agent_id.clone(),
         capability_profile_revision: "forge.capability-profile/v1".to_owned(),
         capability_profile_digest:
             "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8".to_owned(),
@@ -2829,37 +2902,7 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
         ),
     )
     .await
-    .expect("legacy Task without TaskRole may use singleton assignment");
-
-    let role_now = now_rfc3339();
-    let task_role = TaskRoleRepo::create(
-        &db,
-        CreateTaskRole {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            role: "implementer".to_owned(),
-            coordination_mode: Some(CoordinationMode::Collaborative),
-            policy_json: "{}".to_owned(),
-            created_at: role_now.clone(),
-            updated_at: role_now.clone(),
-        },
-    )
-    .await
-    .expect("canonical TaskRole creates");
-    RoleMembershipRepo::add(
-        &db,
-        CreateRoleMembership {
-            id: new_uuid_v4(),
-            task_role_id: task_role.id,
-            actor_kind: crate::ActorKind::Agent,
-            actor_id: role_agent_id,
-            status: RoleMembershipStatus::Active,
-            created_at: role_now.clone(),
-            updated_at: role_now,
-        },
-    )
-    .await
-    .expect("canonical Agent membership creates");
+    .expect("canonical TaskRole and matching Execution Actor authorize lease");
     sqlx::query(
         "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
     )
@@ -2869,9 +2912,22 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     .await
     .expect("contradictory legacy projection is restored for trigger coverage");
 
+    let ended_at = (now + chrono::Duration::seconds(1)).to_rfc3339();
+    sqlx::query(
+        "UPDATE role_membership
+         SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
+         WHERE task_role_id = ? AND actor_kind = 'agent' AND actor_id = ? AND status = 'active'",
+    )
+    .bind(&ended_at)
+    .bind(&ended_at)
+    .bind(&task_role.id)
+    .bind(&role_agent_id)
+    .execute(db.pool())
+    .await
+    .expect("end the exact TaskRole membership");
     let renewed = WorkspaceLeaseRepo::renew_active(
         &db,
-        &now.to_rfc3339(),
+        &(now + chrono::Duration::seconds(2)).to_rfc3339(),
         &(now + chrono::Duration::minutes(5)).to_rfc3339(),
         &(now + chrono::Duration::minutes(15)).to_rfc3339(),
         10,
@@ -2883,7 +2939,7 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
         &db,
         &initial_lease.id,
         initial_lease.version,
-        &(now + chrono::Duration::seconds(1)).to_rfc3339(),
+        &(now + chrono::Duration::seconds(3)).to_rfc3339(),
     )
     .await
     .expect("legacy lease can be revoked");
@@ -2898,7 +2954,7 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
             new_uuid_v4(),
             new_uuid_v4(),
             current_task.version,
-            (now + chrono::Duration::seconds(2)).to_rfc3339(),
+            (now + chrono::Duration::seconds(4)).to_rfc3339(),
             (now + chrono::Duration::minutes(20)).to_rfc3339(),
         ),
     )
@@ -2906,7 +2962,7 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     let error = rejected_insert.expect_err("SQLite rejects the stale interactive principal");
     assert!(error
         .to_string()
-        .contains("Workspace lease interactive TaskRole membership is stale"));
+        .contains("Workspace lease Task is stale or lacks current TaskRole/Execution authority"));
 }
 
 #[tokio::test]

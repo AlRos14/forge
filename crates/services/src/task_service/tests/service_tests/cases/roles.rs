@@ -1122,7 +1122,17 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     .await
     .expect("project member Agent scope updates");
 
-    let bound_agent = seed_agent(&db).await;
+    let out_of_scope_agent = seed_agent(&db).await;
+    sqlx::query(
+        "UPDATE agent_identity
+         SET visibility = 'account', owner_id = ?
+         WHERE id = ?",
+    )
+    .bind(&outside_owner)
+    .bind(&out_of_scope_agent)
+    .execute(db.pool())
+    .await
+    .expect("out-of-scope Agent identity updates");
     let global_agent = seed_agent(&db).await;
     let paused_agent = seed_agent(&db).await;
     sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
@@ -1158,10 +1168,10 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
         .expect("global Agent membership succeeds");
     assert!(
         service
-            .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(bound_agent))
+            .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(out_of_scope_agent))
             .await
             .is_err(),
-        "an old Project Agent binding cannot grant Project scope"
+        "an account Agent owned outside the Project cannot join its TaskRole"
     );
     service
         .add_task_role_member(&task.id, "orchestrator", ActorRef::Agent(paused_agent))
