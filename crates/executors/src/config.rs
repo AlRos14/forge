@@ -56,23 +56,6 @@ pub struct CommandOverrides {
     pub env: Option<HashMap<String, String>>,
 }
 
-/// Forge-hosted Agent Runtime configuration.
-///
-/// Embedded profiles are resolved here so task snapshots have the same typed,
-/// deterministic normalization as CLI profiles.  Credential handles and
-/// authority grants deliberately do not belong in this config: the native
-/// host resolves those from the selected immutable profile and canonical Task
-/// scope.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct EmbeddedConfig {
-    pub base_url: Option<String>,
-    pub context_tokens: Option<u32>,
-    pub max_input_tokens: Option<u32>,
-    pub max_output_tokens: Option<u32>,
-    pub runtime_revision: Option<String>,
-    pub prompt_template: Option<String>,
-}
-
 /// Cross-executor permission abstraction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -251,7 +234,6 @@ pub fn deserialize_config(
     json: &Value,
 ) -> Result<Box<dyn Any + Send + Sync>, ExecutorError> {
     match kind {
-        ExecutorKind::Embedded => deserialize_typed::<EmbeddedConfig>(kind, json),
         ExecutorKind::Shell => deserialize_typed::<ShellConfig>(kind, json),
         ExecutorKind::Codex => deserialize_typed::<CodexConfig>(kind, json),
         ExecutorKind::ClaudeCode => deserialize_typed::<ClaudeCodeConfig>(kind, json),
@@ -305,7 +287,6 @@ pub fn resolve_config_value(
     let mut merged = json.clone();
     merge_overrides(&mut merged, overrides)?;
     match kind {
-        ExecutorKind::Embedded => normalize_typed::<EmbeddedConfig>(kind, &merged),
         ExecutorKind::Shell => normalize_typed::<ShellConfig>(kind, &merged),
         ExecutorKind::Codex => normalize_typed::<CodexConfig>(kind, &merged),
         ExecutorKind::ClaudeCode => normalize_typed::<ClaudeCodeConfig>(kind, &merged),
@@ -627,11 +608,6 @@ pub fn build_ordered_fallback_routing(
     primary_config: Value,
     fallbacks: &[Value],
 ) -> Result<ExecutorRouting, ExecutorError> {
-    if primary_kind == ExecutorKind::Embedded {
-        return Err(ExecutorError::Other(
-            "embedded executor is hosted by Forge and cannot use CLI fallback routing".to_owned(),
-        ));
-    }
     let mut candidates = vec![ExecutorCandidate {
         executor_type: primary_kind,
         config: primary_config,
@@ -646,17 +622,11 @@ pub fn build_ordered_fallback_routing(
             .ok_or_else(|| {
                 ExecutorError::Other(format!("fallbacks[{index}] is missing executor_type"))
             })?;
-        let kind = executor_type.parse::<ExecutorKind>().map_err(|_| {
+        let kind = executor_type.parse::<ExecutorKind>().map_err(|error| {
             ExecutorError::Other(format!(
-                "fallbacks[{index}] names unknown executor type: {executor_type}"
+                "fallbacks[{index}] has invalid executor type `{executor_type}`: {error}"
             ))
         })?;
-        if kind == ExecutorKind::Embedded {
-            return Err(ExecutorError::Other(
-                "embedded executor is hosted by Forge and cannot be a CLI fallback candidate"
-                    .to_owned(),
-            ));
-        }
         let raw_config = object
             .get("config")
             .cloned()
@@ -740,34 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_config_round_trips_without_cli_fields() {
-        let value = serde_json::json!({
-            "base_url": "https://api.example.test/v1",
-            "context_tokens": 32_000,
-            "max_input_tokens": 24_000,
-            "max_output_tokens": 4_000,
-            "runtime_revision": "agent-runtime-rev",
-            "model": "model-from-agent",
-            "credential_ref": "opaque-handle",
-            "permission_policy": "scoped_proposals",
-        });
-        let resolved = resolve_config_value(
-            ExecutorKind::Embedded,
-            &value,
-            &ExecutionOverrides::default(),
-        )
-        .expect("embedded config resolves");
-
-        assert_eq!(resolved["base_url"], "https://api.example.test/v1");
-        assert_eq!(resolved["context_tokens"], 32_000);
-        assert_eq!(resolved["runtime_revision"], "agent-runtime-rev");
-        assert!(resolved.get("model").is_none());
-        assert!(resolved.get("credential_ref").is_none());
-        assert!(resolved.get("permission_policy").is_none());
-    }
-
-    #[test]
-    fn embedded_executor_is_not_admitted_to_cli_fallback_routes() {
+    fn embedded_executor_is_retired_from_fallback_routes() {
         let error = build_ordered_fallback_routing(
             ExecutorKind::Shell,
             serde_json::json!({}),
@@ -776,13 +719,12 @@ mod tests {
                 "config": {}
             })],
         )
-        .expect_err("embedded fallback should be rejected");
-        assert!(error.to_string().contains("hosted by Forge"));
-
-        let error =
-            build_ordered_fallback_routing(ExecutorKind::Embedded, serde_json::json!({}), &[])
-                .expect_err("embedded primary should not enter CLI routing");
-        assert!(error.to_string().contains("hosted by Forge"));
+        .expect_err("historical embedded fallback should be rejected");
+        assert!(error.to_string().contains("retired"));
+        assert!("embedded"
+            .parse::<ExecutorKind>()
+            .expect_err("historical embedded value cannot be selected")
+            .contains("retired"));
     }
 
     #[test]
@@ -971,7 +913,7 @@ mod tests {
             &[serde_json::json!({"executor_type": "warp", "config": {}})],
         )
         .expect_err("unknown type rejects");
-        assert!(unknown.to_string().contains("unknown executor type"));
+        assert!(unknown.to_string().contains("unknown executor kind: warp"));
 
         let non_object = build_ordered_fallback_routing(
             ExecutorKind::Smith,

@@ -115,12 +115,13 @@ Codex and Cursor account observations, including Cursor's periodic
 normalizes and dispatches through the selected HarnessAdapter. `effective_policy`
 no longer interprets harness configs in a central kind switch: adapters report
 generic permission/isolation posture, while Forge retains high-risk
-classification and workspace containment. Historical snapshots and Embedded
-retain bounded PR13/PR10 compatibility readers.
+classification and workspace containment. Historical snapshots retain the
+bounded PR13 HarnessSession capability reader; Plan PR10 removed Embedded
+runtime handling and projection-based Resume.
 
-The only remaining service-level `ExecutorKind` special cases are generic
-Embedded routing/config handling (PR10), Shell process/host compatibility, and
-the exact legacy PR2 resume allowlist (PR13). Codex `CODEX_HOME` and Smith
+The remaining service-level `ExecutorKind` special cases are Shell
+process/host compatibility and the exact legacy PR2 HarnessSession capability
+allowlist (PR13). Codex `CODEX_HOME` and Smith
 provider/profile account-key logic remains in generic routing identity code so
 PR0A candidate/account/cooldown behavior is preserved; it does not select
 harness protocol or capability behavior. Shell's reviewer command compatibility

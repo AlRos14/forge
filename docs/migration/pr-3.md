@@ -50,9 +50,10 @@ The preflight classified all relevant reads and writes as follows:
 * **D — generic execution/routing infrastructure:** config-layer precedence,
   ordered candidate routing, fallback classification, candidate/account keys,
   cooldowns, cancellation propagation, and event delivery remain generic.
-* **E — legacy embedded Agent Runtime:** `ExecutorKind::Embedded` and Agent
-  Host execution stay on the existing compatibility path; this is bounded
-  PR10 debt, not a second external HarnessAdapter implementation.
+* **E — legacy embedded Agent Runtime:** this was the bounded exception at the
+  PR3 baseline. Plan PR10 has retired `ExecutorKind::Embedded`, Agent Host, and
+  the Forge-owned model/tool loop. Historical profile values are rejected for
+  new execution; they are not converted to an external adapter.
 * **F — public compatibility:** `ExecutorKind`, `executor_type`, existing
   endpoint names, and generated API field naming remain in place; PR12 owns
   final public naming cleanup.
@@ -218,6 +219,14 @@ evidence and is rechecked by the current adapter at invocation time. Unknown
 or unsupported historical evidence fails closed except for the narrow PR2
 compatibility case above.
 
+Plan PR10 freezes transport host identity at Execution admission. The
+snapshot's `resolved_daemon_id` selects the host for later Start, Resume,
+Cancel, graceful shutdown, and same-attempt recovery. Current Agent daemon
+bindings and availability order cannot select a replacement. Missing or
+malformed host identity fails closed. A connection-generation change for the same daemon is
+still handled by the existing PR3 transport fence and does not change the
+Execution's selected host.
+
 The same generic invocation and resolved candidate/capability data cross
 `ExecutionStartParams` to the daemon. Every remote execution negotiates
 `generic_harness_invocation_v1` through `daemon.protocol_capabilities` before
@@ -284,18 +293,19 @@ high risk; Cursor force/propose behavior maps to the generic policy. Adapter
 interpretation does not grant authority or authorize risky work. New
 snapshots capture primary-adapter policy before dispatch; the selected route
 result replaces it with the actual winner's policy. The old service-side
-harness-kind interpreter remains only for historical snapshots (PR13) and
-the bounded Embedded exception (PR10).
+harness-kind interpreter remains only for historical snapshots (PR13). The
+bounded Embedded exception was removed by PR10.
 
 ## Embedded exception and transitional facade
 
-`ExecutorKind::Embedded`, embedded task execution, Agent Host, and its
-Forge-owned cognition remain the existing bounded legacy exception. PR3 does
-not add a permanent full EmbeddedHarnessAdapter or expand that runtime.
-Cleanup owner: PR10.
+At the PR3 baseline, `ExecutorKind::Embedded`, embedded task execution, Agent
+Host, and Forge-owned cognition formed a bounded legacy exception. Plan PR10
+removed those production paths. Historical profile and session rows remain
+readable, and admission fails explicitly instead of selecting another Agent
+or HarnessAdapter.
 
 `TaskExecutor` remains the supervisor-facing generic facade for TaskService,
-FallbackExecutor, daemon execution, embedded routing, and tests. It owns
+FallbackExecutor, daemon execution, and tests. It owns
 generic routing/fallback/cancellation coordination only. `CodingExecutorAdapter`
 and its registry are removed as production authority.
 
@@ -304,9 +314,9 @@ and its registry are removed as production authority.
 | Shim | Why it remains and exact accepted evidence | Why it grants no new authority | Cleanup owner |
 | --- | --- | --- | --- |
 | PR2 HarnessSession capability snapshots | Only unversioned arrays containing strings or the exact empty object shape are recognized, and only for the explicit PR2 resume-capable harness allowlist. | These values are legacy Agent tags, not dimensional support; all other unversioned or malformed content is Unknown and fails closed. | PR13 |
-| Pre-PR2 `Execution.agent_session_id` reader | Requires an exact persisted known `executor_type`, matching Actor/Agent, harness, account key, credential reference, and a non-ambiguous external ID. | It reads historical continuity only; it does not mutate old rows or infer support from product reputation. | PR13 |
-| Embedded execution/policy path | Existing Agent Host and embedded operator policy readers remain isolated from external HarnessAdapters. | Embedded capabilities are not represented as external harness evidence. | PR10 |
-| Historical effective-policy interpretation | Existing snapshots without adapter-interpreted policy may use the old snapshot reader; the Embedded path is separately bounded. | It cannot overwrite current candidate policy; a remote winner's policy is recomputed from that winner or removed. | PR13 / PR10 |
+| Historical `Execution.agent_session_id` projection | Preserved as readable execution history; it is not a Resume source and cannot be materialized into a HarnessSession. | Only an explicit reusable HarnessSession authorizes Resume. | PR13 physical cleanup |
+| Historical Embedded profile and execution snapshots | The old `embedded` spelling and native profile snapshots remain readable for audit. New selection, Task dispatch, and Agent Chat launch reject them. | Historical records cannot authorize a new runtime or select a replacement harness/account/credential. | PR13 |
+| Historical effective-policy interpretation | Existing snapshots without adapter-interpreted policy may use the old snapshot reader. The Embedded path is retired. | It cannot overwrite current candidate policy; a remote winner's policy is recomputed from that winner or removed. | PR13 |
 | Shell reviewer command | The exact generic `role == reviewer` marker selects the existing fixed command inside ShellAdapter. | It is a Shell compatibility command, not native review-mode capability or verdict authority. | PR8 |
 | Daemon protocol negotiation | `generic_harness_invocation_v1` is required before every remote Start/Resume; reviewer Start also requires `execution_role_v1`; daemon Start params require `invocation`; capability check and Start share one captured connection generation, with final generation check and enqueue serialized against `register()`. | Mixed protocol versions reject before dispatch; a replacement that linearizes first returns unavailable without dispatch to stale A or replacement B. There is no provider-specific dual-write or inference fallback. | Retained transport contract; naming cleanup is PR12 |
 
@@ -419,12 +429,11 @@ Named focused test additions include:
 * `missing_claude_session_fails_before_starting_a_new_session`
 * `auditor_snapshot_records_resolved_adapter_capabilities_without_overwriting_agent_tags`
 
-The pre-PR2 `Execution.agent_session_id` compatibility reader additionally
-requires an exact persisted `executor_type` in the historical Execution
-snapshot, a known PR2 adapter with implemented resume, and equality with the
-current immutable Agent harness identity. Contradictory/missing evidence,
-Shell/Null, and historical ambiguity return no resumable session. This
-read-only shim is bounded PR13 cleanup.
+Plan PR10 removed the pre-PR2 `Execution.agent_session_id` resume reader and
+historical-session materialization path. The field remains a read-only history
+projection; only an explicit reusable `HarnessSession` can authorize Resume.
+Pre-PR2 executions that lack the generic relation remain readable and can be
+re-executed with a fresh Start.
 
 ## Verification status — 2026-09-25
 
@@ -543,7 +552,7 @@ task_service::tests::service_tests::cases::claim::claim_uses_custom_workflow_act
 task_service::tests::service_tests::cases::claim::create_claim_and_transition_task
 task_service::tests::service_tests::cases::claim::default_workflow_assigns_declared_roles_not_assignee
 task_service::tests::service_tests::cases::dependencies::test_done_transition_emits_dependency_satisfied_event
-task_service::tests::service_tests::cases::executions::ambiguous_historical_session_fails_closed_for_resume_and_actions
+task_service::tests::service_tests::cases::executions::legacy_execution_session_id_never_authorizes_resume_or_actions
 task_service::tests::service_tests::cases::executions::before_enter_runs_required_before_work_hook_before_role_dispatch
 task_service::tests::service_tests::cases::executions::claim_task_records_codex_overrides_in_normalized_snapshot
 task_service::tests::service_tests::cases::executions::claim_task_records_execution_permission_policy_override_in_snapshot
@@ -670,10 +679,12 @@ At the final source audit:
   normalization is adapter-owned. Effective-policy harness switches are
   removed from core.
 * Remaining `ExecutorKind` branches are serialization/identification,
-  generic routing identity and bookkeeping, bounded Embedded/Shell legacy
-  handling, Cursor-only quota scheduling, and the exact PR2 historical
-  compatibility resolver. Codex `CODEX_HOME` and Smith provider/profile
-  candidate-account identity are retained to preserve PR0A routing semantics.
+  generic routing identity and bookkeeping, Shell process/host compatibility,
+  Cursor-only quota scheduling, and the exact PR2 HarnessSession capability
+  snapshot compatibility resolver. Embedded selection and the legacy
+  execution-session projection reader are retired. Codex `CODEX_HOME` and
+  Smith provider/profile candidate-account identity are retained to preserve
+  PR0A routing semantics.
 * Legacy Agent capabilities, typed effective `harness_capabilities`, and
   historical HarnessSession snapshots remain distinct.
 * PR3 rejects Agent routing that changes harness or identity-bearing account.

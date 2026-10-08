@@ -97,12 +97,12 @@ async fn shell_executor_cancel_while_running_returns_cancelled_and_reaps_child()
 async fn shell_executor_cancel_escalates_to_sigkill_after_grace() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ShellExecutor::default().with_cancel_grace_period(Duration::from_millis(200));
-    let ctx = execution_context(
-        &dir,
-        "sigkill.jsonl",
-        "exec-sigkill",
-        r#"sh -c 'trap "" TERM; sleep 30'"#,
+    let descendant_pid_file = dir.path().join("descendant.pid");
+    let command = format!(
+        "trap '' TERM; sh -c 'trap \"\" TERM; exec sleep 30' & child=$!; echo $child > {}; wait",
+        descendant_pid_file.display()
     );
+    let ctx = execution_context(&dir, "sigkill.jsonl", "exec-sigkill", &command);
 
     let started = Instant::now();
     let handle = {
@@ -111,7 +111,18 @@ async fn shell_executor_cancel_escalates_to_sigkill_after_grace() {
         tokio::spawn(async move { executor.execute(ctx).await })
     };
 
-    sleep(Duration::from_millis(200)).await;
+    let descendant_pid = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(value) = tokio::fs::read_to_string(&descendant_pid_file).await {
+                if let Ok(pid) = value.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process group descendant starts");
     executor
         .cancel("exec-sigkill")
         .await
@@ -124,6 +135,73 @@ async fn shell_executor_cancel_escalates_to_sigkill_after_grace() {
         "cancel should not wait for the full sleep"
     );
     assert!(!executor.has_process("exec-sigkill"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pid_can_execute(descendant_pid) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancel terminates the process group descendant");
+}
+
+fn pid_can_execute(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        !matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        is_pid_alive(pid)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shell_executor_drop_kills_process_group_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ShellExecutor::default();
+    let descendant_pid_file = dir.path().join("aborted-descendant.pid");
+    let command = format!(
+        "trap '' TERM; sh -c 'trap \"\" TERM; exec sleep 30' & child=$!; echo $child > {}; wait",
+        descendant_pid_file.display()
+    );
+    let ctx = execution_context(&dir, "aborted.jsonl", "exec-aborted", &command);
+    let task = {
+        let executor = executor.clone();
+        tokio::spawn(async move { executor.execute(ctx).await })
+    };
+
+    let descendant_pid = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(value) = tokio::fs::read_to_string(&descendant_pid_file).await {
+                if let Ok(pid) = value.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process group descendant starts");
+
+    task.abort();
+    assert!(task
+        .await
+        .expect_err("execution task is aborted")
+        .is_cancelled());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pid_can_execute(descendant_pid) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropping the execution future kills its process group");
 }
 
 #[tokio::test]

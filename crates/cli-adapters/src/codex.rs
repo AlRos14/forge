@@ -5,13 +5,10 @@ pub mod protocol;
 
 use async_trait::async_trait;
 use client::CodexClient;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
-#[cfg(unix)]
-use command_group::{Signal, UnixChildExt};
 use executors::{
     AvailabilityInfo, AvailabilityStatus, CodexConfig, DiscoverContext, DiscoveredOptions,
     ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
-    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
 };
 use protocol::{
     AskForApproval, SandboxMode, ThreadForkParams, ThreadForkResponse, ThreadResumeParams,
@@ -61,33 +58,8 @@ struct CodexModelOptions {
 
 #[derive(Clone)]
 struct RunningProcess {
-    child: Arc<AsyncMutex<AsyncGroupChild>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     cancel: CancellationToken,
-}
-
-struct CleanupSignalGuard {
-    child: Arc<AsyncMutex<AsyncGroupChild>>,
-    armed: bool,
-}
-
-impl CleanupSignalGuard {
-    fn new(child: Arc<AsyncMutex<AsyncGroupChild>>) -> Self {
-        Self { child, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CleanupSignalGuard {
-    fn drop(&mut self) {
-        if self.armed
-            && let Ok(mut child) = self.child.try_lock()
-        {
-            signal_child(&mut child);
-        }
-    }
 }
 
 pub struct CodexAdapter {
@@ -451,46 +423,73 @@ impl HarnessAdapter for CodexAdapter {
         let config = Self::resolve_config(&ctx);
         let mut command = Self::build_command(&config);
         command.current_dir(&ctx.worktree_path);
-        let mut child = command.group_spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut command)?;
 
         let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
             None => {
-                cleanup_child(&mut child).await;
-                return Err(ExecutorError::Other(
-                    "failed to capture codex stdout".to_owned(),
-                ));
+                let cleanup = cleanup_child(&mut child).await;
+                return Err(ExecutorError::Other(cleanup.map_or_else(
+                    |error| {
+                        format!(
+                            "failed to capture codex stdout; process-group cleanup failed: {error}"
+                        )
+                    },
+                    |_| "failed to capture codex stdout".to_owned(),
+                )));
             }
         };
         let stdin = match child.inner().stdin.take() {
             Some(stdin) => stdin,
             None => {
-                cleanup_child(&mut child).await;
-                return Err(ExecutorError::Other(
-                    "failed to capture codex stdin".to_owned(),
-                ));
+                let cleanup = cleanup_child(&mut child).await;
+                return Err(ExecutorError::Other(cleanup.map_or_else(
+                    |error| {
+                        format!(
+                            "failed to capture codex stdin; process-group cleanup failed: {error}"
+                        )
+                    },
+                    |_| "failed to capture codex stdin".to_owned(),
+                )));
             }
         };
         let stderr = match child.inner().stderr.take() {
             Some(stderr) => stderr,
             None => {
-                cleanup_child(&mut child).await;
-                return Err(ExecutorError::Other(
-                    "failed to capture codex stderr".to_owned(),
-                ));
+                let cleanup = cleanup_child(&mut child).await;
+                return Err(ExecutorError::Other(cleanup.map_or_else(
+                    |error| {
+                        format!(
+                            "failed to capture codex stderr; process-group cleanup failed: {error}"
+                        )
+                    },
+                    |_| "failed to capture codex stderr".to_owned(),
+                )));
             }
         };
 
         let cancel = CancellationToken::new();
         let child = Arc::new(AsyncMutex::new(child));
-        let mut cleanup_guard = CleanupSignalGuard::new(child.clone());
-        self.insert_process(
+        let mut cleanup_guard = crate::command::GroupKillOnDrop::new(child.clone());
+        if let Err(registration_error) = self.insert_process(
             ctx.execution_id.clone(),
             RunningProcess {
                 child: child.clone(),
                 cancel: cancel.clone(),
             },
-        )?;
+        ) {
+            let cleanup_result = {
+                let mut child = child.lock().await;
+                crate::command::kill_group_and_wait(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Codex process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            cleanup_guard.disarm();
+            return Err(registration_error);
+        }
 
         let writer = Arc::new(AsyncMutex::new(LogWriter::new(
             &ctx.logs_path,
@@ -518,12 +517,17 @@ impl HarnessAdapter for CodexAdapter {
             )
             .await;
 
-        self.remove_process(&ctx.execution_id)?;
-        {
+        let cleanup_result = {
             let mut guard = child.lock().await;
-            cleanup_child(&mut guard).await;
+            cleanup_child(&mut guard).await
+        };
+        if let Err(cleanup_error) = cleanup_result {
+            return Err(ExecutorError::Other(format!(
+                "Codex process-group termination could not be verified: {cleanup_error}"
+            )));
         }
         cleanup_guard.disarm();
+        self.remove_process(&ctx.execution_id)?;
 
         result
     }
@@ -539,7 +543,7 @@ impl HarnessAdapter for CodexAdapter {
         if let Some(running) = running {
             running.cancel.cancel();
             let mut child = running.child.lock().await;
-            signal_child(&mut child);
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
 
         Ok(())
@@ -946,20 +950,8 @@ async fn write_shared_log(
         .map_err(ExecutorError::Io)
 }
 
-async fn cleanup_child(child: &mut AsyncGroupChild) {
-    signal_child(child);
-    let _ = child.wait().await;
-}
-
-fn signal_child(child: &mut AsyncGroupChild) {
-    #[cfg(unix)]
-    {
-        let _ = child.signal(Signal::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.start_kill();
-    }
+async fn cleanup_child(child: &mut ProcessGroupChild) -> std::io::Result<std::process::ExitStatus> {
+    crate::command::kill_group_and_wait(child).await
 }
 
 fn dirs_path(name: &str) -> PathBuf {

@@ -88,6 +88,10 @@ and a small `pending`/`active`/`ended`/`failed` lifecycle. Its Agent and
 harness identity are immutable. A pending session is not resumable until an
 executor result supplies the external identity.
 
+Plan PR10 removed resume from a legacy `execution.agent_session_id` value
+without an explicit `harness_session_id`. Historical executions with only that
+projection remain readable and re-execute through a fresh Start.
+
 Plan PR3 snapshots effective `harness_capabilities` separately from the legacy
 Agent `capabilities_json` tags/filters. The historical HarnessSession snapshot
 is not recomputed when an Agent profile changes. Runtime invocation is generic:

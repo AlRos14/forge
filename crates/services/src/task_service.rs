@@ -124,7 +124,7 @@ pub struct TaskService {
     workspace_root: PathBuf,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
+    credential_env: Option<Arc<crate::credential_service::CredentialService>>,
 }
 
 #[derive(Debug)]
@@ -404,9 +404,9 @@ impl TaskService {
     /// into their in-memory executor environment.
     pub fn with_provider_credential_env(
         mut self,
-        embedded: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
+        credentials: Arc<crate::credential_service::CredentialService>,
     ) -> Self {
-        self.credential_env = Some(embedded);
+        self.credential_env = Some(credentials);
         self
     }
 

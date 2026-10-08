@@ -11,17 +11,14 @@ use std::sync::Arc;
 
 use api_types::{
     ProductGenesisLifecycle, ProductMaturity, ProjectCharterContent, ProjectMode, ProvenanceRef,
-    RevisionProvenance,
+    RevisionProvenance, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
+    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
     AgentActionPolicyResult, AgentActionStatus, AgentProfileRepo, AgentRepo, CreateProjectCharter,
     CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically, ProjectCharterRecord,
     ProjectCharterRevisionRecord, ProjectOrchestrationRepo, SqliteDb,
-};
-use forge_agent_host::{
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};

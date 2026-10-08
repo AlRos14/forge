@@ -19,9 +19,10 @@ use db::{
     CredentialHandleRepo, CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy,
     SortOrder, UpsertAgentConnectionHealth,
 };
-use forge_agent_host::{AgentHostError, CredentialRevocationOutcome, Secret};
 use serde_json::Value;
-use services::embedded_agent_service::ConnectApiKeyCredential;
+use services::credential_service::{
+    ConnectApiKeyCredential, CredentialError, CredentialRevocationOutcome, Secret,
+};
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -70,7 +71,7 @@ pub async fn create_provider_entry(
 ) -> ApiResult<Json<ProviderEntryResponse>> {
     let provider = provider_name(request.provider);
     let handle = state
-        .embedded_agent_service
+        .credential_service
         .connect_api_key_credential(ConnectApiKeyCredential {
             owner_user_id: user.user_id,
             provider: provider.to_owned(),
@@ -88,7 +89,7 @@ pub async fn test_provider_entry(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProviderEntryTestResponse>> {
     let outcome = state
-        .embedded_agent_service
+        .credential_service
         .test_provider_entry(&user.user_id, &id)
         .await?;
     Ok(Json(ProviderEntryTestResponse {
@@ -105,7 +106,7 @@ pub async fn usage_provider_entry(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProviderUsageResponse>> {
     let outcome = state
-        .embedded_agent_service
+        .credential_service
         .usage_provider_entry(&user.user_id, &id)
         .await?;
     Ok(Json(ProviderUsageResponse {
@@ -174,12 +175,11 @@ pub async fn delete_provider_entry(
             .filter(|row| row.credential_id == handle_id)
             .collect();
     let outcome = state
-        .embedded_agent_service
-        .protected_store()
+        .credential_service
         .revoke_credential_at_version(&handle_id, &user.user_id, request.version, &now_rfc3339())
         .await
         .map_err(|error| match error {
-            AgentHostError::VersionConflict => ApiError::conflict_with_code(
+            CredentialError::VersionConflict => ApiError::conflict_with_code(
                 "provider_entry.version_conflict",
                 "provider entry changed before it could be disconnected",
             ),

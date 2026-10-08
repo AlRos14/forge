@@ -43,7 +43,7 @@ impl CrashRecovery {
         // Expire stale grants before recovering active Tasks. The recovery
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.
-        expire_workspace_leases(&self.db, &self.event_bus, None, None, false).await?;
+        expire_workspace_leases(&self.db, &self.event_bus, None, None, None, false).await?;
         let tasks = self.list_in_progress_tasks(None).await?;
         let mut recovered = 0;
 
@@ -277,6 +277,7 @@ impl HeartbeatMonitor {
         let expired = expire_workspace_leases(
             &self.db,
             &self.event_bus,
+            self.daemon_connections.as_deref(),
             self.task_executor.as_deref(),
             self.task_service.as_deref(),
             true,
@@ -326,20 +327,25 @@ impl HeartbeatMonitor {
         let mut stalled = 0;
 
         for execution in executions {
-            if let Some(task_executor) = self.task_executor.as_ref() {
-                // Agents without a daemon binding run in-process, so only a
-                // definitively remote-owned execution skips the embedded cancel.
-                if !execution_is_remote_owned(&self.db, &execution)
-                    .await
-                    .unwrap_or(false)
+            if self.task_service.is_some()
+                || self.daemon_connections.is_some()
+                || self.task_executor.is_some()
+            {
+                if let Err(error) = cancel_execution_on_frozen_host(
+                    &self.db,
+                    &execution,
+                    "execution stalled",
+                    self.daemon_connections.as_deref(),
+                    self.task_service.as_deref(),
+                    self.task_executor.as_deref(),
+                )
+                .await
                 {
-                    if let Err(error) = task_executor.cancel(&execution.id).await {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            %error,
-                            "failed to cancel stalled execution"
-                        );
-                    }
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %error,
+                        "failed to cancel stalled execution on its admitted daemon"
+                    );
                 }
             }
 
@@ -450,9 +456,17 @@ impl HeartbeatMonitor {
         let now = Instant::now();
 
         for execution in running {
-            let Some((daemon_id, daemon)) = resolve_execution_daemon(&self.db, &execution).await?
-            else {
-                continue;
+            let (daemon_id, daemon) = match resolve_execution_daemon(&self.db, &execution).await {
+                Ok(Some(host)) => host,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %error,
+                        "skipping daemon disconnect recovery without a frozen Execution host"
+                    );
+                    continue;
+                }
             };
             if is_embedded_daemon_machine(&daemon.machine_id) {
                 continue;
@@ -545,6 +559,7 @@ async fn renew_workspace_leases(db: &SqliteDb) -> Result<u64> {
 async fn expire_workspace_leases(
     db: &SqliteDb,
     event_bus: &EventBus,
+    daemon_connections: Option<&DaemonConnectionRegistry>,
     task_executor: Option<&dyn TaskExecutor>,
     task_service: Option<&TaskService>,
     terminalize_running: bool,
@@ -563,18 +578,22 @@ async fn expire_workspace_leases(
             continue;
         }
 
-        if let Some(task_executor) = task_executor {
-            if !execution_is_remote_owned(db, &execution)
-                .await
-                .unwrap_or(false)
+        if task_executor.is_some() || daemon_connections.is_some() || task_service.is_some() {
+            if let Err(error) = cancel_execution_on_frozen_host(
+                db,
+                &execution,
+                "workspace lease expired",
+                daemon_connections,
+                task_service,
+                task_executor,
+            )
+            .await
             {
-                if let Err(error) = task_executor.cancel(&execution.id).await {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %error,
-                        "failed to cancel execution after WorkspaceLease expiry"
-                    );
-                }
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %error,
+                    "failed to cancel expired-lease execution on its admitted daemon"
+                );
             }
         }
 
@@ -1118,29 +1137,58 @@ pub(crate) async fn resolve_execution_daemon(
     db: &SqliteDb,
     execution: &Execution,
 ) -> Result<Option<(String, Daemon)>> {
-    let Some(agent_id) = execution.agent_id.as_deref() else {
+    if execution.agent_id.is_none() {
         return Ok(None);
-    };
-    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
-        return Ok(None);
-    };
-    let Some(daemon_id) = agent.daemon_id else {
-        return Ok(None);
-    };
-    let Some(daemon) = DaemonRepo::get_by_id(db, &daemon_id).await? else {
-        return Ok(None);
-    };
+    }
+    let daemon_id = crate::daemon_transport::router::resolved_daemon_id_for_execution(execution)?;
+    let daemon = DaemonRepo::get_by_id(db, &daemon_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.clone()))?;
     Ok(Some((daemon_id, daemon)))
 }
 
-pub(crate) async fn execution_is_remote_owned(
+pub(crate) async fn cancel_execution_on_frozen_host(
     db: &SqliteDb,
     execution: &Execution,
-) -> Result<bool> {
-    let Some((_, daemon)) = resolve_execution_daemon(db, execution).await? else {
-        return Ok(false);
+    reason: &str,
+    daemon_connections: Option<&DaemonConnectionRegistry>,
+    task_service: Option<&TaskService>,
+    task_executor: Option<&dyn TaskExecutor>,
+) -> Result<()> {
+    if let Some(task_service) = task_service {
+        return task_service
+            .cancel_execution_with_provider(execution, reason)
+            .await;
+    }
+    let Some((daemon_id, daemon)) = resolve_execution_daemon(db, execution).await? else {
+        return Err(ServiceError::invalid_operation(
+            "execution has no Agent host snapshot for recovery cancellation",
+        ));
     };
-    Ok(!is_embedded_daemon_machine(&daemon.machine_id))
+    let params = api_types::ExecutionCancelParams {
+        execution_id: execution.id.clone(),
+        reason: Some(reason.to_owned()),
+    };
+    if let Some(registry) = daemon_connections {
+        let provider =
+            crate::daemon_transport::select_execution_provider(Some(&daemon_id), db, registry)
+                .await?;
+        provider.cancel(params).await?;
+        return Ok(());
+    }
+    if daemon.status == db::DaemonStatus::Online && is_embedded_daemon_machine(&daemon.machine_id) {
+        let task_executor = task_executor.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "local execution cancellation is not configured for its frozen daemon",
+            )
+        })?;
+        return task_executor.cancel(&execution.id).await.map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "local execution cancellation failed on frozen daemon {daemon_id}: {error}"
+            ))
+        });
+    }
+    Err(ServiceError::DaemonUnavailable { daemon_id })
 }
 
 pub(crate) struct FailDaemonDisconnectedExecution<'a> {
@@ -1610,6 +1658,46 @@ mod tests {
             .await
             .expect("agent loads")
             .expect("agent exists");
+        let resolved_daemon_id = match agent.daemon_id.as_deref() {
+            Some(daemon_id) => daemon_id.to_owned(),
+            None => {
+                let machine_id = crate::embedded_daemon::embedded_machine_id();
+                let existing: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM daemon WHERE machine_id = ? LIMIT 1")
+                        .bind(&machine_id)
+                        .fetch_optional(db.pool())
+                        .await
+                        .expect("embedded test daemon lookup succeeds");
+                match existing {
+                    Some(daemon_id) => daemon_id,
+                    None => {
+                        let now = now_rfc3339();
+                        let daemon_id = new_uuid_v4();
+                        DaemonRepo::upsert_by_machine_id(
+                            db,
+                            UpsertDaemon {
+                                id: daemon_id.clone(),
+                                machine_id,
+                                hostname: "embedded-test-host".to_owned(),
+                                os: "linux".to_owned(),
+                                arch: "x86_64".to_owned(),
+                                agent_version: None,
+                                labels_json: "{}".to_owned(),
+                                status: DaemonStatus::Online,
+                                registration_token_hash: None,
+                                owner_id: None,
+                                visibility: "global".to_owned(),
+                                created_at: now.clone(),
+                                updated_at: now,
+                            },
+                        )
+                        .await
+                        .expect("embedded test daemon creates");
+                        daemon_id
+                    }
+                }
+            }
+        };
         let resume_support = if agent.executor_type == "codex" {
             "native"
         } else {
@@ -1640,10 +1728,20 @@ mod tests {
                 before_sha: None,
                 after_sha: None,
                 error: None,
-                executor_config_snapshot_json: Some(format!(
-                    r#"{{"executor_type":"{}","config":{{}},"harness_capabilities":{{"schema_version":1,"capabilities":{{"resume":"{}"}}}}}}"#,
-                    agent.executor_type, resume_support
-                )),
+                executor_config_snapshot_json: Some(
+                    serde_json::json!({
+                        "executor_type": agent.executor_type,
+                        "config": {},
+                        "agent_id": agent.id,
+                        "agent_daemon_id": agent.daemon_id,
+                        "resolved_daemon_id": resolved_daemon_id,
+                        "harness_capabilities": {
+                            "schema_version": 1,
+                            "capabilities": { "resume": resume_support }
+                        }
+                    })
+                    .to_string(),
+                ),
                 workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -2626,6 +2724,97 @@ mod tests {
             .expect("execution loads")
             .expect("execution exists");
         assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn daemon_report_reconciliation_uses_frozen_execution_host_after_agent_rebind() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_a_id, agent_a) =
+            seed_agent_with_daemon(&db, "reconcile-frozen-host-a", AgentStatus::Idle).await;
+        let (_agent_b_id, agent_b) =
+            seed_agent_with_daemon(&db, "reconcile-current-host-b", AgentStatus::Idle).await;
+        let daemon_a = agent_a.daemon_id.clone().expect("daemon A is bound");
+        let daemon_b = agent_b.daemon_id.clone().expect("daemon B is bound");
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_a_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution_with_created_at(
+            &db,
+            task.id.clone(),
+            agent_a_id.clone(),
+            "2000-01-01T00:00:00Z",
+        )
+        .await;
+        let current_agent = AgentRepo::get_by_id(&*db, &agent_a_id)
+            .await
+            .expect("current Agent loads")
+            .expect("current Agent exists");
+        AgentRepo::update(
+            &*db,
+            UpdateAgent {
+                id: current_agent.id,
+                expected_version: current_agent.version,
+                name: None,
+                description: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: None,
+                config_json: None,
+                daemon_id: Some(Some(daemon_b.clone())),
+                max_concurrent_tasks: None,
+                heartbeat_interval_seconds: None,
+                max_missed_heartbeats: None,
+                status: None,
+                last_heartbeat_at: None,
+                is_default: None,
+                paused: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("Agent is rebound after Execution admission");
+
+        let daemon_b_row = DaemonRepo::get_by_id(&*db, &daemon_b)
+            .await
+            .expect("daemon B query succeeds")
+            .expect("daemon B exists");
+        assert_eq!(
+            reconcile_daemon_report_executions(&db, &event_bus, None, &daemon_b_row, &[],)
+                .await
+                .expect("daemon B report reconciliation succeeds"),
+            0
+        );
+        let still_running = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution loads")
+            .expect("Execution exists");
+        assert_eq!(still_running.status, ExecutionStatus::Running);
+
+        let daemon_a_row = DaemonRepo::get_by_id(&*db, &daemon_a)
+            .await
+            .expect("daemon A query succeeds")
+            .expect("daemon A exists");
+        assert_eq!(
+            reconcile_daemon_report_executions(&db, &event_bus, None, &daemon_a_row, &[],)
+                .await
+                .expect("frozen daemon A report reconciliation succeeds"),
+            1
+        );
+        let failed = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution reloads")
+            .expect("Execution exists");
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert_eq!(failed.stop_reason, Some(StopReason::DaemonDisconnected));
     }
 
     #[tokio::test]

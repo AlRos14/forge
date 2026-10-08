@@ -5,6 +5,24 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+// Persisted orchestration operation identifiers shared by Agent action
+// admission, deterministic materialization, and API projections.
+pub const MAIN_CHARTER_READ_OPERATION: &str = "charter.read";
+pub const MAIN_CHARTER_DRAFT_OPERATION: &str = "charter.draft";
+pub const MAIN_CHARTER_READINESS_OPERATION: &str = "charter.readiness";
+pub const MAIN_CHARTER_DIFF_OPERATION: &str = "charter.diff";
+pub const MAIN_CHARTER_APPROVAL_TARGET_OPERATION: &str = "charter.approval_target";
+pub const MAIN_PROJECT_CREATE_OPERATION: &str = "project.create";
+pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
+pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
+pub const PROJECT_DOCUMENT_OPERATION: &str = "project.document";
+pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
+pub const PROJECT_EXECUTION_BASELINE_OPERATION: &str = "project.execution_baseline";
+pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
+pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
+pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
+pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]

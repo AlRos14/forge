@@ -3,8 +3,7 @@
 mod common;
 
 use api_types::{
-    ConnectedEmbeddedAgentResponse, ProductGenesisCharterResponse, ProjectCharterApproval,
-    ProjectCharterRevision, ProjectResponse,
+    ProductGenesisCharterResponse, ProjectCharterApproval, ProjectCharterRevision, ProjectResponse,
 };
 use axum::{http::Method, http::StatusCode};
 use db::{
@@ -251,7 +250,8 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
         StatusCode::OK,
     )
     .await;
-    let connected = connect_embedded_agent(app, &token, "project-charter-fixture-agent-1").await;
+    let connected =
+        create_project_harness_agent(app, &token, "project-charter-fixture-agent-1").await;
     let content = adoption_content("Legacy Charter Project", "one");
     let rendered = services::render_and_digest_charter(&content);
 
@@ -391,7 +391,8 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
     .expect("adoption bootstrap message is durable");
     assert_eq!(bootstrap_count, 1);
 
-    let rotated = connect_embedded_agent(app, &token, "project-charter-fixture-agent-2").await;
+    let rotated =
+        create_project_harness_agent(app, &token, "project-charter-fixture-agent-2").await;
     let mut amendment = content.clone();
     amendment.scope.must_have_outcomes = vec![
         "Preserve the existing Project while recording an exact Charter amendment.".to_owned(),
@@ -564,21 +565,12 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
     assert!(!milestone.definition_revision_id.is_empty());
 }
 
-async fn connect_embedded_agent(
+async fn create_project_harness_agent(
     app: &axum::Router,
     token: &str,
     name: &str,
-) -> ConnectedEmbeddedAgentResponse {
-    common::connect_embedded_agent(
-        app,
-        token,
-        name,
-        "project-charter-test",
-        "fixture-secret",
-        json!({"permissions": ["read_project", "handoff"]}),
-        json!({"allowed": ["read_project", "handoff"]}),
-    )
-    .await
+) -> common::HarnessAgentFixture {
+    common::create_harness_agent(app, token, name).await
 }
 
 fn project_agent_policy_digest(policy: &serde_json::Value) -> String {
@@ -633,7 +625,7 @@ fn approval_body(
     revision: &ProjectCharterRevision,
     expected_charter_version: i64,
     expected_project_version: i64,
-    connected: &ConnectedEmbeddedAgentResponse,
+    connected: &common::HarnessAgentFixture,
     rendered: &services::CharterRender,
     idempotency_key: &str,
 ) -> serde_json::Value {

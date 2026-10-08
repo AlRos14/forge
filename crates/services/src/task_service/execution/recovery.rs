@@ -404,7 +404,7 @@ impl TaskService {
         let blocked_execution_id = annotation.blocked_execution_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("resume_session requires blocked_execution_id")
         })?;
-        let mut blocked_execution = ExecutionRepo::get_by_id(&*self.db, blocked_execution_id)
+        let blocked_execution = ExecutionRepo::get_by_id(&*self.db, blocked_execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", blocked_execution_id.to_owned()))?;
         let authoritative_memberships = if let Some(role) =
@@ -487,41 +487,16 @@ impl TaskService {
                         "blocked execution missing executor config snapshot",
                     )
                 })?;
-            let mut agent_session_id = resumable_external_session(
+            let _external_session_id = resumable_external_session(
                 &self.db,
                 &blocked_execution,
                 Some(&agent_id),
                 Some(&workspace.id),
             )
-            .await?;
-            if blocked_execution.harness_session_id.is_none() {
-                let external_session_id = agent_session_id.clone().ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "blocked execution has no reusable HarnessSession (legacy fallback unavailable)",
-                    )
-                })?;
-                blocked_execution = materialize_historical_harness_session(
-                    &self.db,
-                    &blocked_execution,
-                    &external_session_id,
-                )
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "blocked execution has unresolved legacy session authority",
-                    )
-                })?;
-                agent_session_id = resumable_external_session(
-                    &self.db,
-                    &blocked_execution,
-                    Some(&agent_id),
-                    Some(&workspace.id),
-                )
-                .await?;
-            }
-            let _agent_session_id = agent_session_id.ok_or_else(|| {
+            .await?
+            .ok_or_else(|| {
                 ServiceError::invalid_operation(
-                    "blocked execution HarnessSession is not reusable in this workspace",
+                    "blocked execution has no reusable explicit HarnessSession",
                 )
             })?;
             (

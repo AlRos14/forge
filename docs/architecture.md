@@ -428,7 +428,7 @@ The target responsibility map is:
 | events | Durable-event projection and live delivery | Preserve, update event vocabulary |
 | executors | Transitional execution/logging facade | Replace with adapter-facing execution boundary |
 | review | Transitional special review runtime | Reduce to validation utilities, then remove if no longer meaningful |
-| agent-host | Forge-owned cognition/runtime layer | Remove after credential/process infrastructure is extracted |
+| agent-host | Retired in Plan PR10 | No production crate or runtime consumer remains |
 | forge-cli | Startup and composition root | Thin after retired services/workers are removed |
 
 Target dependency flow:
@@ -443,8 +443,10 @@ forge-cli → api → services → db
           → api-types
 ~~~
 
-agent-host and any embedded cognition runtime are not in the target graph.
-They remain in the current build until Plan PR10 removes them.
+agent-host and embedded cognition are absent from the production workspace.
+Plan PR10 removed the runtime and moved provider credential ownership to
+`CredentialService`; historical native profiles and sessions remain readable
+but cannot authorize execution.
 
 ## Public surfaces
 
@@ -480,7 +482,7 @@ The migration is one reviewed Plan PR at a time:
 | Plan PR7 | Harness-native planning Executions and plan Artifacts |
 | Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence |
 | Plan PR9 | Aggregate Task lifecycle and simplified gates/scheduler |
-| Plan PR10 | Removal of agent-host and embedded cognition |
+| Plan PR10 | Remove agent-host and embedded cognition; Execution credential and resolved daemon identities are snapshot-bound; remote credential-backed dispatch fails closed without exact-identity support. Agent Chat persistence and provenance remain readable, while current production adapters fail closed before model invocation because they cannot prove no-filesystem isolation. Periodic Cursor usage polling is disabled during Executions because its PTY child is outside the verifiable group boundary. PR11 owns vertical retirement or migration. |
 | Plan PR11 | Retirement of Main Agent/Project Agent/Project OS verticals |
 | Plan PR12 | REST, MCP, CLI, web, and event surface alignment |
 | Plan PR13 | Legacy persistence and compatibility cleanup |

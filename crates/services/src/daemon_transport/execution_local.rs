@@ -26,6 +26,10 @@ impl EmbeddedExecutionProvider {
 
 #[async_trait]
 impl ExecutionProvider for EmbeddedExecutionProvider {
+    fn accepts_snapshot_credentials(&self) -> bool {
+        true
+    }
+
     async fn start(
         &self,
         params: api_types::ExecutionStartParams,

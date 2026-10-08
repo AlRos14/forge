@@ -1,8 +1,7 @@
 use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
-    AgentStatus, CreateAgent, Daemon, DaemonRepo, DaemonStatus, PageRequest, SortBy, SortOrder,
-    SqliteDb, UpdateAgent,
+    new_uuid_v4, now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, Daemon,
+    DaemonRepo, DaemonStatus, PageRequest, SortBy, SortOrder, SqliteDb, UpdateAgent,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde_json::Value;
@@ -53,18 +52,10 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         return Ok(EffectiveStatus::Paused);
     }
 
-    if agent.backend_kind == "native" {
-        let health =
-            AgentConnectionHealthRepo::get_connection_health(db, &agent.profile_id).await?;
-        match health.as_ref().map(|health| health.status.as_str()) {
-            Some("healthy") => {}
-            Some("degraded") => return Ok(EffectiveStatus::ConnectionDegraded),
-            _ => return Ok(EffectiveStatus::ConnectionUnavailable),
-        }
-        if !has_running_execution_capacity(db, agent).await? {
-            return Ok(EffectiveStatus::Busy);
-        }
-        return Ok(EffectiveStatus::Active);
+    if agent.backend_kind.eq_ignore_ascii_case("native")
+        || agent.executor_type.eq_ignore_ascii_case("embedded")
+    {
+        return Ok(EffectiveStatus::Deactivated);
     }
 
     if let Some(daemon_id) = &agent.daemon_id {
@@ -197,7 +188,7 @@ impl AgentService {
         tracing::Span::current().record("agent_name", tracing::field::display(&name));
         if executor_type.trim().eq_ignore_ascii_case("embedded") {
             return Err(ServiceError::invalid_operation(
-                "embedded identities must be created through the protected embedded-agent connection",
+                "embedded/native Agent profiles are retired; create a new Agent bound to an available HarnessAdapter",
             ));
         }
         validate_positive("max_concurrent", max_concurrent.unwrap_or(1))?;

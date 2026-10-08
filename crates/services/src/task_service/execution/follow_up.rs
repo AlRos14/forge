@@ -72,7 +72,7 @@ fn dispatch_role_follow_up_impl(
         // Continuity may come from the supplied causal Execution or its
         // explicit causal parent. Never substitute the latest Execution for a
         // role: recency is not session authority.
-        let mut lineage_parent = if execution_role_matches(&supplied_parent_execution, &role) {
+        let lineage_parent = if execution_role_matches(&supplied_parent_execution, &role) {
             supplied_parent_execution.clone()
         } else if let Some(parent_id) = supplied_parent_execution.parent_execution_id.as_deref() {
             ExecutionRepo::get_by_id(&*service.db, parent_id)
@@ -173,33 +173,12 @@ fn dispatch_role_follow_up_impl(
         let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        // Actor selection is authoritative and precedes continuity. A
-        // legacy agent_session_id without an explicit HarnessSession never
-        // causes a new follow-up to inherit a thread.
+        // Actor selection is authoritative and precedes continuity. Legacy
+        // session projections never authorize a follow-up to inherit a thread.
         let same_actor = matches!(
             lineage_parent.actor_ref(),
             Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &agent_id
         );
-        if same_actor && lineage_parent.harness_session_id.is_none() {
-            if let Some(external_session_id) = resumable_external_session(
-                &service.db,
-                &lineage_parent,
-                Some(&agent_id),
-                current_workspace_id.as_deref(),
-            )
-            .await?
-            {
-                if let Some(reconciled) = materialize_historical_harness_session(
-                    &service.db,
-                    &lineage_parent,
-                    &external_session_id,
-                )
-                .await?
-                {
-                    lineage_parent = reconciled;
-                }
-            }
-        }
         let reusable_session = if same_actor {
             reusable_harness_session_for_agent(
                 &service.db,

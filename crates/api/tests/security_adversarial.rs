@@ -17,7 +17,7 @@ use tower::ServiceExt;
 const PROVIDER_SECRET: &str = "provider-secret-never-return-this";
 
 #[tokio::test]
-async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority() {
+async fn credentials_are_redacted_and_retired_runtime_cannot_create_scope_authority() {
     let workspace = common::TestDir::new("security-embedded-ws");
     let harness = common::test_app(workspace.path(), "security-embedded").await;
     let app = &harness.app;
@@ -122,14 +122,14 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(error.code, "invalid_operation");
+        assert_eq!(error.code, "agent_runtime.retired");
         assert_json_does_not_contain_secret(
             &serde_json::to_value(&error).expect("policy error serializes"),
             "placeholder",
         );
     }
 
-    let connected: api_types::ConnectedEmbeddedAgentResponse = common::json_request_with_bearer(
+    let legacy_runtime: ErrorResponse = common::json_request_with_bearer(
         app,
         Method::POST,
         "/api/v1/embedded-agents",
@@ -147,22 +147,42 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
                 "allowed": ["read_account", "read_project", "read_room", "read_task", "task_write"]
             }
         }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(legacy_runtime.code, "agent_runtime.retired");
+    assert_json_does_not_contain_secret(
+        &serde_json::to_value(&legacy_runtime).expect("retired response serializes"),
+        PROVIDER_SECRET,
+    );
+
+    let codex_entry = common::create_provider_entry(
+        app,
+        &token,
+        "openai",
+        "codex-adversarial",
+        PROVIDER_SECRET,
+        "https://8.8.8.8",
+    )
+    .await;
+    let connected: AgentResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/agents",
+        &token,
+        json!({
+            "name": "external-harness-agent",
+            "executor_type": "codex",
+            "credential_id": codex_entry.id
+        }),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(connected.health.status, "unavailable");
-    assert_eq!(connected.session.connection_status, "unavailable");
-    assert_eq!(connected.session.status, "degraded");
-    assert_json_does_not_contain_secret(
-        &serde_json::to_value(&connected).expect("connected response serializes"),
-        PROVIDER_SECRET,
-    );
-
     let profile_list: Vec<AgentProfileResponse> = common::empty_request_with_bearer(
         app,
         Method::GET,
-        &format!("/api/v1/agents/{}/profiles", connected.agent.id),
+        &format!("/api/v1/agents/{}/profiles", connected.id),
         &token,
         StatusCode::OK,
     )
@@ -176,14 +196,15 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let sessions: Vec<AgentSessionResponse> = common::empty_request_with_bearer(
         app,
         Method::GET,
-        &format!("/api/v1/agents/{}/sessions", connected.agent.id),
+        &format!("/api/v1/agents/{}/sessions", connected.id),
         &token,
         StatusCode::OK,
     )
     .await;
-    assert!(sessions
-        .iter()
-        .any(|session| session.id == connected.session.id));
+    assert!(
+        sessions.is_empty(),
+        "new harness Agents do not create legacy sessions"
+    );
     assert_json_does_not_contain_secret(
         &serde_json::to_value(&sessions).expect("session list serializes"),
         PROVIDER_SECRET,
@@ -197,11 +218,12 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         StatusCode::OK,
     )
     .await;
-    assert_eq!(providers.items.len(), 1);
-    assert!(providers.items[0]
-        .used_by
+    assert_eq!(providers.items.len(), 2);
+    assert!(providers
+        .items
         .iter()
-        .any(|usage| usage.agent_id == connected.agent.id));
+        .flat_map(|item| &item.used_by)
+        .any(|usage| usage.agent_id == connected.id));
     assert_json_does_not_contain_secret(
         &serde_json::to_value(&providers).expect("provider list serializes"),
         PROVIDER_SECRET,
@@ -210,7 +232,7 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let fetched: AgentResponse = common::empty_request_with_bearer(
         app,
         Method::GET,
-        &format!("/api/v1/agents/{}", connected.agent.id),
+        &format!("/api/v1/agents/{}", connected.id),
         &token,
         StatusCode::OK,
     )
@@ -226,11 +248,11 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let profile_error: ErrorResponse = common::json_request_with_bearer(
         app,
         Method::POST,
-        &format!("/api/v1/agents/{}/profiles/connect", connected.agent.id),
+        &format!("/api/v1/agents/{}/profiles/connect", connected.id),
         &token,
         json!({
-            "version": connected.agent.version,
-            "credential_id": adversarial_entry.id,
+            "version": connected.version,
+            "credential_id": codex_entry.id,
             "model": "test-model",
             "system_prompt": "authorization:\tBEARER\tplaceholder-profile-token",
             "permission_policy": "safe policy",
@@ -239,7 +261,7 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(profile_error.code, "invalid_operation");
+    assert_eq!(profile_error.code, "agent_runtime.retired");
     assert_json_does_not_contain_secret(
         &serde_json::to_value(&profile_error).expect("profile error serializes"),
         "placeholder-profile",
@@ -250,21 +272,18 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let (project_id, _repo_id) =
         common::create_project_and_repo(app, "health is not authority", &repo_path).await;
 
-    // The connection is persisted and its health is observable, but no
-    // project membership was admitted for this identity.
+    // Credential metadata does not grant an Agent Chat scope or Project
+    // membership.
     let project_scope: ErrorResponse = common::json_request_with_bearer(
         app,
         Method::POST,
-        &format!(
-            "/api/v1/agents/{}/effective-permissions",
-            connected.agent.id
-        ),
+        &format!("/api/v1/agents/{}/effective-permissions", connected.id),
         &token,
         json!({"type": "project", "project_id": project_id}),
-        StatusCode::NOT_FOUND,
+        StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(project_scope.code, "not_found");
+    assert_eq!(project_scope.code, "agent_runtime.retired");
 
     // A connected identity is not implicitly a Main/Project Agent binding.
     // Mentioning a project, chat, or permission in model/runtime text does
@@ -272,16 +291,13 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let chat_scope: ErrorResponse = common::json_request_with_bearer(
         app,
         Method::POST,
-        &format!(
-            "/api/v1/agents/{}/effective-permissions",
-            connected.agent.id
-        ),
+        &format!("/api/v1/agents/{}/effective-permissions", connected.id),
         &token,
         json!({"type": "agent_chat", "chat_id": "opaque-chat-from-text"}),
-        StatusCode::NOT_FOUND,
+        StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(chat_scope.code, "not_found");
+    assert_eq!(chat_scope.code, "agent_runtime.retired");
 
     let task: TaskResponse = common::json_request_with_bearer(
         app,
@@ -316,16 +332,13 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
     let task_scope: ErrorResponse = common::json_request_with_bearer(
         app,
         Method::POST,
-        &format!(
-            "/api/v1/agents/{}/effective-permissions",
-            connected.agent.id
-        ),
+        &format!("/api/v1/agents/{}/effective-permissions", connected.id),
         &token,
         json!({"type": "task", "task_id": task.id, "role": "worker"}),
-        StatusCode::NOT_FOUND,
+        StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(task_scope.code, "not_found");
+    assert_eq!(task_scope.code, "agent_runtime.retired");
 }
 
 #[tokio::test]
@@ -393,16 +406,7 @@ async fn agent_chats_reject_protected_content_and_opaque_cross_chat_references()
     let harness = common::test_app(workspace.path(), "security-agent-chat").await;
     let app = &harness.app;
     let token = common::test_jwt();
-    let connected: api_types::ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
-        app,
-        &token,
-        "agent-chat-security-agent",
-        "adversarial",
-        PROVIDER_SECRET,
-        json!({"permissions": ["read_agent_chat", "propose_message"]}),
-        json!({"allowed": ["read_agent_chat", "propose_message"]}),
-    )
-    .await;
+    let connected = common::create_harness_agent(app, &token, "agent-chat-security-agent").await;
     let binding: api_types::MainAgentBindingResponse = common::json_request_with_bearer(
         app,
         Method::PUT,

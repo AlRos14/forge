@@ -71,10 +71,13 @@ Role, Task, model, or latest Execution, and a session scoped to one workspace
 is not silently reused in another. Human Executions have no HarnessSession.
 
 The existing `agent_session` table and `AgentSession` model are deliberately
-different. They belong to the embedded Agent Runtime/Agent Host, together
-with `agent_context_scope`, protected runtime state, and context manifests.
-They remain legacy embedded-runtime infrastructure until the named later
-cleanup; they are not the generic Execution continuity authority.
+different. They preserve history from the retired embedded Agent Runtime and
+remain readable for audit and connection-health projections. No new embedded
+execution may create or resume one, and it is never the generic Execution
+continuity authority. `agent_context_scope` remains the foreign-key scope for
+server-owned Chat context manifests; those deny-workspace rows do not authorize
+runtime tools. Protected runtime state, LCM state, and runtime context manifests
+have no post-PR10 cognition consumer and remain historical until Plan PR13.
 
 The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of
 representation, each Execution snapshots the exact effective profile,
@@ -128,3 +131,32 @@ Credential storage, environment injection, daemon lifecycle, usage snapshots,
 quota, cooldown, and failover remain platform infrastructure. Failover may
 select another Agent only when that fact is explicit in Execution history; it
 must not impersonate the original Agent or mutate its identity.
+
+Cursor's interactive `/usage` probe is not started as a periodic child of an
+Execution. Its PTY command can run in a separate process session, outside the
+Execution's verifiable process group. A Cursor Execution without a current
+observation therefore has no `account_usage`; Forge does not substitute an
+older account snapshot. Cursor's side-effect-free execution detection checks
+the configured executable, while the detailed availability check remains a
+separate operation.
+
+## Frozen Execution host (Plan PR10)
+
+Admission may resolve an Agent's pinned daemon or select an available daemon
+for an unpinned Agent. The Execution snapshot stores that exact host as
+`resolved_daemon_id`. Start, Resume, Cancel, graceful shutdown, and recovery
+for that Execution use the stored ID. Changes to the Agent's current daemon
+binding or daemon availability cannot silently move the Execution to another host. A missing or
+invalid host fails closed. Reconnecting the same daemon is allowed and remains
+subject to PR3's connection-generation checks.
+
+## Agent Chat transition (Plan PR10)
+
+Agent Chat messages, durable turn jobs, binding/profile provenance,
+operating-context provenance, retry state, and historical reads remain
+available. Current production HarnessAdapters cannot prove a real
+no-filesystem posture, so Main and Project Agent Chat jobs fail closed before
+model invocation. Prompt text and a temporary directory do not establish that
+boundary. The removed native typed Forge tool catalog is not available through
+Chat. PR11 owns retirement or migration of Main Agent, Project Agent, and
+Project OS.

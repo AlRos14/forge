@@ -3,8 +3,8 @@
 //! Chat jobs intentionally do not share the Task worker's workspace contract.
 //! The worker claims one FIFO job per responder/scope, renews an expiring
 //! lease while the backend is running, and commits the response through the
-//! atomic Agent Chat service composite.  A failed adapter call is persisted on
-//! the job with a bounded error and a finite retry budget.
+//! atomic Agent Chat service composite. A failed admission or adapter call is
+//! persisted on the job with a bounded error and a finite retry budget.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,16 +19,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo, AgentChatTurnJob,
-    AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession,
-    CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
+    AgentChatTurnJobRepo, AgentContextScopeRepo, AgentProfile, AgentProfileRepo, AgentRepo,
+    CreateAgentContextScope, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
 use events::EventBus;
 use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
-use forge_agent_host::RuntimeContextManifestLink;
-use forge_agent_host::{
-    AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
-    Message, NativeProviderConfig, Role, TurnEventSink, WorkspaceAccess,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,7 +38,7 @@ use crate::{
     },
     agent_chat_turn_policy::failure_after_claim,
     context_manifest::{ContextManifestInput, ContextManifestService, ContextSourceInput},
-    embedded_agent_service::{CreateScopedSession, RequestedCanonicalScope},
+    credential_service::CredentialService,
     operating_skills::{
         canonical_main_operating_skill_body, canonical_project_operating_skill_body,
         render_main_baseline_operating_skill, render_project_operating_skill,
@@ -58,7 +53,7 @@ use crate::{
         PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
     },
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
-    EmbeddedAgentService, Result, ServiceError,
+    Result, ServiceError,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -104,7 +99,6 @@ until a user-approved Charter-backed adoption is committed.
 pub struct CompletedAgentChatTurn {
     pub identity_id: String,
     pub profile_id: String,
-    pub session_id: String,
     pub model: Option<String>,
     pub content: String,
     pub token_usage_json: Option<String>,
@@ -115,7 +109,7 @@ pub struct CompletedAgentChatTurn {
 struct LoadedAgentChatTurn {
     agent: Agent,
     profile: AgentProfile,
-    session: AgentSession,
+    chat_project_id: Option<String>,
     input: AgentChatMessage,
     history: Vec<AgentChatMessage>,
     /// A server-owned instruction revision.  For Main this is the active
@@ -124,8 +118,8 @@ struct LoadedAgentChatTurn {
     /// adapter boundary so the server contract has the stronger precedence.
     operating_instruction: Option<String>,
     /// Redaction-safe provenance records for the server-owned instruction and
-    /// the authenticated bounded Project state.  These are appended to the
-    /// runtime context manifest when the backend returns one.
+    /// authenticated bounded Project state. These remain server-owned when an
+    /// external HarnessAdapter does not emit a context manifest.
     operating_context_sources: Vec<ContextSourceInput>,
 }
 
@@ -394,9 +388,9 @@ pub trait AgentChatTurnRunner: Send + Sync {
     ) -> Result<CompletedAgentChatTurn>;
 }
 
-/// Narrow legacy CLI adapter for migrated Agent Chats. It deliberately uses a
-/// disposable empty directory and advertises denied workspace authority; a
-/// Task execution path is not routed through this type.
+/// Narrow CLI adapter for Agent Chat. The server-owned denied-workspace marker
+/// is checked by AdapterExecutor before launch; a Task execution path is not
+/// routed through this type.
 #[derive(Clone)]
 pub struct CliAgentChatSessionBackend {
     executor: Arc<dyn TaskExecutor>,
@@ -415,47 +409,30 @@ impl CliAgentChatSessionBackend {
         Self { executor }
     }
 
-    pub fn capabilities() -> BackendCapabilities {
-        BackendCapabilities {
-            native_runtime: false,
-            persistent_session: false,
-            protected_checkpoints: false,
-            lcm: false,
-            cancel: true,
-            steer: false,
-            workspace: WorkspaceAccess::Deny,
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn run_turn(
         &self,
-        scope: &CanonicalScope,
         job_id: &str,
         chat_id: &str,
-        executor_type: &str,
-        agent_config: Value,
+        mut executor_snapshot: Value,
         prompt: String,
         cancellation: CancellationToken,
     ) -> Result<(ExecutionResult, i64)> {
-        if scope.scope_type != CanonicalScopeType::AgentChat
-            || scope.scope_id != chat_id
-            || scope.workspace_access != WorkspaceAccess::Deny
-        {
-            return Err(ServiceError::invalid_operation(
-                "CLI Agent Chat backend requires a denied-filesystem Agent Chat scope",
-            ));
-        }
+        let executor_type = executor_snapshot
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Agent Chat snapshot has no executor type")
+            })?;
         let kind = executor_type
             .parse::<ExecutorKind>()
             .map_err(ServiceError::invalid_operation)?;
-        let executor_type = kind.to_string();
-        if matches!(kind, ExecutorKind::Shell | ExecutorKind::Embedded) {
+        if kind == ExecutorKind::Shell {
             return Err(ServiceError::invalid_operation(
                 "selected executor cannot run a legacy CLI Agent Chat turn",
             ));
         }
-        let executor_snapshot = cli_executor_snapshot(&executor_type, agent_config);
+        executors::mark_workspace_access_denied(&mut executor_snapshot);
 
         let sandbox = chat_sandbox_path(job_id);
         let logs_path = chat_log_path(job_id);
@@ -495,7 +472,14 @@ impl CliAgentChatSessionBackend {
                 let _ = std::fs::remove_dir_all(&sandbox);
                 return Err(ServiceError::invalid_operation("Agent Chat CLI turn was cancelled"));
             }
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&sandbox);
+                return Err(error.into());
+            }
+        };
         let _ = std::fs::remove_dir_all(&sandbox);
         Ok((result, started.elapsed().as_millis() as i64))
     }
@@ -504,8 +488,8 @@ impl CliAgentChatSessionBackend {
 #[derive(Clone)]
 pub struct FederatedAgentChatTurnRunner {
     db: Arc<SqliteDb>,
-    embedded_agents: Arc<EmbeddedAgentService>,
     cli_backend: CliAgentChatSessionBackend,
+    credential_env: Option<Arc<CredentialService>>,
 }
 
 impl fmt::Debug for FederatedAgentChatTurnRunner {
@@ -519,13 +503,13 @@ impl fmt::Debug for FederatedAgentChatTurnRunner {
 impl FederatedAgentChatTurnRunner {
     pub fn new(
         db: Arc<SqliteDb>,
-        embedded_agents: Arc<EmbeddedAgentService>,
         cli_executor: Arc<dyn TaskExecutor>,
+        credential_env: Option<Arc<CredentialService>>,
     ) -> Self {
         Self {
             db,
-            embedded_agents,
             cli_backend: CliAgentChatSessionBackend::new(cli_executor),
+            credential_env,
         }
     }
 
@@ -560,6 +544,25 @@ impl FederatedAgentChatTurnRunner {
             .await?
             .filter(|profile| profile.identity_id == agent.id)
             .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
+        if profile.backend_kind == "native" || profile.executor_type == "embedded" {
+            return Err(ServiceError::invalid_operation(
+                "historical native/embedded Agent Chat profile is retired; select a replacement Agent and HarnessAdapter explicitly",
+            ));
+        }
+        if profile.backend_kind != "cli" {
+            return Err(ServiceError::invalid_operation(
+                "selected Agent Chat profile is not bound to a supported HarnessAdapter",
+            ));
+        }
+        let executor_kind = profile
+            .executor_type
+            .parse::<ExecutorKind>()
+            .map_err(ServiceError::invalid_operation)?;
+        if executor_kind == ExecutorKind::Shell {
+            return Err(ServiceError::invalid_operation(
+                "selected executor cannot run a legacy CLI Agent Chat turn",
+            ));
+        }
 
         // The Project operating skill is admitted before session creation or
         // any model call.  A Project Chat is never allowed to fall back to a
@@ -819,21 +822,6 @@ impl FederatedAgentChatTurnRunner {
                 ));
             }
         };
-        let owner_user_id = agent
-            .owner_id
-            .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent identity has no owner"))?;
-        let session = self
-            .embedded_agents
-            .create_or_resume_session(CreateScopedSession {
-                actor_user_id: owner_user_id,
-                identity_id: agent.id.clone(),
-                profile_id: Some(profile.id.clone()),
-                scope: RequestedCanonicalScope::AgentChat {
-                    chat_id: job.chat_id.clone(),
-                },
-            })
-            .await?;
         let history = AgentChatMessageRepo::list_agent_chat_messages(
             &*self.db,
             AgentChatMessageListQuery {
@@ -858,7 +846,7 @@ impl FederatedAgentChatTurnRunner {
         Ok(LoadedAgentChatTurn {
             agent,
             profile,
-            session,
+            chat_project_id: chat.project_id,
             input,
             history,
             operating_instruction,
@@ -2269,243 +2257,6 @@ impl FederatedAgentChatTurnRunner {
         })
     }
 
-    async fn run_native(
-        &self,
-        job: &AgentChatTurnJob,
-        turn: LoadedAgentChatTurn,
-        cancellation: CancellationToken,
-    ) -> Result<CompletedAgentChatTurn> {
-        let LoadedAgentChatTurn {
-            agent,
-            profile,
-            session,
-            input,
-            history,
-            operating_instruction,
-            operating_context_sources,
-        } = turn;
-        let owner_user_id = agent
-            .owner_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent identity has no owner"))?;
-        let credential_ref = profile
-            .credential_ref
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no credential"))?;
-        let config: NativeProfileConfig = serde_json::from_str(&profile.config_json)
-            .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
-        let runtime_session_id = session
-            .runtime_session_id
-            .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent session has no runtime id"))?;
-        let provider = profile
-            .provider
-            .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no provider"))?;
-        let model = profile
-            .model
-            .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no model"))?;
-        let provider_account_id =
-            CredentialHandleRepo::get_credential_handle(&*self.db, credential_ref)
-                .await?
-                .as_ref()
-                .and_then(crate::embedded_agent_service::entry_provider_account_id);
-        let started = std::time::Instant::now();
-        let output = self
-            .embedded_agents
-            .native_backend()
-            .run_turn(
-                AgentTurnRequest {
-                    forge_session_id: session.id.clone(),
-                    runtime_session_id,
-                    scope: CanonicalScope {
-                        scope_type: CanonicalScopeType::AgentChat,
-                        scope_id: job.chat_id.clone(),
-                        workspace_access: WorkspaceAccess::Deny,
-                    },
-                    workspace_path: None,
-                    provider: NativeProviderConfig {
-                        provider,
-                        base_url: config.base_url,
-                        model: model.clone(),
-                        credential_handle_id: credential_ref.to_owned(),
-                        owner_user_id: owner_user_id.to_owned(),
-                        provider_account_id,
-                        context_tokens: config.context_tokens,
-                        max_input_tokens: config.max_input_tokens,
-                        max_output_tokens: config.max_output_tokens,
-                    },
-                    system_prompt: compose_system_prompt(
-                        profile.prompt_template.as_deref(),
-                        operating_instruction.as_deref(),
-                    ),
-                    history: runtime_history(&history),
-                    input: input.content,
-                    cancellation,
-                },
-                Arc::new(NoopTurnEventSink),
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    job_id = %job.id,
-                    chat_id = %job.chat_id,
-                    %error,
-                    "native Agent Chat turn failed"
-                );
-                ServiceError::invalid_operation(format!("native Agent Chat turn failed: {error}"))
-            })?;
-        let content = output.text.trim().to_owned();
-        guard_agent_chat_content(&content)?;
-        let context_manifest_id = if let Some(manifest) = output.context_manifest.as_ref() {
-            Some(
-                self.persist_runtime_context_manifest(
-                    job,
-                    &agent,
-                    &profile,
-                    &session,
-                    Some(&model),
-                    manifest,
-                    &operating_context_sources,
-                )
-                .await?,
-            )
-        } else if !operating_context_sources.is_empty() {
-            Some(
-                self.persist_server_context_manifest(
-                    job,
-                    &agent,
-                    &profile,
-                    &session,
-                    Some(&model),
-                    &operating_context_sources,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        Ok(CompletedAgentChatTurn {
-            identity_id: agent.id,
-            profile_id: profile.id,
-            session_id: session.id,
-            model: Some(model),
-            content,
-            token_usage_json: Some(
-                serde_json::json!({
-                    "input": output.input_tokens,
-                    "output": output.output_tokens,
-                })
-                .to_string(),
-            ),
-            duration_ms: started.elapsed().as_millis() as i64,
-            context_manifest_id,
-        })
-    }
-
-    /// Persist only the final runtime manifest's redaction-safe linkage. The
-    /// runtime remains the owner of context ordering and bodies; Forge stores
-    /// identifiers, revisions, counts and fingerprints and links the result
-    /// to the canonical Agent Chat session before the response is admitted.
-    #[allow(clippy::too_many_arguments)]
-    async fn persist_runtime_context_manifest(
-        &self,
-        job: &AgentChatTurnJob,
-        agent: &Agent,
-        profile: &AgentProfile,
-        session: &AgentSession,
-        model: Option<&str>,
-        runtime_manifest: &RuntimeContextManifestLink,
-        operating_context_sources: &[ContextSourceInput],
-    ) -> Result<String> {
-        let identity_id = uuid::Uuid::parse_str(&agent.id)
-            .map_err(|_| ServiceError::invalid_operation("Agent identity id is invalid"))?;
-        let context_scope_id = uuid::Uuid::parse_str(&session.context_scope_id).map_err(|_| {
-            ServiceError::invalid_operation("Agent Chat context scope id is invalid")
-        })?;
-        let manifest_id = agent_chat_manifest_id(&agent.id, &session.id, runtime_manifest);
-        let request_fingerprint = agent_chat_request_fingerprint(
-            job,
-            profile,
-            session,
-            model,
-            runtime_manifest,
-            operating_context_sources,
-        )?;
-        let runtime_sources = runtime_manifest_sources(runtime_manifest);
-        let mut sources = operating_context_sources.to_vec();
-        let source_offset = sources.len() as i64;
-        for (offset, mut source) in runtime_sources.into_iter().enumerate() {
-            source.ordinal = source_offset + offset as i64;
-            sources.push(source);
-        }
-        let service = ContextManifestService::new(Arc::clone(&self.db));
-
-        if let Some(existing) = service
-            .get_authorized(manifest_id, identity_id, context_scope_id)
-            .await?
-        {
-            if existing.runtime_manifest_fingerprint.as_deref()
-                != Some(runtime_manifest.runtime_manifest_fingerprint.as_str())
-                || existing.request_fingerprint != request_fingerprint
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Agent Chat runtime context manifest idempotency conflict",
-                ));
-            }
-            let existing_sources = service
-                .sources(manifest_id, identity_id, context_scope_id)
-                .await?;
-            for source in &sources {
-                if existing_sources.iter().any(|stored| {
-                    stored.ordinal == source.ordinal
-                        && stored.source_id == source.source_id
-                        && stored.source_revision == source.source_revision
-                }) {
-                    continue;
-                }
-                service
-                    .append_source(manifest_id, identity_id, context_scope_id, source.clone())
-                    .await?;
-            }
-            return Ok(manifest_id.to_string());
-        }
-
-        let created = service
-            .create(
-                ContextManifestInput {
-                    id: manifest_id,
-                    identity_id,
-                    agent_session_id: Some(uuid::Uuid::parse_str(&session.id).map_err(|_| {
-                        ServiceError::invalid_operation("Agent Chat session id is invalid")
-                    })?),
-                    context_scope_id,
-                    scope_type: "agent_chat".to_owned(),
-                    scope_id: job.chat_id.clone(),
-                    policy_revision: "forge-agent-chat-context-policy-1".to_owned(),
-                    domain_revision: "forge-agent-chat-runtime-link-1".to_owned(),
-                    lcm_binding_revision: runtime_manifest.lcm_binding_revision.clone(),
-                    runtime_manifest_id: Some(runtime_manifest.turn_id.clone()),
-                    runtime_manifest_fingerprint: Some(
-                        runtime_manifest.runtime_manifest_fingerprint.clone(),
-                    ),
-                    request_fingerprint,
-                },
-                &sources,
-            )
-            .await?;
-        let created_id = uuid::Uuid::parse_str(&created.id).map_err(|_| {
-            ServiceError::invalid_operation("persisted context manifest id is invalid")
-        })?;
-        for source in sources {
-            service
-                .append_source(created_id, identity_id, context_scope_id, source)
-                .await?;
-        }
-        Ok(created.id)
-    }
-
     /// Persist the server-owned context even when the selected backend does
     /// not expose an Agent Runtime manifest (for example, the CLI backend).
     ///
@@ -2520,22 +2271,20 @@ impl FederatedAgentChatTurnRunner {
         job: &AgentChatTurnJob,
         agent: &Agent,
         profile: &AgentProfile,
-        session: &AgentSession,
+        project_id: Option<&str>,
         model: Option<&str>,
         operating_context_sources: &[ContextSourceInput],
     ) -> Result<String> {
         let identity_id = uuid::Uuid::parse_str(&agent.id)
             .map_err(|_| ServiceError::invalid_operation("Agent identity id is invalid"))?;
-        let session_id = uuid::Uuid::parse_str(&session.id)
-            .map_err(|_| ServiceError::invalid_operation("Agent Chat session id is invalid"))?;
-        let context_scope_id = uuid::Uuid::parse_str(&session.context_scope_id).map_err(|_| {
-            ServiceError::invalid_operation("Agent Chat context scope id is invalid")
-        })?;
-        let manifest_id = agent_chat_server_manifest_id(&agent.id, &session.id, &job.id);
+        let context_scope_id = self
+            .ensure_chat_context_scope(&agent.id, &job.chat_id, project_id)
+            .await?;
+        let manifest_id = agent_chat_server_manifest_id(&agent.id, &job.id);
         let request_fingerprint = agent_chat_server_request_fingerprint(
             job,
             profile,
-            session,
+            &context_scope_id.to_string(),
             model,
             operating_context_sources,
         )?;
@@ -2573,12 +2322,12 @@ impl FederatedAgentChatTurnRunner {
                 ContextManifestInput {
                     id: manifest_id,
                     identity_id,
-                    agent_session_id: Some(session_id),
+                    agent_session_id: None,
                     context_scope_id,
                     scope_type: "agent_chat".to_owned(),
                     scope_id: job.chat_id.clone(),
                     policy_revision: "forge-agent-chat-context-policy-1".to_owned(),
-                    domain_revision: "forge-agent-chat-server-context-1".to_owned(),
+                    domain_revision: "forge-agent-chat-server-context-2".to_owned(),
                     lcm_binding_revision: None,
                     runtime_manifest_id: None,
                     runtime_manifest_fingerprint: None,
@@ -2598,6 +2347,52 @@ impl FederatedAgentChatTurnRunner {
         Ok(created.id)
     }
 
+    async fn ensure_chat_context_scope(
+        &self,
+        identity_id: &str,
+        chat_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<uuid::Uuid> {
+        if let Some(scope) = AgentContextScopeRepo::get_context_scope_for_identity(
+            &*self.db,
+            identity_id,
+            "agent_chat",
+            chat_id,
+        )
+        .await?
+        {
+            if scope.project_id.as_deref() != project_id || scope.workspace_access != "deny" {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat context manifest scope does not match the current chat",
+                ));
+            }
+            return uuid::Uuid::parse_str(&scope.id).map_err(|_| {
+                ServiceError::invalid_operation("Agent Chat context scope id is invalid")
+            });
+        }
+
+        let now = now_rfc3339();
+        let scope = AgentContextScopeRepo::create_context_scope(
+            &*self.db,
+            CreateAgentContextScope {
+                id: db::new_uuid_v4(),
+                identity_id: identity_id.to_owned(),
+                scope_type: "agent_chat".to_owned(),
+                scope_id: chat_id.to_owned(),
+                project_id: project_id.map(str::to_owned),
+                task_id: None,
+                task_role: None,
+                workspace_access: "deny".to_owned(),
+                authority_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await?;
+        uuid::Uuid::parse_str(&scope.id)
+            .map_err(|_| ServiceError::invalid_operation("Agent Chat context scope id is invalid"))
+    }
+
     async fn run_cli(
         &self,
         job: &AgentChatTurnJob,
@@ -2607,7 +2402,7 @@ impl FederatedAgentChatTurnRunner {
         let LoadedAgentChatTurn {
             agent,
             profile,
-            session,
+            chat_project_id,
             input,
             history,
             operating_instruction,
@@ -2619,21 +2414,59 @@ impl FederatedAgentChatTurnRunner {
             &history,
             &input.content,
         );
-        let config: Value = serde_json::from_str(&profile.config_json)
+        let mut config: Value = serde_json::from_str(&profile.config_json)
             .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
-        let scope = CanonicalScope {
-            scope_type: CanonicalScopeType::AgentChat,
-            scope_id: job.chat_id.clone(),
-            workspace_access: WorkspaceAccess::Deny,
-        };
+        let config_object = config.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent profile config must be a JSON object")
+        })?;
+        if let Some(permission_policy) = profile.permission_policy.as_deref() {
+            config_object.insert(
+                "permission_policy".to_owned(),
+                Value::String(permission_policy.to_owned()),
+            );
+        }
+        let mut executor_snapshot = cli_executor_snapshot(&profile.executor_type, config);
+        let snapshot_object = executor_snapshot.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat executor snapshot is invalid")
+        })?;
+        snapshot_object.insert("agent_id".to_owned(), Value::String(agent.id.clone()));
+        snapshot_object.insert("profile_id".to_owned(), Value::String(profile.id.clone()));
+        snapshot_object.insert(
+            "credential_ref".to_owned(),
+            profile
+                .credential_ref
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        snapshot_object.insert(
+            "provider".to_owned(),
+            profile
+                .provider
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        if executor_snapshot
+            .get("credential_ref")
+            .is_some_and(|credential_ref| !credential_ref.is_null())
+        {
+            self.credential_env
+                .as_ref()
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Agent Chat snapshot credential cannot be resolved by this server",
+                    )
+                })?
+                .inject_snapshot_credential_env(&mut executor_snapshot)
+                .await?;
+        }
         let (result, duration_ms) = self
             .cli_backend
             .run_turn(
-                &scope,
                 &job.id,
                 &job.chat_id,
-                &profile.executor_type,
-                config,
+                executor_snapshot,
                 prompt,
                 cancellation,
             )
@@ -2648,7 +2481,7 @@ impl FederatedAgentChatTurnRunner {
                     job,
                     &agent,
                     &profile,
-                    &session,
+                    chat_project_id.as_deref(),
                     profile.model.as_deref(),
                     &operating_context_sources,
                 )
@@ -2658,7 +2491,6 @@ impl FederatedAgentChatTurnRunner {
         Ok(CompletedAgentChatTurn {
             identity_id: agent.id,
             profile_id: profile.id,
-            session_id: session.id,
             model: profile.model,
             content,
             token_usage_json: None,
@@ -2676,12 +2508,10 @@ impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
         cancellation: CancellationToken,
     ) -> Result<CompletedAgentChatTurn> {
         let turn = self.load_turn(job).await?;
-        let backend_kind = turn.profile.backend_kind.clone();
-        match backend_kind.as_str() {
-            "native" => self.run_native(job, turn, cancellation).await,
+        match turn.profile.backend_kind.as_str() {
             "cli" => self.run_cli(job, turn, cancellation).await,
             _ => Err(ServiceError::invalid_operation(
-                "selected Agent Chat backend is unsupported",
+                "selected Agent Chat profile is not bound to a supported HarnessAdapter",
             )),
         }
     }
@@ -2707,14 +2537,14 @@ impl fmt::Debug for AgentChatTurnWorker {
 impl AgentChatTurnWorker {
     pub fn new(
         db: Arc<SqliteDb>,
-        embedded_agents: Arc<EmbeddedAgentService>,
         cli_executor: Arc<dyn TaskExecutor>,
         event_bus: Arc<EventBus>,
+        credential_env: Option<Arc<CredentialService>>,
     ) -> Self {
         let runner = Arc::new(FederatedAgentChatTurnRunner::new(
             Arc::clone(&db),
-            embedded_agents,
             cli_executor,
+            credential_env,
         ));
         Self::with_runner(db, runner, event_bus)
     }
@@ -2943,7 +2773,7 @@ impl AgentChatTurnWorker {
                 AppendAgentChatSuccessInput {
                     content: turn.content,
                     model: turn.model,
-                    session_id: Some(turn.session_id),
+                    session_id: None,
                     context_manifest_id: turn.context_manifest_id,
                     token_usage_json: turn.token_usage_json,
                     duration_ms: Some(turn.duration_ms),
@@ -2990,44 +2820,6 @@ impl AgentChatTurnWorker {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct NativeProfileConfig {
-    base_url: String,
-    #[serde(default = "default_context_tokens")]
-    context_tokens: u32,
-    #[serde(default = "default_max_input_tokens")]
-    max_input_tokens: u32,
-    #[serde(default = "default_max_output_tokens")]
-    max_output_tokens: u32,
-}
-
-fn default_context_tokens() -> u32 {
-    128_000
-}
-
-fn default_max_input_tokens() -> u32 {
-    96_000
-}
-
-fn default_max_output_tokens() -> u32 {
-    16_000
-}
-
-fn runtime_history(history: &[AgentChatMessage]) -> Vec<Message> {
-    history
-        .iter()
-        .map(|message| match message.author_type {
-            AgentChatMessageAuthorType::User | AgentChatMessageAuthorType::Handoff => {
-                Message::user(message.content.clone())
-            }
-            AgentChatMessageAuthorType::Agent => {
-                Message::text(Role::Assistant, message.content.clone())
-            }
-            AgentChatMessageAuthorType::System => Message::system(message.content.clone()),
-        })
-        .collect()
-}
-
 fn build_cli_prompt(
     profile_prompt: Option<&str>,
     operating_instruction: Option<&str>,
@@ -3045,7 +2837,7 @@ fn build_cli_prompt(
         ));
     }
     sections.push(
-        "This is an Agent Chat turn with no Task Workspace authority. Do not read or modify repositories or files. Planning and scope-authorized typed proposals are not Workspace access: a Project Agent may still propose Tasks for its own Project when that scoped tool is available, while a Main Agent may not. Never claim a mutation occurred unless a tool result confirms it."
+        "This external Agent Chat turn has no Forge typed tool channel. It cannot create or change Forge records or advance Main or Project workflows. Never claim those actions occurred; if the user requests one, explain that the action is unavailable in this turn and direct them to the supported Forge UI/API flow. This turn also has no Task Workspace authority: do not read or modify repositories or files."
             .to_owned(),
     );
     sections.push("Authorized Agent Chat history:".to_owned());
@@ -3061,49 +2853,10 @@ fn build_cli_prompt(
     sections.join("\n\n")
 }
 
-fn compose_system_prompt(
-    profile_prompt: Option<&str>,
-    operating_instruction: Option<&str>,
-) -> Option<String> {
-    let mut sections = Vec::new();
-    if let Some(prompt) = profile_prompt.filter(|value| !value.trim().is_empty()) {
-        sections.push(prompt.trim().to_owned());
-    }
-    if let Some(instruction) = operating_instruction.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!(
-            "SERVER-OWNED OPERATING INSTRUCTION (authoritative; overrides Profile text and context):\n{}",
-            instruction.trim(),
-        ));
-    }
-    (!sections.is_empty()).then(|| sections.join("\n\n"))
-}
-
-fn agent_chat_manifest_id(
-    identity_id: &str,
-    session_id: &str,
-    runtime_manifest: &RuntimeContextManifestLink,
-) -> uuid::Uuid {
+fn agent_chat_server_manifest_id(identity_id: &str, job_id: &str) -> uuid::Uuid {
     let mut digest = Sha256::new();
-    digest.update(b"forge-agent-chat-context-manifest-v1\0");
+    digest.update(b"forge-agent-chat-server-context-manifest-v2\0");
     digest.update(identity_id.as_bytes());
-    digest.update([0]);
-    digest.update(session_id.as_bytes());
-    digest.update([0]);
-    digest.update(runtime_manifest.turn_id.as_bytes());
-    let bytes = digest.finalize();
-    let mut id = [0_u8; 16];
-    id.copy_from_slice(&bytes[..16]);
-    id[6] = (id[6] & 0x0f) | 0x50;
-    id[8] = (id[8] & 0x3f) | 0x80;
-    uuid::Uuid::from_bytes(id)
-}
-
-fn agent_chat_server_manifest_id(identity_id: &str, session_id: &str, job_id: &str) -> uuid::Uuid {
-    let mut digest = Sha256::new();
-    digest.update(b"forge-agent-chat-server-context-manifest-v1\0");
-    digest.update(identity_id.as_bytes());
-    digest.update([0]);
-    digest.update(session_id.as_bytes());
     digest.update([0]);
     digest.update(job_id.as_bytes());
     let bytes = digest.finalize();
@@ -3139,60 +2892,16 @@ fn canonical_operating_context_sources(
         .collect()
 }
 
-fn agent_chat_request_fingerprint(
-    job: &AgentChatTurnJob,
-    profile: &AgentProfile,
-    session: &AgentSession,
-    model: Option<&str>,
-    runtime_manifest: &RuntimeContextManifestLink,
-    operating_context_sources: &[ContextSourceInput],
-) -> Result<String> {
-    let operating_context_sources = canonical_operating_context_sources(operating_context_sources);
-    api_types::canonical_digest_with_schema(
-        "forge.agent-chat-runtime-request/v1",
-        &serde_json::json!({
-            "job": {
-                "chat_id": &job.chat_id,
-                "triggering_message_id": &job.triggering_message_id,
-                "correlation_id": &job.correlation_id,
-                "causation_depth": job.causation_depth,
-            },
-            "session": {
-                "id": &session.id,
-                "context_scope_id": &session.context_scope_id,
-            },
-            "profile": {
-                "id": &profile.id,
-                "version": profile.version,
-                "backend_kind": &profile.backend_kind,
-                "model": model,
-            },
-            "runtime_manifest": {
-                "turn_id": &runtime_manifest.turn_id,
-                "context_fingerprint": &runtime_manifest.context_fingerprint,
-                "cache_plan_fingerprint": &runtime_manifest.cache_plan_fingerprint,
-                "runtime_manifest_fingerprint": &runtime_manifest.runtime_manifest_fingerprint,
-            },
-            "operating_context_sources": operating_context_sources,
-        }),
-    )
-    .map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "Agent Chat runtime request cannot be canonically serialized: {error}"
-        ))
-    })
-}
-
 fn agent_chat_server_request_fingerprint(
     job: &AgentChatTurnJob,
     profile: &AgentProfile,
-    session: &AgentSession,
+    context_scope_id: &str,
     model: Option<&str>,
     operating_context_sources: &[ContextSourceInput],
 ) -> Result<String> {
     let operating_context_sources = canonical_operating_context_sources(operating_context_sources);
     api_types::canonical_digest_with_schema(
-        "forge.agent-chat-server-context-request/v1",
+        "forge.agent-chat-server-context-request/v2",
         &serde_json::json!({
             "job": {
                 "id": &job.id,
@@ -3201,10 +2910,7 @@ fn agent_chat_server_request_fingerprint(
                 "correlation_id": &job.correlation_id,
                 "causation_depth": job.causation_depth,
             },
-            "session": {
-                "id": &session.id,
-                "context_scope_id": &session.context_scope_id,
-            },
+            "context_scope_id": context_scope_id,
             "profile": {
                 "id": &profile.id,
                 "version": profile.version,
@@ -3219,133 +2925,6 @@ fn agent_chat_server_request_fingerprint(
             "Agent Chat server context request cannot be canonically serialized: {error}"
         ))
     })
-}
-
-fn runtime_manifest_sources(
-    runtime_manifest: &RuntimeContextManifestLink,
-) -> Vec<ContextSourceInput> {
-    let source_revision = runtime_manifest.context_fingerprint.clone();
-    let covered = runtime_manifest
-        .summaries
-        .iter()
-        .flat_map(|summary| summary.covered.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let summary_ids = runtime_manifest
-        .summaries
-        .iter()
-        .map(|summary| summary.summary.clone())
-        .collect::<BTreeSet<_>>();
-    let segment_ids = runtime_manifest
-        .segments
-        .iter()
-        .map(|segment| segment.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut sources = Vec::new();
-    let mut source_ids = BTreeSet::new();
-    let mut ordinal = 0_i64;
-    let mut push = |source_id: String,
-                    source_type: String,
-                    source_revision: String,
-                    selection_reason: String,
-                    disposition: String,
-                    retention_priority: i64,
-                    fragment_fingerprint: String,
-                    sensitivity: String| {
-        if source_ids.insert(source_id.clone()) {
-            sources.push(ContextSourceInput {
-                ordinal,
-                source_id,
-                source_type,
-                source_revision,
-                selection_reason,
-                disposition,
-                retention_priority,
-                fragment_fingerprint,
-                sensitivity,
-            });
-            ordinal = ordinal.saturating_add(1);
-        }
-    };
-
-    if let Some(timeline_id) = runtime_manifest.lcm_timeline_id.as_deref() {
-        push(
-            timeline_id.to_owned(),
-            "runtime_lcm_timeline".to_owned(),
-            runtime_manifest
-                .lcm_binding_revision
-                .clone()
-                .unwrap_or_else(|| "unknown".to_owned()),
-            "agent_runtime_lcm_binding".to_owned(),
-            "included".to_owned(),
-            100,
-            fingerprint_id(timeline_id),
-            "internal".to_owned(),
-        );
-    }
-    for segment in &runtime_manifest.segments {
-        push(
-            segment.id.clone(),
-            "runtime_segment".to_owned(),
-            source_revision.clone(),
-            "agent_runtime_final_segment".to_owned(),
-            if covered.contains(&segment.id) && !summary_ids.contains(&segment.id) {
-                "summarized".to_owned()
-            } else {
-                "included".to_owned()
-            },
-            if summary_ids.contains(&segment.id) {
-                100
-            } else {
-                10
-            },
-            segment.content_hash.clone(),
-            segment.sensitivity.clone(),
-        );
-    }
-    for summary in &runtime_manifest.summaries {
-        push(
-            summary.summary.clone(),
-            "runtime_lcm_summary".to_owned(),
-            source_revision.clone(),
-            "agent_runtime_summary_coverage".to_owned(),
-            "included".to_owned(),
-            100,
-            fingerprint_id(&summary.summary),
-            "sensitive".to_owned(),
-        );
-        for covered_id in &summary.covered {
-            push(
-                covered_id.clone(),
-                "runtime_lcm_covered".to_owned(),
-                source_revision.clone(),
-                "agent_runtime_summary_coverage".to_owned(),
-                "summarized".to_owned(),
-                10,
-                fingerprint_id(covered_id),
-                "sensitive".to_owned(),
-            );
-        }
-    }
-    for summary in &runtime_manifest.lossless_summaries {
-        let source_id = summary.node_id.clone();
-        push(
-            source_id.clone(),
-            "runtime_lossless_summary".to_owned(),
-            summary.node_revision.to_string(),
-            "agent_runtime_lossless_summary".to_owned(),
-            "included".to_owned(),
-            100,
-            summary
-                .operation_fingerprint
-                .clone()
-                .unwrap_or_else(|| summary.source_fingerprint.clone()),
-            summary.classification.sensitivity.clone(),
-        );
-    }
-    // Keep the local variable meaningful in the no-summary case and make the
-    // dedupe rule explicit for reviewers: source IDs are never repeated.
-    let _ = segment_ids;
-    sources
 }
 
 fn fingerprint_id(value: &str) -> String {
@@ -4105,15 +3684,332 @@ fn classify_turn_error(error: &ServiceError) -> &'static str {
     }
 }
 
-#[derive(Debug)]
-struct NoopTurnEventSink;
-
-#[async_trait]
-impl TurnEventSink for NoopTurnEventSink {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingChatHarnessAdapter {
+        kind: ExecutorKind,
+        executions: Arc<Mutex<Vec<ExecutionContext>>>,
+        cancellations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl executors::HarnessAdapter for RecordingChatHarnessAdapter {
+        fn kind(&self) -> ExecutorKind {
+            self.kind.clone()
+        }
+
+        fn normalize_config(
+            &self,
+            config: &Value,
+            overrides: &executors::ExecutionOverrides,
+        ) -> std::result::Result<Value, executors::ExecutorError> {
+            cli_adapters::default_registry()
+                .get(&self.kind)
+                .expect("recording adapter kind is registered in production")
+                .normalize_config(config, overrides)
+        }
+
+        fn interpret_execution_policy(
+            &self,
+            config: &Value,
+        ) -> executors::HarnessPolicyInterpretation {
+            cli_adapters::default_registry()
+                .get(&self.kind)
+                .map(|adapter| adapter.interpret_execution_policy(config))
+                .unwrap_or(executors::HarnessPolicyInterpretation {
+                    permission_policy: "unknown".to_owned(),
+                    isolation_posture: "not_applicable".to_owned(),
+                })
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: executors::DiscoverContext,
+        ) -> std::result::Result<executors::DiscoveredOptions, executors::ExecutorError> {
+            Ok(executors::DiscoveredOptions::default())
+        }
+
+        async fn execute(
+            &self,
+            ctx: ExecutionContext,
+        ) -> std::result::Result<ExecutionResult, executors::ExecutorError> {
+            self.executions
+                .lock()
+                .expect("execution log lock")
+                .push(ctx);
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                assistant_output: Some("external harness response".to_owned()),
+                ..Default::default()
+            })
+        }
+
+        async fn cancel(
+            &self,
+            execution_id: &str,
+        ) -> std::result::Result<(), executors::ExecutorError> {
+            self.cancellations
+                .lock()
+                .expect("cancellation log lock")
+                .push(execution_id.to_owned());
+            Ok(())
+        }
+    }
+
+    struct GenericNoWorkspaceContractAdapter;
+
+    #[async_trait]
+    impl executors::HarnessAdapter for GenericNoWorkspaceContractAdapter {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Codex
+        }
+
+        fn interpret_execution_policy(
+            &self,
+            _config: &Value,
+        ) -> executors::HarnessPolicyInterpretation {
+            // Generic contract fixture only. This declaration is not evidence
+            // that any production adapter provides filesystem isolation.
+            executors::HarnessPolicyInterpretation {
+                permission_policy: "deny".to_owned(),
+                isolation_posture: "no-filesystem".to_owned(),
+            }
+        }
+
+        async fn discover_options(
+            &self,
+            _ctx: executors::DiscoverContext,
+        ) -> std::result::Result<executors::DiscoveredOptions, executors::ExecutorError> {
+            Ok(executors::DiscoveredOptions::default())
+        }
+
+        async fn execute(
+            &self,
+            _ctx: ExecutionContext,
+        ) -> std::result::Result<ExecutionResult, executors::ExecutorError> {
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                assistant_output: Some("generic contract accepted".to_owned()),
+                ..Default::default()
+            })
+        }
+
+        async fn cancel(
+            &self,
+            _execution_id: &str,
+        ) -> std::result::Result<(), executors::ExecutorError> {
+            Ok(())
+        }
+    }
+
+    async fn setup_main_chat(
+        backend_kind: &str,
+        executor_type: &str,
+        credential_secret: Option<&str>,
+        policy_override: Option<(&str, &str)>,
+    ) -> (
+        Arc<SqliteDb>,
+        Arc<EventBus>,
+        AgentChatTurnJob,
+        String,
+        String,
+    ) {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("sqlite pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = now_rfc3339();
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: "chat-owner".to_owned(),
+                email: "chat-owner@example.test".to_owned(),
+                password_hash: "test-hash".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("owner seeded");
+        let credential_ref = if let Some(secret) = credential_secret {
+            Some(
+                CredentialService::new(Arc::clone(&db), b"agent-chat-credential-test-key")
+                    .connect_api_key_credential(
+                        crate::credential_service::ConnectApiKeyCredential {
+                            owner_user_id: "chat-owner".to_owned(),
+                            provider: "openai".to_owned(),
+                            label: "job profile credential".to_owned(),
+                            credential: crate::credential_service::Secret::new(secret.to_owned()),
+                            base_url: Some("https://8.8.8.8/v1".to_owned()),
+                        },
+                    )
+                    .await
+                    .expect("profile credential stores")
+                    .id,
+            )
+        } else {
+            None
+        };
+        let (permission_policy, config_json) = policy_override.unwrap_or((
+            "deny",
+            r#"{"model":"profile-model","sandbox":"no-filesystem"}"#,
+        ));
+        let identity_id = db::new_uuid_v4();
+        let profile_id = db::new_uuid_v4();
+        db::AgentRepo::create_identity_with_profile(
+            &*db,
+            db::CreateAgentIdentity {
+                id: identity_id.clone(),
+                name: "Chat Agent".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some("chat-owner".to_owned()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            db::CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: backend_kind.to_owned(),
+                executor_type: executor_type.to_owned(),
+                provider: Some("openai".to_owned()),
+                model: Some("test-model".to_owned()),
+                reasoning_effort: None,
+                permission_policy: Some(permission_policy.to_owned()),
+                prompt_template: Some("profile instruction".to_owned()),
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: config_json.to_owned(),
+                credential_ref,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("identity and profile seeded");
+
+        let event_bus = Arc::new(EventBus::new(16));
+        let chat_service = AgentChatService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let _binding = chat_service
+            .set_main_binding(crate::agent_chat_service::SetMainAgentBindingInput {
+                actor_user_id: "chat-owner".to_owned(),
+                account_id: "chat-owner".to_owned(),
+                identity_id: identity_id.clone(),
+                profile_id: profile_id.clone(),
+                autonomy_policy_json: "{}".to_owned(),
+                tool_policy_revision: "test".to_owned(),
+                expected_version: None,
+                replacement_reason: None,
+            })
+            .await
+            .expect("Main binding created");
+        let chat = AgentChatRepo::get_main_chat(&*db, "chat-owner")
+            .await
+            .expect("Main chat lookup succeeds")
+            .expect("Main chat exists");
+        let admitted = chat_service
+            .send_message(crate::agent_chat_service::SendAgentChatMessageInput {
+                actor_user_id: "chat-owner".to_owned(),
+                chat_id: chat.id,
+                content: "user prompt".to_owned(),
+                dedupe_key: Some("chat-turn-test".to_owned()),
+            })
+            .await
+            .expect("chat turn admitted");
+        (db, event_bus, admitted.turn_job, identity_id, profile_id)
+    }
+
+    #[tokio::test]
+    async fn generic_no_workspace_contract_accepts_adapter_declared_posture() {
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(GenericNoWorkspaceContractAdapter));
+        let executor = executors::AdapterExecutor::new(Arc::new(registry));
+        let mut agent_config = serde_json::json!({
+            "executor_type": "codex",
+            "config": {}
+        });
+        executors::mark_workspace_access_denied(&mut agent_config);
+        let result = executor
+            .execute(ExecutionContext {
+                task_id: "contract-task".to_owned(),
+                execution_id: "contract-execution".to_owned(),
+                role: "interactive".to_owned(),
+                worktree_path: String::new(),
+                description: "generic contract fixture".to_owned(),
+                agent_config,
+                invocation: executors::HarnessInvocation::Start,
+                logs_path: "/tmp/generic-no-workspace-contract.jsonl".to_owned(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await
+            .expect("generic fence accepts an adapter declaring the required posture");
+        assert_eq!(
+            result.assistant_output.as_deref(),
+            Some("generic contract accepted")
+        );
+    }
+
+    #[test]
+    fn production_adapter_registry_does_not_prove_agent_chat_no_workspace() {
+        let registry = cli_adapters::default_registry();
+        let kinds = registry.kinds();
+        assert!(
+            !kinds.is_empty(),
+            "built-in production registry is populated"
+        );
+        let claimed_no_workspace_config = serde_json::json!({
+            "permission_policy": "deny",
+            "sandbox": "no-filesystem"
+        });
+
+        for kind in kinds {
+            let adapter = registry.get(&kind).expect("registered kind has adapter");
+            match adapter.normalize_config(
+                &claimed_no_workspace_config,
+                &executors::ExecutionOverrides::default(),
+            ) {
+                Err(_) => {
+                    // Unsupported config fails closed before adapter execution.
+                }
+                Ok(config) => {
+                    let interpretation = adapter.interpret_execution_policy(&config);
+                    let policy = executors::effective_policy::from_adapter_interpretation(
+                        &kind,
+                        &interpretation,
+                        None,
+                        None,
+                        &config,
+                    );
+                    assert!(
+                        executors::effective_policy::validate_agent_chat_no_workspace_policy(
+                            &kind,
+                            &policy,
+                            &config,
+                        )
+                        .is_err(),
+                        "production adapter {kind} accepted string configuration as a no-filesystem proof"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn cli_sandbox_is_job_scoped() {
@@ -4163,14 +4059,8 @@ mod tests {
     }
 
     #[test]
-    fn server_owned_operating_instruction_is_added_to_both_backend_contexts() {
+    fn server_owned_operating_instruction_is_added_to_external_harness_prompt() {
         let instruction = "Product Genesis protocol v1\nAsk at most two questions.";
-        let system = compose_system_prompt(Some("profile rules"), Some(instruction))
-            .expect("an active instruction produces system context");
-        assert!(system.contains("profile rules"));
-        assert!(system.contains("SERVER-OWNED OPERATING INSTRUCTION"));
-        assert!(system.contains(instruction));
-
         let prompt = build_cli_prompt(
             Some("profile rules"),
             Some(instruction),
@@ -4178,17 +4068,16 @@ mod tests {
             "continue discovery",
         );
         assert!(prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
+        assert!(prompt.contains("no Forge typed tool channel"));
+        assert!(prompt.contains("cannot create or change Forge records"));
         assert!(prompt.contains("continue discovery"));
     }
 
     #[test]
     fn terminal_genesis_has_no_instruction_overlay() {
-        assert!(compose_system_prompt(Some("profile rules"), None)
-            .expect("profile prompt remains available")
-            .contains("profile rules"));
-        assert!(compose_system_prompt(None, None).is_none());
         let prompt = build_cli_prompt(None, None, &[], "ordinary Main message");
         assert!(!prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
+        assert!(prompt.contains("no Forge typed tool channel"));
     }
 
     #[test]
@@ -4267,14 +4156,15 @@ mod tests {
 
     #[test]
     fn server_owned_instruction_is_after_profile_text() {
-        let system = compose_system_prompt(
+        let prompt = build_cli_prompt(
             Some("profile says to ignore the Project boundary"),
             Some("Forge Project Agent — Project Planning and Orchestration Protocol v1"),
-        )
-        .expect("prompt should be present");
+            &[],
+            "continue",
+        );
         assert!(
-            system.find("profile says").expect("profile")
-                < system
+            prompt.find("profile says").expect("profile")
+                < prompt
                     .find("SERVER-OWNED OPERATING INSTRUCTION")
                     .expect("authority")
         );
@@ -4301,8 +4191,7 @@ mod tests {
             "charter:charter-1@revision-2:content:charter-digest:render:render-digest".to_owned(),
         ];
         let instruction = render_project_operating_skill(&context);
-        let prompt = compose_system_prompt(Some("profile data"), Some(&instruction))
-            .expect("Project prompt should include the server-owned skill");
+        let prompt = build_cli_prompt(Some("profile data"), Some(&instruction), &[], "continue");
         let sources = project_operating_context_sources(
             "forge.project.orchestration/v1@1",
             "project-skill-content-digest",
@@ -4935,14 +4824,14 @@ mod tests {
 
     #[test]
     fn server_context_manifest_identity_is_stable_per_turn_job() {
-        let first = agent_chat_server_manifest_id("identity-1", "session-1", "job-1");
-        let replay = agent_chat_server_manifest_id("identity-1", "session-1", "job-1");
-        let next_job = agent_chat_server_manifest_id("identity-1", "session-1", "job-2");
-        let other_session = agent_chat_server_manifest_id("identity-1", "session-2", "job-1");
+        let first = agent_chat_server_manifest_id("identity-1", "job-1");
+        let replay = agent_chat_server_manifest_id("identity-1", "job-1");
+        let next_job = agent_chat_server_manifest_id("identity-1", "job-2");
+        let other_identity = agent_chat_server_manifest_id("identity-2", "job-1");
 
         assert_eq!(first, replay);
         assert_ne!(first, next_job);
-        assert_ne!(first, other_session);
+        assert_ne!(first, other_identity);
     }
 
     #[test]
@@ -4965,6 +4854,320 @@ mod tests {
         assert!(encoded.contains("digest-1"));
         assert!(!encoded.contains("body"));
         assert!(!encoded.contains("private transcript"));
+    }
+
+    #[tokio::test]
+    async fn main_chat_turn_keeps_durable_provenance_and_fails_closed_for_production_adapter() {
+        let (db, event_bus, admitted, identity_id, profile_id) =
+            setup_main_chat("cli", "codex", None, None).await;
+        let task_executor: Arc<dyn TaskExecutor> = Arc::new(executors::AdapterExecutor::new(
+            Arc::new(cli_adapters::default_registry()),
+        ));
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("turn job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert_eq!(
+            failed.responder_identity_id.as_deref(),
+            Some(identity_id.as_str())
+        );
+        assert_eq!(failed.profile_id.as_deref(), Some(profile_id.as_str()));
+        assert!(failed.response_message_id.is_none());
+        assert!(failed.error_message.is_some());
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_session WHERE identity_id = ?")
+                .bind(&identity_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("AgentSession table is queryable");
+        assert_eq!(session_count, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_chat_rejects_write_capable_profile_before_adapter_invocation() {
+        let (db, event_bus, admitted, _, _) = setup_main_chat(
+            "cli",
+            "codex",
+            None,
+            Some((
+                "auto",
+                r#"{"model":"profile-model","sandbox":"workspace-write"}"#,
+            )),
+        )
+        .await;
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert!(failed
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("no-Workspace")));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_chat_rejects_read_only_profile_that_can_still_read_repository_files() {
+        let (db, event_bus, admitted, _, _) = setup_main_chat(
+            "cli",
+            "codex",
+            None,
+            Some(("plan", r#"{"model":"profile-model","sandbox":"read-only"}"#)),
+        )
+        .await;
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert!(failed
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("no-Workspace")));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_chat_uses_the_job_profile_credential_after_current_profile_changes() {
+        let secret_a = "durable-profile-credential-a";
+        let (db, event_bus, admitted, identity_id, profile_a_id) = setup_main_chat(
+            "cli",
+            "codex",
+            Some(secret_a),
+            Some(("plan", r#"{"model":"profile-model","sandbox":"read-only"}"#)),
+        )
+        .await;
+        let credentials = Arc::new(CredentialService::new(
+            Arc::clone(&db),
+            b"agent-chat-credential-test-key",
+        ));
+        let profile_a = db::AgentProfileRepo::get_profile(&*db, &profile_a_id)
+            .await
+            .expect("job profile loads")
+            .expect("job profile exists");
+        let credential_a_ref = profile_a
+            .credential_ref
+            .clone()
+            .expect("job profile freezes its credential reference");
+        assert_eq!(
+            profile_a.credential_ref.as_deref(),
+            Some(credential_a_ref.as_str())
+        );
+
+        let credential_b = credentials
+            .connect_api_key_credential(crate::credential_service::ConnectApiKeyCredential {
+                owner_user_id: "chat-owner".to_owned(),
+                provider: "openai".to_owned(),
+                label: "replacement profile credential".to_owned(),
+                credential: crate::credential_service::Secret::new(
+                    "current-profile-credential-b".to_owned(),
+                ),
+                base_url: Some("https://8.8.8.8/v1".to_owned()),
+            })
+            .await
+            .expect("replacement profile credential stores");
+        assert_ne!(credential_a_ref, credential_b.id);
+        let profile_b_id = db::new_uuid_v4();
+        db::AgentProfileRepo::create_profile(
+            &*db,
+            db::CreateAgentProfile {
+                id: profile_b_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: Some("openai".to_owned()),
+                model: Some("replacement-model".to_owned()),
+                reasoning_effort: None,
+                permission_policy: Some("plan".to_owned()),
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: r#"{"model":"replacement-model","sandbox":"read-only"}"#.to_owned(),
+                credential_ref: Some(credential_b.id.clone()),
+                daemon_id: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("replacement profile creates");
+        let current_agent = AgentRepo::get_by_id(&*db, &identity_id)
+            .await
+            .expect("current Agent loads")
+            .expect("current Agent exists");
+        db::AgentProfileRepo::select_profile(
+            &*db,
+            db::SelectAgentProfile {
+                identity_id: identity_id.clone(),
+                profile_id: profile_b_id,
+                expected_version: current_agent.version,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("current Agent profile changes after job admission");
+        credentials
+            .revoke_credential_at_version(
+                &credential_b.id,
+                "chat-owner",
+                credential_b.version,
+                &now_rfc3339(),
+            )
+            .await
+            .expect("replacement profile credential revokes");
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(
+            Arc::clone(&db),
+            task_executor,
+            event_bus,
+            Some(Arc::clone(&credentials)),
+        );
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert_eq!(failed.profile_id.as_deref(), Some(profile_a_id.as_str()));
+        assert_ne!(
+            failed.error_code.as_deref(),
+            Some("credential_unavailable"),
+            "the revoked current-profile credential B was not selected for the durable job"
+        );
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_agent_chat_profile_credential_fails_before_adapter_invocation() {
+        let (db, event_bus, admitted, _, profile_id) =
+            setup_main_chat("cli", "codex", Some("revoked-profile-secret"), None).await;
+        let credentials = Arc::new(CredentialService::new(
+            Arc::clone(&db),
+            b"agent-chat-credential-test-key",
+        ));
+        let profile = db::AgentProfileRepo::get_profile(&*db, &profile_id)
+            .await
+            .expect("job profile loads")
+            .expect("job profile exists");
+        let credential_ref = profile
+            .credential_ref
+            .expect("job profile freezes its credential reference");
+        let credential = db::CredentialHandleRepo::get_credential_handle(&*db, &credential_ref)
+            .await
+            .expect("credential handle loads")
+            .expect("credential handle exists");
+        credentials
+            .revoke_credential_at_version(
+                &credential.id,
+                "chat-owner",
+                credential.version,
+                &now_rfc3339(),
+            )
+            .await
+            .expect("profile credential revokes");
+
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker =
+            AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, Some(credentials));
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert_eq!(failed.error_code.as_deref(), Some("credential_unavailable"));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn historical_embedded_chat_binding_fails_durably_without_fallback() {
+        let (db, event_bus, admitted, identity_id, profile_id) =
+            setup_main_chat("native", "embedded", None, None).await;
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let cancellations = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = executors::HarnessAdapterRegistry::new();
+        registry.register(Box::new(RecordingChatHarnessAdapter {
+            kind: ExecutorKind::Codex,
+            executions: Arc::clone(&executions),
+            cancellations: Arc::clone(&cancellations),
+        }));
+        let task_executor: Arc<dyn TaskExecutor> =
+            Arc::new(executors::AdapterExecutor::new(Arc::new(registry)));
+        let worker = AgentChatTurnWorker::new(Arc::clone(&db), task_executor, event_bus, None);
+
+        assert_eq!(worker.run_once().await.expect("worker records failure"), 1);
+        let failed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+            .await
+            .expect("job query succeeds")
+            .expect("turn job exists");
+        assert_eq!(failed.status, db::AgentChatTurnState::RetryWait);
+        assert_eq!(failed.error_code.as_deref(), Some("configuration_invalid"));
+        let error = failed.error_message.expect("bounded failure persisted");
+        assert_eq!(
+            error,
+            "invalid operation: historical native/embedded Agent Chat profile is retired; select a replacement Agent and HarnessAdapter explicitly"
+        );
+        assert!(error.chars().count() <= MAX_ERROR_CHARS);
+        assert_eq!(
+            failed.responder_identity_id.as_deref(),
+            Some(identity_id.as_str())
+        );
+        assert_eq!(failed.profile_id.as_deref(), Some(profile_id.as_str()));
+        assert!(executions.lock().expect("execution log lock").is_empty());
+        assert!(cancellations
+            .lock()
+            .expect("cancellation log lock")
+            .is_empty());
     }
 
     #[test]

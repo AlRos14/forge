@@ -8,6 +8,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Production CLI HarnessAdapter execution that uses the shared process-group
+  boundary fails closed before spawning on non-Unix hosts, for both local and
+  remote execution paths. Unix executions use an execution-owned process group
+  and successful retirement verifies that the group is gone. This applies to
+  CLI harness execution using this boundary, not every Forge execution path.
+
+- Plan PR10 removes the Forge-owned Agent Host and keeps Main/Project Agent
+  Chat messages, turn jobs, binding/profile provenance, and history durable.
+  Current production HarnessAdapters cannot prove a no-filesystem boundary,
+  so Agent Chat model invocation and native typed Forge operations fail closed
+  until PR11 retires or migrates those verticals. Task Executions now keep the
+  daemon selected at admission for Start, Resume, Cancel, and recovery; a
+  missing frozen host fails closed rather than routing through a changed
+  Agent binding. Execution credentials remain snapshot-bound, local-only for
+  secret injection, and fail closed for remote credential-backed Start. The
+  daemon CLI now stops reporting if its command stream exits or fails and waits
+  for generation retirement on shutdown.
+
 - Task progress is now owned by the aggregate `task_lifecycle` record. Legacy
   `task.status` is a one-way compatibility projection; old workflow states,
   gates, hooks, and reviewer verdicts cannot advance lifecycle. Existing rows
@@ -65,6 +83,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   by the existing `harness_session_id` relation and a runtime-only generic
   Start/Resume invocation. The HarnessSession relation remains the durable
   continuity authority; typed `harness_capabilities` records support evidence.
+- Agent Resume now requires an explicit reusable `Execution.harness_session_id`
+  relation. Historical `execution.agent_session_id` values remain readable as
+  projections but cannot authorize Resume or be materialized into a new
+  HarnessSession; re-execution starts a fresh adapter session. Forge-owned
+  native/embedded Agent execution is retired. Historical native profiles and
+  session rows remain readable, but starting them fails closed and never
+  switches to another Agent, HarnessAdapter, account, or credential.
+- Credential-backed Task Executions now resolve only the `credential_ref` in
+  their immutable Execution snapshot. Local dispatch injects that exact
+  credential into the in-memory harness invocation; remote daemon dispatch
+  fails before Start until the daemon protocol can prove the same credential
+  identity. Agent Chat pins its durable job profile and fails before launch
+  unless its HarnessAdapter proves a `deny` / `no-filesystem` posture. Current
+  CLI adapters do not expose that posture, so those Agent Chat jobs fail
+  closed rather than receiving read-only filesystem access.
 - Remote execution dispatch now requires a daemon that advertises the generic
   HarnessInvocation protocol. Older daemons are rejected before Start or Resume
   dispatch because they cannot guarantee fresh-start and exact-resume semantics.
@@ -213,6 +246,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Cursor's periodic `/usage` poll no longer runs inside an active Execution.
+  Its PTY child can leave the wrapper's process group, so Forge cannot prove
+  that it retired with the Execution. New Cursor Executions report no
+  `account_usage` unless they produce a current observation; an older account
+  snapshot is never attached as if it were current. Cursor execution routing
+  now checks the configured executable without running `cursor-agent status`.
 - Run observability no longer treats missing USD cost as `$0.00`. Subscription
   Codex and Cursor runs show account quota instead, and Turns counts harness
   protocol turns rather than `assistant` log rows in the loaded tail.

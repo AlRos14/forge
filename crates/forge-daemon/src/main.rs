@@ -8,6 +8,7 @@ mod terminal;
 use std::{
     collections::BTreeMap,
     fs,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -18,7 +19,11 @@ use api_types::DaemonRegisterRequest;
 use clap::Parser;
 use credentials::DaemonCredentials;
 use forge_client::daemon_link::{register_with_retry, DaemonClient};
-use tokio::{sync::watch, time};
+use tokio::{
+    sync::watch,
+    task::{JoinError, JoinSet},
+    time,
+};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_REPORT_INTERVAL_SECONDS: u64 = 60;
@@ -77,15 +82,16 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| credentials::default_path(&cli.server));
     let owner_token = resolve_owner_token(cli.token.as_deref());
+    let mut client = DaemonClient::new(cli.server.clone())?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
+    let signal_shutdown_tx = shutdown_tx.clone();
+    let signal_handle = tokio::spawn(async move {
         termination_signal().await;
-        let _ = shutdown_tx.send(true);
+        let _ = signal_shutdown_tx.send(true);
     });
 
-    let mut client = DaemonClient::new(cli.server.clone())?;
-    if register_or_load_credentials(
+    let registration = register_or_load_credentials(
         &mut client,
         &credentials_path,
         &workspace_root,
@@ -95,46 +101,152 @@ async fn main() -> Result<()> {
         owner_token.as_deref(),
         shutdown_rx.clone(),
     )
-    .await?
-    .is_none()
-    {
-        tracing::info!("daemon stopped before registration completed");
-        return Ok(());
+    .await;
+    match registration {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            stop_signal_task(signal_handle).await;
+            tracing::info!("daemon stopped before registration completed");
+            return Ok(());
+        }
+        Err(error) => {
+            stop_signal_task(signal_handle).await;
+            return Err(error);
+        }
     }
 
     let client = Arc::new(client);
     let active_executions = forge_client::daemon_runtime::ActiveExecutionTracker::default();
-    let reporter_handle = tokio::spawn(reporter::run(
-        Arc::clone(&client),
-        workspace_root.clone(),
-        labels.clone(),
-        cli.interval_seconds,
-        active_executions.clone(),
-        shutdown_rx.clone(),
-    ));
-    let connect_handle = tokio::spawn(connect::run(
-        Arc::clone(&client),
-        workspace_root.clone(),
-        active_executions,
-        shutdown_rx.clone(),
-    ));
+    let connect_shutdown = shutdown_rx.clone();
+    let reporter_shutdown = shutdown_rx.clone();
+    let reporter_executions = active_executions.clone();
+    supervise_daemon_tasks(
+        shutdown_tx,
+        shutdown_rx,
+        signal_handle,
+        connect::run(
+            Arc::clone(&client),
+            workspace_root.clone(),
+            active_executions,
+            connect_shutdown,
+        ),
+        reporter::run(
+            Arc::clone(&client),
+            workspace_root.clone(),
+            labels.clone(),
+            cli.interval_seconds,
+            reporter_executions,
+            reporter_shutdown,
+        ),
+    )
+    .await
+}
 
-    wait_for_shutdown(shutdown_rx.clone()).await;
-    tracing::info!("forge-daemon shutting down");
+#[derive(Clone, Copy)]
+enum DaemonTask {
+    Connect,
+    Reporter,
+}
 
-    if let Err(error) = reporter_handle.await.context("join daemon reporter task")? {
-        tracing::warn!(error = %error, "daemon reporter stopped with error");
+impl DaemonTask {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Connect => "daemon command loop",
+            Self::Reporter => "daemon reporter",
+        }
+    }
+}
+
+async fn supervise_daemon_tasks<C, R>(
+    shutdown_tx: watch::Sender<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    signal_handle: tokio::task::JoinHandle<()>,
+    connect: C,
+    reporter: R,
+) -> Result<()>
+where
+    C: Future<Output = Result<()>> + Send + 'static,
+    R: Future<Output = Result<()>> + Send + 'static,
+{
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async move { (DaemonTask::Connect, connect.await) });
+    tasks.spawn(async move { (DaemonTask::Reporter, reporter.await) });
+
+    let mut failure = None;
+    while !*shutdown_rx.borrow() {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            joined = tasks.join_next() => {
+                match joined {
+                    Some(Ok((task, Ok(())))) => {
+                        if !*shutdown_rx.borrow() {
+                            failure = Some(anyhow!("{} exited before daemon shutdown", task.name()));
+                            break;
+                        }
+                    }
+                    Some(Ok((task, Err(error)))) => {
+                        failure = Some(error.context(format!("{} failed", task.name())));
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        failure = Some(join_task_error(error));
+                        break;
+                    }
+                    None => {
+                        failure = Some(anyhow!("daemon supervision tasks ended unexpectedly"));
+                        break;
+                    }
+                }
+            }
+        }
     }
 
-    connect_handle.abort();
-    match connect_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(error = %error, "daemon command loop stopped with error"),
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => tracing::warn!(error = %error, "daemon command loop task failed"),
+    let _ = shutdown_tx.send(true);
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((task, Err(error))) => {
+                if failure.is_none() {
+                    failure =
+                        Some(error.context(format!("{} failed during shutdown", task.name())));
+                } else {
+                    tracing::warn!(task = task.name(), error = %error, "daemon task failed during shutdown");
+                }
+            }
+            Err(error) => {
+                let error = join_task_error(error);
+                if failure.is_none() {
+                    failure = Some(error);
+                } else {
+                    tracing::warn!(error = %error, "daemon task failed during shutdown");
+                }
+            }
+            Ok((_, Ok(()))) => {}
+        }
     }
 
-    Ok(())
+    stop_signal_task(signal_handle).await;
+    if let Some(error) = failure {
+        tracing::error!(error = %error, "forge-daemon stopped after a supervised task failure");
+        Err(error)
+    } else {
+        tracing::info!("forge-daemon shutting down");
+        Ok(())
+    }
+}
+
+fn join_task_error(error: JoinError) -> anyhow::Error {
+    anyhow!("daemon supervision task failed to join: {error}")
+}
+
+async fn stop_signal_task(handle: tokio::task::JoinHandle<()>) {
+    if !handle.is_finished() {
+        handle.abort();
+    }
+    let _ = handle.await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -361,14 +473,6 @@ fn init_tracing() {
         .init();
 }
 
-async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
-        }
-    }
-}
-
 fn is_auth_failure(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("401") || message.contains("403")
@@ -388,4 +492,93 @@ async fn termination_signal() {
 #[cfg(not(unix))]
 async fn termination_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn fatal_connect_failure_stops_reporter_and_returns_original_error() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (signal_done_tx, signal_done_rx) = oneshot::channel::<()>();
+        let signal_tx = shutdown_tx.clone();
+        let signal_handle = tokio::spawn(async move {
+            let _ = signal_done_rx.await;
+            let _ = signal_tx.send(true);
+        });
+        let reporter_stopped = Arc::new(AtomicBool::new(false));
+        let reporter_flag = Arc::clone(&reporter_stopped);
+        let mut reporter_shutdown = shutdown_rx.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise_daemon_tasks(
+                shutdown_tx,
+                shutdown_rx,
+                signal_handle,
+                async { Err(anyhow!("injected retirement failure")) },
+                async move {
+                    let _ = reporter_shutdown.changed().await;
+                    assert!(*reporter_shutdown.borrow());
+                    reporter_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("supervisor reacts without an OS signal");
+
+        drop(signal_done_tx);
+        let error = result.expect_err("connect failure is fatal");
+        assert!(format!("{error:#}").contains("injected retirement failure"));
+        assert!(reporter_stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_joins_connect_and_reporter_cleanly() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (signal_done_tx, signal_done_rx) = oneshot::channel::<()>();
+        let signal_tx = shutdown_tx.clone();
+        let signal_handle = tokio::spawn(async move {
+            let _ = signal_done_rx.await;
+            let _ = signal_tx.send(true);
+        });
+        let connect_shutdown = shutdown_rx.clone();
+        let reporter_shutdown = shutdown_rx.clone();
+        let connect_stopped = Arc::new(AtomicBool::new(false));
+        let reporter_stopped = Arc::new(AtomicBool::new(false));
+        let connect_flag = Arc::clone(&connect_stopped);
+        let reporter_flag = Arc::clone(&reporter_stopped);
+        let supervisor = tokio::spawn(supervise_daemon_tasks(
+            shutdown_tx,
+            shutdown_rx,
+            signal_handle,
+            async move {
+                let mut shutdown = connect_shutdown;
+                let _ = shutdown.changed().await;
+                assert!(*shutdown.borrow());
+                connect_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            async move {
+                let mut shutdown = reporter_shutdown;
+                let _ = shutdown.changed().await;
+                assert!(*shutdown.borrow());
+                reporter_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+
+        signal_done_tx.send(()).expect("simulate normal signal");
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("graceful supervisor joins tasks")
+            .expect("supervisor task joins")
+            .expect("normal shutdown succeeds");
+        assert!(connect_stopped.load(Ordering::SeqCst));
+        assert!(reporter_stopped.load(Ordering::SeqCst));
+    }
 }

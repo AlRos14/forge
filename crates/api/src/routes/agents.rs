@@ -43,7 +43,7 @@ pub async fn register_agent(
     // capability matrix decides whether that entry can drive this executor.
     let credential_ref = if let Some(credential_id) = request.credential_id.as_deref() {
         let entry = state
-            .embedded_agent_service
+            .credential_service
             .require_owned_entry(&user.user_id, credential_id)
             .await?;
         services::provider_authorization::runtime_supported(

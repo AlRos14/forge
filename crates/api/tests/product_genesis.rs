@@ -3,10 +3,9 @@
 mod common;
 
 use api_types::{
-    AgentChatMessageListResponse, ConnectedEmbeddedAgentResponse, ErrorResponse,
-    ProductGenesisActiveResponse, ProductGenesisCharterResponse, ProductGenesisLifecycle,
-    ProductGenesisSession, ProductGenesisStartResponse, ProjectCharterApproval,
-    ProjectCharterRevision, ProjectResponse,
+    AgentChatMessageListResponse, ErrorResponse, ProductGenesisActiveResponse,
+    ProductGenesisCharterResponse, ProductGenesisLifecycle, ProductGenesisSession,
+    ProductGenesisStartResponse, ProjectCharterApproval, ProjectCharterRevision, ProjectResponse,
 };
 use axum::{http::Method, http::StatusCode, Router};
 use serde_json::json;
@@ -699,17 +698,8 @@ async fn connect_genesis_agent(
     app: &Router,
     token: &str,
     name: &str,
-) -> ConnectedEmbeddedAgentResponse {
-    common::connect_embedded_agent(
-        app,
-        token,
-        name,
-        "genesis-test",
-        "fixture-secret",
-        json!({"permissions": ["read_account", "read_project", "handoff"]}),
-        json!({"allowed": ["read_account", "read_project", "handoff"]}),
-    )
-    .await
+) -> common::HarnessAgentFixture {
+    common::create_harness_agent(app, token, name).await
 }
 
 fn user_authorization(action: &str, event_id: impl Into<String>) -> serde_json::Value {

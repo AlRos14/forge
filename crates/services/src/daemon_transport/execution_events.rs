@@ -6,12 +6,11 @@ use std::{
 
 use async_trait::async_trait;
 use db::{
-    AgentRepo, DaemonRepo, Execution, ExecutionRepo, ExecutionStatus, TaskRepo, UpdateExecution,
-    WorkspaceRepo,
+    AgentRepo, Execution, ExecutionRepo, ExecutionStatus, TaskRepo, UpdateExecution, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{LogKind, LogStream, LogWriter};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
@@ -136,7 +135,7 @@ impl ServerExecutionEventSink {
             return Ok(None);
         };
 
-        let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? else {
+        let Some(_agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? else {
             tracing::warn!(
                 sending_daemon = %daemon_id,
                 execution_id = %execution_id,
@@ -146,42 +145,29 @@ impl ServerExecutionEventSink {
             return Ok(None);
         };
 
-        let resolved_daemon_id = execution
-            .executor_config_snapshot_json
-            .as_deref()
-            .and_then(|snapshot| serde_json::from_str::<Value>(snapshot).ok())
-            .and_then(|snapshot| {
-                snapshot
-                    .get("resolved_daemon_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(ToOwned::to_owned)
-            });
-        let daemon_owns_execution = agent.daemon_id.as_deref() == Some(daemon_id)
-            || (agent.daemon_id.is_none() && resolved_daemon_id.as_deref() == Some(daemon_id))
-            || (agent.daemon_id.is_none()
-                && resolved_daemon_id.is_none()
-                && self.is_embedded_daemon_sender(daemon_id).await?);
-        if daemon_owns_execution {
+        let resolved_daemon_id = match super::router::resolved_daemon_id_for_execution(&execution) {
+            Ok(daemon_id) => daemon_id,
+            Err(error) => {
+                tracing::warn!(
+                    sending_daemon = %daemon_id,
+                    execution_id = %execution_id,
+                    %error,
+                    "rejecting execution notification without a frozen host identity"
+                );
+                return Ok(None);
+            }
+        };
+        if resolved_daemon_id == daemon_id {
             return Ok(Some(execution));
         }
 
         tracing::warn!(
             sending_daemon = %daemon_id,
-            expected_daemon = ?agent.daemon_id,
-            resolved_daemon = ?resolved_daemon_id,
+            expected_daemon = %resolved_daemon_id,
             execution_id = %execution_id,
             "rejecting execution notification: daemon does not own this execution"
         );
         Ok(None)
-    }
-
-    async fn is_embedded_daemon_sender(&self, daemon_id: &str) -> Result<bool> {
-        Ok(DaemonRepo::get_by_id(&*self.db, daemon_id)
-            .await?
-            .is_some_and(|daemon| {
-                daemon.machine_id == crate::embedded_daemon::embedded_machine_id()
-            }))
     }
 }
 

@@ -1,11 +1,8 @@
 use async_trait::async_trait;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
-#[cfg(unix)]
-use command_group::{Signal, UnixChildExt};
 use executors::{
     AvailabilityInfo, AvailabilityStatus, CursorConfig, DiscoverContext, DiscoveredOptions,
     ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
-    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy,
+    HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -111,7 +108,7 @@ impl RuntimePromptFile {
 
 #[derive(Clone)]
 struct RunningProcess {
-    child: Arc<AsyncMutex<AsyncGroupChild>>,
+    child: Arc<AsyncMutex<ProcessGroupChild>>,
     cancel: CancellationToken,
 }
 
@@ -363,6 +360,44 @@ impl HarnessAdapter for CursorAdapter {
         detect_cursor_availability()
     }
 
+    fn detect(&self, config: &Value) -> AvailabilityInfo {
+        let Ok(config) = serde_json::from_value::<CursorConfig>(config.clone()) else {
+            return AvailabilityInfo {
+                status: AvailabilityStatus::NotFound,
+                authenticated_at: None,
+                config_path: None,
+            };
+        };
+        let command = crate::command::CommandBuilder::new("cursor-agent")
+            .overrides(&config.command_overrides);
+        let Some(executable) = command.resolve_executable() else {
+            return AvailabilityInfo {
+                status: AvailabilityStatus::NotFound,
+                authenticated_at: None,
+                config_path: None,
+            };
+        };
+
+        let configured_api_key = config
+            .command_overrides
+            .env
+            .as_ref()
+            .and_then(|env| env.get("CURSOR_API_KEY"))
+            .is_some_and(|value| !value.trim().is_empty());
+        let ambient_api_key = std::env::var("CURSOR_API_KEY")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        AvailabilityInfo {
+            status: if configured_api_key || ambient_api_key {
+                AvailabilityStatus::Authenticated
+            } else {
+                AvailabilityStatus::Installed
+            },
+            authenticated_at: None,
+            config_path: Some(executable.to_string_lossy().into_owned()),
+        }
+    }
+
     fn normalize_config(
         &self,
         config: &Value,
@@ -471,38 +506,57 @@ impl HarnessAdapter for CursorAdapter {
                 .unwrap_or_else(|| prompt.clone()),
         );
         command.current_dir(&ctx.worktree_path);
-        let mut child = command.group_spawn()?;
+        let mut child = ProcessGroupChild::spawn(&mut command)?;
 
         let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
             None => {
-                signal_child(&mut child);
-                let _ = child.wait().await;
-                return Err(ExecutorError::Other(
-                    "failed to capture cursor stdout".to_owned(),
-                ));
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture cursor stdout{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
             }
         };
         let stderr = match child.inner().stderr.take() {
             Some(stderr) => stderr,
             None => {
-                signal_child(&mut child);
-                let _ = child.wait().await;
-                return Err(ExecutorError::Other(
-                    "failed to capture cursor stderr".to_owned(),
-                ));
+                let cleanup = crate::command::kill_group_and_wait(&mut child).await;
+                return Err(ExecutorError::Other(format!(
+                    "failed to capture cursor stderr{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process-group cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
             }
         };
 
         let child = Arc::new(AsyncMutex::new(child));
+        let mut group_kill_guard = crate::command::GroupKillOnDrop::new(child.clone());
         let cancel = CancellationToken::new();
-        self.insert_process(
+        if let Err(registration_error) = self.insert_process(
             ctx.execution_id.clone(),
             RunningProcess {
                 child: child.clone(),
                 cancel: cancel.clone(),
             },
-        )?;
+        ) {
+            let cleanup_result = {
+                let mut child = child.lock().await;
+                crate::command::kill_group_and_wait(&mut child).await
+            };
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(ExecutorError::Other(format!(
+                    "Cursor process registration failed ({registration_error}); child termination failed ({cleanup_error})"
+                )));
+            }
+            group_kill_guard.disarm();
+            return Err(registration_error);
+        }
 
         let mut writer = LogWriter::new(
             &ctx.logs_path,
@@ -527,14 +581,11 @@ impl HarnessAdapter for CursorAdapter {
             .await?;
 
         let stream_result = stream_child_output(stdout, stderr, &mut writer, cancel.clone()).await;
-        let stream_failed = stream_result.is_err();
         let status = {
             let mut child = child.lock().await;
-            if stream_failed {
-                signal_child(&mut child);
-            }
-            child.wait().await?
+            crate::command::kill_group_and_wait(&mut child).await?
         };
+        group_kill_guard.disarm();
         self.remove_process(&ctx.execution_id)?;
 
         let stream = stream_result?;
@@ -622,7 +673,7 @@ impl HarnessAdapter for CursorAdapter {
         if let Some(running) = running {
             running.cancel.cancel();
             let mut child = running.child.lock().await;
-            signal_child(&mut child);
+            crate::command::kill_group_and_wait(&mut child).await?;
         }
 
         Ok(())
@@ -651,9 +702,10 @@ fn resolve_usage_program(config: &CursorConfig) -> String {
         })
 }
 
-/// Cancellable form used by the bounded live-usage probe around an active
-/// execution. Every wait has a deadline, and cancellation drops a
-/// `kill_on_drop` child so a probe cannot survive its execution.
+/// Cancellable one-shot query used by explicit account-usage observation. This
+/// query is not scheduled from active Executions because the PTY wrapper can
+/// create a process outside the wrapper's group, which cannot satisfy the
+/// Execution retirement guarantee.
 pub async fn query_account_usage_with_cancel(
     config: &CursorConfig,
     cancel: CancellationToken,
@@ -1302,17 +1354,6 @@ fn executable_in_path(name: &str) -> bool {
     which::which(name).is_ok()
 }
 
-fn signal_child(child: &mut AsyncGroupChild) {
-    #[cfg(unix)]
-    {
-        let _ = child.signal(Signal::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.start_kill();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1421,40 @@ mod tests {
                 "--resume",
                 "session-123",
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_detection_does_not_run_cursor_status_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("fixture directory creates");
+        let executable = dir.path().join("cursor-agent");
+        let marker = dir.path().join("invoked");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+        )
+        .expect("fake Cursor command writes");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("fake Cursor command is executable");
+
+        let availability = CursorAdapter::new().detect(&serde_json::json!({
+            "base_command_override": executable.display().to_string()
+        }));
+
+        assert!(matches!(
+            availability.status,
+            AvailabilityStatus::Authenticated | AvailabilityStatus::Installed
+        ));
+        assert_eq!(
+            availability.config_path.as_deref(),
+            Some(executable.to_str().unwrap())
+        );
+        assert!(
+            !marker.exists(),
+            "Cursor execution detection must inspect the executable without running it"
         );
     }
 

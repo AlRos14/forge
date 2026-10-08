@@ -11,8 +11,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse, RepoResponse,
-    TaskResponse,
+    AgentProfileResponse, AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse,
+    RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -27,6 +27,12 @@ pub struct Harness {
     pub app: Router,
     pub state: Arc<AppState>,
     _web_dist_dir: TestDir,
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessAgentFixture {
+    pub agent: AgentResponse,
+    pub profile: AgentProfileResponse,
 }
 
 pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
@@ -374,42 +380,33 @@ pub async fn create_provider_entry(
     .await
 }
 
-/// Provider entry + direct embedded agent in one helper: the canonical
-/// two-step replacement for the removed single-shot connect endpoint.
-#[allow(dead_code)]
-pub async fn connect_embedded_agent(
-    app: &Router,
-    token: &str,
-    name: &str,
-    credential_label: &str,
-    credential: &str,
-    account_permission_ceiling: Value,
-    tool_policy: Value,
-) -> api_types::ConnectedEmbeddedAgentResponse {
-    let entry = create_provider_entry(
-        app,
-        token,
-        "openai_compatible",
-        credential_label,
-        credential,
-        "https://8.8.8.8",
-    )
-    .await;
-    json_request_with_bearer(
+/// Create a normal external-harness Agent and load its selected profile.
+pub async fn create_harness_agent(app: &Router, token: &str, name: &str) -> HarnessAgentFixture {
+    let agent: AgentResponse = json_request_with_bearer(
         app,
         Method::POST,
-        "/api/v1/embedded-agents",
+        "/api/v1/agents",
         token,
         json!({
             "name": name,
-            "credential_id": entry.id,
-            "model": "test-model",
-            "account_permission_ceiling": account_permission_ceiling,
-            "tool_policy": tool_policy,
+            "executor_type": "codex"
         }),
         StatusCode::OK,
     )
-    .await
+    .await;
+    let profiles: Vec<AgentProfileResponse> = empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/agents/{}/profiles", agent.id),
+        token,
+        StatusCode::OK,
+    )
+    .await;
+    let profile = profiles
+        .into_iter()
+        .find(|profile| profile.id == agent.profile_id)
+        .expect("selected profile is readable");
+    HarnessAgentFixture { agent, profile }
 }
 
 pub async fn raw_json_request(

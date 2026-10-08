@@ -318,27 +318,31 @@ Codex `account/rateLimits/updated` events captured during a run are stored as
 `{ "rateLimits": … }` and linked to that execution (`account_usage` on
 `GET /api/v1/executions/{id}`). USD `cost_usd` is only present when a harness
 reports on-demand API billing; subscription Codex/Cursor runs leave it null.
-Cursor execution observations are labeled `cursor_poll` because `/usage` is a
-bounded interactive probe, not a native streaming event. The current Agent
-usage surface reports `manual_refresh_supported: false` and
-`POST /usage/refresh` returns `409 usage_refresh_unsupported`: CLI usage belongs
-to the daemon that executes it, while native embedded/provider usage is exposed
-through the provider-entry usage surface. Cursor's bounded in-process usage cache is keyed by the
-effective executable, arguments, and environment; a probe failure never falls
-back to another configuration's observation. Account keys include the harness
-kind and the host that owns host-local credentials; a lexical `CODEX_HOME` value
-is not canonicalized through the server filesystem, and an executable or
-wrapper path is not an account identity. An explicit credential reference is
-required to prove that a credential context is shared across hosts. Daemon
-executions persist native Codex observations and daemon-side Cursor polls
-through the same usage path as local executions. Pinned/local Agents query
-their exact account key. An unpinned remote CLI Agent does not receive a
-synthetic `unresolved-daemon` pool; its usage endpoint returns the newest
-observation linked to one of that Agent's Executions, including the actual
-`account_key` and `daemon_id`. Daemon notifications for such an execution are
-accepted only from the resolved daemon recorded in its immutable execution
-snapshot. If no such observation exists, both fields are `null` and
-`available` is `false`.
+Cursor execution observations were labeled `cursor_poll` because `/usage` is a
+bounded interactive probe, not a native streaming event. New Cursor Executions
+no longer start that periodic probe: the PTY wrapper can create a process in a
+separate session, so its complete lifetime cannot be verified by the Execution
+generation. A Cursor Execution reports `account_usage: null` when it has no
+current observation; Forge does not attach an older account snapshot to that
+Execution. The Agent usage endpoint continues to expose stored snapshot
+freshness, including historical `cursor_poll` records. The current Agent usage
+surface reports `manual_refresh_supported: false` and `POST /usage/refresh`
+returns `409 usage_refresh_unsupported`; provider-entry usage remains available
+for the providers supported there. Cursor's bounded in-process usage cache is
+keyed by the effective executable, arguments, and environment; a probe failure
+never falls back to another configuration's observation. Account keys include
+the harness kind and the host that owns host-local credentials; a lexical
+`CODEX_HOME` value is not canonicalized through the server filesystem, and an
+executable or wrapper path is not an account identity. An explicit credential
+reference is required to prove that a credential context is shared across
+hosts. Daemon executions continue to persist native Codex observations.
+Pinned/local Agents query their exact account key. An unpinned remote CLI Agent
+does not receive a synthetic `unresolved-daemon` pool; its usage endpoint
+returns the newest stored observation linked to one of that Agent's Executions,
+including the actual `account_key` and `daemon_id`. Daemon notifications for
+such an execution are accepted only from the resolved daemon recorded in its
+immutable execution snapshot. If no observation exists, both fields are `null`
+and `available` is `false`.
 Cursor's large control prompt is stored transiently in a private runtime
 directory outside the Git worktree and is removed after the execution attempt,
 so it cannot enter task diffs or commits.
@@ -779,26 +783,35 @@ message with a non-success turn is never rendered as a completed exchange.
 Cancellation is allowed only for an authorized non-terminal turn and requires
 its current optimistic version plus an idempotency key; stale or terminal
 requests return a conflict instead of rewriting the durable outcome.
-CLI-backed assistant output is bounded to 500 Unicode characters before it is
-admitted to the immutable message, semantic-memory, FTS, and subsequent prompt
-history surfaces.
+Assistant output is bounded to 500 Unicode characters before admission to the
+immutable message, semantic-memory, FTS, and subsequent prompt-history
+surfaces.
 
-Main Agent tools are limited to discovery, configured web search, Project
+**Plan PR10 transition:** message admission, immutable history, durable turn
+jobs, profile/binding provenance, retry state, and historical reads remain.
+The current production HarnessAdapter registry cannot prove a no-filesystem
+boundary, so Main and Project Agent Chat jobs fail closed before model
+invocation. The role-scoped Main/Project operations described below are not
+available through these Chat turns during this transition. Task Workers and
+reviewers continue through the existing Task assignment, workflow, Workspace,
+validation, review, and delivery path. PR11 owns Main/Project vertical
+retirement or migration.
+
+The Main Agent's intended scope is discovery, configured web search, Project
 lifecycle/organization, bounded portfolio summaries, and explicit handoff. A
-Project Agent may create and manage Tasks only in its bound Project through
-`TaskService`; neither Main nor Project Agent Chat receives repository access.
-Task Workers and reviewers continue through the existing Task assignment,
-workflow, Workspace, validation, review, and delivery path.
+Project Agent's intended scope is Task management only in its bound Project
+through `TaskService`. Neither role grants repository access through Chat.
+Under PR10 these role descriptions do not imply an operational Agent Chat
+model or Forge tool channel.
 
-When configured, both Main and Project Agent native Chat sessions receive the
-read-only `forge_public_web_search` tool. It is scope-derived (Main account or
-the authenticated Project binding), accepts only a bounded query and result
-limit, and returns at most ten `{url,title,snippet,retrieved_at}` records plus
-untrusted-content metadata. The endpoint is public HTTPS and unauthenticated;
-Forge sends no cookies or credentials. Search results do not create an
-`AgentAction`, persist a decision, or imply user approval. The tool is absent
-when `public_search.endpoint` is not configured, and `web.search` is rejected
-as a proposal operation.
+The public search endpoint remains unauthenticated HTTPS and sends no cookies
+or credentials. Its bounded result contract returns at most ten
+`{url,title,snippet,retrieved_at}` records plus untrusted-content metadata.
+It is not connected to the current Main or Project Agent Chat turn worker:
+those jobs fail closed before model invocation, and no native typed Chat tool
+catalog is available under PR10. Search results do not create an `AgentAction`,
+persist a decision, or imply user approval. PR11 owns migration of the
+vertical Chat tool surfaces.
 
 ### Main-to-Project handoff
 

@@ -59,6 +59,44 @@ pub fn from_adapter_interpretation(
     )
 }
 
+/// Fail closed for Agent Chat unless the selected HarnessAdapter proves that
+/// the invocation cannot read or write a host filesystem. Read-only and plan
+/// modes are insufficient because they still expose files to the harness.
+pub fn validate_agent_chat_no_workspace_policy(
+    executor_kind: &ExecutorKind,
+    policy: &EffectiveExecutionPolicy,
+    config: &Value,
+) -> Result<(), String> {
+    let opaque_overrides_present = ["base_command_override", "additional_params", "env"]
+        .into_iter()
+        .any(|key| match config.get(key) {
+            Some(Value::String(value)) => !value.trim().is_empty(),
+            Some(Value::Array(values)) => !values.is_empty(),
+            Some(Value::Object(values)) => !values.is_empty(),
+            Some(Value::Bool(value)) => *value,
+            _ => false,
+        });
+    if policy.is_high_risk
+        || policy.workspace_root.is_some()
+        || !policy.scoped_tools.is_empty()
+        || !policy.mcp_servers.is_empty()
+        || opaque_overrides_present
+    {
+        return Err(format!(
+            "{executor_kind} HarnessAdapter configuration cannot prove Agent Chat no-Workspace authority"
+        ));
+    }
+
+    let compatible =
+        policy.permission_policy == "deny" && policy.isolation_posture == "no-filesystem";
+    if !compatible {
+        return Err(format!(
+            "{executor_kind} HarnessAdapter has no proven no-Workspace Agent Chat posture"
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_workspace_policy(
     effective_cwd: Option<&str>,
     workspace_root: Option<&str>,
@@ -197,6 +235,94 @@ mod tests {
         );
         assert_eq!(policy.permission_policy, "plan");
         assert!(!policy.is_high_risk);
+    }
+
+    #[test]
+    fn agent_chat_requires_an_explicit_no_filesystem_adapter_posture() {
+        let denied = from_harness_interpretation(
+            &ExecutorKind::Codex,
+            "deny",
+            "no-filesystem",
+            Some("/tmp/empty-chat"),
+            None,
+            &json!({}),
+        );
+        assert!(validate_agent_chat_no_workspace_policy(
+            &ExecutorKind::Codex,
+            &denied,
+            &json!({"permission_policy":"deny","sandbox":"no-filesystem"}),
+        )
+        .is_ok());
+
+        for (kind, permission, isolation) in [
+            (ExecutorKind::Codex, "plan", "read-only"),
+            (ExecutorKind::ClaudeCode, "unknown", "plan"),
+            (ExecutorKind::Cursor, "unknown", "propose_only"),
+        ] {
+            let interpreted = from_harness_interpretation(
+                &kind,
+                permission,
+                isolation,
+                Some("/tmp/empty-chat"),
+                None,
+                &json!({}),
+            );
+            assert!(
+                validate_agent_chat_no_workspace_policy(&kind, &interpreted, &json!({}),).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_chat_rejects_write_unknown_and_opaque_command_postures() {
+        let write = from_harness_interpretation(
+            &ExecutorKind::Codex,
+            "auto",
+            "workspace-write",
+            Some("/tmp/empty-chat"),
+            None,
+            &json!({}),
+        );
+        assert!(validate_agent_chat_no_workspace_policy(
+            &ExecutorKind::Codex,
+            &write,
+            &json!({"permission_policy":"auto","sandbox":"workspace-write"}),
+        )
+        .is_err());
+
+        let unknown = from_harness_interpretation(
+            &ExecutorKind::Smith,
+            "unknown",
+            "not_applicable",
+            Some("/tmp/empty-chat"),
+            None,
+            &json!({}),
+        );
+        assert!(validate_agent_chat_no_workspace_policy(
+            &ExecutorKind::Smith,
+            &unknown,
+            &json!({}),
+        )
+        .is_err());
+
+        let no_filesystem = from_harness_interpretation(
+            &ExecutorKind::Codex,
+            "deny",
+            "no-filesystem",
+            Some("/tmp/empty-chat"),
+            None,
+            &json!({}),
+        );
+        assert!(validate_agent_chat_no_workspace_policy(
+            &ExecutorKind::Codex,
+            &no_filesystem,
+            &json!({
+                "permission_policy":"deny",
+                "sandbox":"no-filesystem",
+                "additional_params":["--full-auto"]
+            }),
+        )
+        .is_err());
     }
 
     #[test]

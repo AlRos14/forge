@@ -197,7 +197,16 @@ async fn seed_running_execution(
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                json!({
+                    "agent_id": agent_id,
+                    "agent_daemon_id": owner_daemon_id,
+                    "resolved_daemon_id": owner_daemon_id,
+                    "executor_type": "shell",
+                    "config": {}
+                })
+                .to_string(),
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now,
@@ -322,6 +331,89 @@ async fn remote_resume_requires_protocol_feature_and_dispatches_exact_session() 
         .expect("supported Resume dispatches");
     assert!(result.accepted);
     handle.await.expect("daemon exchange joins");
+}
+
+#[tokio::test]
+async fn execution_start_after_same_daemon_reconnect_uses_current_generation() {
+    let registry = make_registry();
+    let (connection_a, mut outbound_a) = DaemonConnection::new("daemon-1".to_owned());
+    let connection_a_id = connection_a.id();
+    registry.register("daemon-1".to_owned(), connection_a);
+
+    // Execution admission has frozen daemon-1. Its socket reconnects before
+    // Start, so the request must use the current generation of that same host.
+    let (connection_b, mut outbound_b) = DaemonConnection::new("daemon-1".to_owned());
+    assert_ne!(connection_a_id, connection_b.id());
+    registry.register("daemon-1".to_owned(), connection_b);
+
+    let dispatcher = registry.clone();
+    let responder = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request {
+            id: capabilities_id,
+            method,
+            ..
+        } = outbound_b
+            .recv()
+            .await
+            .expect("replacement receives protocol negotiation")
+        else {
+            panic!("expected protocol request on current generation");
+        };
+        assert_eq!(method, api_types::METHOD_PROTOCOL_CAPABILITIES);
+        dispatcher.dispatch_incoming(
+            "daemon-1",
+            api_types::DaemonFrame::Response {
+                id: capabilities_id,
+                result: json!({
+                    "schema_version": 1,
+                    "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+                }),
+            },
+        );
+
+        let api_types::DaemonFrame::Request {
+            id: start_id,
+            method,
+            params,
+        } = outbound_b
+            .recv()
+            .await
+            .expect("replacement receives Execution Start")
+        else {
+            panic!("expected Start request on current generation");
+        };
+        assert_eq!(method, api_types::METHOD_EXECUTION_START);
+        assert_eq!(params["execution_id"], "execution-after-reconnect");
+        dispatcher.dispatch_incoming(
+            "daemon-1",
+            api_types::DaemonFrame::Response {
+                id: start_id,
+                result: json!({"execution_id":"execution-after-reconnect", "accepted":true}),
+            },
+        );
+    });
+
+    let provider = super::RemoteExecutionProvider::new(registry, "daemon-1".to_owned());
+    let result = provider
+        .start(api_types::ExecutionStartParams {
+            task_id: "task-1".to_owned(),
+            execution_id: "execution-after-reconnect".to_owned(),
+            role: "worker".to_owned(),
+            workspace_path: "/work".to_owned(),
+            executor_type: "codex".to_owned(),
+            executor_config: json!({"executor_type":"codex","config":{}}),
+            prompt: json!({"description":"start after same-host reconnect"}),
+            invocation: api_types::HarnessInvocation::Start,
+            max_turns: None,
+        })
+        .await
+        .expect("Start reaches the current generation for frozen daemon-1");
+    assert!(result.accepted);
+    assert!(
+        outbound_a.try_recv().is_err(),
+        "old generation stays unused"
+    );
+    responder.await.expect("replacement responder joins");
 }
 
 #[tokio::test]
@@ -791,6 +883,130 @@ async fn execution_log_from_non_owner_daemon_is_rejected() {
         unchanged.last_activity_at.as_deref(),
         Some("1970-01-01T00:00:00Z")
     );
+}
+
+#[tokio::test]
+async fn execution_host_does_not_follow_a_mutable_agent_daemon_binding() {
+    let db = sqlite_db().await;
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = std::env::temp_dir().join(format!(
+        "forge-daemon-transport-frozen-host-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("workspace root creates");
+    let owner_daemon_id = seed_daemon(&db, "frozen-owner-machine").await;
+    let replacement_daemon_id = seed_daemon(&db, "mutable-agent-machine").await;
+    let (agent_id, execution) = seed_running_execution(&db, &owner_daemon_id).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    AgentRepo::update(
+        &*db,
+        db::UpdateAgent {
+            id: agent.id,
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(Some(replacement_daemon_id.clone())),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Agent daemon binding changes after admission");
+
+    let sink = execution_event_sink(Arc::clone(&db), Arc::clone(&event_bus), workspace_root);
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::clone(&event_bus),
+        sink as Arc<dyn DaemonExecutionEventHandler>,
+    ));
+    register_daemon_connection(&registry, &owner_daemon_id);
+    register_daemon_connection(&registry, &replacement_daemon_id);
+
+    registry.dispatch_incoming(
+        &replacement_daemon_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_EXECUTION_LOG.to_owned(),
+            params: json!({
+                "execution_id": execution.id,
+                "seq": 1,
+                "stream": "stdout",
+                "line": "replacement daemon must not own this execution",
+                "ts": now_rfc3339(),
+            }),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let unchanged = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(
+        unchanged.last_activity_at.as_deref(),
+        Some("1970-01-01T00:00:00Z")
+    );
+
+    registry.dispatch_incoming(
+        &owner_daemon_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_EXECUTION_LOG.to_owned(),
+            params: json!({
+                "execution_id": execution.id,
+                "seq": 1,
+                "stream": "stdout",
+                "line": "frozen daemon owns this execution",
+                "ts": now_rfc3339(),
+            }),
+        },
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        if updated.last_activity_at.as_deref() != Some("1970-01-01T00:00:00Z") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "frozen daemon notification was not accepted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_execution_snapshot_without_resolved_daemon_fails_closed() {
+    let db = sqlite_db().await;
+    let owner_daemon_id = seed_daemon(&db, "legacy-owner-machine").await;
+    let (_agent_id, mut execution) = seed_running_execution(&db, &owner_daemon_id).await;
+    execution.executor_config_snapshot_json = Some(
+        json!({
+            "agent_daemon_id": owner_daemon_id,
+            "executor_type": "codex",
+            "config": {}
+        })
+        .to_string(),
+    );
+
+    let error = super::router::resolved_daemon_id_for_execution(&execution)
+        .expect_err("a pre-field snapshot cannot select the current Agent host");
+    assert!(matches!(error, ServiceError::InvalidOperation { .. }));
 }
 
 #[tokio::test]

@@ -268,28 +268,22 @@ async fn run_daemon_loop(
         config.initial_credentials.token.clone(),
     );
     let active_executions = config.active_executions.clone();
-    let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
+    let mut connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
         shutdown_rx,
         active_executions.clone(),
     ));
-    loop {
+    let shutdown_error = loop {
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("listen for Ctrl-C")?;
-                let _ = shutdown_tx.send(true);
-                connect_handle.abort();
-                match connect_handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("daemon command stream stopped: {error}"),
-                    Err(error) if error.is_cancelled() => {}
-                    Err(error) => eprintln!("daemon command stream task failed: {error}"),
-                }
-                println!("{}", config.stopped_message);
-                return Ok(());
+            result = &mut connect_handle => {
+                return command_stream_finished(result);
             }
-            () = tokio::time::sleep(Duration::from_secs(config.interval_seconds.max(1))) => {
+            signal = tokio::signal::ctrl_c() => {
+                break signal.context("listen for Ctrl-C").err();
+            }
+            report_result = async {
+                tokio::time::sleep(Duration::from_secs(config.interval_seconds.max(1))).await;
                 let credentials = read_credentials(config.credentials_path)?
                     .ok_or_else(|| anyhow!("missing daemon credentials at {}", config.credentials_path.display()))?;
                 let daemon = report_once(
@@ -305,8 +299,46 @@ async fn run_daemon_loop(
                 } else {
                     println!("reported daemon {}", daemon.id);
                 }
+                Ok::<(), anyhow::Error>(())
+            } => {
+                if let Err(error) = report_result {
+                    break Some(error.context("daemon reporter failed"));
+                }
             }
         }
+    };
+
+    stop_command_stream(&shutdown_tx, connect_handle, shutdown_error).await?;
+    println!("{}", config.stopped_message);
+    Ok(())
+}
+
+async fn stop_command_stream(
+    shutdown: &watch::Sender<bool>,
+    connect_handle: tokio::task::JoinHandle<Result<()>>,
+    shutdown_error: Option<anyhow::Error>,
+) -> Result<()> {
+    let _ = shutdown.send(true);
+    let retirement_result = match connect_handle.await {
+        Ok(result) => result.context("daemon command stream failed during shutdown"),
+        Err(error) => Err(error).context("daemon command stream task failed to join"),
+    };
+    match (shutdown_error, retirement_result) {
+        (Some(shutdown_error), Ok(())) => Err(shutdown_error),
+        (Some(shutdown_error), Err(retirement_error)) => Err(anyhow!(
+            "{shutdown_error:#}; command-stream retirement also failed: {retirement_error:#}"
+        )),
+        (None, retirement_result) => retirement_result,
+    }
+}
+
+fn command_stream_finished(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => Err(anyhow!("daemon command stream stopped unexpectedly")),
+        Ok(Err(error)) => Err(error).context("daemon command stream stopped"),
+        Err(error) => Err(error).context("daemon command stream task failed"),
     }
 }
 
@@ -650,7 +682,82 @@ fn print_daemon(output: &OutputFormat, daemon: &DaemonResponse) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_workspace_root;
+    use super::{command_stream_finished, prepare_workspace_root, stop_command_stream};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_command_stream_retirement() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        let retired = Arc::new(AtomicBool::new(false));
+        let task_retired = Arc::clone(&retired);
+        let connect_handle = tokio::spawn(async move {
+            receiver.changed().await?;
+            task_retired.store(true, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        });
+
+        stop_command_stream(&shutdown, connect_handle, None)
+            .await
+            .expect("command stream retirement succeeds");
+
+        assert!(retired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_command_stream_retirement_failure() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        let connect_handle = tokio::spawn(async move {
+            receiver.changed().await?;
+            Err::<(), anyhow::Error>(anyhow::anyhow!("generation retirement failed"))
+        });
+
+        let error = stop_command_stream(&shutdown, connect_handle, None)
+            .await
+            .expect_err("retirement failure fails daemon shutdown");
+
+        assert!(format!("{error:#}").contains("generation retirement failed"));
+    }
+
+    #[tokio::test]
+    async fn reporter_failure_waits_for_command_stream_retirement() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        let retired = Arc::new(AtomicBool::new(false));
+        let task_retired = Arc::clone(&retired);
+        let connect_handle = tokio::spawn(async move {
+            receiver.changed().await?;
+            task_retired.store(true, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let error = stop_command_stream(
+            &shutdown,
+            connect_handle,
+            Some(anyhow::anyhow!("reporter failed")),
+        )
+        .await
+        .expect_err("reporter failure is returned after retirement");
+
+        assert!(retired.load(Ordering::SeqCst));
+        assert!(format!("{error:#}").contains("reporter failed"));
+    }
+
+    #[test]
+    fn command_stream_exit_stops_the_daemon_report_loop() {
+        let result = command_stream_finished(Ok(Ok(())));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("stopped unexpectedly"));
+
+        let result = command_stream_finished(Ok(Err(anyhow::anyhow!("retirement failed"))));
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("retirement failed"));
+    }
 
     #[test]
     fn prepare_workspace_root_creates_missing_directory() {

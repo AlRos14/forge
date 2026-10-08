@@ -14,6 +14,7 @@ pub mod collaboration_service;
 pub mod context_manifest;
 pub mod coordination_consumer;
 pub mod coordination_service;
+pub mod credential_service;
 pub mod daemon_monitor;
 pub mod daemon_service;
 pub mod daemon_transport;
@@ -22,9 +23,7 @@ pub(crate) mod deferred_dispatch;
 pub mod demo;
 pub mod diff;
 pub mod domain_event_service;
-pub mod embedded_agent_service;
 pub mod embedded_daemon;
-pub mod embedded_task_executor;
 pub mod execution_baseline;
 pub mod external_api;
 pub mod external_sync;
@@ -37,7 +36,6 @@ pub mod memory_source;
 pub mod merge_service;
 pub mod milestone_orchestration;
 pub mod milestone_runtime;
-pub mod native_tools;
 pub mod notification_service;
 pub mod oauth_service;
 pub mod operating_skills;
@@ -117,6 +115,11 @@ pub use coordination_service::{
     DeliverInboxInput, ExecuteActionInput, ExecuteTaskProposalInput, ExecutedTaskProposal,
     ProposeActionInput, TaskProposalPayload, TransferCommitmentInput, UpdateCommitmentInput,
 };
+pub use credential_service::{
+    ConnectApiKeyCredential, ConnectOAuthCredential, CredentialError, CredentialRevocationOutcome,
+    CredentialService, OAuthCredentialBundle, ProviderEntryTestOutcome, ProviderUsageOutcome,
+    ProviderUsageWindowOutcome, Secret,
+};
 pub use daemon_monitor::DaemonMonitor;
 pub use daemon_service::{
     DaemonRegisterInput, DaemonRegistration, DaemonReportInput, DaemonService,
@@ -130,9 +133,7 @@ pub use default_agents::ensure_default_agents;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
 pub use domain_event_service::DomainEventService;
-pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
-pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
 pub use execution_baseline::{
     baseline_column_json, render_execution_baseline, validate_execution_baseline_policy,
     BaselineColumnJson, ExecutionBaselineRender, EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
@@ -164,7 +165,6 @@ pub use milestone_orchestration::{
     MILESTONE_READINESS_DIGEST_SCHEMA_VERSION, MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION,
 };
 pub use milestone_runtime::{validate_release_policy, MilestoneRuntime};
-pub use native_tools::CoordinationToolProvider;
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
 pub use operating_skills::{

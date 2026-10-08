@@ -8,13 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Registry of known CLI executor families.
+/// Registry of known external harness integrations.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
-    /// Forge-hosted Agent Runtime profile.  This is intentionally not a CLI
-    /// adapter; services route it to the Forge-owned native task backend.
-    Embedded,
     Shell,
     Codex,
     ClaudeCode,
@@ -28,7 +25,6 @@ pub enum ExecutorKind {
 impl std::fmt::Display for ExecutorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Embedded => write!(f, "embedded"),
             Self::Shell => write!(f, "shell"),
             Self::Codex => write!(f, "codex"),
             Self::ClaudeCode => write!(f, "claude_code"),
@@ -45,7 +41,10 @@ impl std::str::FromStr for ExecutorKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "embedded" => Ok(Self::Embedded),
+            "embedded" => Err(
+                "executor type `embedded` is retired; create a new Agent bound to an available HarnessAdapter"
+                    .to_owned(),
+            ),
             "shell" => Ok(Self::Shell),
             "codex" => Ok(Self::Codex),
             "claude_code" => Ok(Self::ClaudeCode),
@@ -180,6 +179,8 @@ pub trait HarnessAdapter: Send + Sync {
         self.execute(ctx).await
     }
 
+    /// Stop all processes tracked for this execution. Returning `Ok(())` means
+    /// the adapter has waited for its direct child or process group to exit.
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
 
     /// Optional account/quota observation, separate from per-execution token
@@ -304,6 +305,14 @@ impl TaskExecutor for AdapterExecutor {
             None,
             &config,
         );
+        if crate::workspace_access_denied_required(&ctx.agent_config)? {
+            crate::effective_policy::validate_agent_chat_no_workspace_policy(
+                &kind,
+                &effective_policy,
+                &config,
+            )
+            .map_err(ExecutorError::Other)?;
+        }
         let candidate_key = crate::config::candidate_key(&kind, &config);
         let execution_config = config.clone();
         ctx.agent_config = invocation_config;
@@ -331,12 +340,22 @@ impl TaskExecutor for AdapterExecutor {
     }
 
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
+        let mut failures = Vec::new();
         for kind in self.registry.kinds() {
             if let Some(adapter) = self.registry.get(&kind) {
-                adapter.cancel(execution_id).await?;
+                if let Err(error) = adapter.cancel(execution_id).await {
+                    failures.push(format!("{kind}: {error}"));
+                }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutorError::Other(format!(
+                "adapter cancellation failed: {}",
+                failures.join(", ")
+            )))
+        }
     }
 
     async fn observe_usage(
@@ -378,6 +397,29 @@ impl FallbackExecutor {
             cooldowns: std::sync::Mutex::new(HashMap::new()),
             cancellations: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Reserve cancellation state before a daemon runtime spawns the execution
+    /// task. This lets a generation retirement cancel a Start that has been
+    /// accepted but has not entered `execute` yet.
+    pub fn prepare_execution(&self, execution_id: &str) {
+        let _ = self.cancellation_flag(execution_id);
+    }
+
+    /// Release the reservation after the daemon execution task has completed,
+    /// including failures that happen before `execute` is entered.
+    pub fn finish_execution(&self, execution_id: &str) {
+        self.clear_cancellation(execution_id);
+    }
+
+    /// Whether this executor instance still owns cancellation bookkeeping for
+    /// an admitted execution. This does not report whether a child process is
+    /// alive.
+    pub fn owns_execution(&self, execution_id: &str) -> bool {
+        self.cancellations
+            .lock()
+            .expect("cancellation lock poisoned")
+            .contains_key(execution_id)
     }
 
     /// The preferred candidate is the snapshot's top-level pair (the launch
@@ -563,6 +605,16 @@ impl TaskExecutor for FallbackExecutor {
                 }
         );
         let candidates = self.route(&ctx, !is_resume)?;
+        if crate::workspace_access_denied_required(&ctx.agent_config)? {
+            for candidate in &candidates {
+                crate::effective_policy::validate_agent_chat_no_workspace_policy(
+                    &candidate.kind,
+                    &candidate.effective_policy,
+                    &candidate.config,
+                )
+                .map_err(ExecutorError::Other)?;
+            }
+        }
         let cancelled = self.cancellation_flag(&ctx.execution_id);
         let single_candidate = candidates.len() == 1;
 
@@ -800,12 +852,22 @@ impl TaskExecutor for FallbackExecutor {
         {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        let mut failures = Vec::new();
         for kind in self.registry.kinds() {
             if let Some(adapter) = self.registry.get(&kind) {
-                adapter.cancel(execution_id).await?;
+                if let Err(error) = adapter.cancel(execution_id).await {
+                    failures.push(format!("{kind}: {error}"));
+                }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutorError::Other(format!(
+                "adapter cancellation failed: {}",
+                failures.join(", ")
+            )))
+        }
     }
 
     async fn observe_usage(
@@ -850,11 +912,9 @@ fn executor_config_pair(
         .ok_or_else(|| {
             ExecutorError::Other("executor config snapshot missing executor_type".to_owned())
         })?;
-    let kind = executor_type.parse::<ExecutorKind>().map_err(|_| {
-        ExecutorError::Other(format!(
-            "No adapter registered for executor type: {executor_type}"
-        ))
-    })?;
+    let kind = executor_type
+        .parse::<ExecutorKind>()
+        .map_err(ExecutorError::Other)?;
     let config = object.get("config").unwrap_or(agent_config).clone();
     Ok((kind, config))
 }
@@ -1305,6 +1365,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_embedded_snapshot_fails_before_any_route_candidate_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[(
+            "model-a",
+            ScriptedBehavior::Complete {
+                usage_output_tokens: 1,
+            },
+        )]);
+        let mut ctx = routed_ctx("retired-embedded", dir.path());
+        ctx.agent_config = serde_json::json!({
+            "executor_type": "embedded",
+            "config": {"profile_id": "historical-profile"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "embedded", "config": {"profile_id": "historical-profile"}},
+                    {"executor_type": "smith", "config": {"profile": "other-account", "model": "model-a"}}
+                ]
+            }
+        });
+
+        let error = executor
+            .execute(ctx)
+            .await
+            .expect_err("retired profile must not dispatch or fall back");
+        assert!(error.to_string().contains("retired"));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn usage_exhaustion_does_not_fall_back_across_agent_identity() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
@@ -1461,6 +1551,32 @@ mod tests {
         let result = run.await.expect("join").expect("terminal result");
         assert_eq!(result.status, ExecutionOutcome::Cancelled);
         assert_eq!(*calls.lock().unwrap(), vec!["model-a"]);
+    }
+
+    #[tokio::test]
+    async fn prepared_execution_cancelled_before_execute_never_starts_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[(
+            "model-a",
+            ScriptedBehavior::Complete {
+                usage_output_tokens: 1,
+            },
+        )]);
+
+        executor.prepare_execution("pre-cancelled");
+        assert!(executor.owns_execution("pre-cancelled"));
+        executor
+            .cancel("pre-cancelled")
+            .await
+            .expect("reserved execution can be cancelled before its task starts");
+
+        let result = executor
+            .execute(routed_ctx("pre-cancelled", dir.path()))
+            .await
+            .expect("pre-cancelled execution returns a terminal outcome");
+        assert_eq!(result.status, ExecutionOutcome::Cancelled);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!executor.owns_execution("pre-cancelled"));
     }
 
     #[tokio::test]

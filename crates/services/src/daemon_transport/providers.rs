@@ -17,6 +17,14 @@ pub trait FilesystemProvider: Send + Sync {
 
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
+    /// Whether this provider resolves credential identity from the frozen
+    /// execution snapshot inside the same process before invoking a harness.
+    /// Remote providers remain false until the daemon protocol has an exact,
+    /// non-ambient credential contract.
+    fn accepts_snapshot_credentials(&self) -> bool {
+        false
+    }
+
     async fn start(
         &self,
         params: api_types::ExecutionStartParams,

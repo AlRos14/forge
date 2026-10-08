@@ -108,21 +108,12 @@ pub struct GuardedAgentChatContent {
 }
 
 pub fn guard_agent_chat_content(content: &str) -> Result<GuardedAgentChatContent> {
-    guard_content(content, true)
+    guard_content(content)
 }
 
-/// Validate text that is persisted as an ordinary runtime value (for example
-/// a profile prompt or a tool-policy string).  Runtime configuration is
-/// allowed to be empty, while Agent Chat messages are not; both paths share
-/// the same protected-value classifier so credentials cannot be smuggled
-/// through a non-chat field.
-pub(crate) fn guard_runtime_content(content: &str) -> Result<GuardedAgentChatContent> {
-    guard_content(content, false)
-}
-
-fn guard_content(content: &str, reject_empty: bool) -> Result<GuardedAgentChatContent> {
+fn guard_content(content: &str) -> Result<GuardedAgentChatContent> {
     let trimmed = content.trim();
-    if reject_empty && trimmed.is_empty() {
+    if trimmed.is_empty() {
         return Err(ServiceError::invalid_operation(
             "Agent Chat content cannot be empty",
         ));
