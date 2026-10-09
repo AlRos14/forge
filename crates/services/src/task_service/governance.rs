@@ -1025,7 +1025,7 @@ mod tests {
                 task_type: "planning",
                 task_role: "planner",
                 lease_role: "worker",
-                purpose: "plan",
+                purpose: "general",
                 capability: "repository_read",
             },
             Case {
@@ -1033,7 +1033,7 @@ mod tests {
                 task_type: "review",
                 task_role: "reviewer",
                 lease_role: "worker",
-                purpose: "review",
+                purpose: "general",
                 capability: "repository_read",
             },
             Case {
@@ -1041,7 +1041,7 @@ mod tests {
                 task_type: "validation",
                 task_role: "validator",
                 lease_role: "worker",
-                purpose: "validate",
+                purpose: "general",
                 capability: "repository_read",
             },
             Case {
@@ -1049,7 +1049,7 @@ mod tests {
                 task_type: "discovery",
                 task_role: "investigator",
                 lease_role: "worker",
-                purpose: "investigate",
+                purpose: "general",
                 capability: "repository_read",
             },
         ];

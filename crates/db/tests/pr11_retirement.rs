@@ -1729,7 +1729,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "planning",
             task_role: "planner",
             lease_role: "worker",
-            purpose: "plan",
+            purpose: "general",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1737,7 +1737,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "review",
             task_role: "reviewer",
             lease_role: "worker",
-            purpose: "review",
+            purpose: "general",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1745,7 +1745,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "validation",
             task_role: "validator",
             lease_role: "worker",
-            purpose: "validate",
+            purpose: "general",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1753,7 +1753,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "discovery",
             task_role: "investigator",
             lease_role: "worker",
-            purpose: "investigate",
+            purpose: "general",
             capability: "repository_read",
         },
     ];
@@ -1929,26 +1929,37 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             .await
             .expect("exact running Execution fixture");
         }
-        if case.execution_role == "interactive" && case.task_type == "implementation" {
-            let misplaced_review_purpose = sqlx::query(
-                "INSERT INTO execution
-                 (id, task_id, agent_id, role, status, actor_kind, actor_id,
-                  purpose, created_at, updated_at)
-                 VALUES ('v120-misplaced-review', ?, ?, 'interactive', 'running',
-                         'agent', ?, 'review', ?, ?)",
-            )
-            .bind(&task_id)
-            .bind(&active_actor)
-            .bind(&active_actor)
-            .bind(&task_time)
-            .bind(&task_time)
-            .execute(&pool)
-            .await;
-            assert!(
-                misplaced_review_purpose.is_err(),
-                "interactive review Purpose is restricted to review Tasks"
-            );
-        }
+        let (invalid_review_role, invalid_review_purpose) = if case.execution_role == "reviewer" {
+            (case.execution_role, "general")
+        } else {
+            (case.execution_role, "review")
+        };
+        let invalid_review_execution = sqlx::query(
+            "INSERT INTO execution
+             (id, task_id, agent_id, role, status, actor_kind, actor_id,
+              purpose, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'running', 'agent', ?, ?, ?, ?)",
+        )
+        .bind(format!("v120-invalid-review-contract-{suffix}"))
+        .bind(&task_id)
+        .bind(&active_actor)
+        .bind(invalid_review_role)
+        .bind(&active_actor)
+        .bind(invalid_review_purpose)
+        .bind(&task_time)
+        .bind(&task_time)
+        .execute(&pool)
+        .await
+        .expect_err("non-canonical Review Execution is fenced");
+        assert!(
+            invalid_review_execution
+                .to_string()
+                .contains("Review Execution must use role reviewer and purpose review"),
+            "formal Review guard rejects {} + {} for {} Task: {invalid_review_execution}",
+            invalid_review_role,
+            invalid_review_purpose,
+            case.task_type
+        );
         let capability_digest = match case.capability {
             "repository_read" => read_digest,
             "repository_write" => write_digest,

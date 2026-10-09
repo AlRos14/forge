@@ -145,15 +145,16 @@ bytes.
    instruction revisions, and turns tied to its historical Project Chats.
    `ProjectRepo` deletes the immutable leaves while the Project-scoped teardown
    guard and chat provenance still exist; direct leaf deletion remains blocked.
-10. V120 keeps three authority dimensions independent. TaskRole comes from
-    the explicit Execution role, or from Task type for `interactive`.
-    `WorkspaceLease.role` is only a class: exact reviewer Executions use
-    `reviewer`, and every other Execution uses `worker`. Capabilities come
-    from Purpose and Task type. A `worker` lease does not mean TaskRole
-    `implementer`; an interactive Execution may retain semantic review
-    Purpose on a review Task while still receiving a worker lease. Exact Actor,
-    active RoleMembership, repository, and capability checks remain required
-    for INSERT and renewal.
+10. V120 keeps TaskRole, Execution role/purpose, WorkspaceLease class, and
+    repository capability separate. TaskRole comes from the explicit
+    Execution role, or from Task type for `interactive`. Formal Review remains
+    the PR8 contract `role=reviewer` and `purpose=review`; interactive-labeled
+    Executions use `purpose=general`. Task type independently keeps planning,
+    discovery, review, and validation Tasks read-only. `WorkspaceLease.role` is
+    only a class: exact reviewer Executions use `reviewer`, and every other
+    Execution uses `worker`. A `worker` lease does not mean TaskRole
+    `implementer`. Exact Actor, active RoleMembership, repository, and
+    capability checks remain required for INSERT and renewal.
 
 Every SQL operation is keyed by exact legacy row IDs or exact Task/role/member
 IDs. There is no timestamp, text, latest-record, or current-binding matching.

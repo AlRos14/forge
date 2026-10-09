@@ -1,31 +1,13 @@
--- Keep the three authority dimensions independent:
+-- Keep authority and capability dimensions independent:
 --   * TaskRole comes from the explicit Execution role, or from Task type for
 --     the `interactive` Execution label.
+--   * Execution.role and Execution.purpose keep their separate contracts;
+--     formal Review remains exactly reviewer + review as fenced by V099.
 --   * WorkspaceLease.role is a coarser class derived from Execution.role:
 --     only an exact `reviewer` Execution receives the `reviewer` class;
 --     every other Execution receives `worker`.
 --   * capabilities_json is derived from Purpose and Task type.
 -- `worker` is not an alias for TaskRole `implementer`.
--- An interactive Execution may carry semantic review Purpose on a review
--- Task while retaining its `interactive` label and worker lease class.
-DROP TRIGGER IF EXISTS reviewer_execution_purpose_guard_insert;
-CREATE TRIGGER reviewer_execution_purpose_guard_insert
-BEFORE INSERT ON execution
-WHEN (NEW.role = 'reviewer' AND NEW.purpose IS NOT 'review')
-  OR (
-      NEW.purpose = 'review'
-      AND NEW.role != 'reviewer'
-      AND NOT (
-          NEW.role = 'interactive'
-          AND EXISTS (
-              SELECT 1 FROM task t
-              WHERE t.id = NEW.task_id AND lower(trim(t.task_type)) = 'review'
-          )
-      )
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'Review Execution must use a compatible role and review purpose');
-END;
 DROP TRIGGER IF EXISTS workspace_lease_scope_guard_insert;
 CREATE TRIGGER workspace_lease_scope_guard_insert
 BEFORE INSERT ON workspace_lease
