@@ -131,25 +131,36 @@ bytes.
 8. V119 narrows V118's update fences for the exact historical FK columns that
    SQLite maintains with `ON DELETE SET NULL`. It permits only a non-null to
    NULL transition after the referenced parent is gone, with every other row
-   value unchanged. It also removes the old cross-field Genesis check that
-   made a handed-off history row impossible to retain after its Project and
-   handoff references were cleared. Genesis lifecycle and source content stay
-   unchanged; its INSERT fence remains active.
+   value unchanged. It also removes V118's cross-field Genesis check that
+   prevented handed-off history from surviving Project and handoff deletion.
+   The Genesis table rebuild and exact-fence replacement use
+   separate commits because SQLite requires `foreign_keys` to be changed
+   outside a transaction. The rebuild commit retains deny-all Genesis and
+   dependent Charter UPDATE fences and all other V118 retirement fences; the
+   later trigger replacement is one transaction. Re-running V119 rebuilds
+   Genesis again and converges both from that intermediate state and from a
+   completed schema without its `_migration` receipt. Genesis lifecycle and
+   source content stay unchanged; its INSERT fence remains active.
 9. The existing Project cascade removes handoffs, delivery receipts, messages,
    instruction revisions, and turns tied to its historical Project Chats.
    `ProjectRepo` deletes the immutable leaves while the Project-scoped teardown
    guard and chat provenance still exist; direct leaf deletion remains blocked.
-10. V120 keeps `Execution.role = 'interactive'` as an execution label and maps
-    the WorkspaceLease to the Task's canonical TaskRole (`implementer`,
-    `planner`, `reviewer`, `validator`, or `investigator`). The exact Actor,
-    active RoleMembership, repository, and capability checks remain required.
+10. V120 keeps three authority dimensions independent. TaskRole comes from
+    the explicit Execution role, or from Task type for `interactive`.
+    `WorkspaceLease.role` is only a class: exact reviewer Executions use
+    `reviewer`, and every other Execution uses `worker`. Capabilities come
+    from Purpose and Task type. A `worker` lease does not mean TaskRole
+    `implementer`; an interactive Execution may retain semantic review
+    Purpose on a review Task while still receiving a worker lease. Exact Actor,
+    active RoleMembership, repository, and capability checks remain required
+    for INSERT and renewal.
 
 Every SQL operation is keyed by exact legacy row IDs or exact Task/role/member
 IDs. There is no timestamp, text, latest-record, or current-binding matching.
-The migration's unique receipt key and transaction make reruns and crash
-recovery deterministic. A crash before commit leaves neither partial
-membership changes nor partial receipts; a crash after commit observes the
-same completed state.
+V118's transaction and unique receipt keys make its membership reconciliation
+restart-safe. V119 uses the staged, fenced rebuild described above because
+SQLite cannot toggle foreign-key enforcement inside a transaction; no stage
+marks V119 complete before its exact-fence transaction commits.
 
 Historical rows are semantically immutable, but mechanical foreign-key
 maintenance required by legitimate V2 teardown remains permitted. The
@@ -225,16 +236,18 @@ the focused API/service test:
 | N — exact Task-scoped old record | A Commitment with an exact `originating_task_id` is recorded as `already_represented`; it does not create or replace a Task. No other old record is converted to generic data. |
 | O — ambiguous old record | A Project Document without proven Task/producer provenance remains readable and is recorded `historical_only`; no generic Artifact is fabricated. |
 | P — Project teardown with historical rows | `delete_project(...)` succeeds with handed-off Genesis, Charter and approval provenance, Project Agent binding history, Task Execution, Commitment, MemoryItem, Baseline, Milestone, and a durable Project event. Exact FK references become `NULL`; lifecycle/body/status and other history stay unchanged; Project OS rows follow the existing delete contract; no deletion guard remains. |
-| Q — exact cleanup and denied writes | V119 permits Task/Execution and self-binding `SET NULL` maintenance, preserves their historical rows, and rejects semantic updates, direct FK clearing while a parent exists, and mixed FK-plus-semantic updates. V120 verifies an interactive Execution uses the Task's canonical TaskRole and active Actor membership. |
+| Q — exact cleanup and denied writes | V119 permits Task/Execution and self-binding `SET NULL` maintenance, preserves their historical rows, and rejects semantic updates, direct FK clearing while a parent exists, and mixed FK-plus-semantic updates. Tests rerun V119 without its receipt and resume from post-rebuild/pre-fences. V120 covers the explicit and interactive role matrix for TaskRole, lease class, capability, INSERT, renewal, and stale authority denial. |
 
 Focused tests also verify that legacy REST mutations return 410,
 Project/Task creation uses ordinary domain authority, Project Agent dispatch
 creates explicit TaskRole membership, and V118 media infrastructure remains
 usable. The productive Project deletion service also handles real V117 history
-after V119. The V118 fixture is transactional and restart-safe; it does not
-simulate simultaneous Project deletion, concurrent membership edits, or a live
-Execution racing the upgrade. Those remain review checks for the database's
-single-writer migration boundary and immutable Execution snapshots.
+after V119. The V118 fixture is transactional and restart-safe. The V119
+fixture separately exercises its durable intermediate state and missing-receipt
+retry. These tests do not simulate simultaneous Project deletion, concurrent
+membership edits, or a live Execution racing the upgrade. Those remain review
+checks for the database's single-writer migration boundary and immutable
+Execution snapshots.
 
 ## Plan boundaries
 

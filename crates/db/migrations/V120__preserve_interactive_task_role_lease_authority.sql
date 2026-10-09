@@ -1,7 +1,31 @@
--- Preserve the canonical TaskRole mapping for interactive WorkspaceLeases.
--- `interactive` is an Execution label; its TaskRole is selected from the
--- Task type, matching the existing V107 contract. Keep every V118 Actor,
--- membership, repository, capability, and lease check unchanged.
+-- Keep the three authority dimensions independent:
+--   * TaskRole comes from the explicit Execution role, or from Task type for
+--     the `interactive` Execution label.
+--   * WorkspaceLease.role is a coarser class derived from Execution.role:
+--     only an exact `reviewer` Execution receives the `reviewer` class;
+--     every other Execution receives `worker`.
+--   * capabilities_json is derived from Purpose and Task type.
+-- `worker` is not an alias for TaskRole `implementer`.
+-- An interactive Execution may carry semantic review Purpose on a review
+-- Task while retaining its `interactive` label and worker lease class.
+DROP TRIGGER IF EXISTS reviewer_execution_purpose_guard_insert;
+CREATE TRIGGER reviewer_execution_purpose_guard_insert
+BEFORE INSERT ON execution
+WHEN (NEW.role = 'reviewer' AND NEW.purpose IS NOT 'review')
+  OR (
+      NEW.purpose = 'review'
+      AND NEW.role != 'reviewer'
+      AND NOT (
+          NEW.role = 'interactive'
+          AND EXISTS (
+              SELECT 1 FROM task t
+              WHERE t.id = NEW.task_id AND lower(trim(t.task_type)) = 'review'
+          )
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'Review Execution must use a compatible role and review purpose');
+END;
 DROP TRIGGER IF EXISTS workspace_lease_scope_guard_insert;
 CREATE TRIGGER workspace_lease_scope_guard_insert
 BEFORE INSERT ON workspace_lease
@@ -47,8 +71,10 @@ BEGIN
                   END
                   ELSE lower(trim(e.role))
               END
-              AND CASE NEW.role WHEN 'worker' THEN 'implementer'
-                                ELSE lower(trim(NEW.role)) END = tr.role
+              AND NEW.role = CASE trim(e.role)
+                  WHEN 'reviewer' THEN 'reviewer'
+                  ELSE 'worker'
+              END
               AND (
                   EXISTS (
                       SELECT 1 FROM agent_current a
@@ -129,8 +155,10 @@ BEGIN
                   END
                   ELSE lower(trim(e.role))
               END
-              AND CASE NEW.role WHEN 'worker' THEN 'implementer'
-                                ELSE lower(trim(NEW.role)) END = tr.role
+              AND NEW.role = CASE trim(e.role)
+                  WHEN 'reviewer' THEN 'reviewer'
+                  ELSE 'worker'
+              END
               AND EXISTS (
                   SELECT 1 FROM agent_current a
                   WHERE a.id = e.actor_id

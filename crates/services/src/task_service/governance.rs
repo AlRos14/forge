@@ -9,6 +9,25 @@ const READ_ONLY_CAPABILITY_TYPES: &[&str] = &["planning", "discovery", "review",
 const WORKSPACE_LEASE_SECONDS: i64 = 15 * 60;
 const CAPABILITY_PROFILE_REVISION: &str = "forge.capability-profile/v1";
 
+/// Resolve the capability axis independently from TaskRole and lease class.
+fn workspace_lease_capability_class(
+    task_type: &str,
+    purpose: Option<&str>,
+    execution_role: &str,
+) -> &'static str {
+    let read_only = execution_role.eq_ignore_ascii_case("reviewer")
+        || matches!(
+            purpose,
+            Some("plan" | "review" | "investigate" | "validate")
+        )
+        || READ_ONLY_CAPABILITY_TYPES.contains(&task_type);
+    if read_only {
+        "repository_read"
+    } else {
+        "repository_write"
+    }
+}
+
 impl TaskService {
     /// Prepare the exact scheduler-issued authority for a repository-mutating
     /// WorkUnit Execution. The lease row is inserted by the same DB
@@ -386,17 +405,8 @@ impl TaskService {
         }
         let purpose: Option<String> = execution.get("purpose");
         let execution_role: String = execution.get("role");
-        let read_only = execution_role.eq_ignore_ascii_case("reviewer")
-            || matches!(
-                purpose.as_deref(),
-                Some("plan" | "review" | "investigate" | "validate")
-            )
-            || READ_ONLY_CAPABILITY_TYPES.contains(&task_type.as_str());
-        let capability_class = if read_only {
-            "repository_read"
-        } else {
-            "repository_write"
-        };
+        let capability_class =
+            workspace_lease_capability_class(&task_type, purpose.as_deref(), &execution_role);
         let base_ref = workspace.before_sha.clone().unwrap_or(default_branch);
         let issued_at = now_rfc3339();
         let expires_at =
@@ -701,21 +711,9 @@ impl TaskService {
                 })?;
             execution.purpose.unwrap_or(db::ExecutionPurpose::General)
         };
-        let read_only = role.eq_ignore_ascii_case("reviewer")
-            || matches!(
-                purpose,
-                db::ExecutionPurpose::Plan
-                    | db::ExecutionPurpose::Review
-                    | db::ExecutionPurpose::Investigate
-                    | db::ExecutionPurpose::Validate
-            )
-            || READ_ONLY_CAPABILITY_TYPES.contains(&task.task_type.as_str());
-        let capability_class = if read_only {
-            "repository_read"
-        } else {
-            "repository_write"
-        }
-        .to_owned();
+        let purpose = purpose.to_string();
+        let capability_class =
+            workspace_lease_capability_class(&task.task_type, Some(&purpose), role).to_owned();
         if !is_supported_capability_profile(&capability_class) {
             return Err(ServiceError::invalid_operation(format!(
                 "Task capability profile '{}' is not server-approved",
@@ -961,5 +959,126 @@ mod tests {
             canonical_workspace_lease_role("orchestrator").expect("workflow worker role"),
             "worker"
         );
+    }
+
+    #[test]
+    fn task_role_execution_purpose_lease_class_and_capability_stay_independent() {
+        struct Case {
+            execution_role: &'static str,
+            task_type: &'static str,
+            task_role: &'static str,
+            lease_role: &'static str,
+            purpose: &'static str,
+            capability: &'static str,
+        }
+        let cases = [
+            Case {
+                execution_role: "implementer",
+                task_type: "implementation",
+                task_role: "implementer",
+                lease_role: "worker",
+                purpose: "implement",
+                capability: "repository_write",
+            },
+            Case {
+                execution_role: "planner",
+                task_type: "planning",
+                task_role: "planner",
+                lease_role: "worker",
+                purpose: "plan",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "reviewer",
+                task_type: "review",
+                task_role: "reviewer",
+                lease_role: "reviewer",
+                purpose: "review",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "validator",
+                task_type: "validation",
+                task_role: "validator",
+                lease_role: "worker",
+                purpose: "validate",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "investigator",
+                task_type: "discovery",
+                task_role: "investigator",
+                lease_role: "worker",
+                purpose: "investigate",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "interactive",
+                task_type: "implementation",
+                task_role: "implementer",
+                lease_role: "worker",
+                purpose: "general",
+                capability: "repository_write",
+            },
+            Case {
+                execution_role: "interactive",
+                task_type: "planning",
+                task_role: "planner",
+                lease_role: "worker",
+                purpose: "plan",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "interactive",
+                task_type: "review",
+                task_role: "reviewer",
+                lease_role: "worker",
+                purpose: "review",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "interactive",
+                task_type: "validation",
+                task_role: "validator",
+                lease_role: "worker",
+                purpose: "validate",
+                capability: "repository_read",
+            },
+            Case {
+                execution_role: "interactive",
+                task_type: "discovery",
+                task_role: "investigator",
+                lease_role: "worker",
+                purpose: "investigate",
+                capability: "repository_read",
+            },
+        ];
+
+        for case in cases {
+            let task_role = if case.execution_role == "interactive" {
+                crate::task_service::execution::task_role_for_task_type(case.task_type).to_owned()
+            } else {
+                db::canonical_task_role_name(case.execution_role)
+                    .expect("explicit Execution role maps to a TaskRole")
+            };
+            let purpose = crate::task_service::execution::execution_purpose_for_task_type(
+                case.task_type,
+                case.execution_role,
+            );
+            assert_eq!(task_role, case.task_role);
+            assert_eq!(
+                canonical_workspace_lease_role(case.execution_role).expect("lease class"),
+                case.lease_role
+            );
+            assert_eq!(purpose.to_string(), case.purpose);
+            assert_eq!(
+                workspace_lease_capability_class(
+                    case.task_type,
+                    Some(&purpose.to_string()),
+                    case.execution_role,
+                ),
+                case.capability
+            );
+        }
     }
 }

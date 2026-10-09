@@ -1,5 +1,9 @@
-use db::{create_sqlite_pool, now_rfc3339, run_migrations, run_migrations_from};
-use std::{fs, path::Path};
+use db::{
+    create_sqlite_pool, now_rfc3339, run_migrations, run_migrations_from, AgentRepo, AgentStatus,
+    CreateAgent, CreateWorkspaceLease, WorkspaceLeaseRepo,
+};
+use sqlx::SqlitePool;
+use std::{collections::BTreeSet, fs, path::Path};
 
 fn copy_migrations_through(limit: i64, destination: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -21,6 +25,36 @@ fn copy_migrations_through(limit: i64, destination: &Path) {
                 .expect("migration copied");
         }
     }
+}
+
+async fn genesis_rows(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT json_object(
+            'id', id, 'account_id', account_id, 'main_chat_id', main_chat_id,
+            'prompt_revision', prompt_revision, 'prompt_body', prompt_body,
+            'maturity', maturity, 'initial_idea', initial_idea, 'lifecycle', lifecycle,
+            'source_message_ids_json', source_message_ids_json,
+            'preferred_project_agent_identity_id', preferred_project_agent_identity_id,
+            'project_id', project_id, 'handoff_id', handoff_id,
+            'failure_reason', failure_reason, 'version', version,
+            'created_at', created_at, 'updated_at', updated_at,
+            'charter_id', charter_id, 'charter_revision_id', charter_revision_id,
+            'charter_approval_id', charter_approval_id, 'charter_version', charter_version
+        ) FROM product_genesis_session ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("Genesis history snapshot")
+}
+
+async fn sqlite_schema_snapshot(pool: &SqlitePool) -> Vec<(String, String, String, String)> {
+    sqlx::query_as(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master
+         WHERE sql IS NOT NULL ORDER BY type, name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("SQLite schema snapshot")
 }
 
 #[tokio::test]
@@ -907,6 +941,54 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
 }
 
 #[tokio::test]
+async fn v119_applies_from_pristine_v118() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let migrations = temp.path().join("migrations");
+    fs::create_dir_all(&migrations).expect("migration dir");
+    copy_migrations_through(118, &migrations);
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("in-memory database");
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("schema through pristine V118");
+
+    copy_migrations_through(119, &migrations);
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("V119 applies from pristine V118");
+
+    let receipt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = 119")
+        .fetch_one(&pool)
+        .await
+        .expect("V119 receipt");
+    assert_eq!(receipt, 1);
+    let exact_fences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'
+         AND name IN ('pr11_retired_update_product_genesis_session',
+                      'pr11_retired_update_project_charter')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("exact Genesis and Charter fences");
+    assert_eq!(exact_fences, 2);
+    let pending_fences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'
+         AND name IN ('pr11_v119_product_genesis_update_pending',
+                      'pr11_v119_project_charter_update_pending')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("temporary migration fences removed");
+    assert_eq!(pending_fences, 0);
+    let fk_errors: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .expect("foreign_key_check after pristine V119");
+    assert!(fk_errors.is_empty(), "V119 FK check: {fk_errors:?}");
+}
+
+#[tokio::test]
 async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     let temp = tempfile::tempdir().expect("temp dir");
     let migrations = temp.path().join("migrations");
@@ -947,14 +1029,75 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     .fetch_one(&pool)
     .await
     .expect("account Main Chat");
+    let project_chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = 'fk-project'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical Project Chat");
+    sqlx::query(
+        "INSERT INTO agent_chat_message
+         (id, chat_id, sequence, author_type, author_id, content, status,
+          correlation_id, source_type, created_at)
+         VALUES ('fk-genesis-source', ?, 1, 'user', 'fk-owner', 'source provenance',
+                 'complete', 'fk-genesis-source-correlation', 'native', ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("Genesis source message");
+    sqlx::query(
+        "INSERT INTO agent_handoff
+         (id, source_chat_id, target_chat_id, content, correlation_id,
+          dedupe_key, created_at, updated_at)
+         VALUES ('fk-genesis-handoff', ?, ?, 'historical handoff',
+                 'fk-genesis-handoff-correlation', 'fk-genesis-handoff-key', ?, ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&project_chat_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("historical Main-to-Project handoff");
+    sqlx::query(
+        "INSERT INTO agent_identity (id, name, owner_id, visibility, created_at, updated_at)
+         VALUES ('fk-agent', 'FK Agent', 'fk-owner', 'global', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Agent identity");
+    sqlx::query(
+        "INSERT INTO agent_profile
+         (id, identity_id, backend_kind, executor_type, created_at, updated_at)
+         VALUES ('fk-profile', 'fk-agent', 'cli', 'test', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Agent profile");
+    sqlx::query(
+        "UPDATE agent_identity SET selected_profile_id = 'fk-profile' WHERE id = 'fk-agent'",
+    )
+    .execute(&pool)
+    .await
+    .expect("selected Agent profile");
     sqlx::query(
         "INSERT INTO product_genesis_session
          (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
-          lifecycle, project_id, created_at, updated_at)
-         VALUES ('fk-genesis', 'fk-owner', ?, 'v1', 'history', 'mvp',
-                 'discovering', 'fk-project', ?, ?)",
+          initial_idea, lifecycle, source_message_ids_json,
+          preferred_project_agent_identity_id, project_id, handoff_id, version,
+          created_at, updated_at)
+         VALUES ('fk-genesis', 'fk-owner', ?, 'v7', 'history', 'mvp',
+                 'historical idea', 'handed_off', ?,
+                 'fk-agent', 'fk-project', 'fk-genesis-handoff', 7, ?, ?)",
     )
     .bind(&main_chat_id)
+    .bind(r#"["fk-genesis-source"]"#)
     .bind(&now)
     .bind(&now)
     .execute(&pool)
@@ -962,14 +1105,55 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     .expect("historical Product Genesis");
     sqlx::query(
         "INSERT INTO project_charter
-         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
-         VALUES ('fk-charter', 'fk-owner', 'fk-project', 'standard', 'mvp', 'draft', ?, ?)",
+         (id, account_id, genesis_session_id, project_id, project_mode,
+          maturity, lifecycle, created_at, updated_at)
+         VALUES ('fk-charter', 'fk-owner', 'fk-genesis', 'fk-project',
+                 'standard', 'mvp', 'attached', ?, ?)",
     )
     .bind(&now)
     .bind(&now)
     .execute(&pool)
     .await
     .expect("historical Project Charter");
+    sqlx::query(
+        "INSERT INTO project_charter_revision
+         (id, charter_id, revision, lifecycle, schema_version, render_version,
+          content_json, rendered_view, author_type, author_id, content_digest,
+          rendered_digest, created_at)
+         VALUES ('fk-charter-r1', 'fk-charter', 1, 'approved', 'test', 'test',
+                 '{}', 'historical Genesis Charter', 'user', 'fk-owner',
+                 'fk-charter-digest', 'fk-charter-render-digest', ?)",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("Genesis Charter revision");
+    sqlx::query(
+        "INSERT INTO project_charter_approval
+         (id, approval_type, charter_id, revision_id, content_digest, rendered_digest,
+          expected_charter_version, approving_principal_type, approving_principal_id,
+          authorization_basis, authorization_action, explicit_event,
+          authorization_occurred_at, source_action, idempotency_key, created_at, updated_at)
+         VALUES ('fk-genesis-approval', 'project_creation', 'fk-charter', 'fk-charter-r1',
+                 'fk-charter-digest', 'fk-charter-render-digest', 1, 'user', 'fk-owner',
+                 'historical approval', 'project.create', 'approve Genesis Charter',
+                 ?, 'fixture', 'fk-genesis-approval-key', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("Genesis Charter approval");
+    sqlx::query(
+        "UPDATE product_genesis_session
+         SET charter_id = 'fk-charter', charter_revision_id = 'fk-charter-r1',
+             charter_approval_id = 'fk-genesis-approval', charter_version = 4
+         WHERE id = 'fk-genesis'",
+    )
+    .execute(&pool)
+    .await
+    .expect("Genesis Charter provenance");
     sqlx::query(
         "INSERT INTO project_charter
          (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
@@ -1065,31 +1249,6 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     .await
     .expect("historical Execution");
     sqlx::query(
-        "INSERT INTO agent_identity (id, name, owner_id, visibility, created_at, updated_at)
-         VALUES ('fk-agent', 'FK Agent', 'fk-owner', 'global', ?, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&pool)
-    .await
-    .expect("fixture Agent identity");
-    sqlx::query(
-        "INSERT INTO agent_profile
-         (id, identity_id, backend_kind, executor_type, created_at, updated_at)
-         VALUES ('fk-profile', 'fk-agent', 'cli', 'test', ?, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&pool)
-    .await
-    .expect("fixture Agent profile");
-    sqlx::query(
-        "UPDATE agent_identity SET selected_profile_id = 'fk-profile' WHERE id = 'fk-agent'",
-    )
-    .execute(&pool)
-    .await
-    .expect("selected Agent profile");
-    sqlx::query(
         "UPDATE project_agent_binding
          SET state = 'replaced', replacement_reason = 'historical setup row'
          WHERE project_id = 'fk-project'",
@@ -1162,16 +1321,83 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     let db = db::SqliteDb::new(pool.clone());
     let blocked_by_v118 = db::ProjectRepo::delete(&db, "fk-project")
         .await
-        .expect_err("V118 must reproduce the Project teardown fence blocker");
+        .expect_err("V118 must block deleting the historical handoff");
     assert!(
-        format!("{blocked_by_v118:?}").contains("PR11_OPERATION_RETIRED"),
-        "V118 failure must come from the retired-row fence: {blocked_by_v118:?}"
+        format!("{blocked_by_v118:?}").contains("Agent handoffs are immutable"),
+        "V118 handoff delete fence blocks Project teardown: {blocked_by_v118:?}"
     );
+
+    let genesis_before_v119 = genesis_rows(&pool).await;
+    let v119_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/V119__allow_fk_cleanup_for_pr11_history.sql");
+    let v119_sql = fs::read_to_string(v119_path).expect("read V119 migration");
+    let fences_start = v119_sql
+        .find("-- Plan PR11 FK maintenance correction.")
+        .expect("V119 exact-fence phase marker");
+    let rebuild_phase = &v119_sql[..fences_start];
+    let mut connection = pool.acquire().await.expect("migration connection");
+    sqlx::raw_sql(rebuild_phase)
+        .execute(&mut *connection)
+        .await
+        .expect("simulate V119's durable post-rebuild/pre-fences state");
+    drop(connection);
+    let receipt_after_partial: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = 119")
+            .fetch_one(&pool)
+            .await
+            .expect("partial migration has no receipt");
+    assert_eq!(receipt_after_partial, 0);
+    let partial_update = sqlx::query(
+        "UPDATE product_genesis_session SET prompt_body = 'partial write'
+         WHERE id = 'fk-genesis'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        partial_update.is_err(),
+        "partial Genesis rebuild stays fenced"
+    );
+    let partial_charter_update =
+        sqlx::query("UPDATE project_charter SET lifecycle = 'draft' WHERE id = 'fk-charter'")
+            .execute(&pool)
+            .await;
+    assert!(
+        partial_charter_update.is_err(),
+        "partial Genesis rebuild keeps dependent Charter updates fenced"
+    );
+    let partial_commitment_update =
+        sqlx::query("UPDATE agent_commitment SET status = 'completed' WHERE id = 'fk-commitment'")
+            .execute(&pool)
+            .await;
+    assert!(
+        partial_commitment_update.is_err(),
+        "V118 retirement fences remain active before V119's exact-fence commit"
+    );
+    assert_eq!(genesis_rows(&pool).await, genesis_before_v119);
 
     copy_migrations_through(119, &migrations);
     run_migrations_from(&pool, &migrations)
         .await
-        .expect("apply the additive V119 correction to an already V118 database");
+        .expect("V119 resumes safely from post-rebuild/pre-fences state");
+    let final_genesis_snapshot = genesis_rows(&pool).await;
+    assert_eq!(final_genesis_snapshot, genesis_before_v119);
+    let final_schema = sqlite_schema_snapshot(&pool).await;
+    let receipt_after_apply: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = 119")
+            .fetch_one(&pool)
+            .await
+            .expect("completed V119 receipt");
+    assert_eq!(receipt_after_apply, 1);
+
+    sqlx::query("DELETE FROM _migration WHERE version = 119")
+        .execute(&pool)
+        .await
+        .expect("simulate crash after V119 SQL commit but before receipt");
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("V119 reruns safely without its migration receipt");
+    assert_eq!(genesis_rows(&pool).await, final_genesis_snapshot);
+    assert_eq!(sqlite_schema_snapshot(&pool).await, final_schema);
     let fk_errors: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
         .fetch_all(&pool)
         .await
@@ -1201,6 +1427,16 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
             .await,
         sqlx::query(
             "UPDATE product_genesis_session SET lifecycle = 'cancelled' WHERE id = 'fk-genesis'",
+        )
+        .execute(&pool)
+        .await,
+        sqlx::query("UPDATE product_genesis_session SET project_id = NULL WHERE id = 'fk-genesis'")
+            .execute(&pool)
+            .await,
+        sqlx::query(
+            "UPDATE product_genesis_session
+             SET project_id = NULL, prompt_body = 'mixed semantic write'
+             WHERE id = 'fk-genesis'",
         )
         .execute(&pool)
         .await,
@@ -1265,6 +1501,74 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     db::ProjectRepo::delete(&db, "fk-project")
         .await
         .expect("productive Project teardown permits only exact FK cleanup");
+    let genesis_after_delete: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT lifecycle, project_id, handoff_id, charter_id,
+                charter_revision_id, charter_approval_id
+         FROM product_genesis_session WHERE id = 'fk-genesis'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("handed-off Genesis remains historical");
+    assert_eq!(
+        genesis_after_delete,
+        ("handed_off".to_owned(), None, None, None, None, None),
+        "legitimate parent deletion clears only the exact historical references"
+    );
+    let genesis_history: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+                initial_idea, source_message_ids_json,
+                preferred_project_agent_identity_id, failure_reason, version
+         FROM product_genesis_session WHERE id = 'fk-genesis'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("non-FK Genesis history survives");
+    assert_eq!(
+        genesis_history,
+        (
+            "fk-owner".to_owned(),
+            main_chat_id.clone(),
+            "v7".to_owned(),
+            "history".to_owned(),
+            "mvp".to_owned(),
+            "historical idea".to_owned(),
+            r#"["fk-genesis-source"]"#.to_owned(),
+            Some("fk-agent".to_owned()),
+            None,
+            7,
+        ),
+        "all non-FK Genesis fields remain unchanged"
+    );
+    let genesis_timestamps_and_charter_version: (String, String, i64) = sqlx::query_as(
+        "SELECT created_at, updated_at, charter_version
+         FROM product_genesis_session WHERE id = 'fk-genesis'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Genesis timestamps and Charter version survive");
+    assert_eq!(
+        genesis_timestamps_and_charter_version,
+        (now.clone(), now.clone(), 4),
+        "Genesis timestamps and Charter version remain unchanged"
+    );
     let commitment: (String, String, Option<String>) = sqlx::query_as(
         "SELECT title, status, originating_task_id FROM agent_commitment WHERE id = 'fk-commitment'",
     )
@@ -1359,6 +1663,479 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
         semantic_write.is_err(),
         "self-FK cleanup cannot authorize a state change"
     );
+}
+
+#[tokio::test]
+async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
+    struct LeaseCase {
+        execution_role: &'static str,
+        task_type: &'static str,
+        task_role: &'static str,
+        lease_role: &'static str,
+        purpose: &'static str,
+        capability: &'static str,
+    }
+    const CASES: [LeaseCase; 10] = [
+        LeaseCase {
+            execution_role: "implementer",
+            task_type: "implementation",
+            task_role: "implementer",
+            lease_role: "worker",
+            purpose: "implement",
+            capability: "repository_write",
+        },
+        LeaseCase {
+            execution_role: "planner",
+            task_type: "planning",
+            task_role: "planner",
+            lease_role: "worker",
+            purpose: "plan",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "reviewer",
+            task_type: "review",
+            task_role: "reviewer",
+            lease_role: "reviewer",
+            purpose: "review",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "validator",
+            task_type: "validation",
+            task_role: "validator",
+            lease_role: "worker",
+            purpose: "validate",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "investigator",
+            task_type: "discovery",
+            task_role: "investigator",
+            lease_role: "worker",
+            purpose: "investigate",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "interactive",
+            task_type: "implementation",
+            task_role: "implementer",
+            lease_role: "worker",
+            purpose: "general",
+            capability: "repository_write",
+        },
+        LeaseCase {
+            execution_role: "interactive",
+            task_type: "planning",
+            task_role: "planner",
+            lease_role: "worker",
+            purpose: "plan",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "interactive",
+            task_type: "review",
+            task_role: "reviewer",
+            lease_role: "worker",
+            purpose: "review",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "interactive",
+            task_type: "validation",
+            task_role: "validator",
+            lease_role: "worker",
+            purpose: "validate",
+            capability: "repository_read",
+        },
+        LeaseCase {
+            execution_role: "interactive",
+            task_type: "discovery",
+            task_role: "investigator",
+            lease_role: "worker",
+            purpose: "investigate",
+            capability: "repository_read",
+        },
+    ];
+
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("in-memory database");
+    run_migrations(&pool)
+        .await
+        .expect("all migrations through V120");
+    let db = db::SqliteDb::new(pool.clone());
+    let base = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let base_text = base.to_rfc3339();
+    let project_id = db::new_uuid_v4();
+    let repo_id = db::new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at)
+         VALUES (?, 'V120 lease matrix', '{}', '{}', ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(&base_text)
+    .bind(&base_text)
+    .execute(&pool)
+    .await
+    .expect("Project fixture");
+    sqlx::query(
+        "INSERT INTO repo
+         (id, project_id, name, remote_url, local_path, work_mode, default_branch,
+          created_at, updated_at)
+         VALUES (?, ?, 'lease-matrix', 'https://example.test/lease-matrix.git', NULL,
+                 'direct_merge', 'main', ?, ?)",
+    )
+    .bind(&repo_id)
+    .bind(&project_id)
+    .bind(&base_text)
+    .bind(&base_text)
+    .execute(&pool)
+    .await
+    .expect("repository fixture");
+
+    let active_actor = db::new_uuid_v4();
+    let wrong_role_actor = db::new_uuid_v4();
+    let stale_assignee_actor = db::new_uuid_v4();
+    for (id, name) in [
+        (&active_actor, "active role member"),
+        (&wrong_role_actor, "wrong TaskRole member"),
+        (&stale_assignee_actor, "legacy assignee only"),
+    ] {
+        AgentRepo::create(
+            &db,
+            CreateAgent {
+                id: id.clone(),
+                name: name.to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: base_text.clone(),
+                updated_at: base_text.clone(),
+            },
+        )
+        .await
+        .expect("global Agent fixture");
+    }
+
+    let read_digest = "sha256:6035ec533a0bdb74c461ea9ea2d7147a2e47ba7c8b54c8b732052ceec23e8234";
+    let write_digest = "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8";
+    let mut expected_lease_ids = BTreeSet::new();
+    let mut membership_ids = Vec::new();
+
+    for (index, case) in CASES.iter().enumerate() {
+        let suffix = format!("{index:02}");
+        let task_id = format!("v120-task-{suffix}");
+        let task_role_id = format!("v120-role-{suffix}");
+        let wrong_role_id = format!("v120-wrong-role-{suffix}");
+        let membership_id = format!("v120-membership-{suffix}");
+        let wrong_membership_id = format!("v120-wrong-membership-{suffix}");
+        let execution_id = format!("v120-execution-{suffix}");
+        let wrong_role_execution_id = format!("v120-wrong-role-execution-{suffix}");
+        let stale_execution_id = format!("v120-stale-assignee-execution-{suffix}");
+        let task_time = (base + chrono::Duration::seconds(index as i64)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO task
+             (id, project_id, repo_id, title, task_type, status, assignee_type,
+              assignee_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'in_progress', 'agent', ?, ?, ?)",
+        )
+        .bind(&task_id)
+        .bind(&project_id)
+        .bind(&repo_id)
+        .bind(format!("V120 {} task", case.execution_role))
+        .bind(case.task_type)
+        .bind(&stale_assignee_actor)
+        .bind(&task_time)
+        .bind(&task_time)
+        .execute(&pool)
+        .await
+        .expect("Task fixture with stale legacy assignee projection");
+        sqlx::query(
+            "INSERT INTO task_role (id, task_id, role, coordination_mode, policy_json,
+                                    created_at, updated_at)
+             VALUES (?, ?, ?, 'collaborative', '{}', ?, ?),
+                    (?, ?, 'orchestrator', 'collaborative', '{}', ?, ?)",
+        )
+        .bind(&task_role_id)
+        .bind(&task_id)
+        .bind(case.task_role)
+        .bind(&task_time)
+        .bind(&task_time)
+        .bind(&wrong_role_id)
+        .bind(&task_id)
+        .bind(&task_time)
+        .bind(&task_time)
+        .execute(&pool)
+        .await
+        .expect("canonical and wrong TaskRoles");
+        sqlx::query(
+            "INSERT INTO role_membership
+             (id, task_role_id, actor_kind, actor_id, status, created_at, updated_at)
+             VALUES (?, ?, 'agent', ?, 'active', ?, ?),
+                    (?, ?, 'agent', ?, 'active', ?, ?)",
+        )
+        .bind(&membership_id)
+        .bind(&task_role_id)
+        .bind(&active_actor)
+        .bind(&task_time)
+        .bind(&task_time)
+        .bind(&wrong_membership_id)
+        .bind(&wrong_role_id)
+        .bind(&wrong_role_actor)
+        .bind(&task_time)
+        .bind(&task_time)
+        .execute(&pool)
+        .await
+        .expect("active exact and wrong TaskRole memberships");
+        membership_ids.push((membership_id, task_time.clone()));
+
+        for (id, actor_id) in [
+            (&execution_id, &active_actor),
+            (&wrong_role_execution_id, &wrong_role_actor),
+            (&stale_execution_id, &stale_assignee_actor),
+        ] {
+            sqlx::query(
+                "INSERT INTO execution
+                 (id, task_id, agent_id, role, status, actor_kind, actor_id,
+                  purpose, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, 'running', 'agent', ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&task_id)
+            .bind(actor_id)
+            .bind(case.execution_role)
+            .bind(actor_id)
+            .bind(case.purpose)
+            .bind(&task_time)
+            .bind(&task_time)
+            .execute(&pool)
+            .await
+            .expect("exact running Execution fixture");
+        }
+        if case.execution_role == "interactive" && case.task_type == "implementation" {
+            let misplaced_review_purpose = sqlx::query(
+                "INSERT INTO execution
+                 (id, task_id, agent_id, role, status, actor_kind, actor_id,
+                  purpose, created_at, updated_at)
+                 VALUES ('v120-misplaced-review', ?, ?, 'interactive', 'running',
+                         'agent', ?, 'review', ?, ?)",
+            )
+            .bind(&task_id)
+            .bind(&active_actor)
+            .bind(&active_actor)
+            .bind(&task_time)
+            .bind(&task_time)
+            .execute(&pool)
+            .await;
+            assert!(
+                misplaced_review_purpose.is_err(),
+                "interactive review Purpose is restricted to review Tasks"
+            );
+        }
+        let capability_digest = match case.capability {
+            "repository_read" => read_digest,
+            "repository_write" => write_digest,
+            other => panic!("unexpected capability class {other}"),
+        };
+        let issued_at = (base - chrono::Duration::seconds(5)).to_rfc3339();
+        let expires_at = (base + chrono::Duration::minutes(1)).to_rfc3339();
+        let make_lease = |id: String,
+                          execution_id: &str,
+                          actor_id: &str,
+                          lease_role: &str,
+                          operation_key: String| CreateWorkspaceLease {
+            id,
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+            work_unit_id: None,
+            workspace_id: None,
+            task_version: 1,
+            execution_id: execution_id.to_owned(),
+            operation_idempotency_key: operation_key,
+            repository_binding_id: repo_id.clone(),
+            base_ref: "main".to_owned(),
+            role: lease_role.to_owned(),
+            capabilities_json: serde_json::json!([case.capability]).to_string(),
+            assigned_principal_type: "agent".to_owned(),
+            assigned_principal_id: actor_id.to_owned(),
+            capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+            capability_profile_digest: capability_digest.to_owned(),
+            issuing_principal_type: "system".to_owned(),
+            issuing_principal_id: "task-service-scheduler".to_owned(),
+            issued_at: issued_at.clone(),
+            expires_at: expires_at.clone(),
+            created_at: issued_at.clone(),
+            updated_at: issued_at.clone(),
+        };
+
+        let wrong_lease_role = if case.lease_role == "worker" {
+            "reviewer"
+        } else {
+            "worker"
+        };
+        assert!(
+            WorkspaceLeaseRepo::issue(
+                &db,
+                make_lease(
+                    db::new_uuid_v4(),
+                    &execution_id,
+                    &active_actor,
+                    wrong_lease_role,
+                    execution_id.clone(),
+                ),
+            )
+            .await
+            .is_err(),
+            "wrong lease class is denied for {} + {}",
+            case.execution_role,
+            case.task_type
+        );
+        assert!(
+            WorkspaceLeaseRepo::issue(
+                &db,
+                make_lease(
+                    db::new_uuid_v4(),
+                    &wrong_role_execution_id,
+                    &wrong_role_actor,
+                    case.lease_role,
+                    wrong_role_execution_id.clone(),
+                ),
+            )
+            .await
+            .is_err(),
+            "wrong TaskRole member is denied for {} + {}",
+            case.execution_role,
+            case.task_type
+        );
+        assert!(
+            WorkspaceLeaseRepo::issue(
+                &db,
+                make_lease(
+                    db::new_uuid_v4(),
+                    &stale_execution_id,
+                    &stale_assignee_actor,
+                    case.lease_role,
+                    stale_execution_id.clone(),
+                ),
+            )
+            .await
+            .is_err(),
+            "stale task.assignee_id does not authorize {} + {}",
+            case.execution_role,
+            case.task_type
+        );
+
+        let task_role: Option<String> =
+            sqlx::query_scalar("SELECT role FROM task_role WHERE task_id = ? AND id = ?")
+                .bind(&task_id)
+                .bind(&task_role_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("exact TaskRole lookup");
+        assert_eq!(task_role.as_deref(), Some(case.task_role));
+        let authority: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution e
+             JOIN role_membership rm ON rm.actor_id = e.actor_id
+             JOIN task_role tr ON tr.id = rm.task_role_id
+             WHERE e.id = ? AND e.task_id = ? AND e.actor_kind = 'agent'
+               AND e.actor_id = ? AND e.agent_id = ? AND e.status = 'running'
+               AND e.role = ? AND e.purpose = ?
+               AND tr.id = ? AND tr.role = ? AND rm.status = 'active'",
+        )
+        .bind(&execution_id)
+        .bind(&task_id)
+        .bind(&active_actor)
+        .bind(&active_actor)
+        .bind(case.execution_role)
+        .bind(case.purpose)
+        .bind(&task_role_id)
+        .bind(case.task_role)
+        .fetch_one(&pool)
+        .await
+        .expect("exact TaskRole, Actor membership, and running Execution");
+        assert_eq!(authority, 1, "exact authority fixture for case {index}");
+
+        let lease = WorkspaceLeaseRepo::issue(
+            &db,
+            make_lease(
+                db::new_uuid_v4(),
+                &execution_id,
+                &active_actor,
+                case.lease_role,
+                execution_id.clone(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "valid {}/{} lease was denied: {error:?}",
+                case.execution_role, case.task_type
+            )
+        });
+        assert_eq!(lease.role, case.lease_role);
+        assert_eq!(
+            lease.capabilities_json,
+            serde_json::json!([case.capability]).to_string()
+        );
+        expected_lease_ids.insert(lease.id);
+    }
+
+    let renew_at = (base + chrono::Duration::seconds(30)).to_rfc3339();
+    let renewed_until = (base + chrono::Duration::minutes(15)).to_rfc3339();
+    let renewed = WorkspaceLeaseRepo::renew_active(
+        &db,
+        &renew_at,
+        &(base + chrono::Duration::minutes(2)).to_rfc3339(),
+        &renewed_until,
+        50,
+    )
+    .await
+    .expect("all exact memberships renew while active");
+    let renewed_ids: BTreeSet<String> = renewed.iter().map(|lease| lease.id.clone()).collect();
+    assert_eq!(renewed_ids, expected_lease_ids);
+    assert!(renewed.iter().all(|lease| lease.version == 2));
+
+    for (membership_id, _) in membership_ids {
+        let ended_at = (base + chrono::Duration::seconds(40)).to_rfc3339();
+        sqlx::query(
+            "UPDATE role_membership
+             SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
+             WHERE id = ? AND status = 'active'",
+        )
+        .bind(&ended_at)
+        .bind(&ended_at)
+        .bind(membership_id)
+        .execute(&pool)
+        .await
+        .expect("end exact TaskRole membership");
+    }
+    let after_membership_end = WorkspaceLeaseRepo::renew_active(
+        &db,
+        &(base + chrono::Duration::seconds(50)).to_rfc3339(),
+        &(base + chrono::Duration::minutes(20)).to_rfc3339(),
+        &(base + chrono::Duration::minutes(30)).to_rfc3339(),
+        50,
+    )
+    .await
+    .expect("ended memberships are skipped by renewal");
+    assert!(after_membership_end.is_empty());
 }
 
 async fn seed_legacy_project_os_and_release(

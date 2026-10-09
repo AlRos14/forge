@@ -6,8 +6,12 @@ PRAGMA foreign_keys = OFF;
 BEGIN;
 -- These Charter guards reference the table being rebuilt. The update guard
 -- is superseded by the exact PR11 fence below; restore only the insert guard.
-DROP TRIGGER project_charter_owner_guard_insert;
-DROP TRIGGER project_charter_owner_guard_update;
+DROP TRIGGER IF EXISTS project_charter_owner_guard_insert;
+DROP TRIGGER IF EXISTS project_charter_owner_guard_update;
+-- The completed exact FK fence also reads the table being rebuilt. Retire it
+-- during the rebuild and keep Charter updates denied until replacement.
+DROP TRIGGER IF EXISTS pr11_retired_update_project_charter;
+DROP TRIGGER IF EXISTS pr11_v119_project_charter_update_pending;
 CREATE TABLE product_genesis_session_v119 (
     id                                  TEXT PRIMARY KEY,
     account_id                          TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -117,6 +121,18 @@ WHEN OLD.prompt_revision != NEW.prompt_revision OR OLD.prompt_body != NEW.prompt
 BEGIN
     SELECT RAISE(ABORT, 'Product Genesis prompt revisions are immutable');
 END;
+-- Keep Product Genesis closed in the durable post-rebuild state until the
+-- exact FK-only update fence commits below.
+CREATE TRIGGER pr11_v119_product_genesis_update_pending
+BEFORE UPDATE ON product_genesis_session
+BEGIN
+    SELECT RAISE(ABORT, 'PR11_OPERATION_RETIRED: Product Genesis');
+END;
+CREATE TRIGGER pr11_v119_project_charter_update_pending
+BEFORE UPDATE ON project_charter
+BEGIN
+    SELECT RAISE(ABORT, 'PR11_OPERATION_RETIRED: Project Charter');
+END;
 CREATE TRIGGER project_charter_owner_guard_insert
 BEFORE INSERT ON project_charter
 BEGIN
@@ -151,6 +167,10 @@ PRAGMA foreign_keys = ON;
 -- from a value to NULL, each referenced parent is already absent, and every
 -- other column is byte-for-byte/value-for-value unchanged. This does not
 -- consult project_deletion_guard and cannot authorize semantic UPDATEs.
+
+-- Existing V118 fences remain in force until all replacements commit.
+-- This transaction makes the trigger transition atomic across a crash.
+BEGIN IMMEDIATE;
 
 -- These older guards reject mechanically maintained FK columns. V119
 -- replaces their update protection with the stricter PR11 row-value fence
@@ -476,6 +496,7 @@ END;
 
 -- product_genesis_session: exact cleanup only for charter_approval_id, charter_id, charter_revision_id, handoff_id, preferred_project_agent_identity_id, project_id.
 DROP TRIGGER IF EXISTS "pr11_retired_update_product_genesis_session";
+DROP TRIGGER IF EXISTS "pr11_v119_product_genesis_update_pending";
 CREATE TRIGGER "pr11_retired_update_product_genesis_session"
 BEFORE UPDATE ON "product_genesis_session"
 WHEN NOT (
@@ -538,6 +559,7 @@ END;
 
 -- project_charter: exact cleanup only for genesis_session_id.
 DROP TRIGGER IF EXISTS "pr11_retired_update_project_charter";
+DROP TRIGGER IF EXISTS "pr11_v119_project_charter_update_pending";
 CREATE TRIGGER "pr11_retired_update_project_charter"
 BEFORE UPDATE ON "project_charter"
 WHEN NOT (
@@ -763,3 +785,5 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'Agent Chat messages are immutable outside Project teardown');
 END;
+
+COMMIT;
