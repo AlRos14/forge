@@ -58,6 +58,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_clean_project_after_pr11_cutover() {
+        let temp = TempDir::new().expect("temporary workspace");
+        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = now_rfc3339();
+        let project_id = db::new_uuid_v4();
+        ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Clean Project teardown".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("clean Project");
+
+        delete_project(Arc::clone(&db), temp.path(), &project_id)
+            .await
+            .expect("clean Project deletes through the service");
+        assert!(ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("Project lookup")
+            .is_none());
+        let guard_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_deletion_guard")
+            .fetch_one(db.pool())
+            .await
+            .expect("Project teardown guard is removed");
+        assert_eq!(guard_rows, 0);
+        let fk_errors: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .expect("foreign key check");
+        assert!(fk_errors.is_empty(), "foreign key errors: {fk_errors:?}");
+    }
+
+    #[tokio::test]
     async fn project_deletion_reconciles_stale_task_integration_operations() {
         let temp = TempDir::new().expect("temporary directory");
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
