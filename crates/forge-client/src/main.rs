@@ -2,8 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{data_dir_from_env, read_server_state, server_state_path};
 use forge_client::{
-    agent, auth, client::ForgeClient, daemon, embedded, mcp, memory, project, repo, run, task,
-    OutputFormat,
+    agent, auth, client::ForgeClient, daemon, mcp, project, provider, repo, task, OutputFormat,
 };
 
 #[derive(Parser)]
@@ -30,11 +29,9 @@ enum Commands {
     Agent(agent::AgentArgs),
     Daemon(daemon::DaemonArgs),
     Project(project::ProjectArgs),
-    Memory(memory::MemoryArgs),
+    Provider(provider::ProviderArgs),
     Repo(repo::RepoArgs),
-    Run(run::RunArgs),
     Mcp(mcp::McpArgs),
-    Embedded(embedded::EmbeddedArgs),
 }
 
 #[tokio::main]
@@ -67,7 +64,7 @@ async fn main() -> Result<()> {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
         }
-        Commands::Memory(args) => {
+        Commands::Provider(args) => {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
         }
@@ -75,18 +72,9 @@ async fn main() -> Result<()> {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
         }
-        Commands::Run(args) => {
-            let client = client_for(cli.server.as_deref())?;
-            let exit_code = args.run(&client).await?;
-            std::process::exit(exit_code);
-        }
         Commands::Mcp(args) => {
             let server = resolve_server_url(cli.server.as_deref())?;
             args.run(&server).await
-        }
-        Commands::Embedded(args) => {
-            let client = client_for(cli.server.as_deref())?;
-            args.run(&client, &cli.output).await
         }
     }
 }

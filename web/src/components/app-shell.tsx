@@ -12,10 +12,8 @@ import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import type { IconWeight } from '@phosphor-icons/react'
 import {
   List,
-  ChatCircleDots,
   Robot,
   Kanban,
-  ChartLineUp,
   Gear,
   Key,
   Sliders,
@@ -33,10 +31,9 @@ import {
   UserCircle,
 } from '@phosphor-icons/react'
 import { useTranslation } from 'react-i18next'
-import { useAgentsQuery, useCreateProject, useProjectsInfiniteQuery } from '@/api/hooks'
+import { useCreateProject, useProjectsInfiniteQuery } from '@/api/hooks'
 import { logoutApi } from '@/api/auth'
 import { Avatar } from '@/components/ui/avatar'
-import { ChatLauncher } from '@/components/chat/chat-launcher'
 import { NotificationCenter } from '@/components/notification-center'
 import {
   DropdownMenu,
@@ -57,7 +54,6 @@ import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/cn'
 import { useLayoutStore } from '@/stores/layout'
 import { useAuthStore } from '@/stores/auth'
-import type { Agent } from '@/types/generated/api'
 
 const CommandPalette = lazy(() =>
   import('@/components/command-palette').then((module) => ({
@@ -68,13 +64,9 @@ const CommandPalette = lazy(() =>
 type NavItem = {
   to: string
   key:
-    | 'overview'
     | 'board'
     | 'tasks'
-    | 'mainChat'
-    | 'agentWorkspace'
     | 'agentSettings'
-    | 'missionControl'
     | 'daemons'
     | 'operations'
     | 'settings'
@@ -84,19 +76,10 @@ type NavItem = {
 }
 
 const navItems: NavItem[] = [
-  { to: '/projects/$projectId/overview', key: 'overview', icon: ChartLineUp, section: 'project' },
   { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'project' },
   { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
-  {
-    to: '/projects/$projectId/chat',
-    key: 'agentWorkspace',
-    icon: ChatCircleDots,
-    section: 'project',
-  },
   { to: '/projects/$projectId/settings', key: 'settings', icon: Gear, section: 'project' },
-  { to: '/chat', key: 'mainChat', icon: ChatCircleDots, section: 'main' },
   { to: '/agents', key: 'agentSettings', icon: Robot, section: 'global' },
-  { to: '/mission-control', key: 'missionControl', icon: Pulse, section: 'global' },
   { to: '/daemons', key: 'daemons', icon: Desktop, section: 'global' },
   { to: '/operations', key: 'operations', icon: Pulse, section: 'global' },
   { to: '/settings', key: 'forgeSettings', icon: Sliders, section: 'global' },
@@ -119,15 +102,12 @@ function ProjectSwitcher({
   const navigate = useNavigate()
   const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
   const createProject = useCreateProject()
-  const agentsQuery = useAgentsQuery()
   const [createOpen, setCreateOpen] = useState(false)
   const [newName, setNewName] = useState('')
-  const [selectedAgentId, setSelectedAgentId] = useState('')
   const [error, setError] = useState('')
 
   const projects = projectsQuery.data?.pages.flatMap((page) => page.items) ?? []
   const currentProject = projects.find((p) => p.id === projectId)
-  const availableAgents = (agentsQuery.data?.items ?? []).filter((agent) => !agent.paused)
 
   const fetchNextProjectsPage = () => {
     if (projectsQuery.hasNextPage && !projectsQuery.isFetchingNextPage) {
@@ -181,16 +161,10 @@ function ProjectSwitcher({
       setError(t('projectSwitcher.nameRequired'))
       return
     }
-    const selectedAgent = availableAgents.find((agent) => agent.id === selectedAgentId)
     try {
-      const created = await createProject.mutateAsync({
-        name,
-        project_agent_identity_id: selectedAgent?.id ?? null,
-        project_agent_profile_id: selectedAgent?.profile_id ?? null,
-      })
+      const created = await createProject.mutateAsync({ name })
       setCreateOpen(false)
       setNewName('')
-      setSelectedAgentId('')
       setError('')
       void navigate({ to: '/projects/$projectId/board', params: { projectId: created.id } })
     } catch {
@@ -225,16 +199,11 @@ function ProjectSwitcher({
             setCreateOpen(v)
             if (!v) {
               setNewName('')
-              setSelectedAgentId('')
               setError('')
             }
           }}
           name={newName}
           onNameChange={setNewName}
-          agents={availableAgents}
-          agentsLoading={agentsQuery.isLoading}
-          selectedAgentId={selectedAgentId}
-          onAgentChange={setSelectedAgentId}
           error={error}
           loading={createProject.isPending}
           onSubmit={handleCreate}
@@ -280,16 +249,11 @@ function ProjectSwitcher({
           setCreateOpen(v)
           if (!v) {
             setNewName('')
-            setSelectedAgentId('')
             setError('')
           }
         }}
         name={newName}
         onNameChange={setNewName}
-        agents={availableAgents}
-        agentsLoading={agentsQuery.isLoading}
-        selectedAgentId={selectedAgentId}
-        onAgentChange={setSelectedAgentId}
         error={error}
         loading={createProject.isPending}
         onSubmit={handleCreate}
@@ -303,10 +267,6 @@ function CreateProjectDialog({
   onOpenChange,
   name,
   onNameChange,
-  agents,
-  agentsLoading,
-  selectedAgentId,
-  onAgentChange,
   error,
   loading,
   onSubmit,
@@ -315,10 +275,6 @@ function CreateProjectDialog({
   onOpenChange: (v: boolean) => void
   name: string
   onNameChange: (v: string) => void
-  agents: Agent[]
-  agentsLoading: boolean
-  selectedAgentId: string
-  onAgentChange: (v: string) => void
   error: string
   loading: boolean
   onSubmit: (e: React.FormEvent) => void
@@ -332,11 +288,6 @@ function CreateProjectDialog({
             <DialogTitle>{t('projectSwitcher.createProject')}</DialogTitle>
           </DialogHeader>
           <div className="my-4 space-y-4">
-            <p className="rounded-md border border-border-subtle bg-muted/20 px-3 py-2 text-xs leading-5 text-muted-foreground">
-              Generic Project creation is available for human/API setup and starts in{' '}
-              <span className="font-mono text-micro">charter_setup_required</span>. Use Product
-              Genesis in the Main Chat when this Project needs a Charter-backed handoff.
-            </p>
             <div className="space-y-2">
               <Label htmlFor="project-name">{t('projectSwitcher.projectName')}</Label>
               <Input
@@ -346,32 +297,6 @@ function CreateProjectDialog({
                 placeholder={t('projectSwitcher.projectNamePlaceholder')}
                 autoFocus
               />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="project-agent">
-                {t('projectSwitcher.projectAgent')}
-                <span className="ml-1 font-normal text-muted-foreground">
-                  {t('projectSwitcher.optional')}
-                </span>
-              </Label>
-              <select
-                id="project-agent"
-                value={selectedAgentId}
-                onChange={(event) => onAgentChange(event.target.value)}
-                disabled={agentsLoading}
-                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-              >
-                <option value="">
-                  {agentsLoading ? t('common.loading') : t('projectSwitcher.selectProjectAgent')}
-                </option>
-                {agents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.name} · {agent.executor_type}
-                    {agent.model ? ` · ${agent.model}` : ''}
-                  </option>
-                ))}
-              </select>
-              <p className="text-xs text-muted-foreground">{t('projectSwitcher.agentHint')}</p>
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
           </div>
@@ -496,7 +421,6 @@ export function AppShell({ children }: { children: ReactNode }) {
   const setSelectedProjectId = useLayoutStore((s) => s.setSelectedProjectId)
   const routeProjectId = params?.projectId
   const pathname = useRouterState({ select: (state) => state.location.pathname })
-  const isGlobalChatRoute = pathname === '/chat'
   const isBoardRoute = /^\/projects\/[^/]+\/board$/.test(pathname)
   const firstProjectId = projectsQuery.data?.pages[0]?.items[0]?.id
   const projectId = routeProjectId ?? storedProjectId ?? firstProjectId
@@ -655,11 +579,6 @@ export function AppShell({ children }: { children: ReactNode }) {
             {/* Project switcher */}
             <ProjectSwitcher projectId={projectId} collapsed={effectiveCollapsed} />
 
-            {/* Account-level Main Chat */}
-            <div className={effectiveCollapsed ? 'px-1' : 'px-2'}>
-              {navigationItemsForSection('main').map(renderNavLink)}
-            </div>
-
             {/* Project nav */}
             <NavSection
               label={t('appShell.navigation.project', 'Project')}
@@ -697,7 +616,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                 <List size={17} />
               </button>
             ) : null}
-            {projectId && !isGlobalChatRoute ? (
+            {projectId ? (
               <Suspense
                 fallback={
                   <button
@@ -746,7 +665,6 @@ export function AppShell({ children }: { children: ReactNode }) {
           {children}
         </main>
       </div>
-      <ChatLauncher />
     </div>
   )
 }

@@ -16,6 +16,7 @@ import { productTerm } from '@/lib/i18n'
 import type {
   ActiveExecutionSummary,
   AgentPressureSummary,
+  BlockedTaskSummary,
   DaemonIssueSummary,
   DaemonPressureSummary,
   OperatorSeverity,
@@ -190,7 +191,9 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
                     Daemon {execution.daemon_id}
                   </EntityLink>
                 ) : null}
-                {execution.session_id ? <span>Session {execution.session_id}</span> : null}
+                {execution.harness_session_id ? (
+                  <span>HarnessSession {execution.harness_session_id}</span>
+                ) : null}
                 {execution.workspace_id ? <span>Workspace {execution.workspace_id}</span> : null}
               </div>
             </div>
@@ -249,7 +252,7 @@ function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
                 {item.hostname ?? item.daemon_id}
               </EntityLink>
               <p className="mt-1 text-xs text-muted-foreground">
-                {item.active_sessions}/{item.max_sessions ?? '-'} active sessions
+                {item.active_execution_count} active executions · session capacity {item.max_sessions ?? 'unspecified'}
               </p>
             </div>
             <CapacityBadge atCapacity={item.at_capacity} />
@@ -273,7 +276,7 @@ function AgentPressureSection({ items }: { items: AgentPressureSummary[] }) {
               <p className="truncate text-sm font-medium text-foreground">{item.agent_name}</p>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span>
-                  {item.active_sessions}/{item.max_sessions} active sessions
+                  {item.active_execution_count} active executions · task limit {item.max_concurrent_tasks}
                 </span>
                 {item.daemon_id ? (
                   <EntityLink href={`/daemons/${item.daemon_id}`}>
@@ -308,12 +311,7 @@ function CapacityBadge({ atCapacity }: { atCapacity: boolean }) {
 function BlockedTasksSection({
   tasks,
 }: {
-  tasks: Array<{
-    task_id: string
-    title: string
-    blocked_reason: string | null
-    blocked_since: string | null
-  }>
+  tasks: BlockedTaskSummary[]
 }) {
   return (
     <Section title="Blocked Tasks" count={tasks.length}>
@@ -332,7 +330,13 @@ function BlockedTasksSection({
                 {task.title}
               </Link>
               <p className="mt-1 break-words text-xs text-muted-foreground">
-                {task.blocked_reason ?? 'No blocked reason recorded'}
+                {task.reason_kind
+                  ? `${task.reason_kind}${task.reason_ref ? ` · ${task.reason_ref}` : ''}`
+                  : 'No lifecycle reason recorded'}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Blocked lifecycle v{task.lifecycle_version}
+                {task.transition_id ? ` · transition ${task.transition_id}` : ''}
               </p>
             </div>
             <span className="shrink-0 text-xs text-muted-foreground">
@@ -416,7 +420,7 @@ function RetryPressureSection({ items }: { items: RetryPressureSummary[] }) {
       <div className="divide-y">
         {items.map((item) => (
           <div
-            key={item.task_id}
+            key={item.retry_receipt_id}
             className="flex min-w-0 items-start justify-between gap-4 px-4 py-3 transition-colors hover:bg-muted/20"
           >
             <div className="min-w-0">
@@ -427,19 +431,16 @@ function RetryPressureSection({ items }: { items: RetryPressureSummary[] }) {
               >
                 {item.title}
               </Link>
-              <p className="mt-1 text-xs text-muted-foreground">{item.current_state}</p>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                {item.retry_reason ? <span>{item.retry_reason}</span> : null}
-                {item.due_time ? <span>Due {formatDate(item.due_time)}</span> : null}
+                <span>{item.failure_kind}: {item.failure_ref}</span>
+                <span>Lifecycle {item.lifecycle_state} v{item.lifecycle_version}</span>
               </div>
-              {item.last_error ? (
-                <p className="mt-1 break-words text-xs text-red-600 dark:text-red-300">
-                  {item.last_error}
-                </p>
-              ) : null}
+              <p className="mt-1 text-xs text-muted-foreground">
+                Receipt {item.retry_receipt_id} · event {item.receipt_event_id}
+              </p>
             </div>
             <span className="shrink-0 font-mono text-xs text-muted-foreground">
-              {item.attempt_count}/{item.max_attempts ?? '-'} attempts
+              {item.attempt_number}/{item.retry_budget} · {item.disposition}
             </span>
           </div>
         ))}

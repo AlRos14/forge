@@ -1,113 +1,57 @@
-import { useMemo, useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from '@tanstack/react-router'
+import { useState } from 'react'
+import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import {
-  useAgentsQuery,
-  useAdvanceTask,
-  useApproveGate,
-  useCancelTask,
-  useCommentsQuery,
-  useCreateComment,
-  useDeleteComment,
-  useDuplicateTask,
+  useEvaluateGate,
   useExecutionsQuery,
-  useLaunchExecution,
-  useRecoverTask,
   useReviewsQuery,
+  useStartExecution,
   useSubmitReviewReport,
-  useTaskDiffQuery,
+  useTaskGatesQuery,
+  useTaskLifecycleTransitionsQuery,
   useTaskQuery,
-  useRejectGate,
-  useTransitionTask,
+  useTransitionTaskLifecycle,
   useTriggerReview,
   useValidationsQuery,
-  useUpdateTask,
-  useWorkflowQuery,
 } from '@/api/hooks'
 import { apiFetch } from '@/api/client'
-import { qk } from '@/api/query-keys'
-import type { AssigneeSelection } from '@/components/task-controls'
-import { TaskCommentsPanel } from '@/components/task-detail/task-comments-panel'
-import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
-import { useRolePicker } from '@/components/task-detail/use-role-picker'
+import { ErrorBanner } from '@/components/error-banner'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
-import { productTerm } from '@/lib/i18n'
-import { outgoingWorkflowEdges, workflowTriggerTargets } from '@/lib/workflow-utils'
-import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
-import { getHumanGateActions } from '@/lib/gate-actions'
-import { getBlockingAnnotation } from '@/lib/workflow-utils'
-import { TaskExecutionsTab } from '@/pages/task-detail/TaskExecutionsTab'
-import { TaskReviewTab } from '@/pages/task-detail/TaskReviewTab'
-import {
-  extractRunSuffix,
-  formatDate,
-  getErrorInfo,
-  getTaskDetailApiErrorMessage,
-  isRecord,
-  readTaskStateConfig,
-  stripRunSuffix,
-  type UpdateTaskRequestWithStateConfig,
-} from '@/pages/task-detail/utils'
-import { TaskDetailSidebar } from '@/pages/task-detail/TaskDetailSidebar'
-import { TaskDiffPanel } from '@/pages/task-detail/TaskDiffPanel'
-import { TaskLaunchDialog } from '@/pages/task-detail/TaskLaunchDialog'
-import { TaskOverviewPanel } from '@/pages/task-detail/TaskOverviewPanel'
+import { useAuthStore } from '@/stores/auth'
 import { TaskTerminalPanel } from '@/components/task-detail/task-terminal-panel'
-import type { ExecutionConfigValue } from '@/components/execution-config/ExecutionConfigBar'
 import type {
-  Execution,
-  LaunchExecutionResponse,
-  TaskStatus,
-  WorkflowDefinition,
-  WorkflowExceptionAction,
+  GateEvaluationResponse,
+  MergeAfterGateResponse,
+  ReviewExecutionResponse,
+  ExecutionPurpose,
+  StartExecutionRequest,
+  SubmitReviewReportRequest,
+  Task,
+  TaskLifecycleState,
 } from '@/types/generated'
 
-export type TaskDetailTab =
-  | 'overview'
-  | 'executions'
-  | 'review'
-  | 'diff'
-  | 'terminal'
-  | 'comments'
-  | 'history'
-
-export const taskDetailTabs = [
-  'overview',
-  'executions',
-  'review',
-  'diff',
-  'terminal',
-  'comments',
-  'history',
-] as const
+export type TaskDetailTab = 'overview' | 'executions' | 'review' | 'terminal' | 'history'
 
 export function isTaskDetailTab(value: string | undefined): value is TaskDetailTab {
-  return taskDetailTabs.some((tab) => tab === value)
+  return value === 'overview' || value === 'executions' || value === 'review' || value === 'terminal' || value === 'history'
 }
 
-function retryBudgetFromStateConfig(
-  workflow: WorkflowDefinition | undefined,
-  taskStatus?: string,
-): Record<string, unknown> | undefined {
-  if (!workflow) return undefined
-  const review = workflow.states.find((state) => state.name === 'review')
-  const mergeFailed = workflow.states.find((state) => state.name === 'merge_failed')
-  const current = workflow.states.find((state) => state.name === taskStatus)
-  const mergeBudgets = isRecord(mergeFailed?.config.retry_budgets)
-    ? mergeFailed.config.retry_budgets
-    : undefined
-  const currentBudgets = isRecord(current?.config.retry_budgets)
-    ? current.config.retry_budgets
-    : undefined
-  return {
-    ...(review?.gate_config?.max_rejections == null
-      ? {}
-      : { review: review.gate_config.max_rejections }),
-    ...(mergeBudgets?.merge_fix == null ? {} : { merge_fix: mergeBudgets.merge_fix }),
-    ...(currentBudgets?.execution == null ? {} : { execution: currentBudgets.execution }),
-  }
+const nextLifecycleStates: Partial<Record<TaskLifecycleState, TaskLifecycleState[]>> = {
+  backlog: ['ready', 'blocked', 'cancelled'],
+  ready: ['active', 'blocked', 'cancelled'],
+  active: ['ready', 'blocked', 'cancelled'],
+  blocked: ['ready', 'active', 'cancelled'],
+  ready_to_merge: [],
+  merging: [],
+  done: [],
+  cancelled: [],
 }
+
+const tabs: TaskDetailTab[] = ['overview', 'executions', 'review', 'terminal', 'history']
 
 export function TaskDetailPage({
   taskId,
@@ -116,573 +60,480 @@ export function TaskDetailPage({
   taskId: string
   initialTab?: TaskDetailTab
 }) {
-  const navigate = useNavigate()
-  const queryClient = useQueryClient()
+  const [activeTab, setActiveTab] = useState<TaskDetailTab>(initialTab)
   const taskQuery = useTaskQuery(taskId)
+  const transitionsQuery = useTaskLifecycleTransitionsQuery(taskId)
   const executionsQuery = useExecutionsQuery(taskId)
   const reviewsQuery = useReviewsQuery(taskId)
   const validationsQuery = useValidationsQuery(taskId)
-  const diffQuery = useTaskDiffQuery(taskId)
-  const agentsQuery = useAgentsQuery()
-  const updateTask = useUpdateTask()
-  const transitionTask = useTransitionTask()
-  const advanceTask = useAdvanceTask()
-  const approveGate = useApproveGate()
-  const rejectGate = useRejectGate()
-  const rolePicker = useRolePicker()
-  const launchExecution = useLaunchExecution()
-  const triggerReview = useTriggerReview()
-  const submitReviewReport = useSubmitReviewReport()
-  const cancelTask = useCancelTask()
-  const duplicateTask = useDuplicateTask()
-  const recoverTask = useRecoverTask()
-  const commentsQuery = useCommentsQuery(taskId)
-  const createComment = useCreateComment()
-  const deleteComment = useDeleteComment()
-
-  const [launchDialogOpen, setLaunchDialogOpen] = useState(false)
-  const [commentDraft, setCommentDraft] = useState('')
-
-  const stopExecution = useMutation({
-    mutationFn: (executionId: string) =>
-      apiFetch<Execution>(`/executions/${executionId}/cancel`, { method: 'POST' }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-      toast.success(`${productTerm('run')} stopped`)
-    },
-    onError: (error) => toast.error(getApiErrorMessage(error, 'Stop failed')),
-  })
-
-  const reExecuteExecution = useMutation({
-    mutationFn: (executionId: string) =>
-      apiFetch<LaunchExecutionResponse | Execution>(`/executions/${executionId}/re-execute`, {
-        method: 'POST',
-      }),
-    onSuccess: (response) => {
-      const nextExecution = 'data' in response ? response.data.execution : response
-      const nextTask = 'data' in response ? response.data.task : task
-      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.taskDiff(taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-      if (nextTask) {
-        void queryClient.invalidateQueries({ queryKey: qk.projectTasks(nextTask.project_id) })
-      }
-      void navigate({
-        to: '/tasks/$taskId/executions/$executionId',
-        params: { taskId, executionId: nextExecution.id },
-      })
-    },
-    onError: (error) => toast.error(getApiErrorMessage(error, 'Re-execute failed')),
-  })
+  const gatesQuery = useTaskGatesQuery(taskId)
+  const transition = useTransitionTaskLifecycle()
+  const evaluateGate = useEvaluateGate()
+  const startReview = useTriggerReview()
+  const startExecution = useStartExecution()
+  const submitReport = useSubmitReviewReport()
+  const userId = useAuthStore((state) => state.user?.id)
+  const [evaluations, setEvaluations] = useState<Record<string, GateEvaluationResponse>>({})
+  const [reportForm, setReportForm] = useState<Record<string, SubmitReviewReportRequest>>({})
+  const [executionForm, setExecutionForm] = useState<{
+    role: string
+    agentId: string
+    purpose: ExecutionPurpose | ''
+    prompt: string
+    artifactIds: string
+  }>({ role: '', agentId: '', purpose: '', prompt: '', artifactIds: '' })
 
   const task = taskQuery.data
-  const coderAssignment = task?.role_assignments.find(
-    (assignment) => assignment.role_name === 'coder',
-  )
-  const executions = useMemo(() => executionsQuery.data?.items ?? [], [executionsQuery.data])
-  const reviewDisabledReason = undefined
-  const runSuffix = task ? extractRunSuffix(task.title) : ''
-  const agentNamesById = useMemo(
-    () => new Map((agentsQuery.data?.items ?? []).map((agent) => [agent.id, agent.name])),
-    [agentsQuery.data],
-  )
-  const agentName = (agentId?: string | null) => {
-    const name = agentId ? (agentNamesById.get(agentId) ?? agentId) : undefined
-    return name ? stripRunSuffix(name, runSuffix) : undefined
-  }
   const reviews = reviewsQuery.data ?? []
   const validations = validationsQuery.data ?? []
-  const comments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data])
-  const workflowQuery = useWorkflowQuery(task?.project_id ?? '')
-  const workflow = workflowQuery.data
-  const effectiveWorkflow = workflow
-  const workflowRetryBudgets = retryBudgetFromStateConfig(effectiveWorkflow, task?.status)
+  const executions = executionsQuery.data?.items ?? []
+  const executableRoles =
+    task?.task_roles.filter((role) =>
+      role.members.some(
+        (member) => member.status === 'active' && member.actor_ref.kind === 'agent',
+      ),
+    ) ?? []
+  const executableAgents =
+    executableRoles
+      .find((role) => role.role === executionForm.role)
+      ?.members.filter(
+        (member) => member.status === 'active' && member.actor_ref.kind === 'agent',
+      )
+      .map((member) => member.actor_ref.id) ?? []
+  const reviewerRole = task?.task_roles.find((role) => role.role === 'reviewer')
+  const canStartReview = Boolean(
+    task?.lifecycle.state === 'active' &&
+      userId &&
+      reviewerRole?.members.some(
+        (member) =>
+          member.status === 'active' &&
+          member.actor_ref.kind === 'human' &&
+          member.actor_ref.id === userId,
+      ),
+  )
 
-  const errorInfo = task ? getErrorInfo(task) : undefined
-  const showReviewTab = true
-  const launchableStatuses = new Set<TaskStatus>([
-    'todo',
-    'in_progress',
-    'blocked',
-    'merge_failed',
-    'review',
-  ])
-  const canLaunch = Boolean(task && launchableStatuses.has(task.status))
-  const hasAgents = (agentsQuery.data?.items ?? []).length > 0
-
-  const hiddenTransitions = ['merging', effectiveWorkflow?.cancellation_state ?? 'cancelled']
-
-  const transitions: Record<TaskStatus, TaskStatus[]> = {
-    todo: ['in_progress', 'cancelled'],
-    in_progress: ['review', 'cancelled'],
-    review: ['merging', 'cancelled'],
-    merging: [],
-    merge_failed: ['cancelled'],
-    done: [],
-    cancelled: [],
-  }
-
-  const workflowTransitions =
-    effectiveWorkflow && task ? workflowTriggerTargets(effectiveWorkflow, task.status) : undefined
-  const availableTransitions = (
-    workflowTransitions ??
-    (task && task.status === 'todo' && !coderAssignment
-      ? transitions.todo.filter((status) => status !== 'in_progress')
-      : task
-        ? (transitions[task.status] ?? [])
-        : [])
-  ).filter((status) => !hiddenTransitions.includes(status))
-
-  const manualAdvanceTarget =
-    effectiveWorkflow && task
-      ? (() => {
-          const currentIndex = effectiveWorkflow.states.findIndex(
-            (state) => state.name === task.status,
-          )
-          if (currentIndex < 0) return null
-          const cancellationState = effectiveWorkflow.cancellation_state ?? 'cancelled'
-          const currentState = effectiveWorkflow.states[currentIndex]
-          const rejectTarget =
-            typeof currentState.gate_config === 'object' && currentState.gate_config
-              ? currentState.gate_config.reject_target
-              : null
-          const candidates = outgoingWorkflowEdges(effectiveWorkflow, task.status).filter(
-            (transition) =>
-              transition.to !== task.status &&
-              transition.to !== cancellationState &&
-              transition.to !== rejectTarget,
-          )
-          const forwardTarget = candidates
-            .map((transition) => ({
-              transition,
-              index: effectiveWorkflow.states.findIndex((state) => state.name === transition.to),
-            }))
-            .filter((candidate) => candidate.index > currentIndex)
-            .sort((a, b) => a.index - b.index)[0]?.transition.to
-          return forwardTarget ?? candidates[0]?.to ?? null
-        })()
-      : null
-  const manualAdvanceLabel = manualAdvanceTarget
-    ? (effectiveWorkflow?.states.find((state) => state.name === manualAdvanceTarget)
-        ?.display_name ?? manualAdvanceTarget.replace(/_/g, ' '))
-    : null
-  const managedStatusDisabledReason = undefined
-  const gateActions = getHumanGateActions(task, effectiveWorkflow)
-  const gateRole =
-    gateActions && effectiveWorkflow
-      ? (effectiveWorkflow.states.find((state) => state.name === gateActions.stateName)?.role ??
-        null)
-      : null
-  const runningGateExecution =
-    gateRole == null
-      ? undefined
-      : executions.find(
-          (execution) => execution.status === 'running' && execution.role === gateRole,
-        )
-  const gateDecisionDisabledReason = runningGateExecution
-    ? `${gateRole} is still running. Wait for the ${productTerm('run').toLowerCase()} to finish before approving or rejecting.`
-    : undefined
-  const gateDecisionPending = approveGate.isPending || rejectGate.isPending
-  const terminal =
-    task?.status === 'done' ||
-    task?.status === (effectiveWorkflow?.cancellation_state ?? 'cancelled')
-  const currentRole =
-    effectiveWorkflow?.states.find((state) => state.name === task?.status)?.role ?? null
-  const coderRole =
-    effectiveWorkflow?.states.find((state) => state.name === 'in_progress')?.role ??
-    effectiveWorkflow?.roles.find((role) => role.name === 'coder')?.name ??
-    'coder'
-  const visibleRoles = effectiveWorkflow?.roles ?? [
-    { name: 'coder', display_name: 'Coder', description: '' },
-  ]
-  const assignableRoles = [
-    ...visibleRoles.filter((role) => role.name === coderRole),
-    ...visibleRoles.filter((role) => role.name !== coderRole),
-  ]
-
-  // Handlers
-
-  const onUpdateTitle = (title: string) => {
+  async function transitionTo(toState: TaskLifecycleState) {
     if (!task) return
-    updateTask.mutate({ taskId: task.id, body: { title, version: task.version } })
-  }
-
-  const onUpdateDescription = (description: string | null) => {
-    if (!task) return
-    updateTask.mutate({
-      taskId: task.id,
-      body: { description, version: task.version },
-    })
-  }
-
-  const onUpdatePriority = (priority: number) => {
-    if (!task) return
-    updateTask.mutate({ taskId: task.id, body: { priority, version: task.version } })
-  }
-
-  const onSaveRetryBudgets = (
-    review: number | undefined,
-    mergeFix: number | undefined,
-    execution: number | undefined,
-  ) => {
-    if (!task) return
-    const nextConfig = { ...readTaskStateConfig(task) }
-    if (review === undefined && mergeFix === undefined && execution === undefined) {
-      delete nextConfig.retry_budgets
-    } else {
-      nextConfig.retry_budgets = {
-        ...(review === undefined ? {} : { review }),
-        ...(mergeFix === undefined ? {} : { merge_fix: mergeFix }),
-        ...(execution === undefined ? {} : { execution }),
-      }
-    }
-    const body: UpdateTaskRequestWithStateConfig = {
-      version: task.version,
-      task_state_config: nextConfig,
-    }
-    updateTask.mutate(
-      { taskId: task.id, body },
-      {
-        onSuccess: () => toast.success('Retry budgets saved'),
-        onError: (error) => toast.error(getApiErrorMessage(error, 'Retry budget update failed')),
-      },
-    )
-  }
-
-  const onStatusChange = (status: string, reason?: string) => {
-    if (!task || status === task.status) return
-    transitionTask.mutate(
-      {
+    try {
+      await transition.mutateAsync({
         taskId: task.id,
-        body: { status, version: task.version, reason },
-        currentStatus: task.status,
-      },
-      {
-        onError: (error) => {
-          toast.error(getTaskDetailApiErrorMessage(error, 'Transition failed'))
-        },
-      },
-    )
-  }
-
-  const onRecoverTask = (
-    action: Parameters<typeof recoverTask.mutate>[0]['action'],
-    input?: { reason?: string; context?: string },
-  ) => {
-    if (!task) return
-    recoverTask.mutate(
-      { taskId: task.id, action, reason: input?.reason, context: input?.context },
-      {
-        onError: (error) => {
-          toast.error(getTaskDetailApiErrorMessage(error, 'Task recovery failed'))
-        },
-      },
-    )
-  }
-
-  const onOpenWorkflowExceptionAction = (action: WorkflowExceptionAction) => {
-    if (!task) return
-    if (action.target_execution_id) {
-      void navigate({
-        to: '/tasks/$taskId/executions/$executionId',
-        params: { taskId: task.id, executionId: action.target_execution_id },
-        search: { followUp: true },
+        toState,
+        expectedLifecycleVersion: task.lifecycle.version,
+        idempotencyKey: crypto.randomUUID(),
       })
-      return
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Task lifecycle transition failed'))
     }
-    setLaunchDialogOpen(true)
   }
 
-  const onApproveGate = (stateName: string) => {
-    if (!task) return
-    const blockingAnnotation = getBlockingAnnotation(task)
-    if (
-      task.status === 'blocked' &&
-      stateName === 'blocked' &&
-      blockingAnnotation?.recovery_actions?.includes('retry_hook')
-    ) {
-      onRecoverTask('retry_hook')
-      return
+  async function evaluate(gateId: string) {
+    try {
+      const result = await evaluateGate.mutateAsync(gateId)
+      setEvaluations((current) => ({ ...current, [gateId]: result }))
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Gate evaluation failed'))
     }
-    approveGate.mutate(
-      { taskId: task.id, stateName, body: { version: task.version } },
-      { onError: (error) => toast.error(getApiErrorMessage(error, 'Gate approval failed')) },
-    )
   }
 
-  const onRejectGate = (stateName: string, reason: string) => {
+  async function merge(task: Task, evaluation: GateEvaluationResponse) {
+    try {
+      const result = await apiFetch<MergeAfterGateResponse>(`/tasks/${task.id}/merge`, {
+        method: 'POST',
+        body: JSON.stringify({ gate_evaluation_id: evaluation.id }),
+      })
+      toast.success(`Merge admission completed: ${result.outcome}`)
+      await taskQuery.refetch()
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Merge admission failed'))
+    }
+  }
+
+  async function beginReview() {
     if (!task) return
-    rejectGate.mutate(
-      { taskId: task.id, stateName, body: { version: task.version, reason } },
-      { onError: (error) => toast.error(getApiErrorMessage(error, 'Gate rejection failed')) },
-    )
-  }
-
-  const onManualAdvance = () => {
-    if (!task || !manualAdvanceTarget) return
-    advanceTask.mutate(task.id, {
-      onSuccess: (advancedTask) => {
-        toast.success(`Advanced to ${advancedTask.status.replace(/_/g, ' ')}`)
-      },
-      onError: (error) => {
-        toast.error(getTaskDetailApiErrorMessage(error, 'Manual advance failed'))
-      },
-    })
-  }
-
-  const onAssigneeChange = (roleName: string, selection: AssigneeSelection) => {
-    if (!task || terminal) return
-    rolePicker.submit({
-      taskId: task.id,
-      roleName,
-      selection,
-      onError: (error) => toast.error(getTaskDetailApiErrorMessage(error, 'Assignment failed')),
-    })
-  }
-
-  const onCancelTask = () => {
-    if (!task) return
-    cancelTask.mutate(task.id, {
-      onError: (error) => toast.error(getApiErrorMessage(error, 'Cancel failed')),
-    })
-  }
-
-  const onDuplicateTask = () => {
-    if (!task) return
-    duplicateTask.mutate(task.id, {
-      onSuccess: () => toast.success('Task duplicated to Todo'),
-      onError: (error) => toast.error(getApiErrorMessage(error, 'Duplicate failed')),
-    })
-  }
-
-  const postComment = () => {
-    if (!task) return
-    const content = commentDraft.trim()
-    if (!content) return
-    createComment.mutate(
-      { taskId: task.id, body: { content, author_name: 'You' } },
-      {
-        onSuccess: () => setCommentDraft(''),
-        onError: (error) => toast.error(getApiErrorMessage(error, 'Comment failed')),
-      },
-    )
-  }
-
-  const startHumanReview = () => {
-    if (!task) return
-    triggerReview.mutate(
-      { taskId: task.id, body: { workspace_id: task.workspace?.id ?? null } },
-      {
-        onSuccess: (result) => toast.success(`Human Review Execution ${result.execution.id} started`),
-        onError: (error) => toast.error(getApiErrorMessage(error, 'Human review could not start')),
-      },
-    )
-  }
-
-  const submitHumanReport = (executionId: string, body: Parameters<typeof submitReviewReport.mutate>[0]['body']) => {
-    submitReviewReport.mutate(
-      { executionId, body },
-      {
-        onSuccess: (result) => toast.success(`ReviewReport ${result.report.id} saved`),
-        onError: (error) => toast.error(getApiErrorMessage(error, 'ReviewReport could not be saved')),
-      },
-    )
-  }
-
-  const onSubmitLaunch = (config: ExecutionConfigValue, summary: string) => {
-    if (!task || !config.agentId) return
-    launchExecution.mutate(
-      {
+    try {
+      await startReview.mutateAsync({
         taskId: task.id,
-        body: {
-          agent_id: config.agentId,
-          summary: summary.trim() ? summary.trim() : null,
-          overrides: config.overrides,
-        },
-      },
-      {
-        onSuccess: () => {
-          saveRecentExecutionSelection(
-            config.agentId,
-            config.selection ?? {
-              modelId: null,
-              reasoningEffort: null,
-              permissionPolicy: null,
-            },
-          )
-          toast.success(`${productTerm('run')} launched`)
-          setLaunchDialogOpen(false)
-          void navigate({
-            to: '/tasks/$taskId/$tab',
-            params: { taskId: task.id, tab: 'executions' },
-          })
-        },
-        onError: (error) => {
-          toast.error(getApiErrorMessage(error, 'Launch failed'))
-        },
-      },
-    )
+        body: { workspace_id: task.workspace?.id ?? null },
+      })
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Review Execution could not start'))
+    }
   }
+
+  async function beginExecution() {
+    if (!task || !executionForm.role || !executionForm.agentId || !executionForm.purpose) return
+    const body: StartExecutionRequest = {
+      agent_id: executionForm.agentId,
+      role: executionForm.role,
+      purpose: executionForm.purpose,
+      prompt: executionForm.prompt,
+      input_artifact_ids: executionForm.artifactIds
+        .split('\n')
+        .map((value) => value.trim())
+        .filter(Boolean),
+    }
+    try {
+      await startExecution.mutateAsync({ taskId: task.id, body })
+      setExecutionForm({ role: '', agentId: '', purpose: '', prompt: '', artifactIds: '' })
+      toast.success('Execution started with the selected Agent and TaskRole')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Execution could not start'))
+    }
+  }
+
+  async function sendReviewReport(executionId: string) {
+    const body = reportForm[executionId]
+    if (!body) return
+    try {
+      await submitReport.mutateAsync({ executionId, body })
+      setReportForm((current) => {
+        const next = { ...current }
+        delete next[executionId]
+        return next
+      })
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'ReviewReport could not be submitted'))
+    }
+  }
+
+  if (taskQuery.isLoading) {
+    return <div className="p-6 text-sm text-muted-foreground">Loading task…</div>
+  }
+  if (taskQuery.isError) {
+    return <div className="p-6"><ErrorBanner error={taskQuery.error} fallback="Task failed to load" /></div>
+  }
+  if (!task) return null
 
   return (
-    <>
-      <div className="flex h-full gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
-        <TaskDetailSidebar
-          task={task}
-          isLoading={taskQuery.isLoading}
-          taskId={taskId}
-          runSuffix={runSuffix}
-          activeTab={initialTab}
-          executionCount={executions.length}
-          commentCount={comments.length}
-          showReviewTab={showReviewTab}
-        />
-
-        <div className="flex-1 overflow-y-auto">
-          {initialTab === 'overview' && (
-            <TaskOverviewPanel
-              task={task}
-              isLoading={taskQuery.isLoading}
-              isError={taskQuery.isError}
-              error={taskQuery.error}
-              onRetryLoad={() => void taskQuery.refetch()}
-              updatePending={updateTask.isPending}
-              recoverPending={recoverTask.isPending}
-              transitionPending={transitionTask.isPending}
-              gateDecisionPending={gateDecisionPending}
-              advancePending={advanceTask.isPending}
-              rolePickerPending={rolePicker.isPending}
-              cancelPending={cancelTask.isPending}
-              duplicatePending={duplicateTask.isPending}
-              executionActionPending={stopExecution.isPending || reExecuteExecution.isPending}
-              errorInfo={errorInfo}
-              gateActions={gateActions}
-              gateDecisionDisabledReason={gateDecisionDisabledReason}
-              availableTransitions={availableTransitions}
-              managedStatusDisabledReason={managedStatusDisabledReason}
-              reviewDisabledReason={reviewDisabledReason}
-              manualAdvanceTarget={manualAdvanceTarget}
-              manualAdvanceLabel={manualAdvanceLabel}
-              terminal={terminal}
-              currentRole={currentRole}
-              assignableRoles={assignableRoles}
-              agents={agentsQuery.data?.items ?? []}
-              executions={executions}
-              canLaunch={canLaunch}
-              hasAgents={hasAgents}
-              runSuffix={runSuffix}
-              workflowRetryBudgets={workflowRetryBudgets}
-              agentName={agentName}
-              onUpdateTitle={onUpdateTitle}
-              onUpdateDescription={onUpdateDescription}
-              onUpdatePriority={onUpdatePriority}
-              onRecover={onRecoverTask}
-              onOpenWorkflowExceptionAction={onOpenWorkflowExceptionAction}
-              onApproveGate={onApproveGate}
-              onRejectGate={onRejectGate}
-              onStatusChange={onStatusChange}
-              onManualAdvance={onManualAdvance}
-              onAssigneeChange={onAssigneeChange}
-              onCancelTask={onCancelTask}
-              onDuplicateTask={onDuplicateTask}
-              onOpenLaunchDialog={() => setLaunchDialogOpen(true)}
-              onContinueSession={(executionId) => {
-                void navigate({
-                  to: '/tasks/$taskId/executions/$executionId',
-                  params: { taskId, executionId },
-                  search: { followUp: true },
-                })
-              }}
-              onStopExecution={(executionId) => stopExecution.mutate(executionId)}
-              onReExecuteExecution={(executionId) => reExecuteExecution.mutate(executionId)}
-              onSaveRetryBudgets={onSaveRetryBudgets}
-            />
-          )}
-
-          {initialTab === 'executions' && (
-            <div className="p-6">
-              <TaskExecutionsTab
-                taskId={taskId}
-                executions={executions}
-                isLoading={executionsQuery.isLoading}
-                agentName={agentName}
-                formatDate={formatDate}
-              />
-            </div>
-          )}
-
-          {initialTab === 'review' && showReviewTab && task ? (
-            <div className="p-6">
-              <TaskReviewTab
-                task={task}
-                reviews={reviews}
-                validations={validations}
-                reviewsLoading={reviewsQuery.isLoading}
-                validationsLoading={validationsQuery.isLoading}
-                reviewStartPending={triggerReview.isPending}
-                reportSubmitPending={submitReviewReport.isPending}
-                recoverPending={recoverTask.isPending}
-                cancelPending={cancelTask.isPending}
-                terminal={terminal}
-                onStartReview={startHumanReview}
-                onSubmitReport={submitHumanReport}
-                onRecover={onRecoverTask}
-                onOpenWorkflowExceptionAction={onOpenWorkflowExceptionAction}
-                onCancelTask={onCancelTask}
-              />
-            </div>
-          ) : null}
-
-          {initialTab === 'diff' && (
-            <TaskDiffPanel
-              diffQuery={diffQuery}
-              canLaunch={canLaunch}
-              hasAgents={hasAgents}
-              onOpenLaunchDialog={() => {
-                setLaunchDialogOpen(true)
-              }}
-            />
-          )}
-
-          {initialTab === 'terminal' && <TaskTerminalPanel taskId={taskId} className="h-full" />}
-
-          {initialTab === 'comments' && (
-            <div className="px-8 py-6">
-              <div className="max-w-[760px]">
-                {task ? (
-                  <TaskCommentsPanel
-                    task={task}
-                    comments={comments}
-                    commentDraft={commentDraft}
-                    setCommentDraft={setCommentDraft}
-                    createComment={createComment}
-                    deleteComment={deleteComment}
-                    formatDate={formatDate}
-                    onPostComment={postComment}
-                  />
-                ) : null}
-              </div>
-            </div>
-          )}
-
-          {initialTab === 'history' && (
-            <div className="p-6">
-              <TaskHistoryPanel taskId={taskId} />
-            </div>
-          )}
+    <main className="mx-auto w-full max-w-6xl space-y-5 p-4 sm:p-6">
+      <header className="space-y-3">
+        <Link
+          to="/projects/$projectId/board"
+          params={{ projectId: task.project_id }}
+          className="text-sm text-muted-foreground hover:text-foreground"
+        >
+          ← Project board
+        </Link>
+        <div className="flex flex-wrap items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-2xl font-semibold">{task.title}</h1>
+            {task.description ? <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{task.description}</p> : null}
+          </div>
+          <Badge variant="outline">{task.lifecycle.state.replaceAll('_', ' ')}</Badge>
+          <Badge variant="outline">{task.task_type}</Badge>
         </div>
+        <div className="flex flex-wrap gap-2">
+          {(nextLifecycleStates[task.lifecycle.state] ?? []).map((state) => (
+            <Button
+              key={state}
+              size="sm"
+              variant={state === 'cancelled' ? 'outline' : 'default'}
+              disabled={transition.isPending}
+              onClick={() => void transitionTo(state)}
+            >
+              Move to {state.replaceAll('_', ' ')}
+            </Button>
+          ))}
+        </div>
+        <nav className="flex gap-2 border-b" aria-label="Task sections">
+          {tabs.map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              className={`border-b-2 px-3 py-2 text-sm capitalize ${activeTab === tab ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground'}`}
+              onClick={() => setActiveTab(tab)}
+            >
+              {tab}
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      {activeTab === 'overview' ? (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <section className="space-y-3 rounded-lg border p-4">
+            <h2 className="font-semibold">TaskLifecycle</h2>
+            <p className="text-sm">State: <strong>{task.lifecycle.state}</strong></p>
+            <p className="text-sm">Task version: {task.version} · lifecycle version: {String(task.lifecycle.version)}</p>
+            <p className="text-sm">Reason: {task.lifecycle.reason_kind ?? 'none'}{task.lifecycle.reason_ref ? ` · ${task.lifecycle.reason_ref}` : ''}</p>
+            <p className="text-xs text-muted-foreground">Lifecycle is aggregate progress. Actor cognition and execution history are recorded separately.</p>
+          </section>
+          <section className="space-y-3 rounded-lg border p-4">
+            <h2 className="font-semibold">TaskRole memberships</h2>
+            {(task.task_roles ?? []).length === 0 ? <p className="text-sm text-muted-foreground">No TaskRoles are defined.</p> : null}
+            {(task.task_roles ?? []).map((role) => (
+              <div key={role.id} className="space-y-1 rounded-md bg-muted/30 p-3">
+                <p className="font-medium">{role.role}</p>
+                {role.members.map((member) => (
+                  <p key={member.id} className="font-mono text-xs text-muted-foreground">
+                    {member.actor_ref.kind}:{member.actor_ref.id} · {member.status} · membership {member.id} v{String(member.version)}
+                  </p>
+                ))}
+              </div>
+            ))}
+          </section>
+          <section className="space-y-3 rounded-lg border p-4 lg:col-span-2">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="font-semibold">Gates</h2>
+              <span className="text-xs text-muted-foreground">Each evaluation pins exact policy and input facts.</span>
+            </div>
+            {gatesQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading Gates…</p> : null}
+            {gatesQuery.data?.map(({ gate, active_policy: policy }) => {
+              const evaluation = evaluations[gate.id]
+              return (
+                <article key={gate.id} className="space-y-3 rounded-md border p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <strong>{gate.gate_kind}</strong>
+                    <Badge variant="outline">policy revision {policy ? String(policy.revision) : 'unavailable'}</Badge>
+                    <code className="text-xs text-muted-foreground">Gate {gate.id}</code>
+                    <Button size="sm" variant="outline" disabled={evaluateGate.isPending} onClick={() => void evaluate(gate.id)}>Evaluate exact current inputs</Button>
+                  </div>
+                  {policy ? <p className="break-all text-xs text-muted-foreground">Policy digest: {policy.policy_digest}</p> : null}
+                  {evaluation ? (
+                    <div className="space-y-2 rounded bg-muted/40 p-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge>{evaluation.outcome}</Badge>
+                        <code className="text-xs">GateEvaluation {evaluation.id}</code>
+                        <span className="text-xs">policy revision {String(evaluation.policy_revision)}</span>
+                      </div>
+                      <p className="break-all text-xs">Input digest: {evaluation.input_digest}</p>
+                      <ul className="space-y-1 text-xs">
+                        {evaluation.inputs.map((input) => (
+                          <li key={`${input.ordinal}-${input.input_id}`} className="break-all">
+                            {input.input_kind} {input.input_id} v{String(input.input_version)} · {input.status} · {input.input_digest}
+                          </li>
+                        ))}
+                      </ul>
+                      {task.lifecycle.state === 'ready_to_merge' && evaluation.outcome === 'satisfied' ? (
+                        <Button size="sm" disabled={transition.isPending} onClick={() => void merge(task, evaluation)}>Merge using GateEvaluation {evaluation.id}</Button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </article>
+              )
+            })}
+            {!gatesQuery.isLoading && (gatesQuery.data?.length ?? 0) === 0 ? <p className="text-sm text-muted-foreground">No Gate with an active policy is recorded.</p> : null}
+          </section>
+        </div>
+      ) : null}
+
+      {activeTab === 'executions' ? (
+        <section className="space-y-3 rounded-lg border p-4">
+          <h2 className="font-semibold">Executions</h2>
+          <p className="text-xs text-muted-foreground">Every start names the exact Agent, active TaskRole, purpose, prompt, and Artifact inputs.</p>
+          <div className="grid gap-3 rounded-md border p-3 md:grid-cols-2">
+            <label className="space-y-1 text-sm">
+              <span>TaskRole</span>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-2"
+                value={executionForm.role}
+                onChange={(event) =>
+                  setExecutionForm((current) => ({ ...current, role: event.target.value, agentId: '' }))
+                }
+              >
+                <option value="">Select a TaskRole</option>
+                {executableRoles.map((role) => <option key={role.id} value={role.role}>{role.role}</option>)}
+              </select>
+            </label>
+            <label className="space-y-1 text-sm">
+              <span>Agent membership</span>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-2"
+                value={executionForm.agentId}
+                onChange={(event) => setExecutionForm((current) => ({ ...current, agentId: event.target.value }))}
+              >
+                <option value="">Select an active Agent membership</option>
+                {executableAgents.map((agentId) => <option key={agentId} value={agentId}>{agentId}</option>)}
+              </select>
+            </label>
+            <label className="space-y-1 text-sm">
+              <span>Execution purpose</span>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-2"
+                value={executionForm.purpose}
+                onChange={(event) => setExecutionForm((current) => ({ ...current, purpose: event.target.value as ExecutionPurpose | '' }))}
+              >
+                <option value="">Select a purpose</option>
+                <option value="plan">Plan</option>
+                <option value="implement">Implement</option>
+                <option value="review">Review</option>
+                <option value="validate">Validate</option>
+                <option value="investigate">Investigate</option>
+                <option value="orchestrate">Orchestrate</option>
+                <option value="general">General</option>
+              </select>
+            </label>
+            <label className="space-y-1 text-sm">
+              <span>Exact Artifact input IDs (one per line)</span>
+              <Textarea
+                aria-label="Exact Artifact input IDs"
+                value={executionForm.artifactIds}
+                onChange={(event) => setExecutionForm((current) => ({ ...current, artifactIds: event.target.value }))}
+                placeholder="Artifact IDs"
+              />
+            </label>
+            <label className="space-y-1 text-sm md:col-span-2">
+              <span>Execution prompt</span>
+              <Textarea
+                aria-label="Execution prompt"
+                value={executionForm.prompt}
+                onChange={(event) => setExecutionForm((current) => ({ ...current, prompt: event.target.value }))}
+                placeholder="Task-specific instructions for the selected Agent"
+              />
+            </label>
+            <div className="md:col-span-2">
+              <Button
+                size="sm"
+                disabled={startExecution.isPending || !executionForm.role || !executionForm.agentId || !executionForm.purpose || !executionForm.prompt.trim()}
+                onClick={() => void beginExecution()}
+              >
+                Start exact Agent Execution
+              </Button>
+            </div>
+          </div>
+          {executions.map((execution) => (
+            <article key={execution.id} className="space-y-1 rounded-md border p-3 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="outline">{execution.status}</Badge>
+                <span>role: {execution.role}</span>
+                <span>purpose: {execution.purpose ?? 'general'}</span>
+                <code className="ml-auto text-xs">{execution.id}</code>
+              </div>
+              <p className="text-xs text-muted-foreground">Actor: {execution.actor_ref?.kind ?? 'unavailable'}:{execution.actor_ref?.id ?? 'unavailable'} · Harness session: {execution.harness_session_id ?? 'none'} · Workspace: {execution.workspace_id ?? 'none'}</p>
+            </article>
+          ))}
+          {executions.length === 0 ? <p className="text-sm text-muted-foreground">No Execution records are available.</p> : null}
+        </section>
+      ) : null}
+
+      {activeTab === 'review' ? (
+        <section className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-4">
+            <div>
+              <h2 className="font-semibold">Review Executions</h2>
+              <p className="text-xs text-muted-foreground">Formal Review requires Execution role reviewer and purpose review.</p>
+            </div>
+            <Button size="sm" disabled={!canStartReview || startReview.isPending} onClick={() => void beginReview()}>
+              Start Human Review Execution
+            </Button>
+          </div>
+          {reviewsQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading Review Executions…</p> : null}
+          {reviews.map(({ execution, report }) => (
+            <ReviewExecutionCard
+              key={execution.id}
+              review={{ execution, report }}
+              validations={validations}
+              form={reportForm[execution.id]}
+              onFormChange={(form) => setReportForm((current) => ({ ...current, [execution.id]: form }))}
+              onSubmit={() => void sendReviewReport(execution.id)}
+              submitting={submitReport.isPending}
+            />
+          ))}
+          {!reviewsQuery.isLoading && reviews.length === 0 ? <p className="rounded-lg border p-4 text-sm text-muted-foreground">No Review Execution is recorded.</p> : null}
+          <section className="space-y-2 rounded-lg border p-4">
+            <h3 className="font-semibold">ValidationRuns and Evidence</h3>
+            {validations.map((run) => (
+              <article key={run.id} className="space-y-1 rounded border p-3 text-xs">
+                <div className="flex flex-wrap gap-2"><Badge variant="outline">{run.status}</Badge><strong>{run.check_identity}</strong><code>ValidationRun {run.id}</code></div>
+                <p>Workspace {run.workspace_id} · commit {run.commit_sha}</p>
+                <p className="break-all">Snapshot {run.workspace_snapshot_digest}</p>
+                <p>Evidence IDs: {run.evidence_ids.length ? run.evidence_ids.join(', ') : 'none'}</p>
+              </article>
+            ))}
+            {validations.length === 0 ? <p className="text-sm text-muted-foreground">No ValidationRun is recorded.</p> : null}
+          </section>
+        </section>
+      ) : null}
+
+      {activeTab === 'terminal' ? <TaskTerminalPanel taskId={taskId} /> : null}
+
+      {activeTab === 'history' ? (
+        <section className="space-y-3 rounded-lg border p-4">
+          <h2 className="font-semibold">TaskLifecycle transition facts</h2>
+          {(transitionsQuery.data ?? []).map((fact) => (
+            <article key={fact.id} className="space-y-1 rounded-md border p-3 text-sm">
+              <div className="flex flex-wrap gap-2"><Badge variant="outline">{fact.from_state} → {fact.to_state}</Badge><span>version {String(fact.from_version)} → {String(fact.to_version)}</span><code className="ml-auto text-xs">transition {fact.id}</code></div>
+              <p className="text-xs text-muted-foreground">Cause {fact.cause_kind}{fact.cause_ref ? ` · ${fact.cause_ref}` : ''}{fact.gate_evaluation_id ? ` · GateEvaluation ${fact.gate_evaluation_id}` : ''}</p>
+              <p className="text-xs text-muted-foreground">DomainEvent {fact.domain_event_id} · {fact.created_at}</p>
+            </article>
+          ))}
+          {(transitionsQuery.data?.length ?? 0) === 0 ? <p className="text-sm text-muted-foreground">No lifecycle transitions are recorded.</p> : null}
+        </section>
+      ) : null}
+    </main>
+  )
+}
+
+function ReviewExecutionCard({
+  review,
+  validations,
+  form,
+  onFormChange,
+  onSubmit,
+  submitting,
+}: {
+  review: ReviewExecutionResponse
+  validations: import('@/types/generated').ValidationRunResponse[]
+  form: SubmitReviewReportRequest | undefined
+  onFormChange: (form: SubmitReviewReportRequest) => void
+  onSubmit: () => void
+  submitting: boolean
+}) {
+  const { execution, report } = review
+  const ownsExecution = execution.actor_ref?.kind === 'human'
+  const canSubmit = ownsExecution && execution.status === 'running' && !report
+  const currentForm = form ?? {
+    verdict: 'pass',
+    summary: '',
+    criteria: [],
+    findings: [],
+    questions: [],
+    evidence_ids: [],
+    artifact_ids: [],
+  }
+  const selectedEvidence = new Set(currentForm.evidence_ids)
+
+  return (
+    <article className="space-y-3 rounded-lg border p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="outline">{execution.status}</Badge>
+        <Badge variant="outline">{execution.role} · {execution.purpose ?? 'general'}</Badge>
+        <code className="ml-auto text-xs">Execution {execution.id}</code>
       </div>
-      <TaskLaunchDialog
-        open={launchDialogOpen}
-        onOpenChange={(open) => {
-          setLaunchDialogOpen(open)
-        }}
-        isPending={launchExecution.isPending}
-        onSubmit={onSubmitLaunch}
-      />
-    </>
+      <p className="text-xs text-muted-foreground">Actor {execution.actor_ref?.kind ?? 'unknown'}:{execution.actor_ref?.id ?? 'unknown'} · Workspace {execution.workspace_id ?? 'none'} · base {execution.before_sha ?? 'none'} · head {execution.after_sha ?? 'none'}</p>
+      {report ? (
+        <div className="space-y-2 rounded bg-muted/40 p-3">
+          <div className="flex flex-wrap gap-2"><Badge>ReviewReport</Badge><code className="text-xs">Artifact {report.id}</code></div>
+          <p className="text-sm">{report.content ?? 'Report content is not available.'}</p>
+        </div>
+      ) : null}
+      {canSubmit ? (
+        <div className="space-y-3 rounded bg-muted/30 p-3">
+          <label className="block space-y-1 text-sm">
+            <span>Verdict</span>
+            <select
+              className="h-9 w-full rounded-md border bg-background px-2"
+              value={currentForm.verdict}
+              onChange={(event) => onFormChange({ ...currentForm, verdict: event.target.value as SubmitReviewReportRequest['verdict'] })}
+            >
+              <option value="pass">Pass</option><option value="request_changes">Request changes</option><option value="questions">Questions</option>
+            </select>
+          </label>
+          <Textarea aria-label="Review summary" value={currentForm.summary} onChange={(event) => onFormChange({ ...currentForm, summary: event.target.value })} placeholder="Summary for this ReviewReport" />
+          <div className="space-y-1">
+            <p className="text-xs font-medium">Pin exact Validation Evidence</p>
+            {validations.flatMap((run) => run.evidence_ids.map((id) => (
+              <label key={id} className="flex items-center gap-2 font-mono text-xs">
+                <input type="checkbox" checked={selectedEvidence.has(id)} onChange={(event) => onFormChange({ ...currentForm, evidence_ids: event.target.checked ? [...currentForm.evidence_ids, id] : currentForm.evidence_ids.filter((value) => value !== id) })} />
+                {id} · ValidationRun {run.id}
+              </label>
+            )))}
+            {validations.every((run) => run.evidence_ids.length === 0) ? <p className="text-xs text-muted-foreground">No Evidence facts are available to pin.</p> : null}
+          </div>
+          <Input aria-label="Exact Artifact IDs" value={currentForm.artifact_ids.join('\n')} onChange={(event) => onFormChange({ ...currentForm, artifact_ids: event.target.value.split('\n').map((value) => value.trim()).filter(Boolean) })} placeholder="One exact Artifact ID per line" />
+          <Button size="sm" disabled={!currentForm.summary.trim() || submitting} onClick={onSubmit}>Submit ReviewReport for this Execution</Button>
+        </div>
+      ) : null}
+    </article>
   )
 }

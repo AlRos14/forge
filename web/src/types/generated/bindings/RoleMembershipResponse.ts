@@ -2,4 +2,4 @@
 import type { ActorRef } from "./ActorRef";
 import type { RoleMembershipStatus } from "./RoleMembershipStatus";
 
-export type RoleMembershipResponse = { id: string, task_role_id: string, actor_ref: ActorRef, status: RoleMembershipStatus, version: bigint, created_at: string, updated_at: string, ended_at: string | null, };
+export type RoleMembershipResponse = { id: string, task_role_id: string, actor_ref: ActorRef, status: RoleMembershipStatus, version: number, created_at: string, updated_at: string, ended_at: string | null, };

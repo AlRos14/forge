@@ -653,10 +653,15 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
                 </thead>
                 <tbody className="divide-y">
                   {daemon.detected_clis.map((cli, i) => {
-                    const avail = availabilityOf(cli.availability)
+                    const kind = typeof cli.kind === 'string' ? cli.kind : 'unknown'
+                    const availability =
+                      typeof cli.availability === 'string' ? cli.availability : 'unknown'
+                    const version = typeof cli.version === 'string' ? cli.version : null
+                    const path = typeof cli.path === 'string' ? cli.path : null
+                    const avail = availabilityOf(availability)
                     return (
                       <tr key={i} className="transition-colors hover:bg-muted/20">
-                        <td className="px-4 py-2.5 font-medium">{cli.kind}</td>
+                        <td className="px-4 py-2.5 font-medium">{kind}</td>
                         <td className="px-4 py-2.5">
                           <div className="flex items-center gap-1.5">
                             <span className={cn('h-1.5 w-1.5 rounded-full', avail.dot)} />
@@ -664,11 +669,11 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
                           </div>
                         </td>
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                          {cli.version ?? '—'}
+                          {version ?? '—'}
                         </td>
                         <td className="max-w-xs px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                          <span className="block truncate" title={cli.path ?? undefined}>
-                            {cli.path ?? '—'}
+                          <span className="block truncate" title={path ?? undefined}>
+                            {path ?? '—'}
                           </span>
                         </td>
                       </tr>
@@ -718,7 +723,7 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
                   />
                   <span className="font-medium">{agent.name}</span>
                   <span className="font-mono text-xs text-muted-foreground">
-                    {agent.active_task_count ?? 0}/{agent.max_concurrent_tasks}
+                    {agent.active_execution_count ?? 0}/{agent.max_concurrent_tasks}
                   </span>
                 </div>
               ))}
@@ -738,7 +743,7 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
                   key={k}
                   className="rounded-md border bg-muted/40 px-2 py-0.5 font-mono text-xs"
                 >
-                  {k}={v}
+                  {k}={String(v)}
                 </span>
               ))}
             </div>

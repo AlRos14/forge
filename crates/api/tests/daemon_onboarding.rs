@@ -9,8 +9,8 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, CliProjectionItem, CliProjectionResponse, DaemonRegisterResponse,
-    DaemonResponse, ExecutionResponse, ExecutionStatus, PaginatedResponse, ProjectResponse,
-    RepoResponse, TaskResponse,
+    DaemonResponse, ExecutionPurpose, ExecutionResponse, ExecutionStatus, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskLifecycleState, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -130,29 +130,49 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(task.status, "todo".to_owned());
+    assert_eq!(task.lifecycle.state, TaskLifecycleState::Ready);
 
-    let claimed: TaskResponse = json_request(
+    state
+        .task_service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            db::CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    state
+        .task_service
+        .add_task_role_member(
+            &task.id,
+            "implementer",
+            api_types::ActorRef::Agent(agent_id.clone()),
+        )
+        .await
+        .expect("Agent joins implementer TaskRole");
+
+    let running_execution: ExecutionResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/claim", task.id),
-        json!({ "agent_id": agent_id, "overrides": null }),
+        &format!("/api/v1/tasks/{}/executions", task.id),
+        json!({
+            "agent_id": agent_id,
+            "role": "implementer",
+            "purpose": "implement",
+            "prompt": "echo forge-e2e-ok",
+            "input_artifact_ids": []
+        }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(claimed.status, "in_progress".to_owned());
-    assert!(claimed.role_assignments.iter().any(|assignment| {
-        assignment.role_name == "coder"
-            && assignment.assignee_type.as_deref() == Some("agent")
-            && assignment.assignee_id.as_deref() == Some(agent_id.as_str())
-    }));
-
-    let running_execution = single_execution_for_task(&app, &task.id).await;
     assert_eq!(running_execution.status, ExecutionStatus::Running);
     assert_eq!(
-        running_execution.agent_id.as_deref(),
-        Some(agent_id.as_str())
+        running_execution.actor_ref,
+        Some(api_types::ActorRef::Agent(agent_id.clone()))
     );
+    assert_eq!(running_execution.role, "implementer");
+    assert_eq!(running_execution.purpose, Some(ExecutionPurpose::Implement));
 
     let workspace = db::WorkspaceRepo::get_by_task_id(&*state.db, &task.id)
         .await
@@ -168,6 +188,8 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     )
     .await;
     assert_eq!(completed_execution.status, ExecutionStatus::Completed);
+    assert_eq!(completed_execution.actor_ref, running_execution.actor_ref);
+    assert_eq!(completed_execution.role, "implementer");
     let snapshot = completed_execution
         .executor_config_snapshot
         .as_ref()
@@ -187,7 +209,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
 
     let agent_detail = poll_agent_active(&app, &agent_id).await;
     assert_eq!(agent_detail.effective_status.as_deref(), Some("active"));
-    assert_eq!(agent_detail.active_task_count, Some(0));
+    assert_eq!(agent_detail.active_execution_count, Some(0));
 }
 
 async fn test_app_with_state() -> (Router, Arc<AppState>) {
@@ -299,15 +321,16 @@ async fn poll_agent_active(app: &Router, agent_id: &str) -> AgentResponse {
             StatusCode::OK,
         )
         .await;
-        if agent.effective_status.as_deref() == Some("active") && agent.active_task_count == Some(0)
+        if agent.effective_status.as_deref() == Some("active")
+            && agent.active_execution_count == Some(0)
         {
             return agent;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "agent did not return active with zero tasks; last effective_status={:?} active_task_count={:?}",
+            "agent did not return active with zero tasks; last effective_status={:?} active_execution_count={:?}",
             agent.effective_status,
-            agent.active_task_count
+            agent.active_execution_count
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

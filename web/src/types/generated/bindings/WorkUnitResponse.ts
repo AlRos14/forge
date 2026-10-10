@@ -4,4 +4,4 @@ import type { WorkUnitProvenance } from "./WorkUnitProvenance";
 import type { WorkUnitReadinessResponse } from "./WorkUnitReadinessResponse";
 import type { WorkUnitStatus } from "./WorkUnitStatus";
 
-export type WorkUnitResponse = { id: string, task_id: string, parent_work_unit_id: string | null, title: string, scope: string, status: WorkUnitStatus, role: string, assigned_actor: ActorRef | null, requires_integration: boolean, provenance: WorkUnitProvenance | null, created_by: ActorRef, version: bigint, created_at: string, updated_at: string, readiness: WorkUnitReadinessResponse, };
+export type WorkUnitResponse = { id: string, task_id: string, parent_work_unit_id: string | null, title: string, scope: string, status: WorkUnitStatus, role: string, assigned_actor: ActorRef | null, requires_integration: boolean, provenance: WorkUnitProvenance | null, created_by: ActorRef, version: number, created_at: string, updated_at: string, readiness: WorkUnitReadinessResponse, };

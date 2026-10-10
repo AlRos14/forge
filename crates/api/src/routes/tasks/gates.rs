@@ -3,10 +3,12 @@ use api_types::{
     CreateTaskGateRequest, GateEvaluationInputResponse, GateEvaluationResponse,
     GatePolicyRevisionResponse, GateResponse, MergeAfterGateRequest, MergeAfterGateResponse,
     ReviseGatePolicyRequest, TaskGateResponse, TaskLifecycleResponse,
+    TaskLifecycleTransitionFactResponse, TaskLifecycleTransitionResponse,
+    TransitionTaskLifecycleRequest,
 };
 use db::{
     Gate, GateEvaluation, GateEvaluationInput, GatePolicyRevision, GateRepo, GateScopeKind,
-    TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState,
+    TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState, TaskRepo,
 };
 use services::gate_engine::GateEngine;
 use std::sync::Arc;
@@ -26,16 +28,7 @@ fn gate_response(gate: Gate) -> TaskGateResponse {
 fn lifecycle_response(lifecycle: db::TaskLifecycle) -> TaskLifecycleResponse {
     TaskLifecycleResponse {
         task_id: lifecycle.task_id,
-        state: match lifecycle.state {
-            DbTaskLifecycleState::Backlog => api_types::TaskLifecycleState::Backlog,
-            DbTaskLifecycleState::Ready => api_types::TaskLifecycleState::Ready,
-            DbTaskLifecycleState::Active => api_types::TaskLifecycleState::Active,
-            DbTaskLifecycleState::Blocked => api_types::TaskLifecycleState::Blocked,
-            DbTaskLifecycleState::ReadyToMerge => api_types::TaskLifecycleState::ReadyToMerge,
-            DbTaskLifecycleState::Merging => api_types::TaskLifecycleState::Merging,
-            DbTaskLifecycleState::Done => api_types::TaskLifecycleState::Done,
-            DbTaskLifecycleState::Cancelled => api_types::TaskLifecycleState::Cancelled,
-        },
+        state: lifecycle_state_response(lifecycle.state),
         version: lifecycle.version,
         reason_kind: lifecycle.reason_kind,
         reason_ref: lifecycle.reason_ref,
@@ -54,6 +47,128 @@ pub async fn get_task_lifecycle(
         .await?
         .ok_or_else(|| ApiError::not_found("task lifecycle", task_id))?;
     Ok(Json(lifecycle_response(lifecycle)))
+}
+
+pub async fn transition_task_lifecycle(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Json(request): Json<TransitionTaskLifecycleRequest>,
+) -> ApiResult<Json<TaskLifecycleTransitionResponse>> {
+    super::require_task_visible(&state, &task_id, &user).await?;
+    let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task", task_id.clone()))?;
+    let to_state = match request.to_state {
+        api_types::TaskLifecycleState::Backlog => DbTaskLifecycleState::Backlog,
+        api_types::TaskLifecycleState::Ready => DbTaskLifecycleState::Ready,
+        api_types::TaskLifecycleState::Active => DbTaskLifecycleState::Active,
+        api_types::TaskLifecycleState::Blocked => DbTaskLifecycleState::Blocked,
+        api_types::TaskLifecycleState::ReadyToMerge => DbTaskLifecycleState::ReadyToMerge,
+        api_types::TaskLifecycleState::Merging => DbTaskLifecycleState::Merging,
+        api_types::TaskLifecycleState::Done => DbTaskLifecycleState::Done,
+        api_types::TaskLifecycleState::Cancelled => DbTaskLifecycleState::Cancelled,
+    };
+    let cause = match request.gate_evaluation_id {
+        Some(evaluation_id)
+            if matches!(
+                to_state,
+                DbTaskLifecycleState::ReadyToMerge | DbTaskLifecycleState::Active
+            ) =>
+        {
+            services::task_lifecycle::LifecycleCause::GateEvaluation(evaluation_id)
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request_with_code(
+                "task_lifecycle.unexpected_gate_evaluation",
+                "gate_evaluation_id is accepted only for exact merge-readiness lifecycle edges",
+            ));
+        }
+        None if to_state == DbTaskLifecycleState::ReadyToMerge => {
+            return Err(ApiError::bad_request_with_code(
+                "task_lifecycle.gate_evaluation_required",
+                "ready_to_merge requires the exact GateEvaluation that admitted it",
+            ));
+        }
+        None => services::task_lifecycle::LifecycleCause::Actor(api_types::Actor::User {
+            user_id: Some(user.user_id.clone()),
+            source: api_types::UserActionSource::Api,
+        }),
+    };
+    let result = services::task_lifecycle::TaskLifecycleService::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+    )
+    .transition_at_lifecycle_version(
+        services::task_lifecycle::TransitionLifecycleInput {
+            task_id: task_id.clone(),
+            expected_task_version: task.version,
+            to_state,
+            cause,
+            reason_kind: request.reason_kind,
+            reason_ref: request.reason_ref,
+            idempotency_key: request.idempotency_key,
+        },
+        request.expected_lifecycle_version,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let (transition_id, gate_evaluation_id, replayed) = match result.transition {
+        Some(transition) => (
+            Some(transition.transition_id),
+            transition.gate_evaluation_id,
+            transition.replayed,
+        ),
+        None => (None, None, false),
+    };
+    Ok(Json(TaskLifecycleTransitionResponse {
+        task_id,
+        lifecycle: lifecycle_response(result.lifecycle),
+        transition_id,
+        gate_evaluation_id,
+        replayed,
+    }))
+}
+
+pub async fn list_task_lifecycle_transitions(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+) -> ApiResult<Json<Vec<TaskLifecycleTransitionFactResponse>>> {
+    super::require_task_visible(&state, &task_id, &user).await?;
+    let transitions = TaskLifecycleRepo::list_task_lifecycle_transitions(&*state.db, &task_id, 100)
+        .await?
+        .into_iter()
+        .map(|transition| TaskLifecycleTransitionFactResponse {
+            id: transition.id,
+            task_id: transition.task_id,
+            from_state: lifecycle_state_response(transition.from_state),
+            to_state: lifecycle_state_response(transition.to_state),
+            from_version: transition.from_version,
+            to_version: transition.to_version,
+            cause_kind: transition.cause_kind,
+            cause_ref: transition.cause_ref,
+            gate_evaluation_id: transition.gate_evaluation_id,
+            reason_kind: transition.reason_kind,
+            reason_ref: transition.reason_ref,
+            domain_event_id: transition.domain_event_id,
+            created_at: transition.created_at,
+        })
+        .collect();
+    Ok(Json(transitions))
+}
+
+fn lifecycle_state_response(state: DbTaskLifecycleState) -> api_types::TaskLifecycleState {
+    match state {
+        DbTaskLifecycleState::Backlog => api_types::TaskLifecycleState::Backlog,
+        DbTaskLifecycleState::Ready => api_types::TaskLifecycleState::Ready,
+        DbTaskLifecycleState::Active => api_types::TaskLifecycleState::Active,
+        DbTaskLifecycleState::Blocked => api_types::TaskLifecycleState::Blocked,
+        DbTaskLifecycleState::ReadyToMerge => api_types::TaskLifecycleState::ReadyToMerge,
+        DbTaskLifecycleState::Merging => api_types::TaskLifecycleState::Merging,
+        DbTaskLifecycleState::Done => api_types::TaskLifecycleState::Done,
+        DbTaskLifecycleState::Cancelled => api_types::TaskLifecycleState::Cancelled,
+    }
 }
 
 fn policy_response(policy: GatePolicyRevision) -> ApiResult<GatePolicyRevisionResponse> {
@@ -127,6 +242,25 @@ pub async fn create_task_gate(
         gate: gate_response(gate),
         active_policy: Some(policy_response(revision)?),
     }))
+}
+
+pub async fn list_task_gates(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+) -> ApiResult<Json<Vec<GateResponse>>> {
+    require_task_visible(&state, &task_id, &user).await?;
+    let gates = GateRepo::list_active_gate_policies(&*state.db, &task_id).await?;
+    let responses = gates
+        .into_iter()
+        .map(|(gate, active_policy)| {
+            Ok(GateResponse {
+                gate: gate_response(gate),
+                active_policy: Some(policy_response(active_policy)?),
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    Ok(Json(responses))
 }
 
 pub async fn get_gate(
@@ -282,28 +416,4 @@ pub async fn merge_after_gate(
         },
     };
     Ok(Json(response))
-}
-
-pub async fn approve_gate(
-    State(state): State<AppState>,
-    user: crate::routes::auth::AuthenticatedUser,
-    Path((task_id, _state_name)): Path<(String, String)>,
-    Json(_request): Json<api_types::ApproveGateRequest>,
-) -> ApiResult<Json<TaskResponse>> {
-    require_task_visible(&state, &task_id, &user).await?;
-    Err(ApiError::invalid_operation_conflict(
-        "Legacy workflow Gate approval is retired; use an exact GateEvaluation and Decision or ReviewReport",
-    ))
-}
-
-pub async fn reject_gate(
-    State(state): State<AppState>,
-    user: crate::routes::auth::AuthenticatedUser,
-    Path((task_id, _state_name)): Path<(String, String)>,
-    Json(_request): Json<api_types::RejectGateRequest>,
-) -> ApiResult<Json<TaskResponse>> {
-    require_task_visible(&state, &task_id, &user).await?;
-    Err(ApiError::invalid_operation_conflict(
-        "Legacy workflow Gate rejection is retired; use an exact GateEvaluation and Decision or ReviewReport",
-    ))
 }

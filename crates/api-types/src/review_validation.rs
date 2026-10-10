@@ -81,6 +81,7 @@ pub struct ValidationRunResponse {
     pub commit_sha: String,
     pub workspace_snapshot_digest: String,
     pub status: ValidationRunStatus,
+    #[ts(type = "number | null")]
     pub exit_code: Option<i32>,
     pub started_at: String,
     pub finished_at: Option<String>,

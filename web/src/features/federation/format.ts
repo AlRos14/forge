@@ -1,23 +1,6 @@
 import type { AgentProviderCapability, ProviderEntryResponse, ProviderRuntimeCapability } from '@/types/generated'
 
-/** Tool ceiling applied to embedded agents/profiles created from this page. */
-export const DEFAULT_CEILING = {
-  allowed: [
-    'read_account',
-    'read_project',
-    'read_agent_chat',
-    'read_task',
-    'read_memory',
-    'propose_task',
-    'propose_message',
-    'propose_review',
-    'task_read',
-    'task_write',
-  ],
-}
-
 export const runtimeDisplayNames: Record<string, string> = {
-  direct: 'Direct · built-in runtime',
   codex: 'Codex CLI harness',
   claude_code: 'Claude Code harness',
   cursor: 'Cursor harness',
@@ -58,20 +41,7 @@ export function runtimeOptionsForEntry(
   capabilities: AgentProviderCapability[] | undefined,
   entry: ProviderEntryResponse,
 ): ProviderRuntimeCapability[] {
-  return (
-    catalogMethodForEntry(capabilities, entry)?.runtimes ?? [
-      { runtime: 'direct', support_level: 'stable', reason: null },
-    ]
-  )
-}
-
-/**
- * A CLI-harness identity (Codex/Claude Code/Cursor/... executor types) can't
- * publish an embedded profile — only "native"/"embedded" backends can. Used
- * to gate ChangeModelDialog's "new model" mode.
- */
-export function canPublishEmbeddedProfile(backendKind: string): boolean {
-  return backendKind === 'native' || backendKind === 'embedded'
+  return catalogMethodForEntry(capabilities, entry)?.runtimes ?? []
 }
 
 /** Coarse relative time to a future instant: "in 42m", "in 1h 30m", "in 3d", "now". */
@@ -105,21 +75,4 @@ export function numberValue(value: number | bigint | null | undefined, fallback:
   if (value === null || value === undefined) return fallback
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
-}
-
-/** Tool/permission ceiling applied to a fresh Project Agent binding. */
-export const DEFAULT_PROJECT_PERMISSION_CEILING = {
-  allowed: [
-    'read_project',
-    'read_agent_chat',
-    'read_task',
-    'read_memory',
-    'propose_task',
-    'propose_message',
-    'propose_review',
-    'propose_commitment',
-    'propose_memory',
-    'propose_decision',
-    'propose_session',
-  ],
 }

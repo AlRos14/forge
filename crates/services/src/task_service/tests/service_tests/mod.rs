@@ -554,23 +554,6 @@ async fn update_project_workflow(db: &SqliteDb, project_id: &str, workflow: &Wor
         .expect("project workflow updates");
 }
 
-async fn update_project_default_roles(db: &SqliteDb, project_id: &str, agent_id: &str) {
-    let settings = json!({
-        "default_role_assignments": [
-            {"role_name": default_roles::PLANNER, "assignee_type": "agent", "assignee_id": agent_id},
-            {"role_name": default_roles::CODER, "assignee_type": "agent", "assignee_id": agent_id},
-            {"role_name": default_roles::REVIEWER, "assignee_type": "agent", "assignee_id": agent_id}
-        ]
-    });
-    sqlx::query("UPDATE project SET settings = ?, updated_at = ? WHERE id = ?")
-        .bind(settings.to_string())
-        .bind(now_rfc3339())
-        .bind(project_id)
-        .execute(db.pool())
-        .await
-        .expect("project settings updates");
-}
-
 async fn wait_until_execution_has_logs_path(db: &SqliteDb, execution_id: &str) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {

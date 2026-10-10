@@ -35,8 +35,23 @@ pub enum AgentStatus {
 
 pub type ExecutionRole = String;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The explicit reason an Actor is performing work in an Execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExecutionPurpose {
+    Plan,
+    Implement,
+    Review,
+    Validate,
+    Investigate,
+    Orchestrate,
+    General,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ExecutionStatus {
     Running,
     Completed,
@@ -307,8 +322,10 @@ pub struct WorkflowExceptionSummary {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub struct FailingStepSummary {
+    #[ts(type = "number")]
     pub index: usize,
     pub command: Option<String>,
+    #[ts(type = "number | null")]
     pub exit_code: Option<i32>,
     pub output_tail: Option<String>,
     pub stderr_tail: Option<String>,

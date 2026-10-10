@@ -1,6 +1,5 @@
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
-    lifecycle::{LifecycleHookContext, LifecycleHookRun, LifecycleHookRunner},
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
     workflow::{default_states, engine::WorkflowEngine},
@@ -10,7 +9,7 @@ use crate::{
 };
 use ::review::ReviewRunner;
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
-use api_types::{Actor, ActorRef, ProjectSettings, UserActionSource};
+use api_types::{Actor, ActorRef, UserActionSource};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
     CommentAuthorType, CreateDomainEvent, CreateExecution, CreateTask, CreateTaskComment,
@@ -47,7 +46,6 @@ mod create_subtasks;
 pub(crate) mod execution;
 pub use execution::resumable_external_session;
 mod governance;
-mod lifecycle_test;
 pub(crate) mod logs;
 mod memberships;
 mod move_task;

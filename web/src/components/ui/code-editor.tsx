@@ -31,7 +31,6 @@ const FORGE_ENV_VARS = [
   { name: 'FORGE_EVENT',         detail: 'Lifecycle event name' },
   { name: 'FORGE_TASK_ID',       detail: 'Task UUID' },
   { name: 'FORGE_TASK_TITLE',    detail: 'Task title' },
-  { name: 'FORGE_TASK_STATUS',   detail: 'Current task status' },
   { name: 'FORGE_PROJECT_ID',    detail: 'Project UUID' },
   { name: 'FORGE_REPO_PATH',     detail: 'Path to the repository root' },
   { name: 'FORGE_WORKTREE_PATH', detail: 'Path to the agent worktree' },

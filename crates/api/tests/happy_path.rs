@@ -12,7 +12,7 @@ use api_types::{
     MergeAfterGateResponse, PaginatedResponse, ProjectResponse, RepoResponse,
     ReviewExecutionResponse, ReviewReportVerdict, StartReviewExecutionRequest,
     SubmitReviewReportRequest, SubmitReviewReportResponse, TaskLifecycleResponse,
-    TaskLifecycleState, TaskResponse, TaskStatus, TerminalAttachTokenResponse, TerminalServerFrame,
+    TaskLifecycleState, TaskResponse, TerminalAttachTokenResponse, TerminalServerFrame,
     TerminalSessionResponse, TerminalSessionStatus,
 };
 use axum::{
@@ -21,11 +21,10 @@ use axum::{
     Router,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, AssigneeKind, CreateTaskRoleAssignment, DomainEventRepo,
-    ProjectHookRunRepo, TaskRepo, TaskRoleAssignmentRepo, ValidationRunRepo, ValidationRunStatus,
-    WorkspaceRepo,
+    CoordinationMode, DomainEventRepo, ProjectHookRunRepo, TaskRepo, ValidationRunRepo,
+    ValidationRunStatus, WorkspaceRepo,
 };
-use events::{EventBus, EventContext, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT};
+use events::{EventBus, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -38,12 +37,6 @@ async fn forge_happy_path_end_to_end() {
 
     let workspaces_root = TestDir::new("forge-happy-workspaces");
     let harness = test_app(workspaces_root.path()).await;
-    harness
-        .state
-        .workflow_template_service
-        .initialize()
-        .await
-        .expect("builtin workflow templates initialize");
     let mut events_rx = harness.event_bus.subscribe();
 
     let project: ProjectResponse = json_request(
@@ -55,15 +48,6 @@ async fn forge_happy_path_end_to_end() {
     )
     .await;
     let project_id = project.id;
-    let _: Value = json_request(
-        &harness.app,
-        Method::PUT,
-        &format!("/api/v1/projects/{project_id}/workflow"),
-        json!({ "template_name": "autonomous_v1" }),
-        StatusCode::OK,
-    )
-    .await;
-
     let repo: RepoResponse = json_request(
         &harness.app,
         Method::POST,
@@ -117,38 +101,35 @@ async fn forge_happy_path_end_to_end() {
         StatusCode::OK,
     )
     .await;
-    let task_id = created_task.id;
-    assert_eq!(created_task.status, "todo".to_owned());
-    let created_lifecycle: TaskLifecycleResponse = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/lifecycle"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(created_lifecycle.state, TaskLifecycleState::Ready);
+    let task_id = created_task.id.clone();
+    assert_eq!(created_task.lifecycle.state, TaskLifecycleState::Ready);
+    assert!(serde_json::to_value(&created_task)
+        .expect("Task response serializes")
+        .get("status")
+        .is_none());
     assert_eq!(created_task.version, 1);
-    assign_test_user_as_reviewer(&harness.state.db, &task_id).await;
+    assign_test_user_as_reviewer(&harness.state, &task_id).await;
+    assign_agent_as_implementer(&harness.state, &task_id, &agent_id).await;
 
-    let claimed: TaskResponse = json_request(
+    let execution: ExecutionResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/claim"),
-        json!({ "agent_id": agent_id, "overrides": null }),
+        &format!("/api/v1/tasks/{task_id}/executions"),
+        json!({
+            "agent_id": agent_id.clone(),
+            "role": "implementer",
+            "purpose": "implement",
+            "prompt": "echo hello > greeting.txt && git add . && git commit -m 'hi'",
+            "input_artifact_ids": []
+        }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(claimed.status, "in_progress".to_owned());
-    let claimed_lifecycle: TaskLifecycleResponse = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/lifecycle"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(claimed_lifecycle.state, TaskLifecycleState::Active);
-
-    let execution = single_execution_for_task(&harness.app, &task_id).await;
+    assert_eq!(execution.role, "implementer");
+    assert_eq!(
+        execution.purpose,
+        Some(api_types::ExecutionPurpose::Implement)
+    );
     let execution_id = execution.id.clone();
 
     let worktree_path = workspaces_root.path().join(&task_id).join("repo");
@@ -315,8 +296,9 @@ async fn forge_happy_path_end_to_end() {
     )
     .await;
     assert!(matches!(merge.outcome.as_str(), "done" | "pull_request"));
-    let completed = poll_until_task_status(&harness.app, &task_id, "done".to_owned()).await;
-    assert_eq!(completed.status, "done".to_owned());
+    let completed =
+        poll_until_task_lifecycle(&harness.app, &task_id, TaskLifecycleState::Done).await;
+    assert_eq!(completed.state, TaskLifecycleState::Done);
 
     let latest_subject = run_git(&repo_path, &["log", "-1", "--format=%s"]);
     assert!(
@@ -384,7 +366,13 @@ async fn forge_happy_path_end_to_end() {
 
     let events = drain_events(&mut events_rx).await;
     assert_event_type(&events, "task.created");
-    assert_event_type(&events, "task.assigned");
+    assert_event_type(&events, "task.updated");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "task.assigned"),
+        "TaskRole membership changes do not publish the retired singular assignment event"
+    );
     assert_event_type(&events, "domain_event.committed");
     assert_event_type(&events, "workspace.cleaned");
     assert!(
@@ -402,13 +390,6 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
     let workspaces_root = TestDir::new("forge-autonomous-workspaces");
     let harness = test_app(workspaces_root.path()).await;
-    harness
-        .state
-        .workflow_template_service
-        .initialize()
-        .await
-        .expect("builtin workflow templates initialize");
-
     let project: ProjectResponse = json_request(
         &harness.app,
         Method::POST,
@@ -431,15 +412,6 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
         StatusCode::OK,
     )
     .await;
-    let _: Value = json_request(
-        &harness.app,
-        Method::PUT,
-        &format!("/api/v1/projects/{project_id}/workflow"),
-        json!({ "template_name": "autonomous_v1" }),
-        StatusCode::OK,
-    )
-    .await;
-
     let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(
         &harness.app,
@@ -465,19 +437,25 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(task.status, "todo".to_owned());
-    assign_test_user_as_reviewer(&harness.state.db, &task.id).await;
+    assert_eq!(task.lifecycle.state, TaskLifecycleState::Ready);
+    assign_test_user_as_reviewer(&harness.state, &task.id).await;
+    assign_agent_as_implementer(&harness.state, &task.id, &agent.id).await;
 
-    let claimed: TaskResponse = json_request(
+    let execution: ExecutionResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/claim", task.id),
-        json!({ "agent_id": agent.id, "overrides": null }),
+        &format!("/api/v1/tasks/{}/executions", task.id),
+        json!({
+            "agent_id": agent.id,
+            "role": "implementer",
+            "purpose": "implement",
+            "prompt": "printf 'requested changes\\n' > requested-changes.txt && git add requested-changes.txt && git commit -m requested-changes",
+            "input_artifact_ids": []
+        }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(claimed.status, "in_progress".to_owned());
-    let first_execution = single_execution_for_task(&harness.app, &task.id).await;
+    let first_execution = execution;
     assert_eq!(first_execution.role.to_string(), "implementer");
     poll_until_execution_completed(&harness.state.db, &first_execution.id).await;
 
@@ -569,21 +547,44 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     assert_eq!(implementer_executions, 1);
 }
 
-async fn assign_test_user_as_reviewer(db: &db::SqliteDb, task_id: &str) {
-    TaskRoleAssignmentRepo::assign(
-        db,
-        CreateTaskRoleAssignment {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            role_name: "reviewer".to_owned(),
-            assignee_type: Some(AssigneeKind::User),
-            assignee_id: Some("test-user-id".to_owned()),
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("test Human reviewer assignment persists");
+async fn assign_test_user_as_reviewer(state: &AppState, task_id: &str) {
+    state
+        .task_service
+        .create_task_role(
+            task_id,
+            "reviewer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole creates");
+    state
+        .task_service
+        .add_task_role_member(
+            task_id,
+            "reviewer",
+            ActorRef::Human("test-user-id".to_owned()),
+        )
+        .await
+        .expect("test Human joins the reviewer TaskRole");
+}
+
+async fn assign_agent_as_implementer(state: &AppState, task_id: &str, agent_id: &str) {
+    state
+        .task_service
+        .create_task_role(
+            task_id,
+            "implementer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    state
+        .task_service
+        .add_task_role_member(task_id, "implementer", ActorRef::Agent(agent_id.to_owned()))
+        .await
+        .expect("Agent joins the implementer TaskRole");
 }
 
 async fn submit_human_review(
@@ -595,7 +596,7 @@ async fn submit_human_review(
     let review: ReviewExecutionResponse = json_request(
         app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review"),
+        &format!("/api/v1/tasks/{task_id}/review-executions"),
         serde_json::to_value(StartReviewExecutionRequest { workspace_id: None })
             .expect("review start request serializes"),
         StatusCode::OK,
@@ -606,11 +607,14 @@ async fn submit_human_review(
         Some(ActorRef::Human("test-user-id".to_owned()))
     );
     assert_eq!(review.execution.role.to_string(), "reviewer");
-    assert_eq!(review.execution.purpose.as_deref(), Some("review"));
+    assert_eq!(
+        review.execution.purpose,
+        Some(api_types::ExecutionPurpose::Review)
+    );
     json_request(
         app,
         Method::POST,
-        &format!("/api/v1/reviews/{}", review.execution.id),
+        &format!("/api/v1/review-executions/{}", review.execution.id),
         serde_json::to_value(SubmitReviewReportRequest {
             verdict,
             summary: summary.to_owned(),
@@ -907,9 +911,13 @@ async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &s
                 return;
             }
             if execution.status != db::ExecutionStatus::Running {
+                let log = execution
+                    .logs_path
+                    .as_deref()
+                    .and_then(|path| std::fs::read_to_string(path).ok());
                 panic!(
-                    "execution ended in unexpected status: {:?}",
-                    execution.status
+                    "execution ended in unexpected status: {:?}; error: {:?}; logs: {:?}",
+                    execution.status, execution.error, log
                 );
             }
         }
@@ -925,7 +933,15 @@ async fn poll_until_workspace_written(app: &Router, task_id: &str, greeting_path
         }
         let execution = single_execution_for_task(app, task_id).await;
         if execution.status != ExecutionStatus::Running {
-            break;
+            panic!(
+                "execution ended before writing workspace output: {:?}; error: {:?}; logs: {:?}",
+                execution.status,
+                execution.error,
+                execution
+                    .logs_path
+                    .as_deref()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -933,27 +949,6 @@ async fn poll_until_workspace_written(app: &Router, task_id: &str, greeting_path
         greeting_path.exists(),
         "greeting.txt was not written before execution stopped"
     );
-}
-
-async fn poll_until_task_status(
-    app: &Router,
-    task_id: &str,
-    expected_status: TaskStatus,
-) -> TaskResponse {
-    for _ in 0..100 {
-        let task: TaskResponse = empty_request(
-            app,
-            Method::GET,
-            &format!("/api/v1/tasks/{task_id}"),
-            StatusCode::OK,
-        )
-        .await;
-        if task.status == expected_status {
-            return task;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("task did not reach {expected_status:?} within timeout");
 }
 
 async fn poll_until_task_lifecycle(
@@ -975,23 +970,6 @@ async fn poll_until_task_lifecycle(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("task did not reach lifecycle {expected_state:?} within timeout");
-}
-
-async fn poll_until_task_awaiting_human(app: &Router, task_id: &str) -> TaskResponse {
-    for _ in 0..100 {
-        let task: TaskResponse = empty_request(
-            app,
-            Method::GET,
-            &format!("/api/v1/tasks/{task_id}"),
-            StatusCode::OK,
-        )
-        .await;
-        if task.status == "review" && task.awaiting_human {
-            return task;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("task did not reach human review within timeout");
 }
 
 async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionResponse {
@@ -1076,21 +1054,6 @@ fn assert_event_type(events: &[ForgeEvent], event_type: &str) {
             .iter()
             .map(|event| event.event_type.as_str())
             .collect::<Vec<_>>()
-    );
-}
-
-fn assert_status_event(events: &[ForgeEvent], task_id: &str, expected_status: &str) {
-    assert!(
-        events.iter().any(|event| {
-            event.event_type == "task.status_changed"
-                && event.entity_id == task_id
-                && matches!(
-                    &event.context,
-                    EventContext::TaskStatusChanged { new_status, .. }
-                        if new_status == expected_status
-                )
-        }),
-        "missing task.status_changed to {expected_status}"
     );
 }
 

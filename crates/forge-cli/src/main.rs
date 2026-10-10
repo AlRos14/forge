@@ -186,22 +186,6 @@ async fn main() {
     ));
     let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
 
-    // Start lifecycle event emitter
-    let mut plugin_registry = services::lifecycle::PluginRegistry::new();
-    plugin_registry.register(Arc::new(
-        services::lifecycle::knowledge_inject::KnowledgeInjectPlugin,
-    ));
-    plugin_registry.register(Arc::new(
-        services::lifecycle::knowledge_capture::KnowledgeCapturePlugin,
-    ));
-    let plugin_registry = Arc::new(plugin_registry);
-    let lifecycle_emitter = services::lifecycle::LifecycleEventEmitter::new(
-        Arc::clone(&db),
-        Arc::clone(&plugin_registry),
-    );
-    let lifecycle_rx = event_bus.subscribe();
-    tokio::spawn(async move { lifecycle_emitter.run(lifecycle_rx).await });
-
     // 5. Build app state and start server
     if !effective_config.server.mcp_enabled {
         info!("mcp endpoint disabled");
@@ -275,10 +259,6 @@ async fn main() {
     ));
     let mut orchestrator_runtime_handle =
         Arc::clone(&orchestrator_runtime).start(state.shutdown_signal.subscribe());
-
-    if let Err(error) = state.workflow_template_service.initialize().await {
-        warn!(%error, "workflow template initialization failed");
-    }
 
     // 6. Install graceful shutdown
     let shutdown = Arc::new(

@@ -233,12 +233,15 @@ impl HarnessInvocation {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ExecutorTypeDescriptor {
     #[serde(rename = "type")]
     pub type_name: String,
     pub display_name: String,
+    #[ts(type = "Record<string, unknown>")]
     pub config_schema: Value,
+    #[ts(type = "Record<string, unknown>")]
     pub default_config: Value,
 }
 
@@ -249,10 +252,12 @@ pub struct AvailabilityResponse {
     pub config_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DiscoveredOptionsResponse {
     pub models: Vec<String>,
     pub permission_policies: Vec<String>,
+    #[ts(type = "Record<string, unknown>")]
     pub cli_specific: Value,
     pub harness_capabilities: HarnessCapabilities,
     #[serde(default)]
@@ -261,19 +266,23 @@ pub struct DiscoveredOptionsResponse {
     pub warning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DiscoveredDaemonResponse {
     pub id: String,
     pub name: String,
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct AgentAvailabilityResponse {
     pub available: bool,
     pub effective_status: String,
     pub resolved_daemon_id: Option<String>,
-    pub active_task_count: i64,
+    #[ts(type = "number")]
+    pub active_execution_count: i64,
+    #[ts(type = "number")]
     pub max_concurrent_tasks: i64,
     pub reason: Option<String>,
 }
@@ -379,7 +388,8 @@ pub struct WorkspaceResponse {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct CreateAgentRequest {
     pub name: String,
     pub description: Option<String>,
@@ -389,10 +399,14 @@ pub struct CreateAgentRequest {
     pub permission_policy: Option<String>,
     pub prompt_template: Option<String>,
     pub capabilities: Option<Vec<String>>,
+    #[ts(type = "Record<string, unknown> | null")]
     pub config_json: Option<Value>,
     pub daemon_id: Option<String>,
+    #[ts(type = "number | null")]
     pub max_concurrent_tasks: Option<i64>,
+    #[ts(type = "number | null")]
     pub heartbeat_interval_seconds: Option<i64>,
+    #[ts(type = "number | null")]
     pub max_missed_heartbeats: Option<i64>,
     pub is_default: Option<bool>,
     /// Optional provider entry powering this harness agent. When set, Forge
@@ -402,26 +416,42 @@ pub struct CreateAgentRequest {
     pub credential_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct UpdateAgentRequest {
+    #[ts(optional = nullable)]
     pub name: Option<String>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub description: Option<Option<String>>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub model: Option<Option<String>>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub reasoning_effort: Option<Option<String>>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub permission_policy: Option<Option<String>>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub prompt_template: Option<Option<String>>,
+    #[ts(optional = nullable)]
     pub capabilities: Option<Vec<String>>,
+    #[ts(type = "Record<string, unknown> | null")]
+    #[ts(optional = nullable)]
     pub config_json: Option<Value>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub daemon_id: Option<Option<String>>,
+    #[ts(type = "number | null")]
+    #[ts(optional = nullable)]
     pub max_concurrent_tasks: Option<i64>,
+    #[ts(optional = nullable)]
     pub is_default: Option<bool>,
+    #[ts(optional = nullable)]
     pub paused: Option<bool>,
+    #[ts(type = "number")]
     pub version: i64,
 }
 
@@ -444,8 +474,11 @@ pub struct CreateEmbeddedAgentRequest {
     pub account_permission_ceiling: Option<Value>,
     #[ts(type = "Record<string, unknown> | null")]
     pub tool_policy: Option<Value>,
+    #[ts(type = "number | null")]
     pub context_tokens: Option<u32>,
+    #[ts(type = "number | null")]
     pub max_input_tokens: Option<u32>,
+    #[ts(type = "number | null")]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -462,8 +495,11 @@ pub struct ConnectEmbeddedProfileRequest {
     pub permission_policy: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]
     pub tool_policy: Option<Value>,
+    #[ts(type = "number | null")]
     pub context_tokens: Option<u32>,
+    #[ts(type = "number | null")]
     pub max_input_tokens: Option<u32>,
+    #[ts(type = "number | null")]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -487,6 +523,13 @@ pub struct CreateAgentSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionVersionRequest {
+    #[ts(type = "number")]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SelectAgentProfileRequest {
     #[ts(type = "number")]
     pub version: i64,
 }
@@ -536,7 +579,6 @@ pub struct DisconnectCredentialResponse {
 pub struct AgentProfileResponse {
     pub id: String,
     pub identity_id: String,
-    pub backend_kind: String,
     pub executor_type: String,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -550,6 +592,7 @@ pub struct AgentProfileResponse {
     #[ts(type = "Record<string, unknown>")]
     pub config: Value,
     pub credential_handle_id: Option<String>,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
 }
@@ -581,6 +624,7 @@ pub struct AgentSessionResponse {
     pub predecessor_session_id: Option<String>,
     pub replaced_by_session_id: Option<String>,
     pub last_activity_at: Option<String>,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -598,6 +642,7 @@ pub struct ProtectedInteractionSummaryResponse {
     pub prompt_redacted: String,
     pub status: String,
     pub expires_at: Option<String>,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -607,6 +652,7 @@ pub struct ProtectedInteractionSummaryResponse {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct ProtectedInteractionAnswerRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub values: Vec<ProtectedInteractionAnswerValue>,
 }
@@ -629,6 +675,7 @@ pub enum ProtectedInteractionAnswerValue {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct ProtectedInteractionCancelRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
 }
 

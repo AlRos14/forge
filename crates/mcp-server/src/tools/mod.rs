@@ -7,10 +7,6 @@ use crate::{error::McpToolError, protocol::McpContext, state::AppState};
 
 pub(crate) use descriptors::tool_descriptors;
 
-// NOTE: role reassignment (POST/DELETE /api/v1/tasks/{id}/roles/...) is intentionally
-// NOT exposed as an MCP tool. Agents must not re-route work between themselves or
-// between agent and human through MCP. Any future change that adds such a tool
-// requires its own authorization spec.
 pub(crate) async fn dispatch_tool(
     state: &AppState,
     name: &str,
@@ -29,61 +25,58 @@ pub(crate) async fn dispatch_tool(
         }
         "forge_list_tasks" => handlers::forge_list_tasks(state, arguments).await,
         "forge_get_task" => handlers::forge_get_task(state, arguments).await,
-        "forge_preview_prompt" => handlers::forge_preview_prompt(state, arguments).await,
-        "forge_memory_search" => handlers::forge_memory_search(state, arguments, context).await,
-        "forge_memory_get" => handlers::forge_memory_get(state, arguments, context).await,
-        "forge_assign_agent" => handlers::forge_assign_agent(state, arguments).await,
-        "forge_cancel_task" => handlers::forge_cancel_task(state, arguments).await,
         "forge_get_task_diff" => handlers::forge_get_task_diff(state, arguments).await,
         "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
+        "forge_start_execution" => handlers::forge_start_execution(state, arguments, context).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,
-        "forge_transition_task" => handlers::forge_transition_task(state, arguments).await,
         "forge_register_agent" => handlers::forge_register_agent(state, arguments).await,
         "forge_list_agents" => handlers::forge_list_agents(state, arguments).await,
         "forge_list_projects" => handlers::forge_list_projects(state, arguments).await,
         "forge_get_project" => handlers::forge_get_project(state, arguments).await,
         "forge_create_project" => handlers::forge_create_project(state, arguments).await,
         "forge_update_project" => handlers::forge_update_project(state, arguments).await,
-        "forge_update_project_lifecycle_hooks" => {
-            handlers::forge_update_project_lifecycle_hooks(state, arguments).await
+        "forge_update_project_hooks" => {
+            handlers::forge_update_project_hooks(state, arguments).await
         }
         "forge_follow_up_execution" => handlers::forge_follow_up_execution(state, arguments).await,
         "forge_list_agent_profiles" => {
             handlers::forge_list_agent_profiles(state, arguments, context).await
         }
-        "forge_list_agent_sessions" => {
-            handlers::forge_list_agent_sessions(state, arguments, context).await
+        "forge_get_task_lifecycle" => handlers::forge_get_task_lifecycle(state, arguments).await,
+        "forge_list_task_lifecycle_transitions" => {
+            handlers::forge_list_task_lifecycle_transitions(state, arguments).await
         }
-        "forge_get_agent_session" => {
-            handlers::forge_get_agent_session(state, arguments, context).await
+        "forge_transition_task_lifecycle" => {
+            handlers::forge_transition_task_lifecycle(state, arguments, context).await
         }
-        "forge_get_main_agent" => handlers::forge_get_main_agent(state, arguments, context).await,
-        "forge_set_main_agent" => handlers::forge_set_main_agent(state, arguments, context).await,
-        "forge_get_project_agent" => {
-            handlers::forge_get_project_agent(state, arguments, context).await
+        "forge_list_task_roles" => handlers::forge_list_task_roles(state, arguments).await,
+        "forge_create_task_role" => {
+            handlers::forge_create_task_role(state, arguments, context).await
         }
-        "forge_set_project_agent" => {
-            handlers::forge_set_project_agent(state, arguments, context).await
+        "forge_add_task_role_member" => {
+            handlers::forge_add_task_role_member(state, arguments, context).await
         }
-        "forge_list_agent_chats" => {
-            handlers::forge_list_agent_chats(state, arguments, context).await
+        "forge_create_task_gate" => handlers::forge_create_task_gate(state, arguments).await,
+        "forge_get_gate" => handlers::forge_get_gate(state, arguments).await,
+        "forge_revise_gate_policy" => handlers::forge_revise_gate_policy(state, arguments).await,
+        "forge_evaluate_gate" => handlers::forge_evaluate_gate(state, arguments).await,
+        "forge_get_gate_evaluation" => handlers::forge_get_gate_evaluation(state, arguments).await,
+        "forge_list_task_review_executions" => {
+            handlers::forge_list_task_review_executions(state, arguments).await
         }
-        "forge_get_agent_chat" => handlers::forge_get_agent_chat(state, arguments, context).await,
-        "forge_list_agent_chat_messages" => {
-            handlers::forge_list_agent_chat_messages(state, arguments, context).await
+        "forge_get_review_execution" => {
+            handlers::forge_get_review_execution(state, arguments).await
         }
-        "forge_send_agent_chat_message" => {
-            handlers::forge_send_agent_chat_message(state, arguments, context).await
+        "forge_list_validation_runs" => {
+            handlers::forge_list_validation_runs(state, arguments).await
         }
-        "forge_list_agent_handoffs" => {
-            handlers::forge_list_agent_handoffs(state, arguments, context).await
-        }
-        "forge_get_agent_handoff" => {
-            handlers::forge_get_agent_handoff(state, arguments, context).await
-        }
-        "forge_create_agent_handoff" => {
-            handlers::forge_create_agent_handoff(state, arguments, context).await
-        }
+        "forge_get_validation_run" => handlers::forge_get_validation_run(state, arguments).await,
+        "forge_get_evidence" => handlers::forge_get_evidence(state, arguments).await,
+        "forge_list_task_artifacts" => handlers::forge_list_task_artifacts(state, arguments).await,
+        "forge_list_task_messages" => handlers::forge_list_task_messages(state, arguments).await,
+        "forge_list_task_handoffs" => handlers::forge_list_task_handoffs(state, arguments).await,
+        "forge_list_task_proposals" => handlers::forge_list_task_proposals(state, arguments).await,
+        "forge_list_task_decisions" => handlers::forge_list_task_decisions(state, arguments).await,
         _ => Err(McpToolError::new(-32601, "method not found")),
     }
 }

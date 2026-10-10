@@ -536,6 +536,13 @@ impl From<DbError> for ApiError {
     }
 }
 
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        tracing::error!(error = %error, "API database operation failed");
+        Self::internal("database operation failed")
+    }
+}
+
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
         Self {

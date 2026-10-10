@@ -63,22 +63,3 @@ pub async fn list_reviews(
     }
     Ok(Json(reviews))
 }
-
-pub async fn approve_review(
-    State(_state): State<AppState>,
-    Path(_task_id): Path<String>,
-) -> ApiResult<Json<api_types::ReviewDecisionResponse>> {
-    Err(ApiError::invalid_operation_conflict(
-        "Task-level Review approval is retired; submit a ReviewReport for an exact Human Review Execution",
-    ))
-}
-
-pub async fn reject_review(
-    State(_state): State<AppState>,
-    Path(_task_id): Path<String>,
-    Json(_request): Json<RejectReviewRequest>,
-) -> ApiResult<Json<api_types::ReviewDecisionResponse>> {
-    Err(ApiError::invalid_operation_conflict(
-        "Task-level Review rejection is retired; submit a ReviewReport for an exact Human Review Execution",
-    ))
-}

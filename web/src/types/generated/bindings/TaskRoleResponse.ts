@@ -2,4 +2,4 @@
 import type { CoordinationMode } from "./CoordinationMode";
 import type { RoleMembershipResponse } from "./RoleMembershipResponse";
 
-export type TaskRoleResponse = { id: string, task_id: string, role: string, coordination_mode: CoordinationMode | null, policy: Record<string, unknown>, version: bigint, members: Array<RoleMembershipResponse>, created_at: string, updated_at: string, };
+export type TaskRoleResponse = { id: string, task_id: string, role: string, coordination_mode: CoordinationMode | null, policy: Record<string, unknown>, version: number, members: Array<RoleMembershipResponse>, created_at: string, updated_at: string, };

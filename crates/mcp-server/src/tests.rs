@@ -422,42 +422,45 @@ fn tools_list_returns_descriptors() {
             .collect::<std::collections::BTreeSet<_>>();
         let expected = [
             "forge_add_task_dependency",
-            "forge_assign_agent",
-            "forge_cancel_task",
-            "forge_create_agent_handoff",
+            "forge_add_task_role_member",
             "forge_create_project",
+            "forge_create_task_role",
             "forge_create_sub_tasks",
             "forge_create_task",
             "forge_follow_up_execution",
-            "forge_memory_get",
-            "forge_memory_search",
+            "forge_get_evidence",
+            "forge_get_gate",
+            "forge_get_gate_evaluation",
             "forge_get_project",
-            "forge_get_agent_session",
-            "forge_get_agent_chat",
-            "forge_get_agent_handoff",
-            "forge_get_main_agent",
-            "forge_get_project_agent",
+            "forge_get_review_execution",
             "forge_get_task",
             "forge_get_task_diff",
+            "forge_get_task_lifecycle",
+            "forge_get_validation_run",
             "forge_list_agent_profiles",
-            "forge_list_agent_chat_messages",
-            "forge_list_agent_chats",
-            "forge_list_agent_handoffs",
-            "forge_list_agent_sessions",
             "forge_list_agents",
             "forge_list_executions",
             "forge_list_projects",
+            "forge_list_task_artifacts",
+            "forge_list_task_decisions",
             "forge_list_task_dependencies",
+            "forge_list_task_handoffs",
+            "forge_list_task_lifecycle_transitions",
+            "forge_list_task_messages",
+            "forge_list_task_proposals",
+            "forge_list_task_review_executions",
+            "forge_list_task_roles",
             "forge_list_tasks",
-            "forge_preview_prompt",
+            "forge_list_validation_runs",
             "forge_register_agent",
             "forge_remove_task_dependency",
-            "forge_send_agent_chat_message",
-            "forge_set_main_agent",
-            "forge_set_project_agent",
-            "forge_transition_task",
+            "forge_revise_gate_policy",
+            "forge_create_task_gate",
+            "forge_evaluate_gate",
+            "forge_transition_task_lifecycle",
+            "forge_start_execution",
             "forge_update_project",
-            "forge_update_project_lifecycle_hooks",
+            "forge_update_project_hooks",
             "forge_update_task",
         ]
         .into_iter()
@@ -467,6 +470,79 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+    });
+}
+
+#[test]
+fn task_role_membership_tools_require_identity_and_keep_exact_actor_ref() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let agent = seed_agent(&state, "Role member").await;
+        let create_args = json!({
+            "task_id": task.id,
+            "role": "implementer",
+            "coordination_mode": "independent"
+        });
+        let unauthenticated = dispatch(
+            &state,
+            "tools/call",
+            json!({
+                "name": "forge_create_task_role",
+                "arguments": create_args.clone()
+            }),
+        )
+        .await
+        .expect_err("role mutation requires an authenticated user");
+        assert_eq!(unauthenticated.code, -32003);
+
+        let context = McpContext {
+            project_id: None,
+            user_id: Some("user-1".to_owned()),
+        };
+        let created = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({
+                "name": "forge_create_task_role",
+                "arguments": create_args
+            }),
+        )
+        .await
+        .expect("TaskRole creates");
+        let created: Value = serde_json::from_str(
+            created["content"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("TaskRole JSON");
+        assert_eq!(created["role"], "implementer");
+        assert_eq!(created["members"], json!([]));
+
+        let member = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({
+                "name": "forge_add_task_role_member",
+                "arguments": {
+                    "task_id": task.id,
+                    "role": "implementer",
+                    "actor_ref": {"kind": "agent", "id": agent.id}
+                }
+            }),
+        )
+        .await
+        .expect("exact Agent membership adds");
+        let member: Value = serde_json::from_str(
+            member["content"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("RoleMembership JSON");
+        assert_eq!(member["actor_ref"], json!({"kind":"agent","id":agent.id}));
+        assert_eq!(member["task_role_id"], created["id"]);
     });
 }
 
@@ -511,7 +587,7 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
         .expect("execution creates");
 
         let page = call_tool(&state, "forge_list_executions", json!({"task_id": task.id})).await;
-        let execution = &page["data"][0];
+        let execution = &page["items"][0];
         assert_eq!(
             execution["actor_ref"],
             json!({"kind": "agent", "id": agent.id})
@@ -522,7 +598,7 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
 }
 
 #[test]
-fn mcp_task_projection_hides_resume_for_ambiguous_legacy_session() {
+fn mcp_task_projection_exposes_lifecycle_without_legacy_recovery_authority() {
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task_with_legacy_resume_hint(&state, true).await;
@@ -534,10 +610,9 @@ fn mcp_task_projection_hides_resume_for_ambiguous_legacy_session() {
         )
         .await;
 
-        assert!(!result["error_annotation"]["recovery_actions"]
-            .as_array()
-            .expect("recovery actions")
-            .contains(&json!("resume_session")));
+        assert!(result.get("error_annotation").is_none());
+        assert!(result["lifecycle"]["state"].is_string());
+        assert!(result.get("status").is_none());
         let persisted = TaskRepo::get_by_id(&*state.db, &task.id, false)
             .await
             .expect("task lookup succeeds")
@@ -557,7 +632,7 @@ fn mcp_task_projection_hides_resume_for_ambiguous_legacy_session() {
 }
 
 #[test]
-fn mcp_task_projection_keeps_resume_for_unambiguous_legacy_session() {
+fn mcp_task_list_uses_items_and_lifecycle_fields() {
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task_with_legacy_resume_hint(&state, false).await;
@@ -568,16 +643,14 @@ fn mcp_task_projection_keeps_resume_for_unambiguous_legacy_session() {
             json!({"project_id": task.project_id}),
         )
         .await;
-        let listed_task = result["data"]
+        let listed_task = result["items"]
             .as_array()
             .expect("task page")
             .iter()
             .find(|item| item["id"] == task.id)
             .expect("task appears in list");
-        assert!(listed_task["error_annotation"]["recovery_actions"]
-            .as_array()
-            .expect("recovery actions")
-            .contains(&json!("resume_session")));
+        assert!(listed_task["lifecycle"]["state"].is_string());
+        assert!(listed_task.get("status").is_none());
     });
 }
 
@@ -594,11 +667,13 @@ fn revised_public_surface_does_not_advertise_retired_collaboration_tools() {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert!(names.iter().all(|name| !name.contains("room")));
-        assert!(names.iter().all(|name| !name.contains("membership")));
-        assert!(names.contains(&"forge_list_agent_chats"));
-        assert!(names.contains(&"forge_send_agent_chat_message"));
-        assert!(names.contains(&"forge_create_agent_handoff"));
+        assert!(names.contains(&"forge_list_task_roles"));
+        assert!(names.contains(&"forge_list_task_handoffs"));
+        assert!(names.contains(&"forge_list_task_review_executions"));
+        assert!(names.contains(&"forge_list_validation_runs"));
+        assert!(names.iter().all(|name| !name.contains("agent_chat")));
+        assert!(names.iter().all(|name| !name.contains("memory")));
+        assert!(names.iter().all(|name| !name.contains("main_agent")));
     });
 }
 
@@ -631,15 +706,9 @@ fn scoped_tools_list_marks_project_id_optional() {
         assert!(required.iter().any(|value| value == "title"));
         assert!(!required.iter().any(|value| value == "project_id"));
 
-        let memory_search = tools
+        assert!(tools
             .iter()
-            .find(|tool| tool["name"] == "forge_memory_search")
-            .expect("memory search descriptor exists");
-        let memory_required = memory_search["inputSchema"]["required"]
-            .as_array()
-            .expect("required is an array");
-        assert!(memory_required.iter().any(|value| value == "project_id"));
-        assert!(memory_required.iter().any(|value| value == "query"));
+            .any(|tool| tool["name"] == "forge_transition_task_lifecycle"));
     });
 }
 
@@ -668,7 +737,7 @@ fn embedded_read_tools_require_authenticated_server_identity() {
         )
         .await
         .expect_err("profile reads must not accept an unbound caller identity");
-        assert_eq!(error.code, -32001);
+        assert_eq!(error.code, -32003);
 
         let error = dispatch(
             &state,
@@ -679,13 +748,13 @@ fn embedded_read_tools_require_authenticated_server_identity() {
             }),
         )
         .await
-        .expect_err("binding reads must bind to the authenticated account");
-        assert_eq!(error.code, -32001);
+        .expect_err("removed binding tools are unknown");
+        assert_eq!(error.code, -32601);
     });
 }
 
 #[test]
-fn retired_agent_os_and_semantic_memory_tools_return_operation_retired() {
+fn removed_agent_os_and_semantic_memory_tools_are_not_found() {
     run_async(async {
         let state = sqlite_state().await;
         for name in [
@@ -699,7 +768,7 @@ fn retired_agent_os_and_semantic_memory_tools_return_operation_retired() {
             let error = dispatch(&state, "tools/call", json!({"name": name, "arguments": {}}))
                 .await
                 .expect_err("retired vertical tools fail closed");
-            assert_eq!(error.code, -32040, "{name}");
+            assert_eq!(error.code, -32601, "{name}");
         }
     });
 }
@@ -1057,7 +1126,6 @@ fn forge_update_task_updates_mutable_fields() {
                 "title": "Updated MCP",
                 "description": "changed",
                 "priority": 9,
-                "plan": "test it",
                 "version": task.version,
             }),
         )
@@ -1068,6 +1136,21 @@ fn forge_update_task_updates_mutable_fields() {
         assert_eq!(result["priority"], 9);
         assert!(result.get("plan").is_none());
         assert_eq!(result["version"], 2);
+        let legacy_plan = dispatch(
+            &state,
+            "tools/call",
+            json!({
+                "name": "forge_update_task",
+                "arguments": {
+                    "task_id": task.id,
+                    "plan": "test it",
+                    "version": 2,
+                },
+            }),
+        )
+        .await
+        .expect_err("retired Task plan field is rejected");
+        assert_eq!(legacy_plan.code, -32602);
         let stored_plan: Option<String> = sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
             .bind(&task.id)
             .fetch_one(state.db.pool())
@@ -1078,26 +1161,79 @@ fn forge_update_task_updates_mutable_fields() {
 }
 
 #[test]
-fn forge_transition_task_changes_status() {
+fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority() {
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task(&state).await;
-        let result = call_tool(
+        let unauthenticated = dispatch(
             &state,
-            "forge_transition_task",
+            "tools/call",
             json!({
-                "task_id": task.id,
-                "status": "in_progress",
-                "version": task.version,
+                "name": "forge_transition_task_lifecycle",
+                "arguments": {
+                    "task_id": task.id,
+                    "to_state": "active",
+                    "expected_lifecycle_version": task.version,
+                    "idempotency_key": "mcp-transition-unauthenticated",
+                },
             }),
         )
-        .await;
+        .await
+        .expect_err("MCP lifecycle transitions require an authenticated Actor");
+        assert_eq!(unauthenticated.code, -32003);
 
-        assert_eq!(result["status"], "in_progress");
-        assert!(
-            result["version"].as_i64().expect("version is an integer") > task.version,
-            "transition should advance task version"
-        );
+        let incomplete_reason = dispatch_with_context(
+            &state,
+            &McpContext {
+                project_id: None,
+                user_id: Some("human-actor".to_owned()),
+            },
+            "tools/call",
+            json!({
+                "name": "forge_transition_task_lifecycle",
+                "arguments": {
+                    "task_id": task.id,
+                    "to_state": "active",
+                    "expected_lifecycle_version": task.version,
+                    "idempotency_key": "mcp-transition-unpaired-reason",
+                    "reason_kind": "manual_start",
+                },
+            }),
+        )
+        .await
+        .expect_err("reason provenance must be an exact pair");
+        assert_eq!(incomplete_reason.code, -32602);
+
+        let result = dispatch_with_context(
+            &state,
+            &McpContext {
+                project_id: None,
+                user_id: Some("human-actor".to_owned()),
+            },
+            "tools/call",
+            json!({
+                "name": "forge_transition_task_lifecycle",
+                "arguments": {
+                    "task_id": task.id,
+                    "to_state": "active",
+                    "expected_lifecycle_version": task.version,
+                    "idempotency_key": "mcp-transition-1",
+                    "reason_kind": "manual_start",
+                    "reason_ref": "user-action:manual_start",
+                },
+            }),
+        )
+        .await
+        .expect("authenticated Actor can request a valid transition");
+        let result = result["content"][0]["text"]
+            .as_str()
+            .map(|text| serde_json::from_str::<Value>(text).expect("tool result JSON"))
+            .expect("tool text content");
+
+        assert_eq!(result["lifecycle"]["state"], "active");
+        assert!(result["transition_id"].is_string());
+        assert!(result["lifecycle"]["version"].as_i64().unwrap() >= 2);
+        assert!(result.get("status").is_none());
     });
 }
 
@@ -1149,7 +1285,7 @@ fn forge_list_agents_returns_paginated_agents() {
             }),
         )
         .await;
-        let agents = result["data"].as_array().expect("agents array");
+        let agents = result["items"].as_array().expect("agents array");
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["name"], "codex");
         assert_eq!(result["has_more"], false);
@@ -1169,7 +1305,7 @@ fn forge_list_projects_returns_paginated_projects() {
             }),
         )
         .await;
-        let projects = result["data"].as_array().expect("projects array");
+        let projects = result["items"].as_array().expect("projects array");
 
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0]["id"], project_id);
@@ -1192,7 +1328,7 @@ fn forge_create_project_creates_project() {
 
         assert_eq!(result["name"], "MCP");
         assert!(result["id"].as_str().is_some());
-        assert_eq!(result["settings"], json!({}));
+        assert!(result.get("settings").is_none());
         assert_eq!(result["paused"], false);
     });
 }
@@ -1212,9 +1348,9 @@ fn forge_get_project_returns_project_details() {
         .await;
 
         assert_eq!(result["name"], "Forge");
-        assert_eq!(result["settings"], json!({}));
+        assert!(result.get("settings").is_none());
         assert_eq!(result["paused"], false);
-        assert!(result.get("workflow_template_name").is_some());
+        assert!(result.get("project_hooks").is_some());
     });
 }
 
@@ -1229,111 +1365,116 @@ fn forge_update_project_updates_mutable_fields() {
             json!({
                 "project_id": project_id,
                 "name": "Updated Forge",
-                "settings": {
-                    "retry_budgets": {
-                        "review": 5,
-                        "merge_fix": 2
-                    }
-                },
                 "paused": true
             }),
         )
         .await;
 
         assert_eq!(result["name"], "Updated Forge");
-        assert_eq!(result["settings"]["retry_budgets"]["review"], 5);
+        assert!(result.get("settings").is_none());
         assert_eq!(result["paused"], true);
         assert!(result["paused_at"].as_str().is_some());
     });
 }
 
 #[test]
-fn forge_update_project_lifecycle_hooks_replaces_hooks_only() {
+fn forge_update_project_hooks_replaces_rules_at_exact_version() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
-        call_tool(
-            &state,
-            "forge_update_project",
-            json!({
-                "project_id": project_id,
-                "settings": {
-                    "retry_budgets": {
-                        "review": 4,
-                        "merge_fix": 1
-                    }
-                }
-            }),
-        )
-        .await;
+        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let result = call_tool(
             &state,
-            "forge_update_project_lifecycle_hooks",
+            "forge_update_project_hooks",
             json!({
                 "project_id": project_id,
-                "lifecycle_hooks": {
-                    "before_work": [
-                        {
-                            "type": "script",
-                            "command": "pnpm test",
-                            "timeout_seconds": 60,
-                            "blocking": true
-                        }
-                    ],
-                    "on_task_done": [
-                        {
-                            "type": "plugin",
-                            "name": "notify",
-                            "enabled": true,
-                            "config": { "channel": "dev" }
-                        }
-                    ]
-                }
+                "version": project.version,
+                "project_hooks": [{
+                    "id": "all-work-notify",
+                    "enabled": true,
+                    "name": "Notify after all work completes",
+                    "trigger": { "type": "project.all_work_completed" },
+                    "filters": null,
+                    "action": { "type": "notify", "title": "Complete", "message": "All work completed", "severity": "info" },
+                    "cooldown_seconds": 0,
+                    "max_concurrent_runs": 1
+                }]
             }),
         )
         .await;
 
-        assert_eq!(result["settings"]["retry_budgets"]["review"], 4);
-        assert_eq!(
-            result["settings"]["lifecycle_hooks"]["before_work"][0]["command"],
-            "pnpm test"
-        );
-        assert_eq!(
-            result["settings"]["lifecycle_hooks"]["on_task_done"][0]["name"],
-            "notify"
-        );
+        assert_eq!(result["project_hooks"][0]["id"], "all-work-notify");
+        assert!(result.get("settings").is_none());
     });
 }
 
 #[test]
-fn forge_update_project_lifecycle_hooks_validates_blocking_event() {
+fn forge_update_project_hooks_requires_supported_trigger() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = dispatch(
+            &state,
+            "tools/call",
+            json!({
+                "name": "forge_update_project_hooks",
+                "arguments": {
+                    "project_id": project_id,
+                    "version": project.version,
+                    "project_hooks": [{
+                        "id": "unsupported-trigger",
+                        "enabled": true,
+                        "name": "Unsupported",
+                        "trigger": { "type": "task.stuck" },
+                        "filters": null,
+                        "action": { "type": "notify", "title": "x", "message": "y", "severity": null },
+                        "cooldown_seconds": null,
+                        "max_concurrent_runs": 1
+                    }]
+                }
+            }),
+        )
+        .await
+        .expect_err("unsupported hook trigger error");
+
+        assert_eq!(error.code, -32602);
+    });
+}
+
+#[test]
+fn retired_project_lifecycle_tool_is_not_translated() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let before = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
         let error = dispatch(
             &state,
             "tools/call",
             json!({
                 "name": "forge_update_project_lifecycle_hooks",
-                "arguments": {
-                    "project_id": project_id,
-                    "lifecycle_hooks": {
-                        "on_work_start": [
-                            {
-                                "type": "script",
-                                "command": "echo no",
-                                "blocking": true
-                            }
-                        ]
-                    }
-                }
+                "arguments": { "project_id": project_id, "lifecycle_hooks": {} }
             }),
         )
         .await
-        .expect_err("invalid lifecycle hooks error");
-
-        assert_eq!(error.code, -32602);
+        .expect_err("retired MCP tool is not found");
+        assert_eq!(error.code, -32601);
+        let after = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.project_hooks_json, before.project_hooks_json);
     });
 }
 

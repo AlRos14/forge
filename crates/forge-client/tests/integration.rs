@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -10,9 +10,10 @@ use std::{
 };
 
 use api_types::{
-    AgentResponse, AgentStatus, CanonicalPhase, ClaimTaskRequest, CreateAgentRequest,
-    CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, DaemonResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskExecutionObservability, TaskResponse, TaskType, WorkMode,
+    CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, PaginatedResponse, ProjectResponse,
+    RepoResponse, TaskExecutionObservability, TaskLifecycleResponse, TaskLifecycleState,
+    TaskLifecycleTransitionResponse, TaskResponse, TaskType, TransitionTaskLifecycleRequest,
+    WorkMode,
 };
 use axum::{
     extract::{Path as AxumPath, State},
@@ -34,11 +35,6 @@ async fn forge_client_creates_and_gets_project() {
             "/api/v1/projects",
             &CreateProjectRequest {
                 name: "Client Project".to_owned(),
-                settings: None,
-                default_review_config: None,
-                paused: None,
-                project_agent_identity_id: None,
-                project_agent_profile_id: None,
             },
         )
         .await
@@ -59,7 +55,7 @@ async fn forge_client_lists_projects_when_project_hooks_is_missing() {
     let Some(server) = TestServer::spawn().await else {
         return;
     };
-    let created = create_project(&server.client, "Legacy List Project").await;
+    let created = create_project(&server.client, "Project List").await;
 
     let projects: PaginatedResponse<ProjectResponse> = server
         .client
@@ -72,7 +68,7 @@ async fn forge_client_lists_projects_when_project_hooks_is_missing() {
         .iter()
         .find(|project| project.id == created.id)
         .expect("created project should be listed");
-    assert_eq!(project.name, "Legacy List Project");
+    assert_eq!(project.name, "Project List");
     assert!(project.project_hooks.is_empty());
 }
 
@@ -111,8 +107,6 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
         .to_str()
         .expect("repo path is UTF-8");
     let _repo = create_repo(&server.client, &project.id, local_path).await;
-    let agent = create_agent(&server.client).await;
-
     let task: TaskResponse = server
         .client
         .post(
@@ -123,38 +117,45 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
                 parent_task_id: None,
                 task_type: None,
                 priority: None,
-                review_config: None,
-                merge_config: None,
-                role_assignments: None,
-                governance: None,
             },
         )
         .await
         .expect("create task");
-    assert_eq!(task.status, "todo");
+    assert_eq!(task.lifecycle.state, TaskLifecycleState::Ready);
 
-    let claimed: TaskResponse = server
+    let activated: TaskLifecycleTransitionResponse = server
         .client
         .post(
-            &format!("/api/v1/tasks/{}/claim", task.id),
-            &ClaimTaskRequest {
-                agent_id: agent.id,
-                overrides: None,
+            &format!("/api/v1/tasks/{}/lifecycle", task.id),
+            &TransitionTaskLifecycleRequest {
+                to_state: TaskLifecycleState::Active,
+                expected_lifecycle_version: task.lifecycle.version,
+                idempotency_key: "client-task-active".to_owned(),
+                gate_evaluation_id: None,
+                reason_kind: None,
+                reason_ref: None,
             },
         )
         .await
-        .expect("claim task");
-    assert_eq!(claimed.status, "in_progress");
+        .expect("transition Task lifecycle");
+    assert_eq!(activated.lifecycle.state, TaskLifecycleState::Active);
 
-    let cancelled: TaskResponse = server
+    let cancelled: TaskLifecycleTransitionResponse = server
         .client
         .post(
-            &format!("/api/v1/tasks/{}/cancel", task.id),
-            &serde_json::json!({}),
+            &format!("/api/v1/tasks/{}/lifecycle", task.id),
+            &TransitionTaskLifecycleRequest {
+                to_state: TaskLifecycleState::Cancelled,
+                expected_lifecycle_version: activated.lifecycle.version,
+                idempotency_key: "client-task-cancelled".to_owned(),
+                gate_evaluation_id: None,
+                reason_kind: None,
+                reason_ref: None,
+            },
         )
         .await
-        .expect("cancel task");
-    assert_eq!(cancelled.status, "cancelled");
+        .expect("cancel Task lifecycle");
+    assert_eq!(cancelled.lifecycle.state, TaskLifecycleState::Cancelled);
 
     server
         .client
@@ -173,7 +174,6 @@ struct TestData {
     projects: BTreeMap<String, ProjectResponse>,
     repos: BTreeMap<String, RepoResponse>,
     tasks: BTreeMap<String, TaskResponse>,
-    daemon: DaemonResponse,
 }
 
 impl Default for TestData {
@@ -183,7 +183,6 @@ impl Default for TestData {
             projects: BTreeMap::new(),
             repos: BTreeMap::new(),
             tasks: BTreeMap::new(),
-            daemon: daemon_response(),
         }
     }
 }
@@ -252,10 +251,10 @@ fn test_router(state: TestState) -> Router {
             "/api/v1/projects/{project_id}/tasks",
             post(create_task_route),
         )
-        .route("/api/v1/agents", post(create_agent_route))
-        .route("/api/v1/daemons", get(list_daemons_route))
-        .route("/api/v1/tasks/{task_id}/claim", post(claim_task_route))
-        .route("/api/v1/tasks/{task_id}/cancel", post(cancel_task_route))
+        .route(
+            "/api/v1/tasks/{task_id}/lifecycle",
+            post(transition_task_lifecycle_route),
+        )
         .route("/api/v1/tasks/{task_id}", delete(delete_task_route))
         .with_state(state)
 }
@@ -268,22 +267,13 @@ async fn create_project_route(
     let project = ProjectResponse {
         id: data.next_id("project"),
         name: request.name,
-        settings: request.settings.unwrap_or_else(|| serde_json::json!({})),
-        default_review_config: request.default_review_config,
         primary_repo_id: None,
         owner_id: None,
         created_at: now(),
         updated_at: now(),
-        workflow_template_name: None,
         paused_at: None,
-        paused: request.paused.unwrap_or(false),
+        paused: false,
         project_hooks: vec![],
-        charter_status: "legacy_unverified".to_owned(),
-        charter_setup_required: true,
-        current_charter_id: None,
-        current_charter_revision_id: None,
-        current_charter_version: 0,
-        primary_milestone_id: None,
         version: 1,
     };
     data.projects.insert(project.id.clone(), project.clone());
@@ -332,8 +322,12 @@ async fn create_repo_route(
     Json(request): Json<CreateRepoRequest>,
 ) -> Json<RepoResponse> {
     let mut data = state.inner.lock().expect("lock test state");
+    let repo_id = data.next_id("repo");
+    if let Some(project) = data.projects.get_mut(&project_id) {
+        project.primary_repo_id = Some(repo_id.clone());
+    }
     let repo = RepoResponse {
-        id: data.next_id("repo"),
+        id: repo_id,
         project_id,
         name: request.name.unwrap_or_else(|| "forge".to_owned()),
         local_path: request.local_path,
@@ -371,31 +365,52 @@ async fn create_task_route(
     Json(request): Json<CreateTaskRequest>,
 ) -> Json<TaskResponse> {
     let mut data = state.inner.lock().expect("lock test state");
+    let lifecycle_state = if data
+        .projects
+        .get(&project_id)
+        .and_then(|project| project.primary_repo_id.as_ref())
+        .is_some()
+    {
+        TaskLifecycleState::Ready
+    } else {
+        TaskLifecycleState::Backlog
+    };
     let task = task_response(
         data.next_id("task"),
         project_id,
         request.title,
         request.task_type.unwrap_or(TaskType::Implementation),
-        "todo",
+        lifecycle_state,
     );
     data.tasks.insert(task.id.clone(), task.clone());
     Json(task)
 }
 
-async fn claim_task_route(
+async fn transition_task_lifecycle_route(
     State(state): State<TestState>,
     AxumPath(task_id): AxumPath<String>,
-    Json(_request): Json<ClaimTaskRequest>,
-) -> Result<Json<TaskResponse>, StatusCode> {
-    update_task_status(&state, &task_id, "in_progress")
-}
-
-async fn cancel_task_route(
-    State(state): State<TestState>,
-    AxumPath(task_id): AxumPath<String>,
-    Json(_request): Json<serde_json::Value>,
-) -> Result<Json<TaskResponse>, StatusCode> {
-    update_task_status(&state, &task_id, "cancelled")
+    Json(request): Json<TransitionTaskLifecycleRequest>,
+) -> Result<Json<TaskLifecycleTransitionResponse>, StatusCode> {
+    let transition_id = state
+        .inner
+        .lock()
+        .expect("lock test state")
+        .next_id("transition");
+    let mut data = state.inner.lock().expect("lock test state");
+    let task = data.tasks.get_mut(&task_id).ok_or(StatusCode::NOT_FOUND)?;
+    if task.lifecycle.version != request.expected_lifecycle_version {
+        return Err(StatusCode::CONFLICT);
+    }
+    task.lifecycle.state = request.to_state;
+    task.lifecycle.version += 1;
+    task.lifecycle.updated_at = now();
+    Ok(Json(TaskLifecycleTransitionResponse {
+        task_id,
+        lifecycle: task.lifecycle.clone(),
+        transition_id: Some(transition_id),
+        gate_evaluation_id: request.gate_evaluation_id,
+        replayed: false,
+    }))
 }
 
 async fn delete_task_route(
@@ -411,75 +426,12 @@ async fn delete_task_route(
     StatusCode::NO_CONTENT
 }
 
-async fn create_agent_route(
-    State(state): State<TestState>,
-    Json(request): Json<CreateAgentRequest>,
-) -> Json<AgentResponse> {
-    let mut data = state.inner.lock().expect("lock test state");
-    Json(AgentResponse {
-        id: data.next_id("agent"),
-        name: request.name,
-        description: request.description,
-        profile_id: data.next_id("profile"),
-        backend_kind: "cli".to_owned(),
-        executor_type: request.executor_type,
-        provider: None,
-        model: request.model,
-        reasoning_effort: request.reasoning_effort,
-        permission_policy: request.permission_policy,
-        prompt_template: request.prompt_template,
-        capabilities: request.capabilities.unwrap_or_default(),
-        config_json: request.config_json.unwrap_or_else(|| serde_json::json!({})),
-        credential_handle_id: None,
-        daemon_id: request.daemon_id,
-        max_concurrent_tasks: request.max_concurrent_tasks.unwrap_or(1),
-        status: AgentStatus::Idle,
-        active_task_count: Some(0),
-        effective_status: Some("idle".to_owned()),
-        total_runs: 0,
-        avg_duration_ms: None,
-        success_rate: None,
-        is_default: request.is_default.unwrap_or(false),
-        paused: false,
-        owner_id: None,
-        visibility: "global".to_owned(),
-        version: 1,
-        created_at: now(),
-        updated_at: now(),
-    })
-}
-
-async fn list_daemons_route(
-    State(state): State<TestState>,
-) -> Json<PaginatedResponse<DaemonResponse>> {
-    let daemon = state.inner.lock().expect("lock test state").daemon.clone();
-    Json(paginated(vec![daemon]))
-}
-
-fn update_task_status(
-    state: &TestState,
-    task_id: &str,
-    status: &str,
-) -> Result<Json<TaskResponse>, StatusCode> {
-    let mut data = state.inner.lock().expect("lock test state");
-    let task = data.tasks.get_mut(task_id).ok_or(StatusCode::NOT_FOUND)?;
-    task.status = status.to_owned();
-    task.updated_at = now();
-    task.version += 1;
-    Ok(Json(task.clone()))
-}
-
 async fn create_project(client: &ForgeClient, name: &str) -> ProjectResponse {
     client
         .post(
             "/api/v1/projects",
             &CreateProjectRequest {
                 name: name.to_owned(),
-                settings: None,
-                default_review_config: None,
-                paused: None,
-                project_agent_identity_id: None,
-                project_agent_profile_id: None,
             },
         )
         .await
@@ -504,87 +456,37 @@ async fn create_repo(client: &ForgeClient, project_id: &str, local_path: &str) -
         .expect("create repo")
 }
 
-async fn create_agent(client: &ForgeClient) -> AgentResponse {
-    let daemons: PaginatedResponse<DaemonResponse> = client
-        .get("/api/v1/daemons?limit=1")
-        .await
-        .expect("list daemons");
-    let daemon_id = daemons
-        .items
-        .first()
-        .expect("seeded daemon exists")
-        .id
-        .clone();
-
-    client
-        .post(
-            "/api/v1/agents",
-            &CreateAgentRequest {
-                name: "client-agent".to_owned(),
-                description: None,
-                executor_type: "shell".to_owned(),
-                model: None,
-                reasoning_effort: None,
-                permission_policy: None,
-                prompt_template: None,
-                capabilities: None,
-                config_json: None,
-                daemon_id: Some(daemon_id),
-                max_concurrent_tasks: None,
-                heartbeat_interval_seconds: None,
-                max_missed_heartbeats: None,
-                is_default: None,
-                credential_id: None,
-            },
-        )
-        .await
-        .expect("create agent")
-}
-
 fn task_response(
     id: String,
     project_id: String,
     title: String,
     task_type: TaskType,
-    status: &str,
+    lifecycle_state: TaskLifecycleState,
 ) -> TaskResponse {
+    let task_id = id.clone();
     TaskResponse {
         id,
         project_id,
         repo_id: None,
         parent_task_id: None,
-        assignee_type: None,
-        assignee_id: None,
         title,
         description: None,
         task_type,
-        status: status.to_owned(),
-        canonical_phase: canonical_phase_for_status(status),
-        awaiting_human: false,
+        lifecycle: TaskLifecycleResponse {
+            task_id,
+            state: lifecycle_state,
+            version: 1,
+            reason_kind: None,
+            reason_ref: None,
+            created_at: now(),
+            updated_at: now(),
+        },
         priority: 0,
         board_position: 0.0,
         subtask_order: None,
-        role_assignments: Vec::new(),
         task_roles: Vec::new(),
-        remaining_retries: HashMap::new(),
-        execution_actions: Vec::new(),
-        error_annotation: None,
-        blocked: None,
-        failed: None,
-        workflow_health: None,
-        workflow_exception: None,
         execution_observability: TaskExecutionObservability {
             execution_count: 0,
-            active_execution_id: None,
-            active_role: None,
-            active_started_at: None,
-            active_elapsed_seconds: None,
-            latest_execution_id: None,
-            latest_execution_status: None,
-            latest_role: None,
-            latest_started_at: None,
-            latest_stopped_at: None,
-            latest_runtime_seconds: None,
             total_runtime_seconds: 0.0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -593,46 +495,9 @@ fn task_response(
             total_tokens: 0,
             total_cost_usd: None,
         },
-        task_state_config: None,
-        review_passed_at: None,
-        archived_at: None,
         workspace: None,
-        plan_progress: None,
-        plan_artifact: None,
         external_issue_number: None,
         external_issue_url: None,
-        version: 1,
-        created_at: now(),
-        updated_at: now(),
-    }
-}
-
-fn canonical_phase_for_status(status: &str) -> CanonicalPhase {
-    match status {
-        "backlog" => CanonicalPhase::Backlog,
-        "todo" => CanonicalPhase::Ready,
-        "review" | "merging" | "merge_failed" => CanonicalPhase::Review,
-        "done" | "cancelled" => CanonicalPhase::Done,
-        _ => CanonicalPhase::Working,
-    }
-}
-
-fn daemon_response() -> DaemonResponse {
-    DaemonResponse {
-        id: "daemon-1".to_owned(),
-        machine_id: "machine-daemon-1".to_owned(),
-        hostname: "test-host".to_owned(),
-        os: "linux".to_owned(),
-        arch: "x86_64".to_owned(),
-        agent_version: None,
-        status: "online".to_owned(),
-        last_report_at: Some(now()),
-        detected_clis: serde_json::json!([
-            { "kind": "shell", "availability": "authenticated", "path": "/bin/sh" }
-        ]),
-        labels: serde_json::json!({}),
-        owner_id: None,
-        visibility: "global".to_owned(),
         version: 1,
         created_at: now(),
         updated_at: now(),

@@ -2,30 +2,25 @@ import { useEffect, useState } from 'react'
 import { useSearch } from '@tanstack/react-router'
 import { Plus } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
-import { useAgentChatsQuery } from '@/features/agent-chat/hooks'
-import type { AgentChatEntry } from '@/features/agent-chat/types'
 import {
   useFederatedAgentsQuery,
   useProvidersQuery,
 } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { CliRuntimeEntryResponse, ProviderEntryResponse } from '@/types/generated'
-import { ErrorPanel, PageHeader } from '@/features/federation/components'
+import { PageHeader } from '@/features/federation/components'
 import { AddProviderWizard, ProvidersTab } from '@/features/federation/ProvidersTab'
 import { AgentsTab, NewAgentDialog } from '@/features/federation/AgentsTab'
-import { BindingsTab } from '@/features/federation/BindingsTab'
-import { ChangeModelDialog, type ChangeModelBindingContext } from '@/features/federation/ChangeModelDialog'
+import { ChangeModelDialog } from '@/features/federation/ChangeModelDialog'
 
 const EMPTY_AGENTS: FederatedAgent[] = []
-const EMPTY_CHAT_ENTRIES: AgentChatEntry[] = []
 const EMPTY_ENTRIES: ProviderEntryResponse[] = []
 const EMPTY_CLI_RUNTIMES: CliRuntimeEntryResponse[] = []
 
-type SettingsTab = 'providers' | 'agents' | 'bindings'
+type SettingsTab = 'providers' | 'agents'
 
 export function FederatedAgentsPage() {
   const routeSearch = useSearch({ strict: false }) as {
-    project?: string
     provider?: string
     status?: string
     authorization?: string
@@ -34,10 +29,8 @@ export function FederatedAgentsPage() {
   }
   const agentsQuery = useFederatedAgentsQuery()
   const providersQuery = useProvidersQuery()
-  const chatsQuery = useAgentChatsQuery()
   const [tab, setTab] = useState<SettingsTab>(() => {
     if (routeSearch.tab === 'providers' || routeSearch.status) return 'providers'
-    if (routeSearch.tab === 'bindings' || routeSearch.project) return 'bindings'
     return 'agents'
   })
   const [selectedId, setSelectedId] = useState<string | null>(routeSearch.identity ?? null)
@@ -45,10 +38,7 @@ export function FederatedAgentsPage() {
   const [addProviderOpen, setAddProviderOpen] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
   const [wizardEntryId, setWizardEntryId] = useState<string | null>(null)
-  const [changeModelTarget, setChangeModelTarget] = useState<{
-    agent: FederatedAgent
-    binding?: ChangeModelBindingContext
-  } | null>(null)
+  const [changeModelTarget, setChangeModelTarget] = useState<FederatedAgent | null>(null)
 
   // A deep link (`?identity=...`) always wins the current selection.
   useEffect(() => {
@@ -58,12 +48,10 @@ export function FederatedAgentsPage() {
   const agents = agentsQuery.data?.items ?? EMPTY_AGENTS
   const entries = providersQuery.data?.items ?? EMPTY_ENTRIES
   const cliRuntimes = providersQuery.data?.cli_runtimes ?? EMPTY_CLI_RUNTIMES
-  const chatEntries = chatsQuery.data?.items ?? EMPTY_CHAT_ENTRIES
 
   const tabs: { id: SettingsTab; label: string; count: number }[] = [
     { id: 'providers', label: 'Providers', count: entries.length },
     { id: 'agents', label: 'Agents', count: agents.length },
-    { id: 'bindings', label: 'Bindings', count: chatEntries.length },
   ]
 
   function openNewAgentWizard(preselectedEntryId: string | null = null) {
@@ -71,8 +59,8 @@ export function FederatedAgentsPage() {
     setWizardOpen(true)
   }
 
-  function openChangeModel(agent: FederatedAgent, binding?: ChangeModelBindingContext) {
-    setChangeModelTarget({ agent, binding })
+  function openChangeModel(agent: FederatedAgent) {
+    setChangeModelTarget(agent)
   }
 
   return (
@@ -80,7 +68,7 @@ export function FederatedAgentsPage() {
       <PageHeader
         eyebrow="Account-owned providers and agents"
         title="Agent Settings"
-        description="Connect providers once, then create agents that use them directly or through a CLI harness."
+        description="Connect provider credentials and register external harness Agents."
         actions={
           tab === 'providers' ? (
             <Button onClick={() => setAddProviderOpen(true)}>
@@ -150,11 +138,10 @@ export function FederatedAgentsPage() {
             openNewAgentWizard(null)
           }}
         />
-      ) : tab === 'agents' ? (
+      ) : (
         <AgentsTab
           agents={agents}
           entries={entries}
-          chatEntries={chatEntries}
           isLoading={agentsQuery.isLoading}
           isError={agentsQuery.isError}
           onRetry={() => void agentsQuery.refetch()}
@@ -164,32 +151,6 @@ export function FederatedAgentsPage() {
           onProviderFilterChange={setProviderFilter}
           onChangeModel={(agent) => openChangeModel(agent)}
           onNewAgent={() => openNewAgentWizard(null)}
-        />
-      ) : agentsQuery.isError && chatsQuery.isError ? (
-        <div
-          role="tabpanel"
-          id="agent-settings-panel-bindings"
-          aria-labelledby="agent-settings-tab-bindings"
-        >
-          <ErrorPanel
-            title="Agent bindings unavailable"
-            description="Forge could not reach the server, so the Main and Project Agent bindings cannot load. Existing Agent Chat history remains server-authoritative."
-            onRetry={() => {
-              void agentsQuery.refetch()
-              void chatsQuery.refetch()
-            }}
-          />
-        </div>
-      ) : (
-        <BindingsTab
-          agents={agents}
-          chatEntries={chatEntries}
-          chatsLoading={chatsQuery.isLoading}
-          chatsError={chatsQuery.isError}
-          onRetryChats={() => void chatsQuery.refetch()}
-          onConnect={() => openNewAgentWizard(null)}
-          onChangeModel={(agent, binding) => openChangeModel(agent, binding)}
-          highlightedProjectId={routeSearch.project}
         />
       )}
 
@@ -215,9 +176,7 @@ export function FederatedAgentsPage() {
         }}
       />
       <ChangeModelDialog
-        agent={changeModelTarget?.agent ?? null}
-        entries={entries}
-        binding={changeModelTarget?.binding}
+        agent={changeModelTarget}
         onClose={() => setChangeModelTarget(null)}
       />
     </div>

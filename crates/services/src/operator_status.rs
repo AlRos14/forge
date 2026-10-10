@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use api_types::{
     ActiveExecutionSummary, AgentPressureSummary, BlockedTaskSummary, DaemonIssueSummary,
     DaemonPressureSummary, EffectiveExecutionPolicy, OperatorSeverity, OperatorStatusResponse,
-    RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary, UsageSummary,
+    RecentErrorSummary, RetryPressureSummary, TaskLifecycleState, TokenTotalsSummary, UsageSummary,
     WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -28,7 +28,6 @@ impl OperatorStatusService {
         let computed_at = now.to_rfc3339();
 
         let active_executions = self.active_executions(now).await?;
-        let _queued_tasks = self.queued_dispatchable_tasks().await?;
         let blocked_tasks = self.blocked_tasks().await?;
         let daemon_issues = self.daemon_issues(now).await?;
         let daemon_error_count = self.daemon_error_count().await?;
@@ -85,7 +84,7 @@ impl OperatorStatusService {
                 a.daemon_id,
                 e.workspace_id,
                 w.worktree_path,
-                e.agent_session_id,
+                e.harness_session_id,
                 e.created_at AS started_at,
                 e.logs_path,
                 e.last_activity_at,
@@ -129,7 +128,7 @@ impl OperatorStatusService {
                 daemon_id: row.try_get("daemon_id")?,
                 workspace_id: row.try_get("workspace_id")?,
                 workspace_path,
-                session_id: row.try_get("agent_session_id")?,
+                harness_session_id: row.try_get("harness_session_id")?,
                 started_at,
                 runtime_seconds,
                 elapsed_seconds: runtime_seconds,
@@ -146,45 +145,34 @@ impl OperatorStatusService {
         Ok(active_executions)
     }
 
-    async fn queued_dispatchable_tasks(&self) -> Result<Vec<String>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT t.id
-             FROM task t
-             WHERE t.status IN ('todo', 'backlog')
-               AND t.deleted_at IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM execution e
-                   WHERE e.task_id = t.id AND e.status = 'running'
-               )
-             ORDER BY t.priority DESC, t.created_at ASC, t.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("id").map_err(ServiceError::from))
-            .collect()
-    }
-
     async fn blocked_tasks(&self) -> Result<Vec<BlockedTaskSummary>, ServiceError> {
         let rows = sqlx::query(
-            "SELECT id, title, error_annotation, blocked_json, updated_at
-             FROM task
-             WHERE status = 'blocked' AND deleted_at IS NULL
-             ORDER BY updated_at DESC, id ASC",
+            "SELECT t.id, t.title, lifecycle.version, lifecycle.reason_kind,
+                    lifecycle.reason_ref, lifecycle.updated_at,
+                    transition.id AS transition_id
+             FROM task t
+             JOIN task_lifecycle lifecycle ON lifecycle.task_id = t.id
+             LEFT JOIN task_lifecycle_transition transition
+               ON transition.task_id = lifecycle.task_id
+              AND transition.to_version = lifecycle.version
+              AND transition.to_state = 'blocked'
+             WHERE lifecycle.state = 'blocked' AND t.deleted_at IS NULL
+             ORDER BY lifecycle.updated_at DESC, t.id ASC",
         )
         .fetch_all(self.db.pool())
         .await?;
 
         rows.into_iter()
             .map(|row| {
-                let error_annotation: Option<String> = row.try_get("error_annotation")?;
-                let blocked_json: Option<String> = row.try_get("blocked_json")?;
                 Ok(BlockedTaskSummary {
                     task_id: row.try_get("id")?,
                     title: row.try_get("title")?,
-                    blocked_reason: error_annotation.or_else(|| blocked_reason(&blocked_json)),
-                    blocked_since: Some(row.try_get("updated_at")?),
+                    lifecycle_state: TaskLifecycleState::Blocked,
+                    lifecycle_version: row.try_get("version")?,
+                    transition_id: row.try_get("transition_id")?,
+                    reason_kind: row.try_get("reason_kind")?,
+                    reason_ref: row.try_get("reason_ref")?,
+                    blocked_since: row.try_get("updated_at")?,
                 })
             })
             .collect()
@@ -256,18 +244,18 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let running_executions: i64 = row.try_get("running_executions")?;
-            let active_sessions = running_executions.max(0) as u32;
+            let active_execution_count = running_executions.max(0) as u32;
             let labels_json: String = row.try_get("labels_json")?;
             let max_sessions = daemon_session_cap_from_labels(&labels_json)
                 .and_then(|value| u32::try_from(value).ok());
-            let at_capacity = max_sessions.is_some_and(|max| active_sessions >= max);
-            if active_sessions == 0 && max_sessions.is_none() {
+            let at_capacity = max_sessions.is_some_and(|max| active_execution_count >= max);
+            if active_execution_count == 0 && max_sessions.is_none() {
                 continue;
             }
             pressure.push(DaemonPressureSummary {
                 daemon_id: row.try_get("daemon_id")?,
                 hostname: row.try_get("hostname")?,
-                active_sessions,
+                active_execution_count,
                 max_sessions,
                 at_capacity,
             });
@@ -296,25 +284,26 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let running_executions: i64 = row.try_get("running_executions")?;
-            let active_sessions = running_executions.max(0) as u32;
-            let max_sessions = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
-            let at_capacity = max_sessions > 0 && active_sessions >= max_sessions;
-            if active_sessions == 0 && !at_capacity {
+            let active_execution_count = running_executions.max(0) as u32;
+            let max_concurrent_tasks = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
+            let at_capacity =
+                max_concurrent_tasks > 0 && active_execution_count >= max_concurrent_tasks;
+            if active_execution_count == 0 && !at_capacity {
                 continue;
             }
             pressure.push(AgentPressureSummary {
                 agent_id: row.try_get("agent_id")?,
                 agent_name: row.try_get("agent_name")?,
                 daemon_id: row.try_get("daemon_id")?,
-                active_sessions,
-                max_sessions,
+                active_execution_count,
+                max_concurrent_tasks,
                 at_capacity,
             });
         }
         pressure.sort_by(|left, right| {
             right
-                .active_sessions
-                .cmp(&left.active_sessions)
+                .active_execution_count
+                .cmp(&left.active_execution_count)
                 .then_with(|| left.agent_name.cmp(&right.agent_name))
         });
         Ok(pressure)
@@ -351,70 +340,61 @@ impl OperatorStatusService {
     async fn retry_pressure(&self) -> Result<Vec<RetryPressureSummary>, ServiceError> {
         let rows = sqlx::query(
             "SELECT
+                receipt.id AS retry_receipt_id,
                 t.id AS task_id,
                 t.title,
-                t.status,
-                t.metadata_json,
-                COUNT(tl.id) AS attempt_count,
-                (
-                    SELECT e.error
-                    FROM execution e
-                    WHERE e.task_id = t.id AND e.status = 'failed'
-                    ORDER BY COALESCE(e.stopped_at, e.updated_at) DESC, e.id DESC
-                    LIMIT 1
-                ) AS last_error
+                receipt.failure_kind,
+                receipt.failure_ref,
+                receipt.source_event_id,
+                receipt.receipt_event_id,
+                receipt.attempt_number,
+                receipt.retry_budget,
+                receipt.disposition,
+                lifecycle.state AS lifecycle_state,
+                lifecycle.version AS lifecycle_version,
+                receipt.created_at
              FROM task t
-             LEFT JOIN transition_log tl ON tl.task_id = t.id AND tl.rejection = 1
+             JOIN task_lifecycle lifecycle ON lifecycle.task_id = t.id
+             JOIN task_failure_retry_receipt receipt ON receipt.task_id = t.id
              WHERE t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'cancelled')
-             GROUP BY t.id, t.title, t.status, t.metadata_json
-             HAVING COUNT(tl.id) >= 1 OR t.metadata_json IS NOT NULL
-             ORDER BY attempt_count DESC, t.updated_at DESC, t.id ASC",
+               AND lifecycle.state NOT IN ('done', 'cancelled')
+             ORDER BY lifecycle.state, t.id, receipt.failure_kind,
+                      receipt.retry_epoch, receipt.attempt_number, receipt.id",
         )
         .fetch_all(self.db.pool())
         .await?;
 
-        let mut pressure = Vec::new();
-        for row in rows {
-            let attempt_count: i64 = row.try_get("attempt_count")?;
-            let metadata_json: Option<String> = row.try_get("metadata_json")?;
-            let metadata = metadata_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .unwrap_or(Value::Null);
-            let execution_retry_count = metadata
-                .get("execution_retry_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
-            let deferred = metadata.get("deferred_dispatch").and_then(Value::as_object);
-            let retry_reason = deferred
-                .and_then(|value| value.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| (execution_retry_count > 0).then(|| "execution retry".to_owned()))
-                .or_else(|| (attempt_count > 0).then(|| "transition rejection".to_owned()));
-            let due_time = deferred
-                .and_then(|value| value.get("not_before"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let attempt_count = (attempt_count.max(0) as u32)
-                .max(execution_retry_count)
-                .max(u32::from(retry_reason.is_some()));
-            if attempt_count == 0 && retry_reason.is_none() {
-                continue;
-            }
-            pressure.push(RetryPressureSummary {
-                task_id: row.try_get("task_id")?,
-                title: row.try_get("title")?,
-                attempt_count,
-                max_attempts: (execution_retry_count > 0).then_some(3),
-                current_state: row.try_get("status")?,
-                retry_reason,
-                due_time,
-                last_error: row.try_get("last_error")?,
-            });
-        }
-        Ok(pressure)
+        rows.into_iter()
+            .map(|row| {
+                let attempt_number = u32::try_from(row.try_get::<i64, _>("attempt_number")?)
+                    .map_err(|_| ServiceError::invalid_operation("invalid retry attempt number"))?;
+                let retry_budget = u32::try_from(row.try_get::<i64, _>("retry_budget")?)
+                    .map_err(|_| ServiceError::invalid_operation("invalid retry budget"))?;
+                let disposition: String = row.try_get("disposition")?;
+                if !matches!(disposition.as_str(), "rework" | "exhausted") {
+                    return Err(ServiceError::invalid_operation(
+                        "invalid retry receipt disposition",
+                    ));
+                }
+                Ok(RetryPressureSummary {
+                    retry_receipt_id: row.try_get("retry_receipt_id")?,
+                    task_id: row.try_get("task_id")?,
+                    title: row.try_get("title")?,
+                    failure_kind: row.try_get("failure_kind")?,
+                    failure_ref: row.try_get("failure_ref")?,
+                    source_event_id: row.try_get("source_event_id")?,
+                    receipt_event_id: row.try_get("receipt_event_id")?,
+                    attempt_number,
+                    retry_budget,
+                    disposition,
+                    lifecycle_state: api_lifecycle_state(
+                        &row.try_get::<String, _>("lifecycle_state")?,
+                    )?,
+                    lifecycle_version: row.try_get("lifecycle_version")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
     }
 
     async fn usage_summary(
@@ -578,13 +558,20 @@ fn rate_limit_snapshot(snapshot_json: Option<&str>) -> Option<Value> {
         .cloned()
 }
 
-fn blocked_reason(blocked_json: &Option<String>) -> Option<String> {
-    let value = serde_json::from_str::<Value>(blocked_json.as_deref()?).ok()?;
-    value
-        .get("reason")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .map(str::to_owned)
+fn api_lifecycle_state(value: &str) -> Result<TaskLifecycleState, ServiceError> {
+    match value {
+        "backlog" => Ok(TaskLifecycleState::Backlog),
+        "ready" => Ok(TaskLifecycleState::Ready),
+        "active" => Ok(TaskLifecycleState::Active),
+        "blocked" => Ok(TaskLifecycleState::Blocked),
+        "ready_to_merge" => Ok(TaskLifecycleState::ReadyToMerge),
+        "merging" => Ok(TaskLifecycleState::Merging),
+        "done" => Ok(TaskLifecycleState::Done),
+        "cancelled" => Ok(TaskLifecycleState::Cancelled),
+        _ => Err(ServiceError::invalid_operation(format!(
+            "unknown TaskLifecycle state `{value}`"
+        ))),
+    }
 }
 
 fn effective_policy(
@@ -714,7 +701,8 @@ mod tests {
     //! and assert the fields you care about. Tests are independent (in-memory SQLite per test).
 
     use super::*;
-    use db::{create_sqlite_pool, new_uuid_v4, run_migrations};
+    use db::{create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo};
+    use serde_json::json;
 
     async fn test_service() -> (Arc<SqliteDb>, OperatorStatusService) {
         let pool = create_sqlite_pool("sqlite::memory:")
@@ -822,6 +810,82 @@ mod tests {
         .expect("transition log inserts");
     }
 
+    async fn insert_retry_receipt(db: &SqliteDb, task_id: &str) -> (String, String, String) {
+        let now = Utc::now().to_rfc3339();
+        let failure_ref = new_uuid_v4();
+        let source_event = DomainEventRepo::append_event(
+            db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "execution.failed".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: failure_ref.clone(),
+                actor_type: "agent".to_owned(),
+                actor_id: Some("agent-exact".to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.to_owned(),
+                correlation_id: failure_ref.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: json!({"execution_id": failure_ref.clone()}).to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("source failure event");
+        let retry_receipt_id = new_uuid_v4();
+        let receipt_event = DomainEventRepo::append_event(
+            db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.rework_requested".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task_id.to_owned(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.to_owned(),
+                correlation_id: retry_receipt_id.clone(),
+                causation_id: Some(source_event.id.clone()),
+                causation_depth: 1,
+                dedupe_key: None,
+                payload_json: json!({
+                    "task_id": task_id,
+                    "failure_kind": "execution_failed",
+                    "failure_ref": failure_ref.clone(),
+                    "source_event_id": source_event.id.clone(),
+                    "attempt_number": 2,
+                    "retry_budget": 3,
+                    "disposition": "rework",
+                })
+                .to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("retry receipt event");
+        sqlx::query(
+            "INSERT INTO task_failure_retry_receipt (
+                id, task_id, failure_kind, failure_ref, source_event_id,
+                attempt_number, retry_budget, disposition, policy_ref,
+                policy_version, policy_digest, receipt_event_id, created_at, retry_epoch
+             ) VALUES (?, ?, 'execution_failed', ?, ?, 2, 3, 'rework',
+                       'forge.task_failure_retry', 3, ?, ?, ?, 0)",
+        )
+        .bind(&retry_receipt_id)
+        .bind(task_id)
+        .bind(&failure_ref)
+        .bind(&source_event.id)
+        .bind("a".repeat(64))
+        .bind(&receipt_event.id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("exact retry receipt");
+        (retry_receipt_id, source_event.id, receipt_event.id)
+    }
+
     async fn insert_daemon(db: &SqliteDb, status: &str) -> String {
         let daemon_id = new_uuid_v4();
         let now = Utc::now().to_rfc3339();
@@ -915,6 +979,11 @@ mod tests {
         assert_eq!(status.overall_severity, OperatorSeverity::Blocked);
         assert_eq!(status.blocked_tasks.len(), 1);
         assert_eq!(status.blocked_tasks[0].task_id, task_id);
+        assert_eq!(
+            status.blocked_tasks[0].lifecycle_state,
+            TaskLifecycleState::Blocked
+        );
+        assert_eq!(status.blocked_tasks[0].lifecycle_version, 1);
     }
 
     #[tokio::test]
@@ -1017,17 +1086,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_tasks_do_not_report_retry_pressure() {
+    async fn legacy_transition_logs_do_not_report_retry_pressure() {
         let (db, service) = test_service().await;
-        let done_task_id = insert_task(&db, "done").await;
-        let active_task_id = insert_task(&db, "review").await;
-        insert_rejected_transition(&db, &done_task_id).await;
+        let active_task_id = insert_task(&db, "in_progress").await;
         insert_rejected_transition(&db, &active_task_id).await;
 
         let status = service.compute_status().await.expect("status computes");
 
+        assert!(status.retry_pressure.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_pressure_reports_exact_receipt_and_lifecycle_identity() {
+        let (db, service) = test_service().await;
+        let task_id = insert_task(&db, "in_progress").await;
+        let (retry_receipt_id, source_event_id, receipt_event_id) =
+            insert_retry_receipt(&db, &task_id).await;
+
+        let status = service.compute_status().await.expect("status computes");
+
         assert_eq!(status.retry_pressure.len(), 1);
-        assert_eq!(status.retry_pressure[0].task_id, active_task_id);
+        let receipt = &status.retry_pressure[0];
+        assert_eq!(receipt.retry_receipt_id, retry_receipt_id);
+        assert_eq!(receipt.task_id, task_id);
+        assert_eq!(receipt.failure_kind, "execution_failed");
+        assert_eq!(receipt.attempt_number, 2);
+        assert_eq!(receipt.retry_budget, 3);
+        assert_eq!(receipt.disposition, "rework");
+        assert_eq!(receipt.lifecycle_state, TaskLifecycleState::Active);
+        assert_eq!(receipt.lifecycle_version, 1);
+        assert_eq!(receipt.source_event_id, source_event_id);
+        assert_eq!(receipt.receipt_event_id, receipt_event_id);
     }
 
     #[tokio::test]

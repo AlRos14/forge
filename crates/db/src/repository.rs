@@ -54,6 +54,11 @@ pub trait TaskRepo: Send + Sync {
 #[async_trait]
 pub trait TaskLifecycleRepo: Send + Sync {
     async fn get_task_lifecycle(&self, task_id: &str) -> Result<Option<TaskLifecycle>>;
+    async fn list_task_lifecycle_transitions(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskLifecycleTransitionFact>>;
     async fn get_task_lifecycle_transition_fact(
         &self,
         transition_id: &str,
@@ -175,7 +180,7 @@ pub trait AgentRepo: Send + Sync {
         now: String,
     ) -> Result<Agent>;
     async fn archive(&self, id: &str, archived_at: &str) -> Result<()>;
-    async fn count_active_tasks(&self, agent_id: &str) -> Result<i64>;
+    async fn count_running_executions(&self, agent_id: &str) -> Result<i64>;
 }
 
 #[async_trait]
@@ -1790,6 +1795,8 @@ pub trait TaskDependencyRepo: Send + Sync {
 pub struct TaskListQuery {
     pub project_id: String,
     pub q: Option<String>,
+    pub lifecycle_states: Vec<TaskLifecycleState>,
+    /// Internal transition-era query support. Public Task listing uses `lifecycle_states`.
     pub statuses: Vec<String>,
     pub agent_ids: Vec<String>,
     pub assignee_types: Vec<String>,
@@ -1815,6 +1822,9 @@ pub struct AgentListQuery {
     pub status: Option<AgentStatus>,
     pub executor_type: Option<String>,
     pub capabilities: Vec<String>,
+    /// Exclude historical native/embedded identities from current Harness
+    /// Agent rosters without deleting their durable records.
+    pub harness_only: bool,
     pub page: PageRequest,
 }
 

@@ -1,5 +1,8 @@
 use anyhow::Result;
-use api_types::{AgentResponse, CreateAgentRequest, PaginatedResponse};
+use api_types::{
+    AgentProfileResponse, AgentResponse, CreateAgentRequest, PaginatedResponse,
+    SelectAgentProfileRequest,
+};
 use clap::Subcommand;
 
 use crate::{
@@ -33,6 +36,26 @@ enum AgentCmd {
     },
     Get {
         id: String,
+    },
+    Profile(AgentProfileArgs),
+}
+
+#[derive(clap::Args)]
+struct AgentProfileArgs {
+    #[command(subcommand)]
+    command: AgentProfileCommand,
+}
+
+#[derive(Subcommand)]
+enum AgentProfileCommand {
+    List {
+        identity_id: String,
+    },
+    Select {
+        identity_id: String,
+        profile_id: String,
+        #[arg(long)]
+        version: i64,
     },
 }
 
@@ -80,6 +103,27 @@ impl AgentArgs {
                 let agent: AgentResponse = client.get(&format!("/api/v1/agents/{id}")).await?;
                 print_agent(output, &agent)
             }
+            AgentCmd::Profile(args) => match &args.command {
+                AgentProfileCommand::List { identity_id } => {
+                    let profiles: Vec<AgentProfileResponse> = client
+                        .get(&format!("/api/v1/agents/{identity_id}/profiles"))
+                        .await?;
+                    print_json(&profiles)
+                }
+                AgentProfileCommand::Select {
+                    identity_id,
+                    profile_id,
+                    version,
+                } => {
+                    let agent: AgentResponse = client
+                        .post(
+                            &format!("/api/v1/agents/{identity_id}/profiles/{profile_id}/select"),
+                            &SelectAgentProfileRequest { version: *version },
+                        )
+                        .await?;
+                    print_agent(output, &agent)
+                }
+            },
         }
     }
 }

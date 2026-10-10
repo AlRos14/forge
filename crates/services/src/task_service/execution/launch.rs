@@ -54,9 +54,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         self.ensure_agent_membership_for_role(task_id, role, agent_id)
             .await?;
         self.ensure_task_runnable(&task).await?;
@@ -74,8 +71,6 @@ impl TaskService {
                 &task.id,
                 self.repo_cache_locks.clone(),
             )
-            .await?;
-        self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(agent_id), None)
             .await?;
         let mut executor_config_snapshot_json = with_dispatch_metadata(
             build_executor_config_snapshot(
@@ -167,9 +162,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         self.ensure_no_running_repository_execution(&task).await?;
         self.ensure_task_runnable(&task).await?;
         self.check_dependency_gate(&task, &agent_id).await?;
@@ -188,8 +180,6 @@ impl TaskService {
                 &task_id,
                 self.repo_cache_locks.clone(),
             )
-            .await?;
-        self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(&agent_id), None)
             .await?;
         let executor_config_snapshot_json = build_executor_config_snapshot(
             &self.db,
@@ -316,57 +306,55 @@ impl TaskService {
                         "Agent {requested_agent_id} cannot receive repository workspace authority"
                     )));
                 }
+            } else if !matches!(
+                parent_execution.actor_ref(),
+                Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &requested_agent_id
+            ) {
+                return Err(ServiceError::conflict(
+                    "a role without TaskRole authority can continue only its exact parent Agent Actor",
+                ));
             }
             requested_agent_id
-        } else if let Some(memberships) = authoritative_memberships.as_ref() {
-            // Keep the causal Agent when it remains active and usable in the
-            // current role. If its membership or runtime eligibility ended,
-            // choose the first usable current member instead.
+        } else {
+            // The supplied parent Execution is the only implicit identity
+            // source. A changed or unavailable membership cannot substitute
+            // a currently selected Agent for the causal Actor.
             let lineage_agent_id = match parent_execution.actor_ref() {
-                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
-                Some(db::ActorRef::Human(_)) => None,
-                None => parent_execution.agent_id.clone(),
-            };
-            let lineage_is_usable = if let Some(agent_id) = lineage_agent_id.as_deref() {
-                if task.repo_id.is_some() {
-                    crate::task_service::is_usable_repository_agent(
-                        &self.db,
-                        &task.project_id,
-                        memberships,
-                        agent_id,
-                    )
-                    .await?
-                } else {
-                    crate::task_service::is_usable_active_agent(&self.db, memberships, agent_id)
-                        .await?
+                Some(db::ActorRef::Agent(agent_id)) => agent_id,
+                Some(db::ActorRef::Human(_)) => {
+                    return Err(ServiceError::invalid_operation(
+                        "a Human Execution has no Harness Actor to continue",
+                    ));
                 }
-            } else {
-                false
+                None => {
+                    return Err(ServiceError::invalid_operation(
+                        "follow-up requires an exact Agent Actor on the parent Execution",
+                    ));
+                }
             };
-            let selected_agent = if lineage_is_usable {
-                lineage_agent_id
-            } else if task.repo_id.is_some() {
-                crate::task_service::select_usable_repository_agent_id(
+            if let Some(memberships) = authoritative_memberships.as_ref() {
+                if crate::task_service::active_agent_membership(memberships, &lineage_agent_id)
+                    .is_none()
+                {
+                    return Err(ServiceError::conflict(format!(
+                        "parent Agent {lineage_agent_id} is not an active member of follow-up role {}",
+                        parent_execution.role
+                    )));
+                }
+            }
+            if task.repo_id.is_some()
+                && !crate::task_service::repository_worker_identity_is_eligible(
                     &self.db,
                     &task.project_id,
-                    memberships,
+                    &lineage_agent_id,
                 )
                 .await?
-            } else {
-                crate::task_service::select_usable_agent_id(&self.db, memberships).await?
-            };
-            selected_agent.ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "no usable Agent is available for follow-up role {}",
-                    parent_execution.role
-                ))
-            })?
-        } else {
-            parent_execution.agent_id.clone().ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "follow-up requires agent_id either in request or parent execution",
-                )
-            })?
+            {
+                return Err(ServiceError::conflict(format!(
+                    "parent Agent {lineage_agent_id} cannot receive repository workspace authority"
+                )));
+            }
+            lineage_agent_id
         };
         let agent = AgentRepo::get_by_id(&*self.db, &resolved_agent_id)
             .await?

@@ -8,7 +8,6 @@ use db::{ExecutionUsageRepo, UpdateTask, UpdateTaskStatus};
 mod cascade;
 mod follow_up;
 mod guards;
-mod hooks;
 mod launch;
 mod recovery;
 mod runner;

@@ -2,7 +2,7 @@
 use std::{path::Path, sync::Arc};
 
 use api::{build_router, AppState};
-use api_types::{ProjectResponse, RepoResponse, TaskResponse};
+use api_types::{ProjectResponse, RepoResponse, TaskLifecycleState, TaskResponse};
 use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
@@ -25,7 +25,7 @@ async fn tasks_can_be_created_without_task_type() {
     )
     .await;
 
-    assert_eq!(task.status, "todo");
+    assert_eq!(task.lifecycle.state, TaskLifecycleState::Ready);
     assert_eq!(task.parent_task_id, None);
 }
 

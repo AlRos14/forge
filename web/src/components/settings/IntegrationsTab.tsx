@@ -7,9 +7,8 @@ import {
   useIntegrationQuery,
   useUpdateIntegration,
   useTriggerSync,
-  type CreateIntegrationRequest,
-  type PatchIntegrationRequest,
 } from '@/api/hooks'
+import type { CreateIntegrationRequest, PatchIntegrationRequest } from '@/types/generated'
 import { parseGitRemoteUrl } from '@/components/settings/integration-utils'
 import { SettingsSection } from '@/components/settings/SettingsSection'
 import { Button } from '@/components/ui/button'
@@ -65,7 +64,7 @@ export function IntegrationsTab({
   const [baseUrl, setBaseUrl] = useState('https://api.github.com')
   const [owner, setOwner] = useState('')
   const [repo, setRepo] = useState('')
-  const [tokenSecretRef, setTokenSecretRef] = useState('')
+  const [credentialEnvVar, setCredentialEnvVar] = useState('')
   const [pollInterval, setPollInterval] = useState('300')
   const [enabled, setEnabled] = useState(true)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -75,7 +74,7 @@ export function IntegrationsTab({
     setBaseUrl(parsedRemote?.baseUrl ?? 'https://api.github.com')
     setOwner(parsedRemote?.owner ?? '')
     setRepo(parsedRemote?.repo ?? '')
-    setTokenSecretRef('')
+    setCredentialEnvVar('')
     setPollInterval('300')
     setEnabled(true)
   }
@@ -88,7 +87,7 @@ export function IntegrationsTab({
     setBaseUrl(d.base_url)
     setOwner(d.owner)
     setRepo(d.repo)
-    setTokenSecretRef(d.token_secret_ref)
+    setCredentialEnvVar(d.credential_env_var)
     setPollInterval(String(d.poll_interval_secs))
     setEnabled(d.enabled)
   }, [integrationQuery.data])
@@ -113,7 +112,7 @@ export function IntegrationsTab({
     const trimmedOwner = owner.trim()
     const trimmedRepo = repo.trim()
     const trimmedUrl = baseUrl.trim()
-    const trimmedToken = tokenSecretRef.trim()
+    const trimmedCredentialEnvVar = credentialEnvVar.trim()
     const interval = Number(pollInterval)
 
     if (!trimmedUrl) {
@@ -128,8 +127,8 @@ export function IntegrationsTab({
       toast.error('Repo is required')
       return
     }
-    if (!trimmedToken) {
-      toast.error('Token secret ref is required')
+    if (!hasIntegration && !trimmedCredentialEnvVar) {
+      toast.error('Credential environment variable is required')
       return
     }
     if (!Number.isInteger(interval) || interval < 1) {
@@ -143,7 +142,7 @@ export function IntegrationsTab({
         base_url: trimmedUrl,
         owner: trimmedOwner,
         repo: trimmedRepo,
-        token_secret_ref: trimmedToken,
+        ...(trimmedCredentialEnvVar ? { credential_env_var: trimmedCredentialEnvVar } : {}),
         poll_interval_secs: interval,
         enabled,
       }
@@ -161,7 +160,7 @@ export function IntegrationsTab({
         base_url: trimmedUrl,
         owner: trimmedOwner,
         repo: trimmedRepo,
-        token_secret_ref: trimmedToken,
+        credential_env_var: trimmedCredentialEnvVar,
         poll_interval_secs: interval,
         enabled,
       }
@@ -278,12 +277,12 @@ export function IntegrationsTab({
           </SettingsSection>
 
           <SettingsSection
-            title="Token secret ref"
-            description="Reference to the secret containing the API token for authentication. This should be a key in your Forge secrets store."
+            title="Credential environment variable"
+            description="Name of the environment variable Forge reads during issue sync. The credential value is never returned or stored."
           >
             <Input
-              value={tokenSecretRef}
-              onChange={(e) => setTokenSecretRef(e.target.value)}
+              value={credentialEnvVar}
+              onChange={(e) => setCredentialEnvVar(e.target.value)}
               placeholder="GITHUB_TOKEN"
               className="max-w-md"
             />

@@ -6,19 +6,6 @@ pub async fn create_task(
     Json(body): Json<Value>,
 ) -> ApiResult<Json<TaskResponse>> {
     let request: CreateTaskRequest = serde_json::from_value(body)?;
-    if request.governance.is_some() {
-        return Err(ApiError::gone_with_code(
-            "operation_retired",
-            "Project Task Governance was retired in Plan PR11; create an ordinary Task",
-        ));
-    }
-    let review_config = match request.review_config {
-        Some(review_config) => Some(review_config),
-        None => project_default_review_config(&state.db, &project_id).await?,
-    };
-    let review_config = serialize_json(
-        review_config.map(|review_config| serde_json::json!({ "review": review_config })),
-    )?;
     let task_type = request.task_type.map(|t| {
         match t {
             api_types::TaskType::Implementation => "implementation",
@@ -38,9 +25,9 @@ pub async fn create_task(
             request.parent_task_id,
             request.priority,
             task_type,
-            review_config,
-            request.merge_config,
-            request.role_assignments,
+            None,
+            None,
+            None,
         )
         .await?;
     Ok(Json(task_response(&state.db, task).await?))
@@ -51,42 +38,23 @@ pub async fn list_tasks(
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<TasksResponse>> {
-    let canonical_phases =
-        parse_csv::<CanonicalPhase>(params.canonical_phase.as_ref(), "canonical_phase")?;
-    let mut statuses = parse_csv::<String>(params.status.as_ref(), "status")?;
-    if !canonical_phases.is_empty() {
-        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
-            .await?
-            .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let requested_phases: std::collections::HashSet<CanonicalPhase> =
-            canonical_phases.iter().copied().collect();
-        let phase_statuses = workflow
-            .states
-            .iter()
-            .filter(|state| {
-                requested_phases.contains(&workflow.canonical_phase_for_state(&state.name))
-            })
-            .map(|state| state.name.clone())
-            .collect::<Vec<_>>();
-
-        if statuses.is_empty() {
-            // An empty status list means "no status filter" to the database layer. Use a
-            // status that cannot be a workflow state when a requested phase has no states.
-            statuses = if phase_statuses.is_empty() {
-                vec!["__no_matching_canonical_phase__".to_owned()]
-            } else {
-                phase_statuses
-            };
-        } else {
-            statuses.retain(|status| phase_statuses.iter().any(|phase| phase == status));
-            if statuses.is_empty() {
-                statuses = vec!["__no_matching_canonical_phase__".to_owned()];
-            }
-        }
-        // `cancelled` is mapped to the Done phase, so phase=done intentionally opts into
-        // the existing include-cancelled behavior through the resolved status list.
+    if params.status.is_some() {
+        return Err(ApiError::bad_request(
+            "Task status filters were retired; use lifecycle_state",
+        ));
     }
+    if params.include_cancelled.is_some() {
+        return Err(ApiError::bad_request(
+            "include_cancelled was retired; filter with lifecycle_state=cancelled",
+        ));
+    }
+    if params.include_archived.is_some() {
+        return Err(ApiError::bad_request(
+            "Task archiving is not part of TaskLifecycle",
+        ));
+    }
+    let lifecycle_states =
+        parse_csv::<db::TaskLifecycleState>(params.lifecycle_state.as_ref(), "lifecycle_state")?;
 
     // Task decoration performs additional reads, so bracket the assembled page with
     // revision reads and retry if a board mutation races the response.
@@ -97,40 +65,23 @@ pub async fn list_tasks(
             TaskListQuery {
                 project_id: project_id.clone(),
                 q: params.q.clone(),
-                statuses: statuses.clone(),
-                agent_ids: parse_csv::<String>(params.agent_id.as_ref(), "agent_id")?,
-                assignee_types: parse_csv::<db::AssigneeKind>(
-                    params.assignee_type.as_ref(),
-                    "assignee_type",
-                )?
-                .into_iter()
-                .map(|kind| kind.to_string())
-                .collect(),
-                assignee_ids: parse_csv::<String>(params.assignee_id.as_ref(), "assignee_id")?,
+                lifecycle_states: lifecycle_states.clone(),
+                statuses: Vec::new(),
+                agent_ids: Vec::new(),
+                assignee_types: Vec::new(),
+                assignee_ids: Vec::new(),
                 priority: params.priority,
-                include_archived: params.include_archived.unwrap_or(false),
-                include_cancelled: params.include_cancelled.unwrap_or(false),
+                include_archived: false,
+                include_cancelled: true,
                 include_deleted: false,
                 page: task_page_request(&params)?,
             },
         )
         .await?;
         let has_more = page.next_cursor.is_some();
-        let task_ids = page
-            .items
-            .iter()
-            .map(|task| task.id.as_str())
-            .collect::<Vec<_>>();
-        let latest_executions =
-            ExecutionRepo::list_latest_executions_for_tasks(&*state.db, &task_ids)
-                .await?
-                .into_iter()
-                .map(|execution| (execution.task_id.clone(), execution))
-                .collect::<std::collections::HashMap<_, _>>();
         let mut items = Vec::with_capacity(page.items.len());
         for task in page.items {
-            let latest_execution = latest_executions.get(&task.id).cloned();
-            items.push(task_response_light_with_latest(&state.db, task, latest_execution).await?);
+            items.push(task_response_light(&state.db, task).await?);
         }
         let current_revision = TaskBoardRepo::board_revision(&*state.db, &project_id).await?;
         if current_revision == board_revision {
@@ -156,8 +107,7 @@ pub async fn get_task(
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
     let task = require_task_visible(&state, &id, &user).await?;
-    let awaiting_human = state.task_service.is_awaiting_human(id.clone()).await?;
-    let response = task_response_with_awaiting_human(&state.db, task, awaiting_human).await?;
+    let response = task_response(&state.db, task).await?;
     Ok(Json(response))
 }
 
@@ -174,11 +124,11 @@ pub async fn update_task(
             title: request.title,
             description: request.description.map(Some),
             priority: request.priority,
-            merge_config: serialize_json(request.merge_config)?.map(Some),
+            merge_config: None,
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
-            task_state_config: serialize_json(request.task_state_config)?.map(Some),
+            task_state_config: None,
             parent_task_id: request.parent_task_id,
             updated_at: now_rfc3339(),
         },
@@ -212,70 +162,5 @@ pub async fn reorder_subtasks(
     let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", task_id.clone()))?;
-    Ok(Json(task_response(&state.db, task).await?))
-}
-
-pub async fn move_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<MoveTaskRequest>,
-) -> ApiResult<Json<MoveTaskResponse>> {
-    let operation_id = request.operation_id.clone();
-    let result = state
-        .task_service
-        .move_task(id, request)
-        .await
-        .map_err(|error| match error {
-            ServiceError::InvalidOperation { message } => {
-                ApiError::unprocessable("invalid_transition", message)
-            }
-            other => ApiError::from(other),
-        })?;
-    Ok(Json(MoveTaskResponse {
-        task: task_response(&state.db, result.task).await?,
-        board_revision: result.board_revision,
-        operation_id,
-    }))
-}
-
-pub async fn archive_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<TaskResponse>> {
-    let task = state.task_service.archive_task(id).await?;
-    Ok(Json(task_response(&state.db, task).await?))
-}
-
-pub async fn advance_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<TaskResponse>> {
-    let task = state.task_service.advance_to_next_state(id).await?;
-    Ok(Json(task_response(&state.db, task).await?))
-}
-
-pub async fn recover_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<RecoverTaskRequest>,
-) -> ApiResult<Json<TaskResponse>> {
-    let task = state
-        .task_service
-        .recover_task(id, body.action, body.reason, body.context)
-        .await
-        .map_err(|error| match &error {
-            ServiceError::InvalidOperation { message } if message.contains("terminal status") => {
-                ApiError::conflict_with_code("task.terminal", message.clone())
-            }
-            _ => ApiError::from(error),
-        })?;
-    Ok(Json(task_response(&state.db, task).await?))
-}
-
-pub async fn duplicate_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<TaskResponse>> {
-    let task = state.task_service.duplicate_task(&id).await?;
     Ok(Json(task_response(&state.db, task).await?))
 }

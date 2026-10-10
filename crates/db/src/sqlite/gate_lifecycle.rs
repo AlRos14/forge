@@ -26,6 +26,26 @@ pub(super) fn map_task_lifecycle(row: &sqlx::sqlite::SqliteRow) -> Result<TaskLi
     })
 }
 
+fn map_lifecycle_transition_fact(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<TaskLifecycleTransitionFact> {
+    Ok(TaskLifecycleTransitionFact {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        from_state: parse_gate_enum(row.try_get("from_state")?)?,
+        to_state: parse_gate_enum(row.try_get("to_state")?)?,
+        from_version: row.try_get("from_version")?,
+        to_version: row.try_get("to_version")?,
+        cause_kind: row.try_get("cause_kind")?,
+        cause_ref: row.try_get("cause_ref")?,
+        gate_evaluation_id: row.try_get("gate_evaluation_id")?,
+        reason_kind: row.try_get("reason_kind")?,
+        reason_ref: row.try_get("reason_ref")?,
+        domain_event_id: row.try_get("domain_event_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 fn map_lifecycle_audit(row: &sqlx::sqlite::SqliteRow) -> Result<TaskLifecycleMigrationAudit> {
     Ok(TaskLifecycleMigrationAudit {
         task_id: row.try_get("task_id")?,
@@ -228,6 +248,27 @@ impl TaskLifecycleRepo for SqliteDb {
         .transpose()
     }
 
+    async fn list_task_lifecycle_transitions(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskLifecycleTransitionFact>> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, from_state, to_state, from_version, to_version,
+                    cause_kind, cause_ref, gate_evaluation_id, reason_kind, reason_ref,
+                    domain_event_id, created_at
+             FROM task_lifecycle_transition
+             WHERE task_id = ?
+             ORDER BY to_version DESC
+             LIMIT ?",
+        )
+        .bind(task_id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_lifecycle_transition_fact).collect()
+    }
+
     async fn get_task_lifecycle_transition_fact(
         &self,
         transition_id: &str,
@@ -241,24 +282,8 @@ impl TaskLifecycleRepo for SqliteDb {
         .bind(transition_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
-            Ok(TaskLifecycleTransitionFact {
-                id: row.try_get("id")?,
-                task_id: row.try_get("task_id")?,
-                from_state: parse_gate_enum(row.try_get("from_state")?)?,
-                to_state: parse_gate_enum(row.try_get("to_state")?)?,
-                from_version: row.try_get("from_version")?,
-                to_version: row.try_get("to_version")?,
-                cause_kind: row.try_get("cause_kind")?,
-                cause_ref: row.try_get("cause_ref")?,
-                gate_evaluation_id: row.try_get("gate_evaluation_id")?,
-                reason_kind: row.try_get("reason_kind")?,
-                reason_ref: row.try_get("reason_ref")?,
-                domain_event_id: row.try_get("domain_event_id")?,
-                created_at: row.try_get("created_at")?,
-            })
-        })
-        .transpose()
+        row.map(|row| map_lifecycle_transition_fact(&row))
+            .transpose()
     }
 
     async fn has_task_lifecycle_transition(
@@ -284,7 +309,7 @@ impl TaskLifecycleRepo for SqliteDb {
         identity: TaskLifecycleTransitionIdentity,
     ) -> Result<Option<TaskLifecycleTransitionWrite>> {
         let row = sqlx::query(
-            "SELECT id, task_id, expected_task_version, to_state, cause_kind, cause_ref,
+            "SELECT id, task_id, expected_task_version, from_version, to_state, cause_kind, cause_ref,
                     reason_kind, reason_ref, gate_evaluation_id, to_version, created_at
              FROM task_lifecycle_transition WHERE task_id = ? AND idempotency_key = ?",
         )
@@ -293,7 +318,16 @@ impl TaskLifecycleRepo for SqliteDb {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
-            if row.try_get::<i64, _>("expected_task_version")? != identity.expected_task_version
+            let expected_task_version = row.try_get::<i64, _>("expected_task_version")?;
+            let expected_lifecycle_version = row.try_get::<i64, _>("from_version")?;
+            if identity
+                .expected_task_version
+                .is_some_and(|expected| expected_task_version != expected)
+                || identity
+                    .expected_lifecycle_version
+                    .is_some_and(|expected| expected_lifecycle_version != expected)
+                || (identity.expected_task_version.is_none()
+                    && identity.expected_lifecycle_version.is_none())
                 || parse_gate_enum::<TaskLifecycleState>(row.try_get("to_state")?)?
                     != identity.to_state
                 || row.try_get::<String, _>("cause_kind")? != identity.cause_kind

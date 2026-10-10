@@ -139,6 +139,34 @@ async fn profile_publication_and_selection_are_atomic_on_version_conflict() {
     .expect("current publication succeeds");
     assert_eq!(published.id, next_profile_id);
     assert_eq!(selected.profile_id, published.id);
+
+    let historical_rows = AgentRepo::list(
+        &db,
+        AgentListQuery {
+            status: None,
+            executor_type: None,
+            capabilities: Vec::new(),
+            harness_only: false,
+            page: page(10),
+        },
+    )
+    .await
+    .expect("historical roster loads");
+    assert_eq!(historical_rows.items.len(), 1);
+    let current_harness_rows = AgentRepo::list(
+        &db,
+        AgentListQuery {
+            status: None,
+            executor_type: None,
+            capabilities: Vec::new(),
+            harness_only: true,
+            page: page(10),
+        },
+    )
+    .await
+    .expect("harness roster loads");
+    assert!(current_harness_rows.items.is_empty());
+    assert_eq!(current_harness_rows.total_count, Some(0));
 }
 
 #[tokio::test]
@@ -3567,6 +3595,7 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
         TaskListQuery {
             project_id: project_id.clone(),
             q: None,
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
@@ -3592,6 +3621,7 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
         TaskListQuery {
             project_id,
             q: None,
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: vec![agent_id],
             assignee_types: Vec::new(),
@@ -3657,6 +3687,7 @@ async fn task_list_filters_by_user_assignee() {
         TaskListQuery {
             project_id: project_id.clone(),
             q: None,
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: vec!["user".to_owned()],
@@ -3678,6 +3709,7 @@ async fn task_list_filters_by_user_assignee() {
         TaskListQuery {
             project_id,
             q: None,
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: vec!["user".to_owned()],
@@ -3775,6 +3807,7 @@ async fn task_list_filters_by_search_query() {
         TaskListQuery {
             project_id: project_id.clone(),
             q: Some("release".to_owned()),
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
@@ -3796,6 +3829,7 @@ async fn task_list_filters_by_search_query() {
         TaskListQuery {
             project_id: project_id.clone(),
             q: Some("needle".to_owned()),
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
@@ -3817,6 +3851,7 @@ async fn task_list_filters_by_search_query() {
         TaskListQuery {
             project_id,
             q: Some("100%".to_owned()),
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
@@ -6852,6 +6887,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
                 status: Some(AgentStatus::Busy),
                 executor_type: None,
                 capabilities: vec!["rust".to_owned()],
+                harness_only: false,
                 page: page(10),
             },
         )
@@ -6866,6 +6902,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             TaskListQuery {
                 project_id,
                 q: None,
+                lifecycle_states: Vec::new(),
                 statuses: vec!["todo".to_string()],
                 agent_ids: vec![agent_id],
                 assignee_types: Vec::new(),
@@ -7173,6 +7210,7 @@ async fn task_list_orders_equal_board_positions_by_created_at() {
         TaskListQuery {
             project_id,
             q: None,
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
@@ -7277,8 +7315,8 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
                 id: new_uuid_v4(),
                 task_id: task_id.clone(),
                 agent_id: Some(agent_id.clone()),
-                actor_ref: None,
-                purpose: None,
+                actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+                purpose: Some(crate::ExecutionPurpose::Implement),
                 harness_session_id: None,
                 role: "executor".to_string(),
                 status: ExecutionStatus::Running,
@@ -7309,7 +7347,9 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     tx.commit().await.expect("claim commits");
     assert_eq!(claimed.task.status, "in_progress".to_string());
     assert_eq!(
-        AgentRepo::count_active_tasks(&db, &agent_id).await.unwrap(),
+        AgentRepo::count_running_executions(&db, &agent_id)
+            .await
+            .unwrap(),
         1
     );
 
@@ -7328,74 +7368,125 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
 }
 
 #[tokio::test]
-async fn agent_active_task_count_uses_aggregate_lifecycle_not_workflow() {
+async fn agent_active_execution_count_counts_only_exact_running_executions() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let workflow = serde_json::json!({
-        "states": [
-            { "name": "todo", "kind": "initial" },
-            { "name": "running", "kind": "active" },
-            { "name": "waiting_review", "kind": "gate" },
-            { "name": "done", "kind": "terminal" }
-        ]
-    });
-
-    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
-        .bind(workflow.to_string())
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("workflow updates");
-
-    seed_task(
+    let task_id = seed_task(
         &db,
         &project_id,
         &repo_id,
-        Some(&agent_id),
-        "running".to_owned(),
-        "custom active state",
-    )
-    .await;
-    seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        Some(&agent_id),
-        "waiting_review".to_owned(),
-        "custom gate state",
-    )
-    .await;
-    seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        Some(&agent_id),
-        "done".to_owned(),
-        "terminal state",
-    )
-    .await;
-    seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        Some(&agent_id),
+        None,
         "in_progress".to_owned(),
-        "aggregate active state",
+        "active Task with role membership",
     )
     .await;
-    seed_task(
+    let now = now_rfc3339();
+    let role = TaskRoleRepo::create(
         &db,
-        &project_id,
-        &repo_id,
-        Some(&agent_id),
-        "review".to_owned(),
-        "ambiguous legacy review is blocked",
+        CreateTaskRole {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role: "executor".to_owned(),
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .await;
+    .await
+    .expect("TaskRole creates");
+    RoleMembershipRepo::add(
+        &db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role.id,
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("active Agent RoleMembership creates");
+
+    // Lifecycle and membership describe the Task and its participants; neither
+    // means that the Agent currently has work in progress.
+    assert_eq!(
+        AgentRepo::count_running_executions(&db, &agent_id)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let execution = ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id,
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(crate::ExecutionPurpose::Implement),
+            harness_session_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Agent Execution starts");
 
     assert_eq!(
-        AgentRepo::count_active_tasks(&db, &agent_id).await.unwrap(),
+        AgentRepo::count_running_executions(&db, &agent_id)
+            .await
+            .unwrap(),
         1
+    );
+
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution.id,
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now.clone())),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Agent Execution completes");
+    assert_eq!(
+        AgentRepo::count_running_executions(&db, &agent_id)
+            .await
+            .unwrap(),
+        0
     );
 }
 

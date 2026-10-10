@@ -4,19 +4,15 @@ export const qk = {
   tasks: (projectId: string, filterKey: string) =>
     ['projects', projectId, 'tasks', filterKey] as const,
   task: (taskId: string) => ['tasks', taskId] as const,
-  taskPlan: (taskId: string) => ['tasks', taskId, 'plan'] as const,
   taskDiff: (taskId: string) => ['tasks', taskId, 'diff'] as const,
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
-  reviews: (taskId: string) => ['tasks', taskId, 'reviews'] as const,
-  validations: (taskId: string) => ['tasks', taskId, 'validations'] as const,
-  comments: (taskId: string) => ['tasks', taskId, 'comments'] as const,
-  taskMedia: (taskId: string) => ['tasks', taskId, 'media'] as const,
+  gates: (taskId: string) => ['tasks', taskId, 'gates'] as const,
+  reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
+  validationRuns: (taskId: string) => ['tasks', taskId, 'validation-runs'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,
   agent: (id: string) => ['agents', id] as const,
-  agentTasks: (id: string, filterKey: string) => ['agents', id, 'tasks', filterKey] as const,
   project: (id: string) => ['projects', id] as const,
-  projectOverview: (id: string) => ['projects', id, 'overview'] as const,
   projectRelease: (projectId: string, releaseId: string) =>
     ['projects', projectId, 'releases', releaseId] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
@@ -41,16 +37,9 @@ export const qk = {
   executorTypes: ['executor-types'] as const,
   daemons: ['daemons'] as const,
   clis: ['clis'] as const,
-  workflow: (projectId: string) => ['projects', projectId, 'workflow'] as const,
-  workflowPromptBuilders: ['workflow', 'prompt-builders'] as const,
-  transitions: (taskId: string) => ['tasks', taskId, 'transitions'] as const,
-  taskRoles: (taskId: string) => ['tasks', taskId, 'roles'] as const,
+  lifecycleTransitions: (taskId: string) => ['tasks', taskId, 'lifecycle-transitions'] as const,
   taskWorkspace: (taskId: string) => ['tasks', taskId, 'workspace'] as const,
   taskExternalLinks: (taskId: string) => ['tasks', taskId, 'external-links'] as const,
-  workflowTemplates: ['workflow-templates'] as const,
-  workflowTemplate: (name: string) => ['workflow-templates', name] as const,
-  projectAnalytics: (projectId: string, from?: string, to?: string) =>
-    ['projects', projectId, 'analytics', from ?? 'all', to ?? 'all'] as const,
   notifications: (projectId?: string, read?: boolean) =>
     ['notifications', projectId ?? 'all', read ?? 'all'] as const,
   notificationUnreadCount: (projectId?: string) =>
@@ -62,5 +51,4 @@ export const qk = {
   taskDependents: (taskId: string) => ['tasks', taskId, 'dependents'] as const,
   pats: () => ['pats'] as const,
   projectMembers: (projectId: string) => ['projects', projectId, 'members'] as const,
-  projectAgents: (projectId: string) => ['projects', projectId, 'agents'] as const,
 }
