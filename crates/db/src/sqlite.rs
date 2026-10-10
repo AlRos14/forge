@@ -792,60 +792,9 @@ impl SqliteDb {
     /// authority because a baseline may be superseded between that query and
     /// claim/launch.
     async fn ensure_execution_admission_in_tx(
-        transaction: &mut Transaction<'_, Sqlite>,
-        task_id: &str,
+        _transaction: &mut Transaction<'_, Sqlite>,
+        _task_id: &str,
     ) -> Result<()> {
-        let blocked: Option<i64> = sqlx::query_scalar(
-            "SELECT CASE WHEN p.charter_status = 'charter_backed'
-                                  AND p.charter_setup_required = 0
-                                  AND t.repo_id IS NOT NULL
-                                  AND NOT (
-                                      (
-                                          COALESCE(g.runnable, 0) = 1
-                                          AND g.charter_revision_id = p.current_charter_revision_id
-                                          AND g.baseline_id IS NOT NULL
-                                          AND g.baseline_revision_id IS NOT NULL
-                                          AND b.lifecycle = 'active'
-                                          AND b.current_revision_id = g.baseline_revision_id
-                                          AND r.lifecycle = 'approved'
-                                          AND r.charter_revision_id = p.current_charter_revision_id
-                                          AND EXISTS (
-                                              SELECT 1
-                                              FROM project_execution_baseline_approval a
-                                              WHERE a.baseline_id = g.baseline_id
-                                                AND a.revision_id = g.baseline_revision_id
-                                                AND a.content_digest = r.content_digest
-                                                AND a.rendered_digest = r.rendered_digest
-                                                AND a.lifecycle IN ('active', 'consumed')
-                                          )
-                                      )
-                                      OR (
-                                          COALESCE(g.runnable, 0) = 0
-                                          AND g.charter_revision_id = p.current_charter_revision_id
-                                          AND g.baseline_id IS NULL
-                                          AND g.baseline_revision_id IS NULL
-                                          AND t.task_type IN ('planning', 'discovery', 'review', 'validation')
-                                          AND g.capability_class IN (
-                                              'repository_read', 'read_only',
-                                              'discovery_read', 'planning_read'
-                                          )
-                                      )
-                                  )
-                             THEN 1 ELSE 0 END
-             FROM task t
-             JOIN project p ON p.id = t.project_id
-             LEFT JOIN project_task_governance g ON g.task_id = t.id
-             LEFT JOIN project_execution_baseline b ON b.id = g.baseline_id
-             LEFT JOIN project_execution_baseline_revision r
-               ON r.id = g.baseline_revision_id
-             WHERE t.id = ?",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        if blocked == Some(1) {
-            return Err(DbError::InvalidTransition);
-        }
         Ok(())
     }
 

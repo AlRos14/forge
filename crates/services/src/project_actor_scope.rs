@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use api_types::ActorRef;
 use db::{
-    canonical_task_role_name, new_uuid_v4, now_rfc3339, AgentRepo, ProjectAgentBindingRepo,
-    ProjectMemberRepo, SqliteDb, UserRepo,
+    canonical_task_role_name, new_uuid_v4, now_rfc3339, AgentRepo, ProjectMemberRepo, SqliteDb,
+    UserRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use sqlx::{Row, Sqlite, Transaction};
@@ -42,15 +42,9 @@ pub(crate) async fn actor_is_valid_for_project(
                     .is_some(),
                 None => false,
             };
-            let binding =
-                ProjectAgentBindingRepo::get_active_project_binding(db, &project.id).await?;
-            let has_active_binding = binding.as_ref().is_some_and(|binding| {
-                binding.state == "active" && binding.identity_id.as_deref() == Some(agent_id)
-            });
             Ok(agent_is_valid_from_sources(
                 &agent.visibility,
                 owner_is_project_actor,
-                has_active_binding,
             ))
         }
     }
@@ -120,33 +114,16 @@ pub(crate) async fn actor_is_valid_for_project_in_tx(
                 }
                 None => false,
             };
-            let has_active_binding: i64 = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM project_agent_binding
-                    WHERE project_id = ? AND identity_id = ? AND state = 'active'
-                )",
-            )
-            .bind(project_id)
-            .bind(agent_id)
-            .fetch_one(&mut **transaction)
-            .await?;
             Ok(agent_is_valid_from_sources(
                 &visibility,
                 owner_is_project_actor,
-                has_active_binding != 0,
             ))
         }
     }
 }
 
-fn agent_is_valid_from_sources(
-    visibility: &str,
-    owner_is_project_actor: bool,
-    has_active_binding: bool,
-) -> bool {
-    visibility == "global"
-        || (visibility == "account" && owner_is_project_actor)
-        || has_active_binding
+fn agent_is_valid_from_sources(visibility: &str, owner_is_project_actor: bool) -> bool {
+    visibility == "global" || (visibility == "account" && owner_is_project_actor)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

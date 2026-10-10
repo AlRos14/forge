@@ -34,7 +34,7 @@ pub async fn search_project_memory(
         vec!["project".to_owned()],
     );
     let (results, has_more, next_cursor) = state
-        .memory_service
+        .memory_history
         .search_scoped(&access, params.query, params.layer, limit, params.cursor)
         .await?;
 
@@ -81,7 +81,7 @@ pub async fn get_memory_item(
         grants,
     };
     let result = state
-        .memory_service
+        .memory_history
         .get_scoped(&access, item_uuid, params.layer)
         .await
         .map_err(|error| match error {

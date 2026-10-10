@@ -611,28 +611,23 @@ pub(crate) async fn select_usable_agent_id(
     Ok(None)
 }
 
-/// Return whether an Agent can receive repository workspace authority. This
-/// is deliberately narrower than TaskRole membership validity: active Main
-/// and Project Agent bindings identify orchestration identities that may
-/// participate in a role but cannot receive a WorkspaceLease.
+/// Return whether an Agent meets generic Project eligibility for a repository
+/// WorkspaceLease. TaskRole membership is checked at the lease authority
+/// boundary; historical Main/Project bindings do not affect eligibility.
 pub(crate) async fn repository_worker_identity_is_eligible(
     db: &db::SqliteDb,
     project_id: &str,
     principal_id: &str,
 ) -> Result<bool> {
-    let orchestration_binding_count: i64 = sqlx::query_scalar(
-        "SELECT
-            (SELECT COUNT(*) FROM project_agent_binding
-             WHERE project_id = ? AND identity_id = ? AND state = 'active')
-          + (SELECT COUNT(*) FROM account_main_agent_binding
-             WHERE identity_id = ? AND state = 'active')",
+    let Some(project) = ProjectRepo::get_by_id(db, project_id).await? else {
+        return Ok(false);
+    };
+    project_actor_scope::actor_is_valid_for_project(
+        db,
+        &project,
+        &ActorRef::Agent(principal_id.to_owned()),
     )
-    .bind(project_id)
-    .bind(principal_id)
-    .bind(principal_id)
-    .fetch_one(db.pool())
-    .await?;
-    Ok(orchestration_binding_count == 0)
+    .await
 }
 
 /// Select a deterministic Agent that is both runtime-usable and capable of

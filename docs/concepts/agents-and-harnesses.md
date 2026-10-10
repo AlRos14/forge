@@ -154,9 +154,8 @@ subject to PR3's connection-generation checks.
 
 Agent Chat messages, durable turn jobs, binding/profile provenance,
 operating-context provenance, retry state, and historical reads remain
-available. Current production HarnessAdapters cannot prove a real
-no-filesystem posture, so Main and Project Agent Chat jobs fail closed before
-model invocation. Prompt text and a temporary directory do not establish that
-boundary. The removed native typed Forge tool catalog is not available through
-Chat. PR11 owns retirement or migration of Main Agent, Project Agent, and
-Project OS.
+available as historical reads. PR11 now prevents all Main and Project Agent
+Chat turn claims and invocations. Prompt text and a temporary directory do not
+establish a no-filesystem boundary. The removed native typed Forge tool
+catalog is not available through Chat. Their transcripts and binding history
+are read-only pending PR12 surface removal and PR13 schema cleanup.

@@ -2572,7 +2572,7 @@ async fn interactive_workspace_lease_uses_the_canonical_task_role_when_present()
     };
     assert!(error
         .to_string()
-        .contains("membership does not authorize this WorkspaceLease principal"));
+        .contains("WorkspaceLease principal is not an active TaskRole member"));
     let failed_execution_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'failed'",
     )

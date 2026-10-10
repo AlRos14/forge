@@ -15,7 +15,7 @@ impl TaskService {
         merge_config: Option<Value>,
         role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
     ) -> Result<Task> {
-        self.create_task_with_governance(
+        self.create_task_inner(
             project_id,
             title,
             description,
@@ -25,13 +25,12 @@ impl TaskService {
             task_state_config,
             merge_config,
             role_assignments,
-            None,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_task_with_governance(
+    async fn create_task_inner(
         &self,
         project_id: impl Into<String>,
         title: impl Into<String>,
@@ -42,7 +41,6 @@ impl TaskService {
         task_state_config: Option<String>,
         merge_config: Option<Value>,
         role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
-        governance: Option<api_types::TaskGovernanceRequest>,
     ) -> Result<Task> {
         let project_id = project_id.into();
         let title = title.into();
@@ -85,9 +83,6 @@ impl TaskService {
         // project workflow state name must not decide whether the Task is
         // ready, active, or blocked.
         let initial_status = if no_repo { "backlog" } else { "todo" }.to_owned();
-        let prepared_governance = self
-            .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, governance)
-            .await?;
         let validated_assignments = if let Some(ref assignments) = role_assignments {
             let mut validated = Vec::with_capacity(assignments.len());
             for assignment in assignments {
@@ -185,16 +180,6 @@ impl TaskService {
             )
             .await?;
         }
-        if let Some(governance) = prepared_governance {
-            self.insert_task_governance(
-                &mut transaction,
-                &task.id,
-                &task.project_id,
-                governance,
-                &now,
-            )
-            .await?;
-        }
         transaction.commit().await?;
         if is_subtask {
             TaskRepo::set_metadata_json(&*self.db, &task.id, metadata_json.clone(), &now).await?;
@@ -255,9 +240,6 @@ impl TaskService {
 
         let now = now_rfc3339();
         let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
-        let prepared_governance = self
-            .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, None)
-            .await?;
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id,
@@ -279,16 +261,6 @@ impl TaskService {
         };
         let mut transaction = self.db.pool().begin().await?;
         let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
-        if let Some(governance) = prepared_governance {
-            self.insert_task_governance(
-                &mut transaction,
-                &task.id,
-                &task.project_id,
-                governance,
-                &now,
-            )
-            .await?;
-        }
         transaction.commit().await?;
 
         self.publish(ForgeEvent {

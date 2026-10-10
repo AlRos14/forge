@@ -2,11 +2,11 @@ use std::collections::HashSet;
 
 use api_types::{
     parse_project_hooks_json, CiStepAnalytics, CreateProjectFromCharterApprovalRequest,
-    CreateProjectFromCharterApprovalResponse, CreateProjectRequest,
-    ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse, ProjectAnalyticsResponse,
-    ProjectHookRunResponse, ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
-    ProjectSettings, ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
-    TokenUsageAnalytics, UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
+    CreateProjectRequest, ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse,
+    ProjectAnalyticsResponse, ProjectHookRunResponse, ProjectHookRunStatus,
+    ProjectHookRunsResponse, ProjectResponse, ProjectSettings, ReviewConfig,
+    ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest, TokenUsageAnalytics,
+    UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -15,18 +15,17 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, CiStepStats, CreateProject,
-    ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
-    ProjectRepo, ProjectReviewSummary, ProjectTokenStats, SortBy, SortOrder, UpdateProject,
+    new_uuid_v4, now_rfc3339, CiStepStats, CreateProject, ModelTokenBreakdown, PageRequest,
+    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary,
+    ProjectTokenStats, SortBy, SortOrder, UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
 use services::{
-    create_project_from_charter_approval as materialize_project_from_charter_approval,
     workflow::{
         default_workflow::default_workflow, engine::WorkflowEngine, validation::validate_workflow,
     },
-    CreateProjectAuthorization, CreateProjectFromCharterApprovalInput, ServiceError,
+    ServiceError,
 };
 
 use crate::{
@@ -57,9 +56,10 @@ pub async fn create_project(
     Json(request): Json<CreateProjectBody>,
 ) -> ApiResult<Response> {
     match request {
-        CreateProjectBody::FromCharterApproval(request) => {
-            create_project_from_charter_approval(state, user, request).await
-        }
+        CreateProjectBody::FromCharterApproval(_) => Err(ApiError::gone_with_code(
+            "operation_retired",
+            "Project creation through Product Genesis and Charter approval was retired in Plan PR11",
+        )),
         CreateProjectBody::Direct(request) => create_direct_project(state, user, request).await,
     }
 }
@@ -69,6 +69,12 @@ async fn create_direct_project(
     user: AuthenticatedUser,
     request: CreateProjectRequest,
 ) -> ApiResult<Response> {
+    if request.project_agent_identity_id.is_some() || request.project_agent_profile_id.is_some() {
+        return Err(ApiError::gone_with_code(
+            "operation_retired",
+            "Project Agent selection was retired; assign Agents through TaskRole membership",
+        ));
+    }
     let now = now_rfc3339();
     let mut settings = request.settings.unwrap_or_else(|| serde_json::json!({}));
     apply_default_review_config(&mut settings, request.default_review_config.as_ref())?;
@@ -77,29 +83,7 @@ async fn create_direct_project(
     let workflow = WorkflowEngine::resolve_workflow(&workflow_definition);
     validate_project_settings(&state.db, &settings, &workflow, None, None).await?;
     let settings = serialize_settings(&settings)?;
-    let (project_agent_identity_id, project_agent_profile_id) = match (
-        request.project_agent_identity_id,
-        request.project_agent_profile_id,
-    ) {
-        (Some(identity_id), Some(profile_id)) => {
-            let identity = AgentRepo::get_by_id(&*state.db, &identity_id)
-                .await?
-                .filter(|agent| agent.owner_id.as_deref() == Some(user.user_id.as_str()))
-                .ok_or_else(|| ApiError::not_found("agent", identity_id.clone()))?;
-            let profile = AgentProfileRepo::get_profile(&*state.db, &profile_id)
-                .await?
-                .filter(|profile| profile.identity_id == identity.id)
-                .ok_or_else(|| ApiError::not_found("agent_profile", profile_id.clone()))?;
-            (Some(identity.id), Some(profile.id))
-        }
-        (None, None) => (None, None),
-        _ => {
-            return Err(ApiError::bad_request(
-                "project_agent_identity_id and project_agent_profile_id must be provided together",
-            ));
-        }
-    };
-    let project = ProjectRepo::create_with_agent_binding(
+    let project = ProjectRepo::create(
         &*state.db,
         CreateProject {
             id: new_uuid_v4(),
@@ -111,8 +95,6 @@ async fn create_direct_project(
             created_at: now.clone(),
             updated_at: now.clone(),
         },
-        project_agent_identity_id,
-        project_agent_profile_id,
     )
     .await?;
 
@@ -140,56 +122,6 @@ async fn create_direct_project(
     });
 
     Ok((StatusCode::OK, Json(project_response(project)?)).into_response())
-}
-
-async fn create_project_from_charter_approval(
-    state: AppState,
-    user: AuthenticatedUser,
-    request: CreateProjectFromCharterApprovalRequest,
-) -> ApiResult<Response> {
-    // Scope the receipt lookup by the authenticated account before entering
-    // the materializer so an approval ID cannot be used to enumerate another
-    // account's Genesis state.
-    let visible: i64 = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM project_charter_approval
-             WHERE id = ? AND approving_principal_type = 'user'
-               AND approving_principal_id = ?
-         )",
-    )
-    .bind(&request.approval_id)
-    .bind(&user.user_id)
-    .fetch_one(state.db.pool())
-    .await?;
-    if visible != 1 {
-        return Err(ApiError::not_found(
-            "project_charter_approval",
-            request.approval_id,
-        ));
-    }
-    let created = materialize_project_from_charter_approval(
-        state.db.clone(),
-        CreateProjectFromCharterApprovalInput {
-            approval_id: request.approval_id,
-            idempotency_key: request.idempotency_key,
-            account_id: user.user_id.clone(),
-            authorization: CreateProjectAuthorization::from_api(&request.authorization),
-            correlation_id: new_uuid_v4(),
-            causation_depth: 1,
-        },
-    )
-    .await?;
-    let response = CreateProjectFromCharterApprovalResponse {
-        project_id: created.project.id,
-        project_agent_binding_id: created.project_agent_binding_id,
-        project_chat_id: created.project_chat_id,
-        charter_id: created.charter_id,
-        charter_revision_id: created.charter_revision_id,
-        handoff_id: created.handoff_id,
-        target_message_id: created.target_message_id,
-        target_turn_id: created.target_turn_id,
-    };
-    Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
 pub async fn list_projects(
@@ -740,11 +672,11 @@ async fn validate_project_settings(
                         assignment.role_name
                     )));
                 }
-                if let (Some(project_id), Some(user_id), Some(assignee_id)) =
+                if let (Some(project_id), Some(_user_id), Some(assignee_id)) =
                     (project_id, user_id, assignment.assignee_id.as_ref())
                 {
                     let usable_agents = db
-                        .list_agents_usable_in_project(project_id, user_id)
+                        .list_agents_eligible_for_project(project_id)
                         .await
                         .map_err(ApiError::from)?;
                     let is_usable = usable_agents

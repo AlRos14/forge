@@ -1,5 +1,17 @@
 # API Reference
 
+> **Plan PR11 status:** Main Agent, Project Agent, Product Genesis, Agent Chat
+> cognition, legacy coordination writes, semantic memory retrieval/writes,
+> Attention mutations, and Project OS mutations are retired. Their REST
+> mutations return HTTP 410 with code `operation_retired`; retired MCP mutation
+> tools return the same code. The legacy endpoint rows below are retained for
+> transition reference: every legacy write is disabled, while authorized
+> historical GETs remain readable until PR12 removes or redesigns the surface.
+> A Main/Project binding, Charter, baseline, readiness snapshot, or release
+> grants no current Task or Execution authority. New Projects need no Agent,
+> Genesis, Charter, or Project OS setup. See the
+> [Plan PR11 contract](migration/plan-pr11-retire-main-project-agent-project-os.md).
+
 All endpoints are under `/api/v1/`. The MCP endpoint is `POST /mcp`. By default,
 Forge binds loopback on an OS-selected port, persists it in `~/.forge/server.json`,
 and reuses it on later starts.
@@ -21,56 +33,55 @@ unknown Task. A Task UUID is a reference, never an authorization capability.
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).
 
-This reference describes the singular Main/Project Agent Chat surface shipped
-by the forward-only `V071+` migrations. Retired collaboration routes are not a
-supported integration point even when their source rows remain in an upgraded
-database for historical provenance.
+The descriptions for retired surfaces later in this file document the historical
+PR10 data contract only. They are not active mutation contracts. PR12 removes or
+redesigns those public surfaces.
 
 ## REST endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST   | `/api/v1/projects` | Create a normal Project through an authorized human/API setup path; Genesis creation uses the exact `CreateProjectFromCharterApproval` receipt contract below |
+| POST   | `/api/v1/projects` | Create a normal Project through authorized Project creation; no Genesis, Charter, Main Agent, or Project Agent setup is required |
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
 | DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
-| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
-| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve` | Create the exact principal-bound, single-use Charter approval receipt |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/charter` | Read the Project's current Charter and revision history |
-| POST   | `/api/v1/projects/{id}/charter/revisions` | Append a Project Charter revision or adoption draft |
-| POST   | `/api/v1/projects/{id}/charter/revisions/{revision_id}/approve` | Approve an exact Project Charter revision or adoption Charter |
+| POST   | `/api/v1/projects/{id}/charter/revisions` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/charter/revisions/{revision_id}/approve` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/documents` | List Project Documents with opaque keyset pagination |
-| POST   | `/api/v1/projects/{id}/documents` | Create a typed Project Document |
+| POST   | `/api/v1/projects/{id}/documents` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/documents/{document_id}` | Read a Project Document and current revision pointers |
 | GET    | `/api/v1/projects/{id}/documents/{document_id}/revisions` | List immutable Document revisions with opaque keyset pagination |
-| POST   | `/api/v1/projects/{id}/documents/{document_id}/revisions` | Append an immutable Document revision |
+| POST   | `/api/v1/projects/{id}/documents/{document_id}/revisions` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/documents/{document_id}/revisions/{revision_id}` | Read one exact Document revision |
 | GET    | `/api/v1/projects/{id}/documents/{document_id}/revisions/{revision_id}/diff` | Read the deterministic diff for one exact Document revision |
-| POST   | `/api/v1/projects/{id}/documents/{document_id}/approve` | Approve an exact Document revision where policy requires it |
+| POST   | `/api/v1/projects/{id}/documents/{document_id}/approve` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/decisions` | List effective Project Decision Log records |
 | GET    | `/api/v1/projects/{id}/decisions/candidates` | List scoped Decision Log candidates with opaque keyset pagination |
-| POST   | `/api/v1/projects/{id}/decisions/candidates` | Propose a scoped Decision Log candidate |
+| POST   | `/api/v1/projects/{id}/decisions/candidates` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}` | Read one Decision Log candidate |
-| POST   | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}/approve` | Approve one exact Decision Log candidate |
-| POST   | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}/reject` | Reject one exact Decision Log candidate |
+| POST   | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}/approve` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/decisions/candidates/{candidate_id}/reject` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/decisions/{decision_id}` | Read one effective Decision Log record |
 | GET    | `/api/v1/projects/{id}/milestones` | List milestone definitions/instances and active projections |
-| POST   | `/api/v1/projects/{id}/milestones` | Create a milestone definition revision |
-| POST   | `/api/v1/projects/{id}/milestones/primary` | Set the explicit primary milestone pointer with CAS |
+| POST   | `/api/v1/projects/{id}/milestones` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/milestones/primary` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}` | Read milestone state, checks, readiness, and evidence references |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/transition` | Transition the mutable milestone instance lifecycle with CAS |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions` | Append an immutable milestone definition revision |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/transition` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions` | List immutable milestone definition revisions |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}` | Read one exact milestone definition revision |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}/transition` | Transition a definition revision lifecycle with CAS |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness` | Persist one principal-bound immutable `ReadinessSnapshot` candidate |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}/transition` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/history` | List immutable readiness candidates with opaque keyset pagination |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/{snapshot_id}` | Read one exact readiness candidate |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Record a user-bound manual acceptance result |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive` | Record a user-bound immutable acceptance waiver |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/release` | User-only release of an exact readiness candidate into immutable `Mxxx-rN` |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/release` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/releases/{release_id}` | Inspect an immutable release manifest and evidence pins |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/releases` | List immutable milestone release history with opaque keyset pagination |
 | GET    | `/api/v1/projects/{id}/media` | List Project-authorized media assets/attachments |
@@ -79,26 +90,26 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/media/{asset_id}/redact` | User-authorized Project owner/admin redaction with an immutable audit tombstone |
 | POST   | `/api/v1/projects/{id}/media/{asset_id}/purge` | User-authorized Project owner/admin purge; removes bytes and overlays pinned release evidence as unavailable |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence` | List milestone evidence attachments with opaque keyset pagination |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence` | Attach/reuse Project media as milestone evidence |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Read one exact active evidence attachment |
-| DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
+| DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Retired; returns `410 operation_retired`; historical release pins remain readable |
 | GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection |
 | GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection |
-| POST   | `/api/v1/projects/{id}/execution-baseline` | Propose one Project execution-baseline shell |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Append an exact, digest-bound execution-baseline revision |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline and promote matching preplanned Tasks |
-| GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |
+| POST   | `/api/v1/projects/{id}/execution-baseline` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Retired; returns `410 operation_retired` |
+| GET    | `/api/v1/projects/{id}/memory/search` | Retired semantic-memory retrieval; returns `410 operation_retired` |
 | GET    | `/api/v1/memory/{id}` | Get memory item |
-| POST   | `/api/v1/memory/{id}/publish` | Explicitly publish an owned private assertion into an authorized scope |
-| POST   | `/api/v1/memory/{id}/lifecycle` | Append an authorized immutable lifecycle assertion |
+| POST   | `/api/v1/memory/{id}/publish` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/memory/{id}/lifecycle` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/memory/{id}/provenance` | Inspect metadata-only memory provenance |
 | GET    | `/api/v1/context-manifests/{id}` | Inspect an authorized immutable context manifest and source decisions |
 | GET    | `/api/v1/agents/{id}/context-manifests` | List recent authorized context manifests for an owned identity |
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
-| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
+| POST   | `/api/v1/projects/{id}/tasks` | Create an ordinary Task; no Project Charter or execution baseline is required |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | POST   | `/api/v1/tasks/{task_id}/work-units` | Create a WorkUnit with Task-local scope, Role, optional Actor allocation, and provenance |
 | GET    | `/api/v1/tasks/{task_id}/work-units` | List authorized WorkUnits for one Task |
@@ -222,45 +233,45 @@ database for historical provenance.
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer` | Answer a protected interaction with an optimistic version |
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel` | Cancel a protected interaction with an optimistic version |
 | GET    | `/api/v1/account/main-agent` | `V071+` — Get the account's single Main Agent binding |
-| PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency |
-| POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat and admit its first finite turn |
+| PUT    | `/api/v1/account/main-agent` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/account/main-agent/product-genesis` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/account/main-agent/product-genesis/active` | `V072+` — Return the authenticated account's active Genesis session, if any |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}` | `V072+` — Read one Genesis session owned by the authenticated account, including lifecycle, source references, and optimistic version |
-| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/cancel` | `V072+` — Cancel an active Genesis session with `expected_version` and an optional reason |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/cancel` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/project-agent` | `V071+` — Get the Project's single Project Agent binding |
-| PUT    | `/api/v1/projects/{id}/project-agent` | `V071+` — Create or replace the Project Agent binding with optimistic concurrency |
+| PUT    | `/api/v1/projects/{id}/project-agent` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/agent-chats` | `V071+` — List the authorized global Main chat and bound Project chats for the switcher |
 | GET    | `/api/v1/agent-chats/{chat_id}` | `V071+` — Get chat metadata, binding state, and visible turn status |
 | GET    | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — List immutable authorized Agent Chat messages |
-| POST   | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — Admit one guarded user message and exactly one queued turn |
+| POST   | `/api/v1/agent-chats/{chat_id}/messages` | Retired; returns `410 operation_retired`; history remains available through GET |
 | GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
-| POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
+| POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — List immutable Main-to-Project handoff records |
-| POST   | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — Publish one bounded, provenance-linked handoff and at most one target turn |
+| POST   | `/api/v1/projects/{id}/agent-handoffs` | Retired; returns `410 operation_retired`; records are historical only |
 | GET    | `/api/v1/projects/{id}/agent-handoffs/{handoff_id}` | `V071+` — Inspect an authorized handoff and delivery receipt |
 | GET    | `/api/v1/agents/{id}/commitments` | List commitments owned by an authenticated identity |
-| POST   | `/api/v1/agents/{id}/commitments` | Create a commitment; owner identity and actor are bound by the route/authenticated user |
+| POST   | `/api/v1/agents/{id}/commitments` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/commitments/{id}` | Get an authorized commitment |
-| PATCH  | `/api/v1/commitments/{id}` | Versioned commitment lifecycle/metadata update |
-| POST   | `/api/v1/commitments/{id}/complete` | Complete only with an authorized evidence reference |
-| POST   | `/api/v1/commitments/{id}/transfer` | Transfer ownership with a required reason |
-| POST   | `/api/v1/commitments/{id}/cancel` | Cancel with a required reason |
+| PATCH  | `/api/v1/commitments/{id}` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/commitments/{id}/complete` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/commitments/{id}/transfer` | Retired; returns `410 operation_retired` |
+| POST   | `/api/v1/commitments/{id}/cancel` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/commitments/{id}/evidence` | List append-only commitment evidence |
 | GET    | `/api/v1/agents/{id}/inbox` | List durable inbox items for an owned identity |
 | GET    | `/api/v1/inbox/{id}` | Get an authorized inbox item |
-| PATCH  | `/api/v1/inbox/{id}/status` | Versioned inbox acknowledgement/status update |
+| PATCH  | `/api/v1/inbox/{id}/status` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/agents/{id}/questions` | List questions addressed to an owned identity |
-| POST   | `/api/v1/agents/{id}/questions` | Ask a question with atomic inbox delivery |
+| POST   | `/api/v1/agents/{id}/questions` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/questions/{id}` | Get an authorized question |
-| POST   | `/api/v1/questions/{id}/answer` | Answer an authorized question |
+| POST   | `/api/v1/questions/{id}/answer` | Retired; returns `410 operation_retired` |
 | GET    | `/api/v1/agents/{id}/actions` | List auditable proposals for an owned identity |
-| POST   | `/api/v1/agents/{id}/actions` | Create a typed proposal; Forge derives permission and policy server-side |
-| POST   | `/api/v1/agents/{id}/task-proposals` | Create a typed Task proposal in an admitted Project scope |
+| POST   | `/api/v1/agents/{id}/actions` | Retired AgentAction API; returns `410 operation_retired` |
+| POST   | `/api/v1/agents/{id}/task-proposals` | Retired AgentAction API; returns `410 operation_retired` |
 | GET    | `/api/v1/actions/{id}` | Get an authorized proposal and its server policy result |
-| POST   | `/api/v1/actions/{id}/approve` | Record an independent, scope-authorized approval/denial |
-| POST   | `/api/v1/actions/{id}/execute` | Record an admitted action execution idempotently |
-| POST   | `/api/v1/actions/{id}/execute-orchestration` | Materialize a Main Charter/Project orchestration proposal through its typed domain executor; generic execution rejects these operations |
-| POST   | `/api/v1/actions/{id}/execute-task` | Create the authoritative Task through TaskService and audit the outcome |
+| POST   | `/api/v1/actions/{id}/approve` | Retired AgentAction API; returns `410 operation_retired` |
+| POST   | `/api/v1/actions/{id}/execute` | Retired AgentAction API; returns `410 operation_retired` |
+| POST   | `/api/v1/actions/{id}/execute-orchestration` | Retired Main orchestration API; returns `410 operation_retired` |
+| POST   | `/api/v1/actions/{id}/execute-task` | Retired AgentAction API; returns `410 operation_retired` |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | POST   | `/api/v1/executions/{id}/follow-up` | Continue an execution session manually; completion does not advance the task workflow |
@@ -429,19 +440,13 @@ request bodies and immediately move them behind a protected write-only store;
 responses, events, errors, and logs contain only opaque credential handles and
 bounded health. Profile `config` fields are recursively redacted.
 
-Creating or connecting an identity grants no Main or Project binding. The
-account may explicitly select one active Main Agent binding, and each
-operational Project may explicitly select one active Project Agent binding.
-Unbound identities remain available for later binding or Task assignment but do
-not create chat-switcher entries. Every session request carries exactly one
-canonical scope: Main Agent Chat, Project Agent Chat, or Task. Main/Project Chat
-scopes are filesystem-denied; a Task session is admitted only through existing
-assignment and workflow authority and derives only that Task Workspace.
-
-`cancel` and `steer` are explicit operations whose availability follows the
-session capability snapshot. Sending an ordinary Agent Chat message does not
-imply either action. Mutable identity/profile-pointer, binding, and session
-operations use optimistic versions and return HTTP 409 on a stale version.
+Creating or connecting an identity does not grant Task authority. Agents
+participate in work through explicit TaskRole membership and ordinary Task
+Executions. Main/Project bindings and Chat scopes are historical only; PR11
+creates no new bindings or Agent Chat turns. Native session controls such as
+`cancel` and `steer` remain available only for supported Task-bound harness
+sessions. Mutable identity/profile-pointer and session operations use
+optimistic versions and return HTTP 409 on a stale version.
 
 Provider entries and agents are separate resources. An entry is one
 credentialed connection (multiple entries per provider type may coexist);
@@ -494,6 +499,14 @@ the authenticated user; request bodies never provide an owner or identity
 authority. Listing returns only redaction-safe lifecycle metadata. Answers are
 write-only protected values, accepted with `expected_version`, and never enter
 ordinary API responses, logs, Agent Chats, memory, manifests, or domain events.
+
+## Retired PR10 vertical contract (historical records only)
+
+The following sections describe the legacy records and their pre-PR11
+semantics so existing history can be interpreted. No listed Main/Project,
+Genesis, coordination, or Project OS write is active. REST writes return
+`410 operation_retired`; the matching MCP mutation tools return
+`operation_retired`. Historical reads do not grant authority.
 
 ### Product Genesis
 
@@ -656,7 +669,7 @@ rejected at dispatch time; an empty `{}` candidate config is valid. See
 [agents and harnesses](concepts/agents-and-harnesses.md) for the target
 harness-bound identity and explicit failover contract.
 
-## Main and Project Agent bindings
+## Task artifact reads and historical Main/Project bindings
 
 Task evidence routes:
 
@@ -679,21 +692,18 @@ digest, fresh-session provenance, actual CI results, and the structured
 reviewer result. A changed head makes the verdict stale and prevents an
 automatic pass.
 
-Bindings are authority, not identity ownership. An account has at most one
-active Main Agent binding and an operational Project has exactly one active
-Project Agent binding. Only an authorized account or Project administrator may
-create or replace a binding. The invariant is unconditional: Task Worker and
-reviewer assignments never satisfy it, and there is no role/`is_primary`
-combination or primary-agent election.
+Main and Project bindings are retained as read-only history. They cannot select
+an Actor/profile, authorize Project or Task operations, or satisfy TaskRole
+membership. The PR11 migration ends only memberships whose Agent had no
+independent global or account-based Project eligibility; it does not choose a
+replacement Actor. New responsibility is explicit in each Task's
+TaskRole/RoleMembership records.
 
-Binding replacement uses optimistic concurrency and preserves the identity,
-profile revisions, sessions, Agent Chat messages, handoffs, commitments, Task
-attribution, and memory provenance. A migrated Project for which no single safe
-binding can be inferred is marked `agent_setup_required`; Project and Task data
-remain readable and usable, but Project Agent turns are unavailable until the
-user selects an identity. A primary Worker is never inferred as the binding.
+## Historical commitments, inbox, and typed actions
 
-## Commitments, inbox, and typed actions
+These records remain available only through safe historical reads until PR12.
+Their former lifecycle and action semantics below no longer run. New Task work
+uses Task, WorkUnit, Message, Handoff, Proposal, Decision, and domain events.
 
 Coordination endpoints are authenticated and least-authority scoped. An
 `/agents/{id}/...` route first verifies that the identity is owned by the
@@ -830,17 +840,12 @@ compatibility aliases are provided.
 
 ## Projects
 
-With the V071+ replacement, a normal authorized human/API Project creation
-creates its single Project Agent binding and Project Agent Chat atomically. A
-Genesis caller must use `CreateProjectFromCharterApproval` with an active
-single-use Charter approval receipt; `product_genesis_session_id` is not a
-Genesis creation bypass or compatibility field. The selected
-identity/profile/operating-skill revision, exact Charter revision/digests,
-expected versions, authenticated principal, and idempotency key are verified
-before any record becomes visible. The transaction creates the Project,
-binding, Chat, Charter attachment, handoff, target message/turn, events, and
-Genesis transition together. Replay returns the original result, while a
-failure leaves no Project or handoff and keeps Genesis ready for retry.
+An authorized human can create a normal Project without Main Agent,
+Product Genesis, Charter, Project Agent, Chat, or Project OS setup. The Project
+may initially have no Tasks. Task creation and execution use the ordinary
+Project/Task APIs, TaskRole membership, Execution, Gate, and lifecycle
+authority. Supplying a retired Project Agent assignment in the Project create
+payload returns `410 operation_retired`.
 
 `DELETE /api/v1/projects/{id}` performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project. Immutable-row
@@ -848,11 +853,10 @@ guards are relaxed only for that exact teardown transaction; individual
 Charter, milestone, readiness, release, baseline, decision, lease, and evidence
 records remain non-deletable through ordinary writes.
 
-There is no later primary-agent election. Projects imported from before the
-Charter model that cannot yield one safe binding remain `agent_setup_required`
-and are also `legacy_unverified` until an explicit adoption Charter is
-approved. Their Project Chat, Tasks, evidence capture, and Document maintenance
-remain usable; only release is blocked by the missing approved Charter.
+Historical Project setup fields such as `charter_setup_required` do not gate
+Project use, Task creation, or execution. Old Charters, bindings, Documents,
+baselines, readiness snapshots, and releases remain historical records and are
+not inputs to current admission or merge readiness.
 
 `ProjectResponse` includes `project_hooks`, an array of project-wide hook
 rules stored separately from workflow settings. Projects with no configured
@@ -1120,43 +1124,35 @@ roles and triggers unavailable from the current state return `400`.
 
 ## Memory
 
-Forge exposes a read-only memory retrieval layer over indexed execution
-summaries, reviews, comments, failure transitions, and finalized Agent Chat
-messages.
+Agent semantic-memory retrieval and writes are retired. Existing memory rows
+and provenance remain historical. `GET /api/v1/memory/{id}` and metadata
+provenance reads remain available where authorized; project search, publish,
+lifecycle, and backfill writes return `410 operation_retired`. MCP memory
+search and item tools are retired. No new Agent Chat messages are indexed.
 
-Scoped memory is ACL-first: Main Agent Chat, Project Agent Chat, Project, and
-Task grants are resolved server-side before full-text search or body retrieval.
-Secret rows are never searchable. A private assertion is not implicitly
-promoted; callers must use `POST /api/v1/memory/{id}/publish` with an owned
-identity, an exact target scope/visibility, and explicit evidence. Lifecycle
-changes append audit records rather than mutating the original assertion. The
-publication, lifecycle, and provenance responses omit memory bodies and
-submitted evidence. Main Chat memory does not imply Project Chat memory, and a
-handoff publishes only its bounded, authorized packet with source provenance.
-
-`GET /api/v1/memory/{id}/provenance` requires `scope_type`, `scope_id`, and an
-owned `identity_id` query parameter. It returns source ids/revisions,
-sensitivity, authority, lifecycle metadata, and retention fields only.
+`GET /api/v1/memory/{id}/provenance` is a historical metadata read. It requires
+`scope_type`, `scope_id`, and an owned `identity_id` query parameter. It returns
+source ids/revisions, sensitivity, historical authority, lifecycle metadata,
+and retention fields only.
 `GET /api/v1/context-manifests/{id}` requires `identity_id` and
 `context_scope_id`; it returns immutable policy/runtime fingerprints and a
 bounded list of source ids, revisions, selection reasons, dispositions, and
 fragment fingerprints, never source fragments. Pointer-backed Project sources
 also expose `is_stale` and `current_revision`; these are read-time comparisons
-against the current Charter, approved Document, active execution baseline,
-active milestone definition, Project identity, or Project Agent binding. The
-stored source revision, disposition, and manifest fingerprint remain immutable.
+against legacy Charter, Document, baseline, milestone, Project identity, or
+Project Agent binding records. These comparisons do not grant current
+authority. The stored source revision, disposition, and manifest fingerprint
+remain immutable.
 `GET /api/v1/agents/{id}/context-manifests` is the discoverability/listing
 counterpart; it accepts optional `context_scope_id` and bounded `limit` (max
 50) query parameters and filters out manifests whose current scope is no
 longer authorized.
 
-### `GET /api/v1/projects/{id}/memory/search`
+### Retired: `GET /api/v1/projects/{id}/memory/search`
 
-Searches memory within one project. The `{id}` path segment is the project
-scope; callers cannot search across projects. Query text is treated as literal
-terms, not raw SQLite FTS syntax. Results are ordered by `created_at DESC,
-id DESC`; `score` is a response-position helper (`1.0`, `0.5`, `0.333`, ...)
-rather than a cross-query relevance rank.
+This endpoint returns `410 operation_retired`. The response schema below is
+retained only to identify historical data and is not a live retrieval
+contract.
 
 Query parameters:
 
@@ -1193,8 +1189,8 @@ Response:
 
 Every item includes attribution (`source_type`, `source_id`, `project_id`,
 `task_id`, `created_at`, `creator`). `content` is memory text selected by the
-requested layer, not raw execution JSONL payloads. Errors: `400` for invalid
-query parameters, `404` for an unknown or inaccessible project.
+requested layer, not raw execution JSONL payloads. The current response is
+`410 operation_retired`.
 
 ### `GET /api/v1/memory/{id}`
 
@@ -1223,8 +1219,8 @@ Response is a single `MemorySearchResultDto`:
 }
 ```
 
-Errors: `400` for invalid query parameters, `404` for an unknown memory id or
-an item in a project the caller cannot access.
+Errors: `404` for an unknown memory id or an item in a project the caller
+cannot access.
 
 ## Notifications
 
@@ -1753,6 +1749,12 @@ and can publish their own status events.
 
 ## MCP tools
 
+PR11 keeps legacy read descriptors temporarily for compatibility. Mutation
+tools for Main/Project bindings, Agent Chat sends, AgentAction, commitments,
+questions/inbox, handoffs, Product Genesis, semantic memory, and Project OS
+return `operation_retired`. Read tools return historical data only and confer
+no authority. PR12 owns descriptor removal or redesign.
+
 Forge exposes tools at `POST /mcp` (JSON-RPC 2.0). The MCP server has its own
 `AppState` and does not depend on the `api` crate.
 
@@ -1783,8 +1785,8 @@ Task IDs are only references that Forge authorizes.
 | `forge_preview_prompt` | Preview effective prompt without dispatching |
 | `forge_update_task` | Update mutable task fields |
 | `forge_transition_task` | Transition a task to another status |
-| `forge_memory_search` | Search project memory with an injection-guard wrapper |
-| `forge_memory_get` | Get one memory item with an injection-guard wrapper |
+| `forge_memory_search` | Retired; returns `operation_retired` |
+| `forge_memory_get` | Retired MCP memory tool; returns `operation_retired` |
 | `forge_assign_agent` | Atomic claim |
 | `forge_cancel_task` | Cancel task |
 | `forge_get_task_diff` | Get code diff |
@@ -1801,16 +1803,16 @@ Task IDs are only references that Forge authorizes.
 | `forge_list_agent_sessions` | List safe status/capability snapshots for an owned identity's sessions |
 | `forge_get_agent_session` | Inspect one owned scope-bound session without protected runtime state |
 | `forge_get_main_agent` | Inspect the singular account Main Agent binding and setup state |
-| `forge_set_main_agent` | Replace the singular Main Agent binding with optimistic concurrency |
+| `forge_set_main_agent` | Retired; returns `operation_retired` |
 | `forge_get_project_agent` | Inspect the singular Project Agent binding |
-| `forge_set_project_agent` | Replace a Project Agent binding with optimistic concurrency |
+| `forge_set_project_agent` | Retired; returns `operation_retired` |
 | `forge_list_agent_chats` | List the authenticated Main Chat and authorized Project Agent Chats |
 | `forge_get_agent_chat` | Inspect one authorized Agent Chat and finite turn state |
 | `forge_list_agent_chat_messages` | List immutable Agent Chat messages and bounded provenance |
-| `forge_send_agent_chat_message` | Send one message to a bound Agent Chat |
+| `forge_send_agent_chat_message` | Retired; returns `operation_retired` |
 | `forge_list_agent_handoffs` | List immutable Main-to-Project handoffs |
 | `forge_get_agent_handoff` | Inspect one handoff and its delivery outcome |
-| `forge_create_agent_handoff` | Publish a bounded, deduplicated Main-to-Project handoff |
+| `forge_create_agent_handoff` | Retired; returns `operation_retired` |
 
 Task response recovery annotations are preserved as stored, but `ResumeSession`
 is removed from the REST or MCP response projection unless the shared session
@@ -1824,7 +1826,10 @@ Disable the endpoint with `forge --no-mcp` if you don't want it.
 project-scoped MCP connection may omit `project_id`; Forge injects the bound
 Project and rejects a conflicting reference.
 
-### Memory MCP tools
+### Retired Memory MCP tools
+
+Both tools below return `operation_retired`. Their parameter and response
+shapes are historical references until PR12 removes the descriptors.
 
 `forge_memory_search` params:
 

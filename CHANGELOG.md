@@ -8,6 +8,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Plan PR11 retires Main Agent, Project Agent, Agent Chat cognition, Product
+  Genesis, bespoke Agent actions/commitments/inbox/questions, semantic Agent
+  memory writes, Attention dispatch, and Project OS authority. V118 preserves
+  their historical rows, drops the V071 user/Project chat bootstrap triggers,
+  records migration dispositions, and prevents new legacy writes or turn-job
+  claims. Project Agent bindings no longer authorize Task membership or
+  WorkspaceLease; only globally visible or Project-owner/member-owned Agents
+  retain their existing TaskRole memberships. Ineligible memberships end with
+  history preserved and no replacement Actor. New Task execution uses
+  TaskRole/RoleMembership, Execution, Gate, and WorkspaceLease authority.
+  Legacy REST writes return HTTP 410 `operation_retired`; retired MCP mutation
+  tools return `operation_retired`. Safe historical reads remain until PR12,
+  and physical cleanup remains PR13. The retired Task governance request field
+  returns HTTP 410; normal Project and Task creation no longer requires Charter
+  or baseline setup.
+
 - Production CLI HarnessAdapter execution that uses the shared process-group
   boundary fails closed before spawning on non-Unix hosts, for both local and
   remote execution paths. Unix executions use an execution-owned process group

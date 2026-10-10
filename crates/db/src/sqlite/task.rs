@@ -661,17 +661,11 @@ impl TaskRepo for SqliteDb {
                           AND task.id != ?
                           AND task.deleted_at IS NULL
                           AND lifecycle.state = 'active'
-                    ) +
-                    (
-                        SELECT COUNT(*) FROM agent_chat_turn_job
-                        WHERE responder_identity_id = ?
-                          AND status IN ('leased', 'running')
                     )",
             )
             .bind(agent_id)
             .bind(agent_id)
             .bind(&input.task_id)
-            .bind(agent_id)
             .fetch_one(&mut **transaction)
             .await?;
             if active_count >= input.max_concurrent_tasks {

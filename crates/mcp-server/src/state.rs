@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use db::SqliteDb;
 use events::EventBus;
-use services::{AgentChatService, AgentService, TaskService};
+use services::{AgentService, HistoricalAgentChatReader, TaskService};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<SqliteDb>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
-    pub agent_chat_service: Arc<AgentChatService<SqliteDb>>,
+    pub agent_chat_history: Arc<HistoricalAgentChatReader<SqliteDb>>,
     pub event_bus: Arc<EventBus>,
 }
 
@@ -26,15 +26,12 @@ impl AppState {
         task_service: Arc<TaskService>,
         agent_service: Arc<AgentService>,
     ) -> Self {
-        let agent_chat_service = Arc::new(AgentChatService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-        ));
+        let agent_chat_history = Arc::new(HistoricalAgentChatReader::new(Arc::clone(&db)));
         Self {
             db,
             task_service,
             agent_service,
-            agent_chat_service,
+            agent_chat_history,
             event_bus,
         }
     }

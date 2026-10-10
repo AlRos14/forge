@@ -1,5 +1,7 @@
+mod support;
+
 use db::{
-    create_sqlite_pool, run_migrations, ActivateProjectExecutionBaseline, AgentRepo, AgentStatus,
+    create_sqlite_pool, ActivateProjectExecutionBaseline, AgentRepo, AgentStatus,
     ApproveProjectExecutionBaseline, CreateAgentIdentity, CreateAgentProfile, CreateProject,
     CreateProjectCanonicalConflict, CreateProjectCharter, CreateProjectCharterRevision,
     CreateProjectExecutionBaseline, CreateProjectExecutionBaselineRevision,
@@ -21,7 +23,7 @@ const PROJECT_POLICY_DIGEST: &str =
 
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-    run_migrations(&pool).await.expect("migrations");
+    support::migrate_through(&pool, 117).await;
     SqliteDb::new(pool)
 }
 

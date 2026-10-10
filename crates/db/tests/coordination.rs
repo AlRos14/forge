@@ -1,15 +1,17 @@
+mod support;
+
 use db::{
-    create_sqlite_pool, now_rfc3339, run_migrations, AgentActionApprovalDecision,
-    AgentActionExecutionStatus, AgentActionPolicyResult, AgentActionRepo, AgentActionStatus,
-    AgentCommitmentRepo, AgentCommitmentStatus, AgentInboxKind, AgentInboxRepo, AgentInboxStatus,
-    AgentRepo, AgentStatus, CreateAgent, CreateAgentAction, CreateAgentActionApproval,
+    create_sqlite_pool, now_rfc3339, AgentActionApprovalDecision, AgentActionExecutionStatus,
+    AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, AgentCommitmentRepo,
+    AgentCommitmentStatus, AgentInboxKind, AgentInboxRepo, AgentInboxStatus, AgentRepo,
+    AgentStatus, CreateAgent, CreateAgentAction, CreateAgentActionApproval,
     CreateAgentActionExecution, CreateAgentCommitment, CreateAgentCommitmentEvidence,
     CreateAgentInboxItem, CreateAgentQuestion, DbError, SqliteDb, TransferAgentCommitment,
 };
 
 async fn sqlite_db() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-    run_migrations(&pool).await.expect("migrations");
+    support::migrate_through(&pool, 117).await;
     let db = SqliteDb::new(pool);
     for id in ["agent-a", "agent-b"] {
         AgentRepo::create(

@@ -1,7 +1,9 @@
 use super::super::*;
-use crate::{AgentChatService, ProjectMemberService, SetProjectAgentBindingInput};
+use crate::ProjectMemberService;
 use api_types::ActorRef;
-use db::{CoordinationMode, RoleMembershipRepo, TaskRoleRepo};
+use db::{
+    CoordinationMode, CreateProjectMember, ProjectMemberRepo, RoleMembershipRepo, TaskRoleRepo,
+};
 
 #[tokio::test]
 async fn reassign_role_updates_assignment_and_emits_event() {
@@ -555,37 +557,6 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let agent_a_record = AgentRepo::get_by_id(&*db, &agent_a)
-        .await
-        .expect("orchestration Agent loads")
-        .expect("orchestration Agent exists");
-    let setup_binding = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
-        .await
-        .expect("project binding loads")
-        .expect("project setup binding exists");
-    ProjectAgentBindingRepo::replace_project_binding(
-        &*db,
-        ReplaceProjectAgentBinding {
-            project_id: project_id.clone(),
-            expected_version: setup_binding.version,
-            replacement: CreateProjectAgentBinding {
-                id: new_uuid_v4(),
-                project_id: project_id.clone(),
-                identity_id: Some(agent_a.clone()),
-                profile_id: Some(agent_a_record.profile_id),
-                state: "active".to_owned(),
-                autonomy_policy_json: "{}".to_owned(),
-                permission_ceiling_json: "{}".to_owned(),
-                subscriptions_json: "[]".to_owned(),
-                wake_budget: 0,
-                created_at: now_rfc3339(),
-                updated_at: now_rfc3339(),
-            },
-            replacement_reason: Some("repository selector test orchestration identity".to_owned()),
-        },
-    )
-    .await
-    .expect("Project Agent binding activates");
     let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     service
         .create_task_role(
@@ -1151,49 +1122,17 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     .await
     .expect("project member Agent scope updates");
 
-    let bound_agent = seed_agent(&db).await;
-    let bound_agent_record = AgentRepo::get_by_id(&*db, &bound_agent)
-        .await
-        .expect("bound Agent loads")
-        .expect("bound Agent exists");
+    let out_of_scope_agent = seed_agent(&db).await;
     sqlx::query(
         "UPDATE agent_identity
          SET visibility = 'account', owner_id = ?
          WHERE id = ?",
     )
     .bind(&outside_owner)
-    .bind(&bound_agent)
+    .bind(&out_of_scope_agent)
     .execute(db.pool())
     .await
-    .expect("bound Agent scope updates");
-    let setup_binding = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
-        .await
-        .expect("project binding loads")
-        .expect("project setup binding exists");
-    ProjectAgentBindingRepo::replace_project_binding(
-        &*db,
-        ReplaceProjectAgentBinding {
-            project_id: project_id.clone(),
-            expected_version: setup_binding.version,
-            replacement: CreateProjectAgentBinding {
-                id: new_uuid_v4(),
-                project_id: project_id.clone(),
-                identity_id: Some(bound_agent.clone()),
-                profile_id: Some(bound_agent_record.profile_id),
-                state: "active".to_owned(),
-                autonomy_policy_json: "{}".to_owned(),
-                permission_ceiling_json: "{}".to_owned(),
-                subscriptions_json: "[]".to_owned(),
-                wake_budget: 0,
-                created_at: now_rfc3339(),
-                updated_at: now_rfc3339(),
-            },
-            replacement_reason: Some("test Task membership scope".to_owned()),
-        },
-    )
-    .await
-    .expect("project Agent binding activates");
-
+    .expect("out-of-scope Agent identity updates");
     let global_agent = seed_agent(&db).await;
     let paused_agent = seed_agent(&db).await;
     sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
@@ -1227,10 +1166,13 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
         .add_task_role_member(&task.id, "implementer", ActorRef::Agent(global_agent))
         .await
         .expect("global Agent membership succeeds");
-    service
-        .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(bound_agent))
-        .await
-        .expect("project-bound Agent membership succeeds");
+    assert!(
+        service
+            .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(out_of_scope_agent))
+            .await
+            .is_err(),
+        "an account Agent owned outside the Project cannot join its TaskRole"
+    );
     service
         .add_task_role_member(&task.id, "orchestrator", ActorRef::Agent(paused_agent))
         .await
@@ -2382,7 +2324,7 @@ async fn project_member_removal_rebuilds_projection_from_surviving_member() {
 }
 
 #[tokio::test]
-async fn project_member_removal_preserves_agent_with_active_binding() {
+async fn project_member_removal_ends_agent_membership_without_project_eligibility() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -2391,7 +2333,6 @@ async fn project_member_removal_preserves_agent_with_active_binding() {
     configure_project_scope(&db, &project_id, &owner_id, &[&member_id]).await;
     let agent_id = seed_agent(&db).await;
     set_account_agent_owner(&db, &agent_id, &member_id).await;
-    replace_project_binding_for_test(&db, &project_id, &agent_id).await;
 
     let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     let role = service
@@ -2406,7 +2347,7 @@ async fn project_member_removal_preserves_agent_with_active_binding() {
     service
         .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
         .await
-        .expect("binding-backed Agent membership creates");
+        .expect("account-member Agent membership creates");
 
     ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
         .remove_member(&project_id, &owner_id, &member_id)
@@ -2416,250 +2357,9 @@ async fn project_member_removal_preserves_agent_with_active_binding() {
     let current = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
         .await
         .expect("current memberships load");
-    assert_eq!(current.len(), 1);
-    assert_eq!(current[0].actor_id, agent_id);
-}
-
-#[tokio::test]
-async fn project_agent_binding_replacement_ends_binding_only_membership() {
-    let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let owner_id = seed_human_user(&db).await;
-    configure_project_scope(&db, &project_id, &owner_id, &[]).await;
-    let binding_only_agent = seed_agent(&db).await;
-    let outsider = seed_human_user(&db).await;
-    set_account_agent_owner(&db, &binding_only_agent, &outsider).await;
-    replace_project_binding_for_test(&db, &project_id, &binding_only_agent).await;
-    let replacement_agent = seed_agent(&db).await;
-    set_account_agent_owner(&db, &replacement_agent, &owner_id).await;
-
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    let role = service
-        .create_task_role(
-            &task.id,
-            "orchestrator",
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("orchestrator role creates");
-    service
-        .add_task_role_member(
-            &task.id,
-            "orchestrator",
-            ActorRef::Agent(binding_only_agent.clone()),
-        )
-        .await
-        .expect("binding-only Agent membership creates");
-    let current = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
-        .await
-        .expect("binding loads")
-        .expect("active binding exists");
-    let replacement_record = AgentRepo::get_by_id(&*db, &replacement_agent)
-        .await
-        .expect("replacement Agent loads")
-        .expect("replacement Agent exists");
-
-    AgentChatService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
-        .set_project_binding(SetProjectAgentBindingInput {
-            actor_user_id: owner_id.clone(),
-            project_id: project_id.clone(),
-            identity_id: Some(replacement_agent.clone()),
-            profile_id: Some(replacement_record.profile_id),
-            state: "active".to_owned(),
-            autonomy_policy_json: "{}".to_owned(),
-            permission_ceiling_json: "{}".to_owned(),
-            subscriptions_json: "[]".to_owned(),
-            wake_budget: 0,
-            expected_version: Some(current.version),
-            replacement_reason: Some("scope revocation regression".to_owned()),
-        })
-        .await
-        .expect("Project Agent binding replacement succeeds");
-
-    let history = RoleMembershipRepo::list_by_role(&*db, &role.id, true)
-        .await
-        .expect("membership history loads");
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].actor_id, binding_only_agent);
-    assert_eq!(history[0].status, db::RoleMembershipStatus::Ended);
-}
-
-#[tokio::test]
-async fn project_agent_binding_replacement_preserves_independently_valid_agent() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let owner_id = seed_human_user(&db).await;
-    configure_project_scope(&db, &project_id, &owner_id, &[]).await;
-    let globally_valid_agent = seed_agent(&db).await;
-    replace_project_binding_for_test(&db, &project_id, &globally_valid_agent).await;
-    let replacement_agent = seed_agent(&db).await;
-    set_account_agent_owner(&db, &replacement_agent, &owner_id).await;
-
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    let role = service
-        .create_task_role(
-            &task.id,
-            "orchestrator",
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("orchestrator role creates");
-    service
-        .add_task_role_member(
-            &task.id,
-            "orchestrator",
-            ActorRef::Agent(globally_valid_agent.clone()),
-        )
-        .await
-        .expect("global Agent membership creates");
-    let current = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
-        .await
-        .expect("binding loads")
-        .expect("active binding exists");
-    let replacement_record = AgentRepo::get_by_id(&*db, &replacement_agent)
-        .await
-        .expect("replacement Agent loads")
-        .expect("replacement Agent exists");
-
-    let mut events = event_bus.subscribe();
-    AgentChatService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .set_project_binding(SetProjectAgentBindingInput {
-            actor_user_id: owner_id,
-            project_id: project_id.clone(),
-            identity_id: Some(replacement_agent),
-            profile_id: Some(replacement_record.profile_id),
-            state: "active".to_owned(),
-            autonomy_policy_json: "{}".to_owned(),
-            permission_ceiling_json: "{}".to_owned(),
-            subscriptions_json: "[]".to_owned(),
-            wake_budget: 0,
-            expected_version: Some(current.version),
-            replacement_reason: Some("preserve global Agent".to_owned()),
-        })
-        .await
-        .expect("Project Agent binding replacement succeeds");
-    assert!(events.try_recv().is_err());
-
-    let current_members = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
-        .await
-        .expect("current memberships load");
-    assert_eq!(current_members.len(), 1);
-    assert_eq!(current_members[0].actor_id, globally_valid_agent);
-}
-
-#[tokio::test]
-async fn project_scope_revocation_isolated_to_affected_project() {
-    let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
-    let (project_one, repo_one, _repo_one_dir) = seed_project_repo(&db).await;
-    let (project_two, repo_two, _repo_two_dir) = seed_project_repo(&db).await;
-    let owner_id = seed_human_user(&db).await;
-    let member_id = seed_human_user(&db).await;
-    configure_project_scope(&db, &project_one, &owner_id, &[&member_id]).await;
-    configure_project_scope(&db, &project_two, &owner_id, &[&member_id]).await;
-    let agent_id = seed_agent(&db).await;
-    set_account_agent_owner(&db, &agent_id, &member_id).await;
-
-    let task_one = seed_task_with_status(&db, &project_one, &repo_one, "todo".to_owned()).await;
-    let role_one = service
-        .create_task_role(
-            &task_one.id,
-            "implementer",
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("Project 1 role creates");
-    service
-        .add_task_role_member(
-            &task_one.id,
-            "implementer",
-            ActorRef::Agent(agent_id.clone()),
-        )
-        .await
-        .expect("Project 1 membership creates");
-
-    let task_two = seed_task_with_status(&db, &project_two, &repo_two, "todo".to_owned()).await;
-    let role_two = service
-        .create_task_role(
-            &task_two.id,
-            "implementer",
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("Project 2 role creates");
-    service
-        .add_task_role_member(
-            &task_two.id,
-            "implementer",
-            ActorRef::Agent(agent_id.clone()),
-        )
-        .await
-        .expect("Project 2 membership creates");
-
-    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
-        .remove_member(&project_one, &owner_id, &member_id)
-        .await
-        .expect("Project 1 member removal succeeds");
-
-    let project_one_members = RoleMembershipRepo::list_by_role(&*db, &role_one.id, false)
-        .await
-        .expect("Project 1 memberships load");
-    assert!(project_one_members.is_empty());
-    let project_two_members = RoleMembershipRepo::list_by_role(&*db, &role_two.id, false)
-        .await
-        .expect("Project 2 memberships load");
-    assert_eq!(project_two_members.len(), 1);
-    assert_eq!(project_two_members[0].actor_id, agent_id);
-}
-
-#[tokio::test]
-async fn ended_scope_membership_is_not_selected_for_new_work() {
-    let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let owner_id = seed_human_user(&db).await;
-    let member_id = seed_human_user(&db).await;
-    configure_project_scope(&db, &project_id, &owner_id, &[&member_id]).await;
-    let agent_id = seed_agent(&db).await;
-    set_account_agent_owner(&db, &agent_id, &member_id).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .create_task_role(
-            &task.id,
-            "implementer",
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("implementer role creates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id))
-        .await
-        .expect("Agent membership creates");
-
-    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
-        .remove_member(&project_id, &owner_id, &member_id)
-        .await
-        .expect("Project member removal succeeds");
-
-    let memberships =
-        crate::task_service::current_role_memberships_authoritative(&db, &task.id, "implementer")
-            .await
-            .expect("authoritative memberships load")
-            .expect("TaskRole exists");
-    assert!(memberships.is_empty());
     assert!(
-        crate::task_service::select_usable_agent_id(&db, &memberships)
-            .await
-            .expect("selection succeeds")
-            .is_none()
+        current.is_empty(),
+        "removing the owning Project member revokes the Agent membership"
     );
 }
 
@@ -2709,42 +2409,4 @@ async fn set_account_agent_owner(db: &db::SqliteDb, agent_id: &str, owner_id: &s
     .execute(db.pool())
     .await
     .expect("account Agent scope updates");
-}
-
-async fn replace_project_binding_for_test(
-    db: &db::SqliteDb,
-    project_id: &str,
-    agent_id: &str,
-) -> db::ProjectAgentBinding {
-    let agent = AgentRepo::get_by_id(db, agent_id)
-        .await
-        .expect("Agent loads")
-        .expect("Agent exists");
-    let current = ProjectAgentBindingRepo::get_active_project_binding(db, project_id)
-        .await
-        .expect("binding loads")
-        .expect("setup binding exists");
-    ProjectAgentBindingRepo::replace_project_binding(
-        db,
-        ReplaceProjectAgentBinding {
-            project_id: project_id.to_owned(),
-            expected_version: current.version,
-            replacement: CreateProjectAgentBinding {
-                id: new_uuid_v4(),
-                project_id: project_id.to_owned(),
-                identity_id: Some(agent.id),
-                profile_id: Some(agent.profile_id),
-                state: "active".to_owned(),
-                autonomy_policy_json: "{}".to_owned(),
-                permission_ceiling_json: "{}".to_owned(),
-                subscriptions_json: "[]".to_owned(),
-                wake_budget: 0,
-                created_at: now_rfc3339(),
-                updated_at: now_rfc3339(),
-            },
-            replacement_reason: Some("scope revocation fixture".to_owned()),
-        },
-    )
-    .await
-    .expect("binding replacement succeeds")
 }

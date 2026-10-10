@@ -177,31 +177,6 @@ pub(crate) struct GetAgentSessionParams {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct BindMainAgentParams {
-    pub(crate) identity_id: String,
-    pub(crate) profile_id: String,
-    pub(crate) expected_version: i64,
-    #[serde(default)]
-    pub(crate) autonomy_policy: Value,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct BindProjectAgentParams {
-    pub(crate) project_id: String,
-    pub(crate) identity_id: String,
-    pub(crate) profile_id: String,
-    pub(crate) expected_version: i64,
-    #[serde(default)]
-    pub(crate) permission_ceiling: Value,
-    #[serde(default)]
-    pub(crate) autonomy_policy: Value,
-    #[serde(default)]
-    pub(crate) subscriptions: Vec<String>,
-    #[serde(default)]
-    pub(crate) wake_budget: i64,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct GetProjectAgentParams {
     pub(crate) project_id: String,
 }
@@ -226,13 +201,6 @@ pub(crate) struct ListAgentChatMessagesParams {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct SendAgentChatMessageParams {
-    pub(crate) chat_id: String,
-    pub(crate) content: String,
-    pub(crate) dedupe_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct ListAgentHandoffsParams {
     pub(crate) project_id: String,
     pub(crate) cursor: Option<String>,
@@ -243,15 +211,6 @@ pub(crate) struct ListAgentHandoffsParams {
 pub(crate) struct GetAgentHandoffParams {
     pub(crate) project_id: String,
     pub(crate) handoff_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CreateAgentHandoffParams {
-    pub(crate) project_id: String,
-    pub(crate) content: String,
-    pub(crate) source_message_id: Option<String>,
-    pub(crate) source_turn_job_id: Option<String>,
-    pub(crate) dedupe_key: String,
 }
 
 #[derive(Debug, Deserialize)]

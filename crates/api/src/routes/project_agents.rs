@@ -11,8 +11,8 @@ use crate::{
     state::AppState,
 };
 
-/// List identities that the authenticated user may select for a Project Agent
-/// binding. Binding mutation itself lives at `/projects/{id}/project-agent`.
+/// List generic Agents eligible for explicit TaskRole membership in a Project.
+/// The Project Agent path remains a historical read surface until PR12.
 pub async fn list_project_agents(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -21,7 +21,7 @@ pub async fn list_project_agents(
     require_project_member(&state, &project_id, &user.user_id).await?;
     let agents = state
         .db
-        .list_agents_usable_in_project(&project_id, &user.user_id)
+        .list_agents_eligible_for_project(&project_id)
         .await
         .map_err(ApiError::from)?;
 

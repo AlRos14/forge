@@ -1,4 +1,5 @@
-use db::{AgentRepo, ProjectAgentBindingRepo, ProjectHookRunStatus};
+use api_types::ActorRef;
+use db::{AgentRepo, CoordinationMode, ExecutionPurpose, ProjectHookRunStatus};
 use serde_json::Value;
 
 use crate::{
@@ -28,7 +29,13 @@ impl HookActionHandler for DispatchAgentAction<'_> {
         let agent = AgentRepo::get_by_id(&*context.service.db, self.agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", self.agent_id.to_owned()))?;
-        if !agent_usable_in_project(context, &agent).await? {
+        if !crate::project_actor_scope::actor_is_valid_for_project(
+            &context.service.db,
+            context.project,
+            &ActorRef::Agent(agent.id.clone()),
+        )
+        .await?
+        {
             return Ok(ActionOutcome::skipped(format!(
                 "agent {} is not usable in project {}",
                 agent.id, context.project.id
@@ -58,14 +65,36 @@ impl HookActionHandler for DispatchAgentAction<'_> {
             )
             .await?;
 
+        context
+            .service
+            .task_service
+            .create_task_role(
+                &task.id,
+                "implementer",
+                CoordinationMode::Collaborative,
+                "{}".to_owned(),
+            )
+            .await?;
+        context
+            .service
+            .task_service
+            .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent.id.clone()))
+            .await?;
+
         let prompt = build_prompt(context, self.prompt, self.follow_up);
         let launch = context
             .service
             .task_service
-            .launch_execution(task.id.clone(), agent.id.clone(), Some(prompt), None)
+            .dispatch_initial_role_execution(
+                &task.id,
+                &agent.id,
+                "implementer",
+                ExecutionPurpose::Implement,
+                prompt,
+            )
             .await;
         let execution = match launch {
-            Ok(result) => result.execution,
+            Ok(execution) => execution,
             Err(error) => {
                 return Ok(ActionOutcome {
                     status: ProjectHookRunStatus::Failed,
@@ -87,23 +116,6 @@ impl HookActionHandler for DispatchAgentAction<'_> {
             reason: Some("agent dispatched".to_owned()),
         })
     }
-}
-
-async fn agent_usable_in_project(context: &ActionContext<'_>, agent: &db::Agent) -> Result<bool> {
-    if agent.visibility == "global" {
-        return Ok(true);
-    }
-    if context.project.owner_id.as_deref().is_some()
-        && context.project.owner_id.as_deref() == agent.owner_id.as_deref()
-    {
-        return Ok(true);
-    }
-    Ok(ProjectAgentBindingRepo::get_active_project_binding(
-        &*context.service.db,
-        &context.project.id,
-    )
-    .await?
-    .is_some_and(|binding| binding.identity_id.as_deref() == Some(agent.id.as_str())))
 }
 
 fn automation_task_description(context: &ActionContext<'_>) -> String {

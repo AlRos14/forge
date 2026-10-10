@@ -33,11 +33,17 @@ pub(crate) fn execution_purpose_for_role(role: &str) -> ExecutionPurpose {
     }
 }
 
-/// Resolve the purpose at a semantic task-dispatch boundary. Role remains the
-/// fallback for the legacy role-driven implementation path, but task types
-/// with a stronger domain meaning win so validation is not recorded as
-/// implementation merely because its workflow role is `worker`.
+/// Resolve the purpose at a semantic task-dispatch boundary. The `interactive`
+/// label remains general regardless of Task type or workflow state; Task type
+/// independently selects its TaskRole and repository capability. For other
+/// role-driven paths, typed Tasks keep their stronger domain purpose so
+/// validation is not recorded as implementation merely because its workflow
+/// role is `worker`.
 pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> ExecutionPurpose {
+    if role.trim().eq_ignore_ascii_case("interactive") {
+        return ExecutionPurpose::General;
+    }
+
     match task_type.trim().to_ascii_lowercase().as_str() {
         "planning" => ExecutionPurpose::Plan,
         "review" => ExecutionPurpose::Review,
@@ -61,12 +67,17 @@ pub(crate) fn task_role_for_task_type(task_type: &str) -> &'static str {
 
 /// Resolve purpose from the workflow operation at dispatch time. The default
 /// planning state is an explicit Plan operation; a planner role in another
-/// state does not turn that Execution into planning.
+/// state does not turn that Execution into planning. The `interactive` label
+/// keeps General purpose across states.
 pub(crate) fn execution_purpose_for_workflow_state(
     task_type: &str,
     state_name: &str,
     role: &str,
 ) -> ExecutionPurpose {
+    if role.trim().eq_ignore_ascii_case("interactive") {
+        return ExecutionPurpose::General;
+    }
+
     match state_name.trim().to_ascii_lowercase().as_str() {
         "planning" => ExecutionPurpose::Plan,
         "review" => ExecutionPurpose::Review,
@@ -523,6 +534,25 @@ mod purpose_tests {
             execution_purpose_for_task_type("implementation", "implementer"),
             ExecutionPurpose::Implement
         );
+
+        for (task_type, state_name) in [
+            ("implementation", "in_progress"),
+            ("planning", "planning"),
+            ("review", "review"),
+            ("validation", "validation"),
+            ("discovery", "discovery"),
+        ] {
+            assert_eq!(
+                execution_purpose_for_task_type(task_type, "interactive"),
+                ExecutionPurpose::General,
+                "interactive purpose for {task_type} Task"
+            );
+            assert_eq!(
+                execution_purpose_for_workflow_state(task_type, state_name, "interactive"),
+                ExecutionPurpose::General,
+                "interactive purpose for {task_type} Task at {state_name}"
+            );
+        }
     }
 }
 

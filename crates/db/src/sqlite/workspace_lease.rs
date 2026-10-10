@@ -20,6 +20,7 @@ fn is_stale_workspace_lease_renewal(error: &sqlx::Error) -> bool {
     matches!(
         database_error.message(),
         "Workspace lease renewal authority is stale"
+            | "Workspace lease renewal lacks current TaskRole/Execution authority"
             | "Orchestration agents cannot receive Workspace leases"
     )
 }
