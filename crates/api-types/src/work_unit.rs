@@ -61,6 +61,7 @@ pub struct CreateWorkUnitRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct UpdateWorkUnitRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub title: Option<String>,
     pub scope: Option<String>,
@@ -71,6 +72,7 @@ pub struct UpdateWorkUnitRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct AllocateWorkUnitRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
@@ -80,6 +82,7 @@ pub struct AllocateWorkUnitRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct TransitionWorkUnitRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub status: WorkUnitStatus,
 }
@@ -88,6 +91,7 @@ pub struct TransitionWorkUnitRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct AddWorkUnitDependencyRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
 }
 
@@ -127,6 +131,7 @@ pub struct WorkUnitResponse {
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
     pub created_by: ActorRef,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -166,6 +171,7 @@ pub struct WorkUnitIntegrationResponse {
     pub target_before_sha: String,
     pub target_after_sha: Option<String>,
     pub outcome: WorkUnitIntegrationOutcome,
+    #[ts(type = "number")]
     pub version: i64,
     pub started_at: String,
     pub finished_at: Option<String>,

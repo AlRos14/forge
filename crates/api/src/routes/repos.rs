@@ -8,13 +8,14 @@ use axum::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, PrProviderConfigRepo,
-    ProjectRepo, RepoRepo, UpdateProject, UpdateRepo, WorkMode,
+    ProjectRepo, Repo, RepoRepo, SqliteDb, UpdatePrProviderConfig, UpdateProject, UpdateRepo,
+    WorkMode,
 };
 
 use crate::{
     errors::{ApiError, ApiResult},
     path_input::canonical_directory,
-    routes::{page_request, paginated, repo_response, ListParams},
+    routes::{page_request, repo_response, ListParams},
     state::AppState,
 };
 
@@ -23,6 +24,22 @@ pub async fn create_repo(
     Path(project_id): Path<String>,
     Json(request): Json<CreateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
+    if request.pr_provider.is_none() && request.pr_provider_config.is_some() {
+        return Err(ApiError::bad_request_with_code(
+            "repo.pr_provider_required",
+            "pr_provider is required when creating provider configuration",
+        ));
+    }
+    if request
+        .pr_provider
+        .as_ref()
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
+        return Err(ApiError::bad_request_with_code(
+            "repo.pr_provider_invalid",
+            "pr_provider must not be empty",
+        ));
+    }
     let project = ProjectRepo::get_by_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
@@ -87,7 +104,7 @@ pub async fn create_repo(
         },
     )
     .await?;
-    Ok(Json(repo_response(repo)))
+    Ok(Json(repo_with_provider(&*state.db, repo).await?))
 }
 
 pub async fn list_repos(
@@ -96,7 +113,16 @@ pub async fn list_repos(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<RepoResponse>>> {
     let page = RepoRepo::list_by_project(&*state.db, &project_id, page_request(&params)?).await?;
-    Ok(Json(paginated(page, repo_response)))
+    let mut items = Vec::with_capacity(page.items.len());
+    for repo in page.items {
+        items.push(repo_with_provider(&*state.db, repo).await?);
+    }
+    Ok(Json(PaginatedResponse {
+        has_more: page.next_cursor.is_some(),
+        items,
+        next_cursor: page.next_cursor,
+        total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
+    }))
 }
 
 pub async fn get_repo(
@@ -106,7 +132,7 @@ pub async fn get_repo(
     let repo = RepoRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("repo", id))?;
-    Ok(Json(repo_response(repo)))
+    Ok(Json(repo_with_provider(&*state.db, repo).await?))
 }
 
 pub async fn update_repo(
@@ -114,21 +140,141 @@ pub async fn update_repo(
     Path(id): Path<String>,
     Json(request): Json<UpdateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
-    let local_path = normalize_update_local_path(request.local_path)?;
+    let db = &*state.db;
+    let UpdateRepoRequest {
+        name,
+        remote_url,
+        local_path,
+        default_branch,
+        work_mode,
+        pr_provider,
+        pr_provider_config,
+    } = request;
+    if pr_provider
+        .as_ref()
+        .and_then(|provider| provider.as_ref())
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
+        return Err(ApiError::bad_request_with_code(
+            "repo.pr_provider_invalid",
+            "pr_provider must not be empty",
+        ));
+    }
+    let local_path = normalize_update_local_path(local_path)?;
     let repo = RepoRepo::update(
-        &*state.db,
+        db,
         UpdateRepo {
             id,
-            name: request.name,
+            name,
             local_path,
-            remote_url: request.remote_url,
-            work_mode: request.work_mode.map(work_mode_domain),
-            default_branch: request.default_branch,
+            remote_url,
+            work_mode: work_mode.map(work_mode_domain),
+            default_branch,
             updated_at: now_rfc3339(),
         },
     )
     .await?;
-    Ok(Json(repo_response(repo)))
+    update_pr_provider_config(db, &repo.id, pr_provider, pr_provider_config).await?;
+    Ok(Json(repo_with_provider(db, repo).await?))
+}
+
+async fn repo_with_provider(db: &SqliteDb, repo: Repo) -> ApiResult<RepoResponse> {
+    let mut response = repo_response(repo);
+    if let Some(config) = PrProviderConfigRepo::get_by_repo_id(db, &response.id).await? {
+        response.pr_provider = Some(config.provider_type.clone());
+        response.pr_provider_status = Some(api_types::PrProviderStatus {
+            provider_type: config.provider_type,
+            has_token: config.token_secret_ref.is_some(),
+            polling_interval_seconds: config.polling_interval_seconds,
+        });
+    }
+    Ok(response)
+}
+
+async fn update_pr_provider_config(
+    db: &SqliteDb,
+    repo_id: &str,
+    provider: Option<Option<String>>,
+    config: Option<Option<api_types::UpdatePrProviderConfigRequest>>,
+) -> ApiResult<()> {
+    let existing = PrProviderConfigRepo::get_by_repo_id(db, repo_id).await?;
+    if provider.as_ref().is_some_and(Option::is_none) {
+        if config.as_ref().is_some_and(Option::is_some) {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_config_conflict",
+                "provider configuration cannot be supplied when pr_provider is cleared",
+            ));
+        }
+        if let Some(existing) = existing {
+            PrProviderConfigRepo::delete(db, &existing.id).await?;
+        }
+        return Ok(());
+    }
+
+    if config.as_ref().is_some_and(Option::is_none) {
+        if provider.as_ref().is_some_and(Option::is_some) {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_config_conflict",
+                "provider configuration cannot be cleared while pr_provider is set",
+            ));
+        }
+        if let Some(existing) = existing {
+            PrProviderConfigRepo::delete(db, &existing.id).await?;
+        }
+        return Ok(());
+    }
+
+    let provider_type = provider.flatten();
+    let config = config.flatten();
+    if provider_type.is_none() && config.is_none() {
+        return Ok(());
+    }
+
+    if let Some(existing) = existing {
+        PrProviderConfigRepo::update(
+            db,
+            UpdatePrProviderConfig {
+                id: existing.id,
+                provider_type,
+                base_url: config.as_ref().and_then(|config| config.base_url.clone()),
+                polling_interval_seconds: config
+                    .as_ref()
+                    .and_then(|config| config.polling_interval_seconds),
+                token_secret_ref: config.as_ref().and_then(|config| config.token.clone()),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+    } else {
+        let Some(provider_type) = provider_type else {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_required",
+                "pr_provider must be set before provider configuration can be updated",
+            ));
+        };
+        PrProviderConfigRepo::create(
+            db,
+            CreatePrProviderConfig {
+                id: new_uuid_v4(),
+                repo_id: repo_id.to_owned(),
+                provider_type,
+                base_url: config
+                    .as_ref()
+                    .and_then(|config| config.base_url.clone().flatten()),
+                polling_interval_seconds: config
+                    .as_ref()
+                    .and_then(|config| config.polling_interval_seconds)
+                    .unwrap_or(300),
+                token_secret_ref: config
+                    .as_ref()
+                    .and_then(|config| config.token.clone().flatten()),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub async fn delete_repo(

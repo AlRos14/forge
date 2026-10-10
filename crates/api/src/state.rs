@@ -5,8 +5,7 @@ use db::SqliteDb;
 use events::EventBus;
 use executors::{FallbackExecutor, HarnessAdapterRegistry, TaskExecutor};
 use services::{
-    AgentService, AuthService, CredentialService, DaemonService, HistoricalAgentChatReader,
-    HistoricalMemoryReader, HistoricalProductGenesisReader, MergeService, NotificationService,
+    AgentService, AuthService, CredentialService, DaemonService, MergeService, NotificationService,
     OperatorStatusEmitter, OperatorStatusService, ProjectHookService, ProviderAuthorizationService,
     TaskService, TerminalActivityTracker, TerminalService, WorkspaceCleanupScheduler,
     WorkspaceExecutionLockManager,
@@ -65,15 +64,10 @@ pub struct AppState {
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub credential_service: Arc<CredentialService>,
-    pub agent_chat_history: Arc<HistoricalAgentChatReader<SqliteDb>>,
-    pub product_genesis_history: Arc<HistoricalProductGenesisReader>,
     pub collaboration_service: Arc<services::CollaborationService>,
     pub work_unit_service: Arc<services::WorkUnitService>,
     pub daemon_service: Arc<DaemonService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
-    pub workflow_template_service:
-        Arc<services::workflow::template_service::WorkflowTemplateService>,
-    pub memory_history: Arc<HistoricalMemoryReader>,
     pub merge_service: Arc<MergeService>,
     pub notification_service: Arc<NotificationService>,
     pub project_hook_service: Arc<ProjectHookService>,
@@ -171,16 +165,13 @@ impl AppState {
         cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
         review_runner: Arc<review::ReviewRunner>,
         shutdown_signal: ShutdownSignal,
-        workflows_dir: PathBuf,
+        _workflows_dir: PathBuf,
         jwt_secret: Vec<u8>,
         bcrypt_cost: u32,
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
         let credential_service = Arc::new(CredentialService::new(Arc::clone(&db), &jwt_secret));
-        let agent_chat_history = Arc::new(HistoricalAgentChatReader::new(Arc::clone(&db)));
-        let product_genesis_history =
-            Arc::new(HistoricalProductGenesisReader::new(Arc::clone(&db)));
         let collaboration_service = Arc::new(services::CollaborationService::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -201,10 +192,6 @@ impl AppState {
             Arc::clone(&workspace_exec_locks),
         ));
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
-        let memory_history = Arc::new(HistoricalMemoryReader::new(Arc::clone(&db)));
-        let workflow_template_service = Arc::new(
-            services::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
-        );
         let execution_events = Arc::new(services::daemon_transport::ServerExecutionEventSink::new(
             Arc::clone(&db),
             Arc::clone(&event_bus),
@@ -291,14 +278,10 @@ impl AppState {
             task_service,
             agent_service,
             credential_service,
-            agent_chat_history,
-            product_genesis_history,
             collaboration_service,
             work_unit_service,
             daemon_service,
             daemon_connections,
-            workflow_template_service,
-            memory_history,
             merge_service,
             notification_service,
             project_hook_service,

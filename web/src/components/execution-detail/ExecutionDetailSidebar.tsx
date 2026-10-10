@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ArrowBendUpLeft, Check, Clock, Copy, GitBranch, Info, Play, Spinner, StopCircle } from '@phosphor-icons/react'
+import { ArrowBendUpLeft, Check, Clock, Copy, GitBranch, Info, Spinner, StopCircle } from '@phosphor-icons/react'
 
 import { ExecutionObservabilitySection } from '@/components/execution-detail/ExecutionObservabilitySection'
 import { ExecutionStatusBadge } from '@/components/execution-detail/ExecutionStatusBadge'
@@ -10,7 +10,6 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
-import { isResumeExecution, roleDisplayName } from '@/lib/execution-utils'
 import { productTerm } from '@/lib/i18n'
 import type { Execution, ExecutionUsage, LogEntry } from '@/types/generated'
 
@@ -56,8 +55,6 @@ type HookLogEntry = {
 type SidebarActions = {
   onStop?: () => void
   stopPending?: boolean
-  onContinue?: () => void
-  continuePending?: boolean
 }
 
 export function ExecutionDetailSidebar({
@@ -85,7 +82,7 @@ export function ExecutionDetailSidebar({
   onNavigateParent: (taskId: string, executionId: string) => void
   actions?: SidebarActions
 }) {
-  const hasActions = Boolean(actions?.onStop || actions?.onContinue)
+  const hasActions = Boolean(actions?.onStop)
 
   return (
     <aside className="flex h-full flex-col">
@@ -111,11 +108,7 @@ export function ExecutionDetailSidebar({
                 <div className="flex items-center gap-2 rounded-md border border-dashed px-2.5 py-2">
                   <ArrowBendUpLeft className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   <div className="min-w-0 flex-1">
-                    <p className="text-xs text-muted-foreground">
-                      {isResumeExecution(execution)
-                        ? `Continues ${roleDisplayName(execution.role)} session`
-                        : 'Follow-up'}
-                    </p>
+                    <p className="text-xs text-muted-foreground">Child Execution</p>
                     <button
                       className="text-[11px] font-mono text-primary hover:underline cursor-pointer"
                       type="button"
@@ -139,16 +132,10 @@ export function ExecutionDetailSidebar({
                 </p>
                 <CopyableId value={execution.id} label={`${productTerm('run').toLowerCase()} ID`} />
               </div>
-              {execution.agent_id && (
+              {execution.actor_ref?.kind === 'agent' && (
                 <div className="space-y-1">
                   <p className="text-micro font-medium uppercase tracking-wider text-muted-foreground">Agent</p>
-                  <p className="text-sm font-medium">{agentName(execution.agent_id)}</p>
-                </div>
-              )}
-              {execution.agent_session_id && (
-                <div className="space-y-1">
-                  <p className="text-micro font-medium uppercase tracking-wider text-muted-foreground">Session ID</p>
-                  <CopyableId value={execution.agent_session_id} label="session ID" />
+                  <p className="text-sm font-medium">{agentName(execution.actor_ref.id)}</p>
                 </div>
               )}
             </section>
@@ -299,24 +286,6 @@ export function ExecutionDetailSidebar({
                   <StopCircle className="h-3.5 w-3.5" />
                 )}
                 Stop {productTerm('run')}
-              </Button>
-            </Tooltip>
-          )}
-          {actions?.onContinue && (
-            <Tooltip content="Resume with the same agent session context">
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1.5"
-                disabled={actions.continuePending}
-                onClick={actions.onContinue}
-              >
-                {actions.continuePending ? (
-                  <Spinner className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Play className="h-3.5 w-3.5" />
-                )}
-                Continue Session
               </Button>
             </Tooltip>
           )}

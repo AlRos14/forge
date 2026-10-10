@@ -67,8 +67,18 @@ impl TaskRepo for SqliteDb {
         if !query.include_archived {
             where_parts.push("archived_at IS NULL");
         }
-        if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
-            where_parts.push("status != 'cancelled'");
+        let explicitly_includes_cancelled = query
+            .lifecycle_states
+            .contains(&crate::TaskLifecycleState::Cancelled)
+            || query.statuses.iter().any(|status| status == "cancelled");
+        if !query.include_cancelled && !explicitly_includes_cancelled {
+            where_parts
+                .push("id IN (SELECT task_id FROM task_lifecycle WHERE state != 'cancelled')");
+        }
+        if !query.lifecycle_states.is_empty() {
+            where_parts.push(
+                "id IN (SELECT task_id FROM task_lifecycle WHERE state IN (__LIFECYCLE_STATES__))",
+            );
         }
         if !query.statuses.is_empty() {
             where_parts.push("status IN (__STATUSES__)");
@@ -128,6 +138,7 @@ impl TaskRepo for SqliteDb {
             where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
         }
         let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
+        let lifecycle_placeholders = vec!["?"; query.lifecycle_states.len()].join(", ");
         let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
         let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
         let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
@@ -154,6 +165,7 @@ impl TaskRepo for SqliteDb {
         let where_sql = where_parts
             .join(" AND ")
             .replace("__STATUSES__", &status_placeholders)
+            .replace("__LIFECYCLE_STATES__", &lifecycle_placeholders)
             .replace("__AGENTS__", &agent_placeholders)
             .replace(
                 "__ASSIGNEE_TYPE_FILTER_MEMBERSHIP__",
@@ -176,6 +188,9 @@ impl TaskRepo for SqliteDb {
         let mut q = sqlx::query(&sql).bind(&query.project_id);
         for status in &query.statuses {
             q = q.bind(status);
+        }
+        for state in &query.lifecycle_states {
+            q = q.bind(state.to_string());
         }
         for agent_id in &query.agent_ids {
             q = q.bind(agent_id);
@@ -212,6 +227,9 @@ impl TaskRepo for SqliteDb {
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
             for status in &query.statuses {
                 q = q.bind(status);
+            }
+            for state in &query.lifecycle_states {
+                q = q.bind(state.to_string());
             }
             for agent_id in &query.agent_ids {
                 q = q.bind(agent_id);
@@ -255,7 +273,9 @@ impl TaskRepo for SqliteDb {
             where_parts.push("archived_at IS NULL".to_owned());
         }
         if !query.include_cancelled {
-            where_parts.push("status != 'cancelled'".to_owned());
+            where_parts.push(
+                "id IN (SELECT task_id FROM task_lifecycle WHERE state != 'cancelled')".to_owned(),
+            );
         }
         let where_sql = where_parts.join(" AND ");
         let sql = format!(

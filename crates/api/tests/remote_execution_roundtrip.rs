@@ -4,9 +4,12 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
-use api_types::{AgentResponse, TaskResponse, METHOD_EXECUTION_START};
+use api_types::{AgentResponse, ExecutionResponse, TaskResponse, METHOD_EXECUTION_START};
 use axum::http::{Method, StatusCode};
-use db::{ExecutionRepo, ExecutionStatus as DbExecutionStatus, StopReason, TaskRepo};
+use db::{
+    ExecutionRepo, ExecutionStatus as DbExecutionStatus, StopReason, TaskLifecycleRepo,
+    TaskLifecycleState, TaskRepo,
+};
 use futures_util::SinkExt;
 use serde_json::{json, Value};
 use services::HeartbeatMonitor;
@@ -23,51 +26,27 @@ use common::{
     json_request, json_request_with_bearer, setup_git_repo, test_app, TestDir,
 };
 
-async fn poll_task_status_after_execution(
+async fn poll_task_lifecycle(
     db: &Arc<db::SqliteDb>,
     task_id: &str,
-    expected: &str,
-) -> db::Task {
+    expected: TaskLifecycleState,
+) -> db::TaskLifecycle {
     for _ in 0..200 {
-        if let Some(task) = TaskRepo::get_by_id(&**db, task_id, false)
+        if let Some(lifecycle) = TaskLifecycleRepo::get_task_lifecycle(&**db, task_id)
             .await
             .expect("task lookup")
         {
-            if task.status == expected {
-                return task;
+            if lifecycle.state == expected {
+                return lifecycle;
             }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let task = TaskRepo::get_by_id(&**db, task_id, false)
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&**db, task_id)
         .await
         .expect("task lookup")
-        .expect("task exists");
-    panic!(
-        "task {task_id} did not reach {expected}; status={} blocked={:?} error_annotation={:?}",
-        task.status, task.blocked_json, task.error_annotation
-    );
-}
-
-async fn poll_failed_task_recovery_state(db: &Arc<db::SqliteDb>, task_id: &str) -> db::Task {
-    for _ in 0..200 {
-        if let Some(task) = TaskRepo::get_by_id(&**db, task_id, false)
-            .await
-            .expect("task lookup")
-        {
-            if task.status == "in_progress"
-                && task.blocked_json.is_some()
-                && task.error_annotation.is_some()
-            {
-                return task;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    TaskRepo::get_by_id(&**db, task_id, false)
-        .await
-        .expect("task lookup")
-        .expect("task exists")
+        .expect("task lifecycle exists");
+    panic!("task {task_id} did not reach {expected:?}; lifecycle={lifecycle:?}");
 }
 
 struct RemoteRoundtripFixture {
@@ -136,16 +115,15 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
     }
 }
 
-async fn claim_task_with_accepted_start(
+async fn start_execution_with_accepted_daemon(
     harness: &common::Harness,
     daemon_socket: &mut common::fake_daemon::ClientSocket,
     project_id: &str,
     agent_id: &str,
     title: &str,
     description: &str,
-    zero_execution_retry_budget: bool,
 ) -> (String, String) {
-    let mut created_task: TaskResponse = json_request(
+    let created_task: TaskResponse = json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/projects/{project_id}/tasks"),
@@ -156,30 +134,57 @@ async fn claim_task_with_accepted_start(
         StatusCode::OK,
     )
     .await;
-    if zero_execution_retry_budget {
-        created_task = json_request(
-            &harness.app,
-            Method::PATCH,
-            &format!("/api/v1/tasks/{}", created_task.id),
-            json!({
-                "version": created_task.version,
-                "task_state_config": { "retry_budgets": { "execution": 0 } }
-            }),
-            StatusCode::OK,
-        )
-        .await;
-    }
     let task_id = created_task.id.clone();
+    let (execution_id, _) =
+        launch_execution_for_task(harness, daemon_socket, &task_id, agent_id, description).await;
+    (task_id, execution_id)
+}
 
-    let claim_app = harness.app.clone();
-    let claim_agent_id = agent_id.to_owned();
-    let claim_task_id = task_id.clone();
-    let claim_handle = tokio::spawn(async move {
-        json_request::<TaskResponse>(
-            &claim_app,
+async fn launch_execution_for_task(
+    harness: &common::Harness,
+    daemon_socket: &mut common::fake_daemon::ClientSocket,
+    task_id: &str,
+    agent_id: &str,
+    prompt: &str,
+) -> (String, Value) {
+    harness
+        .state
+        .task_service
+        .create_task_role(
+            &task_id,
+            "implementer",
+            db::CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    harness
+        .state
+        .task_service
+        .add_task_role_member(
+            &task_id,
+            "implementer",
+            api_types::ActorRef::Agent(agent_id.to_owned()),
+        )
+        .await
+        .expect("Agent joins implementer TaskRole");
+
+    let start_app = harness.app.clone();
+    let start_task_id = task_id.to_owned();
+    let start_agent_id = agent_id.to_owned();
+    let prompt = prompt.to_owned();
+    let start_handle = tokio::spawn(async move {
+        json_request::<ExecutionResponse>(
+            &start_app,
             Method::POST,
-            &format!("/api/v1/tasks/{claim_task_id}/claim"),
-            json!({ "agent_id": claim_agent_id, "overrides": null }),
+            &format!("/api/v1/tasks/{start_task_id}/executions"),
+            json!({
+                "agent_id": start_agent_id,
+                "role": "implementer",
+                "purpose": "implement",
+                "prompt": prompt,
+                "input_artifact_ids": []
+            }),
             StatusCode::OK,
         )
         .await
@@ -200,24 +205,32 @@ async fn claim_task_with_accepted_start(
     )
     .await;
 
-    let claimed = claim_handle.await.expect("claim task joins");
-    assert_eq!(claimed.status, "in_progress".to_owned());
+    let execution = start_handle.await.expect("Execution start joins");
+    assert_eq!(execution.id, execution_id);
+    assert_eq!(execution.role, "implementer");
+    assert_eq!(
+        execution.purpose,
+        Some(api_types::ExecutionPurpose::Implement)
+    );
+    assert_eq!(
+        execution.actor_ref,
+        Some(api_types::ActorRef::Agent(agent_id.to_owned()))
+    );
 
-    (task_id, execution_id)
+    (execution_id, start_params)
 }
 
 #[tokio::test]
 async fn remote_execution_completes_and_transitions_task() {
     let mut fixture = setup_remote_roundtrip("remote-roundtrip-success").await;
 
-    let (task_id, execution_id) = claim_task_with_accepted_start(
+    let (task_id, execution_id) = start_execution_with_accepted_daemon(
         &fixture.harness,
         &mut fixture.daemon_socket,
         &fixture.project_id,
         &fixture.agent_id,
         "Remote roundtrip success",
         "echo remote success",
-        false,
     )
     .await;
 
@@ -257,9 +270,13 @@ async fn remote_execution_completes_and_transitions_task() {
     .await;
     assert_eq!(completed.status, DbExecutionStatus::Completed);
 
-    let reviewed =
-        poll_task_status_after_execution(&fixture.harness.state.db, &task_id, "done").await;
-    assert_eq!(reviewed.status, "done");
+    let lifecycle = poll_task_lifecycle(
+        &fixture.harness.state.db,
+        &task_id,
+        TaskLifecycleState::Active,
+    )
+    .await;
+    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
 
     let logs = fetch_execution_logs(&fixture.harness.app, &execution_id).await;
     let entries = logs["items"].as_array().expect("log items array");
@@ -282,17 +299,16 @@ async fn remote_execution_completes_and_transitions_task() {
 }
 
 #[tokio::test]
-async fn remote_execution_failure_takes_failure_path() {
+async fn remote_execution_failure_does_not_mutate_aggregate_task_lifecycle() {
     let mut fixture = setup_remote_roundtrip("remote-roundtrip-failure").await;
 
-    let (task_id, execution_id) = claim_task_with_accepted_start(
+    let (task_id, execution_id) = start_execution_with_accepted_daemon(
         &fixture.harness,
         &mut fixture.daemon_socket,
         &fixture.project_id,
         &fixture.agent_id,
         "Remote roundtrip failure",
         "this should fail remotely",
-        true,
     )
     .await;
 
@@ -319,33 +335,29 @@ async fn remote_execution_failure_takes_failure_path() {
         failed.error
     );
 
-    // The daemon terminal message persists the execution outcome before the
-    // task recovery projection is applied. Wait for both durable records so
-    // this assertion remains deterministic under workspace-wide test load.
-    let task = poll_failed_task_recovery_state(&fixture.harness.state.db, &task_id).await;
-    assert_eq!(task.status, "in_progress");
-    assert!(
-        task.blocked_json.is_some(),
-        "failed remote execution should block the task for recovery"
-    );
-    assert!(
-        task.error_annotation.is_some(),
-        "failed remote execution should expose error annotation"
-    );
+    // Execution outcome is historical work evidence. A failed Execution does
+    // not itself rewrite aggregate TaskLifecycle; exact retry receipts and
+    // Gate facts own any later lifecycle effects.
+    let lifecycle = poll_task_lifecycle(
+        &fixture.harness.state.db,
+        &task_id,
+        TaskLifecycleState::Active,
+    )
+    .await;
+    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
 }
 
 #[tokio::test]
-async fn remote_daemon_disconnect_fails_running_execution() {
+async fn remote_daemon_disconnect_does_not_mutate_aggregate_task_lifecycle() {
     let mut fixture = setup_remote_roundtrip("remote-roundtrip-disconnect").await;
 
-    let (task_id, execution_id) = claim_task_with_accepted_start(
+    let (task_id, execution_id) = start_execution_with_accepted_daemon(
         &fixture.harness,
         &mut fixture.daemon_socket,
         &fixture.project_id,
         &fixture.agent_id,
         "Remote disconnect",
         "running until disconnect",
-        true,
     )
     .await;
 
@@ -375,25 +387,20 @@ async fn remote_daemon_disconnect_fails_running_execution() {
     assert_eq!(execution.status, DbExecutionStatus::Failed);
     assert_eq!(execution.stop_reason, Some(StopReason::DaemonDisconnected));
 
-    let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert!(
-        task.blocked_json.is_some(),
-        "disconnect failure should block the task for recovery"
-    );
-    assert!(
-        task.error_annotation.is_some(),
-        "disconnect failure should expose recovery annotation"
-    );
+    let lifecycle = poll_task_lifecycle(
+        &fixture.harness.state.db,
+        &task_id,
+        TaskLifecycleState::Active,
+    )
+    .await;
+    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
 }
 
 /// Fallback-chain round-trip over the daemon protocol: the snapshot carries
 /// the route to the daemon, and the structured terminal notification carries
 /// disposition, attempts, and the winner back for persistence.
 #[tokio::test]
-async fn remote_executor_unavailable_defers_and_persists_route() {
+async fn remote_executor_unavailability_preserves_route_without_legacy_task_projection() {
     let mut fixture = setup_remote_roundtrip("remote-unavailable").await;
 
     // A routed legacy shell agent: fallback may vary its command while
@@ -427,27 +434,14 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
     )
     .await;
     let task_id = created_task.id.clone();
-
-    let claim_app = fixture.harness.app.clone();
-    let claim_agent_id = routed_agent.id.clone();
-    let claim_task_id = task_id.clone();
-    let claim_handle = tokio::spawn(async move {
-        json_request::<TaskResponse>(
-            &claim_app,
-            Method::POST,
-            &format!("/api/v1/tasks/{claim_task_id}/claim"),
-            json!({ "agent_id": claim_agent_id, "overrides": null }),
-            StatusCode::OK,
-        )
-        .await
-    });
-
-    let (start_id, start_params) =
-        next_daemon_request(&mut fixture.daemon_socket, METHOD_EXECUTION_START).await;
-    let execution_id = start_params["execution_id"]
-        .as_str()
-        .expect("execution id in start params")
-        .to_owned();
+    let (execution_id, start_params) = launch_execution_for_task(
+        &fixture.harness,
+        &mut fixture.daemon_socket,
+        &task_id,
+        &routed_agent.id,
+        "exhaust every candidate",
+    )
+    .await;
     // Server → daemon: the snapshot carries the full route.
     let routing = &start_params["executor_config"]["routing"];
     assert_eq!(routing["policy"], "ordered_fallback_v1");
@@ -455,17 +449,6 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
         routing["candidates"].as_array().expect("candidates").len(),
         2
     );
-
-    send_daemon_response(
-        &mut fixture.daemon_socket,
-        start_id,
-        api_types::ExecutionStartResult {
-            execution_id: execution_id.clone(),
-            accepted: true,
-        },
-    )
-    .await;
-    claim_handle.await.expect("claim task joins");
 
     // Daemon → server: every candidate exhausted, retry known in ~90s.
     let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc3339();
@@ -510,38 +493,25 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
     .await;
     assert_eq!(failed.status, DbExecutionStatus::Failed);
 
-    // Transient unavailability: deferred dispatch scheduled, no retry budget
-    // consumed, task not blocked.
-    let mut deferred_seen = false;
-    for _ in 0..200 {
-        let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
-            .await
-            .expect("task lookup")
-            .expect("task exists");
-        let metadata: Value = task
-            .metadata_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .unwrap_or_else(|| json!({}));
-        if metadata.get("deferred_dispatch").is_some() {
-            assert!(
-                metadata.get("execution_retry_count").is_none(),
-                "executor unavailability must not consume the retry budget; metadata: {metadata}"
-            );
-            assert!(
-                task.blocked_json.is_none(),
-                "transient unavailability must not block the task; blocked: {:?}",
-                task.blocked_json
-            );
-            deferred_seen = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        deferred_seen,
-        "expected a deferred dispatch to be scheduled"
-    );
+    // TaskLifecycle and old retry metadata do not derive from an unavailable
+    // harness route. The exact route disposition is retained on this
+    // Execution for an explicit later decision.
+    let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
+        .await
+        .expect("task lookup")
+        .expect("task exists");
+    let metadata: Value = task
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_else(|| json!({}));
+    assert!(metadata.get("execution_retry_count").is_none());
+    assert!(metadata.get("deferred_dispatch").is_none());
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.harness.state.db, &task_id)
+        .await
+        .expect("TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
 
     // Attempts and disposition are persisted on the execution snapshot.
     let stored = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &execution_id)

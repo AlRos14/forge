@@ -21,6 +21,7 @@ pub enum SortBy {
     Priority,
     BoardPosition,
     Title,
+    LifecycleState,
     Status,
     Agent,
     TaskType,

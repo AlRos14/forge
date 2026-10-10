@@ -193,6 +193,7 @@ async fn find_or_create_null_agent(db: &SqliteDb, now: &str) -> Result<String> {
             status: None,
             executor_type: Some("null".to_owned()),
             capabilities: Vec::new(),
+            harness_only: false,
             page: page_request(),
         },
     )
@@ -282,6 +283,7 @@ async fn install_demo_tasks(
         db::TaskListQuery {
             project_id: project_id.to_owned(),
             q: None,
+            lifecycle_states: Vec::new(),
             statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
@@ -428,6 +430,7 @@ mod tests {
                 status: None,
                 executor_type: Some("null".to_owned()),
                 capabilities: Vec::new(),
+                harness_only: false,
                 page: page_request(),
             },
         )
@@ -461,6 +464,7 @@ mod tests {
                 db::TaskListQuery {
                     project_id: project_id.clone(),
                     q: None,
+                    lifecycle_states: Vec::new(),
                     statuses: vec![status.to_owned()],
                     agent_ids: Vec::new(),
                     assignee_types: Vec::new(),

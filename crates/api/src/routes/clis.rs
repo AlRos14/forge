@@ -108,6 +108,7 @@ async fn list_agents(state: &AppState) -> ApiResult<Vec<Agent>> {
                 status: None,
                 executor_type: None,
                 capabilities: Vec::new(),
+                harness_only: false,
                 page: PageRequest {
                     cursor,
                     limit: 500,

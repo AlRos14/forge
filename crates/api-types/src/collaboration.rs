@@ -306,6 +306,7 @@ pub struct HandoffResponse {
     pub parent_execution_id: Option<String>,
     pub expected_policy_ref: Option<String>,
     pub status: HandoffStatus,
+    #[ts(type = "number")]
     pub version: i64,
     pub artifact_ids: Vec<String>,
     pub created_at: String,
@@ -317,6 +318,7 @@ pub struct HandoffResponse {
 #[ts(export)]
 pub struct HandoffTransitionRequest {
     pub status: HandoffStatus,
+    #[ts(type = "number")]
     pub expected_version: i64,
 }
 
@@ -327,9 +329,11 @@ pub struct CreateProposalRequest {
     pub target: ProposalTarget,
     pub action: String,
     pub reason: String,
+    #[ts(type = "number | null")]
     pub target_version: Option<i64>,
     pub target_digest: Option<String>,
     pub required_policy_ref: Option<String>,
+    #[ts(type = "number | null")]
     pub required_policy_version: Option<i64>,
     pub required_policy_digest: Option<String>,
     pub supersedes_proposal_id: Option<String>,
@@ -347,11 +351,14 @@ pub struct ProposalResponse {
     pub target: ProposalTarget,
     pub action: String,
     pub reason: String,
+    #[ts(type = "number | null")]
     pub target_version: Option<i64>,
     pub target_digest: Option<String>,
     pub required_policy_ref: Option<String>,
+    #[ts(type = "number | null")]
     pub required_policy_version: Option<i64>,
     pub required_policy_digest: Option<String>,
+    #[ts(type = "number")]
     pub content_version: i64,
     pub status: ProposalStatus,
     pub supersedes_proposal_id: Option<String>,
@@ -364,10 +371,12 @@ pub struct ProposalResponse {
 #[ts(export)]
 pub struct CreateDecisionRequest {
     pub proposal_id: String,
+    #[ts(type = "number")]
     pub proposal_version: i64,
     pub outcome: DecisionOutcome,
     pub rationale: String,
     pub policy_ref: Option<String>,
+    #[ts(type = "number | null")]
     pub policy_version: Option<i64>,
     pub policy_digest: Option<String>,
 }
@@ -379,10 +388,12 @@ pub struct DecisionResponse {
     pub id: String,
     pub task_id: String,
     pub proposal_id: String,
+    #[ts(type = "number")]
     pub proposal_version: i64,
     pub outcome: DecisionOutcome,
     pub rationale: String,
     pub policy_ref: Option<String>,
+    #[ts(type = "number | null")]
     pub policy_version: Option<i64>,
     pub policy_digest: Option<String>,
     pub actors: Vec<ActorRef>,
@@ -394,6 +405,7 @@ pub struct DecisionResponse {
 #[ts(export)]
 pub struct CollaborationListQuery {
     pub cursor: Option<String>,
+    #[ts(type = "number | null")]
     pub limit: Option<i64>,
     pub include_total: Option<bool>,
 }

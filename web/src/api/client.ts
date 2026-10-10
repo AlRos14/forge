@@ -6,22 +6,16 @@ import type {
   OperationsRefreshResponse,
   OperatorStatusResponse,
   PaginatedResponse,
-  ProjectAnalyticsResponse,
   ProjectMemberResponse,
   UpdateProfileRequest,
   UserResponse,
   UserSearchResult,
-  RecoverTaskRequest,
-  RecoveryAction,
   ReorderSubtasksRequest,
-  SaveWorkflowTemplateRequest,
   SettingsResponse,
   Task,
   TokenResponse,
   UnreadCountResponse,
   UpdateSettingsRequest,
-  WorkflowTemplateResponse,
-  WorkflowTemplateSummary,
 } from '@/types/generated'
 import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
 import { refreshAccess, useAuthStore } from '@/stores/auth'
@@ -174,44 +168,6 @@ export function removeDependency(taskId: string, dependsOnId: string): Promise<v
   })
 }
 
-export async function recoverTask(
-  taskId: string,
-  action: RecoveryAction,
-  reason?: string,
-  context?: string,
-): Promise<Task> {
-  return apiFetch<Task>(`/tasks/${taskId}/recover`, {
-    method: 'POST',
-    body: JSON.stringify({
-      action,
-      reason: reason ?? null,
-      context: context ?? null,
-    } satisfies RecoverTaskRequest),
-  })
-}
-
-export function listWorkflowTemplates(): Promise<WorkflowTemplateSummary[]> {
-  return apiFetch<WorkflowTemplateSummary[]>('/workflow-templates')
-}
-
-export function getWorkflowTemplate(name: string): Promise<WorkflowTemplateResponse> {
-  return apiFetch<WorkflowTemplateResponse>(`/workflow-templates/${name}`)
-}
-
-export function saveWorkflowTemplate(
-  name: string,
-  body: SaveWorkflowTemplateRequest,
-): Promise<WorkflowTemplateResponse> {
-  return apiFetch<WorkflowTemplateResponse>(`/workflow-templates/${name}`, {
-    method: 'PUT',
-    body: JSON.stringify(body),
-  })
-}
-
-export async function deleteWorkflowTemplate(name: string): Promise<void> {
-  return apiFetch<void>(`/workflow-templates/${name}`, { method: 'DELETE' })
-}
-
 export function listNotifications(params?: {
   project_id?: string
   read?: boolean
@@ -235,20 +191,6 @@ export function getOperationsStatus(): Promise<OperatorStatusResponse> {
 
 export function refreshOperations(): Promise<OperationsRefreshResponse> {
   return apiFetch<OperationsRefreshResponse>('/operations/refresh', { method: 'POST' })
-}
-
-export async function getProjectAnalytics(
-  projectId: string,
-  from?: string,
-  to?: string,
-): Promise<ProjectAnalyticsResponse> {
-  const params = new URLSearchParams()
-  if (from) params.set('from', from)
-  if (to) params.set('to', to)
-  const query = params.toString()
-  return apiFetch<ProjectAnalyticsResponse>(
-    `/projects/${projectId}/analytics${query ? `?${query}` : ''}`,
-  )
 }
 
 export function listProjectHookRuns(
@@ -330,10 +272,6 @@ export function searchUsers(q: string): Promise<UserSearchResult[]> {
 
 export function listMembers(projectId: string): Promise<ProjectMemberResponse[]> {
   return apiFetch<ProjectMemberResponse[]>(`/projects/${projectId}/members`)
-}
-
-export function listProjectAgents(projectId: string): Promise<Agent[]> {
-  return apiFetch<Agent[]>(`/projects/${projectId}/agents`)
 }
 
 export function addMember(

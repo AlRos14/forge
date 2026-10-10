@@ -4,13 +4,14 @@ use crate::{
     },
     Result, ServiceError, TaskService,
 };
+use api_types::ActorRef;
 use db::{
-    new_uuid_v4, now_rfc3339, AssigneeKind, CreateProjectIntegration, CreateTaskExternalLink,
-    CreateTaskRoleAssignment, ExternalLinkRepo, IntegrationPlatform, IntegrationRepo,
-    ProjectIntegration, ProjectRepo, SqliteDb, UpdateProjectIntegration,
+    new_uuid_v4, now_rfc3339, CoordinationMode, CreateProjectIntegration, CreateTaskExternalLink,
+    ExternalLinkRepo, IntegrationPlatform, IntegrationRepo, ProjectIntegration, ProjectRepo,
+    SqliteDb, UpdateProjectIntegration,
 };
 use events::EventBus;
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 pub struct IntegrationService {
     db: Arc<SqliteDb>,
@@ -70,6 +71,17 @@ impl IntegrationService {
 
     pub async fn sync_integration(&self, integration: &ProjectIntegration) -> Result<SyncResult> {
         let _ = &self.event_bus;
+        let default_implementer = integration_default_implementer(integration)?;
+        if let Some(actor) = default_implementer.as_ref() {
+            let project = ProjectRepo::get_by_id(&*self.db, &integration.project_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("project", integration.project_id.clone())
+                })?;
+            self.task_service
+                .validate_actor_for_project(&project, actor)
+                .await?;
+        }
         let token = resolve_token(&integration.token_secret_ref)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let sync_filter = parse_sync_filter(&integration.sync_filter);
@@ -126,6 +138,20 @@ impl IntegrationService {
                 )
                 .await?;
 
+            if let Some(actor) = default_implementer.as_ref() {
+                self.task_service
+                    .create_task_role(
+                        &task.id,
+                        "implementer",
+                        CoordinationMode::Independent,
+                        "{}".to_owned(),
+                    )
+                    .await?;
+                self.task_service
+                    .add_task_role_member(&task.id, "implementer", actor.clone())
+                    .await?;
+            }
+
             let now = now_rfc3339();
             ExternalLinkRepo::create_link(
                 &*self.db,
@@ -152,7 +178,6 @@ impl IntegrationService {
             )
             .await?;
 
-            assign_default_coder(&self.task_service, &task.id, integration).await?;
             imported += 1;
         }
 
@@ -172,10 +197,6 @@ impl IntegrationService {
         validate_required("token_secret_ref", &input.token_secret_ref)?;
         validate_poll_interval(input.poll_interval_secs)?;
         validate_sync_filter(&input.sync_filter)?;
-        validate_assignee(
-            input.default_assignee_type.as_deref(),
-            input.default_assignee_id.as_deref(),
-        )?;
         ProjectRepo::get_by_id(&*self.db, &input.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", input.project_id.clone()))?;
@@ -184,7 +205,7 @@ impl IntegrationService {
 
     async fn validate_update(&self, input: &UpdateProjectIntegration) -> Result<()> {
         validate_required("id", &input.id)?;
-        let existing = IntegrationRepo::get_by_id(&*self.db, &input.id)
+        IntegrationRepo::get_by_id(&*self.db, &input.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("integration", input.id.clone()))?;
         if let Some(project_id) = &input.project_id {
@@ -211,16 +232,21 @@ impl IntegrationService {
         if let Some(sync_filter) = &input.sync_filter {
             validate_sync_filter(sync_filter)?;
         }
-        let assignee_type = match &input.default_assignee_type {
-            Some(value) => value.as_deref(),
-            None => existing.default_assignee_type.as_deref(),
-        };
-        let assignee_id = match &input.default_assignee_id {
-            Some(value) => value.as_deref(),
-            None => existing.default_assignee_id.as_deref(),
-        };
-        validate_assignee(assignee_type, assignee_id)?;
         Ok(())
+    }
+}
+
+fn integration_default_implementer(integration: &ProjectIntegration) -> Result<Option<ActorRef>> {
+    match (
+        integration.default_assignee_type.as_deref(),
+        integration.default_assignee_id.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some("agent"), Some(id)) if !id.is_empty() => Ok(Some(ActorRef::Agent(id.to_owned()))),
+        (Some("user"), Some(id)) if !id.is_empty() => Ok(Some(ActorRef::Human(id.to_owned()))),
+        _ => Err(ServiceError::invalid_operation(
+            "integration default implementer must be an exact Agent or Human Actor reference",
+        )),
     }
 }
 
@@ -265,50 +291,6 @@ fn validate_sync_filter(sync_filter: &str) -> Result<()> {
     serde_json::from_str::<serde_json::Value>(sync_filter)
         .map(|_| ())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid sync_filter: {error}")))
-}
-
-fn validate_assignee(assignee_type: Option<&str>, assignee_id: Option<&str>) -> Result<()> {
-    match (assignee_type, assignee_id) {
-        (Some(kind), Some(id)) => {
-            validate_required("default_assignee_type", kind)?;
-            validate_required("default_assignee_id", id)?;
-            kind.parse::<AssigneeKind>()
-                .map_err(ServiceError::invalid_operation)?;
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        _ => Err(ServiceError::invalid_operation(
-            "default_assignee_type and default_assignee_id must be provided together",
-        )),
-    }
-}
-
-async fn assign_default_coder(
-    task_service: &TaskService,
-    task_id: &str,
-    integration: &ProjectIntegration,
-) -> Result<()> {
-    let (Some(assignee_type), Some(assignee_id)) = (
-        integration.default_assignee_type.as_deref(),
-        integration.default_assignee_id.as_deref(),
-    ) else {
-        return Ok(());
-    };
-    let assignee_type =
-        AssigneeKind::from_str(assignee_type).map_err(ServiceError::invalid_operation)?;
-    let now = now_rfc3339();
-    task_service
-        .assign_role_membership(CreateTaskRoleAssignment {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            role_name: "coder".to_owned(),
-            assignee_type: Some(assignee_type),
-            assignee_id: Some(assignee_id.to_owned()),
-            created_at: now.clone(),
-            updated_at: now,
-        })
-        .await?;
-    Ok(())
 }
 
 fn compute_global_id(

@@ -5,9 +5,4 @@ import type { HarnessCapabilitiesSnapshot } from "./HarnessCapabilitiesSnapshot"
 /**
  * The executor candidate that actually ran a remote execution.
  */
-export type RemoteResolvedCandidate = { candidate_key: string, executor_type: string, config: Record<string, unknown>,
-/**
- * Absent on pre-PR3 daemons. The server resolves absence to an explicit
- * all-Unknown snapshot and never inherits primary-candidate evidence.
- */
-harness_capabilities: HarnessCapabilitiesSnapshot | null, effective_policy: EffectiveExecutionPolicy | null, };
+export type RemoteResolvedCandidate = { candidate_key: string, executor_type: string, config: Record<string, unknown>, harness_capabilities: HarnessCapabilitiesSnapshot | null, effective_policy: EffectiveExecutionPolicy | null, };

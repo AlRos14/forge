@@ -12,10 +12,6 @@ pub struct AgentUsageResponse {
     pub account_key: Option<String>,
     /// Host/daemon that produced the returned observation, when known.
     pub daemon_id: Option<String>,
-    /// Whether this Agent usage surface supports an explicit manual refresh.
-    /// The current runtime model reports false: CLI usage is observed on its
-    /// execution host, while native provider usage has its own provider-entry path.
-    pub manual_refresh_supported: bool,
     pub shared_account: bool,
     pub source: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]

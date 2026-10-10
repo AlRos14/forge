@@ -1,4 +1,4 @@
-use api_types::{ExecutionResponse, FollowUpRequest, LaunchExecutionResponse, PaginatedResponse};
+use api_types::{ExecutionResponse, FollowUpRequest, PaginatedResponse, StartExecutionRequest};
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -12,7 +12,7 @@ use crate::{
     errors::{ApiError, ApiResult},
     routes::{
         execution_response, execution_response_with_usage, execution_usage_response, page_request,
-        paginated, task_response, task_usage_summary_response, workspace_response, ListParams,
+        paginated, task_usage_summary_response, ListParams,
     },
     state::AppState,
 };
@@ -24,6 +24,45 @@ pub async fn list_executions(
 ) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
     Ok(Json(paginated(page, execution_response)))
+}
+
+pub async fn start_task_execution(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Json(request): Json<StartExecutionRequest>,
+) -> ApiResult<Json<ExecutionResponse>> {
+    crate::routes::tasks::require_task_visible(&state, &task_id, &user).await?;
+    if request.role.trim().is_empty() || request.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "role and prompt must be non-empty for an Execution",
+        ));
+    }
+    let purpose = match request.purpose {
+        api_types::ExecutionPurpose::Plan => db::ExecutionPurpose::Plan,
+        api_types::ExecutionPurpose::Implement => db::ExecutionPurpose::Implement,
+        api_types::ExecutionPurpose::Review => db::ExecutionPurpose::Review,
+        api_types::ExecutionPurpose::Validate => db::ExecutionPurpose::Validate,
+        api_types::ExecutionPurpose::Investigate => db::ExecutionPurpose::Investigate,
+        api_types::ExecutionPurpose::Orchestrate => db::ExecutionPurpose::Orchestrate,
+        api_types::ExecutionPurpose::General => db::ExecutionPurpose::General,
+    };
+    let execution = state
+        .task_service
+        .dispatch_initial_role_execution_with_artifacts(
+            &task_id,
+            &request.agent_id,
+            &request.role,
+            purpose,
+            request.prompt,
+            request.input_artifact_ids,
+            None,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        execution_response_with_usage(&state.db, execution).await?,
+    ))
 }
 
 pub async fn get_execution(
@@ -52,13 +91,17 @@ pub async fn get_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<LogsQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<api_types::ExecutionLogsResponse>> {
     let execution = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
 
     let Some(path) = execution.logs_path else {
-        return Ok(Json(serde_json::json!({"items": [], "has_more": false})));
+        return Ok(Json(api_types::ExecutionLogsResponse {
+            items: Vec::new(),
+            has_more: false,
+            next_sequence: None,
+        }));
     };
 
     let log_path = std::path::Path::new(&path);
@@ -83,11 +126,48 @@ pub async fn get_logs(
         Err(error) => return Err(ApiError::bad_request(error.to_string())),
     };
 
-    Ok(Json(serde_json::json!({
-        "items": result.entries,
-        "has_more": result.has_more,
-        "next_sequence": result.next_sequence,
-    })))
+    Ok(Json(api_types::ExecutionLogsResponse {
+        items: result
+            .entries
+            .into_iter()
+            .map(execution_log_response)
+            .collect(),
+        has_more: result.has_more,
+        next_sequence: result.next_sequence,
+    }))
+}
+
+fn execution_log_response(entry: executors::LogEntry) -> api_types::ExecutionLogEntry {
+    use api_types::{ExecutionLogKind as PublicKind, ExecutionLogStream as PublicStream};
+    let kind = match entry.kind {
+        executors::LogKind::Stdout => PublicKind::Stdout,
+        executors::LogKind::Stderr => PublicKind::Stderr,
+        executors::LogKind::ToolCall => PublicKind::ToolCall,
+        executors::LogKind::ToolResult => PublicKind::ToolResult,
+        executors::LogKind::Assistant => PublicKind::Assistant,
+        executors::LogKind::AssistantDelta => PublicKind::AssistantDelta,
+        executors::LogKind::User => PublicKind::User,
+        executors::LogKind::System => PublicKind::System,
+        executors::LogKind::FileChange => PublicKind::FileChange,
+        executors::LogKind::ShellCommand => PublicKind::ShellCommand,
+        executors::LogKind::ApprovalQuestion => PublicKind::ApprovalQuestion,
+        executors::LogKind::SessionInfo => PublicKind::SessionInfo,
+        executors::LogKind::Unknown => PublicKind::Unknown,
+    };
+    let stream = match entry.stream {
+        executors::LogStream::Main => PublicStream::Main,
+        executors::LogStream::Heartbeat => PublicStream::Heartbeat,
+    };
+    api_types::ExecutionLogEntry {
+        schema_version: entry.schema_version,
+        sequence: entry.sequence,
+        timestamp: entry.timestamp,
+        execution_id: entry.execution_id,
+        kind,
+        stream,
+        payload: entry.payload,
+        truncated: entry.truncated,
+    }
 }
 
 pub async fn get_hook_logs(
@@ -131,7 +211,7 @@ pub async fn follow_up_execution(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<FollowUpRequest>,
-) -> ApiResult<Json<LaunchExecutionResponse>> {
+) -> ApiResult<Json<ExecutionResponse>> {
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
@@ -139,62 +219,15 @@ pub async fn follow_up_execution(
     });
     let launched = state
         .task_service
-        .follow_up_execution(id, request.message, request.agent_id, overrides)
+        .follow_up_execution(id, request.message, Some(request.agent_id), overrides)
         .await
         .map_err(map_follow_up_error)?;
 
     let execution_id = launched.execution.id.clone();
     state.task_service.start_execution(execution_id).await?;
-
-    let execution_behavior = Some(api_types::ExecutionBehavior {
-        kind: api_types::ExecutionBehaviorKind::SessionFollowUp,
-        propagates: false,
-        cascade_role: None,
-        cascade_state: None,
-        description:
-            "Session follow-up — resumes prior context without auto-transitioning the task"
-                .to_owned(),
-    });
-
-    Ok(Json(LaunchExecutionResponse {
-        data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
-            execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
-            execution_behavior,
-        },
-    }))
-}
-
-pub async fn re_execute_execution(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<LaunchExecutionResponse>> {
-    let launched = state
-        .task_service
-        .re_execute_execution(id)
-        .await
-        .map_err(map_re_execute_error)?;
-
-    let execution_id = launched.execution.id.clone();
-    state.task_service.start_execution(execution_id).await?;
-
-    let execution_behavior = Some(api_types::ExecutionBehavior {
-        kind: api_types::ExecutionBehaviorKind::ReExecute,
-        propagates: true,
-        cascade_role: Some(launched.execution.role.clone()),
-        cascade_state: Some(launched.task.status.clone()),
-        description: "Re-execute — completion may auto-transition the task".to_owned(),
-    });
-
-    Ok(Json(LaunchExecutionResponse {
-        data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
-            execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
-            execution_behavior,
-        },
-    }))
+    Ok(Json(
+        execution_response_with_usage(&state.db, launched.execution).await?,
+    ))
 }
 
 pub async fn cancel_execution(
@@ -218,23 +251,6 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
             } else if message.contains("follow-up requires same executor type") {
                 ApiError::conflict_with_code("follow_up.executor_mismatch", message)
             } else if message.contains("interactive execution already running") {
-                ApiError::conflict_with_code("execution.already_running", message)
-            } else if message.contains("terminal status") {
-                ApiError::conflict_with_code("task.terminal", message)
-            } else {
-                ApiError::invalid_operation_conflict(message)
-            }
-        }
-        other => ApiError::from(other),
-    }
-}
-
-fn map_re_execute_error(error: ServiceError) -> ApiError {
-    match error {
-        ServiceError::InvalidOperation { message } => {
-            if message.contains("re-execute requires a completed, failed, or cancelled execution") {
-                ApiError::conflict_with_code("re_execute.execution_active", message)
-            } else if message.contains("execution already running") {
                 ApiError::conflict_with_code("execution.already_running", message)
             } else if message.contains("terminal status") {
                 ApiError::conflict_with_code("task.terminal", message)

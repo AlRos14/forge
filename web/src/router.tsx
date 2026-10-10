@@ -20,7 +20,7 @@ import type { ForgeSettingsTab } from '@/pages/ForgeSettingsPage'
 import type { ProjectSettingsTab } from '@/pages/ProjectSettingsPage'
 import type { TaskDetailTab } from '@/pages/TaskDetailPage'
 import type { TaskListSortBy, TaskListSortOrder } from '@/pages/TaskListPage'
-import type { PaginatedResponse, Project } from '@/types/generated'
+import type { PaginatedResponse, Project, TaskLifecycleState } from '@/types/generated'
 import { useAuthStore } from '@/stores/auth'
 
 const AccountPage = lazy(() =>
@@ -52,20 +52,9 @@ const OAuthAuthorizePage = lazy(() =>
 const OperationsPage = lazy(() =>
   import('@/pages/OperationsPage').then((module) => ({ default: module.OperationsPage })),
 )
-const MissionControlPage = lazy(() =>
-  import('@/pages/MissionControlPage').then((module) => ({ default: module.MissionControlPage })),
-)
-const ChatPage = lazy(() =>
-  import('@/pages/ChatPage').then((module) => ({ default: module.ChatPage })),
-)
 const ProjectSettingsPage = lazy(() =>
   import('@/pages/ProjectSettingsPage').then((module) => ({
     default: module.ProjectSettingsPage,
-  })),
-)
-const ProjectOverviewPage = lazy(() =>
-  import('@/pages/ProjectOverviewPage').then((module) => ({
-    default: module.ProjectOverviewPage,
   })),
 )
 const ProjectReleasePage = lazy(() =>
@@ -91,17 +80,13 @@ const projectSettingsTabs = new Set<ProjectSettingsTab>([
   'members',
   'mcp',
   'hooks',
-  'analytics',
-  'workflow',
   'danger',
 ])
 const taskDetailTabs = new Set<TaskDetailTab>([
   'overview',
   'executions',
   'review',
-  'diff',
   'terminal',
-  'comments',
   'history',
 ])
 
@@ -183,42 +168,9 @@ const indexRoute = createRoute({
   },
 })
 
-type BoardRouteSearch = {
-  agentIds?: string
-  priorityMax?: number
-  priorityMin?: number
-  q?: string
-  task?: string
-  blockedOnly?: boolean
-  includeCancelled?: boolean
-  includeArchived?: boolean
-}
-
-function parseOptionalNumber(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value !== 'string' || value === '') return undefined
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : undefined
-}
-
-function parseOptionalBool(value: unknown): boolean | undefined {
-  if (value === true || value === 'true') return true
-  return undefined
-}
-
 const boardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/projects/$projectId/board',
-  validateSearch: (search: Record<string, unknown>): BoardRouteSearch => ({
-    agentIds: typeof search.agentIds === 'string' ? search.agentIds : undefined,
-    priorityMax: parseOptionalNumber(search.priorityMax),
-    priorityMin: parseOptionalNumber(search.priorityMin),
-    q: typeof search.q === 'string' ? search.q : undefined,
-    task: typeof search.task === 'string' ? search.task : undefined,
-    blockedOnly: parseOptionalBool(search.blockedOnly),
-    includeCancelled: parseOptionalBool(search.includeCancelled),
-    includeArchived: parseOptionalBool(search.includeArchived),
-  }),
   component: BoardRouteComponent,
 })
 
@@ -237,21 +189,20 @@ function BoardRouteComponent() {
 type TaskListRouteSearch = {
   sort_by: TaskListSortBy
   sort_order: TaskListSortOrder
-  agentIds?: string
-  blockedOnly?: boolean
-  includeCancelled?: boolean
-  includeArchived?: boolean
-  priorityMin?: number
-  priorityMax?: number
+  lifecycle_state?: TaskLifecycleState
 }
 
 const taskListSortByValues = new Set<TaskListSortBy>([
   'title',
-  'status',
-  'agent',
+  'lifecycle_state',
   'priority',
   'task_type',
   'updated_at',
+  'board_position',
+])
+
+const taskLifecycleStates = new Set<TaskLifecycleState>([
+  'backlog', 'ready', 'active', 'blocked', 'ready_to_merge', 'merging', 'done', 'cancelled',
 ])
 
 const taskListRoute = createRoute({
@@ -264,12 +215,9 @@ const taskListRoute = createRoute({
         ? (search.sort_by as TaskListSortBy)
         : 'updated_at',
     sort_order: search.sort_order === 'asc' ? 'asc' : 'desc',
-    agentIds: typeof search.agentIds === 'string' ? search.agentIds : undefined,
-    blockedOnly: parseOptionalBool(search.blockedOnly),
-    includeCancelled: parseOptionalBool(search.includeCancelled),
-    includeArchived: parseOptionalBool(search.includeArchived),
-    priorityMin: parseOptionalNumber(search.priorityMin),
-    priorityMax: parseOptionalNumber(search.priorityMax),
+    lifecycle_state: typeof search.lifecycle_state === 'string' && taskLifecycleStates.has(search.lifecycle_state as TaskLifecycleState)
+      ? search.lifecycle_state as TaskLifecycleState
+      : undefined,
   }),
   component: TaskListRouteComponent,
 })
@@ -279,32 +227,11 @@ function TaskListRouteComponent() {
   const search = taskListRoute.useSearch()
   const navigate = useNavigate({ from: '/projects/$projectId/tasks' })
 
-  const agentIds = search.agentIds ? search.agentIds.split(',').filter(Boolean) : []
-
-  const setFilter = (patch: {
-    agentIds?: string[]
-    blockedOnly?: boolean
-    includeCancelled?: boolean
-    includeArchived?: boolean
-    priorityMin?: number
-    priorityMax?: number
-  }) => {
+  const setFilter = (lifecycleState?: TaskLifecycleState) => {
     void navigate({
       search: (prev) => ({
         ...prev,
-        agentIds:
-          'agentIds' in patch
-            ? patch.agentIds && patch.agentIds.length > 0
-              ? patch.agentIds.join(',')
-              : undefined
-            : prev.agentIds,
-        blockedOnly: 'blockedOnly' in patch ? patch.blockedOnly || undefined : prev.blockedOnly,
-        includeCancelled:
-          'includeCancelled' in patch ? patch.includeCancelled || undefined : prev.includeCancelled,
-        includeArchived:
-          'includeArchived' in patch ? patch.includeArchived || undefined : prev.includeArchived,
-        priorityMin: 'priorityMin' in patch ? patch.priorityMin : prev.priorityMin,
-        priorityMax: 'priorityMax' in patch ? patch.priorityMax : prev.priorityMax,
+        lifecycle_state: lifecycleState,
       }),
     })
   }
@@ -314,12 +241,7 @@ function TaskListRouteComponent() {
       projectId={projectId}
       sortBy={search.sort_by}
       sortOrder={search.sort_order}
-      agentIds={agentIds}
-      blockedOnly={search.blockedOnly ?? false}
-      includeCancelled={search.includeCancelled ?? false}
-      includeArchived={search.includeArchived ?? false}
-      priorityMin={search.priorityMin}
-      priorityMax={search.priorityMax}
+      lifecycleState={search.lifecycle_state}
       onSortChange={(sortBy, sortOrder) => {
         void navigate({ search: (prev) => ({ ...prev, sort_by: sortBy, sort_order: sortOrder }) })
       }}
@@ -361,6 +283,12 @@ function TaskDetailTabRouteComponent() {
 type ExecutionDetailRouteSearch = {
   followUp?: boolean
   view?: ExecutionViewerMode
+}
+
+function parseOptionalBool(value: unknown): boolean | undefined {
+  if (value === true || value === 'true') return true
+  if (value === false || value === 'false') return false
+  return undefined
 }
 
 const executionDetailRoute = createRoute({
@@ -435,53 +363,15 @@ const operationsRoute = createRoute({
   component: OperationsPage,
 })
 
-const missionControlRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/mission-control',
-  component: MissionControlPage,
-})
-
-const chatRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/chat',
-  component: ChatRouteComponent,
-})
-
-function ChatRouteComponent() {
-  return <ChatPage />
-}
-
-const projectChatRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/projects/$projectId/chat',
-  component: ProjectChatRouteComponent,
-})
-
-const projectOverviewRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/projects/$projectId/overview',
-  component: ProjectOverviewRouteComponent,
-})
-
 const projectReleaseRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/projects/$projectId/releases/$releaseId',
   component: ProjectReleaseRouteComponent,
 })
 
-function ProjectOverviewRouteComponent() {
-  const { projectId } = projectOverviewRoute.useParams()
-  return <ProjectOverviewPage projectId={projectId} />
-}
-
 function ProjectReleaseRouteComponent() {
   const { projectId, releaseId } = projectReleaseRoute.useParams()
   return <ProjectReleasePage projectId={projectId} releaseId={releaseId} />
-}
-
-function ProjectChatRouteComponent() {
-  const { projectId } = projectChatRoute.useParams()
-  return <ChatPage projectId={projectId} />
 }
 
 const projectSettingsRoute = createRoute({
@@ -619,10 +509,6 @@ const routeTree = rootRoute.addChildren([
   daemonsRoute,
   daemonDetailRoute,
   operationsRoute,
-  missionControlRoute,
-  chatRoute,
-  projectChatRoute,
-  projectOverviewRoute,
   projectReleaseRoute,
   projectSettingsRoute,
   projectSettingsTabRoute,

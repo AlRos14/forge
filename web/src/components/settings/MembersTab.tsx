@@ -27,7 +27,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
-import type { MemberRole, ProjectMemberResponse, UserSearchResult } from '@/types/generated'
+import type { ProjectMemberResponse, UserSearchResult } from '@/types/generated'
+
+type MemberRole = string
 
 const ROLES: MemberRole[] = ['owner', 'admin', 'member', 'viewer']
 
@@ -66,7 +68,7 @@ function RoleBadge({ role }: { role: MemberRole }) {
       className={`inline-flex w-[68px] shrink-0 items-center justify-center rounded-sm border px-2 py-0.5 text-[11px] font-medium ${roleBadgeClass(role)}`}
     >
       {role === 'owner' && <Crown size={9} className="mr-1" weight="fill" />}
-      {ROLE_LABELS[role]}
+      {ROLE_LABELS[role] ?? role}
     </span>
   )
 }

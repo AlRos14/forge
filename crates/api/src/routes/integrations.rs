@@ -1,5 +1,6 @@
 use api_types::{
-    CreateIntegrationRequest, IntegrationResponse, PatchIntegrationRequest, SyncTriggerResponse,
+    ActorRef, CreateIntegrationRequest, IntegrationResponse, PatchIntegrationRequest,
+    SyncTriggerResponse,
 };
 use axum::{
     extract::{Json, Path, State},
@@ -19,6 +20,14 @@ use crate::{
 };
 
 fn integration_response(model: db::ProjectIntegration) -> IntegrationResponse {
+    let default_implementer = match (
+        model.default_assignee_type.as_deref(),
+        model.default_assignee_id,
+    ) {
+        (Some("agent"), Some(id)) => Some(ActorRef::Agent(id)),
+        (Some("user"), Some(id)) => Some(ActorRef::Human(id)),
+        _ => None,
+    };
     IntegrationResponse {
         id: model.id,
         project_id: model.project_id,
@@ -26,12 +35,10 @@ fn integration_response(model: db::ProjectIntegration) -> IntegrationResponse {
         base_url: model.base_url,
         owner: model.owner,
         repo: model.repo,
-        token_secret_ref: model.token_secret_ref,
+        credential_env_var: model.token_secret_ref,
+        default_implementer,
         poll_interval_secs: model.poll_interval_secs,
         sync_filter: serde_json::from_str(&model.sync_filter).unwrap_or_else(|_| json!({})),
-        default_task_state: model.default_task_state,
-        default_assignee_type: model.default_assignee_type,
-        default_assignee_id: model.default_assignee_id,
         enabled: model.enabled,
         last_polled_at: model.last_polled_at,
         created_at: model.created_at,
@@ -48,6 +55,7 @@ pub async fn create_integration(
         .platform
         .parse::<db::IntegrationPlatform>()
         .map_err(|_| ApiError::bad_request("invalid platform"))?;
+    let (default_assignee_type, default_assignee_id) = storage_actor(body.default_implementer);
 
     ProjectRepo::get_by_id(&*state.db, &project_id)
         .await?
@@ -61,12 +69,12 @@ pub async fn create_integration(
         base_url: body.base_url,
         owner: body.owner,
         repo: body.repo,
-        token_secret_ref: body.token_secret_ref,
+        token_secret_ref: body.credential_env_var,
         poll_interval_secs: body.poll_interval_secs.unwrap_or(300),
         sync_filter: body.sync_filter.unwrap_or_else(|| json!({})).to_string(),
-        default_task_state: body.default_task_state,
-        default_assignee_type: body.default_assignee_type,
-        default_assignee_id: body.default_assignee_id,
+        default_task_state: None,
+        default_assignee_type,
+        default_assignee_id,
         enabled: body.enabled.unwrap_or(true),
         last_polled_at: None,
         created_at: now.clone(),
@@ -103,6 +111,14 @@ pub async fn update_integration(
         .map(|platform| platform.parse::<db::IntegrationPlatform>())
         .transpose()
         .map_err(|_| ApiError::bad_request("invalid platform"))?;
+    let (default_assignee_type, default_assignee_id) = match body.default_implementer {
+        None => (None, None),
+        Some(None) => (Some(None), Some(None)),
+        Some(Some(actor)) => {
+            let (kind, id) = storage_actor(Some(actor));
+            (Some(kind), Some(id))
+        }
+    };
 
     let update = UpdateProjectIntegration {
         id: existing.id.clone(),
@@ -112,12 +128,12 @@ pub async fn update_integration(
         base_url: body.base_url,
         owner: body.owner,
         repo: body.repo,
-        token_secret_ref: body.token_secret_ref,
+        token_secret_ref: body.credential_env_var,
         poll_interval_secs: body.poll_interval_secs,
         sync_filter: body.sync_filter.as_ref().map(Value::to_string),
-        default_task_state: body.default_task_state.map(Some),
-        default_assignee_type: body.default_assignee_type.map(Some),
-        default_assignee_id: body.default_assignee_id.map(Some),
+        default_task_state: None,
+        default_assignee_type,
+        default_assignee_id,
         enabled: body.enabled,
         last_polled_at: None,
     };
@@ -128,6 +144,14 @@ pub async fn update_integration(
         .ok_or_else(|| ApiError::not_found("integration", project_id))?;
 
     Ok(Json(integration_response(updated)))
+}
+
+fn storage_actor(actor: Option<ActorRef>) -> (Option<String>, Option<String>) {
+    match actor {
+        Some(ActorRef::Agent(id)) => (Some("agent".to_owned()), Some(id)),
+        Some(ActorRef::Human(id)) => (Some("user".to_owned()), Some(id)),
+        None => (None, None),
+    }
 }
 
 pub async fn delete_integration(

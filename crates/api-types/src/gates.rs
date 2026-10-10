@@ -15,6 +15,7 @@ pub struct CreateTaskGateRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct ReviseGatePolicyRequest {
+    #[ts(type = "number | null")]
     pub expected_active_revision: Option<i64>,
     #[ts(type = "Record<string, unknown>")]
     pub policy: Value,
@@ -28,6 +29,7 @@ pub struct TaskGateResponse {
     pub gate_kind: String,
     pub scope_kind: String,
     pub scope_id: String,
+    #[ts(type = "number | null")]
     pub active_policy_revision: Option<i64>,
     pub created_at: String,
 }
@@ -51,6 +53,7 @@ pub enum TaskLifecycleState {
 pub struct TaskLifecycleResponse {
     pub task_id: String,
     pub state: TaskLifecycleState,
+    #[ts(type = "number")]
     pub version: i64,
     pub reason_kind: Option<String>,
     pub reason_ref: Option<String>,
@@ -58,11 +61,57 @@ pub struct TaskLifecycleResponse {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct TransitionTaskLifecycleRequest {
+    pub to_state: TaskLifecycleState,
+    #[ts(type = "number")]
+    pub expected_lifecycle_version: i64,
+    pub idempotency_key: String,
+    /// Exact GateEvaluation required for merge-readiness lifecycle edges.
+    pub gate_evaluation_id: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskLifecycleTransitionResponse {
+    pub task_id: String,
+    pub lifecycle: TaskLifecycleResponse,
+    pub transition_id: Option<String>,
+    pub gate_evaluation_id: Option<String>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskLifecycleTransitionFactResponse {
+    pub id: String,
+    pub task_id: String,
+    pub from_state: TaskLifecycleState,
+    pub to_state: TaskLifecycleState,
+    #[ts(type = "number")]
+    pub from_version: i64,
+    #[ts(type = "number")]
+    pub to_version: i64,
+    pub cause_kind: String,
+    pub cause_ref: Option<String>,
+    pub gate_evaluation_id: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub domain_event_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq)]
 #[ts(export)]
 pub struct GatePolicyRevisionResponse {
     pub gate_id: String,
+    #[ts(type = "number")]
     pub revision: i64,
+    #[ts(type = "number")]
     pub schema_version: i64,
     #[ts(type = "Record<string, unknown>")]
     pub policy: Value,
@@ -80,9 +129,11 @@ pub struct GateResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct GateEvaluationInputResponse {
+    #[ts(type = "number")]
     pub ordinal: i64,
     pub input_kind: String,
     pub input_id: String,
+    #[ts(type = "number")]
     pub input_version: i64,
     pub input_digest: String,
     pub producer_ref: Option<String>,
@@ -97,6 +148,7 @@ pub struct GateEvaluationResponse {
     pub id: String,
     pub gate_id: String,
     pub task_id: String,
+    #[ts(type = "number")]
     pub policy_revision: i64,
     pub outcome: String,
     pub input_digest: String,

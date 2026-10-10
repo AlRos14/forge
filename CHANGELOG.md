@@ -8,6 +8,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Plan PR12 aligns public REST, MCP, `forge-ctl`, web, generated TypeScript, and
+  SSE contracts with Architecture V2. Removed retired Main/Project Agent,
+  Product Genesis, Agent Chat, Attention, Charter/baseline, milestone/readiness,
+  workflow, legacy review, and native runtime endpoints and commands. Task
+  responses and list filters now use TaskLifecycle and exact lifecycle
+  versions; formal Review is an exact reviewer `review` Execution with its
+  frozen subject and ReviewReport. MCP exposes target lifecycle, Gate, role,
+  review, validation/evidence, and generic collaboration operations. Public
+  SSE now uses an explicit typed projection over durable DomainEvents plus a
+  small allowlist of safe runtime hints. Immutable Project Release snapshots
+  remain read-only history. Issue integrations now use the accurate public
+  `credential_env_var` name for the environment-variable key, return no
+  credential value, and accept an exact `default_implementer` ActorRef that
+  creates a TaskRole membership for imported issues; legacy state/singular-
+  assignee configuration is rejected.
+  Agent roster and availability responses rename `active_task_count` to
+  `active_execution_count`, which counts only running Executions attributed to
+  the exact Agent Actor, not active Tasks or RoleMemberships.
+  Ordinary Task creation no longer applies `ProjectSettings.default_role_assignments`
+  from historical Project rows. Legacy state-driven lifecycle hook scripts and
+  their EventBus emitter no longer run or block new Executions; their stored
+  settings remain intact, and generic durable Project hooks remain supported.
+  Operator health now reports blocked state from TaskLifecycle, retry pressure
+  from exact immutable retry receipts, and HarnessSession only from an
+  Execution's explicit reference; it no longer projects transition-log retry
+  counts, legacy task state, or `agent_session_id`.
+  Removed the unused `public_search` server configuration and its environment
+  variables with the retired chat tool; a saved top-level `public_search`
+  setting is rejected during config loading.
+  No storage is dropped; physical cleanup remains PR13 and general
+  naming/branding remains PR14.
+
 - Plan PR11 retires Main Agent, Project Agent, Agent Chat cognition, Product
   Genesis, bespoke Agent actions/commitments/inbox/questions, semantic Agent
   memory writes, Attention dispatch, and Project OS authority. V118 preserves

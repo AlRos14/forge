@@ -1,16 +1,13 @@
 use api_types::{
     AgentAvailabilityResponse, AgentResponse, CreateAgentRequest, DiscoveredDaemonResponse,
-    DiscoveredOptionsResponse, DuplicateAgentRequest, PaginatedResponse, UpdateAgentRequest,
+    DiscoveredOptionsResponse, PaginatedResponse, UpdateAgentRequest,
 };
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
-use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentTaskListQuery, DaemonRepo,
-    ExecutionRepo, TaskRepo, UpdateAgent,
-};
+use db::{now_rfc3339, Agent, AgentListQuery, AgentRepo, DaemonRepo, ExecutionRepo, UpdateAgent};
 use events::{event_timestamp, EventContext, ForgeEvent};
 use executors::{DiscoverContext, ExecutorKind};
 use serde_json::Value;
@@ -20,10 +17,7 @@ use sqlx::Row;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::auth::AuthenticatedUser,
-    routes::{
-        agent_response, page_request, parse_csv, serialize_json, task_page_request,
-        task_response_light, ListParams,
-    },
+    routes::{agent_response, page_request, parse_csv, serialize_json, ListParams},
     state::AppState,
 };
 
@@ -104,6 +98,7 @@ pub async fn list_agents(
             status,
             executor_type: params.executor_type.clone(),
             capabilities,
+            harness_only: true,
             page: page_request(&params)?,
         },
     )
@@ -114,9 +109,11 @@ pub async fn list_agents(
         if !can_view_agent(&agent, &user) {
             continue;
         }
-        let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+        let active_execution_count =
+            AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
         items.push(
-            build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+            build_agent_response_for_user(&state, agent, Some(active_execution_count), &user)
+                .await?,
         );
     }
     Ok(Json(PaginatedResponse {
@@ -136,9 +133,9 @@ pub async fn get_agent(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_execution_count = AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     Ok(Json(
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+        build_agent_response_for_user(&state, agent, Some(active_execution_count), &user).await?,
     ))
 }
 
@@ -148,26 +145,6 @@ pub async fn get_agent_usage(
     Path(id): Path<String>,
 ) -> ApiResult<Json<api_types::AgentUsageResponse>> {
     agent_usage_response(&state, &user, &id).await.map(Json)
-}
-
-pub async fn refresh_agent_usage(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(id): Path<String>,
-) -> ApiResult<Json<api_types::AgentUsageResponse>> {
-    let agent = AgentRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
-    require_agent_visible(&agent, &user, &id)?;
-
-    // The current domain has no server-local Codex/Cursor CLI Agent. CLI
-    // harness usage belongs to the daemon that executes it; native Agents use
-    // the embedded/provider-entry usage path instead. Keep this compatibility
-    // endpoint explicit rather than probing an unrelated server account.
-    Err(ApiError::conflict_with_code(
-        "usage_refresh_unsupported",
-        "Manual Agent usage refresh is unavailable in the current runtime model; CLI usage is refreshed from execution-host observations and native provider usage is exposed through provider entries",
-    ))
 }
 
 async fn agent_usage_response(
@@ -180,7 +157,6 @@ async fn agent_usage_response(
         .ok_or_else(|| ApiError::not_found("agent", id.to_owned()))?;
     require_agent_visible(&agent, user, id)?;
     let account_key = usage_account_key(&agent);
-    let manual_refresh_supported = false;
     let shared_account = usage_is_shared(&agent);
     // A pinned/local/explicit-credential Agent has an exact account key. An
     // unpinned remote CLI Agent does not: its scheduler-selected daemon is a
@@ -218,7 +194,6 @@ async fn agent_usage_response(
             executor_type: agent.executor_type,
             account_key,
             daemon_id: None,
-            manual_refresh_supported,
             shared_account,
             source: None,
             usage: None,
@@ -233,7 +208,6 @@ async fn agent_usage_response(
         executor_type: agent.executor_type,
         account_key: Some(row.get("account_key")),
         daemon_id: row.get("daemon_id"),
-        manual_refresh_supported,
         shared_account,
         source: Some(row.get("source")),
         usage: serde_json::from_str::<Value>(&row.get::<String, _>("usage_json")).ok(),
@@ -279,40 +253,6 @@ fn usage_is_shared(agent: &Agent) -> bool {
         .credential_ref
         .as_deref()
         .is_some_and(|reference| !reference.trim().is_empty())
-}
-
-pub async fn list_agent_tasks(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(id): Path<String>,
-    Query(params): Query<ListParams>,
-) -> ApiResult<Json<PaginatedResponse<api_types::TaskResponse>>> {
-    let agent = AgentRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
-    require_agent_visible(&agent, &user, &id)?;
-    let page = TaskRepo::list_by_executing_agent(
-        &*state.db,
-        AgentTaskListQuery {
-            agent_id: id,
-            include_archived: params.include_archived.unwrap_or(false),
-            include_cancelled: params.include_cancelled.unwrap_or(false),
-            include_deleted: false,
-            page: task_page_request(&params)?,
-        },
-    )
-    .await?;
-    let has_more = page.next_cursor.is_some();
-    let mut items = Vec::with_capacity(page.items.len());
-    for task in page.items {
-        items.push(task_response_light(&state.db, task).await?);
-    }
-    Ok(Json(PaginatedResponse {
-        items,
-        next_cursor: page.next_cursor,
-        has_more,
-        total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
-    }))
 }
 
 pub async fn update_agent(
@@ -367,9 +307,9 @@ pub async fn update_agent(
         },
     )
     .await?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_execution_count = AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     Ok(Json(
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+        build_agent_response_for_user(&state, agent, Some(active_execution_count), &user).await?,
     ))
 }
 
@@ -399,7 +339,7 @@ pub async fn pause_agent(
         let response = build_agent_response_for_user(
             &state,
             agent,
-            Some(AgentRepo::count_active_tasks(&*state.db, &id).await?),
+            Some(AgentRepo::count_running_executions(&*state.db, &id).await?),
             &user,
         )
         .await?;
@@ -417,9 +357,9 @@ pub async fn pause_agent(
         timestamp: event_timestamp(),
         context: EventContext::AgentPaused {},
     });
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_execution_count = AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     let response =
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?;
+        build_agent_response_for_user(&state, agent, Some(active_execution_count), &user).await?;
     Ok(Json(response))
 }
 
@@ -436,7 +376,7 @@ pub async fn resume_agent(
         let response = build_agent_response_for_user(
             &state,
             agent,
-            Some(AgentRepo::count_active_tasks(&*state.db, &id).await?),
+            Some(AgentRepo::count_running_executions(&*state.db, &id).await?),
             &user,
         )
         .await?;
@@ -454,29 +394,10 @@ pub async fn resume_agent(
         timestamp: event_timestamp(),
         context: EventContext::AgentResumed {},
     });
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_execution_count = AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     let response =
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?;
+        build_agent_response_for_user(&state, agent, Some(active_execution_count), &user).await?;
     Ok(Json(response))
-}
-
-pub async fn duplicate_agent(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(id): Path<String>,
-    Json(request): Json<DuplicateAgentRequest>,
-) -> ApiResult<Json<AgentResponse>> {
-    let existing = AgentRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
-    require_agent_manageable(&existing, &user, &id)?;
-    let agent =
-        AgentRepo::duplicate_agent(&*state.db, &id, new_uuid_v4(), request.name, now_rfc3339())
-            .await?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
-    Ok(Json(
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
-    ))
 }
 
 pub async fn agent_availability(
@@ -488,7 +409,7 @@ pub async fn agent_availability(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_execution_count = AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     let effective_status = compute_effective_status(&state.db, &agent).await?;
     let resolved_daemon = resolve_daemon_for_agent(&state.db, &agent).await.ok();
     let available = effective_status.as_str() == "active" || effective_status.as_str() == "busy";
@@ -515,7 +436,7 @@ pub async fn agent_availability(
         } else {
             None
         },
-        active_task_count,
+        active_execution_count,
         max_concurrent_tasks: agent.max_concurrent_tasks,
         reason,
     }))
@@ -578,7 +499,7 @@ pub async fn agent_discovered_options(
 async fn build_agent_response(
     state: &AppState,
     agent: Agent,
-    active_task_count: Option<i64>,
+    active_execution_count: Option<i64>,
 ) -> ApiResult<AgentResponse> {
     let effective_status = compute_effective_status(&state.db, &agent)
         .await?
@@ -587,7 +508,7 @@ async fn build_agent_response(
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
     Ok(agent_response(
         agent,
-        active_task_count,
+        active_execution_count,
         Some(effective_status),
         stats,
     ))
@@ -596,10 +517,10 @@ async fn build_agent_response(
 async fn build_agent_response_for_user(
     state: &AppState,
     agent: Agent,
-    active_task_count: Option<i64>,
+    active_execution_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
-    let mut response = build_agent_response(state, agent, active_task_count).await?;
+    let mut response = build_agent_response(state, agent, active_execution_count).await?;
     if !user.is_admin {
         response.daemon_id = None;
     }
@@ -618,11 +539,16 @@ fn parse_executor_kind(value: &str) -> ApiResult<ExecutorKind> {
 }
 
 fn can_view_agent(agent: &Agent, user: &AuthenticatedUser) -> bool {
-    agent.visibility == "global" || agent.owner_id.as_deref() == Some(&user.user_id)
+    is_harness_agent(agent)
+        && (agent.visibility == "global" || agent.owner_id.as_deref() == Some(&user.user_id))
 }
 
 fn can_manage_agent(agent: &Agent, user: &AuthenticatedUser) -> bool {
-    agent.owner_id.as_deref() == Some(&user.user_id)
+    is_harness_agent(agent) && agent.owner_id.as_deref() == Some(&user.user_id)
+}
+
+fn is_harness_agent(agent: &Agent) -> bool {
+    agent.backend_kind != "native" && agent.executor_type != "embedded"
 }
 
 fn require_agent_visible(agent: &Agent, user: &AuthenticatedUser, id: &str) -> ApiResult<()> {

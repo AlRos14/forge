@@ -229,7 +229,10 @@ async fn answer_routing_test_daemon(
         let result = match method.as_str() {
             api_types::METHOD_PROTOCOL_CAPABILITIES => serde_json::json!({
                 "schema_version": 1,
-                "features": [api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1]
+                "features": [
+                    api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
+                    api_types::DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1
+                ]
             }),
             api_types::METHOD_EXECUTION_START => serde_json::json!({
                 "execution_id": params["execution_id"],
@@ -2599,47 +2602,77 @@ async fn interactive_workspace_lease_uses_the_canonical_task_role_when_present()
 }
 
 #[tokio::test]
-async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
+async fn dispatch_initial_role_execution_creates_and_starts_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(NoDiffExecutor))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let daemon_id = agent.daemon_id.expect("Agent daemon binding");
+    let registry = routing_test_registry();
+    let outbound = register_routing_test_daemon(&registry, &daemon_id);
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_daemon_connections(Arc::clone(&registry));
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
+        .await
+        .expect("Agent joins implementer TaskRole");
+    let responder = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_id,
+        outbound,
+        std::time::Duration::from_secs(2),
+    ));
+
     let execution = service
         .dispatch_initial_role_execution(
             &task.id,
             &agent_id,
-            crate::workflow::default_roles::CODER,
+            "implementer",
             db::ExecutionPurpose::Implement,
             "implement the task".to_owned(),
         )
         .await
         .expect("initial role dispatch succeeds");
 
-    assert_eq!(execution.role, crate::workflow::default_roles::CODER);
+    assert_eq!(execution.role, "implementer");
     assert_eq!(execution.status, ExecutionStatus::Running);
+    assert_eq!(
+        execution.actor_ref(),
+        Some(db::ActorRef::Agent(agent_id.clone()))
+    );
     assert_eq!(execution.agent_id.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(execution.purpose, Some(db::ExecutionPurpose::Implement));
     assert_eq!(execution.summary.as_deref(), Some("implement the task"));
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let current = ExecutionRepo::get_by_id(&*db, &execution.id)
-                .await
-                .expect("execution loads")
-                .expect("execution exists");
-            if current.status == ExecutionStatus::Completed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("spawned execution completes");
+    assert!(execution.harness_session_id.is_none());
+    assert_eq!(
+        responder.await.expect("daemon responder joins"),
+        vec![
+            api_types::METHOD_PROTOCOL_CAPABILITIES,
+            api_types::METHOD_EXECUTION_START
+        ]
+    );
+    let current = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("Execution reloads")
+        .expect("Execution exists");
+    assert_eq!(current.status, ExecutionStatus::Running);
 }
 
 #[tokio::test]
@@ -3315,20 +3348,29 @@ async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_
 }
 
 #[tokio::test]
-async fn role_dispatch_runs_required_before_work_hook_before_execution_creation() {
+async fn role_dispatch_ignores_legacy_state_hook_settings() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(NoDiffExecutor))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let daemon_id = agent.daemon_id.expect("Agent daemon binding");
+    let registry = routing_test_registry();
+    let outbound = register_routing_test_daemon(&registry, &daemon_id);
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_daemon_connections(Arc::clone(&registry));
+    let marker_path = workspace_root.path().join("legacy-state-hook-ran");
     let settings = json!({
         "lifecycle_hooks": {
             "before_work": [{
                 "type": "script",
-                "command": "printf required-ok > required-hook.out; exit 0",
+                "command": format!("printf legacy-hook-ran > '{}'; exit 9", marker_path.display()),
                 "timeout_seconds": 5,
                 "blocking": true
             }]
@@ -3340,187 +3382,66 @@ async fn role_dispatch_runs_required_before_work_hook_before_execution_creation(
         .bind(&project_id)
         .execute(db.pool())
         .await
-        .expect("project settings update");
-    let agent_id = seed_agent(&db).await;
+        .expect("historical Project settings update");
     let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     service
-        .reassign_role(
-            role_assignment_input(
-                &task.id,
-                crate::workflow::default_roles::CODER,
-                Some(agent_id.clone()),
-                None,
-            ),
-            false,
-            false,
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
         )
         .await
-        .expect("coder role assignment succeeds");
+        .expect("implementer TaskRole creates");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
+        .await
+        .expect("Agent Actor joins the exact TaskRole");
 
-    let launched = service
+    let responder = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_id,
+        outbound,
+        std::time::Duration::from_secs(2),
+    ));
+    let execution = service
         .dispatch_initial_role_execution(
             &task.id,
             &agent_id,
-            crate::workflow::default_roles::CODER,
+            "implementer",
             db::ExecutionPurpose::Implement,
-            "run the required before-work hook".to_owned(),
+            "start scoped work".to_owned(),
         )
         .await
-        .expect("required hook passes and role dispatch succeeds");
+        .expect("legacy state hook does not block Execution admission");
 
-    let executions = ExecutionRepo::list_by_task(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .expect("executions list");
-    assert_eq!(executions.items.len(), 1);
     assert_eq!(
-        executions.items[0].role,
-        crate::workflow::default_roles::CODER,
-        "this dispatch is explicitly requested through the legacy coder role label"
+        responder.await.expect("daemon responder joins"),
+        vec![
+            api_types::METHOD_PROTOCOL_CAPABILITIES,
+            api_types::METHOD_EXECUTION_START
+        ]
     );
-    assert_eq!(
-        executions.items[0].agent_id.as_deref(),
-        Some(agent_id.as_str())
-    );
-    assert_eq!(launched.id, executions.items[0].id);
-
-    let workspace =
-        WorkspaceRepo::get_by_id(&*db, executions.items[0].workspace_id.as_deref().unwrap())
-            .await
-            .expect("workspace loads")
-            .expect("workspace exists");
-    let marker = std::fs::read_to_string(
-        std::path::Path::new(&workspace.worktree_path).join("required-hook.out"),
-    )
-    .expect("required hook marker exists");
-    assert_eq!(marker, "required-ok");
-}
-
-#[tokio::test]
-async fn role_dispatch_blocks_lifecycle_when_required_before_work_hook_fails() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(NoDiffExecutor))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let settings = json!({
-        "lifecycle_hooks": {
-            "before_work": [{
-                "type": "script",
-                "command": "echo preflight-out; echo preflight-err >&2; exit 9",
-                "timeout_seconds": 5,
-                "blocking": true
-            }]
-        }
-    });
-    sqlx::query("UPDATE project SET settings = ?, updated_at = ? WHERE id = ?")
-        .bind(settings.to_string())
-        .bind(now_rfc3339())
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("project settings update");
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(
-                &task.id,
-                crate::workflow::default_roles::CODER,
-                Some(agent_id.clone()),
-                None,
-            ),
-            false,
-            false,
-        )
-        .await
-        .expect("coder role assignment succeeds");
-
-    let result = service
-        .dispatch_initial_role_execution(
-            &task.id,
-            &agent_id,
-            crate::workflow::default_roles::CODER,
-            db::ExecutionPurpose::Implement,
-            "run the required before-work hook".to_owned(),
-        )
-        .await;
-    assert!(
-        result.is_err(),
-        "required hook failure rejects role dispatch"
-    );
-    let executions = ExecutionRepo::list_by_task(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .expect("executions list");
-    assert!(
-        executions.items.is_empty(),
-        "no execution should be created"
-    );
-
-    let blocked = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
+    assert!(!marker_path.exists(), "historical script was not executed");
     let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
         .await
-        .expect("task lifecycle lookup succeeds")
-        .expect("task lifecycle exists");
-    assert_eq!(lifecycle.state, db::TaskLifecycleState::Blocked);
-    let annotation: serde_json::Value = serde_json::from_str(
-        blocked
-            .error_annotation
-            .as_deref()
-            .expect("blocking annotation is recorded"),
-    )
-    .expect("annotation parses");
-    assert_eq!(annotation["type"], "before_work_hook_failed");
-    assert_eq!(annotation["artifact"]["kind"], "hook");
-    assert_eq!(annotation["hook"]["exit_code"], 9);
-    assert_eq!(annotation["hook"]["stdout"], "preflight-out\n");
-    assert!(annotation["hook"]["stderr"]
-        .as_str()
-        .expect("hook stderr is captured")
-        .contains("preflight-err\n"));
-    let recovery_actions = annotation["recovery_actions"]
-        .as_array()
-        .expect("recovery actions array");
-    assert!(recovery_actions.iter().any(|value| value == "retry_hook"));
-    assert!(recovery_actions
-        .iter()
-        .any(|value| value == "update_workspace_and_retry_hook"));
-    assert!(recovery_actions
-        .iter()
-        .any(|value| value == "skip_hook_once"));
-    assert!(recovery_actions.iter().any(|value| value == "cancel_task"));
-    let log_path = annotation["hook"]["log_path"]
-        .as_str()
-        .expect("hook log path recorded");
-    assert!(
-        std::path::Path::new(log_path).exists(),
-        "hook log path should exist: {log_path}"
+        .expect("TaskLifecycle lookup succeeds")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
+    let stored_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("Execution lookup succeeds")
+        .expect("Execution was admitted");
+    assert_eq!(
+        stored_execution.actor_ref(),
+        Some(db::ActorRef::Agent(agent_id))
     );
+    assert_eq!(stored_execution.role, "implementer");
+    assert_eq!(
+        stored_execution.purpose,
+        Some(db::ExecutionPurpose::Implement)
+    );
+    assert!(stored_execution.harness_session_id.is_none());
 }
 
 #[tokio::test]
@@ -3578,20 +3499,23 @@ async fn retired_workflow_recovery_actions_cannot_run_hooks_or_dispatch() {
 }
 
 #[tokio::test]
-async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_same_task() {
+async fn reviewer_dispatch_creates_formal_review_execution_without_legacy_review() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(ReviewOutputExecutor {
-            mutate_worktree: false,
-            commit_mutation: false,
-            remove_git_marker: false,
-        }))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let daemon_id = agent.daemon_id.expect("Agent daemon binding");
+    let registry = routing_test_registry();
+    let outbound = register_routing_test_daemon(&registry, &daemon_id);
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_daemon_connections(Arc::clone(&registry));
     let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
     sqlx::query("UPDATE task SET task_type = 'review' WHERE id = ?")
         .bind(&task.id)
@@ -3599,17 +3523,29 @@ async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_sam
         .await
         .expect("fixture marks this Task as a read-only Review operation");
 
-    TaskRoleAssignmentRepo::assign(
-        &*db,
-        role_assignment_input(
+    service
+        .create_task_role(
             &task.id,
             crate::workflow::default_roles::REVIEWER,
-            Some(agent_id.clone()),
-            None,
-        ),
-    )
-    .await
-    .expect("reviewer assignment created");
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole creates");
+    service
+        .add_task_role_member(
+            &task.id,
+            crate::workflow::default_roles::REVIEWER,
+            ActorRef::Agent(agent_id.clone()),
+        )
+        .await
+        .expect("Agent joins reviewer TaskRole");
+    let responder = tokio::spawn(answer_routing_test_daemon(
+        Arc::clone(&registry),
+        daemon_id,
+        outbound,
+        std::time::Duration::from_secs(2),
+    ));
 
     let execution = service
         .dispatch_initial_role_execution(
@@ -3621,21 +3557,32 @@ async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_sam
         )
         .await
         .expect("reviewer dispatch succeeds");
+    assert_eq!(
+        responder.await.expect("daemon responder joins"),
+        vec![
+            api_types::METHOD_PROTOCOL_CAPABILITIES,
+            api_types::METHOD_EXECUTION_START
+        ]
+    );
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let current = ExecutionRepo::get_by_id(&*db, &execution.id)
-                .await
-                .expect("execution loads")
-                .expect("execution exists");
-            if current.status == ExecutionStatus::Completed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("reviewer execution completes");
+    let current = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("Review Execution reloads")
+        .expect("Review Execution exists");
+    assert_eq!(current.role, crate::workflow::default_roles::REVIEWER);
+    assert_eq!(current.purpose, Some(db::ExecutionPurpose::Review));
+    assert_eq!(current.actor_ref(), Some(db::ActorRef::Agent(agent_id)));
+    assert_eq!(current.status, ExecutionStatus::Running);
+    let legacy_review_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("legacy Review row count");
+    assert_eq!(
+        legacy_review_count, 0,
+        "Review Execution creates no legacy row"
+    );
 }
 
 #[tokio::test]

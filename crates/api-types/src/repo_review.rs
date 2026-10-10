@@ -3,28 +3,17 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    project_hooks::ProjectHookRule, AuthorType, ReviewConfig, ReviewStatus, TaskResponse, WorkMode,
+    project_hooks::ProjectHookRule, AuthorType, ReviewStatus, TaskResponse, WorkMode,
     WorkflowDefinition,
 };
-
-fn default_json_object() -> Value {
-    Value::Object(Default::default())
-}
-
-fn default_charter_status() -> String {
-    "legacy_unverified".to_owned()
-}
-
-fn default_charter_setup_required() -> bool {
-    true
-}
 
 fn default_project_version() -> i64 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum DiffFileStatus {
     Added,
     Modified,
@@ -32,22 +21,30 @@ pub enum DiffFileStatus {
     Renamed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct FileDiffSummary {
     pub path: String,
     pub status: DiffFileStatus,
+    #[ts(type = "number")]
     pub additions: u64,
+    #[ts(type = "number")]
     pub deletions: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DiffStats {
+    #[ts(type = "number")]
     pub files_changed: u64,
+    #[ts(type = "number")]
     pub total_additions: u64,
+    #[ts(type = "number")]
     pub total_deletions: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DiffResponse {
     pub base_ref: String,
     pub head_ref: String,
@@ -58,21 +55,19 @@ pub struct DiffResponse {
     pub diff: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DiffEnvelope {
     pub data: DiffResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ProjectResponse {
     pub id: String,
     pub name: String,
-    #[serde(default = "default_json_object")]
-    pub settings: Value,
     #[serde(default)]
     pub project_hooks: Vec<ProjectHookRule>,
-    #[serde(default)]
-    pub default_review_config: Option<ReviewConfig>,
     #[serde(default)]
     pub primary_repo_id: Option<String>,
     #[serde(default)]
@@ -80,29 +75,17 @@ pub struct ProjectResponse {
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
-    pub workflow_template_name: Option<String>,
-    #[serde(default)]
     pub paused_at: Option<String>,
     #[serde(default)]
     pub paused: bool,
-    #[serde(default = "default_charter_status")]
-    pub charter_status: String,
-    #[serde(default = "default_charter_setup_required")]
-    pub charter_setup_required: bool,
-    #[serde(default)]
-    pub current_charter_id: Option<String>,
-    #[serde(default)]
-    pub current_charter_revision_id: Option<String>,
-    #[serde(default)]
-    pub current_charter_version: i64,
-    #[serde(default)]
-    pub primary_milestone_id: Option<String>,
     #[serde(default = "default_project_version")]
+    #[ts(type = "number")]
     pub version: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
+// Internal workflow storage/service DTOs remain until PR13 retires the
+// legacy engine. They are deliberately absent from the TypeScript export set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowTemplateSummary {
     pub name: String,
     pub display_name: String,
@@ -110,33 +93,13 @@ pub struct WorkflowTemplateSummary {
     pub is_builtin: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowTemplateResponse {
     pub name: String,
     pub display_name: String,
     pub description: String,
     pub is_builtin: bool,
     pub definition: WorkflowDefinition,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct SaveWorkflowTemplateRequest {
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    pub definition: WorkflowDefinition,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct UpdateProjectWorkflowRequest {
-    #[serde(default)]
-    pub template_name: Option<String>,
-    #[serde(default)]
-    pub definition: Option<WorkflowDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -160,6 +123,7 @@ pub struct RepoResponse {
 pub struct PrProviderStatus {
     pub provider_type: String,
     pub has_token: bool,
+    #[ts(type = "number")]
     pub polling_interval_seconds: i64,
 }
 
@@ -332,6 +296,7 @@ pub struct NotificationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct UnreadCountResponse {
+    #[ts(type = "number")]
     pub count: i64,
 }
 
@@ -349,10 +314,12 @@ pub struct PaginatedResponse<T> {
     pub total_count: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ErrorResponse {
     pub code: String,
     pub message: String,
+    #[ts(type = "Record<string, unknown> | null")]
     pub details: Option<Value>,
     pub request_id: String,
 }
@@ -362,7 +329,7 @@ mod tests {
     use super::ProjectResponse;
 
     #[test]
-    fn project_response_accepts_missing_compatibility_fields() {
+    fn project_response_deserializes_target_fields() {
         let response: ProjectResponse = serde_json::from_value(serde_json::json!({
             "id": "project-1",
             "name": "Forge",
@@ -372,12 +339,8 @@ mod tests {
         .expect("project response should deserialize without compatibility fields");
 
         assert_eq!(response.id, "project-1");
-        assert_eq!(response.settings, serde_json::json!({}));
         assert!(response.project_hooks.is_empty());
         assert!(!response.paused);
-        assert_eq!(response.charter_status, "legacy_unverified");
-        assert!(response.charter_setup_required);
-        assert_eq!(response.current_charter_version, 0);
         assert_eq!(response.version, 1);
     }
 }

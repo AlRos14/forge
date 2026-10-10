@@ -13,78 +13,18 @@ const TASK_ID = 'task-terminal-e2e'
 const SESSION_ID = 'term-terminal-e2e'
 const WORKSPACE_ID = 'ws-terminal-e2e'
 
-function emptyHooks() {
-  return { before_exit: [], on_exit: [], on_enter: [], after_enter: [] }
-}
-
-function mockWorkflow() {
-  return {
-    states: [
-      {
-        name: 'todo',
-        kind: 'initial',
-        column: 'Todo',
-        display_name: 'Todo',
-        role: null,
-        hooks: emptyHooks(),
-        gate_config: null,
-        config: {},
-      },
-      {
-        name: 'in_progress',
-        kind: 'active',
-        column: 'In Progress',
-        display_name: 'In Progress',
-        role: 'coder',
-        hooks: emptyHooks(),
-        gate_config: null,
-        config: {},
-      },
-      {
-        name: 'review',
-        kind: 'gate',
-        column: 'Review',
-        display_name: 'Review',
-        role: null,
-        hooks: emptyHooks(),
-        gate_config: null,
-        config: {},
-      },
-      {
-        name: 'done',
-        kind: 'terminal',
-        column: 'Done',
-        display_name: 'Done',
-        role: null,
-        hooks: emptyHooks(),
-        gate_config: null,
-        config: {},
-      },
-      {
-        name: 'cancelled',
-        kind: 'terminal',
-        column: 'Done',
-        display_name: 'Cancelled',
-        role: null,
-        hooks: emptyHooks(),
-        gate_config: null,
-        config: {},
-      },
-    ],
-    roles: [{ name: 'coder', display_name: 'Coder', description: '' }],
-    cancellation_state: 'cancelled',
-  }
-}
-
 function mockProject() {
   return {
     id: PROJECT_ID,
     name: 'Terminal E2E Project',
-    settings: {},
-    workflow_template_name: null,
-    default_review_config: { ci_steps: [], review_prompt: null },
+    project_hooks: [],
+    primary_repo_id: 'repo-terminal-e2e',
+    owner_id: 'e2e-user',
     created_at: '2026-05-20T00:00:00Z',
     updated_at: '2026-05-20T00:00:00Z',
+    paused_at: null,
+    paused: false,
+    version: 1,
   }
 }
 
@@ -94,27 +34,24 @@ function mockTask() {
     project_id: PROJECT_ID,
     repo_id: 'repo-terminal-e2e',
     parent_task_id: null,
-    assignee_type: null,
-    assignee_id: null,
     title: 'Terminal E2E task',
-    description: 'Exercise the embedded task terminal.',
+    description: 'Exercise the workspace terminal.',
     task_type: 'task',
-    status: 'in_progress',
+    lifecycle: {
+      task_id: TASK_ID,
+      state: 'active',
+      version: 2,
+      reason_kind: null,
+      reason_ref: null,
+      created_at: '2026-05-20T00:00:00Z',
+      updated_at: '2026-05-20T00:00:00Z',
+    },
     priority: 50,
     board_position: 10,
     subtask_order: null,
-    role_assignments: [],
-    remaining_retries: {},
-    execution_actions: [],
-    error_annotation: null,
-    blocked: null,
-    failed: null,
-    workflow_health: null,
-    workflow_exception: null,
+    task_roles: [],
     external_issue_number: null,
     external_issue_url: null,
-    review_passed_at: null,
-    archived_at: null,
     workspace: {
       id: WORKSPACE_ID,
       task_id: TASK_ID,
@@ -129,16 +66,6 @@ function mockTask() {
     },
     execution_observability: {
       execution_count: 0,
-      active_execution_id: null,
-      active_role: null,
-      active_started_at: null,
-      active_elapsed_seconds: null,
-      latest_execution_id: null,
-      latest_execution_status: null,
-      latest_role: null,
-      latest_started_at: null,
-      latest_stopped_at: null,
-      latest_runtime_seconds: null,
       total_runtime_seconds: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
@@ -147,8 +74,6 @@ function mockTask() {
       total_tokens: 0,
       total_cost_usd: null,
     },
-    plan_progress: null,
-    plan_artifact: null,
     version: 1,
     created_at: '2026-05-20T00:00:00Z',
     updated_at: '2026-05-20T00:00:00Z',
@@ -254,7 +179,7 @@ async function setupMockRoutes(page: Page, userId: string) {
   })
   await page.route(`**/api/v1/projects/${PROJECT_ID}`, (route) => {
     const url = route.request().url()
-    if (url.includes('/tasks') || url.includes('/workflow') || url.includes('/repos')) {
+    if (url.includes('/tasks') || url.includes('/repos')) {
       return route.fallback()
     }
     return route.fulfill({ json: mockProject() })
@@ -271,38 +196,30 @@ async function setupMockRoutes(page: Page, userId: string) {
   await page.route(`**/api/v1/projects/${PROJECT_ID}/tasks*`, (route) =>
     route.fulfill({ json: { items: [mockTask()], has_more: false } }),
   )
-  await page.route(`**/api/v1/projects/${PROJECT_ID}/workflow`, (route) =>
-    route.fulfill({ json: mockWorkflow() }),
-  )
   await page.route(`**/api/v1/tasks/${TASK_ID}`, (route) => {
     const url = route.request().url()
     if (
-      url.includes('/comments') ||
-      url.includes('/diff') ||
       url.includes('/executions') ||
       url.includes('/reviews') ||
+      url.includes('/validations') ||
+      url.includes('/gates') ||
+      url.includes('/lifecycle/transitions') ||
       url.includes('/terminals') ||
-      url.includes('/transitions') ||
       url.includes('/workspace')
     ) {
       return route.fallback()
     }
     return route.fulfill({ json: mockTask() })
   })
-  await page.route(`**/api/v1/tasks/${TASK_ID}/comments*`, (route) =>
-    route.fulfill({ json: { items: [], has_more: false } }),
-  )
-  await page.route(`**/api/v1/tasks/${TASK_ID}/diff`, (route) =>
-    route.fulfill({ status: 400, body: 'workspace.not_found' }),
-  )
-  await page.route(`**/api/v1/tasks/${TASK_ID}/external-links`, (route) =>
-    route.fulfill({ json: [] }),
-  )
   await page.route(`**/api/v1/tasks/${TASK_ID}/executions*`, (route) =>
     route.fulfill({ json: { items: [], has_more: false } }),
   )
   await page.route(`**/api/v1/tasks/${TASK_ID}/reviews*`, (route) => route.fulfill({ json: [] }))
-  await page.route(`**/api/v1/tasks/${TASK_ID}/transitions*`, (route) =>
+  await page.route(`**/api/v1/tasks/${TASK_ID}/validations*`, (route) =>
+    route.fulfill({ json: [] }),
+  )
+  await page.route(`**/api/v1/tasks/${TASK_ID}/gates*`, (route) => route.fulfill({ json: [] }))
+  await page.route(`**/api/v1/tasks/${TASK_ID}/lifecycle/transitions*`, (route) =>
     route.fulfill({ json: { items: [], has_more: false } }),
   )
   await page.route(`**/api/v1/tasks/${TASK_ID}/terminals**`, (route) => {

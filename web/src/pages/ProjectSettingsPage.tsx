@@ -2,22 +2,19 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
 import type { Icon } from '@phosphor-icons/react'
 import {
-  ChartBar,
   CloudArrowDown,
   Database,
-  FlowArrow,
-  FolderOpen,
   Gear,
   GitBranch,
   Lightning,
   Pause,
   Plugs,
+  FolderOpen,
   Users,
   WarningOctagon,
 } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import {
-  useAgentsQuery,
   useCreateRepo,
   useDaemonsQuery,
   useDeleteProject,
@@ -26,12 +23,9 @@ import {
   useReposQuery,
   useResumeProject,
   useUpdateProject,
-  useWorkflowQuery,
 } from '@/api/hooks'
-import { normalizeCiSteps } from '@/components/ci-steps-editor'
 import { ErrorBanner } from '@/components/error-banner'
 import { McpInstallControls } from '@/components/mcp-install-controls'
-import { AnalyticsTab } from '@/components/settings/AnalyticsTab'
 import { DangerTab } from '@/components/settings/DangerTab'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
@@ -39,13 +33,7 @@ import { MembersTab } from '@/components/settings/MembersTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
 import { ReposTab } from '@/components/settings/ReposTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
-import { WorkflowTab } from '@/components/settings/WorkflowTab'
-import {
-  ciStepsFromReviewConfig,
-  isRecord,
-  lifecycleHooksFromSettings,
-  settingsErrorMessage,
-} from '@/components/settings/project-settings-utils'
+import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
 import { emptyRepoForm, type RepoFormState } from '@/components/settings/RepoForm'
 import { Button } from '@/components/ui/button'
 import {
@@ -60,7 +48,6 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
-import type { DefaultRoleAssignment, LifecycleHooks } from '@/types/generated'
 
 export type ProjectSettingsTab =
   | 'general'
@@ -68,8 +55,6 @@ export type ProjectSettingsTab =
   | 'members'
   | 'mcp'
   | 'hooks'
-  | 'analytics'
-  | 'workflow'
   | 'danger'
 
 const SETTINGS_TABS: Array<{
@@ -83,8 +68,6 @@ const SETTINGS_TABS: Array<{
   { id: 'members', label: 'Members', icon: Users },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
-  { id: 'analytics', label: 'Analytics', icon: ChartBar },
-  { id: 'workflow', label: 'Workflow', icon: FlowArrow },
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
 ]
 
@@ -100,57 +83,23 @@ export function ProjectSettingsPage({
   initialTab?: ProjectSettingsTab
 }) {
   const projectQuery = useProjectQuery(projectId)
-  const workflowQuery = useWorkflowQuery(projectId)
   const updateProject = useUpdateProject()
   const deleteProject = useDeleteProject()
   const pauseProject = usePauseProject()
   const resumeProject = useResumeProject()
   const navigate = useNavigate()
 
-  const agentsQuery = useAgentsQuery()
-
   const [deletingProject, setDeletingProject] = useState(false)
 
   // Form state (all needed by saveProject)
   const [name, setName] = useState('')
-  const [ciSteps, setCiSteps] = useState<string[]>([])
-  const [lifecycleHooks, setLifecycleHooks] = useState<LifecycleHooks>({})
-  const [defaultRoleSelections, setDefaultRoleSelections] = useState<Record<string, string>>({})
-  const [automaticRecoveryEnabled, setAutomaticRecoveryEnabled] = useState(false)
-  const [automaticRecoveryAgentId, setAutomaticRecoveryAgentId] = useState('')
 
   const project = projectQuery.data
-  const roles = workflowQuery.data?.roles ?? []
-  const agents = agentsQuery.data?.items ?? []
 
   useEffect(() => {
     if (!project) return
     const timeout = window.setTimeout(() => {
       setName(project.name)
-      setCiSteps(ciStepsFromReviewConfig(project.default_review_config))
-      setLifecycleHooks(lifecycleHooksFromSettings(project.settings))
-      const rawAssignments = project.settings?.default_role_assignments
-      const assignments: DefaultRoleAssignment[] = Array.isArray(rawAssignments)
-        ? rawAssignments
-        : []
-      const selections: Record<string, string> = {}
-      for (const a of assignments) {
-        if (a.assignee_type === 'agent' && a.assignee_id) {
-          selections[a.role_name] = `agent:${a.assignee_id}`
-        } else if (a.assignee_type === 'user' && a.assignee_id === 'human') {
-          selections[a.role_name] = 'manual'
-        } else if (a.assignee_type === 'user' && a.assignee_id) {
-          selections[a.role_name] = `user:${a.assignee_id}`
-        }
-      }
-      setDefaultRoleSelections(selections)
-      const rawRecovery = isRecord(project.settings?.automatic_recovery)
-        ? project.settings.automatic_recovery
-        : {}
-      setAutomaticRecoveryEnabled(rawRecovery.enabled === true)
-      setAutomaticRecoveryAgentId(
-        typeof rawRecovery.agent_id === 'string' ? rawRecovery.agent_id : '',
-      )
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [project])
@@ -162,71 +111,12 @@ export function ProjectSettingsPage({
       toast.error('Project name is required')
       return
     }
-    for (const hooks of Object.values(lifecycleHooks)) {
-      for (const hook of hooks ?? []) {
-        if (hook.type !== 'script') continue
-        if (!hook.command.trim()) {
-          toast.error('Script command is required')
-          return
-        }
-        if (!Number.isInteger(hook.timeout_seconds) || hook.timeout_seconds < 1) {
-          toast.error('Script timeout must be 1 or greater')
-          return
-        }
-      }
-    }
-    if (automaticRecoveryEnabled && !automaticRecoveryAgentId) {
-      toast.error('Automatic recovery requires an agent')
-      return
-    }
-    const settingsWithoutRolePrompts: Record<string, unknown> = {
-      ...(isRecord(project.settings) ? project.settings : {}),
-    }
-    delete settingsWithoutRolePrompts.role_prompts
-    const defaultRoleAssignmentsList: DefaultRoleAssignment[] = roles.flatMap(
-      (role): DefaultRoleAssignment[] => {
-        const sel = defaultRoleSelections[role.name] ?? 'unassigned'
-        if (sel === 'unassigned') return []
-        if (sel === 'manual')
-          return [{ role_name: role.name, assignee_type: 'user', assignee_id: 'human' }]
-        if (sel.startsWith('user:'))
-          return [
-            {
-              role_name: role.name,
-              assignee_type: 'user',
-              assignee_id: sel.slice('user:'.length),
-            },
-          ]
-        return [
-          {
-            role_name: role.name,
-            assignee_type: 'agent',
-            assignee_id: sel.slice('agent:'.length),
-          },
-        ]
-      },
-    )
-    const nextSettings: Record<string, unknown> = {
-      ...settingsWithoutRolePrompts,
-      default_role_assignments: defaultRoleAssignmentsList,
-      lifecycle_hooks: lifecycleHooks,
-      automatic_recovery: {
-        enabled: automaticRecoveryEnabled,
-        agent_id: automaticRecoveryEnabled ? automaticRecoveryAgentId : null,
-        max_attempts: 1,
-      },
-    }
     updateProject.mutate(
       {
         projectId,
         body: {
           version: project.version,
           name: nextName,
-          settings: nextSettings,
-          default_review_config: {
-            ci_steps: normalizeCiSteps(ciSteps),
-            review_prompt: null,
-          },
         },
       },
       {
@@ -317,21 +207,8 @@ export function ProjectSettingsPage({
               pausedAt={project?.paused_at}
               pausePending={pauseProject.isPending || resumeProject.isPending}
               name={name}
-              ciSteps={ciSteps}
-              defaultRoleSelections={defaultRoleSelections}
-              roles={roles}
-              workflowIsLoading={workflowQuery.isLoading}
-              agents={agents}
-              agentsIsLoading={agentsQuery.isLoading}
-              agentsIsError={agentsQuery.isError}
-              automaticRecoveryEnabled={automaticRecoveryEnabled}
-              automaticRecoveryAgentId={automaticRecoveryAgentId}
               onNameChange={setName}
               onTogglePaused={toggleProjectPaused}
-              onCiStepsChange={setCiSteps}
-              onDefaultRoleSelectionsChange={setDefaultRoleSelections}
-              onAutomaticRecoveryEnabledChange={setAutomaticRecoveryEnabled}
-              onAutomaticRecoveryAgentIdChange={setAutomaticRecoveryAgentId}
               onSave={saveProject}
             />
           )}
@@ -347,20 +224,6 @@ export function ProjectSettingsPage({
               project={project}
               projectId={projectId}
               projectIsLoading={projectQuery.isLoading}
-              canSave={Boolean(project)}
-              isSaving={updateProject.isPending}
-              lifecycleHooks={lifecycleHooks}
-              onLifecycleHooksChange={setLifecycleHooks}
-              onSave={saveProject}
-            />
-          )}
-
-          {initialTab === 'analytics' && <AnalyticsTab projectId={projectId} />}
-
-          {initialTab === 'workflow' && (
-            <WorkflowTab
-              projectId={projectId}
-              workflowTemplateName={project?.workflow_template_name ?? undefined}
             />
           )}
 

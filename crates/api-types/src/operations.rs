@@ -5,6 +5,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::TaskLifecycleState;
+
 // Persisted orchestration operation identifiers shared by Agent action
 // admission, deterministic materialization, and API projections.
 pub const MAIN_CHARTER_READ_OPERATION: &str = "charter.read";
@@ -109,13 +111,14 @@ pub struct ActiveExecutionSummary {
     pub daemon_id: Option<String>,
     pub workspace_id: Option<String>,
     pub workspace_path: Option<String>,
-    pub session_id: Option<String>,
+    pub harness_session_id: Option<String>,
     pub started_at: String,
     pub runtime_seconds: f64,
     pub elapsed_seconds: f64,
     pub latest_event: Option<String>,
     pub last_event: Option<String>,
     pub last_event_time: Option<String>,
+    #[ts(type = "number")]
     pub turn_count: u32,
     pub token_totals: Option<TokenTotalsSummary>,
     #[ts(type = "Record<string, unknown> | null")]
@@ -128,8 +131,13 @@ pub struct ActiveExecutionSummary {
 pub struct BlockedTaskSummary {
     pub task_id: String,
     pub title: String,
-    pub blocked_reason: Option<String>,
-    pub blocked_since: Option<String>,
+    pub lifecycle_state: TaskLifecycleState,
+    #[ts(type = "number")]
+    pub lifecycle_version: i64,
+    pub transition_id: Option<String>,
+    pub reason_kind: Option<String>,
+    pub reason_ref: Option<String>,
+    pub blocked_since: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -147,7 +155,9 @@ pub struct DaemonIssueSummary {
 pub struct DaemonPressureSummary {
     pub daemon_id: String,
     pub hostname: Option<String>,
-    pub active_sessions: u32,
+    #[ts(type = "number")]
+    pub active_execution_count: u32,
+    #[ts(type = "number | null")]
     pub max_sessions: Option<u32>,
     pub at_capacity: bool,
 }
@@ -158,8 +168,10 @@ pub struct AgentPressureSummary {
     pub agent_id: String,
     pub agent_name: String,
     pub daemon_id: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: u32,
+    #[ts(type = "number")]
+    pub active_execution_count: u32,
+    #[ts(type = "number")]
+    pub max_concurrent_tasks: u32,
     pub at_capacity: bool,
 }
 
@@ -175,22 +187,34 @@ pub struct WorkspaceCleanupSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RetryPressureSummary {
+    pub retry_receipt_id: String,
     pub task_id: String,
     pub title: String,
-    pub attempt_count: u32,
-    pub max_attempts: Option<u32>,
-    pub current_state: String,
-    pub retry_reason: Option<String>,
-    pub due_time: Option<String>,
-    pub last_error: Option<String>,
+    pub failure_kind: String,
+    pub failure_ref: String,
+    pub source_event_id: String,
+    pub receipt_event_id: String,
+    #[ts(type = "number")]
+    pub attempt_number: u32,
+    #[ts(type = "number")]
+    pub retry_budget: u32,
+    pub disposition: String,
+    pub lifecycle_state: TaskLifecycleState,
+    #[ts(type = "number")]
+    pub lifecycle_version: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TokenTotalsSummary {
+    #[ts(type = "number")]
     pub input_tokens: i64,
+    #[ts(type = "number")]
     pub output_tokens: i64,
+    #[ts(type = "number")]
     pub cache_read_tokens: i64,
+    #[ts(type = "number")]
     pub cache_write_tokens: i64,
     pub cost_usd: Option<f64>,
 }
@@ -198,6 +222,7 @@ pub struct TokenTotalsSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct OperationsRefreshResponse {
+    #[ts(type = "number")]
     pub dispatched_tasks: u64,
     pub refreshed_at: String,
 }
@@ -206,9 +231,12 @@ pub struct OperationsRefreshResponse {
 #[ts(export)]
 pub struct UsageSummary {
     pub available: bool,
+    #[ts(type = "number | null")]
     pub total_input_tokens: Option<i64>,
+    #[ts(type = "number | null")]
     pub total_output_tokens: Option<i64>,
     pub total_cost_usd: Option<f64>,
+    #[ts(type = "number")]
     pub active_execution_count: u32,
 }
 
@@ -247,7 +275,9 @@ pub struct TaskPlanHistoryResponse {
 pub struct PlanChecklistItem {
     pub checked: bool,
     pub label: String,
+    #[ts(type = "number")]
     pub nesting_level: u32,
+    #[ts(type = "number")]
     pub line_number: u32,
 }
 
@@ -268,8 +298,11 @@ pub struct EffectiveExecutionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct PlanProgressSummary {
+    #[ts(type = "number")]
     pub total: u32,
+    #[ts(type = "number")]
     pub completed: u32,
+    #[ts(type = "number")]
     pub remaining: u32,
     pub available: bool,
     pub warnings: Vec<String>,

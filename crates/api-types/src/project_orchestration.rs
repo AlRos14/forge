@@ -437,6 +437,7 @@ pub struct ProjectCharterReadiness {
 pub struct ProjectCharterRevision {
     pub id: String,
     pub charter_id: String,
+    #[ts(type = "number")]
     pub revision_number: i64,
     #[serde(default)]
     pub base_revision_id: Option<String>,
@@ -475,6 +476,7 @@ pub struct ProjectCharter {
     pub current_draft_revision_id: Option<String>,
     #[serde(default)]
     pub current_approved_revision_id: Option<String>,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -508,6 +510,7 @@ pub struct ProjectCharterApproval {
     pub charter_revision_id: String,
     pub charter_content_digest: String,
     pub charter_render_digest: String,
+    #[ts(type = "number")]
     pub expected_charter_version: i64,
     pub approved_project_name: String,
     #[serde(default)]
@@ -601,6 +604,7 @@ pub struct CharterAmendment {
     pub rationale: String,
     pub material_diff: String,
     pub requested_by: PrincipalRef,
+    #[ts(type = "number")]
     pub expected_current_charter_version: i64,
     #[serde(default)]
     pub affected_decision_ids: Vec<String>,
@@ -873,6 +877,7 @@ pub struct ProjectDocument {
     pub current_draft_revision_id: Option<String>,
     #[serde(default)]
     pub current_approved_revision_id: Option<String>,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -885,6 +890,7 @@ pub struct ProjectDocumentRevision {
     pub id: String,
     pub document_id: String,
     pub project_id: String,
+    #[ts(type = "number")]
     pub revision_number: i64,
     #[serde(default)]
     pub base_revision_id: Option<String>,
@@ -912,6 +918,7 @@ pub struct ProjectDocumentApproval {
     pub revision_id: String,
     pub content_digest: String,
     pub render_digest: String,
+    #[ts(type = "number")]
     pub expected_document_version: i64,
     pub approved_by: PrincipalRef,
     pub authorization: AuthorizationProvenance,
@@ -1136,6 +1143,7 @@ pub struct ExecutionBaselineRevision {
     pub id: String,
     pub baseline_id: String,
     pub project_id: String,
+    #[ts(type = "number")]
     pub revision_number: i64,
     #[serde(default)]
     pub base_revision_id: Option<String>,
@@ -1161,6 +1169,7 @@ pub struct ExecutionBaseline {
     #[serde(default)]
     pub current_revision_id: Option<String>,
     pub lifecycle: ExecutionBaselineLifecycle,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -1175,6 +1184,7 @@ pub struct ExecutionBaselineApproval {
     pub revision_id: String,
     pub content_digest: String,
     pub render_digest: String,
+    #[ts(type = "number")]
     pub expected_project_version: i64,
     pub approved_by: PrincipalRef,
     pub authorization: AuthorizationProvenance,
@@ -1234,6 +1244,7 @@ pub struct ApproveExecutionBaselineRequest {
     /// Project version observed while the user reviewed this exact revision.
     /// Activation performs a second CAS against the then-current Project
     /// version; this value remains part of the durable approval receipt.
+    #[ts(type = "number")]
     pub expected_project_version: i64,
 }
 
@@ -1399,6 +1410,7 @@ pub struct MilestoneDefinitionRevision {
     pub id: String,
     pub milestone_id: String,
     pub project_id: String,
+    #[ts(type = "number")]
     pub revision_number: i64,
     #[serde(default)]
     pub base_revision_id: Option<String>,
@@ -1497,6 +1509,7 @@ pub struct WaiveMilestoneCheckRequest {
 pub struct ProjectMilestone {
     pub id: String,
     pub project_id: String,
+    #[ts(type = "number")]
     pub milestone_sequence: i64,
     pub canonical_id: String,
     #[serde(default)]
@@ -1505,6 +1518,7 @@ pub struct ProjectMilestone {
     pub lifecycle: MilestoneLifecycle,
     #[serde(default)]
     pub projection_reasons: Vec<MilestoneProjectionReason>,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -1544,6 +1558,7 @@ pub struct PrimaryMilestonePointer {
     pub project_id: String,
     #[serde(default)]
     pub primary_milestone_id: Option<String>,
+    #[ts(type = "number")]
     pub expected_project_version: i64,
     pub updated_at: String,
 }
@@ -1561,6 +1576,7 @@ pub struct ValidationResult {
     pub authorization: AuthorizationProvenance,
     pub input_digest: String,
     pub governing_revision_ids: Vec<String>,
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub event_id: String,
     pub evaluated_at: String,
@@ -1573,6 +1589,7 @@ pub struct ValidationResult {
 pub struct ReadinessInput {
     pub source_kind: String,
     pub source_id: String,
+    #[ts(type = "number")]
     pub source_version: i64,
     pub source_digest: String,
     pub observed_at: String,
@@ -1611,6 +1628,7 @@ pub struct ReadinessSnapshot {
     /// The immutable milestone CAS version used to compute this candidate.
     /// A readiness request is bound to this exact version; it is not inferred
     /// from the mutable milestone returned later.
+    #[ts(type = "number")]
     pub expected_milestone_version: i64,
     pub milestone_definition_revision_id: String,
     pub baseline_id: String,
@@ -1668,6 +1686,7 @@ pub struct MediaAsset {
     pub project_id: String,
     pub original_filename: String,
     pub content_type: String,
+    #[ts(type = "number")]
     pub byte_size: u64,
     pub checksum: String,
     pub availability: EvidenceAvailability,
@@ -1714,6 +1733,7 @@ pub struct EvidenceAttachment {
     pub availability: EvidenceAvailability,
     pub author: PrincipalRef,
     pub captured_at: String,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     #[serde(default)]
@@ -1766,6 +1786,7 @@ pub enum ReleaseEvidenceAvailability {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseTaskReference {
     pub task_id: String,
+    #[ts(type = "number")]
     pub task_version: i64,
     pub task_type: String,
     pub task_state: String,
@@ -1811,10 +1832,12 @@ pub struct ReleaseSnapshot {
     pub project_id: String,
     pub milestone_id: String,
     pub milestone_canonical_id: String,
+    #[ts(type = "number")]
     pub release_revision: i64,
     pub release_identity: String,
     pub milestone_definition_revision_id: String,
     pub milestone_definition_digest: String,
+    #[ts(type = "number")]
     pub expected_milestone_version: i64,
     #[serde(default)]
     pub display_label: Option<String>,
@@ -1858,9 +1881,11 @@ pub struct ProjectRelease {
     pub id: String,
     pub project_id: String,
     pub milestone_id: String,
+    #[ts(type = "number")]
     pub release_sequence: i64,
     pub release_identity: String,
     pub snapshot: ReleaseSnapshot,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
 }
@@ -1893,11 +1918,17 @@ pub enum OverviewProjectionState {
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct TaskProgressCounts {
+    #[ts(type = "number")]
     pub total: i64,
+    #[ts(type = "number")]
     pub backlog: i64,
+    #[ts(type = "number")]
     pub active: i64,
+    #[ts(type = "number")]
     pub review: i64,
+    #[ts(type = "number")]
     pub terminal: i64,
+    #[ts(type = "number")]
     pub blocked: i64,
 }
 
@@ -1905,12 +1936,19 @@ pub struct TaskProgressCounts {
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceCheckSummary {
+    #[ts(type = "number")]
     pub required_total: i64,
+    #[ts(type = "number")]
     pub passed: i64,
+    #[ts(type = "number")]
     pub failed: i64,
+    #[ts(type = "number")]
     pub missing: i64,
+    #[ts(type = "number")]
     pub stale: i64,
+    #[ts(type = "number")]
     pub waived: i64,
+    #[ts(type = "number")]
     pub unavailable: i64,
 }
 
@@ -1982,6 +2020,7 @@ pub struct ProjectOverview {
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct MutationEnvelope {
+    #[ts(type = "number")]
     pub expected_version: i64,
     #[serde(default)]
     pub expected_digest: Option<String>,
@@ -2016,10 +2055,12 @@ pub struct ApproveProjectCharterRequest {
     pub revision_id: String,
     pub content_digest: String,
     pub render_digest: String,
+    #[ts(type = "number")]
     pub expected_charter_version: i64,
     /// Project version observed while the user reviewed this exact Charter
     /// revision. Genesis approvals have no Project and must omit this field;
     /// Project adoption/amendment approvals must provide a positive version.
+    #[ts(type = "number | null")]
     pub expected_project_version: Option<i64>,
     pub approved_project_name: String,
     #[serde(default)]

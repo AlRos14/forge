@@ -30,12 +30,6 @@ pub(crate) async fn dispatch_with_context(
         "tools/list" => handle_tools_list(context),
         "tools/call" => {
             let params: ToolCallParams = parse_params(params)?;
-            if is_retired_vertical_tool(&params.name) {
-                return Err(McpToolError::new(-32040, "operation retired").with_data(json!({
-                    "code": "operation_retired",
-                    "message": "This Main Agent, Project Agent, or Agent memory operation was retired in Plan PR11"
-                })));
-            }
             let arguments = match params.arguments {
                 Value::Null => json!({}),
                 arguments => arguments,
@@ -46,18 +40,6 @@ pub(crate) async fn dispatch_with_context(
         }
         _ => Err(McpToolError::new(-32601, "method not found")),
     }
-}
-
-fn is_retired_vertical_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "forge_set_main_agent"
-            | "forge_set_project_agent"
-            | "forge_send_agent_chat_message"
-            | "forge_create_agent_handoff"
-            | "forge_memory_search"
-            | "forge_memory_get"
-    )
 }
 
 async fn apply_project_scope(
@@ -104,9 +86,50 @@ async fn apply_project_scope(
         return Ok(arguments);
     }
 
-    if tool_name == "forge_follow_up_execution" {
+    if matches!(
+        tool_name,
+        "forge_follow_up_execution" | "forge_get_review_execution"
+    ) {
         let execution_id = required_string_arg(object, "execution_id")?;
         assert_execution_in_scope(state, project_id, execution_id).await?;
+    }
+    if tool_name == "forge_get_gate" {
+        let id = required_string_arg(object, "gate_id")?;
+        let gate = db::GateRepo::get_gate(&*state.db, id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("Gate", id.to_owned()))?;
+        assert_task_in_scope(state, project_id, &gate.task_id).await?;
+    }
+    if matches!(
+        tool_name,
+        "forge_revise_gate_policy" | "forge_evaluate_gate"
+    ) {
+        let id = required_string_arg(object, "gate_id")?;
+        let gate = db::GateRepo::get_gate(&*state.db, id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("Gate", id.to_owned()))?;
+        assert_task_in_scope(state, project_id, &gate.task_id).await?;
+    }
+    if tool_name == "forge_get_gate_evaluation" {
+        let id = required_string_arg(object, "evaluation_id")?;
+        let evaluation = db::GateRepo::get_gate_evaluation(&*state.db, id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("GateEvaluation", id.to_owned()))?;
+        assert_task_in_scope(state, project_id, &evaluation.task_id).await?;
+    }
+    if tool_name == "forge_get_validation_run" {
+        let id = required_string_arg(object, "validation_run_id")?;
+        let run = db::ValidationRunRepo::get_validation_run(&*state.db, id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("ValidationRun", id.to_owned()))?;
+        assert_task_in_scope(state, project_id, &run.task_id).await?;
+    }
+    if tool_name == "forge_get_evidence" {
+        let id = required_string_arg(object, "evidence_id")?;
+        let evidence = db::ValidationRunRepo::get_evidence(&*state.db, id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("Evidence", id.to_owned()))?;
+        assert_task_in_scope(state, project_id, &evidence.task_id).await?;
     }
 
     Ok(arguments)
@@ -119,27 +142,34 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
             | "forge_list_tasks"
             | "forge_get_project"
             | "forge_update_project"
-            | "forge_update_project_lifecycle_hooks"
-            | "forge_memory_search"
-            | "forge_get_project_agent"
-            | "forge_set_project_agent"
-            | "forge_list_agent_handoffs"
-            | "forge_get_agent_handoff"
-            | "forge_create_agent_handoff"
+            | "forge_update_project_hooks"
     )
 }
 
 fn task_scope_field(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "forge_get_task"
-        | "forge_preview_prompt"
-        | "forge_assign_agent"
-        | "forge_cancel_task"
+        | "forge_update_task"
         | "forge_get_task_diff"
         | "forge_list_executions"
-        | "forge_update_task"
-        | "forge_transition_task" => Some("task_id"),
-        "forge_create_sub_tasks" => Some("parent_task_id"),
+        | "forge_create_sub_tasks"
+        | "forge_add_task_dependency"
+        | "forge_remove_task_dependency"
+        | "forge_list_task_dependencies"
+        | "forge_get_task_lifecycle"
+        | "forge_list_task_lifecycle_transitions"
+        | "forge_transition_task_lifecycle"
+        | "forge_list_task_roles"
+        | "forge_create_task_role"
+        | "forge_add_task_role_member"
+        | "forge_create_task_gate"
+        | "forge_list_task_review_executions"
+        | "forge_list_validation_runs"
+        | "forge_list_task_artifacts"
+        | "forge_list_task_messages"
+        | "forge_list_task_handoffs"
+        | "forge_list_task_proposals"
+        | "forge_list_task_decisions" => Some("task_id"),
         _ => None,
     }
 }

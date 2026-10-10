@@ -15,20 +15,17 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
-import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/cn'
 import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
-import type { AgentChatEntry } from '@/features/agent-chat/types'
 import {
   useAgentProviderCapabilitiesQuery,
-  useCreateEmbeddedAgentMutation,
   useRegisterHarnessAgentMutation,
 } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { CliRuntimeEntryResponse, ProviderEntryResponse } from '@/types/generated'
 import { EmptyPanel, ErrorPanel, LoadingPanel, StateBadge, StatusDot } from '@/features/federation/components'
 import { AgentDetailPanel } from './AgentDetailPanel'
-import { DEFAULT_CEILING, humanize, runtimeDisplayNames, runtimeOptionsForEntry } from './format'
+import { humanize, runtimeDisplayNames, runtimeOptionsForEntry } from './format'
 
 type WizardRuntime = { runtime: string; support_level: string; reason: string | null }
 
@@ -49,7 +46,6 @@ export function NewAgentDialog({
   onAddProvider: () => void
 }) {
   const capabilities = useAgentProviderCapabilitiesQuery()
-  const createEmbedded = useCreateEmbeddedAgentMutation()
   const registerHarness = useRegisterHarnessAgentMutation()
   const [entryId, setEntryId] = useState<string | null>(preselectedEntryId)
   const [cliKind, setCliKind] = useState<string | null>(null)
@@ -59,7 +55,6 @@ export function NewAgentDialog({
   const [model, setModel] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null)
   const [permissionPolicy, setPermissionPolicy] = useState<string | null>(null)
-  const [systemPrompt, setSystemPrompt] = useState('')
   const [error, setError] = useState<string>()
   const inFlight = useRef(false)
 
@@ -73,7 +68,6 @@ export function NewAgentDialog({
     setModel('')
     setReasoningEffort(null)
     setPermissionPolicy(null)
-    setSystemPrompt('')
     setError(undefined)
   }, [open, preselectedEntryId])
 
@@ -88,7 +82,7 @@ export function NewAgentDialog({
     ? capabilities.data?.items.find((item) => item.provider === selectedEntry.provider)
     : undefined
   const step: 1 | 2 | 3 = !selectedEntry && !cliKind ? 1 : !runtime ? 2 : 3
-  const discovered = useDiscoveredOptions(null, runtime === 'direct' ? null : runtime)
+  const discovered = useDiscoveredOptions(null, runtime)
   const reasoningOptionsForModel = useMemo(
     () => getReasoningOptionsForModel(discovered.data, model),
     [discovered.data, model],
@@ -117,31 +111,15 @@ export function NewAgentDialog({
     inFlight.current = true
     setError(undefined)
     try {
-      if (runtime === 'direct' && selectedEntry) {
-        if (!model.trim()) {
-          setError('A model is required for a direct agent.')
-          return
-        }
-        await createEmbedded.mutateAsync({
-          name: name.trim(),
-          description: description.trim() ? description.trim() : null,
-          credential_id: selectedEntry.id,
-          model: model.trim(),
-          system_prompt: systemPrompt.trim() ? systemPrompt.trim() : null,
-          account_permission_ceiling: DEFAULT_CEILING,
-          tool_policy: DEFAULT_CEILING,
-        })
-      } else {
-        await registerHarness.mutateAsync({
-          name: name.trim(),
-          description: description.trim() ? description.trim() : null,
-          executor_type: runtime,
-          model: model.trim() ? model.trim() : null,
-          reasoning_effort: reasoningEffort,
-          permission_policy: permissionPolicy,
-          credential_id: selectedEntry?.id ?? null,
-        })
-      }
+      await registerHarness.mutateAsync({
+        name: name.trim(),
+        description: description.trim() ? description.trim() : null,
+        executor_type: runtime,
+        model: model.trim() ? model.trim() : null,
+        reasoning_effort: reasoningEffort,
+        permission_policy: permissionPolicy,
+        credential_id: selectedEntry?.id ?? null,
+      })
       onClose()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'The agent could not be created.')
@@ -305,29 +283,17 @@ export function NewAgentDialog({
                 />
               </div>
               <div className="space-y-2">
-                {runtime === 'direct' ? (
-                  <>
-                    <Label htmlFor="agent-model">Model</Label>
-                    <Input
-                      id="agent-model"
-                      value={model}
-                      onChange={(event) => setModel(event.target.value)}
-                      required
-                    />
-                  </>
-                ) : (
-                  <ModelSelector
-                    id="agent-model"
-                    models={discovered.data?.models ?? []}
-                    recentModelIds={[]}
-                    value={model || null}
-                    isLoading={discovered.isLoading}
-                    hasError={discovered.isError}
-                    onChange={(value) => setModel(value ?? '')}
-                  />
-                )}
+                <ModelSelector
+                  id="agent-model"
+                  models={discovered.data?.models ?? []}
+                  recentModelIds={[]}
+                  value={model || null}
+                  isLoading={discovered.isLoading}
+                  hasError={discovered.isError}
+                  onChange={(value) => setModel(value ?? '')}
+                />
               </div>
-              {runtime !== 'direct' && reasoningOptionsForModel.length > 0 ? (
+              {reasoningOptionsForModel.length > 0 ? (
                 <ReasoningSelector
                   id="agent-reasoning"
                   options={reasoningOptionsForModel}
@@ -337,7 +303,7 @@ export function NewAgentDialog({
                   onChange={setReasoningEffort}
                 />
               ) : null}
-              {runtime !== 'direct' && (discovered.data?.permissionPolicies.length ?? 0) > 0 ? (
+              {(discovered.data?.permissionPolicies.length ?? 0) > 0 ? (
                 <PolicySelector
                   id="agent-permission-policy"
                   policies={discovered.data?.permissionPolicies}
@@ -354,18 +320,6 @@ export function NewAgentDialog({
                   placeholder="What this agent is for"
                 />
               </div>
-              {runtime === 'direct' ? (
-                <div className="space-y-2 sm:col-span-2">
-                  <Label htmlFor="agent-prompt">System prompt (optional)</Label>
-                  <Textarea
-                    id="agent-prompt"
-                    value={systemPrompt}
-                    onChange={(event) => setSystemPrompt(event.target.value)}
-                    placeholder="A bounded role for this agent"
-                    rows={3}
-                  />
-                </div>
-              ) : null}
             </div>
             {error ? (
               <p role="alert" className="text-xs text-destructive">
@@ -376,9 +330,9 @@ export function NewAgentDialog({
               <Button type="button" variant="ghost" onClick={() => setRuntime(null)}>
                 Back
               </Button>
-              <Button type="submit" disabled={createEmbedded.isPending || registerHarness.isPending}>
+              <Button type="submit" disabled={registerHarness.isPending}>
                 <ShieldCheck size={15} aria-hidden />
-                {createEmbedded.isPending || registerHarness.isPending ? 'Creating…' : 'Create agent'}
+                {registerHarness.isPending ? 'Creating…' : 'Create agent'}
               </Button>
             </DialogFooter>
           </form>
@@ -397,7 +351,7 @@ function RosterRow({
   selected: boolean
   onSelect: () => void
 }) {
-  const runtime = agent.executor_type === 'embedded' ? 'direct' : agent.executor_type
+  const runtime = agent.executor_type
   return (
     <button
       type="button"
@@ -447,7 +401,6 @@ function EmptyDetailPanel() {
 export function AgentsTab({
   agents,
   entries,
-  chatEntries,
   isLoading,
   isError,
   onRetry,
@@ -460,7 +413,6 @@ export function AgentsTab({
 }: {
   agents: FederatedAgent[]
   entries: ProviderEntryResponse[]
-  chatEntries: AgentChatEntry[]
   isLoading: boolean
   isError: boolean
   onRetry: () => void
@@ -517,13 +469,13 @@ export function AgentsTab({
         <ErrorPanel
           title="Agent roster unavailable"
           onRetry={onRetry}
-          description="The agent roster is unavailable. Existing Agent Chat history remains server-authoritative."
+          description="The external harness Agent roster is unavailable."
         />
       ) : null}
       {!isLoading && !isError && agents.length === 0 ? (
         <EmptyPanel
           title="No agents yet"
-          description="1. Connect a provider. 2. Create an agent on it — directly or through a CLI harness."
+          description="Connect a provider or CLI runtime, then register an Agent for that external harness."
           icon={<Robot size={19} />}
           action={
             <Button onClick={onNewAgent}>
@@ -607,7 +559,6 @@ export function AgentsTab({
               <AgentDetailPanel
                 agent={selectedAgent}
                 entries={entries}
-                chatEntries={chatEntries}
                 onChangeModel={onChangeModel}
               />
             ) : (
