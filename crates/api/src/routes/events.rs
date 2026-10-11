@@ -169,6 +169,7 @@ async fn public_event_is_visible(
             (Some("project"), Some(project_id)) => {
                 project_is_visible(db, project_id, user_id).await
             }
+            (Some("user"), Some(recipient_id)) => recipient_id == user_id,
             (Some("task"), Some(task_id)) => {
                 let Ok(Some(task)) = TaskRepo::get_by_id(db, task_id, false).await else {
                     return false;
@@ -239,7 +240,7 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
         ("project.updated", events::EventContext::ProjectUpdated {}) => {
             (PublicEventType::ProjectUpdated, json!({}))
         }
-        ("project.deleted", events::EventContext::ProjectDeleted {}) => {
+        ("project.deleted", events::EventContext::ProjectDeleted { .. }) => {
             (PublicEventType::ProjectDeleted, json!({}))
         }
         ("project.paused", events::EventContext::ProjectPaused { .. }) => {
@@ -289,10 +290,14 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
     let (scope_type, scope_id) = match &event.context {
         events::EventContext::ProjectCreated { .. }
         | events::EventContext::ProjectUpdated {}
-        | events::EventContext::ProjectDeleted {}
         | events::EventContext::ProjectPaused { .. }
         | events::EventContext::ProjectResumed {} => {
             (Some("project".to_owned()), Some(event.entity_id.clone()))
+        }
+        events::EventContext::ProjectDeleted { actor_user_id } => {
+            // The Project no longer exists, so the exact authenticated actor
+            // who completed deletion is the only verifiable recipient.
+            (Some("user".to_owned()), Some(actor_user_id.clone()))
         }
         events::EventContext::ProjectHookRunChanged { project_id, .. } => {
             (Some("project".to_owned()), Some(project_id.clone()))
@@ -488,5 +493,27 @@ mod tests {
         assert!(!public_event_is_visible(&db, "owner-b", false, &project_event).await);
         assert!(public_event_is_visible(&db, "owner-a", false, &task_event).await);
         assert!(!public_event_is_visible(&db, "owner-b", false, &task_event).await);
+    }
+
+    #[tokio::test]
+    async fn project_deleted_hint_is_scoped_to_the_authenticated_actor() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        db::run_migrations(&pool).await.expect("migrations");
+        let db = SqliteDb::new(pool);
+        let hint = events::ForgeEvent {
+            event_type: "project.deleted".to_owned(),
+            entity_id: "deleted-private-project".to_owned(),
+            timestamp: "2026-10-11T00:00:00Z".to_owned(),
+            context: events::EventContext::ProjectDeleted {
+                actor_user_id: "owner-a".to_owned(),
+            },
+        };
+        let public_event = project_runtime_hint(&hint).expect("allowlisted Project deletion hint");
+        assert_eq!(public_event.scope_type.as_deref(), Some("user"));
+        assert_eq!(public_event.scope_id.as_deref(), Some("owner-a"));
+        assert!(public_event_is_visible(&db, "owner-a", false, &public_event).await);
+        assert!(!public_event_is_visible(&db, "user-b", false, &public_event).await);
     }
 }

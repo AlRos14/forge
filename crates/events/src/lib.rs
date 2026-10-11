@@ -288,7 +288,9 @@ pub enum EventContext {
         name: String,
     },
     ProjectUpdated {},
-    ProjectDeleted {},
+    ProjectDeleted {
+        actor_user_id: String,
+    },
     ProjectPaused {
         paused_at: String,
     },

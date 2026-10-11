@@ -241,8 +241,10 @@ gap. Agent Chat, Attention, old workflow transitions, `task.status`, and
 legacy Review-row events are not public event types.
 
 SSE requires authentication and filters Project- and Task-scoped events through
-the same owner/member visibility rule as REST. Operations status hints are
-limited to administrators; resync hints carry no Project data.
+the same owner/member visibility rule as REST. Since a deleted Project cannot
+be resolved after teardown, `project.deleted` is scoped only to the authenticated
+user who completed that deletion. Operations status hints are limited to
+administrators; resync hints carry no Project data.
 
 ## MCP
 

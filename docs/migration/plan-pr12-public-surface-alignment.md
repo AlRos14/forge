@@ -194,6 +194,8 @@ migrations, rename Forge, or create cross-model synchronization.
   before pagination, so private Agent rows do not affect visible cursors or
   `has_more` metadata. Historical Release snapshot reads now reuse the shared
   Project visibility helper, including the existing ownerless-public rule.
+  `project.deleted` remains scoped to the exact authenticated actor who
+  completed deletion; the deleted Project row is no longer consulted.
   ReviewReport submission is shown only for a running formal Review Execution
   owned by the current Human with no existing report. No schema or migration
   changes; PR13 storage cleanup and PR14 naming work remain excluded.
@@ -204,12 +206,15 @@ migrations, rename Forge, or create cross-model synchronization.
 
 - `cargo test -p api --test pr12_public_surface --locked --offline` (12 passed;
   test phase 80.62s; compile 69s).
-- `cargo test -p api --lib routes::events:: --locked --offline` (5 passed;
-  test phase 7.81s; compile 27.83s).
+- `cargo test -p api --lib routes::events:: --locked --offline` (final run:
+  6 passed; test phase 10.93s; compile 2m12s after the EventContext update).
+- `cargo test -p api --test pr12_public_surface project_reads_and_mutations_require_project_visibility --locked --offline`
+  (1 passed; test phase 6.89s; compile 47.41s after the EventContext update).
 - `cargo test -p mcp-server user_scoped_mcp_isolates_projects_and_derived_resources --locked --offline`
   (1 passed; test phase 9.94s; incremental compile 17.03s).
 - `cargo test -p mcp-server --locked --offline` (38 passed; test phase 229.02s;
-  compile 11.97s; doc-tests 0).
+  compile 11.97s; doc-tests 0; run before the final EventContext-only SSE scope
+  update, after which `mcp-server` compiled as an `api` test dependency).
 - `pnpm --dir web exec vitest run src/pages/TaskDetailPage.test.tsx`
   (4 passed; 7.31s).
 - `pnpm --dir web typecheck` (passed; no diagnostics).
@@ -218,7 +223,7 @@ migrations, rename Forge, or create cross-model synchronization.
 Workspace-wide Cargo tests/build/clippy, full web Vitest, and Playwright E2E
 remain intentionally unrun. No migration, generated-type output, `cargo clean`,
 or workspace-wide build was used for this fix pass. Reused `target/` measured
-36 GB after the focused crate tests; the filesystem retained 70 GB free.
+37 GB after the focused crate tests; the filesystem retained 70 GB free.
 
 ### Initial PR12 implementation checks
 
@@ -325,7 +330,7 @@ is DomainEvent-only (`task.lifecycle_changed`, `gate.created`,
 | `TaskAwaitingHuman` | task.awaiting_human".to_string() @ crates/services/src/workflow/actions/dispatch.rs | no production consumer found; internal hint only | no; explicit SSE projection suppresses this hint | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. REMOVE_PUBLIC; retain internal only while current consumers need it; PR13 owns physical cleanup. |
 | `ProjectCreated` | project.created".to_owned() @ crates/api/src/routes/projects.rs | REST SSE runtime allowlist | yes: `project.created` with fixed safe payload | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP; bounded notification projection. |
 | `ProjectUpdated` | project.updated".to_owned() @ crates/api/src/routes/projects.rs | REST SSE runtime allowlist | yes: `project.updated` with fixed safe payload | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP; bounded notification projection. |
-| `ProjectDeleted` | project.deleted".to_owned() @ crates/api/src/routes/projects.rs | REST SSE runtime allowlist | yes: `project.deleted` with fixed safe payload | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP; bounded notification projection. |
+| `ProjectDeleted` | project.deleted".to_owned() @ crates/api/src/routes/projects.rs | REST SSE runtime allowlist | yes: `project.deleted` with fixed safe payload, scoped to the exact authenticated deleting Human because the Project no longer exists | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP; bounded notification projection with exact actor visibility. |
 | `ProjectPaused` | project.paused".to_owned() @ crates/api/src/routes/projects.rs | REST SSE runtime allowlist | yes: `project.paused` with fixed safe payload | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP; bounded notification projection. |
 | `ProjectResumed` | project.resumed".to_owned() @ crates/api/src/routes/projects.rs | REST SSE runtime allowlist | yes: `project.resumed` with fixed safe payload | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP; bounded notification projection. |
 | `DaemonRegistered` | daemon.registered".to_owned() @ crates/services/src/daemon_service.rs | no production consumer found; internal hint only | no; explicit SSE projection suppresses this hint | `—` | EventContext is never authority; DomainEvent row is the ledger when explicitly linked. TARGET_V2_KEEP internal signal; no public projection. |

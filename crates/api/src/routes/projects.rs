@@ -155,7 +155,9 @@ pub async fn delete_project(
         event_type: "project.deleted".to_owned(),
         entity_id: id,
         timestamp: event_timestamp(),
-        context: EventContext::ProjectDeleted {},
+        context: EventContext::ProjectDeleted {
+            actor_user_id: user.user_id.clone(),
+        },
     });
     Ok(StatusCode::NO_CONTENT)
 }
